@@ -1,13 +1,6 @@
 ---
 name: jacked
-description: Search and load context from past Claude Code sessions using semantic search
-activation:
-  - when: user asks to implement a feature and you suspect similar work was done before
-  - when: user asks to fix a bug that may have been addressed in a previous session
-  - when: user mentions continuing or resuming previous work
-  - when: user asks "how did I do X before" or "what was that solution for Y"
-  - when: user references past work on similar functionality
-  - when: starting work on a feature where prior context would be valuable
+description: Search and load context from past Claude Code sessions. Use when: user mentions a past project like "configurator" or other previous work, asks to continue/resume previous work, says "how did I do X before", references past sessions, or starts work on a feature that may have been done before.
 ---
 
 # Jacked
@@ -122,7 +115,7 @@ After injection, summarize what the previous session covered and ask what the us
 
 - If search returns no results: "No matching sessions found. Try a different description or run `jacked backfill` to index your sessions."
 - If retrieve fails: "Session not found in index. It may have been deleted or the session ID is invalid."
-- If jacked command not found: "jacked CLI not installed. Run `pipx install jacked` to install."
+- If jacked command not found: "jacked not installed or not on PATH. Run `pipx install claude-jacked` to install."
 
 ## Notes
 

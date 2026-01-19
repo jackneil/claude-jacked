@@ -2,9 +2,25 @@
 
 Supercharge your Claude Code workflow with cross-machine session search, review agents, and workflow commands.
 
-## Install (Copy This Into Claude Code)
+## Quick Install
 
-> 📋 [View on GitHub](https://github.com/jackneil/claude-jacked#install-copy-this-into-claude-code) for copy button
+**One-liner (Linux/macOS/Git Bash):**
+```bash
+curl -sSL https://raw.githubusercontent.com/jackneil/claude-jacked/master/install.sh | bash
+```
+
+**Or manual two-step:**
+```bash
+pipx install claude-jacked && jacked install
+```
+
+Then set up Qdrant credentials (see [Qdrant Setup](#set-up-qdrant-cloud)) and run `jacked backfill`.
+
+---
+
+## Guided Install (Copy Into Claude Code)
+
+> 📋 [View on GitHub](https://github.com/jackneil/claude-jacked#guided-install-copy-into-claude-code) for copy button
 
 ```
 Install claude-jacked for me. First check what's already set up, then help me with anything missing:
@@ -28,12 +44,11 @@ REPORT what's already configured vs what's missing before proceeding.
 SETUP PHASE (only do steps that are missing):
 1. If no Python 3.11+: help install miniconda
 2. If no pipx: pip install pipx && pipx ensurepath
-3. If jacked not installed: pipx install claude-jacked
+3. If jacked not installed: pipx install claude-jacked && jacked install
 4. If no Qdrant credentials anywhere: walk me through cloud.qdrant.io setup
 5. If env vars in Windows but not bash: add export lines to ~/.bashrc, then source it
 6. If env vars missing entirely: help add to shell profile
-7. If hook/agents not installed: jacked install
-8. If no indexed sessions: jacked backfill
+7. If no indexed sessions: jacked backfill
 
 VERIFY: jacked status && jacked configure --show
 
@@ -79,7 +94,7 @@ The goal: never lose useful context, never repeat solved problems, catch issues 
 
 ## Manual Install
 
-### Install the CLI
+### Step 1: Install the CLI
 
 **Use pipx** (recommended - installs globally, always on PATH):
 
@@ -91,20 +106,7 @@ Don't have pipx? `pip install pipx && pipx ensurepath`
 
 **Why not regular pip?** If you `pip install` into a conda env or virtualenv, the `jacked` command only works when that env is active. Claude Code hooks run in a fresh shell without your env activated → `jacked: command not found`. pipx avoids this by installing to an isolated global location that's always on PATH.
 
-### Set Up Qdrant Cloud
-
-The session search features require Qdrant Cloud for vector storage and embedding:
-
-1. Sign up at [cloud.qdrant.io](https://cloud.qdrant.io) (requires paid tier ~$30/mo for server-side embedding)
-2. Create a cluster and get your URL + API key
-3. Add to your shell profile:
-
-```bash
-export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
-export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
-```
-
-### Install Everything
+### Step 2: Install Claude Code Integration
 
 ```bash
 jacked install
@@ -118,7 +120,20 @@ This installs:
 
 Restart Claude Code after running this.
 
-### Index Your Sessions
+### Step 3: Set Up Qdrant Cloud
+
+The session search features require Qdrant Cloud for vector storage and embedding:
+
+1. Sign up at [cloud.qdrant.io](https://cloud.qdrant.io) (requires paid tier ~$30/mo for server-side embedding)
+2. Create a cluster and get your URL + API key
+3. Add to your shell profile:
+
+```bash
+export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
+export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
+```
+
+### Step 4: Index Your Sessions
 
 ```bash
 jacked backfill        # Index all existing sessions
@@ -127,6 +142,22 @@ jacked search "something you worked on before"
 ```
 
 **Note:** If you only want the agents and commands (not the session search), you can manually copy just those files from the repo without setting up Qdrant. But the main `jacked` functionality requires it.
+
+---
+
+## Uninstall
+
+**One-liner:**
+```bash
+curl -sSL https://raw.githubusercontent.com/jackneil/claude-jacked/master/uninstall.sh | bash
+```
+
+**Or manual two-step:**
+```bash
+jacked uninstall && pipx uninstall claude-jacked
+```
+
+This removes hooks, skill, agents, and commands from Claude Code. Your Qdrant index is preserved if you reinstall later.
 
 ---
 
@@ -268,6 +299,7 @@ jacked backfill --force            # Re-index everything
 jacked status                      # Check Qdrant connectivity
 jacked delete <session_id>         # Remove session from index
 jacked install                     # Install hook + skill + agents + commands
+jacked uninstall                   # Remove hook + skill + agents + commands
 jacked configure                   # Show config help
 jacked configure --show            # Show current config values
 ```

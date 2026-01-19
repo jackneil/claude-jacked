@@ -448,6 +448,14 @@ def configure(show: bool):
 from jacked.config import SmartForkConfig
 
 
+def _get_data_root() -> Path:
+    """Find the data root directory for skills/agents/commands.
+
+    Data is now inside the package at jacked/data/.
+    """
+    return Path(__file__).parent / "data"
+
+
 @main.command()
 def install():
     """Auto-install hook config, skill, agents, and commands."""
@@ -456,9 +464,9 @@ def install():
     import shutil
 
     home = Path.home()
-    pkg_root = Path(__file__).parent.parent
+    pkg_root = _get_data_root()
 
-    # Hook configuration
+    # Hook configuration - assumes jacked is on PATH (installed via pipx)
     hook_config = {
         "hooks": {
             "Stop": [
@@ -507,7 +515,8 @@ def install():
     else:
         console.print(f"[yellow][-][/yellow] Stop hook already exists in {settings_path}")
 
-    # Copy skill file - Claude Code expects skills in subdirectories with SKILL.md
+    # Copy skill file with Python path templating
+    # Claude Code expects skills in subdirectories with SKILL.md
     skill_dir = home / ".claude" / "skills" / "jacked"
     skill_dir.mkdir(parents=True, exist_ok=True)
 
@@ -558,6 +567,92 @@ def install():
     console.print("  2. Set environment variables (run 'jacked configure' for help)")
     console.print("  3. Run 'jacked backfill' to index existing sessions")
     console.print("  4. Use '/jacked <description>' in Claude to search past sessions")
+
+
+@main.command()
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+def uninstall(yes: bool):
+    """Remove jacked hooks, skill, agents, and commands from Claude Code."""
+    import json
+    import shutil
+
+    home = Path.home()
+    pkg_root = _get_data_root()
+
+    if not yes:
+        if not click.confirm("Remove jacked from Claude Code? (This won't delete your Qdrant index)"):
+            console.print("Cancelled")
+            return
+
+    console.print("[bold]Uninstalling Jacked...[/bold]\n")
+
+    # Remove Stop hook from settings.json
+    settings_path = home / ".claude" / "settings.json"
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+            if "hooks" in settings and "Stop" in settings["hooks"]:
+                # Filter out jacked hooks
+                original_count = len(settings["hooks"]["Stop"])
+                settings["hooks"]["Stop"] = [
+                    h for h in settings["hooks"]["Stop"]
+                    if "jacked" not in str(h.get("hooks", []))
+                ]
+                removed_count = original_count - len(settings["hooks"]["Stop"])
+                if removed_count > 0:
+                    settings_path.write_text(json.dumps(settings, indent=2))
+                    console.print(f"[green][OK][/green] Removed Stop hook from {settings_path}")
+                else:
+                    console.print(f"[yellow][-][/yellow] No jacked hook found in settings")
+        except (json.JSONDecodeError, KeyError) as e:
+            console.print(f"[red][FAIL][/red] Error reading settings: {e}")
+    else:
+        console.print(f"[yellow][-][/yellow] No settings.json found")
+
+    # Remove skill directory
+    skill_dir = home / ".claude" / "skills" / "jacked"
+    if skill_dir.exists():
+        shutil.rmtree(skill_dir)
+        console.print(f"[green][OK][/green] Removed skill: /jacked")
+    else:
+        console.print(f"[yellow][-][/yellow] Skill not found")
+
+    # Remove only jacked-installed agents (not the whole directory!)
+    agents_src = pkg_root / "agents"
+    agents_dst = home / ".claude" / "agents"
+    if agents_src.exists() and agents_dst.exists():
+        agent_count = 0
+        for agent_file in agents_src.glob("*.md"):
+            dst_file = agents_dst / agent_file.name
+            if dst_file.exists():
+                dst_file.unlink()
+                agent_count += 1
+        if agent_count > 0:
+            console.print(f"[green][OK][/green] Removed {agent_count} agents")
+        else:
+            console.print(f"[yellow][-][/yellow] No jacked agents found")
+    else:
+        console.print(f"[yellow][-][/yellow] Agents directory not found")
+
+    # Remove only jacked-installed commands (not the whole directory!)
+    commands_src = pkg_root / "commands"
+    commands_dst = home / ".claude" / "commands"
+    if commands_src.exists() and commands_dst.exists():
+        cmd_count = 0
+        for cmd_file in commands_src.glob("*.md"):
+            dst_file = commands_dst / cmd_file.name
+            if dst_file.exists():
+                dst_file.unlink()
+                cmd_count += 1
+        if cmd_count > 0:
+            console.print(f"[green][OK][/green] Removed {cmd_count} commands")
+        else:
+            console.print(f"[yellow][-][/yellow] No jacked commands found")
+    else:
+        console.print(f"[yellow][-][/yellow] Commands directory not found")
+
+    console.print("\n[bold]Uninstall complete![/bold]")
+    console.print("\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]")
 
 
 if __name__ == "__main__":
