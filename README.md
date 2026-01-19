@@ -87,7 +87,7 @@ jacked search "something you worked on"
 
 ## Agents
 
-Drop these in `~/.claude/agents/` or your project's `.claude/agents/` folder.
+Installed automatically by `jacked install` to `~/.claude/agents/`.
 
 | Agent | What It Does |
 |-------|--------------|
@@ -114,7 +114,7 @@ Use the double-check-reviewer agent to review what we just built
 
 ## Commands
 
-Drop these in `~/.claude/commands/` or your project's `.claude/commands/` folder.
+Installed automatically by `jacked install` to `~/.claude/commands/`.
 
 | Command | What It Does |
 |---------|--------------|
@@ -132,7 +132,7 @@ Drop these in `~/.claude/commands/` or your project's `.claude/commands/` folder
 
 ## Skills
 
-Drop these in `~/.claude/skills/` or your project's `.claude/skills/` folder.
+Installed automatically by `jacked install` to `~/.claude/skills/`.
 
 | Skill | What It Does |
 |-------|--------------|
