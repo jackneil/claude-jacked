@@ -35,7 +35,29 @@ The goal: never lose useful context, never repeat solved problems, catch issues 
 
 ## Quick Start
 
-### Install the CLI
+### Let Claude Do It (Recommended)
+
+Copy this into Claude Code and it'll walk you through everything:
+
+```
+Install claude-jacked for me. Guide me through the full setup:
+
+1. Check if I have pipx, install it if not
+2. Run: pipx install claude-jacked
+3. Help me set up Qdrant Cloud (walk me through creating account at cloud.qdrant.io, getting credentials)
+4. Help me add QDRANT_CLAUDE_SESSIONS_ENDPOINT and QDRANT_CLAUDE_SESSIONS_API_KEY to my shell profile
+5. Run: jacked install
+6. Run: jacked backfill
+7. Verify with: jacked status
+
+Ask me questions as needed. I'm on [Windows/Mac/Linux - edit this].
+```
+
+---
+
+### Manual Install
+
+#### Install the CLI
 
 **Use pipx** (recommended - installs globally, always on PATH):
 
@@ -47,7 +69,7 @@ Don't have pipx? `pip install pipx && pipx ensurepath`
 
 **Why not regular pip?** If you `pip install` into a conda env or virtualenv, the `jacked` command only works when that env is active. Claude Code hooks run in a fresh shell without your env activated → `jacked: command not found`. pipx avoids this by installing to an isolated global location that's always on PATH.
 
-### Set Up Qdrant Cloud
+#### Set Up Qdrant Cloud
 
 The session search features require Qdrant Cloud for vector storage and embedding:
 
@@ -60,7 +82,7 @@ export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
 export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
 ```
 
-### Install Everything
+#### Install Everything
 
 ```bash
 jacked install
@@ -74,7 +96,7 @@ This installs:
 
 Restart Claude Code after running this.
 
-### Index Your Sessions
+#### Index Your Sessions
 
 ```bash
 jacked backfill        # Index all existing sessions
@@ -146,6 +168,8 @@ Installed automatically by `jacked install` to `~/.claude/skills/`.
 ```
 
 Claude searches your indexed sessions, shows matches, and lets you load relevant context.
+
+**Note:** This searches ALL your indexed sessions across every repo and machine. Results are ranked by semantic similarity, not filtered to the current repo. Use `jacked search "query" --repo /path/to/repo` if you want to filter to a specific project.
 
 ---
 
