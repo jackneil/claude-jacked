@@ -1,3 +1,15 @@
+---
+name: jacked
+description: Search and load context from past Claude Code sessions using semantic search
+activation:
+  - when: user asks to implement a feature and you suspect similar work was done before
+  - when: user asks to fix a bug that may have been addressed in a previous session
+  - when: user mentions continuing or resuming previous work
+  - when: user asks "how did I do X before" or "what was that solution for Y"
+  - when: user references past work on similar functionality
+  - when: starting work on a feature where prior context would be valuable
+---
+
 # Jacked
 
 Search and load context from past Claude Code sessions using semantic search.
