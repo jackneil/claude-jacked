@@ -40,15 +40,39 @@ class SmartForkConfig:
     collection_name: str = "claude_sessions"
     claude_projects_dir: Path = field(default_factory=lambda: SmartForkConfig._default_claude_dir())
     machine_name: str = field(default_factory=lambda: platform.node())
+    user_name: str = field(default_factory=lambda: SmartForkConfig._default_user_name())
     chunk_size: int = 4000  # ~4KB chunks
     chunk_overlap: int = 200  # 200 char overlap for context continuity
     intent_max_tokens: int = 400  # Max tokens per intent chunk (Qdrant model limit ~512)
+    # Ranking weights for multi-factor search
+    teammate_weight: float = 0.8  # Multiplier for teammate sessions (vs 1.0 for own)
+    other_repo_weight: float = 0.7  # Multiplier for other repos (vs 1.0 for current)
+    time_decay_halflife_weeks: int = 35  # Weeks until session relevance halves
 
     @staticmethod
     def _default_claude_dir() -> Path:
         """Get the default Claude projects directory."""
         home = Path.home()
         return home / ".claude" / "projects"
+
+    @staticmethod
+    def _default_user_name() -> str:
+        """Get default user name from git config or system."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["git", "config", "user.name"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+        # Fallback to system username
+        import getpass
+        return getpass.getuser()
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "SmartForkConfig":
@@ -107,6 +131,12 @@ class SmartForkConfig:
         claude_dir = Path(claude_dir_str) if claude_dir_str else cls._default_claude_dir()
 
         machine_name = os.getenv("SMART_FORK_MACHINE_NAME", platform.node())
+        user_name = os.getenv("JACKED_USER_NAME", cls._default_user_name())
+
+        # Ranking weights
+        teammate_weight = float(os.getenv("JACKED_TEAMMATE_WEIGHT", "0.8"))
+        other_repo_weight = float(os.getenv("JACKED_OTHER_REPO_WEIGHT", "0.7"))
+        time_decay_halflife = int(os.getenv("JACKED_TIME_DECAY_HALFLIFE_WEEKS", "35"))
 
         return cls(
             qdrant_endpoint=endpoint,
@@ -114,6 +144,10 @@ class SmartForkConfig:
             collection_name=collection_name,
             claude_projects_dir=claude_dir,
             machine_name=machine_name,
+            user_name=user_name,
+            teammate_weight=teammate_weight,
+            other_repo_weight=other_repo_weight,
+            time_decay_halflife_weeks=time_decay_halflife,
         )
 
     def validate(self) -> bool:

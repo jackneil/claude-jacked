@@ -52,18 +52,23 @@ Parse the output to get the list of matching sessions.
 Show the user the matching sessions in a table format:
 - Number (for selection)
 - Relevance score (percentage)
+- User (YOU or @username for teammates)
 - Date
 - Repository name
 - Preview of the conversation
 
-Ask the user to select a session by number, or 'skip' to cancel.
+Ask the user to select sessions by number (can select multiple, e.g., "1, 3" or "1-3"), or 'skip' to cancel.
 
-### Step 3: Retrieve Selected Session
+### Step 3: Retrieve Selected Sessions
 
-When the user selects a session:
+When the user selects one or more sessions:
 
 ```bash
+# Single session
 jacked retrieve <session_id>
+
+# Multiple sessions
+jacked retrieve <session_id_1> <session_id_2> ...
 ```
 
 This will output:

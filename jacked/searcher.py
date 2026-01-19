@@ -2,11 +2,13 @@
 Session searching for Jacked.
 
 Handles semantic search across indexed sessions using Qdrant Cloud Inference.
+Implements multi-factor ranking: ownership, repo, recency, and semantic similarity.
 """
 
 import logging
+import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from collections import defaultdict
 
@@ -26,26 +28,35 @@ class SearchResult:
         session_id: The session UUID
         repo_name: Name of the repository
         repo_path: Full path to the repository
+        user_name: Name of the user who created the session
         machine: Machine name where the session was indexed
         timestamp: When the session was last indexed
-        score: Relevance score (0-100)
+        score: Final relevance score (0-100) after multi-factor ranking
+        semantic_score: Raw semantic similarity score (0-100)
+        is_own: Whether this is the current user's session
+        is_current_repo: Whether this is from the current repo
         intent_preview: Preview of the matched intent text
         chunk_count: Number of transcript chunks stored
     """
     session_id: str
     repo_name: str
     repo_path: str
+    user_name: str
     machine: str
     timestamp: Optional[datetime]
     score: float
+    semantic_score: float
+    is_own: bool
+    is_current_repo: bool
     intent_preview: str
     chunk_count: int
 
     def __str__(self) -> str:
         """Format result for display."""
         ts_str = self.timestamp.strftime("%Y-%m-%d") if self.timestamp else "unknown"
+        owner = "YOU" if self.is_own else f"@{self.user_name}"
         return (
-            f"[{self.score:.0f}%] {ts_str} - {self.repo_name} ({self.machine})\n"
+            f"[{self.score:.0f}%] {owner} - {self.repo_name} - {ts_str}\n"
             f"      {self.intent_preview[:80]}..."
         )
 
@@ -83,37 +94,45 @@ class SessionSearcher:
         repo_path: Optional[str] = None,
         limit: int = 10,
         min_score: float = 0.3,
+        mine_only: bool = False,
+        user_filter: Optional[str] = None,
     ) -> list[SearchResult]:
         """
-        Search for sessions similar to the query.
+        Search for sessions similar to the query with multi-factor ranking.
 
-        Qdrant Cloud Inference embeds the query server-side.
+        Ranking factors:
+        - Semantic similarity (from Qdrant)
+        - Ownership (own sessions weighted higher)
+        - Repository (current repo weighted higher)
+        - Recency (recent sessions weighted higher)
 
         Args:
             query: Text description of what you're looking for
-            repo_path: Optional repo path to filter by
+            repo_path: Optional repo path to boost (and filter if combined with mine_only)
             limit: Maximum number of results
             min_score: Minimum cosine similarity score (0-1)
+            mine_only: If True, only return current user's sessions
+            user_filter: If set, only return sessions from this user
 
         Returns:
-            List of SearchResult objects, sorted by relevance
+            List of SearchResult objects, sorted by multi-factor relevance
 
         Examples:
             >>> searcher = SessionSearcher(config)  # doctest: +SKIP
-            >>> results = searcher.search("fix anesthesia time handling")  # doctest: +SKIP
+            >>> results = searcher.search("fix auth handling")  # doctest: +SKIP
             >>> for r in results[:3]:  # doctest: +SKIP
             ...     print(r)
         """
-        # Filter by repo if specified
-        repo_id = get_repo_id(repo_path) if repo_path else None
+        current_repo_id = get_repo_id(repo_path) if repo_path else None
+        current_user = self.config.user_name
 
         # Search for intent points using server-side embedding
-        # Get more results than needed since we'll aggregate by session
+        # Get more results than needed since we'll aggregate and re-rank
         raw_results = self.client.search(
             query_text=query,
-            repo_id=repo_id,
+            repo_id=None,  # Don't filter in Qdrant, we'll boost instead
             point_type="intent",
-            limit=limit * 5,  # Get extra for aggregation
+            limit=limit * 10,  # Get extra for aggregation and filtering
         )
 
         # Aggregate by session (multiple intent chunks per session)
@@ -126,8 +145,15 @@ class SessionSearcher:
 
             payload = result.payload or {}
             session_id = payload.get("session_id")
+            session_user = payload.get("user_name", "unknown")
 
             if not session_id:
+                continue
+
+            # Apply filters
+            if mine_only and session_user != current_user:
+                continue
+            if user_filter and session_user != user_filter:
                 continue
 
             session_scores[session_id].append(result.score)
@@ -136,11 +162,11 @@ class SessionSearcher:
             if session_id not in session_data or result.score > max(session_scores[session_id][:-1], default=0):
                 session_data[session_id] = payload
 
-        # Build search results with aggregated scores
+        # Build search results with multi-factor ranking
         results = []
         for session_id, scores in session_scores.items():
-            # Use max score for ranking (best match in session)
-            max_score = max(scores)
+            # Use max score for semantic ranking (best match in session)
+            semantic_score = max(scores)
             payload = session_data[session_id]
 
             # Parse timestamp
@@ -152,22 +178,79 @@ class SessionSearcher:
                 except ValueError:
                     pass
 
+            # Determine ownership and repo match
+            session_user = payload.get("user_name", "unknown")
+            session_repo_id = payload.get("repo_id", "")
+            is_own = session_user == current_user
+            is_current_repo = current_repo_id and session_repo_id == current_repo_id
+
+            # Calculate multi-factor score
+            final_score = self._calculate_ranked_score(
+                semantic_score=semantic_score,
+                is_own=is_own,
+                is_current_repo=is_current_repo,
+                timestamp=timestamp,
+            )
+
             results.append(
                 SearchResult(
                     session_id=session_id,
                     repo_name=payload.get("repo_name", "unknown"),
                     repo_path=payload.get("repo_path", ""),
+                    user_name=session_user,
                     machine=payload.get("machine", "unknown"),
                     timestamp=timestamp,
-                    score=max_score * 100,  # Convert to percentage
+                    score=final_score * 100,  # Convert to percentage
+                    semantic_score=semantic_score * 100,
+                    is_own=is_own,
+                    is_current_repo=is_current_repo,
                     intent_preview=payload.get("intent_text", "")[:200],
                     chunk_count=payload.get("transcript_chunk_count", 0),
                 )
             )
 
-        # Sort by score (descending) and limit
+        # Sort by final score (descending) and limit
         results.sort(key=lambda r: r.score, reverse=True)
         return results[:limit]
+
+    def _calculate_ranked_score(
+        self,
+        semantic_score: float,
+        is_own: bool,
+        is_current_repo: bool,
+        timestamp: Optional[datetime],
+    ) -> float:
+        """
+        Calculate multi-factor ranked score.
+
+        Formula: semantic * ownership_weight * repo_weight * time_decay
+
+        Args:
+            semantic_score: Raw semantic similarity (0-1)
+            is_own: Whether this is current user's session
+            is_current_repo: Whether this is from current repo
+            timestamp: Session timestamp for decay calculation
+
+        Returns:
+            Final ranked score (0-1)
+        """
+        # Ownership weight
+        ownership_weight = 1.0 if is_own else self.config.teammate_weight
+
+        # Repo weight
+        repo_weight = 1.0 if is_current_repo else self.config.other_repo_weight
+
+        # Time decay (exponential decay with configurable half-life)
+        time_decay = 1.0
+        if timestamp:
+            now = datetime.now(timezone.utc)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            age_weeks = (now - timestamp).days / 7
+            halflife = self.config.time_decay_halflife_weeks
+            time_decay = math.pow(0.5, age_weeks / halflife)
+
+        return semantic_score * ownership_weight * repo_weight * time_decay
 
     def search_by_repo(
         self,

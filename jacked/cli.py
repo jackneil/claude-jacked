@@ -163,14 +163,20 @@ def backfill(repo: Optional[str], force: bool):
 
 @main.command()
 @click.argument("query")
-@click.option("--repo", "-r", help="Filter by repository path")
+@click.option("--repo", "-r", help="Boost results from this repository path")
 @click.option("--limit", "-n", default=5, help="Maximum results")
-def search(query: str, repo: Optional[str], limit: int):
-    """Search for sessions by semantic similarity."""
+@click.option("--mine", "-m", is_flag=True, help="Only show my sessions")
+@click.option("--user", "-u", help="Only show sessions from this user")
+def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Optional[str]):
+    """Search for sessions by semantic similarity with multi-factor ranking."""
+    import os
     from jacked.searcher import SessionSearcher
 
     config = get_config()
     searcher = SessionSearcher(config)
+
+    # Use current repo if not specified
+    current_repo = repo or os.getenv("CLAUDE_PROJECT_DIR")
 
     with Progress(
         SpinnerColumn(),
@@ -179,7 +185,13 @@ def search(query: str, repo: Optional[str], limit: int):
     ) as progress:
         task = progress.add_task("Searching...", total=None)
 
-        results = searcher.search(query, repo_path=repo, limit=limit)
+        results = searcher.search(
+            query,
+            repo_path=current_repo,
+            limit=limit,
+            mine_only=mine,
+            user_filter=user,
+        )
 
         progress.remove_task(task)
 
@@ -190,16 +202,19 @@ def search(query: str, repo: Optional[str], limit: int):
     table = Table(title="Search Results", show_header=True)
     table.add_column("#", style="dim", width=3)
     table.add_column("Score", style="cyan", width=6)
+    table.add_column("User", style="yellow", width=12)
     table.add_column("Date", style="green", width=12)
     table.add_column("Repository", style="magenta")
     table.add_column("Preview")
 
     for i, result in enumerate(results, 1):
         date_str = result.timestamp.strftime("%Y-%m-%d") if result.timestamp else "?"
-        preview = result.intent_preview[:60] + "..." if len(result.intent_preview) > 60 else result.intent_preview
+        preview = result.intent_preview[:50] + "..." if len(result.intent_preview) > 50 else result.intent_preview
+        user_display = "YOU" if result.is_own else f"@{result.user_name}"
         table.add_row(
             str(i),
             f"{result.score:.0f}%",
+            user_display,
             date_str,
             result.repo_name,
             preview,
@@ -207,6 +222,7 @@ def search(query: str, repo: Optional[str], limit: int):
 
     console.print(table)
     console.print(f"\n[dim]Use 'jacked retrieve <session_id>' to get full transcript[/dim]")
+    console.print(f"[dim]Use 'jacked retrieve <id1> <id2> ...' to get multiple transcripts[/dim]")
 
     # Print session IDs for easy copy
     console.print("\nSession IDs:")
@@ -370,27 +386,66 @@ def status():
 
 
 @main.command()
-def configure():
-    """Interactive configuration setup."""
+@click.option("--show", "-s", is_flag=True, help="Show current configuration")
+def configure(show: bool):
+    """Show configuration help or current settings."""
+    import os
+
+    if show:
+        # Show current config
+        console.print("[bold]Current Configuration[/bold]\n")
+        try:
+            config = get_config()
+            console.print(Panel(
+                f"User: [cyan]{config.user_name}[/cyan]\n"
+                f"Machine: {config.machine_name}\n"
+                f"Qdrant Endpoint: {config.qdrant_endpoint[:50]}...\n"
+                f"Collection: {config.collection_name}\n"
+                f"Projects Dir: {config.claude_projects_dir}\n"
+                f"\n[bold]Ranking Weights:[/bold]\n"
+                f"  Teammate weight: {config.teammate_weight}\n"
+                f"  Other repo weight: {config.other_repo_weight}\n"
+                f"  Time decay half-life: {config.time_decay_halflife_weeks} weeks",
+                title="Active Config",
+            ))
+        except Exception as e:
+            console.print(f"[red]Error loading config:[/red] {e}")
+        return
+
     console.print("[bold]Jacked Configuration[/bold]\n")
 
-    console.print("Jacked requires two environment variables:\n")
-    console.print("  [cyan]QDRANT_CLAUDE_SESSIONS_ENDPOINT[/cyan]")
-    console.print("    Your Qdrant Cloud endpoint URL")
-    console.print("    Example: https://abc123.us-east-1-1.aws.cloud.qdrant.io\n")
-
-    console.print("  [cyan]QDRANT_CLAUDE_SESSIONS_API_KEY[/cyan]")
+    console.print("[bold cyan]Required:[/bold cyan]\n")
+    console.print("  QDRANT_CLAUDE_SESSIONS_ENDPOINT")
+    console.print("    Your Qdrant Cloud endpoint URL\n")
+    console.print("  QDRANT_CLAUDE_SESSIONS_API_KEY")
     console.print("    Your Qdrant Cloud API key\n")
 
-    console.print("To get these values:")
-    console.print("  1. Sign up at https://cloud.qdrant.io")
-    console.print("  2. Create a cluster")
-    console.print("  3. Get the endpoint URL and API key from the cluster dashboard\n")
+    console.print("[bold cyan]Team/Identity (Optional):[/bold cyan]\n")
+    console.print("  JACKED_USER_NAME")
+    console.print(f"    Your name for session attribution (default: git user.name or system user)")
+    console.print(f"    Current: {os.getenv('JACKED_USER_NAME', SmartForkConfig._default_user_name())}\n")
 
-    console.print("Add to your shell profile (~/.bashrc, ~/.zshrc, or PowerShell profile):")
-    console.print("")
+    console.print("[bold cyan]Ranking Weights (Optional):[/bold cyan]\n")
+    console.print("  JACKED_TEAMMATE_WEIGHT")
+    console.print("    Multiplier for teammate sessions vs yours (default: 0.8)\n")
+    console.print("  JACKED_OTHER_REPO_WEIGHT")
+    console.print("    Multiplier for other repos vs current (default: 0.7)\n")
+    console.print("  JACKED_TIME_DECAY_HALFLIFE_WEEKS")
+    console.print("    Weeks until session relevance halves (default: 35)\n")
+
+    console.print("[bold]Example shell profile setup:[/bold]\n")
+    console.print('  # Required')
     console.print('  export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"')
     console.print('  export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"')
+    console.print('')
+    console.print('  # Team setup (optional)')
+    console.print('  export JACKED_USER_NAME="yourname"')
+    console.print('')
+    console.print("[dim]Run 'jacked configure --show' to see current values[/dim]")
+
+
+# Import for configure command
+from jacked.config import SmartForkConfig
 
 
 @main.command()

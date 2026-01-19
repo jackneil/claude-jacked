@@ -12,12 +12,16 @@ Install claude-jacked for me. First detect my OS, then guide me through the full
 3. Check if I have pipx, install it if not (use Python 3.11)
 4. Run: pipx install claude-jacked
 5. Help me set up Qdrant Cloud (walk me through creating account at cloud.qdrant.io, getting credentials)
-6. Help me add QDRANT_CLAUDE_SESSIONS_ENDPOINT and QDRANT_CLAUDE_SESSIONS_API_KEY to my shell profile
+6. Help me add environment variables to my shell profile:
+   - QDRANT_CLAUDE_SESSIONS_ENDPOINT (required)
+   - QDRANT_CLAUDE_SESSIONS_API_KEY (required)
+   - JACKED_USER_NAME (ask me what name I want to use for attribution)
 7. Run: jacked install
 8. Run: jacked backfill
-9. Verify with: jacked status
+9. Verify with: jacked status && jacked configure --show
 
-Ask me questions as needed.
+Ask me if I'm setting this up for personal use or for a team sharing sessions.
+If team: explain that everyone needs the same Qdrant cluster credentials.
 ```
 
 ---
@@ -99,6 +103,55 @@ jacked search "something you worked on before"
 ```
 
 **Note:** If you only want the agents and commands (not the session search), you can manually copy just those files from the repo without setting up Qdrant. But the main `jacked` functionality requires it.
+
+---
+
+## Team Setup
+
+Share knowledge across your team by using the same Qdrant cluster.
+
+### How It Works
+
+1. **Everyone on the team** uses the same `QDRANT_CLAUDE_SESSIONS_ENDPOINT` and `QDRANT_CLAUDE_SESSIONS_API_KEY`
+2. **Each person sets** their `JACKED_USER_NAME` to identify their sessions
+3. **Search results** show who created each session (YOU vs @teammate)
+4. **Ranking prioritizes** your own sessions, then teammates, with recency boost
+
+### Team Environment Setup
+
+```bash
+# Everyone uses the same cluster
+export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://team-cluster.qdrant.io"
+export QDRANT_CLAUDE_SESSIONS_API_KEY="team-api-key"
+
+# Each person sets their name
+export JACKED_USER_NAME="sarah"  # or "mike", "jack", etc.
+```
+
+### Search Examples
+
+```bash
+jacked search "auth implementation"     # Ranked: your stuff first, then team
+jacked search "auth" --mine             # Only your sessions
+jacked search "auth" --user sarah       # Only Sarah's sessions
+```
+
+### Multi-Factor Ranking
+
+Results are ranked by:
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| Semantic | Core | How well the query matches the session content |
+| Ownership | 1.0 / 0.8 | Your sessions weighted higher than teammates |
+| Repository | 1.0 / 0.7 | Current repo weighted higher than others |
+| Recency | Decay | Recent sessions weighted higher (35-week half-life) |
+
+Customize weights via environment variables:
+```bash
+export JACKED_TEAMMATE_WEIGHT=0.8        # Teammate session multiplier
+export JACKED_OTHER_REPO_WEIGHT=0.7      # Other repo multiplier
+export JACKED_TIME_DECAY_HALFLIFE_WEEKS=35  # Weeks until half relevance
+```
 
 ---
 
