@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(smart-fork search:*)",
+      "Bash(smart-fork retrieve:*)",
+      "Bash(smart-fork list:*)"
+    ]
+  }
+}
