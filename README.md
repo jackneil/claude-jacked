@@ -1,242 +1,202 @@
-# Jacked
+# claude-jacked
 
-Cross-machine semantic search for Claude Code sessions. Find and load context from past work without digging through files.
+A collection of agents, commands, skills, and tools to supercharge your Claude Code workflow.
+
+```bash
+pip install claude-jacked
+```
+
+## What's In Here
+
+| Component | Description |
+|-----------|-------------|
+| **jacked CLI** | Cross-machine semantic search for Claude Code sessions via Qdrant |
+| **10 Agents** | Double-check reviewer, PR workflow, test coverage, code simplicity, and more |
+| **2 Commands** | `/dc` (double-check), `/pr` (PR workflow) |
+| **1 Skill** | `/jacked` for searching past sessions from within Claude |
 
 ## Why This Exists
 
-Claude Code stores sessions locally at `~/.claude/projects/`. Problem is:
-- Sessions don't sync across machines
-- They get compacted over time (context lost)
-- Finding "that thing I did 2 weeks ago" means grep-ing through JSONL files
+Claude Code has a context problem:
 
-Jacked fixes this by continuously indexing all your sessions to Qdrant Cloud. Search semantically, load context instantly, works from any machine.
+1. **Sessions don't sync across machines** - Work on your desktop, can't resume on laptop
+2. **Auto-compact destroys context** - Hit the limit and your carefully built context gets summarized into oblivion
+3. **Finding past work is painful** - "How did I solve that auth bug last week?" means grep-ing through JSONL files
 
-## How It Works
+This repo addresses these problems:
 
-```
-You: /jacked implement overnight OB time handling
+- **jacked** indexes all your sessions to Qdrant Cloud for semantic search from anywhere
+- **Agents** like `double-check-reviewer` catch mistakes before they ship
+- **Commands** like `/dc` trigger comprehensive reviews at the right moments
 
-Claude: Found 3 matches:
-        1. [92%] 2025-01-10 - "anesthesia time handling, overnight cases..."
-        2. [78%] 2025-01-05 - "OB epidural time tracking..."
-        3. [65%] 2024-12-20 - "DOS resolver for midnight cases..."
+The goal: never lose useful context, never repeat solved problems, catch issues early.
 
-        Load context from which session? (1-3, or 'skip')
-
-You: 1
-
-Claude: Loaded context from session 2025-01-10. That session covered:
-        - AnesthesiaTimeEntry model changes
-        - Discontinuous time handling
-        - note_ids tracking fixes
-
-        What would you like to work on?
-```
+---
 
 ## Quick Start
 
-### 1. Get Qdrant Cloud Account
-
-Sign up at [cloud.qdrant.io](https://cloud.qdrant.io) and create a cluster.
-
-**Important:** You need a **paid tier** ($30/month minimum) for server-side embedding via Qdrant Cloud Inference. The free tier won't work.
-
-Get your:
-- Cluster URL (e.g., `https://abc123.us-east-1-1.aws.cloud.qdrant.io`)
-- API Key
-
-### 2. Install Jacked
-
-**Recommended: Use pipx** (installs globally, available in all terminals):
+### Install the Package
 
 ```bash
-pipx install jacked
+pip install claude-jacked
 ```
 
-Don't have pipx? Install it first:
-```bash
-# Linux/Mac
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
+### Copy Agents/Commands/Skills to Your Claude Config
 
-# Windows
-pip install pipx
-pipx ensurepath
+```bash
+# Clone the repo to get the agent/command/skill files
+git clone https://github.com/jackneil/claude-jacked
+cd claude-jacked
+
+# Copy to your global Claude config (or a specific project)
+cp -r agents/* ~/.claude/agents/
+cp -r commands/* ~/.claude/commands/
+cp -r skills/* ~/.claude/skills/
 ```
 
-**Alternative: pip install** (if you don't want pipx):
-```bash
-pip install jacked
-```
+### Set Up Jacked (Session Search)
 
-**For development** (editable install, code changes take effect immediately):
-```bash
-git clone https://github.com/hank-ai/jacked
-cd jacked
-pipx install --editable .
-```
+If you want cross-machine session search, you'll need Qdrant Cloud:
 
-### 3. Configure Credentials
-
-Set environment variables (add to your shell profile):
+1. Sign up at [cloud.qdrant.io](https://cloud.qdrant.io) (requires paid tier ~$30/mo for server-side embedding)
+2. Create a cluster and get your URL + API key
+3. Configure environment:
 
 ```bash
-# Linux/Mac (.bashrc or .zshrc)
 export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
 export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
 ```
 
-```powershell
-# Windows PowerShell (profile.ps1) - or set via System Properties
-$env:QDRANT_CLAUDE_SESSIONS_ENDPOINT = "https://your-cluster.qdrant.io"
-$env:QDRANT_CLAUDE_SESSIONS_API_KEY = "your-api-key"
-```
-
-Or create a `.env` file in your working directory:
-```
-QDRANT_CLAUDE_SESSIONS_ENDPOINT=https://your-cluster.qdrant.io
-QDRANT_CLAUDE_SESSIONS_API_KEY=your-api-key
-```
-
-### 4. Install Hook & Skill
+4. Install the hook and backfill existing sessions:
 
 ```bash
-jacked install
+jacked install   # Adds auto-index hook to Claude
+jacked backfill  # Index all existing sessions
 ```
 
-This adds:
-- **Stop hook** - Auto-indexes sessions after every Claude response
-- **Skill file** - Enables `/jacked` command in Claude
-
-### 5. Index Existing Sessions
+5. Verify:
 
 ```bash
-jacked backfill
-```
-
-This indexes all your existing Claude sessions. Takes a few minutes depending on how many you have.
-
-### 6. Verify It Works
-
-```bash
-jacked status   # Check Qdrant connectivity
-jacked search "something you worked on before"
-```
-
-## Usage
-
-### CLI Commands
-
-```bash
-# Search for sessions
-jacked search "implement user authentication"
-jacked search "fix database connection" --repo /path/to/repo
-
-# List indexed sessions
-jacked list
-jacked list --repo myproject --limit 20
-
-# Get full transcript
-jacked retrieve <session_id>
-jacked retrieve <session_id> --summary
-jacked retrieve <session_id> --output transcript.txt
-
-# Index a specific session
-jacked index /path/to/session.jsonl --repo /path/to/repo
-
-# Backfill all sessions
-jacked backfill
-jacked backfill --repo myproject --force  # Re-index even unchanged
-
-# Check status
 jacked status
-
-# Delete a session from index
-jacked delete <session_id>
-
-# Show configuration help
-jacked configure
+jacked search "something you worked on"
 ```
 
-### In Claude Code
+---
 
-Use the `/jacked` skill:
+## Agents
+
+Drop these in `~/.claude/agents/` or your project's `.claude/agents/` folder.
+
+| Agent | What It Does |
+|-------|--------------|
+| `double-check-reviewer` | CTO/CSO-level review for security, auth gaps, data leaks |
+| `code-simplicity-reviewer` | Reviews for over-engineering and unnecessary complexity |
+| `defensive-error-handler` | Audits error handling and adds defensive patterns |
+| `git-pr-workflow-manager` | Manages branches, commits, and PR organization |
+| `pr-workflow-checker` | Checks PR status and handles PR lifecycle |
+| `issue-pr-coordinator` | Scans issues, groups related ones, manages PR workflows |
+| `test-coverage-engineer` | Analyzes and improves test coverage |
+| `test-coverage-improver` | Adds doctests and test files systematically |
+| `readme-maintainer` | Keeps README in sync with code changes |
+| `wiki-documentation-architect` | Creates/maintains GitHub Wiki documentation |
+
+### Usage
+
+Claude automatically uses these agents when appropriate. You can also invoke them explicitly:
 
 ```
-/jacked implement caching for the API
+Use the double-check-reviewer agent to review what we just built
 ```
 
-Claude will:
-1. Search for similar past sessions
-2. Show matches with relevance scores
-3. Let you pick which one to load
-4. If local: suggest native resume command
-5. If remote: inject the transcript as context
+---
 
-## Architecture
+## Commands
+
+Drop these in `~/.claude/commands/` or your project's `.claude/commands/` folder.
+
+| Command | What It Does |
+|---------|--------------|
+| `/dc` | Triggers comprehensive double-check review (auto-detects if planning vs implementation) |
+| `/pr` | Checks PR status, manages workflow for current branch |
+
+### Usage
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  YOUR MACHINE                                                   │
-│                                                                 │
-│  Claude Code                                                    │
-│  ├── Stop hook → jacked index (after every response)       │
-│  └── /jacked skill → search + retrieve + inject            │
-│                                                                 │
-│  jacked CLI                                                 │
-│  ├── index    - Parse JSONL, upsert to Qdrant                  │
-│  ├── search   - Semantic search via Qdrant                     │
-│  ├── retrieve - Get full transcript from Qdrant                │
-│  └── ...                                                        │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTPS
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  QDRANT CLOUD                                                   │
-│                                                                 │
-│  • Server-side embedding (no local ML models needed)           │
-│  • Model: sentence-transformers/all-minilm-l6-v2               │
-│  • Stores vectors + full transcripts in payloads               │
-│  • ~11K points for 120 sessions                                │
-└─────────────────────────────────────────────────────────────────┘
+/dc          # Review current work
+/pr          # Check PR status
 ```
 
-## Why Qdrant Cloud Inference?
+---
 
-Jacked uses Qdrant's **server-side embedding** feature. This means:
+## Skills
 
-**You don't need:**
-- sentence-transformers
-- PyTorch
-- Any ML models locally
-- GPU
+Drop these in `~/.claude/skills/` or your project's `.claude/skills/` folder.
 
-**Benefits:**
-- Fast `pip install` (no heavy dependencies)
-- Consistent embeddings across all your machines
-- Qdrant handles model updates
+| Skill | What It Does |
+|-------|--------------|
+| `/jacked` | Search past sessions and load context |
 
-**Trade-off:**
-- Requires paid Qdrant tier ($30/month)
-- Your text goes to Qdrant for embedding
+### Usage
 
-## ⚠️ Security Warning
+```
+/jacked implement user authentication
+```
 
-**Jacked sends your session data to Qdrant Cloud.** This includes:
+Claude searches your indexed sessions, shows matches, and lets you load relevant context.
 
-- Full conversation transcripts (your messages + Claude's responses)
-- Repo paths and machine names
-- **Anything you paste into sessions** (API keys, passwords, secrets)
+---
 
-**If you paste sensitive data in a Claude session, it will be indexed.**
+## Jacked CLI Reference
 
-Recommendations:
-- Don't paste secrets in Claude sessions (use env vars instead)
-- Keep your Qdrant API key secure
-- Consider self-hosting Qdrant if security is critical
+### Commands
 
-Future versions may add regex-based redaction for common secret patterns.
+```bash
+jacked search "query"              # Semantic search across sessions
+jacked search "query" --repo path  # Filter by repo
+
+jacked list                        # List indexed sessions
+jacked list --repo myproject       # Filter by repo name
+
+jacked retrieve <session_id>       # Get full transcript
+jacked retrieve <id> --summary     # Get summary only
+
+jacked index /path/to/session.jsonl --repo /path  # Index specific session
+jacked backfill                    # Index all existing sessions
+jacked backfill --force            # Re-index everything
+
+jacked status                      # Check Qdrant connectivity
+jacked delete <session_id>         # Remove session from index
+jacked install                     # Install hook + skill
+jacked configure                   # Show config help
+```
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  YOUR MACHINE                                               │
+│                                                             │
+│  Claude Code                                                │
+│  ├── Stop hook → jacked index (after every response)        │
+│  └── /jacked skill → search + load context                  │
+│                                                             │
+│  ~/.claude/projects/                                        │
+│  └── {repo}/                                                │
+│      └── {session}.jsonl  ←── parsed and indexed            │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            │ HTTPS
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  QDRANT CLOUD                                               │
+│                                                             │
+│  • Server-side embedding (no local ML needed)               │
+│  • Vectors + full transcripts stored                        │
+│  • Accessible from any machine                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Configuration
 
@@ -244,15 +204,15 @@ Future versions may add regex-based redaction for common secret patterns.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `QDRANT_CLAUDE_SESSIONS_ENDPOINT` | Yes | Your Qdrant Cloud cluster URL |
-| `QDRANT_CLAUDE_SESSIONS_API_KEY` | Yes | Your Qdrant API key |
+| `QDRANT_CLAUDE_SESSIONS_ENDPOINT` | Yes | Qdrant Cloud cluster URL |
+| `QDRANT_CLAUDE_SESSIONS_API_KEY` | Yes | Qdrant API key |
 | `QDRANT_CLAUDE_SESSIONS_COLLECTION` | No | Collection name (default: `claude_sessions`) |
 | `CLAUDE_PROJECTS_DIR` | No | Override Claude projects dir (default: `~/.claude/projects`) |
-| `SMART_FORK_MACHINE_NAME` | No | Override machine name for indexing |
+| `SMART_FORK_MACHINE_NAME` | No | Override machine name |
 
 ### Hook Configuration
 
-The Stop hook is added to `~/.claude/settings.json`:
+The `jacked install` command adds this to `~/.claude/settings.json`:
 
 ```json
 {
@@ -268,79 +228,66 @@ The Stop hook is added to `~/.claude/settings.json`:
 }
 ```
 
+---
+
+## Security Warning
+
+**Jacked sends session data to Qdrant Cloud.** This includes:
+
+- Full conversation transcripts
+- Repo paths and machine names
+- Anything you paste into sessions (including secrets)
+
+Recommendations:
+- Don't paste API keys/passwords in Claude sessions
+- Keep your Qdrant API key secure
+- Consider self-hosting Qdrant for sensitive work
+
+---
+
 ## Troubleshooting
 
-### "Configuration error: QDRANT_CLAUDE_SESSIONS_ENDPOINT not set"
+### "QDRANT_CLAUDE_SESSIONS_ENDPOINT not set"
 
-Your environment variables aren't loaded. Either:
-- Add them to your shell profile and restart terminal
-- Create a `.env` file in your working directory
-- On Windows, you may need to set them at Machine level via System Properties
+Add to your shell profile (`~/.bashrc`, `~/.zshrc`, or PowerShell profile):
+
+```bash
+export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
+export QDRANT_CLAUDE_SESSIONS_API_KEY="your-key"
+```
 
 ### "No matching sessions found"
 
-- Run `jacked backfill` to index existing sessions
-- Check `jacked status` to verify Qdrant connectivity
-- Try a broader search query
-
-### "Indexed Vectors: 0" in status
-
-This is normal right after indexing. Qdrant indexes vectors asynchronously. Wait a few seconds and check again.
-
-### Hook not running
-
-- Verify hook is in `~/.claude/settings.json`
-- Make sure `jacked` is on your PATH
-- Check Claude Code logs for hook errors
+```bash
+jacked backfill  # Index existing sessions first
+jacked status    # Verify connectivity
+```
 
 ### "jacked: command not found"
 
-The script is installed but not on PATH. Best fix:
 ```bash
-pipx install jacked
+pip install claude-jacked
+# Or ensure ~/.local/bin is on PATH
 ```
 
-This installs it globally and adds it to PATH automatically.
+### Agents not loading
 
-If you prefer pip, add the scripts directory to PATH:
-- Linux/Mac: `~/.local/bin`
-- Windows: `C:\Users\you\AppData\Roaming\Python\PythonXX\Scripts`
+Make sure files are in the right place:
+- Global: `~/.claude/agents/`
+- Project: `.claude/agents/` in your repo root
 
-## How It's Different From...
-
-### Claude's native `--resume`
-- Only works on the same machine
-- Requires the session file to exist locally
-- Jacked works cross-machine via Qdrant
-
-### Grep-ing through session files
-- Grep is keyword-based, Jacked is semantic
-- "implement auth" finds sessions about "user authentication" and "login flow"
-- No need to remember exact words you used
-
-### Manual copy-paste
-- Jacked automates the search → retrieve → inject flow
-- Context appears in your current conversation without switching windows
+---
 
 ## Development
 
 ```bash
-# Clone and install in dev mode
-git clone https://github.com/hank-ai/jacked
-cd jacked
+git clone https://github.com/jackneil/claude-jacked
+cd claude-jacked
 pip install -e ".[dev]"
-
-# Run tests
 pytest
-
-# Create .env for local testing
-echo "QDRANT_CLAUDE_SESSIONS_ENDPOINT=your-url" > .env
-echo "QDRANT_CLAUDE_SESSIONS_API_KEY=your-key" >> .env
 ```
 
-## Design Documentation
-
-For implementation details, architecture decisions, and lessons learned, see [docs/DESIGN.md](docs/DESIGN.md).
+---
 
 ## License
 
@@ -348,6 +295,6 @@ MIT
 
 ## Credits
 
-Built for use with [Claude Code](https://claude.ai/code) by Anthropic.
+Built for [Claude Code](https://claude.ai/code) by Anthropic.
 
-Uses [Qdrant](https://qdrant.tech/) for vector search and [Qdrant Cloud Inference](https://qdrant.tech/documentation/cloud/cloud-inference/) for server-side embedding.
+Uses [Qdrant](https://qdrant.tech/) for vector search.
