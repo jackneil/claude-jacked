@@ -5,23 +5,37 @@ Supercharge your Claude Code workflow with cross-machine session search, review 
 ## Install (Copy This Into Claude Code)
 
 ```
-Install claude-jacked for me. First detect my OS, then guide me through the full setup:
+Install claude-jacked for me. First check what's already set up, then help me with anything missing:
 
-1. Detect my operating system
-2. Check if I have Python 3.11+. If not, help me install miniconda and create a Python 3.11 environment.
-3. Check if I have pipx, install it if not (use Python 3.11)
-4. Run: pipx install claude-jacked
-5. Help me set up Qdrant Cloud (walk me through creating account at cloud.qdrant.io, getting credentials)
-6. Help me add environment variables to my shell profile:
-   - QDRANT_CLAUDE_SESSIONS_ENDPOINT (required)
-   - QDRANT_CLAUDE_SESSIONS_API_KEY (required)
-   - JACKED_USER_NAME (ask me what name I want to use for attribution)
-7. Run: jacked install
-8. Run: jacked backfill
-9. Verify with: jacked status && jacked configure --show
+DIAGNOSTIC PHASE (run these first to see current state):
+- Detect my operating system
+- Check if pipx is installed: pipx --version
+- Check if jacked CLI is installed: jacked --version (or on Windows: where jacked)
+- Check if Qdrant credentials are set: echo $QDRANT_CLAUDE_SESSIONS_ENDPOINT (bash) or echo %QDRANT_CLAUDE_SESSIONS_ENDPOINT% (cmd)
+- Check current config: jacked configure --show (if jacked exists)
+- Check if hook is installed: look in ~/.claude/settings.json for "jacked index"
+- Check indexed sessions: jacked status (if connected)
 
-Ask me if I'm setting this up for personal use or for a team sharing sessions.
+REPORT what's already configured vs what's missing before proceeding.
+
+SETUP PHASE (only do steps that are missing):
+1. If no Python 3.11+: help install miniconda
+2. If no pipx: pip install pipx && pipx ensurepath
+3. If jacked not installed: pipx install claude-jacked
+4. If no Qdrant credentials: walk me through cloud.qdrant.io setup
+5. If env vars missing: help add to shell profile (QDRANT_CLAUDE_SESSIONS_ENDPOINT, QDRANT_CLAUDE_SESSIONS_API_KEY, JACKED_USER_NAME)
+6. If hook/agents not installed: jacked install
+7. If no indexed sessions: jacked backfill
+
+VERIFY: jacked status && jacked configure --show
+
+Ask if this is personal use or team setup.
 If team: explain that everyone needs the same Qdrant cluster credentials.
+
+WINDOWS NOTES:
+- pipx installs jacked to: C:\Users\<user>\pipx\venvs\claude-jacked\Scripts\jacked.exe
+- If "jacked" isn't found, find it with: where jacked OR dir C:\Users\%USERNAME%\pipx\venvs\claude-jacked\Scripts\jacked.exe
+- In Git Bash, backslash paths get mangled. Use: cmd.exe /c "C:\full\path\to\jacked.exe <command>"
 ```
 
 ---
@@ -367,6 +381,39 @@ pipx install claude-jacked
 ```
 
 This installs globally so the hook can find it regardless of which env is active.
+
+### Windows: Path Issues in Git Bash
+
+Claude Code uses Git Bash on Windows, which mangles backslash paths. When you run `C:\Users\jack\.local\bin\jacked.exe`, bash turns it into garbage like `C:Usersjack.localbinjacked.exe`.
+
+**Where pipx installs jacked on Windows:**
+```
+C:\Users\<your-username>\pipx\venvs\claude-jacked\Scripts\jacked.exe
+```
+
+**Solutions:**
+
+1. **Use cmd.exe wrapper** (most reliable in Git Bash):
+   ```bash
+   cmd.exe /c "C:\Users\jack\pipx\venvs\claude-jacked\Scripts\jacked.exe status"
+   ```
+
+2. **Add Scripts folder to PATH** (one-time fix):
+   Add `C:\Users\<you>\pipx\venvs\claude-jacked\Scripts` to your Windows PATH environment variable.
+
+3. **Use forward slashes** (sometimes works):
+   ```bash
+   /c/Users/jack/pipx/venvs/claude-jacked/Scripts/jacked.exe status
+   ```
+
+**Finding where jacked is installed:**
+```cmd
+where jacked
+```
+or
+```cmd
+dir C:\Users\%USERNAME%\pipx\venvs\claude-jacked\Scripts\jacked.exe
+```
 
 ### Agents not loading
 
