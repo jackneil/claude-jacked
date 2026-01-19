@@ -5,7 +5,7 @@ This package provides tools to index, search, and retrieve context from past
 Claude Code sessions, enabling seamless context sharing across machines.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from jacked.config import SmartForkConfig
 from jacked.client import QdrantSessionClient
