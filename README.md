@@ -216,7 +216,7 @@ Installed automatically by `jacked install` to `~/.claude/skills/`.
 
 Claude searches your indexed sessions, shows matches, and lets you load relevant context.
 
-**Note:** This searches ALL your indexed sessions across every repo and machine. Results are ranked by semantic similarity, not filtered to the current repo. Use `jacked search "query" --repo /path/to/repo` if you want to filter to a specific project.
+**Note:** Searches all indexed sessions (yours + teammates if team setup). Results are ranked by: semantic match × ownership (yours first) × repo (current first) × recency. Use `--mine` for only your sessions.
 
 ---
 
@@ -225,13 +225,16 @@ Claude searches your indexed sessions, shows matches, and lets you load relevant
 ### Commands
 
 ```bash
-jacked search "query"              # Semantic search across sessions
-jacked search "query" --repo path  # Filter by repo
+jacked search "query"              # Semantic search with multi-factor ranking
+jacked search "query" --mine       # Only your sessions
+jacked search "query" --user sarah # Only this teammate's sessions
+jacked search "query" --repo path  # Boost results from this repo
 
 jacked list                        # List indexed sessions
 jacked list --repo myproject       # Filter by repo name
 
 jacked retrieve <session_id>       # Get full transcript
+jacked retrieve <id1> <id2>        # Get multiple transcripts
 jacked retrieve <id> --summary     # Get summary only
 
 jacked index /path/to/session.jsonl --repo /path  # Index specific session
@@ -240,8 +243,9 @@ jacked backfill --force            # Re-index everything
 
 jacked status                      # Check Qdrant connectivity
 jacked delete <session_id>         # Remove session from index
-jacked install                     # Install hook + skill
+jacked install                     # Install hook + skill + agents + commands
 jacked configure                   # Show config help
+jacked configure --show            # Show current config values
 ```
 
 ### How It Works
@@ -276,13 +280,30 @@ jacked configure                   # Show config help
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `QDRANT_CLAUDE_SESSIONS_ENDPOINT` | Yes | Qdrant Cloud cluster URL |
-| `QDRANT_CLAUDE_SESSIONS_API_KEY` | Yes | Qdrant API key |
-| `QDRANT_CLAUDE_SESSIONS_COLLECTION` | No | Collection name (default: `claude_sessions`) |
-| `CLAUDE_PROJECTS_DIR` | No | Override Claude projects dir (default: `~/.claude/projects`) |
-| `SMART_FORK_MACHINE_NAME` | No | Override machine name |
+**Required:**
+| Variable | Description |
+|----------|-------------|
+| `QDRANT_CLAUDE_SESSIONS_ENDPOINT` | Qdrant Cloud cluster URL |
+| `QDRANT_CLAUDE_SESSIONS_API_KEY` | Qdrant API key |
+
+**Identity (for team sharing):**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JACKED_USER_NAME` | git user.name | Your name for session attribution |
+| `SMART_FORK_MACHINE_NAME` | hostname | Override machine name |
+
+**Ranking weights:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JACKED_TEAMMATE_WEIGHT` | 0.8 | Multiplier for teammate sessions |
+| `JACKED_OTHER_REPO_WEIGHT` | 0.7 | Multiplier for other repos |
+| `JACKED_TIME_DECAY_HALFLIFE_WEEKS` | 35 | Weeks until session relevance halves |
+
+**Other:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QDRANT_CLAUDE_SESSIONS_COLLECTION` | `claude_sessions` | Collection name |
+| `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Claude projects directory |
 
 ### Hook Configuration
 
