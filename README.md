@@ -47,37 +47,31 @@ Don't have pipx? `pip install pipx && pipx ensurepath`
 
 **Why not regular pip?** If you `pip install` into a conda env or virtualenv, the `jacked` command only works when that env is active. Claude Code hooks run in a fresh shell without your env activated → `jacked: command not found`. pipx avoids this by installing to an isolated global location that's always on PATH.
 
-### Copy Agents/Commands/Skills to Your Claude Config
+### Install Everything
 
 ```bash
-# Clone the repo to get the agent/command/skill files
-git clone https://github.com/jackneil/claude-jacked
-cd claude-jacked
-
-# Copy to your global Claude config (or a specific project)
-cp -r agents/* ~/.claude/agents/
-cp -r commands/* ~/.claude/commands/
-cp -r skills/* ~/.claude/skills/
+jacked install
 ```
 
-### Set Up Jacked (Session Search)
+This copies all agents, commands, and skills to `~/.claude/` and adds the auto-index hook. Restart Claude Code after running this.
 
-If you want cross-machine session search, you'll need Qdrant Cloud:
+### (Optional) Set Up Cross-Machine Session Search
+
+If you want semantic search across sessions from any machine, you need Qdrant Cloud:
 
 1. Sign up at [cloud.qdrant.io](https://cloud.qdrant.io) (requires paid tier ~$30/mo for server-side embedding)
 2. Create a cluster and get your URL + API key
-3. Configure environment:
+3. Add to your shell profile:
 
 ```bash
 export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
 export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
 ```
 
-4. Install the hook and backfill existing sessions:
+4. Index existing sessions:
 
 ```bash
-jacked install   # Adds auto-index hook to Claude
-jacked backfill  # Index all existing sessions
+jacked backfill
 ```
 
 5. Verify:
@@ -86,6 +80,8 @@ jacked backfill  # Index all existing sessions
 jacked status
 jacked search "something you worked on"
 ```
+
+**Note:** The agents and commands work without Qdrant. Only the `/jacked` skill and CLI search features need it.
 
 ---
 
