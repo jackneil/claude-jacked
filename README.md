@@ -5,17 +5,19 @@ Supercharge your Claude Code workflow with cross-machine session search, review 
 ## Install (Copy This Into Claude Code)
 
 ```
-Install claude-jacked for me. Guide me through the full setup:
+Install claude-jacked for me. First detect my OS, then guide me through the full setup:
 
-1. Check if I have pipx, install it if not
-2. Run: pipx install claude-jacked
-3. Help me set up Qdrant Cloud (walk me through creating account at cloud.qdrant.io, getting credentials)
-4. Help me add QDRANT_CLAUDE_SESSIONS_ENDPOINT and QDRANT_CLAUDE_SESSIONS_API_KEY to my shell profile
-5. Run: jacked install
-6. Run: jacked backfill
-7. Verify with: jacked status
+1. Detect my operating system
+2. Check if I have Python 3.11+. If not, help me install miniconda and create a Python 3.11 environment.
+3. Check if I have pipx, install it if not (use Python 3.11)
+4. Run: pipx install claude-jacked
+5. Help me set up Qdrant Cloud (walk me through creating account at cloud.qdrant.io, getting credentials)
+6. Help me add QDRANT_CLAUDE_SESSIONS_ENDPOINT and QDRANT_CLAUDE_SESSIONS_API_KEY to my shell profile
+7. Run: jacked install
+8. Run: jacked backfill
+9. Verify with: jacked status
 
-Ask me questions as needed. I'm on [Windows/Mac/Linux - edit this].
+Ask me questions as needed.
 ```
 
 ---
