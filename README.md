@@ -3,7 +3,7 @@
 A collection of agents, commands, skills, and tools to supercharge your Claude Code workflow.
 
 ```bash
-pip install claude-jacked
+pipx install claude-jacked
 ```
 
 ## What's In Here
@@ -35,11 +35,17 @@ The goal: never lose useful context, never repeat solved problems, catch issues 
 
 ## Quick Start
 
-### Install the Package
+### Install the CLI
+
+**Use pipx** (recommended - installs globally, always on PATH):
 
 ```bash
-pip install claude-jacked
+pipx install claude-jacked
 ```
+
+Don't have pipx? `pip install pipx && pipx ensurepath`
+
+**Why not regular pip?** If you `pip install` into a conda env or virtualenv, the `jacked` command only works when that env is active. Claude Code hooks run in a fresh shell without your env activated → `jacked: command not found`. pipx avoids this by installing to an isolated global location that's always on PATH.
 
 ### Copy Agents/Commands/Skills to Your Claude Config
 
@@ -265,10 +271,13 @@ jacked status    # Verify connectivity
 
 ### "jacked: command not found"
 
+You probably installed with `pip` into a virtualenv/conda env that isn't active. Fix:
+
 ```bash
-pip install claude-jacked
-# Or ensure ~/.local/bin is on PATH
+pipx install claude-jacked
 ```
+
+This installs globally so the hook can find it regardless of which env is active.
 
 ### Agents not loading
 
