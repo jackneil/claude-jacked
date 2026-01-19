@@ -3,7 +3,7 @@
 import os
 import pytest
 
-from smart_fork.config import (
+from jacked.config import (
     SmartForkConfig,
     get_repo_id,
     get_repo_name,
@@ -99,6 +99,8 @@ class TestSmartForkConfig:
 
     def test_from_env_missing_endpoint(self, monkeypatch):
         """Should raise error if endpoint missing."""
+        # Mock load_dotenv to prevent it from loading .env file
+        monkeypatch.setattr("jacked.config.load_dotenv", lambda *args, **kwargs: None)
         monkeypatch.delenv("QDRANT_CLAUDE_SESSIONS_ENDPOINT", raising=False)
         monkeypatch.setenv("QDRANT_CLAUDE_SESSIONS_API_KEY", "test-key")
 
@@ -107,6 +109,8 @@ class TestSmartForkConfig:
 
     def test_from_env_missing_api_key(self, monkeypatch):
         """Should raise error if API key missing."""
+        # Mock load_dotenv to prevent it from loading .env file
+        monkeypatch.setattr("jacked.config.load_dotenv", lambda *args, **kwargs: None)
         monkeypatch.setenv("QDRANT_CLAUDE_SESSIONS_ENDPOINT", "https://test.qdrant.io")
         monkeypatch.delenv("QDRANT_CLAUDE_SESSIONS_API_KEY", raising=False)
 

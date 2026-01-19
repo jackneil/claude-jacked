@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from smart_fork.transcript import (
+from jacked.transcript import (
     parse_jsonl_file,
     chunk_text,
     chunk_intent_text,
