@@ -4,17 +4,24 @@ Supercharge your Claude Code workflow with cross-machine session search, review 
 
 ## Install (Copy This Into Claude Code)
 
+> 📋 [View on GitHub](https://github.com/jackneil/claude-jacked#install-copy-this-into-claude-code) for copy button
+
 ```
 Install claude-jacked for me. First check what's already set up, then help me with anything missing:
 
 DIAGNOSTIC PHASE (run these first to see current state):
 - Detect my operating system
-- Check if pipx is installed: pipx --version
+- Check if pipx is installed: pipx --version (or: python -m pipx --version)
 - Check if jacked CLI is installed: jacked --version (or on Windows: where jacked)
-- Check if Qdrant credentials are set: echo $QDRANT_CLAUDE_SESSIONS_ENDPOINT (bash) or echo %QDRANT_CLAUDE_SESSIONS_ENDPOINT% (cmd)
-- Check current config: jacked configure --show (if jacked exists)
+- Check if Qdrant credentials are set in current shell: echo $QDRANT_CLAUDE_SESSIONS_ENDPOINT
 - Check if hook is installed: look in ~/.claude/settings.json for "jacked index"
-- Check indexed sessions: jacked status (if connected)
+- If jacked exists and env vars visible: jacked status && jacked configure --show
+
+WINDOWS EXTRA CHECK (Git Bash doesn't inherit Windows System Environment):
+- If env vars NOT visible in bash, check Windows System Environment:
+  powershell.exe -Command "[System.Environment]::GetEnvironmentVariable('QDRANT_CLAUDE_SESSIONS_ENDPOINT', 'Machine')"
+  powershell.exe -Command "[System.Environment]::GetEnvironmentVariable('QDRANT_CLAUDE_SESSIONS_ENDPOINT', 'User')"
+- If vars exist in Windows but not bash: they need to be added to ~/.bashrc
 
 REPORT what's already configured vs what's missing before proceeding.
 
@@ -22,10 +29,11 @@ SETUP PHASE (only do steps that are missing):
 1. If no Python 3.11+: help install miniconda
 2. If no pipx: pip install pipx && pipx ensurepath
 3. If jacked not installed: pipx install claude-jacked
-4. If no Qdrant credentials: walk me through cloud.qdrant.io setup
-5. If env vars missing: help add to shell profile (QDRANT_CLAUDE_SESSIONS_ENDPOINT, QDRANT_CLAUDE_SESSIONS_API_KEY, JACKED_USER_NAME)
-6. If hook/agents not installed: jacked install
-7. If no indexed sessions: jacked backfill
+4. If no Qdrant credentials anywhere: walk me through cloud.qdrant.io setup
+5. If env vars in Windows but not bash: add export lines to ~/.bashrc, then source it
+6. If env vars missing entirely: help add to shell profile
+7. If hook/agents not installed: jacked install
+8. If no indexed sessions: jacked backfill
 
 VERIFY: jacked status && jacked configure --show
 
@@ -33,9 +41,11 @@ Ask if this is personal use or team setup.
 If team: explain that everyone needs the same Qdrant cluster credentials.
 
 WINDOWS NOTES:
+- Claude Code uses Git Bash, which does NOT inherit Windows System Environment variables
+- If you set env vars in Windows Settings, you ALSO need them in ~/.bashrc for Git Bash
 - pipx installs jacked to: C:\Users\<user>\pipx\venvs\claude-jacked\Scripts\jacked.exe
-- If "jacked" isn't found, find it with: where jacked OR dir C:\Users\%USERNAME%\pipx\venvs\claude-jacked\Scripts\jacked.exe
-- In Git Bash, backslash paths get mangled. Use: cmd.exe /c "C:\full\path\to\jacked.exe <command>"
+- If "jacked" isn't found, find it with: where jacked OR ls /c/Users/$USER/pipx/venvs/claude-jacked/Scripts/
+- In Git Bash, backslash paths get mangled. Use forward slashes: /c/Users/...
 ```
 
 ---
