@@ -47,17 +47,9 @@ Don't have pipx? `pip install pipx && pipx ensurepath`
 
 **Why not regular pip?** If you `pip install` into a conda env or virtualenv, the `jacked` command only works when that env is active. Claude Code hooks run in a fresh shell without your env activated → `jacked: command not found`. pipx avoids this by installing to an isolated global location that's always on PATH.
 
-### Install Everything
+### Set Up Qdrant Cloud
 
-```bash
-jacked install
-```
-
-This copies all agents, commands, and skills to `~/.claude/` and adds the auto-index hook. Restart Claude Code after running this.
-
-### (Optional) Set Up Cross-Machine Session Search
-
-If you want semantic search across sessions from any machine, you need Qdrant Cloud:
+The session search features require Qdrant Cloud for vector storage and embedding:
 
 1. Sign up at [cloud.qdrant.io](https://cloud.qdrant.io) (requires paid tier ~$30/mo for server-side embedding)
 2. Create a cluster and get your URL + API key
@@ -68,20 +60,29 @@ export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
 export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
 ```
 
-4. Index existing sessions:
+### Install Everything
 
 ```bash
-jacked backfill
+jacked install
 ```
 
-5. Verify:
+This installs:
+- All agents to `~/.claude/agents/`
+- All commands to `~/.claude/commands/`
+- The `/jacked` skill to `~/.claude/skills/`
+- Auto-index hook (indexes sessions after every Claude response)
+
+Restart Claude Code after running this.
+
+### Index Your Sessions
 
 ```bash
-jacked status
-jacked search "something you worked on"
+jacked backfill        # Index all existing sessions
+jacked status          # Verify it's working
+jacked search "something you worked on before"
 ```
 
-**Note:** The agents and commands work without Qdrant. Only the `/jacked` skill and CLI search features need it.
+**Note:** If you only want the agents and commands (not the session search), you can manually copy just those files from the repo without setting up Qdrant. But the main `jacked` functionality requires it.
 
 ---
 
