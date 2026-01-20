@@ -2,6 +2,13 @@
 Session indexing for Jacked.
 
 Handles parsing Claude sessions and upserting to Qdrant with server-side embedding.
+
+Content types indexed:
+- plan: Full implementation strategy from ~/.claude/plans/{slug}.md
+- subagent_summary: Rich summaries from subagent outputs
+- summary_label: Tiny chapter titles from compaction events
+- user_message: First few user messages for intent matching
+- chunk: Full transcript chunks for full retrieval mode
 """
 
 import logging
@@ -20,10 +27,9 @@ from jacked.config import (
 )
 from jacked.client import QdrantSessionClient, INFERENCE_MODEL
 from jacked.transcript import (
-    parse_jsonl_file,
+    parse_jsonl_file_enriched,
     chunk_text,
-    chunk_intent_text,
-    ParsedTranscript,
+    EnrichedTranscript,
 )
 
 
@@ -34,9 +40,12 @@ class SessionIndexer:
     """
     Indexes Claude sessions to Qdrant using server-side embedding.
 
-    Creates two types of points for each session:
-    - Intent points: User messages for semantic search
-    - Chunk points: Full transcript chunks for retrieval
+    Creates multiple content types for each session:
+    - plan: Full implementation strategy (gold - highest priority)
+    - subagent_summary: Rich summaries from agent outputs (gold)
+    - summary_label: Tiny chapter titles from compaction
+    - user_message: First few user messages for intent matching
+    - chunk: Full transcript chunks for full retrieval mode
 
     Qdrant Cloud Inference handles all embedding server-side.
 
@@ -68,7 +77,7 @@ class SessionIndexer:
         force: bool = False,
     ) -> dict:
         """
-        Index a single session to Qdrant.
+        Index a single session to Qdrant with all content types.
 
         Args:
             session_path: Path to the .jsonl session file
@@ -80,8 +89,11 @@ class SessionIndexer:
             - session_id: The session ID
             - indexed: Whether the session was indexed
             - skipped: Whether it was skipped (unchanged)
-            - intent_chunks: Number of intent chunks created
-            - transcript_chunks: Number of transcript chunks created
+            - plans: Number of plan points (0 or 1)
+            - subagent_summaries: Number of subagent summary points
+            - summary_labels: Number of summary label points
+            - user_messages: Number of user message points
+            - chunks: Number of transcript chunk points
             - error: Error message if failed
 
         Examples:
@@ -92,8 +104,11 @@ class SessionIndexer:
             "session_id": session_path.stem,
             "indexed": False,
             "skipped": False,
-            "intent_chunks": 0,
-            "transcript_chunks": 0,
+            "plans": 0,
+            "subagent_summaries": 0,
+            "summary_labels": 0,
+            "user_messages": 0,
+            "chunks": 0,
             "error": None,
         }
 
@@ -101,8 +116,8 @@ class SessionIndexer:
             # Ensure collection exists
             self.client.ensure_collection()
 
-            # Parse the transcript
-            transcript = parse_jsonl_file(session_path)
+            # Parse the transcript with enriched data
+            transcript = parse_jsonl_file_enriched(session_path)
             result["session_id"] = transcript.session_id
 
             # Check if we should skip (unchanged)
@@ -114,7 +129,7 @@ class SessionIndexer:
                     result["skipped"] = True
                     return result
 
-            # Build points
+            # Build points for all content types
             points = self._build_points(transcript, repo_path)
 
             if not points:
@@ -128,19 +143,29 @@ class SessionIndexer:
             # Upsert new points
             self.client.upsert_points(points)
 
-            # Count results
+            # Count results by content_type
             result["indexed"] = True
             for p in points:
                 payload = p.payload or {}
-                if payload.get("type") == "intent":
-                    result["intent_chunks"] += 1
-                elif payload.get("type") == "chunk":
-                    result["transcript_chunks"] += 1
+                content_type = payload.get("content_type", payload.get("type"))
+                if content_type == "plan":
+                    result["plans"] += 1
+                elif content_type == "subagent_summary":
+                    result["subagent_summaries"] += 1
+                elif content_type == "summary_label":
+                    result["summary_labels"] += 1
+                elif content_type == "user_message":
+                    result["user_messages"] += 1
+                elif content_type == "chunk":
+                    result["chunks"] += 1
 
             logger.info(
                 f"Indexed session {transcript.session_id}: "
-                f"{result['intent_chunks']} intent chunks, "
-                f"{result['transcript_chunks']} transcript chunks"
+                f"{result['plans']} plan, "
+                f"{result['subagent_summaries']} agent summaries, "
+                f"{result['summary_labels']} labels, "
+                f"{result['user_messages']} user msgs, "
+                f"{result['chunks']} chunks"
             )
 
             return result
@@ -160,25 +185,43 @@ class SessionIndexer:
         Returns:
             Content hash string or None if not found
         """
-        # Look for the first intent point using deterministic UUID
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{session_id}_intent_0"))
+        # Look for the first user_message point using deterministic UUID
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{session_id}:user_message:0"))
         point = self.client.get_point_by_id(point_id)
         if point and point.payload:
             return point.payload.get("content_hash")
         return None
 
+    def _make_point_id(self, session_id: str, content_type: str, index: int) -> str:
+        """Generate deterministic point ID.
+
+        Args:
+            session_id: The session UUID
+            content_type: One of plan, subagent_summary, summary_label, user_message, chunk
+            index: Index within that content type
+
+        Returns:
+            UUID5 string for the point
+        """
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{session_id}:{content_type}:{index}"))
+
     def _build_points(
         self,
-        transcript: ParsedTranscript,
+        transcript: EnrichedTranscript,
         repo_path: str,
     ) -> list[models.PointStruct]:
         """
-        Build Qdrant points for a transcript.
+        Build Qdrant points for all content types in a transcript.
 
-        Uses models.Document for server-side embedding via Qdrant Cloud Inference.
+        Creates points for:
+        - plan: Full implementation strategy (if exists)
+        - subagent_summary: Rich summaries from agent outputs
+        - summary_label: Tiny chapter titles from compaction
+        - user_message: First few user messages for intent matching
+        - chunk: Full transcript chunks for full retrieval
 
         Args:
-            transcript: Parsed transcript
+            transcript: EnrichedTranscript with all extracted data
             repo_path: Full path to the repository
 
         Returns:
@@ -194,74 +237,131 @@ class SessionIndexer:
             else datetime.now().isoformat()
         )
 
-        # Build intent points (user messages for semantic search)
-        intent_chunks = chunk_intent_text(
-            transcript.intent_text,
-            max_tokens=self.config.intent_max_tokens,
-        )
+        # Base payload for all points
+        base_payload = {
+            "repo_id": repo_id,
+            "repo_name": repo_name,
+            "repo_path": repo_path,
+            "session_id": transcript.session_id,
+            "user_name": self.config.user_name,
+            "machine": self.config.machine_name,
+            "timestamp": timestamp_str,
+            "content_hash": full_hash,
+            "slug": transcript.slug,
+        }
 
-        # Get total transcript chunks for metadata
+        # 1. Plan file (gold - highest priority)
+        if transcript.plan:
+            point_id = self._make_point_id(transcript.session_id, "plan", 0)
+            points.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=models.Document(
+                        text=transcript.plan.content[:8000],  # Limit for embedding
+                        model=INFERENCE_MODEL,
+                    ),
+                    payload={
+                        **base_payload,
+                        "type": "plan",  # Keep for backwards compat
+                        "content_type": "plan",
+                        "content": transcript.plan.content,
+                        "plan_path": str(transcript.plan.path),
+                    },
+                )
+            )
+
+        # 2. Subagent summaries (gold)
+        for i, agent_summary in enumerate(transcript.agent_summaries):
+            point_id = self._make_point_id(transcript.session_id, "subagent_summary", i)
+            points.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=models.Document(
+                        text=agent_summary.summary_text[:8000],  # Limit for embedding
+                        model=INFERENCE_MODEL,
+                    ),
+                    payload={
+                        **base_payload,
+                        "type": "subagent_summary",
+                        "content_type": "subagent_summary",
+                        "content": agent_summary.summary_text,
+                        "agent_id": agent_summary.agent_id,
+                        "agent_type": agent_summary.agent_type,
+                        "chunk_index": i,
+                    },
+                )
+            )
+
+        # 3. Summary labels (chapter titles from compaction)
+        for i, label in enumerate(transcript.summary_labels):
+            point_id = self._make_point_id(transcript.session_id, "summary_label", i)
+            points.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=models.Document(
+                        text=label.label,
+                        model=INFERENCE_MODEL,
+                    ),
+                    payload={
+                        **base_payload,
+                        "type": "summary_label",
+                        "content_type": "summary_label",
+                        "content": label.label,
+                        "leaf_uuid": label.leaf_uuid,
+                        "chunk_index": i,
+                    },
+                )
+            )
+
+        # 4. User messages (first 5 for intent matching)
+        max_user_messages = 5
+        for i, msg in enumerate(transcript.user_messages[:max_user_messages]):
+            if not msg.content or len(msg.content) < 20:
+                continue
+            point_id = self._make_point_id(transcript.session_id, "user_message", i)
+            points.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=models.Document(
+                        text=msg.content[:2000],  # Limit for embedding
+                        model=INFERENCE_MODEL,
+                    ),
+                    payload={
+                        **base_payload,
+                        "type": "user_message",
+                        "content_type": "user_message",
+                        "content": msg.content,
+                        "chunk_index": i,
+                    },
+                )
+            )
+
+        # 5. Transcript chunks (for full retrieval mode)
         transcript_chunks = chunk_text(
             transcript.full_text,
             chunk_size=self.config.chunk_size,
             overlap=self.config.chunk_overlap,
         )
 
-        # Create intent points with Document for server-side embedding
-        for i, chunk in enumerate(intent_chunks):
-            if not chunk.strip():
-                continue
-
-            # Generate deterministic UUID from session_id + type + index
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{transcript.session_id}_intent_{i}"))
-            points.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=models.Document(
-                        text=chunk,
-                        model=INFERENCE_MODEL,
-                    ),
-                    payload={
-                        "type": "intent",
-                        "repo_id": repo_id,
-                        "repo_name": repo_name,
-                        "repo_path": repo_path,
-                        "session_id": transcript.session_id,
-                        "user_name": self.config.user_name,
-                        "machine": self.config.machine_name,
-                        "timestamp": timestamp_str,
-                        "content_hash": full_hash,
-                        "intent_text": chunk,
-                        "chunk_index": i,
-                        "total_chunks": len(intent_chunks),
-                        "transcript_chunk_count": len(transcript_chunks),
-                    },
-                )
-            )
-
-        # Create transcript chunk points for retrieval
         for i, chunk in enumerate(transcript_chunks):
             if not chunk.strip():
                 continue
 
-            # Generate deterministic UUID from session_id + type + index
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{transcript.session_id}_chunk_{i}"))
+            point_id = self._make_point_id(transcript.session_id, "chunk", i)
             points.append(
                 models.PointStruct(
                     id=point_id,
                     vector=models.Document(
-                        text=chunk,
+                        text=chunk[:4000],  # Limit for embedding
                         model=INFERENCE_MODEL,
                     ),
                     payload={
+                        **base_payload,
                         "type": "chunk",
-                        "repo_id": repo_id,
-                        "repo_name": repo_name,
-                        "session_id": transcript.session_id,
-                        "user_name": self.config.user_name,
+                        "content_type": "chunk",
+                        "content": chunk,
                         "chunk_index": i,
                         "total_chunks": len(transcript_chunks),
-                        "content": chunk,
                     },
                 )
             )

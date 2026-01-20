@@ -284,13 +284,16 @@ jacked search "query"              # Semantic search with multi-factor ranking
 jacked search "query" --mine       # Only your sessions
 jacked search "query" --user sarah # Only this teammate's sessions
 jacked search "query" --repo path  # Boost results from this repo
+jacked search "query" --type chunk # Search full transcript chunks only
 
-jacked list                        # List indexed sessions
-jacked list --repo myproject       # Filter by repo name
+jacked sessions                        # List indexed sessions
+jacked sessions --repo myproject       # Filter by repo name
 
-jacked retrieve <session_id>       # Get full transcript
-jacked retrieve <id1> <id2>        # Get multiple transcripts
-jacked retrieve <id> --summary     # Get summary only
+jacked retrieve <session_id>       # Smart mode: plan + summaries + labels
+jacked retrieve <id> --mode full   # Get full transcript (huge)
+jacked retrieve <id> --mode plan   # Just the plan file
+jacked retrieve <id> --mode agents # Just subagent summaries
+jacked retrieve <id> --mode labels # Just summary labels (tiny)
 
 jacked index /path/to/session.jsonl --repo /path  # Index specific session
 jacked backfill                    # Index all existing sessions
@@ -298,8 +301,11 @@ jacked backfill --force            # Re-index everything
 
 jacked status                      # Check Qdrant connectivity
 jacked delete <session_id>         # Remove session from index
+jacked cleardb                     # Delete all YOUR indexed data (requires confirmation)
 jacked install                     # Install hook + skill + agents + commands
+jacked install --sounds            # Also install sound notification hooks
 jacked uninstall                   # Remove hook + skill + agents + commands
+jacked uninstall --sounds          # Remove only sound hooks
 jacked configure                   # Show config help
 jacked configure --show            # Show current config values
 ```
@@ -328,6 +334,44 @@ jacked configure --show            # Show current config values
 │  • Vectors + full transcripts stored                        │
 │  • Accessible from any machine                              │
 └─────────────────────────────────────────────────────────────┘
+```
+
+### Smart Retrieval (v0.2.6+)
+
+Sessions are indexed with multiple content types for efficient retrieval:
+
+| Content Type | What It Contains | Token Cost |
+|--------------|------------------|------------|
+| `plan` | Full implementation strategy from plan files | ~500-2K |
+| `subagent_summary` | Rich summaries from exploration/planning agents | ~200-500 each |
+| `summary_label` | Tiny chapter titles from auto-compaction | ~10-20 each |
+| `user_message` | First 5 user messages for intent matching | ~100-500 each |
+| `chunk` | Full transcript chunks (legacy) | ~2K each |
+
+**Retrieval Modes:**
+
+| Mode | What's Included | When to Use |
+|------|-----------------|-------------|
+| `smart` | Plan + agent summaries + labels + user msgs | Default - best balance (~5-10K tokens) |
+| `plan` | Just the plan file | Quick strategic overview |
+| `labels` | Just summary labels | Quick topic check (tiny) |
+| `agents` | All subagent summaries | Deep dive into exploration results |
+| `full` | Everything including transcript | Need full details (50-200K tokens - use sparingly!) |
+
+**Why smart mode?** Full transcripts can be 50-200K tokens, which blows up your context window. Smart mode returns the highest-value content (~5-10K tokens) so you get the key decisions and plans without the bloat.
+
+**Staleness warnings:** When loading old context, you'll see warnings based on age:
+- 7-30 days: "Code may have changed since this session"
+- 30-90 days: "Treat as starting point for WHERE to look, not WHAT to do"
+- 90+ days: "Historical reference only - verify everything"
+
+### Re-indexing After Upgrade
+
+If you upgraded from a version before v0.2.6, your existing sessions are indexed as full transcript chunks only. To get smart retrieval:
+
+```bash
+jacked cleardb   # Wipes YOUR data (not teammates), requires typing "DELETE MY DATA"
+jacked backfill  # Re-index with new content types
 ```
 
 ---
@@ -379,6 +423,25 @@ The `jacked install` command adds this to `~/.claude/settings.json`:
 }
 ```
 
+### Sound Notifications
+
+Add audio feedback when Claude needs attention or completes a task:
+
+```bash
+jacked install --sounds
+```
+
+This adds hooks that play:
+- **Notification sound** when Claude requests user input
+- **Completion sound** when Claude finishes a task
+
+Works on Windows (PowerShell), macOS (afplay), Linux (paplay), and WSL. Falls back to terminal bell on unsupported systems.
+
+To remove only sound hooks (keep everything else):
+```bash
+jacked uninstall --sounds
+```
+
 ---
 
 ## Security Warning
@@ -393,6 +456,8 @@ Recommendations:
 - Don't paste API keys/passwords in Claude sessions
 - Keep your Qdrant API key secure
 - Consider self-hosting Qdrant for sensitive work
+
+**Data isolation:** The `cleardb` command only deletes data belonging to the current user (based on `JACKED_USER_NAME`). Teammates' data is unaffected.
 
 ---
 

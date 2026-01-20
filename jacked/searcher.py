@@ -3,17 +3,33 @@ Session searching for Jacked.
 
 Handles semantic search across indexed sessions using Qdrant Cloud Inference.
 Implements multi-factor ranking: ownership, repo, recency, and semantic similarity.
+
+Supports filtering by content_type:
+- plan: Full implementation strategy (gold)
+- subagent_summary: Rich summaries from agent outputs (gold)
+- summary_label: Tiny chapter titles from compaction
+- user_message: User messages for intent matching
+- chunk: Full transcript chunks
 """
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 from collections import defaultdict
 
 from jacked.config import SmartForkConfig, get_repo_id
 from jacked.client import QdrantSessionClient
+
+
+# Default content types for search (high-value content)
+DEFAULT_SEARCH_CONTENT_TYPES = [
+    "plan",
+    "subagent_summary",
+    "summary_label",
+    "user_message",
+]
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +53,9 @@ class SearchResult:
         is_current_repo: Whether this is from the current repo
         intent_preview: Preview of the matched intent text
         chunk_count: Number of transcript chunks stored
+        has_plan: Whether this session has a plan file indexed
+        has_agent_summaries: Whether this session has agent summaries
+        content_types_found: Set of content types found in this session
     """
     session_id: str
     repo_name: str
@@ -50,13 +69,23 @@ class SearchResult:
     is_current_repo: bool
     intent_preview: str
     chunk_count: int
+    has_plan: bool = False
+    has_agent_summaries: bool = False
+    content_types_found: set = field(default_factory=set)
 
     def __str__(self) -> str:
         """Format result for display."""
         ts_str = self.timestamp.strftime("%Y-%m-%d") if self.timestamp else "unknown"
         owner = "YOU" if self.is_own else f"@{self.user_name}"
+        # Add indicators for rich content
+        indicators = []
+        if self.has_plan:
+            indicators.append("📋")
+        if self.has_agent_summaries:
+            indicators.append("🤖")
+        indicator_str = " ".join(indicators)
         return (
-            f"[{self.score:.0f}%] {owner} - {self.repo_name} - {ts_str}\n"
+            f"[{self.score:.0f}%] {owner} - {self.repo_name} - {ts_str} {indicator_str}\n"
             f"      {self.intent_preview[:80]}..."
         )
 
@@ -96,6 +125,7 @@ class SessionSearcher:
         min_score: float = 0.3,
         mine_only: bool = False,
         user_filter: Optional[str] = None,
+        content_types: Optional[list[str]] = None,
     ) -> list[SearchResult]:
         """
         Search for sessions similar to the query with multi-factor ranking.
@@ -113,6 +143,8 @@ class SessionSearcher:
             min_score: Minimum cosine similarity score (0-1)
             mine_only: If True, only return current user's sessions
             user_filter: If set, only return sessions from this user
+            content_types: Content types to search (default: plan, subagent_summary,
+                          summary_label, user_message). Use ["chunk"] for full-text search.
 
         Returns:
             List of SearchResult objects, sorted by multi-factor relevance
@@ -126,18 +158,31 @@ class SessionSearcher:
         current_repo_id = get_repo_id(repo_path) if repo_path else None
         current_user = self.config.user_name
 
-        # Search for intent points using server-side embedding
+        # Default to high-value content types
+        if content_types is None:
+            content_types = DEFAULT_SEARCH_CONTENT_TYPES
+
+        # Build user filter for Qdrant (more efficient than post-filter)
+        qdrant_user_filter = None
+        if mine_only:
+            qdrant_user_filter = current_user
+        elif user_filter:
+            qdrant_user_filter = user_filter
+
+        # Search using content_types filter
         # Get more results than needed since we'll aggregate and re-rank
         raw_results = self.client.search(
             query_text=query,
             repo_id=None,  # Don't filter in Qdrant, we'll boost instead
-            point_type="intent",
+            content_types=content_types,
+            user_name=qdrant_user_filter,
             limit=limit * 10,  # Get extra for aggregation and filtering
         )
 
-        # Aggregate by session (multiple intent chunks per session)
+        # Aggregate by session (multiple points per session)
         session_scores: dict[str, list[float]] = defaultdict(list)
         session_data: dict[str, dict] = {}
+        session_content_types: dict[str, set] = defaultdict(set)
 
         for result in raw_results:
             if result.score < min_score:
@@ -146,17 +191,13 @@ class SessionSearcher:
             payload = result.payload or {}
             session_id = payload.get("session_id")
             session_user = payload.get("user_name", "unknown")
+            content_type = payload.get("content_type", payload.get("type", ""))
 
             if not session_id:
                 continue
 
-            # Apply filters
-            if mine_only and session_user != current_user:
-                continue
-            if user_filter and session_user != user_filter:
-                continue
-
             session_scores[session_id].append(result.score)
+            session_content_types[session_id].add(content_type)
 
             # Keep the best payload data (highest score)
             if session_id not in session_data or result.score > max(session_scores[session_id][:-1], default=0):
@@ -168,6 +209,7 @@ class SessionSearcher:
             # Use max score for semantic ranking (best match in session)
             semantic_score = max(scores)
             payload = session_data[session_id]
+            found_types = session_content_types[session_id]
 
             # Parse timestamp
             timestamp = None
@@ -192,6 +234,9 @@ class SessionSearcher:
                 timestamp=timestamp,
             )
 
+            # Get preview text - prefer content field over intent_text
+            preview = payload.get("content", payload.get("intent_text", ""))[:200]
+
             results.append(
                 SearchResult(
                     session_id=session_id,
@@ -204,8 +249,11 @@ class SessionSearcher:
                     semantic_score=semantic_score * 100,
                     is_own=is_own,
                     is_current_repo=is_current_repo,
-                    intent_preview=payload.get("intent_text", "")[:200],
-                    chunk_count=payload.get("transcript_chunk_count", 0),
+                    intent_preview=preview,
+                    chunk_count=payload.get("total_chunks", 0),
+                    has_plan="plan" in found_types,
+                    has_agent_summaries="subagent_summary" in found_types,
+                    content_types_found=found_types,
                 )
             )
 

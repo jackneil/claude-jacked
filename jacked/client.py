@@ -116,6 +116,16 @@ class QdrantSessionClient:
                 field_name="machine",
                 field_schema=models.PayloadSchemaType.KEYWORD,
             )
+            self.client.create_payload_index(
+                collection_name=collection_name,
+                field_name="user_name",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+            self.client.create_payload_index(
+                collection_name=collection_name,
+                field_name="content_type",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
 
             logger.info(f"Collection '{collection_name}' created successfully")
             return True
@@ -182,11 +192,97 @@ class QdrantSessionClient:
             logger.error(f"Failed to delete session {session_id}: {e}")
             raise
 
+    def delete_by_user(self, user_name: str) -> int:
+        """
+        Delete all points for a specific user.
+
+        Args:
+            user_name: User name to delete data for
+
+        Returns:
+            Number of points deleted
+
+        Examples:
+            >>> client.delete_by_user("jack")  # doctest: +SKIP
+            42
+        """
+        try:
+            # First count points to delete
+            count_result = self.client.count(
+                collection_name=self.config.collection_name,
+                count_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="user_name",
+                            match=models.MatchValue(value=user_name),
+                        )
+                    ]
+                ),
+            )
+            count = count_result.count
+
+            if count == 0:
+                logger.info(f"No points found for user {user_name}")
+                return 0
+
+            # Delete all points for this user
+            self.client.delete(
+                collection_name=self.config.collection_name,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="user_name",
+                                match=models.MatchValue(value=user_name),
+                            )
+                        ]
+                    )
+                ),
+            )
+            logger.info(f"Deleted {count} points for user {user_name}")
+            return count
+        except UnexpectedResponse as e:
+            logger.error(f"Failed to delete data for user {user_name}: {e}")
+            raise
+
+    def count_by_user(self, user_name: str) -> int:
+        """
+        Count points for a specific user.
+
+        Args:
+            user_name: User name to count
+
+        Returns:
+            Number of points
+
+        Examples:
+            >>> client.count_by_user("jack")  # doctest: +SKIP
+            42
+        """
+        try:
+            result = self.client.count(
+                collection_name=self.config.collection_name,
+                count_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="user_name",
+                            match=models.MatchValue(value=user_name),
+                        )
+                    ]
+                ),
+            )
+            return result.count
+        except UnexpectedResponse as e:
+            logger.error(f"Failed to count for user {user_name}: {e}")
+            raise
+
     def search(
         self,
         query_text: str,
         repo_id: Optional[str] = None,
         point_type: Optional[str] = None,
+        content_types: Optional[list[str]] = None,
+        user_name: Optional[str] = None,
         limit: int = 10,
     ) -> list[models.ScoredPoint]:
         """
@@ -195,7 +291,10 @@ class QdrantSessionClient:
         Args:
             query_text: Text to search for (will be embedded server-side)
             repo_id: Optional repo ID to filter by
-            point_type: Optional point type filter ('intent' or 'chunk')
+            point_type: Optional point type filter (legacy, use content_types instead)
+            content_types: Optional list of content types to search
+                          (plan, subagent_summary, summary_label, user_message, chunk)
+            user_name: Optional user name to filter by
             limit: Maximum number of results
 
         Returns:
@@ -212,10 +311,28 @@ class QdrantSessionClient:
             )
 
         if point_type:
+            # Legacy support
             filter_conditions.append(
                 models.FieldCondition(
                     key="type",
                     match=models.MatchValue(value=point_type),
+                )
+            )
+
+        if content_types:
+            # Filter by content_type (supports multiple)
+            filter_conditions.append(
+                models.FieldCondition(
+                    key="content_type",
+                    match=models.MatchAny(any=content_types),
+                )
+            )
+
+        if user_name:
+            filter_conditions.append(
+                models.FieldCondition(
+                    key="user_name",
+                    match=models.MatchValue(value=user_name),
                 )
             )
 

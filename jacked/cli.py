@@ -119,8 +119,8 @@ def index(session: Optional[str], repo: Optional[str]):
     if result.get("indexed"):
         console.print(
             f"[green][OK][/green] Indexed session {result['session_id']}: "
-            f"{result['intent_chunks']} intent chunks, "
-            f"{result['transcript_chunks']} transcript chunks"
+            f"{result['plans']}p {result['subagent_summaries']}a "
+            f"{result['summary_labels']}l {result['user_messages']}u {result['chunks']}c"
         )
     elif result.get("skipped"):
         console.print(f"[yellow][-][/yellow] Session {result['session_id']} unchanged, skipped")
@@ -167,8 +167,17 @@ def backfill(repo: Optional[str], force: bool):
 @click.option("--limit", "-n", default=5, help="Maximum results")
 @click.option("--mine", "-m", is_flag=True, help="Only show my sessions")
 @click.option("--user", "-u", help="Only show sessions from this user")
-def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Optional[str]):
-    """Search for sessions by semantic similarity with multi-factor ranking."""
+@click.option(
+    "--type", "-t", "content_types",
+    multiple=True,
+    help="Filter by content type (plan, subagent_summary, summary_label, user_message, chunk)"
+)
+def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Optional[str], content_types: tuple):
+    """Search for sessions by semantic similarity with multi-factor ranking.
+
+    By default, searches plan, subagent_summary, summary_label, and user_message content.
+    Use --type to filter to specific content types.
+    """
     import os
     from jacked.searcher import SessionSearcher
 
@@ -177,6 +186,9 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 
     # Use current repo if not specified
     current_repo = repo or os.getenv("CLAUDE_PROJECT_DIR")
+
+    # Convert tuple to list or None
+    type_filter = list(content_types) if content_types else None
 
     with Progress(
         SpinnerColumn(),
@@ -191,6 +203,7 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
             limit=limit,
             mine_only=mine,
             user_filter=user,
+            content_types=type_filter,
         )
 
         progress.remove_task(task)
@@ -202,27 +215,61 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
     table = Table(title="Search Results", show_header=True)
     table.add_column("#", style="dim", width=3)
     table.add_column("Score", style="cyan", width=6)
-    table.add_column("User", style="yellow", width=12)
-    table.add_column("Date", style="green", width=12)
-    table.add_column("Repository", style="magenta")
+    table.add_column("User", style="yellow", width=10)
+    table.add_column("Age", style="green", width=12)
+    table.add_column("Repo", style="magenta", width=15)
+    table.add_column("Content", style="blue", width=8)
     table.add_column("Preview")
 
     for i, result in enumerate(results, 1):
-        date_str = result.timestamp.strftime("%Y-%m-%d") if result.timestamp else "?"
-        preview = result.intent_preview[:50] + "..." if len(result.intent_preview) > 50 else result.intent_preview
+        # Format relative time
+        if result.timestamp:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            ts = result.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            days = (now - ts).days
+            if days == 0:
+                age_str = "today"
+            elif days == 1:
+                age_str = "yesterday"
+            elif days < 7:
+                age_str = f"{days}d ago"
+            elif days < 30:
+                age_str = f"{days // 7}w ago"
+            elif days < 365:
+                age_str = f"{days // 30}mo ago"
+            else:
+                age_str = f"{days // 365}y ago"
+        else:
+            age_str = "?"
+
+        preview = result.intent_preview[:40] + "..." if len(result.intent_preview) > 40 else result.intent_preview
         user_display = "YOU" if result.is_own else f"@{result.user_name}"
+
+        # Content indicators
+        indicators = []
+        if result.has_plan:
+            indicators.append("📋")
+        if result.has_agent_summaries:
+            indicators.append("🤖")
+        content_str = " ".join(indicators) if indicators else "-"
+
         table.add_row(
             str(i),
             f"{result.score:.0f}%",
             user_display,
-            date_str,
-            result.repo_name,
+            age_str,
+            result.repo_name[:15],
+            content_str,
             preview,
         )
 
     console.print(table)
-    console.print(f"\n[dim]Use 'jacked retrieve <session_id>' to get full transcript[/dim]")
-    console.print(f"[dim]Use 'jacked retrieve <id1> <id2> ...' to get multiple transcripts[/dim]")
+    console.print("\n[dim]📋 = has plan file | 🤖 = has agent summaries[/dim]")
+    console.print(f"[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]")
+    console.print(f"[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]")
 
     # Print session IDs for easy copy
     console.print("\nSession IDs:")
@@ -232,10 +279,26 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 
 @main.command()
 @click.argument("session_id")
-@click.option("--output", "-o", type=click.Path(), help="Save transcript to file")
-@click.option("--summary", "-s", is_flag=True, help="Show summary instead of full transcript")
-def retrieve(session_id: str, output: Optional[str], summary: bool):
-    """Retrieve a session's full transcript."""
+@click.option("--output", "-o", type=click.Path(), help="Save output to file")
+@click.option("--summary", "-s", is_flag=True, help="Show summary instead of content")
+@click.option(
+    "--mode", "-m",
+    type=click.Choice(["smart", "plan", "labels", "agents", "full"]),
+    default="smart",
+    help="Retrieval mode (default: smart)"
+)
+@click.option("--max-tokens", "-t", default=15000, help="Max token budget for smart mode")
+@click.option("--inject", "-i", is_flag=True, help="Format for context injection")
+def retrieve(session_id: str, output: Optional[str], summary: bool, mode: str, max_tokens: int, inject: bool):
+    """Retrieve a session's context with smart mode support.
+
+    Modes:
+      smart  - Plan + agent summaries + labels + user messages (default)
+      plan   - Just the plan file
+      labels - Just summary labels (tiny)
+      agents - All subagent summaries
+      full   - Everything including full transcript
+    """
     from jacked.retriever import SessionRetriever
 
     config = get_config()
@@ -248,7 +311,7 @@ def retrieve(session_id: str, output: Optional[str], summary: bool):
     ) as progress:
         task = progress.add_task(f"Retrieving {session_id}...", total=None)
 
-        session = retriever.retrieve(session_id)
+        session = retriever.retrieve(session_id, mode=mode)
 
         progress.remove_task(task)
 
@@ -256,12 +319,28 @@ def retrieve(session_id: str, output: Optional[str], summary: bool):
         console.print(f"[red]Session {session_id} not found[/red]")
         sys.exit(1)
 
-    # Show metadata
+    # Show metadata with content summary
+    tokens = session.content.estimate_tokens()
+    content_parts = []
+    if session.content.plan:
+        content_parts.append(f"Plan: {tokens['plan']} tokens")
+    if session.content.subagent_summaries:
+        content_parts.append(f"Agent summaries: {len(session.content.subagent_summaries)} ({tokens['subagent_summaries']} tokens)")
+    if session.content.summary_labels:
+        content_parts.append(f"Labels: {len(session.content.summary_labels)} ({tokens['summary_labels']} tokens)")
+    if session.content.user_messages:
+        content_parts.append(f"User messages: {len(session.content.user_messages)} ({tokens['user_messages']} tokens)")
+    if session.content.chunks:
+        content_parts.append(f"Transcript chunks: {len(session.content.chunks)} ({tokens['chunks']} tokens)")
+
     console.print(Panel(
         f"Session: {session.session_id}\n"
         f"Repository: {session.repo_name}\n"
         f"Machine: {session.machine}\n"
-        f"Local: {'Yes' if session.is_local else 'No'}",
+        f"Age: {session.format_relative_time()}\n"
+        f"Local: {'Yes' if session.is_local else 'No'}\n"
+        f"\nContent available:\n  " + "\n  ".join(content_parts) +
+        f"\n\nEstimated tokens (smart): {tokens['total']}",
         title="Session Info",
     ))
 
@@ -272,21 +351,24 @@ def retrieve(session_id: str, output: Optional[str], summary: bool):
 
     if summary:
         text = retriever.get_summary(session)
+    elif inject:
+        text = retriever.format_for_injection(session, mode=mode, max_tokens=max_tokens)
     else:
-        text = session.full_transcript
+        # Default: format based on mode
+        text = retriever.format_for_injection(session, mode=mode, max_tokens=max_tokens)
 
     if output:
         Path(output).write_text(text, encoding="utf-8")
         console.print(f"\n[green]Saved to {output}[/green]")
     else:
-        console.print(f"\n[bold]Transcript ({len(session.full_transcript)} chars):[/bold]")
+        console.print(f"\n[bold]Content (mode={mode}):[/bold]")
         console.print(text)
 
 
-@main.command()
+@main.command(name="sessions")
 @click.option("--repo", "-r", help="Filter by repository path")
 @click.option("--limit", "-n", default=20, help="Maximum results")
-def list(repo: Optional[str], limit: int):
+def list_sessions(repo: Optional[str], limit: int):
     """List indexed sessions."""
     from jacked.client import QdrantSessionClient
 
@@ -338,6 +420,50 @@ def delete(session_id: str, yes: bool):
 
     client.delete_by_session(session_id)
     console.print(f"[green][OK][/green] Deleted session {session_id}")
+
+
+@main.command()
+def cleardb():
+    """
+    Delete ALL your indexed data from Qdrant.
+
+    Only deletes YOUR data (matching your user_name), not teammates' data.
+    Use this before re-indexing with a new schema or to start fresh.
+    """
+    from jacked.client import QdrantSessionClient
+
+    config = get_config()
+    client = QdrantSessionClient(config)
+
+    # Show what we're about to delete
+    user_name = config.user_name
+    count = client.count_by_user(user_name)
+
+    if count == 0:
+        console.print(f"[yellow]No data found for user '{user_name}'[/yellow]")
+        return
+
+    console.print(Panel(
+        f"[bold red]WARNING: This will permanently delete ALL your indexed data![/bold red]\n\n"
+        f"User: [cyan]{user_name}[/cyan]\n"
+        f"Points to delete: [red]{count}[/red]\n\n"
+        f"This only affects YOUR data. Teammates' data will be untouched.\n"
+        f"After clearing, run 'jacked backfill' to re-index.",
+        title="Clear Database",
+    ))
+
+    # Require typing confirmation phrase
+    console.print("\n[bold]To confirm, type: DELETE MY DATA[/bold]")
+    confirmation = click.prompt("Confirmation", default="", show_default=False)
+
+    if confirmation != "DELETE MY DATA":
+        console.print("[yellow]Cancelled - confirmation did not match[/yellow]")
+        return
+
+    # Do the delete
+    deleted = client.delete_by_user(user_name)
+    console.print(f"\n[green][OK][/green] Deleted {deleted} points for user '{user_name}'")
+    console.print("\n[dim]Run 'jacked backfill' to re-index your sessions[/dim]")
 
 
 @main.command()
@@ -456,8 +582,107 @@ def _get_data_root() -> Path:
     return Path(__file__).parent / "data"
 
 
+def _sound_hook_marker() -> str:
+    """Marker to identify jacked sound hooks."""
+    return "# jacked-sound: "
+
+
+def _get_sound_command(hook_type: str) -> str:
+    """Generate cross-platform sound command (backgrounded, with fallbacks).
+
+    Args:
+        hook_type: 'notification' or 'complete'
+    """
+    if hook_type == "notification":
+        win_sound = "Exclamation"
+        mac_sound = "Basso.aiff"
+        linux_sound = "dialog-warning.oga"
+    else:  # complete
+        win_sound = "Asterisk"
+        mac_sound = "Glass.aiff"
+        linux_sound = "complete.oga"
+
+    # Use uname for detection, background with &, fallback to bell
+    return (
+        '('
+        'OS=$(uname -s); '
+        'case "$OS" in '
+        f'Darwin) afplay /System/Library/Sounds/{mac_sound} 2>/dev/null || printf "\\a";; '
+        'Linux) '
+        '  if grep -qi microsoft /proc/version 2>/dev/null; then '
+        f'    powershell.exe -Command "[System.Media.SystemSounds]::{win_sound}.Play()" 2>/dev/null || printf "\\a"; '
+        '  else '
+        f'    paplay /usr/share/sounds/freedesktop/stereo/{linux_sound} 2>/dev/null || printf "\\a"; '
+        '  fi;; '
+        f'MINGW*|MSYS*|CYGWIN*) powershell -Command "[System.Media.SystemSounds]::{win_sound}.Play()" 2>/dev/null || printf "\\a";; '
+        '*) printf "\\a";; '
+        'esac'
+        ') &'
+    )
+
+
+def _install_sound_hooks(existing: dict, settings_path: Path):
+    """Install sound notification hooks."""
+    marker = _sound_hook_marker()
+
+    # Notification hook
+    if "Notification" not in existing["hooks"]:
+        existing["hooks"]["Notification"] = []
+
+    notif_exists = any(marker in str(h) for h in existing["hooks"]["Notification"])
+    if not notif_exists:
+        existing["hooks"]["Notification"].append({
+            "matcher": "",
+            "hooks": [{"type": "command", "command": marker + _get_sound_command("notification")}]
+        })
+        console.print("[green][OK][/green] Added Notification sound hook")
+    else:
+        console.print("[yellow][-][/yellow] Notification sound hook exists")
+
+    # Stop sound hook (separate from index)
+    stop_exists = any(marker in str(h) for h in existing["hooks"]["Stop"])
+    if not stop_exists:
+        existing["hooks"]["Stop"].append({
+            "matcher": "",
+            "hooks": [{"type": "command", "command": marker + _get_sound_command("complete")}]
+        })
+        console.print("[green][OK][/green] Added Stop sound hook")
+    else:
+        console.print("[yellow][-][/yellow] Stop sound hook exists")
+
+    settings_path.write_text(json.dumps(existing, indent=2))
+
+
+def _remove_sound_hooks(settings_path: Path) -> bool:
+    """Remove jacked sound hooks. Returns True if any removed."""
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text())
+    marker = _sound_hook_marker()
+    modified = False
+
+    for hook_type in ["Notification", "Stop"]:
+        if hook_type in settings.get("hooks", {}):
+            before = len(settings["hooks"][hook_type])
+            settings["hooks"][hook_type] = [
+                h for h in settings["hooks"][hook_type]
+                if marker not in str(h)
+            ]
+            if len(settings["hooks"][hook_type]) < before:
+                console.print(f"[green][OK][/green] Removed {hook_type} sound hook")
+                modified = True
+
+    if modified:
+        settings_path.write_text(json.dumps(settings, indent=2))
+    return modified
+
+
 @main.command()
-def install():
+@click.option("--sounds", is_flag=True, help="Install sound notification hooks")
+def install(sounds: bool):
     """Auto-install hook config, skill, agents, and commands."""
     import os
     import json
@@ -555,6 +780,10 @@ def install():
     else:
         console.print(f"[yellow][-][/yellow] Commands directory not found")
 
+    # Install sound hooks if requested
+    if sounds:
+        _install_sound_hooks(existing, settings_path)
+
     console.print("\n[bold]Installation complete![/bold]")
     console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
     console.print("\nWhat you get:")
@@ -571,13 +800,23 @@ def install():
 
 @main.command()
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
-def uninstall(yes: bool):
+@click.option("--sounds", is_flag=True, help="Remove only sound hooks")
+def uninstall(yes: bool, sounds: bool):
     """Remove jacked hooks, skill, agents, and commands from Claude Code."""
     import json
     import shutil
 
     home = Path.home()
     pkg_root = _get_data_root()
+    settings_path = home / ".claude" / "settings.json"
+
+    # If --sounds flag, only remove sound hooks
+    if sounds:
+        if _remove_sound_hooks(settings_path):
+            console.print("[bold]Sound hooks removed![/bold]")
+        else:
+            console.print("[yellow]No sound hooks found[/yellow]")
+        return
 
     if not yes:
         if not click.confirm("Remove jacked from Claude Code? (This won't delete your Qdrant index)"):
@@ -586,8 +825,10 @@ def uninstall(yes: bool):
 
     console.print("[bold]Uninstalling Jacked...[/bold]\n")
 
+    # Also remove sound hooks during full uninstall
+    _remove_sound_hooks(settings_path)
+
     # Remove Stop hook from settings.json
-    settings_path = home / ".claude" / "settings.json"
     if settings_path.exists():
         try:
             settings = json.loads(settings_path.read_text())

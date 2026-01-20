@@ -475,3 +475,342 @@ def _is_uuid_format(name: str) -> bool:
     """
     uuid_pattern = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     return bool(re.match(uuid_pattern, name.lower()))
+
+
+# =============================================================================
+# NEW: Extraction functions for subagent summaries, labels, and plans
+# =============================================================================
+
+
+@dataclass
+class SummaryLabel:
+    """A compaction summary label (tiny chapter title).
+
+    Examples:
+        >>> label = SummaryLabel("Implementing auth flow", "abc123", None)
+        >>> label.label
+        'Implementing auth flow'
+    """
+    label: str
+    leaf_uuid: Optional[str] = None
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
+class AgentSummary:
+    """Summary extracted from a subagent's final output.
+
+    Examples:
+        >>> summary = AgentSummary("a4e75d5", "Explore", "## Summary\\n...", None)
+        >>> summary.agent_id
+        'a4e75d5'
+    """
+    agent_id: str
+    agent_type: Optional[str]
+    summary_text: str
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
+class PlanFile:
+    """A plan file linked to a session via slug.
+
+    Examples:
+        >>> plan = PlanFile("hidden-finding-goose", Path("..."), "# Plan content")
+        >>> plan.slug
+        'hidden-finding-goose'
+    """
+    slug: str
+    path: Path
+    content: str
+
+
+def find_subagent_files(session_path: Path) -> list[Path]:
+    """Find all subagent JSONL files for a session.
+
+    Subagents are stored in {session-id}/subagents/agent-*.jsonl
+
+    Args:
+        session_path: Path to the main session JSONL file
+
+    Returns:
+        List of paths to subagent JSONL files
+
+    Examples:
+        >>> # files = find_subagent_files(Path('session.jsonl'))  # doctest: +SKIP
+    """
+    # Session dir is {session-id}/ next to {session-id}.jsonl
+    session_dir = session_path.parent / session_path.stem
+    subagents_dir = session_dir / "subagents"
+
+    if not subagents_dir.exists():
+        return []
+
+    # Use iterator to avoid memory issues with large directories
+    return sorted(subagents_dir.glob("agent-*.jsonl"))
+
+
+def extract_agent_summary(agent_file: Path) -> Optional[AgentSummary]:
+    """Extract the final summary text from an agent's session.
+
+    The summary is the text content from the LAST assistant message.
+
+    Args:
+        agent_file: Path to an agent-*.jsonl file
+
+    Returns:
+        AgentSummary or None if no usable summary found
+
+    Examples:
+        >>> # summary = extract_agent_summary(Path('agent-abc.jsonl'))  # doctest: +SKIP
+    """
+    # Extract agent_id from filename: agent-a4e75d5.jsonl -> a4e75d5
+    agent_id = agent_file.stem.replace("agent-", "")
+
+    last_assistant_msg = None
+    timestamp = None
+
+    try:
+        with open(agent_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get("type") == "assistant":
+                    last_assistant_msg = data
+                    ts_str = data.get("timestamp")
+                    if ts_str:
+                        try:
+                            timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        except ValueError:
+                            pass
+    except (IOError, OSError) as e:
+        logger.warning(f"Failed to read agent file {agent_file}: {e}")
+        return None
+
+    if not last_assistant_msg:
+        return None
+
+    # Extract text content from the message
+    message = last_assistant_msg.get("message", {})
+    content = message.get("content", [])
+
+    text_parts = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if text:
+                    text_parts.append(text)
+    elif isinstance(content, str):
+        text_parts.append(content)
+
+    summary_text = "\n".join(text_parts).strip()
+
+    # Skip if too short (likely not a real summary)
+    if len(summary_text) < 200:
+        logger.debug(f"Agent {agent_id} summary too short ({len(summary_text)} chars), skipping")
+        return None
+
+    # Agent type is hard to detect from the file itself
+    # Could infer from content patterns but skip for MVP
+    agent_type = None
+
+    return AgentSummary(
+        agent_id=agent_id,
+        agent_type=agent_type,
+        summary_text=summary_text,
+        timestamp=timestamp,
+    )
+
+
+def extract_summary_labels(session_path: Path) -> list[SummaryLabel]:
+    """Extract summary labels from a session JSONL file.
+
+    These are the tiny "chapter titles" from compaction events.
+
+    Args:
+        session_path: Path to the main session JSONL file
+
+    Returns:
+        List of SummaryLabel objects
+
+    Examples:
+        >>> # labels = extract_summary_labels(Path('session.jsonl'))  # doctest: +SKIP
+    """
+    labels = []
+
+    try:
+        with open(session_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get("type") == "summary":
+                    label_text = data.get("summary", "")
+                    if label_text:
+                        timestamp = None
+                        ts_str = data.get("timestamp")
+                        if ts_str:
+                            try:
+                                timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            except ValueError:
+                                pass
+
+                        labels.append(SummaryLabel(
+                            label=label_text,
+                            leaf_uuid=data.get("leafUuid"),
+                            timestamp=timestamp,
+                        ))
+    except (IOError, OSError) as e:
+        logger.warning(f"Failed to read session file {session_path}: {e}")
+
+    return labels
+
+
+def extract_session_slug(session_path: Path) -> Optional[str]:
+    """Extract the slug from a session JSONL file.
+
+    The slug links the session to its plan file in ~/.claude/plans/
+
+    Args:
+        session_path: Path to the main session JSONL file
+
+    Returns:
+        The slug string or None if not found
+
+    Examples:
+        >>> # slug = extract_session_slug(Path('session.jsonl'))  # doctest: +SKIP
+    """
+    try:
+        with open(session_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if "slug" in data:
+                    return data["slug"]
+    except (IOError, OSError) as e:
+        logger.warning(f"Failed to read session file {session_path}: {e}")
+
+    return None
+
+
+def find_plan_file(slug: str, plans_dir: Optional[Path] = None) -> Optional[PlanFile]:
+    """Find and read the plan file for a session slug.
+
+    Args:
+        slug: The session slug (e.g., "hidden-finding-goose")
+        plans_dir: Path to plans directory (default: ~/.claude/plans/)
+
+    Returns:
+        PlanFile or None if not found or invalid
+
+    Examples:
+        >>> # plan = find_plan_file("hidden-finding-goose")  # doctest: +SKIP
+    """
+    if plans_dir is None:
+        plans_dir = Path.home() / ".claude" / "plans"
+
+    plan_path = plans_dir / f"{slug}.md"
+
+    if not plan_path.exists():
+        return None
+
+    try:
+        # Size validation - skip huge files
+        file_size = plan_path.stat().st_size
+        if file_size > 100_000:  # 100KB sanity check
+            logger.warning(f"Plan file too large ({file_size} bytes), skipping: {plan_path}")
+            return None
+
+        if file_size < 50:  # Too small to be useful
+            logger.debug(f"Plan file too small ({file_size} bytes), skipping: {plan_path}")
+            return None
+
+        content = plan_path.read_text(encoding="utf-8")
+
+        return PlanFile(
+            slug=slug,
+            path=plan_path,
+            content=content,
+        )
+    except (IOError, OSError) as e:
+        logger.warning(f"Failed to read plan file {plan_path}: {e}")
+        return None
+
+
+@dataclass
+class EnrichedTranscript(ParsedTranscript):
+    """ParsedTranscript with additional extracted data.
+
+    Adds subagent summaries, summary labels, and plan file content.
+    """
+    summary_labels: list[SummaryLabel] = field(default_factory=list)
+    agent_summaries: list[AgentSummary] = field(default_factory=list)
+    plan: Optional[PlanFile] = None
+    slug: Optional[str] = None
+
+
+def parse_jsonl_file_enriched(filepath: Path) -> EnrichedTranscript:
+    """Parse a Claude session with all enriched data.
+
+    Extracts:
+    - Messages (user, assistant)
+    - Summary labels (compaction chapter titles)
+    - Subagent summaries (gold context from agent outputs)
+    - Plan file (if linked via slug)
+
+    Args:
+        filepath: Path to the .jsonl session file
+
+    Returns:
+        EnrichedTranscript with all extracted data
+
+    Examples:
+        >>> # transcript = parse_jsonl_file_enriched(Path('session.jsonl'))  # doctest: +SKIP
+    """
+    # Parse base transcript
+    base = parse_jsonl_file(filepath)
+
+    # Extract summary labels
+    labels = extract_summary_labels(filepath)
+
+    # Extract subagent summaries
+    agent_summaries = []
+    for agent_file in find_subagent_files(filepath):
+        summary = extract_agent_summary(agent_file)
+        if summary:
+            agent_summaries.append(summary)
+
+    # Extract plan file via slug
+    slug = extract_session_slug(filepath)
+    plan = find_plan_file(slug) if slug else None
+
+    return EnrichedTranscript(
+        session_id=base.session_id,
+        messages=base.messages,
+        user_messages=base.user_messages,
+        full_text=base.full_text,
+        intent_text=base.intent_text,
+        timestamp=base.timestamp,
+        summary_labels=labels,
+        agent_summaries=agent_summaries,
+        plan=plan,
+        slug=slug,
+    )
