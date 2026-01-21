@@ -32,11 +32,18 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def get_config() -> SmartForkConfig:
-    """Load configuration from environment."""
+def get_config(quiet: bool = False) -> Optional[SmartForkConfig]:
+    """Load configuration from environment.
+
+    Args:
+        quiet: If True, return None instead of printing error and exiting.
+               Used by hooks that should fail gracefully.
+    """
     try:
         return SmartForkConfig.from_env()
     except ValueError as e:
+        if quiet:
+            return None
         console.print(f"[red]Configuration error:[/red] {e}")
         console.print("\nSet these environment variables:")
         console.print("  QDRANT_CLAUDE_SESSIONS_ENDPOINT=<your-qdrant-url>")
@@ -63,7 +70,12 @@ def index(session: Optional[str], repo: Optional[str]):
     import os
     from jacked.indexer import SessionIndexer
 
-    config = get_config()
+    # Try to get config quietly - if not configured, nudge and exit cleanly
+    config = get_config(quiet=True)
+    if config is None:
+        print("[jacked] Indexing skipped - run 'jacked configure' to set up Qdrant")
+        sys.exit(0)
+
     indexer = SessionIndexer(config)
 
     if session:
@@ -754,29 +766,59 @@ def install(sounds: bool):
     else:
         console.print(f"[yellow][-][/yellow] Skill file not found at {skill_src}")
 
-    # Copy agents
+    # Copy agents (with conflict detection)
     agents_src = pkg_root / "agents"
     agents_dst = home / ".claude" / "agents"
     if agents_src.exists():
         agents_dst.mkdir(parents=True, exist_ok=True)
         agent_count = 0
+        skipped = 0
         for agent_file in agents_src.glob("*.md"):
-            shutil.copy(agent_file, agents_dst / agent_file.name)
+            dst_file = agents_dst / agent_file.name
+            src_content = agent_file.read_text(encoding="utf-8")
+            if dst_file.exists():
+                dst_content = dst_file.read_text(encoding="utf-8")
+                if src_content == dst_content:
+                    skipped += 1
+                    continue  # Same content, skip silently
+                # Different content - ask before overwriting
+                if not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
+                    console.print(f"[yellow][-][/yellow] Skipped {agent_file.name}")
+                    continue
+            shutil.copy(agent_file, dst_file)
             agent_count += 1
-        console.print(f"[green][OK][/green] Installed {agent_count} agents")
+        msg = f"[green][OK][/green] Installed {agent_count} agents"
+        if skipped:
+            msg += f" ({skipped} unchanged)"
+        console.print(msg)
     else:
         console.print(f"[yellow][-][/yellow] Agents directory not found")
 
-    # Copy commands
+    # Copy commands (with conflict detection)
     commands_src = pkg_root / "commands"
     commands_dst = home / ".claude" / "commands"
     if commands_src.exists():
         commands_dst.mkdir(parents=True, exist_ok=True)
         cmd_count = 0
+        skipped = 0
         for cmd_file in commands_src.glob("*.md"):
-            shutil.copy(cmd_file, commands_dst / cmd_file.name)
+            dst_file = commands_dst / cmd_file.name
+            src_content = cmd_file.read_text(encoding="utf-8")
+            if dst_file.exists():
+                dst_content = dst_file.read_text(encoding="utf-8")
+                if src_content == dst_content:
+                    skipped += 1
+                    continue  # Same content, skip silently
+                # Different content - ask before overwriting
+                if not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
+                    console.print(f"[yellow][-][/yellow] Skipped {cmd_file.name}")
+                    continue
+            shutil.copy(cmd_file, dst_file)
             cmd_count += 1
-        console.print(f"[green][OK][/green] Installed {cmd_count} commands")
+        msg = f"[green][OK][/green] Installed {cmd_count} commands"
+        if skipped:
+            msg += f" ({skipped} unchanged)"
+        console.print(msg)
     else:
         console.print(f"[yellow][-][/yellow] Commands directory not found")
 
