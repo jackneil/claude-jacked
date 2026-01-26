@@ -704,6 +704,7 @@ def install(sounds: bool):
     pkg_root = _get_data_root()
 
     # Hook configuration - assumes jacked is on PATH (installed via pipx)
+    # async: True runs indexing in background so Claude Code doesn't wait
     hook_config = {
         "hooks": {
             "Stop": [
@@ -712,7 +713,8 @@ def install(sounds: bool):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": 'jacked index --repo "$CLAUDE_PROJECT_DIR"'
+                            "command": 'jacked index --repo "$CLAUDE_PROJECT_DIR"',
+                            "async": True
                         }
                     ]
                 }
@@ -738,19 +740,31 @@ def install(sounds: bool):
     if "Stop" not in existing["hooks"]:
         existing["hooks"]["Stop"] = []
 
-    # Check if hook already exists
-    hook_exists = any(
-        "jacked" in str(h.get("hooks", []))
-        for h in existing["hooks"]["Stop"]
-    )
+    # Check if hook already exists and if it needs updating
+    hook_index = None
+    needs_async_update = False
+    for i, hook_entry in enumerate(existing["hooks"]["Stop"]):
+        for h in hook_entry.get("hooks", []):
+            if "jacked" in h.get("command", ""):
+                hook_index = i
+                # Check if async is missing or false
+                if not h.get("async"):
+                    needs_async_update = True
+                break
 
-    if not hook_exists:
+    if hook_index is None:
+        # No hook exists - add it
         existing["hooks"]["Stop"].append(hook_config["hooks"]["Stop"][0])
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(json.dumps(existing, indent=2))
         console.print(f"[green][OK][/green] Added Stop hook to {settings_path}")
+    elif needs_async_update:
+        # Hook exists but needs async: true
+        existing["hooks"]["Stop"][hook_index] = hook_config["hooks"]["Stop"][0]
+        settings_path.write_text(json.dumps(existing, indent=2))
+        console.print(f"[green][OK][/green] Updated Stop hook with async: true")
     else:
-        console.print(f"[yellow][-][/yellow] Stop hook already exists in {settings_path}")
+        console.print(f"[yellow][-][/yellow] Stop hook already configured correctly")
 
     # Copy skill file with Python path templating
     # Claude Code expects skills in subdirectories with SKILL.md

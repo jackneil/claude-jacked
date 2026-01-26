@@ -333,9 +333,13 @@ class SessionSearcher:
                     session_id=session.get("session_id", ""),
                     repo_name=session.get("repo_name", "unknown"),
                     repo_path=session.get("repo_path", ""),
+                    user_name=session.get("user_name", "unknown"),
                     machine=session.get("machine", "unknown"),
                     timestamp=timestamp,
                     score=100,  # No relevance score for list
+                    semantic_score=0.0,  # Not applicable for list
+                    is_own=session.get("user_name") == self.config.user_name,
+                    is_current_repo=True,  # We're filtering by repo
                     intent_preview="",  # Not available in list
                     chunk_count=session.get("chunk_count", 0),
                 )

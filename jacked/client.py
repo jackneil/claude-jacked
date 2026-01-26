@@ -55,11 +55,13 @@ class QdrantSessionClient:
 
     def ensure_collection(self) -> bool:
         """
-        Ensure the collection exists, creating it if necessary.
+        Ensure the collection exists with all required indexes.
 
         Creates collection with:
         - Dense vectors for semantic search
-        - Payload indexing for repo filtering
+        - Payload indexing for filtering
+
+        Also ensures indexes exist on existing collections (for upgrades).
 
         Returns:
             True if collection exists or was created
@@ -75,7 +77,9 @@ class QdrantSessionClient:
             exists = any(c.name == collection_name for c in collections.collections)
 
             if exists:
-                logger.info(f"Collection '{collection_name}' already exists")
+                logger.debug(f"Collection '{collection_name}' already exists")
+                # Ensure indexes exist (handles upgrades)
+                self._ensure_indexes(collection_name)
                 return True
 
             logger.info(f"Creating collection '{collection_name}'")
@@ -134,6 +138,30 @@ class QdrantSessionClient:
             logger.error(f"Failed to create collection: {e}")
             raise
 
+    def _ensure_indexes(self, collection_name: str):
+        """
+        Ensure all required payload indexes exist on a collection.
+
+        Creates indexes if they don't exist (idempotent).
+        """
+        required_indexes = [
+            "repo_id", "repo_name", "session_id", "type",
+            "machine", "user_name", "content_type"
+        ]
+
+        for field_name in required_indexes:
+            try:
+                self.client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+                logger.debug(f"Created index for '{field_name}'")
+            except UnexpectedResponse as e:
+                # Index might already exist - that's fine
+                if "already exists" not in str(e).lower():
+                    logger.warning(f"Could not create index for '{field_name}': {e}")
+
     def upsert_points(self, points: list[models.PointStruct]) -> bool:
         """
         Upsert points to the collection.
@@ -191,6 +219,48 @@ class QdrantSessionClient:
         except UnexpectedResponse as e:
             logger.error(f"Failed to delete session {session_id}: {e}")
             raise
+
+    def get_session_points(self, session_id: str, user_name: str) -> list:
+        """
+        Get all points for a session owned by this user (for write tracker seeding).
+
+        IMPORTANT: Filters by BOTH session_id AND user_name to ensure we only
+        see our own data. This is for write-side tracking only - not for retrieval.
+
+        Args:
+            session_id: Session UUID
+            user_name: User name to filter by
+
+        Returns:
+            List of Qdrant points with payloads (no vectors)
+        """
+        points = []
+        offset = None
+        while True:
+            result = self.client.scroll(
+                collection_name=self.config.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="session_id",
+                            match=models.MatchValue(value=session_id)
+                        ),
+                        models.FieldCondition(
+                            key="user_name",
+                            match=models.MatchValue(value=user_name)
+                        )
+                    ]
+                ),
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,  # Don't need vectors, just metadata
+            )
+            points.extend(result[0])
+            offset = result[1]
+            if offset is None:
+                break
+        return points
 
     def delete_by_user(self, user_name: str) -> int:
         """
@@ -387,28 +457,6 @@ class QdrantSessionClient:
             logger.error(f"Failed to get points for session {session_id}: {e}")
             raise
 
-    def get_point_by_id(self, point_id: str) -> Optional[models.Record]:
-        """
-        Get a single point by ID.
-
-        Args:
-            point_id: Point ID to retrieve
-
-        Returns:
-            Record object or None if not found
-        """
-        try:
-            results = self.client.retrieve(
-                collection_name=self.config.collection_name,
-                ids=[point_id],
-                with_payload=True,
-                with_vectors=False,
-            )
-            return results[0] if results else None
-        except UnexpectedResponse as e:
-            logger.error(f"Failed to get point {point_id}: {e}")
-            return None
-
     def list_sessions(
         self,
         repo_id: Optional[str] = None,
@@ -424,10 +472,11 @@ class QdrantSessionClient:
         Returns:
             List of session metadata dicts
         """
+        # Filter by plan content_type - one per session, gives unique sessions
         filter_conditions = [
             models.FieldCondition(
-                key="type",
-                match=models.MatchValue(value="intent"),
+                key="content_type",
+                match=models.MatchValue(value="plan"),
             )
         ]
 
@@ -455,9 +504,10 @@ class QdrantSessionClient:
                     "session_id": payload.get("session_id"),
                     "repo_name": payload.get("repo_name"),
                     "repo_path": payload.get("repo_path"),
+                    "user_name": payload.get("user_name"),
                     "machine": payload.get("machine"),
                     "timestamp": payload.get("timestamp"),
-                    "chunk_count": payload.get("transcript_chunk_count", 0),
+                    "chunk_count": payload.get("total_chunks", 0),
                 })
 
             return sessions

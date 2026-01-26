@@ -31,6 +31,7 @@ from jacked.transcript import (
     chunk_text,
     EnrichedTranscript,
 )
+from jacked.index_write_tracker import IndexWriteTracker
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ class SessionIndexer:
         """
         self.config = config
         self.client = client or QdrantSessionClient(config)
+        # Config hash for detecting chunk_size/overlap changes
+        self._config_hash = content_hash(f"{config.chunk_size}:{config.chunk_overlap}")
+        # Write tracker for incremental indexing (NOT for retrieval!)
+        self._tracker = IndexWriteTracker(self._config_hash)
 
     def index_session(
         self,
@@ -77,23 +82,24 @@ class SessionIndexer:
         force: bool = False,
     ) -> dict:
         """
-        Index a single session to Qdrant with all content types.
+        Index a single session to Qdrant with incremental updates.
+
+        Uses local SQLite tracker to avoid re-pushing unchanged content.
+        Only indexes NEW or CHANGED points - much more efficient than
+        the old delete-all-and-replace approach.
 
         Args:
             session_path: Path to the .jsonl session file
             repo_path: Full path to the repository
-            force: If True, re-index even if unchanged
+            force: If True, clear tracker and re-seed from Qdrant
 
         Returns:
             Dict with indexing results:
             - session_id: The session ID
-            - indexed: Whether the session was indexed
-            - skipped: Whether it was skipped (unchanged)
-            - plans: Number of plan points (0 or 1)
-            - subagent_summaries: Number of subagent summary points
-            - summary_labels: Number of summary label points
-            - user_messages: Number of user message points
-            - chunks: Number of transcript chunk points
+            - indexed: Whether new content was indexed
+            - skipped: Whether it was skipped (no new content)
+            - new_points: Number of new/changed points indexed
+            - plans, subagent_summaries, etc.: Counts by content type
             - error: Error message if failed
 
         Examples:
@@ -104,6 +110,7 @@ class SessionIndexer:
             "session_id": session_path.stem,
             "indexed": False,
             "skipped": False,
+            "new_points": 0,
             "plans": 0,
             "subagent_summaries": 0,
             "summary_labels": 0,
@@ -118,36 +125,58 @@ class SessionIndexer:
 
             # Parse the transcript with enriched data
             transcript = parse_jsonl_file_enriched(session_path)
-            result["session_id"] = transcript.session_id
+            session_id = transcript.session_id
+            result["session_id"] = session_id
 
-            # Check if we should skip (unchanged)
-            if not force:
-                current_hash = content_hash(transcript.full_text)
-                existing = self._get_existing_hash(transcript.session_id)
-                if existing == current_hash:
-                    logger.debug(f"Session {transcript.session_id} unchanged, skipping")
-                    result["skipped"] = True
-                    return result
+            # Check session metadata from tracker
+            meta = self._tracker.get_session_meta(session_id)
 
-            # Build points for all content types
-            points = self._build_points(transcript, repo_path)
+            # Config changed? Clear and re-seed from Qdrant
+            if meta and meta["config_hash"] != self._config_hash:
+                logger.info(f"Config changed for session {session_id}, re-seeding from Qdrant")
+                self._tracker.clear_session(session_id)
+                meta = None
 
-            if not points:
-                logger.warning(f"No points to index for session {transcript.session_id}")
-                result["error"] = "No content to index"
+            # Previous crash mid-indexing? Force re-index
+            if meta and meta["status"] == "indexing":
+                logger.info(f"Session {session_id} was interrupted mid-index, forcing re-seed")
+                force = True
+
+            # Cache miss or force? Seed from Qdrant (source of truth, THIS USER ONLY)
+            if meta is None or force:
+                self._tracker.clear_session(session_id)
+                self._tracker.seed_from_qdrant(session_id, self.client, self.config.user_name)
+
+            # Get what's already indexed
+            indexed = self._tracker.get_session_state(session_id)
+
+            # Mark as indexing BEFORE doing work (crash safety)
+            self._tracker.mark_indexing(session_id)
+
+            # Build only NEW/CHANGED points
+            points_to_index, points_metadata = self._build_incremental_points(
+                transcript, repo_path, indexed
+            )
+
+            if not points_to_index:
+                self._tracker.mark_complete(session_id)
+                result["skipped"] = True
+                logger.debug(f"Session {session_id}: no new content to index")
                 return result
 
-            # Delete existing points for this session (if any)
-            self.client.delete_by_session(transcript.session_id)
+            # Upsert to Qdrant (no delete needed - deterministic IDs handle overwrites)
+            self.client.upsert_points(points_to_index)
 
-            # Upsert new points
-            self.client.upsert_points(points)
+            # Record what we indexed in tracker
+            for content_type, idx, hash_val, point_id in points_metadata:
+                self._tracker.record_indexed(session_id, content_type, idx, hash_val, str(point_id))
+
+            self._tracker.mark_complete(session_id)
 
             # Count results by content_type
             result["indexed"] = True
-            for p in points:
-                payload = p.payload or {}
-                content_type = payload.get("content_type", payload.get("type"))
+            result["new_points"] = len(points_to_index)
+            for content_type, _, _, _ in points_metadata:
                 if content_type == "plan":
                     result["plans"] += 1
                 elif content_type == "subagent_summary":
@@ -160,12 +189,13 @@ class SessionIndexer:
                     result["chunks"] += 1
 
             logger.info(
-                f"Indexed session {transcript.session_id}: "
+                f"Indexed session {session_id}: "
+                f"{result['new_points']} new points ("
                 f"{result['plans']} plan, "
-                f"{result['subagent_summaries']} agent summaries, "
+                f"{result['subagent_summaries']} summaries, "
                 f"{result['summary_labels']} labels, "
-                f"{result['user_messages']} user msgs, "
-                f"{result['chunks']} chunks"
+                f"{result['user_messages']} msgs, "
+                f"{result['chunks']} chunks)"
             )
 
             return result
@@ -174,23 +204,6 @@ class SessionIndexer:
             logger.error(f"Failed to index session {session_path}: {e}")
             result["error"] = str(e)
             return result
-
-    def _get_existing_hash(self, session_id: str) -> Optional[str]:
-        """
-        Get the content hash of an existing indexed session.
-
-        Args:
-            session_id: Session ID to check
-
-        Returns:
-            Content hash string or None if not found
-        """
-        # Look for the first user_message point using deterministic UUID
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{session_id}:user_message:0"))
-        point = self.client.get_point_by_id(point_id)
-        if point and point.payload:
-            return point.payload.get("content_hash")
-        return None
 
     def _make_point_id(self, session_id: str, content_type: str, index: int) -> str:
         """Generate deterministic point ID.
@@ -205,29 +218,27 @@ class SessionIndexer:
         """
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{session_id}:{content_type}:{index}"))
 
-    def _build_points(
+    def _build_incremental_points(
         self,
         transcript: EnrichedTranscript,
         repo_path: str,
-    ) -> list[models.PointStruct]:
+        indexed: dict,
+    ) -> tuple[list[models.PointStruct], list[tuple]]:
         """
-        Build Qdrant points for all content types in a transcript.
-
-        Creates points for:
-        - plan: Full implementation strategy (if exists)
-        - subagent_summary: Rich summaries from agent outputs
-        - summary_label: Tiny chapter titles from compaction
-        - user_message: First few user messages for intent matching
-        - chunk: Full transcript chunks for full retrieval
+        Build only NEW or CHANGED points by comparing against what's already indexed.
 
         Args:
             transcript: EnrichedTranscript with all extracted data
             repo_path: Full path to the repository
+            indexed: Dict mapping (content_type, index) -> content_hash from tracker
 
         Returns:
-            List of PointStruct objects
+            Tuple of (points_to_index, points_metadata) where points_metadata is
+            a list of (content_type, index, content_hash, point_id) tuples
         """
-        points = []
+        points_to_index = []
+        points_metadata = []  # (content_type, index, hash, point_id)
+
         repo_id = get_repo_id(repo_path)
         repo_name = get_repo_name(repo_path)
         full_hash = content_hash(transcript.full_text)
@@ -250,93 +261,106 @@ class SessionIndexer:
             "slug": transcript.slug,
         }
 
-        # 1. Plan file (gold - highest priority)
+        # 1. Plan - check hash
         if transcript.plan:
-            point_id = self._make_point_id(transcript.session_id, "plan", 0)
-            points.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=models.Document(
-                        text=transcript.plan.content[:8000],  # Limit for embedding
-                        model=INFERENCE_MODEL,
-                    ),
-                    payload={
-                        **base_payload,
-                        "type": "plan",  # Keep for backwards compat
-                        "content_type": "plan",
-                        "content": transcript.plan.content,
-                        "plan_path": str(transcript.plan.path),
-                    },
+            plan_hash = content_hash(transcript.plan.content)
+            if indexed.get(("plan", 0)) != plan_hash:
+                point_id = self._make_point_id(transcript.session_id, "plan", 0)
+                points_to_index.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=models.Document(
+                            text=transcript.plan.content[:8000],
+                            model=INFERENCE_MODEL,
+                        ),
+                        payload={
+                            **base_payload,
+                            "type": "plan",
+                            "content_type": "plan",
+                            "content": transcript.plan.content,
+                            "plan_path": str(transcript.plan.path),
+                            "chunk_index": 0,
+                        },
+                    )
                 )
-            )
+                points_metadata.append(("plan", 0, plan_hash, point_id))
 
-        # 2. Subagent summaries (gold)
-        for i, agent_summary in enumerate(transcript.agent_summaries):
-            point_id = self._make_point_id(transcript.session_id, "subagent_summary", i)
-            points.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=models.Document(
-                        text=agent_summary.summary_text[:8000],  # Limit for embedding
-                        model=INFERENCE_MODEL,
-                    ),
-                    payload={
-                        **base_payload,
-                        "type": "subagent_summary",
-                        "content_type": "subagent_summary",
-                        "content": agent_summary.summary_text,
-                        "agent_id": agent_summary.agent_id,
-                        "agent_type": agent_summary.agent_type,
-                        "chunk_index": i,
-                    },
-                )
-            )
-
-        # 3. Summary labels (chapter titles from compaction)
-        for i, label in enumerate(transcript.summary_labels):
-            point_id = self._make_point_id(transcript.session_id, "summary_label", i)
-            points.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=models.Document(
-                        text=label.label,
-                        model=INFERENCE_MODEL,
-                    ),
-                    payload={
-                        **base_payload,
-                        "type": "summary_label",
-                        "content_type": "summary_label",
-                        "content": label.label,
-                        "leaf_uuid": label.leaf_uuid,
-                        "chunk_index": i,
-                    },
-                )
-            )
-
-        # 4. User messages (first 5 for intent matching)
+        # 2. User messages - compare by content hash
         max_user_messages = 5
         for i, msg in enumerate(transcript.user_messages[:max_user_messages]):
             if not msg.content or len(msg.content) < 20:
                 continue
-            point_id = self._make_point_id(transcript.session_id, "user_message", i)
-            points.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=models.Document(
-                        text=msg.content[:2000],  # Limit for embedding
-                        model=INFERENCE_MODEL,
-                    ),
-                    payload={
-                        **base_payload,
-                        "type": "user_message",
-                        "content_type": "user_message",
-                        "content": msg.content,
-                        "chunk_index": i,
-                    },
+            msg_hash = content_hash(msg.content)
+            if indexed.get(("user_message", i)) != msg_hash:
+                point_id = self._make_point_id(transcript.session_id, "user_message", i)
+                points_to_index.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=models.Document(
+                            text=msg.content[:2000],
+                            model=INFERENCE_MODEL,
+                        ),
+                        payload={
+                            **base_payload,
+                            "type": "user_message",
+                            "content_type": "user_message",
+                            "content": msg.content,
+                            "chunk_index": i,
+                        },
+                    )
                 )
-            )
+                points_metadata.append(("user_message", i, msg_hash, point_id))
 
-        # 5. Transcript chunks (for full retrieval mode)
+        # 3. Agent summaries - compare by hash
+        for i, agent_summary in enumerate(transcript.agent_summaries):
+            summary_hash = content_hash(agent_summary.summary_text)
+            if indexed.get(("subagent_summary", i)) != summary_hash:
+                point_id = self._make_point_id(transcript.session_id, "subagent_summary", i)
+                points_to_index.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=models.Document(
+                            text=agent_summary.summary_text[:8000],
+                            model=INFERENCE_MODEL,
+                        ),
+                        payload={
+                            **base_payload,
+                            "type": "subagent_summary",
+                            "content_type": "subagent_summary",
+                            "content": agent_summary.summary_text,
+                            "agent_id": agent_summary.agent_id,
+                            "agent_type": agent_summary.agent_type,
+                            "chunk_index": i,
+                        },
+                    )
+                )
+                points_metadata.append(("subagent_summary", i, summary_hash, point_id))
+
+        # 4. Summary labels - compare by hash
+        for i, label in enumerate(transcript.summary_labels):
+            label_hash = content_hash(label.label)
+            if indexed.get(("summary_label", i)) != label_hash:
+                point_id = self._make_point_id(transcript.session_id, "summary_label", i)
+                points_to_index.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=models.Document(
+                            text=label.label,
+                            model=INFERENCE_MODEL,
+                        ),
+                        payload={
+                            **base_payload,
+                            "type": "summary_label",
+                            "content_type": "summary_label",
+                            "content": label.label,
+                            "leaf_uuid": label.leaf_uuid,
+                            "chunk_index": i,
+                        },
+                    )
+                )
+                points_metadata.append(("summary_label", i, label_hash, point_id))
+
+        # 5. Chunks - compare by hash (handles boundary drift)
         transcript_chunks = chunk_text(
             transcript.full_text,
             chunk_size=self.config.chunk_size,
@@ -346,27 +370,29 @@ class SessionIndexer:
         for i, chunk in enumerate(transcript_chunks):
             if not chunk.strip():
                 continue
-
-            point_id = self._make_point_id(transcript.session_id, "chunk", i)
-            points.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=models.Document(
-                        text=chunk[:4000],  # Limit for embedding
-                        model=INFERENCE_MODEL,
-                    ),
-                    payload={
-                        **base_payload,
-                        "type": "chunk",
-                        "content_type": "chunk",
-                        "content": chunk,
-                        "chunk_index": i,
-                        "total_chunks": len(transcript_chunks),
-                    },
+            chunk_hash = content_hash(chunk)
+            if indexed.get(("chunk", i)) != chunk_hash:
+                point_id = self._make_point_id(transcript.session_id, "chunk", i)
+                points_to_index.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=models.Document(
+                            text=chunk[:4000],
+                            model=INFERENCE_MODEL,
+                        ),
+                        payload={
+                            **base_payload,
+                            "type": "chunk",
+                            "content_type": "chunk",
+                            "content": chunk,
+                            "chunk_index": i,
+                            "total_chunks": len(transcript_chunks),
+                        },
+                    )
                 )
-            )
+                points_metadata.append(("chunk", i, chunk_hash, point_id))
 
-        return points
+        return points_to_index, points_metadata
 
     def index_all_sessions(
         self,
