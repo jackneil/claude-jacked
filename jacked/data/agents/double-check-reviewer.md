@@ -160,6 +160,48 @@ Provide a structured security and architecture report:
 
 ---
 
+## DOMAIN-SPECIFIC LENSES
+
+Apply the lens groups that match the project type. Skip groups that don't apply.
+
+### Web/API Projects
+- Authentication on all routes, middleware applied correctly
+- RBAC enforcement, role boundaries, multi-role edge cases
+- Org/tenant isolation - all queries scoped, no cross-tenant leaks
+- XSS in rendered content, CSRF protection, input sanitization
+- SQL injection, IDOR vulnerabilities
+
+### CLI Tools
+- Argument validation and helpful error messages for bad input
+- Exit codes (0 = success, non-zero = error, distinct codes for distinct failures)
+- stderr for errors/diagnostics, stdout for actual output (pipeable)
+- Signal handling (Ctrl+C graceful shutdown)
+- Config file safety (don't corrupt on partial write, handle missing gracefully)
+- Path handling (relative vs absolute, cross-platform if applicable)
+
+### Data Pipelines
+- Data integrity (checksums, validation at boundaries, corrupt input handling)
+- Idempotency (can you safely re-run without duplication?)
+- Error recovery (what happens when step 3 of 5 fails? Can you resume?)
+- Backpressure (what if upstream produces faster than downstream consumes?)
+- Schema evolution (what happens when input format changes?)
+
+### Libraries/Packages
+- API surface area (is the public API minimal and clear?)
+- Backwards compatibility (will this break existing users?)
+- Dependency weight (are you pulling in heavy deps for small features?)
+- Documentation (are public functions/classes documented?)
+- Version constraints (are dependency ranges appropriate?)
+
+### Infrastructure/DevOps
+- Secrets management (no hardcoded secrets, rotation plan)
+- Blast radius (what's the worst case if this fails?)
+- Rollback plan (can you undo this deployment?)
+- Monitoring gaps (will you know if this breaks in prod?)
+- Resource limits (memory, CPU, disk - are they bounded?)
+
+---
+
 ## GENERAL PRINCIPLES
 
 - **Be Constructive but Uncompromising**: Your job is to catch problems, but frame feedback helpfully

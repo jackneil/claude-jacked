@@ -635,6 +635,8 @@ def _get_sound_command(hook_type: str) -> str:
 
 def _install_sound_hooks(existing: dict, settings_path: Path):
     """Install sound notification hooks."""
+    import json
+
     marker = _sound_hook_marker()
 
     # Notification hook
@@ -692,9 +694,280 @@ def _remove_sound_hooks(settings_path: Path) -> bool:
     return modified
 
 
+def _get_behavioral_rules() -> str:
+    """Load behavioral rules from data file."""
+    rules_path = _get_data_root() / "rules" / "jacked_behaviors.md"
+    if not rules_path.exists():
+        raise FileNotFoundError(f"Behavioral rules not found: {rules_path}")
+    return rules_path.read_text(encoding="utf-8").strip()
+
+
+def _behavioral_rules_marker() -> str:
+    """Start marker for jacked behavioral rules block."""
+    return "# jacked-behaviors-v2"
+
+
+def _behavioral_rules_end_marker() -> str:
+    """End marker for jacked behavioral rules block."""
+    return "# end-jacked-behaviors"
+
+
+def _install_behavioral_rules(claude_md_path: Path):
+    """Install behavioral rules into CLAUDE.md with marker boundaries.
+
+    - Show rules before writing, require confirmation
+    - Backup file before first modification
+    - Atomic write (build in memory, write once)
+    - Skip if already installed with same version
+    """
+    import shutil
+
+    try:
+        rules_text = _get_behavioral_rules()
+    except FileNotFoundError as e:
+        console.print(f"[red][FAIL][/red] {e}")
+        console.print("[yellow]Skipping behavioral rules installation[/yellow]")
+        return
+
+    start_marker = _behavioral_rules_marker()
+    end_marker = _behavioral_rules_end_marker()
+
+    # Read existing content
+    existing_content = ""
+    if claude_md_path.exists():
+        existing_content = claude_md_path.read_text(encoding="utf-8")
+
+    # Check if already installed (any version)
+    marker_prefix = "# jacked-behaviors-v"
+    has_start = marker_prefix in existing_content
+    has_end = end_marker in existing_content
+
+    # Orphaned marker detection: start without end (or end without start)
+    if has_start != has_end:
+        which = "start" if has_start else "end"
+        missing = "end" if has_start else "start"
+        console.print(f"[red][FAIL][/red] Found {which} marker but no {missing} marker in CLAUDE.md")
+        console.print("Your CLAUDE.md has a corrupted jacked rules block. Please fix it manually:")
+        console.print(f"  Start marker: {start_marker}")
+        console.print(f"  End marker: {end_marker}")
+        return
+
+    has_existing = has_start and has_end
+    if has_existing:
+        # Extract existing block (find the versioned start marker)
+        start_idx = existing_content.index(marker_prefix)
+        end_idx = existing_content.index(end_marker) + len(end_marker)
+        existing_block = existing_content[start_idx:end_idx].strip()
+
+        if existing_block == rules_text:
+            console.print("[yellow][-][/yellow] Behavioral rules already configured correctly")
+            return
+        else:
+            # Version upgrade needed
+            console.print("\n[bold]Behavioral rules update available:[/bold]")
+            console.print(f"[dim]{rules_text}[/dim]")
+            if not click.confirm("Update behavioral rules in CLAUDE.md?"):
+                console.print("[yellow][-][/yellow] Skipped behavioral rules update")
+                return
+
+            # Backup before modifying
+            backup_path = claude_md_path.with_suffix(".md.pre-jacked")
+            if not backup_path.exists():
+                shutil.copy2(claude_md_path, backup_path)
+                console.print(f"[dim]Backup: {backup_path}[/dim]")
+
+            # Replace the block (symmetric with _remove_behavioral_rules)
+            before = existing_content[:start_idx].rstrip("\n")
+            after = existing_content[end_idx:].lstrip("\n")
+            if before and after:
+                new_content = before + "\n\n" + rules_text + "\n\n" + after
+            elif before:
+                new_content = before + "\n\n" + rules_text + "\n"
+            else:
+                new_content = rules_text + "\n" + after if after else rules_text + "\n"
+            try:
+                claude_md_path.write_text(new_content, encoding="utf-8")
+            except PermissionError:
+                console.print(f"[red][FAIL][/red] Permission denied writing to {claude_md_path}")
+                console.print("Check file permissions and try again.")
+                return
+            console.print("[green][OK][/green] Updated behavioral rules to latest version")
+            return
+
+    # Fresh install - show and confirm
+    console.print("\n[bold]Proposed behavioral rules for ~/.claude/CLAUDE.md:[/bold]")
+    console.print(f"[dim]{rules_text}[/dim]")
+    if not click.confirm("Add these behavioral rules to your global CLAUDE.md?"):
+        console.print("[yellow][-][/yellow] Skipped behavioral rules")
+        return
+
+    # Backup before modifying (if file exists and no backup yet)
+    if claude_md_path.exists():
+        backup_path = claude_md_path.with_suffix(".md.pre-jacked")
+        if not backup_path.exists():
+            shutil.copy2(claude_md_path, backup_path)
+            console.print(f"[dim]Backup: {backup_path}[/dim]")
+
+    # Ensure parent directory exists
+    claude_md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build new content atomically
+    if existing_content and not existing_content.endswith("\n\n"):
+        if existing_content.endswith("\n"):
+            new_content = existing_content + "\n" + rules_text + "\n"
+        else:
+            new_content = existing_content + "\n\n" + rules_text + "\n"
+    else:
+        new_content = existing_content + rules_text + "\n"
+
+    try:
+        claude_md_path.write_text(new_content, encoding="utf-8")
+    except PermissionError:
+        console.print(f"[red][FAIL][/red] Permission denied writing to {claude_md_path}")
+        console.print("Check file permissions and try again.")
+        return
+    console.print("[green][OK][/green] Installed behavioral rules in CLAUDE.md")
+
+
+def _remove_behavioral_rules(claude_md_path: Path) -> bool:
+    """Remove jacked behavioral rules block from CLAUDE.md.
+
+    Returns True if rules were found and removed.
+    """
+    if not claude_md_path.exists():
+        return False
+
+    content = claude_md_path.read_text(encoding="utf-8")
+    marker_prefix = "# jacked-behaviors-v"
+    end_marker = _behavioral_rules_end_marker()
+
+    if marker_prefix not in content or end_marker not in content:
+        return False
+
+    start_idx = content.index(marker_prefix)
+    end_idx = content.index(end_marker) + len(end_marker)
+
+    # Strip the block and any extra blank lines around it
+    before = content[:start_idx].rstrip("\n")
+    after = content[end_idx:].lstrip("\n")
+
+    if before and after:
+        new_content = before + "\n\n" + after
+    elif before:
+        new_content = before + "\n"
+    else:
+        new_content = after
+
+    try:
+        claude_md_path.write_text(new_content, encoding="utf-8")
+    except PermissionError:
+        console.print(f"[red][FAIL][/red] Permission denied writing to {claude_md_path}")
+        return False
+    return True
+
+
+def _security_hook_marker() -> str:
+    """Marker to identify jacked security gatekeeper hooks."""
+    return "# jacked-security"
+
+
+def _get_security_prompt() -> str:
+    """Load security gatekeeper prompt from data file."""
+    prompt_path = _get_data_root() / "prompts" / "security_gatekeeper.txt"
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Security prompt not found: {prompt_path}")
+    return prompt_path.read_text(encoding="utf-8")
+
+
+def _install_security_hook(existing: dict, settings_path: Path):
+    """Install Opus-powered security gatekeeper hook for Bash commands.
+
+    Handles fresh install and version upgrades (detects stale prompts).
+    """
+    import json
+
+    marker = _security_hook_marker()
+
+    try:
+        prompt_text = _get_security_prompt()
+    except FileNotFoundError as e:
+        console.print(f"[red][FAIL][/red] {e}")
+        console.print("[yellow]Skipping security gatekeeper installation[/yellow]")
+        return
+
+    if "PermissionRequest" not in existing["hooks"]:
+        existing["hooks"]["PermissionRequest"] = []
+
+    # Check if already installed and whether it needs upgrading
+    hook_index = None
+    needs_upgrade = False
+    for i, hook_entry in enumerate(existing["hooks"]["PermissionRequest"]):
+        hook_str = str(hook_entry)
+        if marker in hook_str:
+            hook_index = i
+            # Check if installed prompt matches current version
+            for h in hook_entry.get("hooks", []):
+                installed_prompt = h.get("prompt", "")
+                if installed_prompt != prompt_text:
+                    needs_upgrade = True
+            break
+
+    if hook_index is not None and not needs_upgrade:
+        console.print("[yellow][-][/yellow] Security gatekeeper hook already configured")
+        return
+
+    hook_entry = {
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "prompt",
+            "prompt": prompt_text,
+            "model": "opus",
+            "timeout": 60,
+        }]
+    }
+
+    if hook_index is not None and needs_upgrade:
+        existing["hooks"]["PermissionRequest"][hook_index] = hook_entry
+        settings_path.write_text(json.dumps(existing, indent=2))
+        console.print("[green][OK][/green] Updated security gatekeeper prompt to latest version")
+    else:
+        existing["hooks"]["PermissionRequest"].append(hook_entry)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(existing, indent=2))
+        console.print("[green][OK][/green] Installed security gatekeeper (Opus evaluates Bash commands)")
+
+
+def _remove_security_hook(settings_path: Path) -> bool:
+    """Remove jacked security gatekeeper hook. Returns True if removed."""
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text())
+    marker = _security_hook_marker()
+
+    if "PermissionRequest" not in settings.get("hooks", {}):
+        return False
+
+    before = len(settings["hooks"]["PermissionRequest"])
+    settings["hooks"]["PermissionRequest"] = [
+        h for h in settings["hooks"]["PermissionRequest"]
+        if marker not in str(h)
+    ]
+    if len(settings["hooks"]["PermissionRequest"]) < before:
+        settings_path.write_text(json.dumps(settings, indent=2))
+        console.print("[green][OK][/green] Removed security gatekeeper hook")
+        return True
+
+    return False
+
+
 @main.command()
 @click.option("--sounds", is_flag=True, help="Install sound notification hooks")
-def install(sounds: bool):
+@click.option("--no-security", is_flag=True, help="Skip security gatekeeper hook")
+@click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
+def install(sounds: bool, no_security: bool, no_rules: bool):
     """Auto-install hook config, skill, agents, and commands."""
     import os
     import json
@@ -840,13 +1113,30 @@ def install(sounds: bool):
     if sounds:
         _install_sound_hooks(existing, settings_path)
 
+    # Install security gatekeeper (default on, --no-security to skip)
+    if not no_security:
+        _install_security_hook(existing, settings_path)
+
+    # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
+    if not no_rules:
+        claude_md_path = home / ".claude" / "CLAUDE.md"
+        _install_behavioral_rules(claude_md_path)
+
     console.print("\n[bold]Installation complete![/bold]")
     console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
     console.print("\nWhat you get:")
     console.print("  - /jacked - Search past Claude sessions")
-    console.print("  - /dc - Double-check reviewer")
+    console.print("  - /dc - Double-check reviewer (with grill mode)")
     console.print("  - /pr - PR workflow helper")
+    console.print("  - /learn - Distill lessons into CLAUDE.md rules")
+    console.print("  - /techdebt - Project tech debt audit")
+    console.print("  - /redo - Scrap and re-implement with hindsight")
+    console.print("  - /audit-rules - CLAUDE.md quality audit")
     console.print("  - 10 specialized agents (readme, wiki, tests, etc.)")
+    if not no_security:
+        console.print("  - Security gatekeeper (Opus evaluates Bash commands)")
+    if not no_rules:
+        console.print("  - Behavioral rules in CLAUDE.md (auto-triggers for jacked commands)")
     console.print("\nNext steps:")
     console.print("  1. Restart Claude Code (exit and run 'claude' again)")
     console.print("  2. Set environment variables (run 'jacked configure' for help)")
@@ -857,7 +1147,9 @@ def install(sounds: bool):
 @main.command()
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 @click.option("--sounds", is_flag=True, help="Remove only sound hooks")
-def uninstall(yes: bool, sounds: bool):
+@click.option("--security", is_flag=True, help="Remove only security gatekeeper hook")
+@click.option("--rules", is_flag=True, help="Remove only behavioral rules from CLAUDE.md")
+def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     """Remove jacked hooks, skill, agents, and commands from Claude Code."""
     import json
     import shutil
@@ -874,6 +1166,23 @@ def uninstall(yes: bool, sounds: bool):
             console.print("[yellow]No sound hooks found[/yellow]")
         return
 
+    # If --security flag, only remove security hook
+    if security:
+        if _remove_security_hook(settings_path):
+            console.print("[bold]Security gatekeeper removed![/bold]")
+        else:
+            console.print("[yellow]No security gatekeeper hook found[/yellow]")
+        return
+
+    # If --rules flag, only remove behavioral rules
+    if rules:
+        claude_md_path = home / ".claude" / "CLAUDE.md"
+        if _remove_behavioral_rules(claude_md_path):
+            console.print("[bold]Behavioral rules removed from CLAUDE.md![/bold]")
+        else:
+            console.print("[yellow]No behavioral rules found in CLAUDE.md[/yellow]")
+        return
+
     if not yes:
         if not click.confirm("Remove jacked from Claude Code? (This won't delete your Qdrant index)"):
             console.print("Cancelled")
@@ -881,8 +1190,12 @@ def uninstall(yes: bool, sounds: bool):
 
     console.print("[bold]Uninstalling Jacked...[/bold]\n")
 
-    # Also remove sound hooks during full uninstall
+    # Also remove sound, security hooks, and behavioral rules during full uninstall
     _remove_sound_hooks(settings_path)
+    _remove_security_hook(settings_path)
+    claude_md_path = home / ".claude" / "CLAUDE.md"
+    if _remove_behavioral_rules(claude_md_path):
+        console.print("[green][OK][/green] Removed behavioral rules from CLAUDE.md")
 
     # Remove Stop hook from settings.json
     if settings_path.exists():

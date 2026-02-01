@@ -15,6 +15,13 @@ When invoked, you must:
 
 Analyze these signals to determine phase:
 
+**GRILL MODE indicators:**
+Check BOTH `$ARGUMENTS` AND conversation history for these signals:
+User said or typed "grill me", "grill", "challenge me", "prove this works", "poke holes", "stress test this", "be adversarial"
+User wants to be questioned, not given a report
+This is interactive - NOT a static review
+Example: `/dc grill` or `/dc challenge me` should trigger grill mode
+
 **PLANNING PHASE indicators:**
 Recent discussion of architecture, design, or approach
 Plan documents or markdown files recently created/edited
@@ -36,6 +43,9 @@ Commit messages or PR preparation
 Code changes appear complete and coherent
 User asking for final verification
 
+**AMBIGUOUS/UNCLEAR indicators:**
+If conversation has signals from multiple phases or no clear signals at all, do NOT guess. Ask the user: "I can't tell what phase you're in. What would you like me to review?" and offer the options (planning, implementation, post-implementation, grill mode).
+
 ## SPAWNING INSTRUCTIONS
 
 Once you detect the phase, use the Task tool to spawn double-check-reviewer with these specific instructions:
@@ -43,7 +53,7 @@ Once you detect the phase, use the Task tool to spawn double-check-reviewer with
 ### FOR PLANNING PHASE:
 Review this plan with ultrathink depth. Ralph Wiggum style - appear simple but catch everything.
 
-Review lenses (RANDOMIZE ORDER, skip if N/A to this codebase):
+Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
 - Security: Auth bypass, privilege escalation, injection, data exposure
 - RBAC: Role boundaries enforced? Multi-role edge cases? Permission checks on all paths?
 - Org isolation: Cross-tenant data leakage? Queries always scoped to org?
@@ -57,7 +67,7 @@ STOP CONDITION: ALL applicable lenses must pass clean. If ANY fix is made, reset
 ### FOR IMPLEMENTATION PHASE:
 Review recent code changes with ultrathink depth. Ralph Wiggum style - innocent questions that expose real issues.
 
-Review lenses (RANDOMIZE ORDER, skip if N/A):
+Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
 - Attacker mindset: Auth bypass? Privilege escalation? Injection? IDOR?
 - RBAC audit: Every endpoint checks permissions? Multi-role users handled?
 - Org isolation: All queries scoped? No cross-tenant leakage possible?
@@ -81,7 +91,7 @@ Checklist (ALL must pass):
 [ ] No perf regressions
 [ ] Tests added/updated
 
-Review lenses (RANDOMIZE ORDER, skip N/A):
+Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
 - Requirements traceability: Does code match every requirement?
 - Defensive review: What assumptions might be wrong?
 - Fresh eyes: What would confuse someone seeing this first time?
@@ -90,6 +100,29 @@ Review lenses (RANDOMIZE ORDER, skip N/A):
 - Perf check: Queries efficient? Pagination where needed?
 
 STOP CONDITION: Checklist 100% AND all lenses pass. Any fix resets tracker.
+
+### FOR GRILL MODE:
+Do NOT spawn a subagent. Handle this directly as an interactive session.
+
+Become an adversarial interviewer. Think Socratic method meets senior engineer code review. Your goal is to stress-test the user's understanding and the design/implementation's robustness.
+
+Rules:
+- Ask ONE pointed question at a time. Wait for the answer.
+- Challenge weak answers. "That sounds reasonable" is not good enough - push for specifics.
+- Don't move on until you're satisfied or the user explicitly says to skip.
+- Cover these angles (pick the ones that apply):
+  - "What happens when X fails?" (failure modes)
+  - "How does this handle Y at scale?" (performance/load)
+  - "Walk me through the auth flow for Z" (security)
+  - "What if a user does A instead of B?" (edge cases)
+  - "Why this approach over [alternative]?" (design justification)
+  - "What's your rollback plan if this breaks?" (operational readiness)
+- After 5-8 questions (or when the user has survived), give a verdict:
+  - SOLID: "You've thought this through. Ship it."
+  - GAPS: "Here's what I'd tighten up before shipping: [list]"
+  - CONCERNING: "I'd rethink [specific area] before this goes out."
+
+Skip lenses/angles that don't apply to this type of project.
 
 ## MULTI-THREAD SPAWNING
 
