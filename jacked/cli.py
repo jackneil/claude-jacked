@@ -59,8 +59,8 @@ def _require_search(command_name: str) -> bool:
     except ImportError:
         console.print(f"[red]Error:[/red] '{command_name}' requires the search extra.")
         console.print('\nInstall it with:')
-        console.print('  [bold]pip install "claude-jacked[search]"[/bold]')
-        console.print('  [bold]pipx install "claude-jacked[search]"[/bold]')
+        console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
+        console.print('  [bold]pipx install "claude-jacked\[search]"[/bold]')
         return False
 
 
@@ -94,7 +94,7 @@ def index(session: Optional[str], repo: Optional[str]):
         else:
             console.print("[red]Error:[/red] 'index' requires the search extra.")
             console.print('\nInstall it with:')
-            console.print('  [bold]pip install "claude-jacked[search]"[/bold]')
+            console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
             sys.exit(1)
 
     from jacked.indexer import SessionIndexer
@@ -753,7 +753,7 @@ def _behavioral_rules_end_marker() -> str:
     return "# end-jacked-behaviors"
 
 
-def _install_behavioral_rules(claude_md_path: Path):
+def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
     """Install behavioral rules into CLAUDE.md with marker boundaries.
 
     - Show rules before writing, require confirmation
@@ -807,7 +807,7 @@ def _install_behavioral_rules(claude_md_path: Path):
             # Version upgrade needed
             console.print("\n[bold]Behavioral rules update available:[/bold]")
             console.print(f"[dim]{rules_text}[/dim]")
-            if not click.confirm("Update behavioral rules in CLAUDE.md?"):
+            if not force and not click.confirm("Update behavioral rules in CLAUDE.md?"):
                 console.print("[yellow][-][/yellow] Skipped behavioral rules update")
                 return
 
@@ -838,7 +838,7 @@ def _install_behavioral_rules(claude_md_path: Path):
     # Fresh install - show and confirm
     console.print("\n[bold]Proposed behavioral rules for ~/.claude/CLAUDE.md:[/bold]")
     console.print(f"[dim]{rules_text}[/dim]")
-    if not click.confirm("Add these behavioral rules to your global CLAUDE.md?"):
+    if not force and not click.confirm("Add these behavioral rules to your global CLAUDE.md?"):
         console.print("[yellow][-][/yellow] Skipped behavioral rules")
         return
 
@@ -1032,7 +1032,8 @@ def _remove_security_hook(settings_path: Path) -> bool:
 @click.option("--search", is_flag=True, help="Install session indexing hook (requires [search] extra)")
 @click.option("--security", is_flag=True, help="Install security gatekeeper hook (requires [security] extra)")
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
-def install(sounds: bool, search: bool, security: bool, no_rules: bool):
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing agents/commands without prompting")
+def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: bool):
     """Auto-install skill, agents, commands, and optional hooks.
 
     Base install: agents, commands, behavioral rules, /jacked skill.
@@ -1109,7 +1110,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool):
         else:
             console.print(f"[yellow][-][/yellow] Stop hook already configured")
     else:
-        console.print("[dim][-][/dim] Skipping session indexing hook (install [search] extra to enable)")
+        console.print("[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)")
 
     # Copy skill file with Python path templating
     # Claude Code expects skills in subdirectories with SKILL.md
@@ -1140,8 +1141,8 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool):
                 if src_content == dst_content:
                     skipped += 1
                     continue  # Same content, skip silently
-                # Different content - ask before overwriting
-                if not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
+                # Different content - ask before overwriting (unless --force)
+                if not force and not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
                     console.print(f"[yellow][-][/yellow] Skipped {agent_file.name}")
                     continue
             shutil.copy(agent_file, dst_file)
@@ -1168,8 +1169,8 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool):
                 if src_content == dst_content:
                     skipped += 1
                     continue  # Same content, skip silently
-                # Different content - ask before overwriting
-                if not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
+                # Different content - ask before overwriting (unless --force)
+                if not force and not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
                     console.print(f"[yellow][-][/yellow] Skipped {cmd_file.name}")
                     continue
             shutil.copy(cmd_file, dst_file)
@@ -1194,7 +1195,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool):
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
         claude_md_path = home / ".claude" / "CLAUDE.md"
-        _install_behavioral_rules(claude_md_path)
+        _install_behavioral_rules(claude_md_path, force=force)
 
     console.print("\n[bold]Installation complete![/bold]")
     console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
@@ -1223,9 +1224,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool):
         console.print("  4. Use '/jacked <description>' to search past sessions")
     else:
         console.print("\nOptional extras:")
-        console.print('  pip install "claude-jacked[search]"    # Session search via Qdrant')
-        console.print('  pip install "claude-jacked[security]"  # Auto-approve safe Bash commands')
-        console.print('  pip install "claude-jacked[all]"       # Everything')
+        console.print('  pip install "claude-jacked\[search]"    # Session search via Qdrant')
+        console.print('  pip install "claude-jacked\[security]"  # Auto-approve safe Bash commands')
+        console.print('  pip install "claude-jacked\[all]"       # Everything')
 
 
 @main.command()
