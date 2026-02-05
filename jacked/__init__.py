@@ -1,22 +1,42 @@
 """
-Claude Jacked - Cross-machine semantic search for Claude Code sessions.
+Claude Jacked - Smart reviewers, commands, and session search for Claude Code.
 
-This package provides tools to index, search, and retrieve context from past
-Claude Code sessions, enabling seamless context sharing across machines.
+Base install provides agents, commands, and behavioral rules.
+Install extras for additional features:
+  pip install "claude-jacked[search]"    — session search via Qdrant
+  pip install "claude-jacked[security]"  — security gatekeeper hook
+  pip install "claude-jacked[all]"       — everything
 """
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
-from jacked.config import SmartForkConfig
-from jacked.client import QdrantSessionClient
-from jacked.indexer import SessionIndexer
-from jacked.searcher import SessionSearcher
-from jacked.retriever import SessionRetriever
+
+def _qdrant_available() -> bool:
+    """Check if qdrant-client is installed."""
+    try:
+        import qdrant_client  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def __getattr__(name: str):
+    """Lazy imports for backwards compat — only works if [search] extra installed."""
+    _search_classes = {
+        "SmartForkConfig": "jacked.config",
+        "QdrantSessionClient": "jacked.client",
+        "SessionIndexer": "jacked.indexer",
+        "SessionSearcher": "jacked.searcher",
+        "SessionRetriever": "jacked.retriever",
+    }
+    if name in _search_classes:
+        import importlib
+        module = importlib.import_module(_search_classes[name])
+        return getattr(module, name)
+    raise AttributeError(f"module 'jacked' has no attribute {name!r}")
+
 
 __all__ = [
-    "SmartForkConfig",
-    "QdrantSessionClient",
-    "SessionIndexer",
-    "SessionSearcher",
-    "SessionRetriever",
+    "__version__",
+    "_qdrant_available",
 ]

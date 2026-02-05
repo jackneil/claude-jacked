@@ -1,15 +1,16 @@
 # claude-jacked
 
-**Never lose your Claude Code work again.** Search past conversations, share solutions with your team, and get AI-powered code reviews—all from within Claude Code.
+**Smart reviewers, quick commands, and session search for Claude Code.** Catch bugs before they ship, search past conversations, and auto-approve safe commands — all from within Claude Code.
 
 ---
 
 ## What You Get
 
-- **Find past solutions instantly** — "How did I fix that login bug last month?" Just ask, and get the answer.
-- **Work from any computer** — Start on your desktop, continue on your laptop. Your history follows you.
-- **Share knowledge with your team** — Your teammate already solved this problem. Find their solution in seconds.
 - **Catch mistakes before they ship** — Built-in reviewers check for security issues, complexity, and common bugs.
+- **Quick commands** — `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules` for common workflows.
+- **Find past solutions instantly** — Search past Claude sessions by meaning, not keywords. *(requires [search] extra)*
+- **Work from any computer** — Start on your desktop, continue on your laptop. *(requires [search] extra)*
+- **Auto-approve safe commands** — Security gatekeeper evaluates bash commands so you only get interrupted for risky ones. *(requires [security] extra)*
 - **Sound notifications** — Get audio alerts when Claude needs your attention or finishes a task.
 
 ---
@@ -21,6 +22,7 @@
 - [Using the Session Search](#using-the-session-search)
 - [Working with Your Team](#working-with-your-team)
 - [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
+- [Security Gatekeeper](#security-gatekeeper)
 - [Sound Notifications](#sound-notifications)
 - [Uninstall](#uninstall)
 - [Common Issues](#common-issues)
@@ -30,49 +32,81 @@
 
 ## Quick Start
 
-### Option 1: Let Claude Install It For You
+### Option 1: Let Claude Install It
 
-Copy this into Claude Code and it will handle everything:
+Copy this into Claude Code and it will walk you through the options:
 
 ```
-Install claude-jacked for me. Walk me through each step and help me set up Qdrant Cloud.
+Install claude-jacked for me. Use AskUserQuestion to ask me which features I want:
+
+1. First check if pipx and jacked are already installed
+2. Ask me which install tier I want:
+   - BASE: Smart reviewers, commands (/dc, /pr, /learn, etc.), behavioral rules
+   - SEARCH: Everything above + session search across machines (requires Qdrant Cloud ~$30/mo)
+   - SECURITY: Everything above + auto-approve safe bash commands (fewer permission prompts)
+   - ALL: Everything
+3. Install based on my choice:
+   - BASE: pipx install claude-jacked && jacked install
+   - SEARCH: pipx install "claude-jacked[search]" && jacked install
+   - SECURITY: pipx install "claude-jacked[security]" && jacked install --security
+   - ALL: pipx install "claude-jacked[all]" && jacked install --security
+4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
+5. Verify with: jacked --help
 ```
 
-### Option 2: One-Line Install
+### Option 2: Manual Install
 
-**Mac/Linux:**
-```bash
-curl -sSL https://raw.githubusercontent.com/jackneil/claude-jacked/master/install.sh | bash
-```
-
-**Windows (in Git Bash):**
-```bash
-curl -sSL https://raw.githubusercontent.com/jackneil/claude-jacked/master/install.sh | bash
-```
-
-After installing, you'll need to set up a free cloud database (Qdrant) to store your session history. The installer will guide you through this, or ask Claude to help: `"Help me set up Qdrant Cloud for jacked"`
-
-### Option 3: Manual Install
-
+**Core (reviewers, commands, behavioral rules):**
 ```bash
 pipx install claude-jacked
 jacked install
 ```
 
-Then follow the [cloud database setup](#cloud-database-setup-qdrant) instructions below.
+**Add session search (optional):**
+```bash
+pipx install "claude-jacked[search]"
+jacked install
+# Then set up Qdrant Cloud credentials (see below)
+```
+
+**Add security gatekeeper (optional):**
+```bash
+pipx install "claude-jacked[security]"
+jacked install --security
+```
+
+**Everything:**
+```bash
+pipx install "claude-jacked[all]"
+jacked install --security
+```
 
 ---
 
 ## What's Included
 
-When you run `jacked install`, you get:
+### Base (`pip install claude-jacked`)
+
+| Feature | What It Does |
+|---------|--------------|
+| **10 Smart Reviewers** | AI assistants that check your code for bugs, security issues, and complexity |
+| **Quick Commands** | `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules` |
+| **Behavioral Rules** | Auto-triggers for jacked commands, lesson tracking, plan-first workflow |
+| **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
+
+### Search Extra (`pip install "claude-jacked[search]"`)
 
 | Feature | What It Does |
 |---------|--------------|
 | **Session Search** | Find any past Claude conversation by describing what you were working on |
-| **10 Smart Reviewers** | AI assistants that check your code for bugs, security issues, and complexity |
-| **Quick Commands** | `/dc` for code review, `/pr` for pull request help |
+| **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
 | **Team Sharing** | Search your teammates' sessions (with their permission) |
+
+### Security Extra (`pip install "claude-jacked[security]"`)
+
+| Feature | What It Does |
+|---------|--------------|
+| **Security Gatekeeper** | Auto-approves safe bash commands, blocks dangerous ones, asks you about ambiguous ones |
 
 ---
 
@@ -160,7 +194,11 @@ Type these directly in Claude Code:
 | Command | What It Does |
 |---------|--------------|
 | `/dc` | **Double-check** — Reviews your recent work for bugs, security issues, and problems |
-| `/pr` | **Pull Request** — Helps organize your changes and create a clean PR |
+| `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
+| `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
+| `/redo` | **Redo** — Scraps the current approach and re-implements cleanly with full hindsight |
+| `/techdebt` | **Tech Debt** — Scans for TODOs, oversized files, missing tests, dead code |
+| `/audit-rules` | **Audit Rules** — Checks CLAUDE.md for duplicates, contradictions, stale rules |
 
 ### Smart Reviewers
 
@@ -176,6 +214,58 @@ These work automatically when Claude thinks they'd help, or you can ask for them
 **Example:** After building a new feature:
 ```
 Use the double-check reviewer to review what we just built
+```
+
+---
+
+## Security Gatekeeper
+
+The security gatekeeper is a PreToolUse hook that intercepts every bash command Claude runs and decides whether to auto-approve it or ask you first.
+
+### How It Works
+
+A 4-tier evaluation chain, fastest first:
+
+| Tier | Speed | What It Does |
+|------|-------|--------------|
+| **Deny patterns** | <1ms | Blocks dangerous commands (sudo, rm -rf /, disk wipe, etc.) |
+| **Permission rules** | <1ms | Checks commands already approved in your Claude settings |
+| **Local allowlist** | <1ms | Matches safe patterns (git, pytest, linting, docker, etc.) |
+| **LLM evaluation** | ~2s | Sends ambiguous commands to Haiku for safety evaluation |
+
+About 90% of commands resolve in under 2 milliseconds. The LLM tier also reads the contents of referenced Python/SQL/shell scripts and evaluates what the code actually does.
+
+### Install / Uninstall
+
+The security gatekeeper is opt-in. To enable it:
+
+```bash
+pip install "claude-jacked[security]"
+jacked install --security
+```
+
+To remove just the security hook:
+```bash
+jacked uninstall --security
+```
+
+### Debug Logging
+
+```bash
+# Always-on log (decisions only)
+cat ~/.claude/hooks-debug.log
+
+# Verbose debug mode
+export JACKED_HOOK_DEBUG=1
+```
+
+### Faster LLM Evaluation
+
+If you have an Anthropic API key, the gatekeeper uses the SDK directly (~2s) instead of the CLI fallback (~8s):
+
+```bash
+pip install anthropic               # or: pip install claude-jacked[security]
+export ANTHROPIC_API_KEY="sk-..."
 ```
 
 ---
@@ -249,6 +339,8 @@ Help me fix jacked path issues on Windows
 
 ## Cloud Database Setup (Qdrant)
 
+> **This is only needed if you installed the `[search]` extra.** The base install works fine without Qdrant.
+
 The session search feature stores your conversations in a cloud database so you can access them from any computer.
 
 ### Why Qdrant?
@@ -260,10 +352,11 @@ The session search feature stores your conversations in a cloud database so you 
 
 ### Setting Up Qdrant Cloud
 
-1. Go to [cloud.qdrant.io](https://cloud.qdrant.io) and create an account
-2. Create a new cluster (the paid tier ~$30/month is required for the search features)
-3. Copy your cluster URL and API key
-4. Add them to your shell profile:
+1. Install the search extra: `pip install "claude-jacked[search]"`
+2. Go to [cloud.qdrant.io](https://cloud.qdrant.io) and create an account
+3. Create a new cluster (the paid tier ~$30/month is required for the search features)
+4. Copy your cluster URL and API key
+5. Add them to your shell profile:
 
 **Mac/Linux** — Add to `~/.bashrc` or `~/.zshrc`:
 ```bash
@@ -273,7 +366,7 @@ export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
 
 **Windows** — Add to your environment variables, or add to `~/.bashrc` in Git Bash.
 
-5. Restart your terminal and run:
+6. Restart your terminal and run:
 ```bash
 jacked backfill    # Index your existing sessions
 jacked status      # Verify it's working
@@ -315,13 +408,16 @@ jacked delete <session_id>         # Remove from index
 jacked cleardb                     # Delete all your data
 
 # Setup
-jacked install                     # Install hooks, agents, commands
+jacked install                     # Install agents, commands, rules
+jacked install --search            # Also add session indexing hook
+jacked install --security          # Also add security gatekeeper hook
 jacked install --sounds            # Also add sound notifications
 jacked uninstall                   # Remove from Claude Code
 jacked uninstall --sounds          # Remove only sounds
-jacked backfill                    # Index all existing sessions
+jacked uninstall --security        # Remove only security hook
+jacked backfill                    # Index all existing sessions (requires [search])
 jacked backfill --force            # Re-index everything
-jacked status                      # Check connectivity
+jacked status                      # Check connectivity (requires [search])
 jacked configure --show            # Show current config
 ```
 
@@ -343,6 +439,8 @@ jacked configure --show            # Show current config
 | `JACKED_TEAMMATE_WEIGHT` | 0.8 | How much to weight teammate results |
 | `JACKED_OTHER_REPO_WEIGHT` | 0.7 | How much to weight other repos |
 | `JACKED_TIME_DECAY_HALFLIFE_WEEKS` | 35 | How fast old sessions lose relevance |
+| `JACKED_HOOK_DEBUG` | (unset) | Set to `1` for verbose security hook logging |
+| `ANTHROPIC_API_KEY` | (unset) | Enables fast (~2s) LLM evaluation in security hook |
 
 </details>
 
@@ -409,16 +507,32 @@ jacked configure --show            # Show current config
 <details>
 <summary><strong>Hook Configuration</strong></summary>
 
-The `jacked install` command adds this to `~/.claude/settings.json`:
+The `jacked install` command adds hooks to `~/.claude/settings.json` based on installed extras:
 
 ```json
+// With [search] extra installed:
 {
   "hooks": {
     "Stop": [{
       "matcher": "",
       "hooks": [{
         "type": "command",
-        "command": "jacked index --repo \"$CLAUDE_PROJECT_DIR\""
+        "command": "jacked index --repo \"$CLAUDE_PROJECT_DIR\"",
+        "async": true
+      }]
+    }]
+  }
+}
+
+// With --security flag:
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Bash",
+      "hooks": [{
+        "type": "command",
+        "command": "python /path/to/security_gatekeeper.py",
+        "timeout": 30
       }]
     }]
   }
@@ -433,26 +547,48 @@ The `jacked install` command adds this to `~/.claude/settings.json`:
 Copy this into Claude Code for a guided installation:
 
 ```
-Install claude-jacked for me. First check what's already set up, then help me with anything missing:
+Install claude-jacked for me. Use the AskUserQuestion tool to guide me through options.
 
-DIAGNOSTIC PHASE (run these first to see current state):
-- Detect my operating system
-- Check if pipx is installed: pipx --version
-- Check if jacked CLI is installed: jacked --version
-- Check if Qdrant credentials are set: echo $QDRANT_CLAUDE_SESSIONS_ENDPOINT
-- Check if hook is installed: look in ~/.claude/settings.json for "jacked index"
+PHASE 1 - DIAGNOSTICS:
+- Detect OS (Windows/Mac/Linux)
+- Check: pipx --version (if missing: pip install pipx && pipx ensurepath)
+- Check: jacked --version (to see if already installed)
+- Check ~/.claude/settings.json for existing hooks
 
-WINDOWS EXTRA CHECK (Git Bash doesn't inherit Windows System Environment):
-- If env vars NOT visible in bash, check Windows:
-  powershell.exe -Command "[System.Environment]::GetEnvironmentVariable('QDRANT_CLAUDE_SESSIONS_ENDPOINT', 'User')"
+PHASE 2 - ASK USER PREFERENCES:
+Use AskUserQuestion with these options:
 
-SETUP PHASE (only do steps that are missing):
-1. If no pipx: pip install pipx && pipx ensurepath
-2. If jacked not installed: pipx install claude-jacked && jacked install
-3. If no Qdrant credentials: walk me through cloud.qdrant.io setup
-4. If no indexed sessions: jacked backfill
+Question: "Which jacked features do you want?"
+Options:
+- BASE (Recommended): Smart reviewers (/dc, /pr, /learn, /redo, /techdebt), 10 agents, behavioral rules. No external services needed.
+- SEARCH: Everything in BASE + search past Claude sessions across machines. Requires Qdrant Cloud (~$30/mo).
+- SECURITY: Everything in BASE + auto-approve safe bash commands. Fewer permission prompts, uses Anthropic API.
+- ALL: Everything. Requires Qdrant Cloud + Anthropic API key for fastest security evaluation.
 
-VERIFY: jacked status && jacked configure --show
+PHASE 3 - INSTALL:
+Based on user choice:
+- BASE: pipx install claude-jacked && jacked install
+- SEARCH: pipx install "claude-jacked[search]" && jacked install
+- SECURITY: pipx install "claude-jacked[security]" && jacked install --security
+- ALL: pipx install "claude-jacked[all]" && jacked install --security
+
+PHASE 4 - POST-INSTALL (if SEARCH or ALL):
+Help user set up Qdrant Cloud:
+1. Go to cloud.qdrant.io, create account
+2. Create cluster (paid tier required)
+3. Copy endpoint URL and API key
+4. Add to shell profile:
+   export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://..."
+   export QDRANT_CLAUDE_SESSIONS_API_KEY="..."
+5. Restart terminal
+6. Run: jacked backfill
+
+PHASE 5 - VERIFY:
+- jacked --help (should show all commands)
+- jacked configure --show (if SEARCH installed)
+
+WINDOWS NOTE: If env vars not visible in Git Bash, check Windows system env vars:
+powershell.exe -Command "[System.Environment]::GetEnvironmentVariable('QDRANT_CLAUDE_SESSIONS_ENDPOINT', 'User')"
 ```
 
 </details>

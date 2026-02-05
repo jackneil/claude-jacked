@@ -41,3 +41,8 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+nul
+
+# Root-level test scripts (not part of test suite)
+/test_permission_hook*.py
+/test_permreq_*.py

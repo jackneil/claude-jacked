@@ -51,6 +51,19 @@ def get_config(quiet: bool = False) -> Optional[SmartForkConfig]:
         sys.exit(1)
 
 
+def _require_search(command_name: str) -> bool:
+    """Check if qdrant-client is installed. If not, print helpful error and return False."""
+    try:
+        import qdrant_client  # noqa: F401
+        return True
+    except ImportError:
+        console.print(f"[red]Error:[/red] '{command_name}' requires the search extra.")
+        console.print('\nInstall it with:')
+        console.print('  [bold]pip install "claude-jacked[search]"[/bold]')
+        console.print('  [bold]pipx install "claude-jacked[search]"[/bold]')
+        return False
+
+
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 def main(verbose: bool):
@@ -66,8 +79,24 @@ def index(session: Optional[str], repo: Optional[str]):
     Index a Claude session to Qdrant.
 
     If SESSION is not provided, indexes the current session (from CLAUDE_SESSION_ID).
+    Requires: pip install "claude-jacked[search]"
     """
     import os
+
+    # Check if qdrant is available
+    try:
+        import qdrant_client  # noqa: F401
+    except ImportError:
+        # If called from Stop hook (CLAUDE_SESSION_ID set), exit silently
+        # If called manually, show helpful message
+        if os.getenv("CLAUDE_SESSION_ID") and not session:
+            sys.exit(0)
+        else:
+            console.print("[red]Error:[/red] 'index' requires the search extra.")
+            console.print('\nInstall it with:')
+            console.print('  [bold]pip install "claude-jacked[search]"[/bold]')
+            sys.exit(1)
+
     from jacked.indexer import SessionIndexer
 
     # Try to get config quietly - if not configured, nudge and exit cleanly
@@ -145,7 +174,10 @@ def index(session: Optional[str], repo: Optional[str]):
 @click.option("--repo", "-r", help="Filter by repository name pattern")
 @click.option("--force", "-f", is_flag=True, help="Re-index all sessions")
 def backfill(repo: Optional[str], force: bool):
-    """Index all existing Claude sessions."""
+    """Index all existing Claude sessions. Requires: pip install "claude-jacked[search]" """
+    if not _require_search("backfill"):
+        sys.exit(1)
+
     from jacked.indexer import SessionIndexer
 
     config = get_config()
@@ -187,9 +219,11 @@ def backfill(repo: Optional[str], force: bool):
 def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Optional[str], content_types: tuple):
     """Search for sessions by semantic similarity with multi-factor ranking.
 
-    By default, searches plan, subagent_summary, summary_label, and user_message content.
-    Use --type to filter to specific content types.
+    Requires: pip install "claude-jacked[search]"
     """
+    if not _require_search("search"):
+        sys.exit(1)
+
     import os
     from jacked.searcher import SessionSearcher
 
@@ -304,13 +338,11 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 def retrieve(session_id: str, output: Optional[str], summary: bool, mode: str, max_tokens: int, inject: bool):
     """Retrieve a session's context with smart mode support.
 
-    Modes:
-      smart  - Plan + agent summaries + labels + user messages (default)
-      plan   - Just the plan file
-      labels - Just summary labels (tiny)
-      agents - All subagent summaries
-      full   - Everything including full transcript
+    Requires: pip install "claude-jacked[search]"
     """
+    if not _require_search("retrieve"):
+        sys.exit(1)
+
     from jacked.retriever import SessionRetriever
 
     config = get_config()
@@ -381,7 +413,10 @@ def retrieve(session_id: str, output: Optional[str], summary: bool, mode: str, m
 @click.option("--repo", "-r", help="Filter by repository path")
 @click.option("--limit", "-n", default=20, help="Maximum results")
 def list_sessions(repo: Optional[str], limit: int):
-    """List indexed sessions."""
+    """List indexed sessions. Requires: pip install "claude-jacked[search]" """
+    if not _require_search("sessions"):
+        sys.exit(1)
+
     from jacked.client import QdrantSessionClient
 
     config = get_config()
@@ -419,7 +454,10 @@ def list_sessions(repo: Optional[str], limit: int):
 @click.argument("session_id")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 def delete(session_id: str, yes: bool):
-    """Delete a session from the index."""
+    """Delete a session from the index. Requires: pip install "claude-jacked[search]" """
+    if not _require_search("delete"):
+        sys.exit(1)
+
     from jacked.client import QdrantSessionClient
 
     config = get_config()
@@ -439,9 +477,11 @@ def cleardb():
     """
     Delete ALL your indexed data from Qdrant.
 
-    Only deletes YOUR data (matching your user_name), not teammates' data.
-    Use this before re-indexing with a new schema or to start fresh.
+    Requires: pip install "claude-jacked[search]"
     """
+    if not _require_search("cleardb"):
+        sys.exit(1)
+
     from jacked.client import QdrantSessionClient
 
     config = get_config()
@@ -480,7 +520,10 @@ def cleardb():
 
 @main.command()
 def status():
-    """Show indexing health and Qdrant connectivity."""
+    """Show indexing health and Qdrant connectivity. Requires: pip install "claude-jacked[search]" """
+    if not _require_search("status"):
+        sys.exit(1)
+
     from jacked.client import QdrantSessionClient
 
     config = get_config()
@@ -582,8 +625,6 @@ def configure(show: bool):
     console.print("[dim]Run 'jacked configure --show' to see current values[/dim]")
 
 
-# Import for configure command
-from jacked.config import SmartForkConfig
 
 
 def _get_data_root() -> Path:
@@ -871,44 +912,61 @@ def _security_hook_marker() -> str:
     return "# jacked-security"
 
 
-def _get_security_prompt() -> str:
-    """Load security gatekeeper prompt from data file."""
-    prompt_path = _get_data_root() / "prompts" / "security_gatekeeper.txt"
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"Security prompt not found: {prompt_path}")
-    return prompt_path.read_text(encoding="utf-8")
-
 
 def _install_security_hook(existing: dict, settings_path: Path):
-    """Install Opus-powered security gatekeeper hook for Bash commands.
+    """Install security gatekeeper command hook for Bash PreToolUse events.
 
-    Handles fresh install and version upgrades (detects stale prompts).
+    Uses a PreToolUse command hook (blocking) that calls a Python script.
+    The script evaluates commands via local rules, Anthropic API, or claude -p
+    and returns permissionDecision:"allow" to auto-approve safe commands.
+
+    Handles fresh install, version upgrades, and migration from PermissionRequest.
     """
     import json
+    import shutil
 
     marker = _security_hook_marker()
+    script_path = _get_data_root() / "hooks" / "security_gatekeeper.py"
 
-    try:
-        prompt_text = _get_security_prompt()
-    except FileNotFoundError as e:
-        console.print(f"[red][FAIL][/red] {e}")
+    if not script_path.exists():
+        console.print(f"[red][FAIL][/red] Security gatekeeper script not found: {script_path}")
         console.print("[yellow]Skipping security gatekeeper installation[/yellow]")
         return
 
-    if "PermissionRequest" not in existing["hooks"]:
-        existing["hooks"]["PermissionRequest"] = []
+    # Find python executable — prefer the one running this process
+    python_exe = sys.executable
+    if not python_exe or not Path(python_exe).exists():
+        python_exe = shutil.which("python3") or shutil.which("python") or "python"
+
+    # Use forward slashes for the command (works on Windows too)
+    python_path = str(Path(python_exe)).replace("\\", "/")
+    script_str = str(script_path).replace("\\", "/")
+    command_str = f"{python_path} {script_str}"
+
+    # Migrate: remove old PermissionRequest hooks with our marker
+    if "PermissionRequest" in existing.get("hooks", {}):
+        old_hooks = existing["hooks"]["PermissionRequest"]
+        before = len(old_hooks)
+        existing["hooks"]["PermissionRequest"] = [
+            h for h in old_hooks
+            if marker not in str(h) and "security_gatekeeper" not in str(h)
+        ]
+        if len(existing["hooks"]["PermissionRequest"]) < before:
+            console.print("[green][OK][/green] Migrated security hook from PermissionRequest to PreToolUse")
+
+    if "PreToolUse" not in existing["hooks"]:
+        existing["hooks"]["PreToolUse"] = []
 
     # Check if already installed and whether it needs upgrading
     hook_index = None
     needs_upgrade = False
-    for i, hook_entry in enumerate(existing["hooks"]["PermissionRequest"]):
+    for i, hook_entry in enumerate(existing["hooks"]["PreToolUse"]):
         hook_str = str(hook_entry)
-        if marker in hook_str:
+        if marker in hook_str or "security_gatekeeper" in hook_str:
             hook_index = i
-            # Check if installed prompt matches current version
             for h in hook_entry.get("hooks", []):
-                installed_prompt = h.get("prompt", "")
-                if installed_prompt != prompt_text:
+                installed_cmd = h.get("command", "")
+                if installed_cmd != command_str:
                     needs_upgrade = True
             break
 
@@ -919,26 +977,28 @@ def _install_security_hook(existing: dict, settings_path: Path):
     hook_entry = {
         "matcher": "Bash",
         "hooks": [{
-            "type": "prompt",
-            "prompt": prompt_text,
-            "model": "opus",
-            "timeout": 60,
+            "type": "command",
+            "command": command_str,
+            "timeout": 30,
         }]
     }
 
     if hook_index is not None and needs_upgrade:
-        existing["hooks"]["PermissionRequest"][hook_index] = hook_entry
+        existing["hooks"]["PreToolUse"][hook_index] = hook_entry
         settings_path.write_text(json.dumps(existing, indent=2))
-        console.print("[green][OK][/green] Updated security gatekeeper prompt to latest version")
+        console.print("[green][OK][/green] Updated security gatekeeper to latest version")
     else:
-        existing["hooks"]["PermissionRequest"].append(hook_entry)
+        existing["hooks"]["PreToolUse"].append(hook_entry)
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(json.dumps(existing, indent=2))
-        console.print("[green][OK][/green] Installed security gatekeeper (Opus evaluates Bash commands)")
+        console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse, blocking)")
 
 
 def _remove_security_hook(settings_path: Path) -> bool:
-    """Remove jacked security gatekeeper hook. Returns True if removed."""
+    """Remove jacked security gatekeeper hook. Returns True if removed.
+
+    Checks both PreToolUse (current) and PermissionRequest (legacy).
+    """
     import json
 
     if not settings_path.exists():
@@ -946,16 +1006,20 @@ def _remove_security_hook(settings_path: Path) -> bool:
 
     settings = json.loads(settings_path.read_text())
     marker = _security_hook_marker()
+    modified = False
 
-    if "PermissionRequest" not in settings.get("hooks", {}):
-        return False
+    for hook_type in ["PreToolUse", "PermissionRequest"]:
+        if hook_type not in settings.get("hooks", {}):
+            continue
+        before = len(settings["hooks"][hook_type])
+        settings["hooks"][hook_type] = [
+            h for h in settings["hooks"][hook_type]
+            if marker not in str(h)
+        ]
+        if len(settings["hooks"][hook_type]) < before:
+            modified = True
 
-    before = len(settings["hooks"]["PermissionRequest"])
-    settings["hooks"]["PermissionRequest"] = [
-        h for h in settings["hooks"]["PermissionRequest"]
-        if marker not in str(h)
-    ]
-    if len(settings["hooks"]["PermissionRequest"]) < before:
+    if modified:
         settings_path.write_text(json.dumps(settings, indent=2))
         console.print("[green][OK][/green] Removed security gatekeeper hook")
         return True
@@ -965,10 +1029,16 @@ def _remove_security_hook(settings_path: Path) -> bool:
 
 @main.command()
 @click.option("--sounds", is_flag=True, help="Install sound notification hooks")
-@click.option("--no-security", is_flag=True, help="Skip security gatekeeper hook")
+@click.option("--search", is_flag=True, help="Install session indexing hook (requires [search] extra)")
+@click.option("--security", is_flag=True, help="Install security gatekeeper hook (requires [security] extra)")
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
-def install(sounds: bool, no_security: bool, no_rules: bool):
-    """Auto-install hook config, skill, agents, and commands."""
+def install(sounds: bool, search: bool, security: bool, no_rules: bool):
+    """Auto-install skill, agents, commands, and optional hooks.
+
+    Base install: agents, commands, behavioral rules, /jacked skill.
+    Use --search to add session indexing (requires qdrant-client).
+    Use --security to add security gatekeeper (requires anthropic SDK).
+    """
     import os
     import json
     import shutil
@@ -976,24 +1046,16 @@ def install(sounds: bool, no_security: bool, no_rules: bool):
     home = Path.home()
     pkg_root = _get_data_root()
 
-    # Hook configuration - assumes jacked is on PATH (installed via pipx)
-    # async: True runs indexing in background so Claude Code doesn't wait
-    hook_config = {
-        "hooks": {
-            "Stop": [
-                {
-                    "matcher": "",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": 'jacked index --repo "$CLAUDE_PROJECT_DIR"',
-                            "async": True
-                        }
-                    ]
-                }
-            ]
-        }
-    }
+    # Auto-detect extras: if the package is installed, enable by default
+    has_qdrant = False
+    try:
+        import qdrant_client  # noqa: F401
+        has_qdrant = True
+    except ImportError:
+        pass
+
+    install_search = search or has_qdrant
+    install_security = security
 
     console.print("[bold]Installing Jacked...[/bold]\n")
 
@@ -1007,37 +1069,47 @@ def install(sounds: bool, no_security: bool, no_rules: bool):
     else:
         existing = {}
 
-    # Merge hook config
     if "hooks" not in existing:
         existing["hooks"] = {}
     if "Stop" not in existing["hooks"]:
         existing["hooks"]["Stop"] = []
 
-    # Check if hook already exists and if it needs updating
-    hook_index = None
-    needs_async_update = False
-    for i, hook_entry in enumerate(existing["hooks"]["Stop"]):
-        for h in hook_entry.get("hooks", []):
-            if "jacked" in h.get("command", ""):
-                hook_index = i
-                # Check if async is missing or false
-                if not h.get("async"):
-                    needs_async_update = True
-                break
+    # Stop hook for session indexing — only if search extra available
+    if install_search:
+        hook_config_stop = {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": 'jacked index --repo "$CLAUDE_PROJECT_DIR"',
+                    "async": True
+                }
+            ]
+        }
 
-    if hook_index is None:
-        # No hook exists - add it
-        existing["hooks"]["Stop"].append(hook_config["hooks"]["Stop"][0])
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps(existing, indent=2))
-        console.print(f"[green][OK][/green] Added Stop hook to {settings_path}")
-    elif needs_async_update:
-        # Hook exists but needs async: true
-        existing["hooks"]["Stop"][hook_index] = hook_config["hooks"]["Stop"][0]
-        settings_path.write_text(json.dumps(existing, indent=2))
-        console.print(f"[green][OK][/green] Updated Stop hook with async: true")
+        hook_index = None
+        needs_async_update = False
+        for i, hook_entry in enumerate(existing["hooks"]["Stop"]):
+            for h in hook_entry.get("hooks", []):
+                if "jacked" in h.get("command", ""):
+                    hook_index = i
+                    if not h.get("async"):
+                        needs_async_update = True
+                    break
+
+        if hook_index is None:
+            existing["hooks"]["Stop"].append(hook_config_stop)
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            settings_path.write_text(json.dumps(existing, indent=2))
+            console.print(f"[green][OK][/green] Added Stop hook (session indexing)")
+        elif needs_async_update:
+            existing["hooks"]["Stop"][hook_index] = hook_config_stop
+            settings_path.write_text(json.dumps(existing, indent=2))
+            console.print(f"[green][OK][/green] Updated Stop hook with async: true")
+        else:
+            console.print(f"[yellow][-][/yellow] Stop hook already configured")
     else:
-        console.print(f"[yellow][-][/yellow] Stop hook already configured correctly")
+        console.print("[dim][-][/dim] Skipping session indexing hook (install [search] extra to enable)")
 
     # Copy skill file with Python path templating
     # Claude Code expects skills in subdirectories with SKILL.md
@@ -1113,9 +1185,11 @@ def install(sounds: bool, no_security: bool, no_rules: bool):
     if sounds:
         _install_sound_hooks(existing, settings_path)
 
-    # Install security gatekeeper (default on, --no-security to skip)
-    if not no_security:
+    # Install security gatekeeper — only if --security flag passed
+    if install_security:
         _install_security_hook(existing, settings_path)
+    else:
+        console.print("[dim][-][/dim] Skipping security gatekeeper (use --security to enable)")
 
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
@@ -1126,22 +1200,32 @@ def install(sounds: bool, no_security: bool, no_rules: bool):
     console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
     console.print("\nWhat you get:")
     console.print("  - /jacked - Search past Claude sessions")
-    console.print("  - /dc - Double-check reviewer (with grill mode)")
+    console.print("  - /dc - Double-check reviewer")
     console.print("  - /pr - PR workflow helper")
     console.print("  - /learn - Distill lessons into CLAUDE.md rules")
     console.print("  - /techdebt - Project tech debt audit")
     console.print("  - /redo - Scrap and re-implement with hindsight")
     console.print("  - /audit-rules - CLAUDE.md quality audit")
     console.print("  - 10 specialized agents (readme, wiki, tests, etc.)")
-    if not no_security:
-        console.print("  - Security gatekeeper (Opus evaluates Bash commands)")
+    if install_search:
+        console.print("  - Session indexing hook (auto-indexes after each response)")
+    if install_security:
+        console.print("  - Security gatekeeper (auto-approves safe Bash commands)")
     if not no_rules:
-        console.print("  - Behavioral rules in CLAUDE.md (auto-triggers for jacked commands)")
+        console.print("  - Behavioral rules in CLAUDE.md")
+
+    # Show next steps based on what's installed
     console.print("\nNext steps:")
     console.print("  1. Restart Claude Code (exit and run 'claude' again)")
-    console.print("  2. Set environment variables (run 'jacked configure' for help)")
-    console.print("  3. Run 'jacked backfill' to index existing sessions")
-    console.print("  4. Use '/jacked <description>' in Claude to search past sessions")
+    if install_search:
+        console.print("  2. Set Qdrant credentials (run 'jacked configure' for help)")
+        console.print("  3. Run 'jacked backfill' to index existing sessions")
+        console.print("  4. Use '/jacked <description>' to search past sessions")
+    else:
+        console.print("\nOptional extras:")
+        console.print('  pip install "claude-jacked[search]"    # Session search via Qdrant')
+        console.print('  pip install "claude-jacked[security]"  # Auto-approve safe Bash commands')
+        console.print('  pip install "claude-jacked[all]"       # Everything')
 
 
 @main.command()

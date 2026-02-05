@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-jacked"
-version = "0.2.9"
-description = "Cross-machine semantic search for Claude Code sessions"
+version = "0.3.0"
+description = "Smart reviewers, commands, and session search for Claude Code"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -23,16 +23,27 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "qdrant-client>=1.7.0",
     "click>=8.0.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
+search = [
+    "qdrant-client>=1.7.0",
+]
+security = [
+    "anthropic>=0.40.0",
+]
+all = [
+    "qdrant-client>=1.7.0",
+    "anthropic>=0.40.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "qdrant-client>=1.7.0",
+    "anthropic>=0.40.0",
 ]
 
 [project.scripts]
@@ -45,6 +56,9 @@ Issues = "https://github.com/jackneil/claude-jacked/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["jacked"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"jacked/data" = "jacked/data"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
