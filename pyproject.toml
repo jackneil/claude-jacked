@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-jacked"
-version = "0.3.3"
+version = "0.3.4"
 description = "Smart reviewers, commands, and session search for Claude Code"
 readme = "README.md"
 license = "MIT"
