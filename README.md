@@ -52,6 +52,10 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
    - ALL: pipx install "claude-jacked[all]" && jacked install --force --security
 4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
 5. Verify with: jacked --help
+6. If I chose SECURITY or ALL, show me how to monitor the gatekeeper log:
+   - Mac/Linux: tail -f ~/.claude/hooks-debug.log
+   - Windows PowerShell: Get-Content ~\.claude\hooks-debug.log -Wait -Tail 20
+   - Windows Git Bash: tail -f ~/.claude/hooks-debug.log
 ```
 
 ### Option 2: Manual Install
@@ -251,11 +255,32 @@ jacked uninstall --security
 
 ### Debug Logging
 
-```bash
-# Always-on log (decisions only)
-cat ~/.claude/hooks-debug.log
+The security gatekeeper logs every decision to `~/.claude/hooks-debug.log`.
 
-# Verbose debug mode
+**Live monitoring (watch decisions in real-time):**
+
+Mac/Linux:
+```bash
+tail -f ~/.claude/hooks-debug.log
+```
+
+Windows (PowerShell):
+```powershell
+Get-Content ~\.claude\hooks-debug.log -Wait -Tail 20
+```
+
+Windows (Git Bash):
+```bash
+tail -f ~/.claude/hooks-debug.log
+```
+
+**Read full log:**
+```bash
+cat ~/.claude/hooks-debug.log
+```
+
+**Verbose debug mode** (logs extra detail about each evaluation tier):
+```bash
 export JACKED_HOOK_DEBUG=1
 ```
 
@@ -586,6 +611,10 @@ Help user set up Qdrant Cloud:
 PHASE 5 - VERIFY:
 - jacked --help (should show all commands)
 - jacked configure --show (if SEARCH installed)
+- If SECURITY or ALL: show user how to monitor gatekeeper decisions:
+  Mac/Linux: tail -f ~/.claude/hooks-debug.log
+  Windows PowerShell: Get-Content ~\.claude\hooks-debug.log -Wait -Tail 20
+  Windows Git Bash: tail -f ~/.claude/hooks-debug.log
 
 WINDOWS NOTE: If env vars not visible in Git Bash, check Windows system env vars:
 powershell.exe -Command "[System.Environment]::GetEnvironmentVariable('QDRANT_CLAUDE_SESSIONS_ENDPOINT', 'User')"
