@@ -64,14 +64,16 @@ SAFE_EXACT = {
 # e.g., C:/Users/jack/.conda/envs/krac_llm/python.exe → python
 PATH_STRIP_RE = re.compile(r'^(?:.*[/\\])?([^/\\]+?)(?:\.exe)?(?:\s|$)', re.IGNORECASE)
 
+# Strip leading env var assignments: HOME=/x PATH="/y:$PATH" cmd → cmd
+ENV_ASSIGN_RE = re.compile(r"""^(?:\w+=(?:"[^"]*"|'[^']*'|\S+)\s+)+""")
+
 # Universal safe: any command that just asks for version or help
 VERSION_HELP_RE = re.compile(r'^\S+\s+(-[Vv]|--version|-h|--help)\s*$')
 
-# Safe when python/node runs with -c and simple expressions or -m with safe modules
+# Safe: python -m with known safe modules only
+# No -c or -e patterns — arbitrary code execution can't be safely regex-matched
 SAFE_PYTHON_PATTERNS = [
-    re.compile(r'python[23]?(?:\.exe)?\s+-c\s+["\'](?:print|import\s|from\s)', re.IGNORECASE),
     re.compile(r'python[23]?(?:\.exe)?\s+-m\s+(?:pytest|pip|http\.server|json\.tool|venv|ensurepip)', re.IGNORECASE),
-    re.compile(r'node\s+-e\s+["\'](?:console\.log|process\.)', re.IGNORECASE),
 ]
 
 # Commands with these anywhere are dangerous
@@ -195,14 +197,18 @@ def check_permissions(command: str, cwd: str) -> bool:
     patterns.extend(_load_permissions(project_dir / ".claude" / "settings.json"))
     patterns.extend(_load_permissions(project_dir / ".claude" / "settings.local.json"))
 
+    cmd_core = _strip_env_prefix(command)
+    candidates = [command, cmd_core] if cmd_core != command else [command]
+
     for pat in patterns:
         prefix, is_wildcard = _parse_bash_pattern(pat)
-        if is_wildcard:
-            if command.startswith(prefix):
-                return True
-        else:
-            if command == prefix:
-                return True
+        for cmd in candidates:
+            if is_wildcard:
+                if cmd.startswith(prefix):
+                    return True
+            else:
+                if cmd == prefix:
+                    return True
 
     return False
 
@@ -223,9 +229,14 @@ def _get_base_command(command: str) -> str:
     return stripped
 
 
+def _strip_env_prefix(cmd: str) -> str:
+    """Strip leading env var assignments: HOME=/x PATH="/y" cmd → cmd"""
+    return ENV_ASSIGN_RE.sub('', cmd).strip()
+
+
 def local_evaluate(command: str) -> str | None:
     """Evaluate command locally. Returns 'YES', 'NO', or None (ambiguous)."""
-    cmd = command.strip()
+    cmd = _strip_env_prefix(command.strip())
     base = _get_base_command(cmd)
 
     # Check deny patterns first (on original command, not stripped)
@@ -353,11 +364,12 @@ def main():
 
     # Tier 0: Deny check FIRST — security always wins over permissions
     cmd_stripped = command.strip()
+    cmd_core = _strip_env_prefix(cmd_stripped)
     for pattern in DENY_PATTERNS:
-        if pattern.search(cmd_stripped):
+        if pattern.search(cmd_stripped) or pattern.search(cmd_core):
             elapsed = time.time() - start
             log(f"DENY MATCH ({elapsed:.3f}s)")
-            log(f"DECISION: PASS ({elapsed:.3f}s)")
+            log(f"DECISION: ASK USER ({elapsed:.3f}s)")
             sys.exit(0)
 
     # Tier 1: Check Claude's own permission rules
@@ -380,7 +392,7 @@ def main():
         # Shouldn't hit this since deny checked above, but just in case
         elapsed = time.time() - start
         log(f"LOCAL SAID: NO ({elapsed:.3f}s)")
-        log(f"DECISION: PASS ({elapsed:.3f}s)")
+        log(f"DECISION: ASK USER ({elapsed:.3f}s)")
         sys.exit(0)
 
     # Tier 3+4: API then CLI for ambiguous commands
@@ -396,7 +408,7 @@ def main():
     elapsed = time.time() - start
 
     if response is None:
-        log(f"DECISION: PASS (no response, {elapsed:.1f}s)")
+        log(f"DECISION: ASK USER (no response, {elapsed:.1f}s)")
         sys.exit(0)
 
     response_upper = response.upper()
@@ -406,7 +418,7 @@ def main():
         log(f"DECISION: ALLOW ({elapsed:.1f}s)")
         emit_allow()
     else:
-        log(f"DECISION: PASS ({elapsed:.1f}s)")
+        log(f"DECISION: ASK USER ({elapsed:.1f}s)")
 
     sys.exit(0)
 
