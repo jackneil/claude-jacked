@@ -128,6 +128,7 @@ NOT safe (return NO):
 - Destructive SQL: DROP, DELETE, UPDATE, INSERT, ALTER, TRUNCATE, GRANT, REVOKE, EXEC
 - Scripts calling shutil.rmtree, os.remove, os.system, subprocess with dangerous args
 - Encoded/obfuscated payloads, system config modification
+- Package installs from registries (pip install <pkg>, pipx install, npm install <pkg>, cargo install, gem install, go install) — executes arbitrary code from the internet. Only pip install -e (local editable) and pip install -r (from requirements file) are safe.
 - Anything you're unsure about
 
 IMPORTANT: When file contents are provided, evaluate what the code ACTUALLY DOES, not just function names.
