@@ -807,7 +807,7 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
             # Version upgrade needed
             console.print("\n[bold]Behavioral rules update available:[/bold]")
             console.print(f"[dim]{rules_text}[/dim]")
-            if not force and not click.confirm("Update behavioral rules in CLAUDE.md?"):
+            if not force and sys.stdin.isatty() and not click.confirm("Update behavioral rules in CLAUDE.md?"):
                 console.print("[yellow][-][/yellow] Skipped behavioral rules update")
                 return
 
@@ -838,7 +838,7 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
     # Fresh install - show and confirm
     console.print("\n[bold]Proposed behavioral rules for ~/.claude/CLAUDE.md:[/bold]")
     console.print(f"[dim]{rules_text}[/dim]")
-    if not force and not click.confirm("Add these behavioral rules to your global CLAUDE.md?"):
+    if not force and sys.stdin.isatty() and not click.confirm("Add these behavioral rules to your global CLAUDE.md?"):
         console.print("[yellow][-][/yellow] Skipped behavioral rules")
         return
 
@@ -1142,7 +1142,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                     skipped += 1
                     continue  # Same content, skip silently
                 # Different content - ask before overwriting (unless --force)
-                if not force and not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
+                if not force and sys.stdin.isatty() and not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
                     console.print(f"[yellow][-][/yellow] Skipped {agent_file.name}")
                     continue
             shutil.copy(agent_file, dst_file)
@@ -1170,7 +1170,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                     skipped += 1
                     continue  # Same content, skip silently
                 # Different content - ask before overwriting (unless --force)
-                if not force and not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
+                if not force and sys.stdin.isatty() and not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
                     console.print(f"[yellow][-][/yellow] Skipped {cmd_file.name}")
                     continue
             shutil.copy(cmd_file, dst_file)

@@ -46,10 +46,10 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
    - SECURITY: Everything above + auto-approve safe bash commands (fewer permission prompts)
    - ALL: Everything
 3. Install based on my choice:
-   - BASE: pipx install claude-jacked && jacked install
-   - SEARCH: pipx install "claude-jacked[search]" && jacked install
-   - SECURITY: pipx install "claude-jacked[security]" && jacked install --security
-   - ALL: pipx install "claude-jacked[all]" && jacked install --security
+   - BASE: pipx install claude-jacked && jacked install --force
+   - SEARCH: pipx install "claude-jacked[search]" && jacked install --force
+   - SECURITY: pipx install "claude-jacked[security]" && jacked install --force --security
+   - ALL: pipx install "claude-jacked[all]" && jacked install --force --security
 4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
 5. Verify with: jacked --help
 ```
@@ -59,26 +59,26 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
 **Core (reviewers, commands, behavioral rules):**
 ```bash
 pipx install claude-jacked
-jacked install
+jacked install --force
 ```
 
 **Add session search (optional):**
 ```bash
 pipx install "claude-jacked[search]"
-jacked install
+jacked install --force
 # Then set up Qdrant Cloud credentials (see below)
 ```
 
 **Add security gatekeeper (optional):**
 ```bash
 pipx install "claude-jacked[security]"
-jacked install --security
+jacked install --force --security
 ```
 
 **Everything:**
 ```bash
 pipx install "claude-jacked[all]"
-jacked install --security
+jacked install --force --security
 ```
 
 ---
@@ -241,7 +241,7 @@ The security gatekeeper is opt-in. To enable it:
 
 ```bash
 pip install "claude-jacked[security]"
-jacked install --security
+jacked install --force --security
 ```
 
 To remove just the security hook:
@@ -275,7 +275,7 @@ export ANTHROPIC_API_KEY="sk-..."
 Get audio alerts so you don't have to watch the terminal:
 
 ```bash
-jacked install --sounds
+jacked install --force --sounds
 ```
 
 - **Notification sound** — Plays when Claude needs your input
@@ -408,10 +408,10 @@ jacked delete <session_id>         # Remove from index
 jacked cleardb                     # Delete all your data
 
 # Setup
-jacked install                     # Install agents, commands, rules
-jacked install --search            # Also add session indexing hook
-jacked install --security          # Also add security gatekeeper hook
-jacked install --sounds            # Also add sound notifications
+jacked install --force              # Install agents, commands, rules
+jacked install --force --search    # Also add session indexing hook
+jacked install --force --security  # Also add security gatekeeper hook
+jacked install --force --sounds    # Also add sound notifications
 jacked uninstall                   # Remove from Claude Code
 jacked uninstall --sounds          # Remove only sounds
 jacked uninstall --security        # Remove only security hook
@@ -567,10 +567,10 @@ Options:
 
 PHASE 3 - INSTALL:
 Based on user choice:
-- BASE: pipx install claude-jacked && jacked install
-- SEARCH: pipx install "claude-jacked[search]" && jacked install
-- SECURITY: pipx install "claude-jacked[security]" && jacked install --security
-- ALL: pipx install "claude-jacked[all]" && jacked install --security
+- BASE: pipx install claude-jacked && jacked install --force
+- SEARCH: pipx install "claude-jacked[search]" && jacked install --force
+- SECURITY: pipx install "claude-jacked[security]" && jacked install --force --security
+- ALL: pipx install "claude-jacked[all]" && jacked install --force --security
 
 PHASE 4 - POST-INSTALL (if SEARCH or ALL):
 Help user set up Qdrant Cloud:
