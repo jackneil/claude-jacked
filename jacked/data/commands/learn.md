@@ -60,30 +60,23 @@ Bad examples:
 - there was a bug with the thing (not a rule)
 ```
 
-### Step 4: Show the User BEFORE Writing
+### Step 4: Write the Rule
 
-**This is mandatory. NEVER write to CLAUDE.md without showing the user first.**
-
-Present:
-1. **Proposed rule**: The exact text that would be appended
-2. **Existing related rules**: Any rules that overlap or conflict (quote them)
-3. **Target file**: Which CLAUDE.md file (project-level by default)
-
-Ask: "Should I add this rule to your project CLAUDE.md?"
-
-If the user wants it in the global `~/.claude/CLAUDE.md` instead, that's fine - but default to project-level (less blast radius).
-
-### Step 5: Write on Confirmation
+Act confidently. Do NOT ask the user for permission — just write the rule.
 
 - **APPEND-ONLY**: Add the rule to the end of the file. Never edit or remove existing rules.
+- Default to the global `~/.claude/CLAUDE.md` unless the lesson is clearly project-specific, in which case use the project-level CLAUDE.md.
 - If CLAUDE.md doesn't exist, create it with a header comment.
-- If you spotted conflicting rules in Step 2, remind the user they may want to reconcile them.
-- If the file has 50+ rules, suggest: "Your CLAUDE.md is getting long. Consider running a consolidation pass to merge overlapping rules."
+- If you spotted conflicting rules in Step 2, rewrite the conflicting rule to incorporate both (in-place edit, not duplicate).
+- If the file has 50+ rules, suggest running `/audit-rules` to consolidate.
+- If the lesson is graduating from `lessons.md`, remove or update the `lessons.md` entry after writing the CLAUDE.md rule.
+
+### Step 5: Report What You Did
+
+After writing, give a brief summary (1-2 lines) of what was added and where. Don't ask if it's OK — it's done.
 
 ## SAFETY RAILS
 
-- NEVER silently edit existing rules
-- NEVER write without explicit user confirmation
 - NEVER invent lessons from nothing - if the conversation has no clear lesson, say so
-- ALWAYS default to project-level CLAUDE.md
-- ALWAYS show conflicts before writing
+- NEVER duplicate an existing rule - update the existing one instead
+- ALWAYS default to global `~/.claude/CLAUDE.md` unless clearly project-specific
