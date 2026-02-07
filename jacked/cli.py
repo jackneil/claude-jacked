@@ -566,6 +566,23 @@ def status():
         ))
 
 
+@main.command(name="check-version")
+def check_version():
+    """Check if a newer version of claude-jacked is available on PyPI."""
+    from jacked import __version__
+    from jacked.version_check import check_version_cached
+
+    result = check_version_cached(__version__)
+    if result is None:
+        console.print("[yellow]Could not reach PyPI[/yellow]")
+        return
+    if result["outdated"]:
+        console.print(f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}")
+        console.print("Run: [bold]pipx upgrade claude-jacked[/bold]  or  [bold]pip install -U claude-jacked[/bold]")
+    else:
+        console.print(f"[green]Up to date:[/green] {__version__}")
+
+
 @main.command()
 @click.option("--show", "-s", is_flag=True, help="Show current configuration")
 def configure(show: bool):
@@ -993,20 +1010,27 @@ def _install_security_hook(existing: dict, settings_path: Path):
         settings_path.write_text(json.dumps(existing, indent=2))
         console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse, blocking)")
 
-    # Create customizable prompt file if it doesn't exist
+    # Clean up stale prompt file from older versions (v0.3.9 and earlier created
+    # this automatically, but it goes stale on upgrades and triggers warnings).
+    # Users who want a custom prompt can create it manually.
     from jacked.data.hooks import security_gatekeeper as gk
     prompt_path = Path.home() / ".claude" / "gatekeeper-prompt.txt"
-    if not prompt_path.exists():
-        prompt_path.write_text(gk.SECURITY_PROMPT, encoding="utf-8")
-        console.print("[green][OK][/green] Created gatekeeper prompt: ~/.claude/gatekeeper-prompt.txt")
-    else:
+    if prompt_path.exists():
         try:
-            if prompt_path.read_text(encoding="utf-8").strip() != gk.SECURITY_PROMPT.strip():
-                console.print("[yellow][-][/yellow] Custom gatekeeper prompt detected (not overwriting)")
+            existing_prompt = prompt_path.read_text(encoding="utf-8").strip()
+            # If it's an unmodified built-in prompt (current or stale), remove it
+            if existing_prompt == gk.SECURITY_PROMPT.strip():
+                prompt_path.unlink()
+                console.print("[dim][-][/dim] Removed default gatekeeper prompt (built-in is used automatically)")
             else:
-                console.print("[dim][-][/dim] Gatekeeper prompt unchanged")
+                # Check if it's a stale built-in that's missing required placeholders
+                if not all(p in existing_prompt for p in ["{command}", "{cwd}", "{file_context}"]):
+                    prompt_path.unlink()
+                    console.print("[yellow][OK][/yellow] Removed stale gatekeeper prompt (missing required placeholders)")
+                else:
+                    console.print("[yellow][-][/yellow] Custom gatekeeper prompt detected (not overwriting)")
         except Exception:
-            console.print("[dim][-][/dim] Gatekeeper prompt unchanged")
+            pass
 
 
 def _remove_security_hook(settings_path: Path) -> bool:
@@ -1029,7 +1053,7 @@ def _remove_security_hook(settings_path: Path) -> bool:
         before = len(settings["hooks"][hook_type])
         settings["hooks"][hook_type] = [
             h for h in settings["hooks"][hook_type]
-            if marker not in str(h)
+            if marker not in str(h) and "security_gatekeeper" not in str(h)
         ]
         if len(settings["hooks"][hook_type]) < before:
             modified = True
@@ -1037,6 +1061,22 @@ def _remove_security_hook(settings_path: Path) -> bool:
     if modified:
         settings_path.write_text(json.dumps(settings, indent=2))
         console.print("[green][OK][/green] Removed security gatekeeper hook")
+        # Clean up default prompt file but preserve genuinely customized ones
+        prompt_path = Path.home() / ".claude" / "gatekeeper-prompt.txt"
+        if prompt_path.exists():
+            try:
+                from jacked.data.hooks import security_gatekeeper as gk
+                existing_prompt = prompt_path.read_text(encoding="utf-8").strip()
+                if existing_prompt == gk.SECURITY_PROMPT.strip():
+                    prompt_path.unlink()
+                    console.print("[dim][-][/dim] Removed default gatekeeper prompt")
+                elif not all(p in existing_prompt for p in ["{command}", "{cwd}", "{file_context}"]):
+                    prompt_path.unlink()
+                    console.print("[dim][-][/dim] Removed stale gatekeeper prompt (missing placeholders)")
+                else:
+                    console.print("[yellow][-][/yellow] Keeping custom gatekeeper prompt file")
+            except Exception:
+                pass
         return True
 
     return False
@@ -1140,6 +1180,20 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print(f"[green][OK][/green] Installed skill: /jacked")
     else:
         console.print(f"[yellow][-][/yellow] Skill file not found at {skill_src}")
+
+    # Copy jacked reference doc (comprehensive knowledge for Claude about jacked)
+    ref_src = pkg_root / "rules" / "jacked-reference.md"
+    ref_dst = home / ".claude" / "jacked-reference.md"
+    if ref_src.exists():
+        src_content = ref_src.read_text(encoding="utf-8")
+        if ref_dst.exists():
+            dst_content = ref_dst.read_text(encoding="utf-8")
+            if src_content != dst_content:
+                shutil.copy(ref_src, ref_dst)
+                console.print("[green][OK][/green] Updated jacked reference doc")
+        else:
+            shutil.copy(ref_src, ref_dst)
+            console.print("[green][OK][/green] Installed jacked reference doc")
 
     # Copy agents (with conflict detection)
     agents_src = pkg_root / "agents"
@@ -1338,6 +1392,12 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         console.print(f"[green][OK][/green] Removed skill: /jacked")
     else:
         console.print(f"[yellow][-][/yellow] Skill not found")
+
+    # Remove jacked reference doc
+    ref_path = home / ".claude" / "jacked-reference.md"
+    if ref_path.exists():
+        ref_path.unlink()
+        console.print("[green][OK][/green] Removed jacked reference doc")
 
     # Remove only jacked-installed agents (not the whole directory!)
     agents_src = pkg_root / "agents"
