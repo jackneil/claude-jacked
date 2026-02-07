@@ -800,6 +800,241 @@ class TestSafeFormatter:
             gk._safe_fmt.format("{unknown_field}", command="ls")
 
 
+# ---------------------------------------------------------------------------
+# _increment_perms_counter — periodic nudge
+# ---------------------------------------------------------------------------
+
+class TestIncrementPermsCounter:
+    """Tests for the permission auto-approve counter and nudge."""
+
+    def test_creates_state_file(self, tmp_path):
+        state_path = tmp_path / "gatekeeper-state.json"
+        with patch.object(gk, 'STATE_PATH', state_path):
+            gk._increment_perms_counter()
+        assert state_path.exists()
+        state = json.loads(state_path.read_text())
+        assert state["perms_count"] == 1
+
+    def test_increments_existing_counter(self, tmp_path):
+        state_path = tmp_path / "gatekeeper-state.json"
+        state_path.write_text(json.dumps({"perms_count": 41}))
+        with patch.object(gk, 'STATE_PATH', state_path):
+            gk._increment_perms_counter()
+        state = json.loads(state_path.read_text())
+        assert state["perms_count"] == 42
+
+    def test_nudge_at_interval(self, tmp_path):
+        state_path = tmp_path / "gatekeeper-state.json"
+        state_path.write_text(json.dumps({"perms_count": 99}))
+        with patch.object(gk, 'STATE_PATH', state_path), \
+             patch.object(gk, 'AUDIT_NUDGE_INTERVAL', 100), \
+             patch.object(gk, 'log') as mock_log:
+            gk._increment_perms_counter()
+        # Should have logged the TIP
+        mock_log.assert_called_once()
+        assert "100 commands auto-approved" in mock_log.call_args[0][0]
+
+    def test_no_nudge_between_intervals(self, tmp_path):
+        state_path = tmp_path / "gatekeeper-state.json"
+        state_path.write_text(json.dumps({"perms_count": 50}))
+        with patch.object(gk, 'STATE_PATH', state_path), \
+             patch.object(gk, 'AUDIT_NUDGE_INTERVAL', 100), \
+             patch.object(gk, 'log') as mock_log:
+            gk._increment_perms_counter()
+        mock_log.assert_not_called()
+
+    def test_preserves_other_state_keys(self, tmp_path):
+        state_path = tmp_path / "gatekeeper-state.json"
+        state_path.write_text(json.dumps({"perms_count": 5, "other_key": "value"}))
+        with patch.object(gk, 'STATE_PATH', state_path):
+            gk._increment_perms_counter()
+        state = json.loads(state_path.read_text())
+        assert state["perms_count"] == 6
+        assert state["other_key"] == "value"
+
+    def test_handles_corrupted_state(self, tmp_path):
+        state_path = tmp_path / "gatekeeper-state.json"
+        state_path.write_text("not json")
+        with patch.object(gk, 'STATE_PATH', state_path):
+            # Should not raise
+            gk._increment_perms_counter()
+
+    def test_handles_missing_parent_dir(self, tmp_path):
+        state_path = tmp_path / "nonexistent" / "gatekeeper-state.json"
+        with patch.object(gk, 'STATE_PATH', state_path):
+            # Should not raise (swallowed by except)
+            gk._increment_perms_counter()
+
+
+# ---------------------------------------------------------------------------
+# CLI audit helpers — _classify_permission, _parse_log_for_perms_commands
+# ---------------------------------------------------------------------------
+
+class TestClassifyPermission:
+    """Tests for permission rule risk classification."""
+
+    def test_python_wildcard_is_warn(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(python:*)")
+        assert level == "WARN"
+        assert prefix == "python"
+        assert "code execution" in reason
+
+    def test_curl_wildcard_is_warn(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(curl:*)")
+        assert level == "WARN"
+        assert "exfiltration" in reason
+
+    def test_node_wildcard_is_warn(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(node:*)")
+        assert level == "WARN"
+
+    def test_bash_wildcard_is_warn(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(bash:*)")
+        assert level == "WARN"
+        assert "shell" in reason
+
+    def test_ssh_wildcard_is_warn(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(ssh:*)")
+        assert level == "WARN"
+
+    def test_cat_wildcard_is_info(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(cat:*)")
+        assert level == "INFO"
+
+    def test_grep_wildcard_is_ok(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(grep:*)")
+        assert level == "OK"
+
+    def test_git_wildcard_is_ok(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(git :*)")
+        assert level == "OK"
+
+    def test_gh_pr_list_wildcard_is_ok(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(gh pr list:*)")
+        assert level == "OK"
+
+    def test_exact_match_is_ok(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(git status)")
+        assert level == "OK"
+
+    def test_unknown_wildcard_is_info(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(sometool:*)")
+        assert level == "INFO"
+        assert "unrecognized" in reason
+
+    def test_rm_wildcard_is_warn(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(rm:*)")
+        assert level == "WARN"
+        assert "deletion" in reason
+
+    def test_powershell_wildcard_is_warn(self):
+        from jacked.cli import _classify_permission
+        level, prefix, reason = _classify_permission("Bash(powershell:*)")
+        assert level == "WARN"
+
+
+class TestExtractPrefixFromPattern:
+    """Tests for extracting command prefix from permission patterns."""
+
+    def test_simple_wildcard(self):
+        from jacked.cli import _extract_prefix_from_pattern
+        assert _extract_prefix_from_pattern("Bash(python:*)") == "python"
+
+    def test_wildcard_with_space(self):
+        from jacked.cli import _extract_prefix_from_pattern
+        assert _extract_prefix_from_pattern("Bash(git :*)") == "git"
+
+    def test_multi_word_wildcard(self):
+        from jacked.cli import _extract_prefix_from_pattern
+        assert _extract_prefix_from_pattern("Bash(gh pr list:*)") == "gh"
+
+    def test_exact_match(self):
+        from jacked.cli import _extract_prefix_from_pattern
+        assert _extract_prefix_from_pattern("Bash(git status)") == "git"
+
+
+class TestParseLogForPermsCommands:
+    """Tests for parsing hooks-debug.log for auto-approved commands."""
+
+    def test_extracts_commands(self, tmp_path):
+        from jacked.cli import _parse_log_for_perms_commands
+        log_file = tmp_path / "hooks-debug.log"
+        log_file.write_text(
+            "2025-01-01T00:00:00 EVALUATING: git push origin main\n"
+            "2025-01-01T00:00:00 PERMS MATCH (0.001s)\n"
+            "2025-01-01T00:00:00 DECISION: ALLOW (0.001s)\n"
+        )
+        commands = _parse_log_for_perms_commands(log_file, limit=50)
+        assert commands == ["git push origin main"]
+
+    def test_extracts_multiple(self, tmp_path):
+        from jacked.cli import _parse_log_for_perms_commands
+        log_file = tmp_path / "hooks-debug.log"
+        log_file.write_text(
+            "2025-01-01T00:00:00 EVALUATING: git push\n"
+            "2025-01-01T00:00:00 PERMS MATCH (0.001s)\n"
+            "2025-01-01T00:00:01 EVALUATING: python script.py\n"
+            "2025-01-01T00:00:01 PERMS MATCH (0.001s)\n"
+        )
+        commands = _parse_log_for_perms_commands(log_file, limit=50)
+        assert len(commands) == 2
+        assert commands[0] == "git push"
+        assert commands[1] == "python script.py"
+
+    def test_respects_limit(self, tmp_path):
+        from jacked.cli import _parse_log_for_perms_commands
+        log_file = tmp_path / "hooks-debug.log"
+        lines = []
+        for i in range(10):
+            lines.append(f"2025-01-01T00:00:{i:02d} EVALUATING: cmd_{i}\n")
+            lines.append(f"2025-01-01T00:00:{i:02d} PERMS MATCH (0.001s)\n")
+        log_file.write_text("".join(lines))
+        commands = _parse_log_for_perms_commands(log_file, limit=3)
+        assert len(commands) == 3
+        # Most recent 3
+        assert commands == ["cmd_7", "cmd_8", "cmd_9"]
+
+    def test_no_file(self, tmp_path):
+        from jacked.cli import _parse_log_for_perms_commands
+        log_file = tmp_path / "nonexistent.log"
+        commands = _parse_log_for_perms_commands(log_file)
+        assert commands == []
+
+    def test_no_perms_match(self, tmp_path):
+        from jacked.cli import _parse_log_for_perms_commands
+        log_file = tmp_path / "hooks-debug.log"
+        log_file.write_text(
+            "2025-01-01T00:00:00 EVALUATING: git push\n"
+            "2025-01-01T00:00:00 LOCAL SAID: YES (0.001s)\n"
+        )
+        commands = _parse_log_for_perms_commands(log_file)
+        assert commands == []
+
+    def test_skips_non_perms_evaluating(self, tmp_path):
+        from jacked.cli import _parse_log_for_perms_commands
+        log_file = tmp_path / "hooks-debug.log"
+        log_file.write_text(
+            "2025-01-01T00:00:00 EVALUATING: safe_cmd\n"
+            "2025-01-01T00:00:00 LOCAL SAID: YES (0.001s)\n"
+            "2025-01-01T00:00:01 EVALUATING: perms_cmd\n"
+            "2025-01-01T00:00:01 PERMS MATCH (0.001s)\n"
+        )
+        commands = _parse_log_for_perms_commands(log_file)
+        assert commands == ["perms_cmd"]
+
+
 class TestEmitAllow:
     """Tests that emit_allow produces correct JSON."""
 

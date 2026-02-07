@@ -8,7 +8,7 @@ Install extras for additional features:
   pip install "claude-jacked[all]"       — everything
 """
 
-__version__ = "0.3.8"
+__version__ = "0.3.9"
 
 
 def _qdrant_available() -> bool:

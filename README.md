@@ -111,6 +111,9 @@ jacked install --force --security
 | Feature | What It Does |
 |---------|--------------|
 | **Security Gatekeeper** | Auto-approves safe bash commands, blocks dangerous ones, asks you about ambiguous ones |
+| **Customizable Prompt** | Tune the LLM's safety evaluation via `~/.claude/gatekeeper-prompt.txt` |
+| **Permission Audit** | Scans your permission rules for dangerous wildcards that bypass the gatekeeper |
+| **Log Redaction** | Passwords, API keys, and tokens are automatically redacted from debug logs |
 
 ---
 
@@ -293,6 +296,55 @@ pip install anthropic               # or: pip install claude-jacked[security]
 export ANTHROPIC_API_KEY="sk-..."
 ```
 
+### Customize the Gatekeeper Prompt
+
+The gatekeeper uses an LLM prompt to evaluate ambiguous commands. You can customize it:
+
+```bash
+# View the current prompt
+jacked gatekeeper show
+
+# Edit the prompt file directly
+# (created automatically during install)
+~/.claude/gatekeeper-prompt.txt
+
+# Compare your changes against the built-in default
+jacked gatekeeper diff
+
+# Reset to built-in default
+jacked gatekeeper reset
+```
+
+Your custom prompt must include these placeholders: `{command}`, `{cwd}`, `{file_context}`. The gatekeeper will fall back to the built-in prompt if your custom prompt has invalid placeholders.
+
+### Permission Rule Audit
+
+If you've set broad permission wildcards in Claude Code (like `Bash(python:*)` or `Bash(curl:*)`), those commands bypass the gatekeeper entirely — no LLM evaluation, no safety check. The audit command catches this:
+
+```bash
+# Scan your permission rules for dangerous wildcards
+jacked gatekeeper audit
+
+# Also send recent auto-approved commands to the LLM for review
+jacked gatekeeper audit --log
+
+# Scan more entries (default: 50)
+jacked gatekeeper audit --log -n 100
+```
+
+The static audit also runs automatically when you `jacked install --security`. Every 100 permission auto-approvals, the gatekeeper logs a reminder to run the audit.
+
+### Log Redaction
+
+The gatekeeper automatically redacts sensitive data from `~/.claude/hooks-debug.log`:
+
+- Connection strings (`postgresql://user:***@host`)
+- Environment variables (`PGPASSWORD=***`, `ANTHROPIC_API_KEY=***`)
+- CLI flags (`--password ***`, `--token ***`)
+- Bearer tokens, AWS access keys, and `sk-...` API keys
+
+No configuration needed — this happens automatically.
+
 ---
 
 ## Sound Notifications
@@ -444,6 +496,14 @@ jacked backfill                    # Index all existing sessions (requires [sear
 jacked backfill --force            # Re-index everything
 jacked status                      # Check connectivity (requires [search])
 jacked configure --show            # Show current config
+
+# Security Gatekeeper
+jacked gatekeeper show             # Print current LLM prompt
+jacked gatekeeper reset            # Reset prompt to built-in default
+jacked gatekeeper diff             # Compare custom vs built-in prompt
+jacked gatekeeper audit            # Audit permission rules for dangerous wildcards
+jacked gatekeeper audit --log      # Also scan recent auto-approved commands via LLM
+jacked gatekeeper audit --log -n 100  # Scan last 100 entries
 ```
 
 </details>

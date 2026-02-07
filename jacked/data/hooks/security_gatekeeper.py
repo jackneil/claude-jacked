@@ -23,9 +23,11 @@ import time
 from pathlib import Path
 
 LOG_PATH = Path.home() / ".claude" / "hooks-debug.log"
+STATE_PATH = Path.home() / ".claude" / "gatekeeper-state.json"
 DEBUG = os.environ.get("JACKED_HOOK_DEBUG", "") == "1"
 MODEL = "claude-haiku-4-5-20251001"
 MAX_FILE_READ = 30_000
+AUDIT_NUDGE_INTERVAL = 100
 
 # --- Log redaction patterns ---
 
@@ -216,6 +218,19 @@ def log(msg: str):
 def log_debug(msg: str):
     if DEBUG:
         _write_log(msg)
+
+
+def _increment_perms_counter():
+    """Increment perms auto-approve counter, nudge every AUDIT_NUDGE_INTERVAL."""
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8")) if STATE_PATH.exists() else {}
+        count = state.get("perms_count", 0) + 1
+        state["perms_count"] = count
+        STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
+        if count % AUDIT_NUDGE_INTERVAL == 0:
+            log(f"TIP: {count} commands auto-approved via permission rules since last audit. Run 'jacked gatekeeper audit --log' to review.")
+    except Exception:
+        pass
 
 
 # --- Permission rules from Claude settings ---
@@ -471,6 +486,7 @@ def main():
         elapsed = time.time() - start
         log(f"PERMS MATCH ({elapsed:.3f}s)")
         log(f"DECISION: ALLOW ({elapsed:.3f}s)")
+        _increment_perms_counter()
         emit_allow()
         sys.exit(0)
 

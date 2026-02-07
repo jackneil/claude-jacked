@@ -1204,6 +1204,18 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     # Install security gatekeeper — only if --security flag passed
     if install_security:
         _install_security_hook(existing, settings_path)
+        # Auto-run static permission audit
+        console.print("")
+        audit_results = _scan_permission_rules()
+        if audit_results:
+            warns = [r for r in audit_results if r[1] == "WARN"]
+            if warns:
+                console.print(f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]")
+                for pat, _, prefix, reason in warns:
+                    console.print(f"  [red][WARN][/red] {pat} — {reason}")
+                console.print(f"[dim]Run 'jacked gatekeeper audit' for full details[/dim]")
+            else:
+                console.print("[green][AUDIT] Permission rules look clean[/green]")
     else:
         console.print("[dim][-][/dim] Skipping security gatekeeper (use --security to enable)")
 
@@ -1413,6 +1425,262 @@ def gatekeeper_reset(yes: bool):
     PROMPT_PATH.write_text(SECURITY_PROMPT, encoding="utf-8")
     console.print(f"[green][OK][/green] Reset gatekeeper prompt to built-in default")
     console.print(f"[dim]{PROMPT_PATH}[/dim]")
+
+
+HIGH_RISK_PREFIXES = {
+    "python": "arbitrary code execution via -c",
+    "python3": "arbitrary code execution via -c",
+    "python.exe": "arbitrary code execution via -c",
+    "node": "arbitrary code execution via -e",
+    "bash": "shell-in-shell, can run anything",
+    "sh": "shell-in-shell, can run anything",
+    "zsh": "shell-in-shell, can run anything",
+    "cmd": "shell-in-shell, can run anything",
+    "powershell": "can run encoded commands or scripts",
+    "curl": "potential data exfiltration",
+    "wget": "potential data exfiltration",
+    "rm": "file deletion beyond deny pattern coverage",
+    "del": "file deletion beyond deny pattern coverage",
+    "ssh": "remote command execution",
+    "scp": "file transfer to remote",
+    "rsync": "file transfer to remote",
+    "nc": "raw network connections",
+    "ncat": "raw network connections",
+    "netcat": "raw network connections",
+}
+
+MEDIUM_RISK_PREFIXES = {
+    "cat": "deny patterns cover sensitive files, but not all",
+}
+
+# Prefixes that are always low-risk and get [OK]
+LOW_RISK_PREFIXES = {
+    "git", "gh", "grep", "rg", "find", "fd", "ls", "dir", "pwd",
+    "echo", "which", "where", "env", "printenv", "npm", "pip",
+    "pytest", "make", "cargo", "go", "docker", "jacked", "claude",
+    "npx", "tsc", "ruff", "flake8", "pylint", "mypy", "eslint",
+    "prettier", "black", "isort", "jest", "conda", "pipx",
+}
+
+
+def _extract_prefix_from_pattern(pattern: str) -> str:
+    """Extract the command prefix from a Bash permission pattern.
+
+    'Bash(git :*)' → 'git'
+    'Bash(python:*)' → 'python'
+    'Bash(gh pr list:*)' → 'gh'
+    """
+    inner = pattern[5:]  # strip 'Bash('
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    if inner.endswith(":*"):
+        inner = inner[:-2]
+    return inner.split()[0].strip()
+
+
+def _classify_permission(pattern: str) -> tuple[str, str, str]:
+    """Classify a permission pattern as high/medium/low risk.
+
+    Returns (level, prefix, reason).
+    level is 'WARN', 'INFO', or 'OK'.
+    """
+    inner = pattern[5:]
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    is_wildcard = inner.endswith(":*")
+
+    prefix = _extract_prefix_from_pattern(pattern)
+
+    if is_wildcard and prefix in HIGH_RISK_PREFIXES:
+        return "WARN", prefix, HIGH_RISK_PREFIXES[prefix]
+    if is_wildcard and prefix in MEDIUM_RISK_PREFIXES:
+        return "INFO", prefix, MEDIUM_RISK_PREFIXES[prefix]
+    if not is_wildcard:
+        return "OK", prefix, "scoped (low risk)"
+    if prefix in LOW_RISK_PREFIXES:
+        return "OK", prefix, "read-only (low risk)"
+    return "INFO", prefix, "unrecognized wildcard — review manually"
+
+
+def _scan_permission_rules() -> list[tuple[str, str, str, str]]:
+    """Scan all settings files for Bash permission rules.
+
+    Returns list of (pattern, level, prefix, reason).
+    """
+    from jacked.data.hooks.security_gatekeeper import _load_permissions
+    results = []
+    seen = set()
+
+    settings_files = [
+        Path.home() / ".claude" / "settings.json",
+        Path(".claude") / "settings.json",
+        Path(".claude") / "settings.local.json",
+    ]
+
+    for settings_path in settings_files:
+        patterns = _load_permissions(settings_path)
+        for pat in patterns:
+            if pat in seen:
+                continue
+            seen.add(pat)
+            level, prefix, reason = _classify_permission(pat)
+            results.append((pat, level, prefix, reason))
+
+    return results
+
+
+def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
+    """Parse hooks-debug.log for auto-approved PERMS MATCH commands.
+
+    Finds PERMS MATCH lines and extracts the command from the preceding EVALUATING line.
+    Returns up to `limit` commands (most recent first).
+    """
+    if not log_path.exists():
+        return []
+
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+
+    commands = []
+    for i, line in enumerate(lines):
+        if "PERMS MATCH" in line:
+            # Look backwards for the EVALUATING line
+            for j in range(i - 1, max(i - 5, -1), -1):
+                if "EVALUATING:" in lines[j]:
+                    # Extract command after "EVALUATING: "
+                    idx = lines[j].index("EVALUATING:") + len("EVALUATING:")
+                    cmd = lines[j][idx:].strip()
+                    commands.append(cmd)
+                    break
+
+    # Return most recent N
+    return commands[-limit:]
+
+
+@gatekeeper.command(name="audit")
+@click.option("--log", "scan_log", is_flag=True, help="Also scan recent auto-approved commands via LLM")
+@click.option("--limit", "-n", default=50, help="Number of recent log entries to scan")
+def gatekeeper_audit(scan_log, limit):
+    """Audit permission rules for dangerous wildcards."""
+    import os
+    import json
+    from jacked.data.hooks.security_gatekeeper import LOG_PATH, STATE_PATH
+
+    console.print("[bold]Scanning permission rules...[/bold]\n")
+
+    console.print("[dim]Sources:[/dim]")
+    console.print("[dim]  ~/.claude/settings.json[/dim]")
+    console.print("[dim]  .claude/settings.json[/dim]")
+    console.print("[dim]  .claude/settings.local.json[/dim]\n")
+
+    results = _scan_permission_rules()
+
+    if not results:
+        console.print("[yellow]No Bash permission rules found[/yellow]")
+        console.print("[dim]Permission rules are set via Claude Code's /permissions command[/dim]")
+        return
+
+    warn_count = 0
+    info_count = 0
+    ok_count = 0
+
+    for pat, level, prefix, reason in results:
+        if level == "WARN":
+            console.print(f"  [red][WARN][/red] {pat} — {reason}")
+            console.print(f"         Gatekeeper deny patterns won't catch all {prefix} inline code.")
+            console.print(f"         Consider removing and letting the gatekeeper evaluate individually.\n")
+            warn_count += 1
+        elif level == "INFO":
+            console.print(f"  [yellow][INFO][/yellow] {pat} — {reason}")
+            info_count += 1
+        else:
+            console.print(f"  [green][OK][/green] {pat} — {reason}")
+            ok_count += 1
+
+    console.print(f"\n{warn_count} warnings, {info_count} info, {ok_count} OK")
+
+    if warn_count > 0:
+        console.print(f"\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]")
+
+    # Log scanning
+    if scan_log:
+        console.print(f"\n[bold]Scanning last {limit} auto-approved commands from hooks-debug.log...[/bold]\n")
+
+        commands = _parse_log_for_perms_commands(LOG_PATH, limit=limit)
+        if not commands:
+            console.print("[yellow]No PERMS MATCH entries found in log[/yellow]")
+            console.print(f"[dim]Log path: {LOG_PATH}[/dim]")
+            return
+
+        # Send to LLM for evaluation
+        cmd_list = "\n".join(f"  {i+1}. {cmd}" for i, cmd in enumerate(commands))
+        audit_prompt = f"""You are a security auditor. Review these {len(commands)} Bash commands that were auto-approved via permission rules (bypassing LLM evaluation).
+
+Flag any that look dangerous — data exfiltration, destructive operations, arbitrary code execution, secret access, etc. Most will be safe.
+
+Commands:
+{cmd_list}
+
+Respond with ONLY a JSON object:
+{{"flagged": [{{"index": 1, "command": "the command", "reason": "brief reason"}}], "safe_count": N}}
+
+If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
+
+        console.print(f"[dim]Sending {len(commands)} commands to LLM for review...[/dim]")
+
+        try:
+            import anthropic
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                console.print("[red]ANTHROPIC_API_KEY not set — cannot run LLM audit[/red]")
+                console.print("[dim]Set ANTHROPIC_API_KEY or install anthropic SDK[/dim]")
+                return
+
+            client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": audit_prompt}],
+            )
+            text = response.content[0].text.strip()
+
+            # Strip markdown fences
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+            parsed = json.loads(text)
+            flagged = parsed.get("flagged", [])
+            safe_count = parsed.get("safe_count", len(commands) - len(flagged))
+
+            if flagged:
+                for item in flagged:
+                    console.print(f"  [red][WARN][/red] {item.get('command', '?')}")
+                    console.print(f"         LLM says: {item.get('reason', '?')}\n")
+            console.print(f"{safe_count}/{len(commands)} commands look safe.")
+            if flagged:
+                console.print(f"[red]{len(flagged)} commands flagged[/red] — consider tightening your permission rules.")
+            else:
+                console.print("[green]No dangerous commands found.[/green]")
+
+        except ImportError:
+            console.print("[red]anthropic SDK not installed — cannot run LLM audit[/red]")
+            console.print('[dim]Install it: pip install "claude-jacked[security]"[/dim]')
+        except json.JSONDecodeError:
+            console.print(f"[yellow]LLM returned non-JSON response:[/yellow] {text[:200]}")
+        except Exception as e:
+            console.print(f"[red]LLM audit failed:[/red] {e}")
+
+    # Show counter info
+    if STATE_PATH.exists():
+        try:
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            count = state.get("perms_count", 0)
+            if count > 0:
+                console.print(f"\n[dim]Total permission auto-approvals since last reset: {count}[/dim]")
+        except Exception:
+            pass
 
 
 @gatekeeper.command(name="diff")
