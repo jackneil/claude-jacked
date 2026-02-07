@@ -771,33 +771,89 @@ class TestLoadPrompt:
                 result = gk._load_prompt()
         assert result == gk.SECURITY_PROMPT
 
+    def test_falls_back_when_missing_placeholders(self, tmp_path):
+        """Custom prompt missing {file_context} should fall back to built-in."""
+        prompt_file = tmp_path / "gatekeeper-prompt.txt"
+        prompt_file.write_text("only {command} and {cwd} here", encoding="utf-8")
+        with patch.object(gk, 'PROMPT_PATH', prompt_file):
+            result = gk._load_prompt()
+        assert result == gk.SECURITY_PROMPT
+
+    def test_accepts_prompt_with_extra_braces(self, tmp_path):
+        """Prompt with JSON examples like {\"safe\": true} should load fine."""
+        content = 'Evaluate {command} in {cwd}\n{file_context}\nRespond: {"safe": true}'
+        prompt_file = tmp_path / "gatekeeper-prompt.txt"
+        prompt_file.write_text(content, encoding="utf-8")
+        with patch.object(gk, 'PROMPT_PATH', prompt_file):
+            result = gk._load_prompt()
+        assert result == content
+
 
 # ---------------------------------------------------------------------------
-# _SafeFormatter — blocks dunder attribute access
+# _substitute_prompt — single-pass placeholder substitution
 # ---------------------------------------------------------------------------
 
-class TestSafeFormatter:
-    """Tests for the safe format string handler."""
+class TestSubstitutePrompt:
+    """Tests for single-pass prompt substitution."""
 
-    def test_normal_placeholders_work(self):
-        result = gk._safe_fmt.format("{command} in {cwd}", command="ls", cwd="/tmp")
-        assert result == "ls in /tmp"
+    def test_replaces_all_placeholders(self):
+        template = "CMD: {command} DIR: {cwd} FILES: {file_context}"
+        result = gk._substitute_prompt(template, command="ls -la", cwd="/home", file_context="stuff")
+        assert result == "CMD: ls -la DIR: /home FILES: stuff"
 
-    def test_blocks_dunder_class(self):
-        with pytest.raises(KeyError):
-            gk._safe_fmt.format("{command.__class__}", command="ls")
+    def test_json_braces_not_mangled(self):
+        """The whole point — {\"safe\": true} must survive substitution."""
+        template = '{command} in {cwd}\n{file_context}\nRespond: {"safe": true} or {"safe": false, "reason": "x"}'
+        result = gk._substitute_prompt(template, command="whoami", cwd="/tmp", file_context="")
+        assert '{"safe": true}' in result
+        assert '{"safe": false, "reason": "x"}' in result
+        assert "whoami" in result
 
-    def test_blocks_dunder_mro(self):
-        with pytest.raises(KeyError):
-            gk._safe_fmt.format("{command.__class__.__mro__}", command="ls")
+    def test_no_cross_contamination(self):
+        """Command containing literal '{cwd}' must NOT leak cwd value."""
+        result = gk._substitute_prompt(
+            "CMD: {command} DIR: {cwd}",
+            command="echo {cwd}",
+            cwd="/secret/path",
+            file_context="",
+        )
+        assert result == "CMD: echo {cwd} DIR: /secret/path"
 
-    def test_allows_file_context(self):
-        result = gk._safe_fmt.format("{file_context}", file_context="content here")
-        assert result == "content here"
+    def test_no_cross_contamination_file_context(self):
+        """Command containing literal '{file_context}' must NOT leak."""
+        result = gk._substitute_prompt(
+            "CMD: {command} FILES: {file_context}",
+            command="echo {file_context}",
+            cwd="/tmp",
+            file_context="SENSITIVE",
+        )
+        assert result == "CMD: echo {file_context} FILES: SENSITIVE"
 
-    def test_unknown_placeholder_raises(self):
-        with pytest.raises(KeyError):
-            gk._safe_fmt.format("{unknown_field}", command="ls")
+    def test_integration_with_security_prompt(self):
+        """Run substitution against the actual SECURITY_PROMPT constant."""
+        result = gk._substitute_prompt(
+            gk.SECURITY_PROMPT,
+            command="python -c 'print(42)'",
+            cwd="/home/user",
+            file_context="",
+        )
+        assert "python -c 'print(42)'" in result
+        assert "/home/user" in result
+        assert '{"safe": true}' in result
+        assert "{command}" not in result
+        assert "{cwd}" not in result
+        assert "{file_context}" not in result
+
+    def test_empty_values(self):
+        template = "CMD: {command} DIR: {cwd} FILES: {file_context}"
+        result = gk._substitute_prompt(template, command="", cwd="", file_context="")
+        assert result == "CMD:  DIR:  FILES: "
+
+    def test_unknown_placeholders_ignored(self):
+        """Placeholders like {foo} are left as-is, not errored."""
+        template = "{command} {foo} {cwd} {file_context}"
+        result = gk._substitute_prompt(template, command="ls", cwd="/", file_context="ctx")
+        assert result == "ls {foo} / ctx"
 
 
 # ---------------------------------------------------------------------------

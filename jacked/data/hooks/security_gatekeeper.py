@@ -16,7 +16,6 @@ Output format (PreToolUse):
 import json
 import os
 import re
-import string
 import subprocess
 import sys
 import time
@@ -177,25 +176,36 @@ Respond with ONLY a JSON object, nothing else: {"safe": true} or {"safe": false,
 PROMPT_PATH = Path.home() / ".claude" / "gatekeeper-prompt.txt"
 
 
-# --- Prompt loading ---
+# --- Prompt loading and substitution ---
 
-class _SafeFormatter(string.Formatter):
-    """Formatter that blocks dunder attribute access in format strings."""
-
-    def get_field(self, field_name, args, kwargs):
-        if '__' in field_name:
-            raise KeyError(field_name)
-        return super().get_field(field_name, args, kwargs)
+_PLACEHOLDER_RE = re.compile(r"\{(command|cwd|file_context)\}")
+_REQUIRED_PLACEHOLDERS = {"{command}", "{cwd}", "{file_context}"}
 
 
-_safe_fmt = _SafeFormatter()
+def _substitute_prompt(template: str, command: str, cwd: str, file_context: str) -> str:
+    """Single-pass placeholder substitution that ignores other {braces}.
+
+    Unlike str.format(), this does NOT interpret {safe}, {reason}, etc.
+    as placeholders — so JSON examples in the prompt work correctly.
+    Single-pass means substituted values are never re-scanned, preventing
+    cross-contamination if a command contains literal '{cwd}' etc.
+    """
+    replacements = {"command": command, "cwd": cwd, "file_context": file_context}
+    return _PLACEHOLDER_RE.sub(lambda m: replacements[m.group(1)], template)
 
 
 def _load_prompt() -> str:
-    """Load the LLM security prompt. Custom file overrides built-in."""
+    """Load the LLM security prompt. Custom file overrides built-in.
+
+    Falls back to built-in if the custom file is missing required
+    placeholders ({command}, {cwd}, {file_context}).
+    """
     if PROMPT_PATH.exists():
         try:
-            return PROMPT_PATH.read_text(encoding="utf-8").strip()
+            custom = PROMPT_PATH.read_text(encoding="utf-8").strip()
+            if _REQUIRED_PLACEHOLDERS.issubset(set(re.findall(r"\{command\}|\{cwd\}|\{file_context\}", custom))):
+                return custom
+            log("WARNING: Custom prompt missing required placeholders, using built-in")
         except Exception:
             pass
     return SECURITY_PROMPT
@@ -508,11 +518,7 @@ def main():
     # Tier 3+4: API then CLI for ambiguous commands
     file_context = read_file_context(command, cwd)
     template = _load_prompt()
-    try:
-        prompt = _safe_fmt.format(template, command=command, cwd=cwd, file_context=file_context)
-    except (KeyError, ValueError, IndexError):
-        log("WARNING: Custom prompt has invalid placeholders, using built-in")
-        prompt = SECURITY_PROMPT.format(command=command, cwd=cwd, file_context=file_context)
+    prompt = _substitute_prompt(template, command=command, cwd=cwd, file_context=file_context)
 
     response = evaluate_via_api(prompt)
     method = "CLAUDE-API"
