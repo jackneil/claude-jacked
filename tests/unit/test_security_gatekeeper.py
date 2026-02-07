@@ -647,6 +647,159 @@ class TestParseLlmResponse:
         assert safe is not True
 
 
+# ---------------------------------------------------------------------------
+# _redact — log redaction
+# ---------------------------------------------------------------------------
+
+class TestRedact:
+    """Tests for sensitive data redaction in log messages."""
+
+    def test_pgpassword_env(self):
+        assert gk._redact("PGPASSWORD=secret123 psql -h host") == "PGPASSWORD=*** psql -h host"
+
+    def test_connection_string(self):
+        assert gk._redact("postgresql://user:pass123@host/db") == "postgresql://user:***@host/db"
+
+    def test_connection_string_at_in_password(self):
+        result = gk._redact("postgresql://user:p@ss@host/db")
+        assert "p@ss" not in result
+        assert "***@" in result
+
+    def test_two_connection_strings(self):
+        msg = "from postgresql://u1:secret1@h1/db to postgresql://u2:secret2@h2/db"
+        result = gk._redact(msg)
+        assert "secret1" not in result
+        assert "secret2" not in result
+
+    def test_token_flag(self):
+        assert gk._redact("--token sk-abc123xyz456") == "--token ***"
+
+    def test_password_equals(self):
+        assert gk._redact("--password=mysecret") == "--password=***"
+
+    def test_password_space(self):
+        assert gk._redact("--password mysecret") == "--password ***"
+
+    def test_password_quoted(self):
+        result = gk._redact('--password "my secret"')
+        assert "my secret" not in result
+        assert "--password ***" == result
+
+    def test_password_single_quoted(self):
+        result = gk._redact("--password 'my secret'")
+        assert "my secret" not in result
+
+    def test_bearer_token(self):
+        assert gk._redact("Bearer eyJhbGciOiJIUzI1NiJ9") == "Bearer ***"
+
+    def test_aws_key(self):
+        assert gk._redact("key=AKIA1234567890ABCDEF rest") == "key=*** rest"
+
+    def test_sk_api_key(self):
+        assert gk._redact("sk-abc123456789012345678901") == "***"
+
+    def test_no_secrets_unchanged(self):
+        msg = "git status --short"
+        assert gk._redact(msg) == msg
+
+    def test_anthropic_api_key_env(self):
+        assert gk._redact("ANTHROPIC_API_KEY=sk-ant-abc123") == "ANTHROPIC_API_KEY=***"
+
+    def test_mysql_pwd(self):
+        assert gk._redact("MYSQL_PWD=secret123 mysql -h host") == "MYSQL_PWD=*** mysql -h host"
+
+    def test_api_key_flag(self):
+        assert gk._redact("--api-key abc123def456") == "--api-key ***"
+
+    def test_secret_flag(self):
+        assert gk._redact("--secret mytoken123") == "--secret ***"
+
+
+# ---------------------------------------------------------------------------
+# psql deny patterns
+# ---------------------------------------------------------------------------
+
+class TestPsqlDeny:
+    """Tests for psql destructive SQL deny patterns."""
+
+    def test_drop_table(self):
+        assert gk.local_evaluate('psql -c "DROP TABLE users"') == "NO"
+
+    def test_truncate(self):
+        assert gk.local_evaluate('psql -c "TRUNCATE users"') == "NO"
+
+    def test_drop_case_insensitive(self):
+        assert gk.local_evaluate("psql -c 'drop table foo'") == "NO"
+
+    def test_select_is_ambiguous(self):
+        """SELECT falls to LLM, not auto-approved locally."""
+        assert gk.local_evaluate('psql -c "SELECT * FROM users"') is None
+
+    def test_delete_is_ambiguous(self):
+        """DELETE falls to LLM (not in deny regex, LLM handles it)."""
+        assert gk.local_evaluate('psql -c "DELETE FROM users"') is None
+
+    def test_psql_file_is_ambiguous(self):
+        assert gk.local_evaluate("psql -f migrate.sql") is None
+
+
+# ---------------------------------------------------------------------------
+# _load_prompt — custom prompt loading
+# ---------------------------------------------------------------------------
+
+class TestLoadPrompt:
+    """Tests for loading custom LLM prompts."""
+
+    def test_returns_builtin_when_no_file(self, tmp_path):
+        fake_path = tmp_path / "nonexistent.txt"
+        with patch.object(gk, 'PROMPT_PATH', fake_path):
+            result = gk._load_prompt()
+        assert result == gk.SECURITY_PROMPT
+
+    def test_returns_file_contents(self, tmp_path):
+        prompt_file = tmp_path / "gatekeeper-prompt.txt"
+        prompt_file.write_text("custom prompt {command} {cwd} {file_context}", encoding="utf-8")
+        with patch.object(gk, 'PROMPT_PATH', prompt_file):
+            result = gk._load_prompt()
+        assert result == "custom prompt {command} {cwd} {file_context}"
+
+    def test_returns_builtin_on_read_error(self, tmp_path):
+        prompt_file = tmp_path / "gatekeeper-prompt.txt"
+        prompt_file.write_text("custom", encoding="utf-8")
+        with patch.object(gk, 'PROMPT_PATH', prompt_file):
+            with patch.object(Path, 'read_text', side_effect=PermissionError("nope")):
+                result = gk._load_prompt()
+        assert result == gk.SECURITY_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# _SafeFormatter — blocks dunder attribute access
+# ---------------------------------------------------------------------------
+
+class TestSafeFormatter:
+    """Tests for the safe format string handler."""
+
+    def test_normal_placeholders_work(self):
+        result = gk._safe_fmt.format("{command} in {cwd}", command="ls", cwd="/tmp")
+        assert result == "ls in /tmp"
+
+    def test_blocks_dunder_class(self):
+        with pytest.raises(KeyError):
+            gk._safe_fmt.format("{command.__class__}", command="ls")
+
+    def test_blocks_dunder_mro(self):
+        with pytest.raises(KeyError):
+            gk._safe_fmt.format("{command.__class__.__mro__}", command="ls")
+
+    def test_allows_file_context(self):
+        result = gk._safe_fmt.format("{file_context}", file_context="content here")
+        assert result == "content here"
+
+    def test_unknown_placeholder_raises(self):
+        with pytest.raises(KeyError):
+            gk._safe_fmt.format("{unknown_field}", command="ls")
+
+
 class TestEmitAllow:
     """Tests that emit_allow produces correct JSON."""
 

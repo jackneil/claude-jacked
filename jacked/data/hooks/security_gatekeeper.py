@@ -16,6 +16,7 @@ Output format (PreToolUse):
 import json
 import os
 import re
+import string
 import subprocess
 import sys
 import time
@@ -25,6 +26,35 @@ LOG_PATH = Path.home() / ".claude" / "hooks-debug.log"
 DEBUG = os.environ.get("JACKED_HOOK_DEBUG", "") == "1"
 MODEL = "claude-haiku-4-5-20251001"
 MAX_FILE_READ = 30_000
+
+# --- Log redaction patterns ---
+
+_REDACT_PATTERNS = [
+    # connection strings: protocol://user:PASS@host
+    re.compile(r'(://[^:]+:)([^@]+)(@)', re.IGNORECASE),
+    # env var assignments with sensitive names
+    re.compile(r'(\b(?:PASSWORD|PGPASSWORD|MYSQL_PWD|API_KEY|SECRET|TOKEN|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY)\s*=\s*)[^\s"\']+', re.IGNORECASE),
+    # CLI flags with sensitive names (--password VALUE and --password=VALUE, including quoted)
+    re.compile(r'(--(?:password|token|secret|api-key|apikey)[\s=])(?:"[^"]*"|\'[^\']*\'|\S+)', re.IGNORECASE),
+    # Bearer tokens
+    re.compile(r'(Bearer\s+)\S+', re.IGNORECASE),
+    # AWS access key IDs
+    re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+    # Generic sk-... API keys (OpenAI, Anthropic style)
+    re.compile(r'\bsk-[a-zA-Z0-9_-]{20,}\b'),
+]
+
+
+def _redact(msg: str) -> str:
+    """Redact sensitive values (passwords, keys, tokens) from log messages."""
+    for pattern in _REDACT_PATTERNS:
+        msg = pattern.sub(
+            lambda m: m.group(1) + '***' + (m.group(3) if m.lastindex and m.lastindex >= 3 else '')
+            if m.lastindex else '***',
+            msg,
+        )
+    return msg
+
 
 # --- Patterns for local evaluation ---
 
@@ -103,6 +133,8 @@ DENY_PATTERNS = [
     re.compile(r'\bschtasks\b', re.IGNORECASE),
     re.compile(r'\bchmod\s+777\b'),
     re.compile(r'\bkill\s+-9\s+1\b'),
+    # psql with obviously destructive SQL inline
+    re.compile(r'psql\b.*-c\s+["\']?\s*(?:DROP|TRUNCATE)\b', re.IGNORECASE),
 ]
 
 SECURITY_PROMPT = r"""You are a security gatekeeper. Evaluate whether this Bash command is safe to auto-approve.
@@ -140,13 +172,39 @@ WORKING DIRECTORY: {cwd}
 {file_context}
 Respond with ONLY a JSON object, nothing else: {"safe": true} or {"safe": false, "reason": "brief reason under 10 words"}"""
 
+PROMPT_PATH = Path.home() / ".claude" / "gatekeeper-prompt.txt"
+
+
+# --- Prompt loading ---
+
+class _SafeFormatter(string.Formatter):
+    """Formatter that blocks dunder attribute access in format strings."""
+
+    def get_field(self, field_name, args, kwargs):
+        if '__' in field_name:
+            raise KeyError(field_name)
+        return super().get_field(field_name, args, kwargs)
+
+
+_safe_fmt = _SafeFormatter()
+
+
+def _load_prompt() -> str:
+    """Load the LLM security prompt. Custom file overrides built-in."""
+    if PROMPT_PATH.exists():
+        try:
+            return PROMPT_PATH.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return SECURITY_PROMPT
+
 
 # --- Logging ---
 
 def _write_log(msg: str):
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {_redact(msg)}\n")
     except Exception:
         pass
 
@@ -433,7 +491,12 @@ def main():
 
     # Tier 3+4: API then CLI for ambiguous commands
     file_context = read_file_context(command, cwd)
-    prompt = SECURITY_PROMPT.format(command=command, cwd=cwd, file_context=file_context)
+    template = _load_prompt()
+    try:
+        prompt = _safe_fmt.format(template, command=command, cwd=cwd, file_context=file_context)
+    except (KeyError, ValueError, IndexError):
+        log("WARNING: Custom prompt has invalid placeholders, using built-in")
+        prompt = SECURITY_PROMPT.format(command=command, cwd=cwd, file_context=file_context)
 
     response = evaluate_via_api(prompt)
     method = "CLAUDE-API"

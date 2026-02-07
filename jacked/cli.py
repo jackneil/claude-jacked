@@ -993,6 +993,21 @@ def _install_security_hook(existing: dict, settings_path: Path):
         settings_path.write_text(json.dumps(existing, indent=2))
         console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse, blocking)")
 
+    # Create customizable prompt file if it doesn't exist
+    from jacked.data.hooks import security_gatekeeper as gk
+    prompt_path = Path.home() / ".claude" / "gatekeeper-prompt.txt"
+    if not prompt_path.exists():
+        prompt_path.write_text(gk.SECURITY_PROMPT, encoding="utf-8")
+        console.print("[green][OK][/green] Created gatekeeper prompt: ~/.claude/gatekeeper-prompt.txt")
+    else:
+        try:
+            if prompt_path.read_text(encoding="utf-8").strip() != gk.SECURITY_PROMPT.strip():
+                console.print("[yellow][-][/yellow] Custom gatekeeper prompt detected (not overwriting)")
+            else:
+                console.print("[dim][-][/dim] Gatekeeper prompt unchanged")
+        except Exception:
+            console.print("[dim][-][/dim] Gatekeeper prompt unchanged")
+
 
 def _remove_security_hook(settings_path: Path) -> bool:
     """Remove jacked security gatekeeper hook. Returns True if removed.
@@ -1348,6 +1363,92 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print("\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]")
+
+
+@main.group()
+def gatekeeper():
+    """View or customize the security gatekeeper LLM prompt."""
+    pass
+
+
+@gatekeeper.command(name="show")
+def gatekeeper_show():
+    """Print the current gatekeeper LLM prompt."""
+    from jacked.data.hooks.security_gatekeeper import SECURITY_PROMPT, PROMPT_PATH
+
+    if PROMPT_PATH.exists():
+        try:
+            prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
+            console.print(f"[dim]Source: {PROMPT_PATH}[/dim]\n")
+        except Exception:
+            prompt = SECURITY_PROMPT
+            console.print("[dim]Source: built-in (file read failed)[/dim]\n")
+    else:
+        prompt = SECURITY_PROMPT
+        console.print("[dim]Source: built-in default[/dim]\n")
+
+    console.print(prompt)
+
+
+@gatekeeper.command(name="reset")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+def gatekeeper_reset(yes: bool):
+    """Reset gatekeeper prompt to built-in default."""
+    from jacked.data.hooks.security_gatekeeper import SECURITY_PROMPT, PROMPT_PATH
+
+    if not yes:
+        if PROMPT_PATH.exists():
+            try:
+                current = PROMPT_PATH.read_text(encoding="utf-8").strip()
+                if current == SECURITY_PROMPT.strip():
+                    console.print("[yellow]Prompt is already the built-in default[/yellow]")
+                    return
+            except Exception:
+                pass
+        if not click.confirm("Reset gatekeeper prompt to built-in default?"):
+            console.print("Cancelled")
+            return
+
+    PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROMPT_PATH.write_text(SECURITY_PROMPT, encoding="utf-8")
+    console.print(f"[green][OK][/green] Reset gatekeeper prompt to built-in default")
+    console.print(f"[dim]{PROMPT_PATH}[/dim]")
+
+
+@gatekeeper.command(name="diff")
+def gatekeeper_diff():
+    """Show diff between custom prompt and built-in default."""
+    import difflib
+    from jacked.data.hooks.security_gatekeeper import SECURITY_PROMPT, PROMPT_PATH
+
+    if not PROMPT_PATH.exists():
+        console.print("[yellow]No custom prompt file found — using built-in default[/yellow]")
+        console.print(f"[dim]Create one at: {PROMPT_PATH}[/dim]")
+        return
+
+    try:
+        custom = PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        console.print(f"[red]Error reading prompt file:[/red] {e}")
+        return
+
+    if custom.strip() == SECURITY_PROMPT.strip():
+        console.print("[green]No differences — custom prompt matches built-in default[/green]")
+        return
+
+    diff = difflib.unified_diff(
+        SECURITY_PROMPT.splitlines(keepends=True),
+        custom.splitlines(keepends=True),
+        fromfile="built-in",
+        tofile=str(PROMPT_PATH),
+    )
+    for line in diff:
+        if line.startswith('+') and not line.startswith('+++'):
+            console.print(f"[green]{line.rstrip()}[/green]")
+        elif line.startswith('-') and not line.startswith('---'):
+            console.print(f"[red]{line.rstrip()}[/red]")
+        else:
+            console.print(line.rstrip())
 
 
 if __name__ == "__main__":
