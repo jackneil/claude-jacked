@@ -101,9 +101,9 @@ def main():
 
     print("\n=== Path-stripped allowlist (full path to python/node) ===")
     results.append(test_case(
-        "python.exe -c print(42)",
+        "python.exe -c print(42) [ambiguous, falls to LLM]",
         f'{sys.executable} -c "print(42)"',
-        expect_allow=True,
+        expect_allow=False,
     ))
     results.append(test_case(
         "python.exe -m pytest",
