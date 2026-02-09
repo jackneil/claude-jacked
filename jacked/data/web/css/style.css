@@ -404,6 +404,11 @@
     animation: badgePulse 3s ease-in-out infinite;
 }
 
+.version-badge--ahead {
+    background-color: rgba(139, 92, 246, 0.15);
+    color: #a78bfa;
+}
+
 .version-badge--unknown {
     background-color: rgba(148, 163, 184, 0.12);
     color: #94a3b8;

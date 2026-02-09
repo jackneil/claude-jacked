@@ -20,11 +20,14 @@ function _timeUntil(isoStr) {
     return `in ${Math.round(diff / 86400)}d`;
 }
 
-function _buildTooltip(current, latest, outdated, checkedAt, nextCheckAt) {
+function _buildTooltip(current, latest, outdated, ahead, checkedAt, nextCheckAt) {
     const lines = [];
     if (outdated && latest) {
         lines.push(`Update available: v${current} \u2192 v${latest}`);
         lines.push('pip install -U claude-jacked');
+    } else if (ahead && latest) {
+        lines.push(`v${current} — ahead of PyPI (v${latest})`);
+        lines.push('Running unreleased build');
     } else if (latest) {
         lines.push(`v${current} \u2014 latest`);
     } else {
@@ -59,16 +62,19 @@ function updateVersionDisplay(versionData) {
     const current = versionData.current_version || versionData.current || '';
     const latest = versionData.latest_version || versionData.latest || '';
     const outdated = versionData.outdated || false;
+    const ahead = versionData.ahead || false;
     const checkedAt = versionData.checked_at || '';
     const nextCheckAt = versionData.next_check_at || '';
 
-    const tooltip = _buildTooltip(current, latest, outdated, checkedAt, nextCheckAt);
+    const tooltip = _buildTooltip(current, latest, outdated, ahead, checkedAt, nextCheckAt);
 
     const refresh = `<button id="version-refresh-btn" class="version-refresh" onclick="_refreshVersion()" title="Check now">\u21bb</button>`;
 
     let badge;
     if (outdated && latest) {
         badge = `<span class="version-badge version-badge--outdated" title="${escapeHtml(tooltip)}">v${escapeHtml(current)} \u2192 v${escapeHtml(latest)} ${refresh}</span>`;
+    } else if (ahead && latest) {
+        badge = `<span class="version-badge version-badge--ahead" title="${escapeHtml(tooltip)}">v${escapeHtml(current)} dev ${refresh}</span>`;
     } else if (latest) {
         badge = `<span class="version-badge version-badge--current" title="${escapeHtml(tooltip)}">v${escapeHtml(current)} \u2713 ${refresh}</span>`;
     } else {

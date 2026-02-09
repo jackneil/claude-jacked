@@ -220,6 +220,7 @@ class TestCheckVersionCached:
 
         assert result["latest"] == "0.4.0"
         assert result["outdated"] is True
+        assert result["ahead"] is False
         assert "checked_at" in result
         assert "next_check_at" in result
 
@@ -239,6 +240,25 @@ class TestCheckVersionCached:
 
         assert result["latest"] == "0.3.11"
         assert result["outdated"] is False
+        assert result["ahead"] is False
+
+    def test_fresh_cache_ahead_of_pypi(self, tmp_path):
+        """Local version ahead of PyPI shows ahead=True.
+
+        >>> # Local 0.4.0 > PyPI 0.3.10 = ahead
+        """
+        cache_file = tmp_path / "version-cache.json"
+        cache_file.write_text(json.dumps({
+            "checked_at": time.time(),
+            "latest": "0.3.10",
+        }))
+
+        with patch.object(vc, "VERSION_CACHE", cache_file):
+            result = vc.check_version_cached("0.4.0")
+
+        assert result["latest"] == "0.3.10"
+        assert result["outdated"] is False
+        assert result["ahead"] is True
 
     def test_stale_cache_hits_pypi(self, tmp_path):
         """Stale cache (>24h) triggers PyPI check.

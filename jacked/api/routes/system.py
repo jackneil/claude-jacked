@@ -20,6 +20,7 @@ class VersionResponse(BaseModel):
     current: str
     latest: Optional[str] = None
     outdated: bool = False
+    ahead: bool = False
     checked_at: Optional[str] = None
     next_check_at: Optional[str] = None
 
@@ -121,6 +122,7 @@ def _version_response(result: dict | None) -> "VersionResponse":
         current=__version__,
         latest=result["latest"],
         outdated=result["outdated"],
+        ahead=result.get("ahead", False),
         checked_at=checked_iso,
         next_check_at=next_iso,
     )

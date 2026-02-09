@@ -87,6 +87,7 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
                             return {
                                 "latest": latest,
                                 "outdated": is_newer(latest, current_version),
+                                "ahead": is_newer(current_version, latest),
                                 "checked_at": checked_at,
                                 "next_check_at": checked_at + CACHE_TTL,
                             }
@@ -122,6 +123,7 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
         return {
             "latest": latest,
             "outdated": is_newer(latest, current_version),
+            "ahead": is_newer(current_version, latest),
             "checked_at": now,
             "next_check_at": now + CACHE_TTL,
         }
