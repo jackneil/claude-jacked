@@ -64,25 +64,37 @@ def is_newer(latest: str, current: str) -> bool:
         return False
 
 
-def check_version_cached(current_version: str) -> dict | None:
-    """Check PyPI with 24h cache. Returns {"latest": "x.y.z", "outdated": bool} or None."""
+def check_version_cached(current_version: str, force: bool = False) -> dict | None:
+    """Check PyPI with 24h cache. Returns {"latest", "outdated", "checked_at", "next_check_at"} or None.
+
+    >>> result = check_version_cached.__doc__  # doctest placeholder
+    >>> isinstance(result, str)
+    True
+    """
     try:
         now = time.time()
 
         # Read cache (corrupt cache falls through to PyPI check)
-        try:
-            if VERSION_CACHE.exists():
-                cache = json.loads(VERSION_CACHE.read_text(encoding="utf-8"))
-                age = now - cache.get("checked_at", 0)
-                if 0 <= age < CACHE_TTL:
-                    latest = cache.get("latest", "")
-                    if latest:
-                        return {"latest": latest, "outdated": is_newer(latest, current_version)}
-                    return None
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass  # Corrupt cache — fall through to PyPI
+        if not force:
+            try:
+                if VERSION_CACHE.exists():
+                    cache = json.loads(VERSION_CACHE.read_text(encoding="utf-8"))
+                    checked_at = cache.get("checked_at", 0)
+                    age = now - checked_at
+                    if 0 <= age < CACHE_TTL:
+                        latest = cache.get("latest", "")
+                        if latest:
+                            return {
+                                "latest": latest,
+                                "outdated": is_newer(latest, current_version),
+                                "checked_at": checked_at,
+                                "next_check_at": checked_at + CACHE_TTL,
+                            }
+                        return None
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass  # Corrupt cache — fall through to PyPI
 
-        # Cache stale, missing, or corrupt — hit PyPI
+        # Cache stale, missing, corrupt, or force refresh — hit PyPI
         latest = get_latest_pypi_version()
         if latest is None:
             return None
@@ -90,6 +102,7 @@ def check_version_cached(current_version: str) -> dict | None:
         # Write cache atomically (temp file + replace)
         import tempfile
         import os
+        VERSION_CACHE.parent.mkdir(parents=True, exist_ok=True)
         cache_data = json.dumps({"checked_at": now, "latest": latest})
         tmp_fd, tmp_path = tempfile.mkstemp(dir=VERSION_CACHE.parent, suffix=".tmp")
         try:
@@ -106,6 +119,11 @@ def check_version_cached(current_version: str) -> dict | None:
             except Exception:
                 pass
 
-        return {"latest": latest, "outdated": is_newer(latest, current_version)}
+        return {
+            "latest": latest,
+            "outdated": is_newer(latest, current_version),
+            "checked_at": now,
+            "next_check_at": now + CACHE_TTL,
+        }
     except Exception:
         return None

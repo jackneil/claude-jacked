@@ -218,7 +218,10 @@ class TestCheckVersionCached:
                 result = vc.check_version_cached("0.3.11")
                 mock_pypi.assert_not_called()
 
-        assert result == {"latest": "0.4.0", "outdated": True}
+        assert result["latest"] == "0.4.0"
+        assert result["outdated"] is True
+        assert "checked_at" in result
+        assert "next_check_at" in result
 
     def test_fresh_cache_not_outdated(self, tmp_path):
         """Fresh cache shows not outdated when versions match.
@@ -234,7 +237,8 @@ class TestCheckVersionCached:
         with patch.object(vc, "VERSION_CACHE", cache_file):
             result = vc.check_version_cached("0.3.11")
 
-        assert result == {"latest": "0.3.11", "outdated": False}
+        assert result["latest"] == "0.3.11"
+        assert result["outdated"] is False
 
     def test_stale_cache_hits_pypi(self, tmp_path):
         """Stale cache (>24h) triggers PyPI check.
@@ -258,7 +262,8 @@ class TestCheckVersionCached:
             with patch("urllib.request.urlopen", return_value=mock_response):
                 result = vc.check_version_cached("0.3.11")
 
-        assert result == {"latest": "0.4.0", "outdated": True}
+        assert result["latest"] == "0.4.0"
+        assert result["outdated"] is True
 
     def test_no_cache_hits_pypi(self, tmp_path):
         """Missing cache file triggers PyPI check.
@@ -278,7 +283,8 @@ class TestCheckVersionCached:
             with patch("urllib.request.urlopen", return_value=mock_response):
                 result = vc.check_version_cached("0.3.11")
 
-        assert result == {"latest": "0.3.11", "outdated": False}
+        assert result["latest"] == "0.3.11"
+        assert result["outdated"] is False
         # Verify cache was written
         assert cache_file.exists()
         cached = json.loads(cache_file.read_text())
@@ -303,7 +309,8 @@ class TestCheckVersionCached:
             with patch("urllib.request.urlopen", return_value=mock_response):
                 result = vc.check_version_cached("0.3.11")
 
-        assert result == {"latest": "0.4.0", "outdated": True}
+        assert result["latest"] == "0.4.0"
+        assert result["outdated"] is True
 
     def test_pypi_down_returns_none(self, tmp_path):
         """PyPI unreachable with no cache returns None.
@@ -341,7 +348,8 @@ class TestCheckVersionCached:
             with patch("urllib.request.urlopen", return_value=mock_response):
                 result = vc.check_version_cached("0.3.11")
 
-        assert result == {"latest": "0.4.0", "outdated": True}
+        assert result["latest"] == "0.4.0"
+        assert result["outdated"] is True
 
     def test_cache_empty_latest_returns_none(self, tmp_path):
         """Cache with empty latest version returns None.
@@ -358,3 +366,31 @@ class TestCheckVersionCached:
             result = vc.check_version_cached("0.3.11")
 
         assert result is None
+
+    def test_force_bypasses_fresh_cache(self, tmp_path):
+        """force=True hits PyPI even when cache is fresh.
+
+        >>> # Fresh cache + force=True = still calls PyPI
+        """
+        cache_file = tmp_path / "version-cache.json"
+        cache_file.write_text(json.dumps({
+            "checked_at": time.time(),
+            "latest": "0.3.10",
+        }))
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "info": {"version": "0.4.0"},
+        }).encode("utf-8")
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(vc, "VERSION_CACHE", cache_file):
+            with patch("urllib.request.urlopen", return_value=mock_response) as mock_pypi:
+                result = vc.check_version_cached("0.3.11", force=True)
+                mock_pypi.assert_called_once()
+
+        assert result["latest"] == "0.4.0"
+        assert result["outdated"] is True
+        assert result["checked_at"] > 0
+        assert result["next_check_at"] > result["checked_at"]

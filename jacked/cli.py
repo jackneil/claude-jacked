@@ -64,6 +64,44 @@ def _require_search(command_name: str) -> bool:
         return False
 
 
+DB_PATH = Path.home() / ".claude" / "jacked.db"
+_VALID_TABLES = {"command_usage", "agent_invocations", "hook_executions", "version_checks"}
+
+
+def _log_to_db(table: str, **kwargs):
+    """Fire-and-forget DB write. Never blocks, never crashes."""
+    if table not in _VALID_TABLES:
+        return
+    import threading
+
+    def _do_write():
+        import sqlite3
+        from datetime import datetime
+        if not DB_PATH.exists():
+            return
+        try:
+            conn = sqlite3.connect(str(DB_PATH), timeout=0.5)
+            conn.execute("PRAGMA journal_mode=WAL")
+            kwargs.setdefault("timestamp", datetime.utcnow().isoformat())
+            cols = ", ".join(kwargs.keys())
+            placeholders = ", ".join("?" for _ in kwargs)
+            conn.execute(
+                f"INSERT INTO {table} ({cols}) VALUES ({placeholders})",
+                tuple(kwargs.values()),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    try:
+        t = threading.Thread(target=_do_write, daemon=True)
+        t.start()
+        t.join(timeout=0.1)
+    except Exception:
+        pass
+
+
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 def main(verbose: bool):
@@ -82,6 +120,8 @@ def index(session: Optional[str], repo: Optional[str]):
     Requires: pip install "claude-jacked[search]"
     """
     import os
+    import time
+    _index_start = time.time()
 
     # Check if qdrant is available
     try:
@@ -167,7 +207,23 @@ def index(session: Optional[str], repo: Optional[str]):
         console.print(f"[yellow][-][/yellow] Session {result['session_id']} unchanged, skipped")
     else:
         console.print(f"[red][FAIL][/red] Failed: {result.get('error')}")
+        _log_to_db(
+            "hook_executions",
+            hook_type="Stop", hook_name="session_indexing",
+            session_id=os.getenv("CLAUDE_SESSION_ID", ""),
+            repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
+            success=False, duration_ms=(time.time() - _index_start) * 1000,
+        )
         sys.exit(1)
+
+    _log_to_db(
+        "hook_executions",
+        hook_type="Stop", hook_name="session_indexing",
+        session_id=os.getenv("CLAUDE_SESSION_ID", ""),
+        repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
+        success=result.get("indexed", False),
+        duration_ms=(time.time() - _index_start) * 1000,
+    )
 
 
 @main.command()
@@ -204,6 +260,8 @@ def backfill(repo: Optional[str], force: bool):
         f"  Errors:  [red]{results['errors']}[/red]"
     )
 
+    _log_to_db("command_usage", command_name="backfill")
+
 
 @main.command()
 @click.argument("query")
@@ -226,6 +284,12 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 
     import os
     from jacked.searcher import SessionSearcher
+
+    _log_to_db(
+        "command_usage", command_name="search",
+        repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
+        session_id=os.getenv("CLAUDE_SESSION_ID", ""),
+    )
 
     config = get_config()
     searcher = SessionSearcher(config)
@@ -566,6 +630,39 @@ def status():
         ))
 
 
+@main.command(name="webux")
+@click.option("--host", default="127.0.0.1", help="Host to bind to")
+@click.option("--port", default=8321, type=int, help="Port to bind to")
+@click.option("--no-browser", is_flag=True, help="Don't auto-open browser")
+@click.option("--reload", is_flag=True, help="Auto-reload on file changes (dev mode)")
+def webux(host: str, port: int, no_browser: bool, reload: bool):
+    """Start the jacked web dashboard."""
+    try:
+        import uvicorn  # noqa: F401
+    except ImportError:
+        console.print("[red]Error:[/red] webux requires the web extra.")
+        console.print('Install it with:')
+        console.print('  [bold]pip install "claude-jacked[web]"[/bold]')
+        sys.exit(1)
+
+    url = f"http://{host}:{port}"
+    console.print(f"[bold]Starting jacked dashboard at {url}[/bold]")
+    if reload:
+        console.print("[dim]Auto-reload enabled — watching for file changes[/dim]")
+
+    if not no_browser:
+        import webbrowser
+        webbrowser.open(url)
+
+    uvicorn.run(
+        "jacked.api.main:app",
+        host=host,
+        port=port,
+        reload=reload,
+        reload_dirs=["jacked"] if reload else None,
+    )
+
+
 @main.command(name="check-version")
 def check_version():
     """Check if a newer version of claude-jacked is available on PyPI."""
@@ -576,11 +673,46 @@ def check_version():
     if result is None:
         console.print("[yellow]Could not reach PyPI[/yellow]")
         return
+
+    _log_to_db(
+        "version_checks",
+        current_version=__version__, latest_version=result["latest"],
+        outdated=result["outdated"],
+    )
+
     if result["outdated"]:
         console.print(f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}")
         console.print("Run: [bold]pipx upgrade claude-jacked[/bold]  or  [bold]pip install -U claude-jacked[/bold]")
     else:
         console.print(f"[green]Up to date:[/green] {__version__}")
+
+
+@main.command()
+@click.argument("category", type=click.Choice(["command", "agent", "hook"]))
+@click.argument("name")
+@click.option("--session-id", envvar="CLAUDE_SESSION_ID")
+@click.option("--repo", envvar="CLAUDE_PROJECT_DIR")
+def log(category, name, session_id, repo):
+    """Record a command/agent/hook invocation to the analytics DB."""
+    import sqlite3
+    from datetime import datetime
+    if not DB_PATH.exists():
+        return
+    table_map = {"command": "command_usage", "agent": "agent_invocations", "hook": "hook_executions"}
+    name_col = {"command": "command_name", "agent": "agent_name", "hook": "hook_name"}
+    table = table_map[category]
+    col = name_col[category]
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=0.5)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            f"INSERT INTO {table} ({col}, timestamp, session_id, repo_path, success) VALUES (?, ?, ?, ?, ?)",
+            (name, datetime.utcnow().isoformat(), session_id or "", repo or "", True),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 @main.command()
@@ -652,6 +784,59 @@ def _get_data_root() -> Path:
     return Path(__file__).parent / "data"
 
 
+def _is_editable_install() -> bool:
+    """Check if package is installed in editable (dev) mode.
+
+    >>> # In a git repo with editable install, returns True
+    >>> isinstance(_is_editable_install(), bool)
+    True
+    """
+    repo_root = _get_data_root().parent.parent
+    return (repo_root / ".git").is_dir()
+
+
+def _link_or_copy(src: Path, dst: Path) -> str:
+    """Symlink src→dst for editable installs, copy otherwise.
+
+    Fallback chain (editable mode): symlink → hardlink → copy.
+    Windows symlinks need admin; hardlinks need same volume.
+
+    Returns 'symlinked', 'hardlinked', or 'copied'.
+
+    >>> isinstance(_link_or_copy.__doc__, str)
+    True
+    """
+    import os as _os
+    import shutil as _shutil
+
+    # Remove existing file/symlink at destination
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+
+    if not _is_editable_install():
+        _shutil.copy(src, dst)
+        return "copied"
+
+    # Editable mode — try symlink first
+    try:
+        _os.symlink(src.resolve(), dst)
+        return "symlinked"
+    except OSError:
+        pass
+
+    # Fallback: hardlink (same volume only)
+    try:
+        if src.stat().st_dev == dst.parent.stat().st_dev:
+            _os.link(src, dst)
+            return "hardlinked"
+    except OSError:
+        pass
+
+    # Last resort: plain copy
+    _shutil.copy(src, dst)
+    return "copied"
+
+
 def _sound_hook_marker() -> str:
     """Marker to identify jacked sound hooks."""
     return "# jacked-sound: "
@@ -672,8 +857,12 @@ def _get_sound_command(hook_type: str) -> str:
         mac_sound = "Glass.aiff"
         linux_sound = "complete.oga"
 
+    # Log hook execution in background, then play sound in background
+    log_cmd = f'(jacked log hook sound_{hook_type} 2>/dev/null &); '
+
     # Use uname for detection, background with &, fallback to bell
     return (
+        log_cmd +
         '('
         'OS=$(uname -s); '
         'case "$OS" in '
@@ -930,12 +1119,15 @@ def _security_hook_marker() -> str:
 
 
 
-def _install_security_hook(existing: dict, settings_path: Path):
-    """Install security gatekeeper command hook for Bash PreToolUse events.
+GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep"]
 
-    Uses a PreToolUse command hook (blocking) that calls a Python script.
-    The script evaluates commands via local rules, Anthropic API, or claude -p
-    and returns permissionDecision:"allow" to auto-approve safe commands.
+
+def _install_security_hook(existing: dict, settings_path: Path):
+    """Install security gatekeeper hooks for Bash + file tool PreToolUse events.
+
+    Installs one PreToolUse hook entry per tool matcher (Bash, Read, Edit, Write, Grep).
+    Bash hook evaluates commands through the full 4-tier pipeline.
+    File tool hooks enforce path safety rules (sensitive files, outside-project access).
 
     Handles fresh install, version upgrades, and migration from PermissionRequest.
     """
@@ -974,41 +1166,49 @@ def _install_security_hook(existing: dict, settings_path: Path):
     if "PreToolUse" not in existing["hooks"]:
         existing["hooks"]["PreToolUse"] = []
 
-    # Check if already installed and whether it needs upgrading
-    hook_index = None
-    needs_upgrade = False
-    for i, hook_entry in enumerate(existing["hooks"]["PreToolUse"]):
-        hook_str = str(hook_entry)
-        if marker in hook_str or "security_gatekeeper" in hook_str:
-            hook_index = i
-            for h in hook_entry.get("hooks", []):
-                installed_cmd = h.get("command", "")
-                if installed_cmd != command_str:
-                    needs_upgrade = True
-            break
+    # Install/upgrade hooks for each tool matcher
+    modified = False
+    for tool in GATEKEEPER_TOOLS:
+        # Find existing hook for this tool matcher
+        hook_index = None
+        needs_upgrade = False
+        for i, hook_entry in enumerate(existing["hooks"]["PreToolUse"]):
+            hook_str = str(hook_entry)
+            entry_matcher = hook_entry.get("matcher", "")
+            if entry_matcher == tool and (marker in hook_str or "security_gatekeeper" in hook_str):
+                hook_index = i
+                for h in hook_entry.get("hooks", []):
+                    if h.get("command", "") != command_str:
+                        needs_upgrade = True
+                break
 
-    if hook_index is not None and not needs_upgrade:
-        console.print("[yellow][-][/yellow] Security gatekeeper hook already configured")
+        if hook_index is not None and not needs_upgrade:
+            continue  # already up to date
+
+        hook_entry = {
+            "matcher": tool,
+            "hooks": [{
+                "type": "command",
+                "command": command_str,
+                "timeout": 30,
+            }]
+        }
+
+        if hook_index is not None and needs_upgrade:
+            existing["hooks"]["PreToolUse"][hook_index] = hook_entry
+            modified = True
+        else:
+            existing["hooks"]["PreToolUse"].append(hook_entry)
+            modified = True
+
+    if not modified:
+        console.print("[yellow][-][/yellow] Security gatekeeper hooks already configured")
         return
 
-    hook_entry = {
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": command_str,
-            "timeout": 30,
-        }]
-    }
-
-    if hook_index is not None and needs_upgrade:
-        existing["hooks"]["PreToolUse"][hook_index] = hook_entry
-        settings_path.write_text(json.dumps(existing, indent=2))
-        console.print("[green][OK][/green] Updated security gatekeeper to latest version")
-    else:
-        existing["hooks"]["PreToolUse"].append(hook_entry)
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps(existing, indent=2))
-        console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse, blocking)")
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(existing, indent=2))
+    tools_str = ", ".join(GATEKEEPER_TOOLS)
+    console.print(f"[green][OK][/green] Installed security gatekeeper for: {tools_str}")
 
     # Clean up stale prompt file from older versions (v0.3.9 and earlier created
     # this automatically, but it goes stale on upgrades and triggers warnings).
@@ -1195,56 +1395,81 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             shutil.copy(ref_src, ref_dst)
             console.print("[green][OK][/green] Installed jacked reference doc")
 
-    # Copy agents (with conflict detection)
+    # Install agents (symlink for editable, copy otherwise)
+    editable = _is_editable_install()
     agents_src = pkg_root / "agents"
     agents_dst = home / ".claude" / "agents"
     if agents_src.exists():
         agents_dst.mkdir(parents=True, exist_ok=True)
         agent_count = 0
         skipped = 0
+        link_method = None
         for agent_file in agents_src.glob("*.md"):
             dst_file = agents_dst / agent_file.name
-            src_content = agent_file.read_text(encoding="utf-8")
-            if dst_file.exists():
-                dst_content = dst_file.read_text(encoding="utf-8")
-                if src_content == dst_content:
+            # Already a correct symlink — always skip
+            if dst_file.is_symlink() and dst_file.resolve() == agent_file.resolve():
+                skipped += 1
+                continue
+            # Already a hardlink to same inode — always skip
+            if not dst_file.is_symlink() and dst_file.exists():
+                try:
+                    if dst_file.stat().st_ino == agent_file.stat().st_ino:
+                        skipped += 1
+                        continue
+                except OSError:
+                    pass
+            # Existing file with same content — skip unless --force
+            if not force and not dst_file.is_symlink() and dst_file.exists():
+                if agent_file.read_text(encoding="utf-8") == dst_file.read_text(encoding="utf-8"):
                     skipped += 1
-                    continue  # Same content, skip silently
-                # Different content - ask before overwriting (unless --force)
-                if not force and sys.stdin.isatty() and not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
+                    continue
+                if sys.stdin.isatty() and not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
                     console.print(f"[yellow][-][/yellow] Skipped {agent_file.name}")
                     continue
-            shutil.copy(agent_file, dst_file)
+            link_method = _link_or_copy(agent_file, dst_file)
             agent_count += 1
-        msg = f"[green][OK][/green] Installed {agent_count} agents"
+        method_label = f" ({link_method})" if link_method and editable else ""
+        msg = f"[green][OK][/green] Installed {agent_count} agents{method_label}"
         if skipped:
             msg += f" ({skipped} unchanged)"
         console.print(msg)
     else:
         console.print(f"[yellow][-][/yellow] Agents directory not found")
 
-    # Copy commands (with conflict detection)
+    # Install commands (symlink for editable, copy otherwise)
     commands_src = pkg_root / "commands"
     commands_dst = home / ".claude" / "commands"
     if commands_src.exists():
         commands_dst.mkdir(parents=True, exist_ok=True)
         cmd_count = 0
         skipped = 0
+        link_method = None
         for cmd_file in commands_src.glob("*.md"):
             dst_file = commands_dst / cmd_file.name
-            src_content = cmd_file.read_text(encoding="utf-8")
-            if dst_file.exists():
-                dst_content = dst_file.read_text(encoding="utf-8")
-                if src_content == dst_content:
+            # Already a correct symlink — always skip
+            if dst_file.is_symlink() and dst_file.resolve() == cmd_file.resolve():
+                skipped += 1
+                continue
+            # Already a hardlink to same inode — always skip
+            if not dst_file.is_symlink() and dst_file.exists():
+                try:
+                    if dst_file.stat().st_ino == cmd_file.stat().st_ino:
+                        skipped += 1
+                        continue
+                except OSError:
+                    pass
+            # Existing file with same content — skip unless --force
+            if not force and not dst_file.is_symlink() and dst_file.exists():
+                if cmd_file.read_text(encoding="utf-8") == dst_file.read_text(encoding="utf-8"):
                     skipped += 1
-                    continue  # Same content, skip silently
-                # Different content - ask before overwriting (unless --force)
-                if not force and sys.stdin.isatty() and not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
+                    continue
+                if sys.stdin.isatty() and not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
                     console.print(f"[yellow][-][/yellow] Skipped {cmd_file.name}")
                     continue
-            shutil.copy(cmd_file, dst_file)
+            link_method = _link_or_copy(cmd_file, dst_file)
             cmd_count += 1
-        msg = f"[green][OK][/green] Installed {cmd_count} commands"
+        method_label = f" ({link_method})" if link_method and editable else ""
+        msg = f"[green][OK][/green] Installed {cmd_count} commands{method_label}"
         if skipped:
             msg += f" ({skipped} unchanged)"
         console.print(msg)
@@ -1277,6 +1502,14 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     if not no_rules:
         claude_md_path = home / ".claude" / "CLAUDE.md"
         _install_behavioral_rules(claude_md_path, force=force)
+
+    # Ensure analytics DB exists
+    try:
+        from jacked.web.database import Database
+        Database()
+        console.print("[green][OK][/green] Analytics database ready")
+    except Exception:
+        console.print("[dim][-][/dim] Analytics database setup skipped")
 
     console.print("\n[bold]Installation complete![/bold]")
     console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
@@ -1406,7 +1639,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         agent_count = 0
         for agent_file in agents_src.glob("*.md"):
             dst_file = agents_dst / agent_file.name
-            if dst_file.exists():
+            if dst_file.exists() or dst_file.is_symlink():
                 dst_file.unlink()
                 agent_count += 1
         if agent_count > 0:
@@ -1423,7 +1656,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         cmd_count = 0
         for cmd_file in commands_src.glob("*.md"):
             dst_file = commands_dst / cmd_file.name
-            if dst_file.exists():
+            if dst_file.exists() or dst_file.is_symlink():
                 dst_file.unlink()
                 cmd_count += 1
         if cmd_count > 0:
@@ -1698,9 +1931,23 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
                 console.print("[dim]Set ANTHROPIC_API_KEY or install anthropic SDK[/dim]")
                 return
 
+            # Use configured model from gatekeeper settings if available
+            audit_model = "claude-haiku-4-5-20251001"
+            try:
+                import sys as _sys
+                _gk_dir = str(Path(__file__).resolve().parent / "data" / "hooks")
+                if _gk_dir not in _sys.path:
+                    _sys.path.insert(0, _gk_dir)
+                from security_gatekeeper import _read_gatekeeper_config
+                gk_config = _read_gatekeeper_config()
+                audit_model = gk_config["model"]
+                api_key = gk_config["api_key"] or api_key
+            except Exception:
+                pass
+
             client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
             response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model=audit_model,
                 max_tokens=1024,
                 messages=[{"role": "user", "content": audit_prompt}],
             )

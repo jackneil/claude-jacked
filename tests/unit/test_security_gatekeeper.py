@@ -2,10 +2,12 @@
 
 Tests the pure functions directly (no subprocess, no API calls).
 Covers: deny patterns, safe patterns, env prefix stripping, path stripping,
-permission rule parsing, file path extraction, and the local_evaluate chain.
+permission rule parsing, file path extraction, local_evaluate chain,
+and gatekeeper config reader.
 """
 
 import json
+import sqlite3
 import sys
 import pytest
 from pathlib import Path
@@ -1461,3 +1463,112 @@ class TestSessionIdLogging:
             assert "[]" not in content
         finally:
             gk.LOG_PATH = old_log_path
+
+
+# ---------------------------------------------------------------------------
+# _read_gatekeeper_config
+# ---------------------------------------------------------------------------
+
+class TestReadGatekeeperConfig:
+    """Tests for reading gatekeeper config from SQLite settings DB."""
+
+    def _make_db(self, tmp_path, settings=None):
+        """Create a test DB with optional settings rows."""
+        db_path = tmp_path / "jacked.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMP)"
+        )
+        if settings:
+            for key, value in settings.items():
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?)",
+                    (key, json.dumps(value)),
+                )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_defaults_when_no_db(self, tmp_path):
+        """Returns defaults when DB file doesn't exist."""
+        fake_db = tmp_path / "nonexistent.db"
+        config = gk._read_gatekeeper_config(db_path=fake_db)
+        assert config["model"] == gk.MODEL_MAP["haiku"]
+        assert config["model_short"] == "haiku"
+        assert config["eval_method"] == "api_first"
+        assert config["api_key"] == ""
+
+    def test_reads_model_from_db(self, tmp_path):
+        """Reads model setting from DB."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.model": "sonnet"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["model"] == gk.MODEL_MAP["sonnet"]
+        assert config["model_short"] == "sonnet"
+
+    def test_reads_opus_model(self, tmp_path):
+        """Reads opus model from DB."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.model": "opus"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["model"] == gk.MODEL_MAP["opus"]
+        assert config["model_short"] == "opus"
+
+    def test_reads_eval_method_from_db(self, tmp_path):
+        """Reads eval_method setting from DB."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.eval_method": "cli_only"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["eval_method"] == "cli_only"
+
+    def test_reads_api_key_from_db(self, tmp_path):
+        """Reads API key from DB."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.api_key": "sk-test-key-123"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["api_key"] == "sk-test-key-123"
+
+    def test_reads_all_settings(self, tmp_path):
+        """Reads all three settings in one query."""
+        db_path = self._make_db(tmp_path, {
+            "gatekeeper.model": "opus",
+            "gatekeeper.eval_method": "api_only",
+            "gatekeeper.api_key": "sk-my-key",
+        })
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["model"] == gk.MODEL_MAP["opus"]
+        assert config["eval_method"] == "api_only"
+        assert config["api_key"] == "sk-my-key"
+
+    def test_invalid_model_uses_default(self, tmp_path):
+        """Invalid model name falls back to haiku."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.model": "gpt-4"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["model"] == gk.MODEL_MAP["haiku"]
+        assert config["model_short"] == "haiku"
+
+    def test_invalid_eval_method_uses_default(self, tmp_path):
+        """Invalid eval_method falls back to api_first."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.eval_method": "yolo"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["eval_method"] == "api_first"
+
+    def test_corrupted_db_returns_defaults(self, tmp_path):
+        """Corrupted DB file falls back to defaults."""
+        db_path = tmp_path / "jacked.db"
+        db_path.write_text("not a database")
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["model"] == gk.MODEL_MAP["haiku"]
+        assert config["eval_method"] == "api_first"
+        assert config["api_key"] == ""
+
+    def test_empty_db_returns_defaults(self, tmp_path):
+        """DB with settings table but no rows returns defaults."""
+        db_path = self._make_db(tmp_path)
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["model"] == gk.MODEL_MAP["haiku"]
+        assert config["model_short"] == "haiku"
+        assert config["eval_method"] == "api_first"
+        assert config["api_key"] == ""
+
+    def test_cli_first_method(self, tmp_path):
+        """cli_first is a valid eval method."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.eval_method": "cli_first"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["eval_method"] == "cli_first"
