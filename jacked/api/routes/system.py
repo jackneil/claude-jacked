@@ -753,7 +753,7 @@ async def update_gatekeeper_prompt(body: PromptUpdateRequest):
     """Save a custom gatekeeper prompt. Validates required placeholders."""
     from jacked.data.hooks.security_gatekeeper import PROMPT_PATH
 
-    required = {"{command}", "{cwd}", "{file_context}"}
+    required = {"{command}", "{cwd}", "{file_context}", "{watched_paths}"}
     missing = [p for p in sorted(required) if p not in body.text]
     if missing:
         return JSONResponse(
@@ -804,11 +804,22 @@ async def get_path_safety_config(request: Request):
             except (json.JSONDecodeError, TypeError):
                 pass
 
+    # Check existence of watched paths for per-row badges
+    from pathlib import Path as _Path
+    watched = config.get("watched_paths", [])
+    watched_existence = {}
+    for wp in watched:
+        try:
+            watched_existence[wp] = _Path(wp).exists() or _Path(wp + "/").exists()
+        except Exception:
+            watched_existence[wp] = False
+
     return {
         "enabled": config.get("enabled", True),
         "allowed_paths": config.get("allowed_paths", []),
         "disabled_patterns": config.get("disabled_patterns", []),
-        "watched_paths": config.get("watched_paths", []),
+        "watched_paths": watched,
+        "watched_existence": watched_existence,
         "available_rules": get_path_safety_rules_metadata(),
     }
 

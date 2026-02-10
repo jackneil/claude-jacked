@@ -353,7 +353,7 @@ PROMPT_PATH = Path.home() / ".claude" / "gatekeeper-prompt.txt"
 # --- Prompt loading and substitution ---
 
 _PLACEHOLDER_RE = re.compile(r"\{(command|cwd|file_context|watched_paths)\}")
-_REQUIRED_PLACEHOLDERS = {"{command}", "{cwd}", "{file_context}"}
+_REQUIRED_PLACEHOLDERS = {"{command}", "{cwd}", "{file_context}", "{watched_paths}"}
 
 
 def _substitute_prompt(template: str, command: str, cwd: str, file_context: str, watched_paths: str = "") -> str:
@@ -377,7 +377,7 @@ def _load_prompt() -> str:
     if PROMPT_PATH.exists():
         try:
             custom = PROMPT_PATH.read_text(encoding="utf-8").strip()
-            if _REQUIRED_PLACEHOLDERS.issubset(set(re.findall(r"\{command\}|\{cwd\}|\{file_context\}", custom))):
+            if _REQUIRED_PLACEHOLDERS.issubset(set(re.findall(r"\{command\}|\{cwd\}|\{file_context\}|\{watched_paths\}", custom))):
                 return custom
             log("WARNING: Custom prompt missing required placeholders, using built-in")
         except Exception:
@@ -1342,7 +1342,7 @@ def main():
     file_context = read_file_context(command, cwd)
     # Build watched paths block for the trusted section of the prompt
     watched_block = ""
-    watched = ps_config.get("watched_paths", [])
+    watched = ps_config.get("watched_paths", []) if ps_config.get("enabled", True) else []
     if watched:
         watched_block = "WATCHED PATHS (ALWAYS deny access to these paths and their children):\n"
         for wp in watched:
@@ -1350,6 +1350,8 @@ def main():
         watched_block += f"Working directory: {cwd}\n"
         watched_block += 'If this command reads, writes, lists, or accesses ANY file under a watched path (resolve relative paths from working directory), respond {"safe": false, "reason": "accesses watched path: <path>"}.\n'
     template = _load_prompt()
+    if watched and "{watched_paths}" not in template:
+        log("WARNING: Custom prompt missing {watched_paths} placeholder — LLM cannot enforce watched paths")
     prompt = _substitute_prompt(template, command=command, cwd=cwd, file_context=file_context, watched_paths=watched_block)
 
     response = None

@@ -45,6 +45,12 @@ function bindSettingsEvents() {
     const tabs = document.querySelectorAll('.settings-tab');
     tabs.forEach(tab => {
         tab.addEventListener('click', () => {
+            // Guard against losing unsaved changes when switching sub-tabs
+            if (window._settingsDirty) {
+                const leave = confirm('You have unsaved settings changes. Leave without saving?');
+                if (!leave) return;
+                window._settingsDirty = false;
+            }
             tabs.forEach(t => t.classList.remove('active'));
             tab.classList.add('active');
             const tabName = tab.dataset.tab;
@@ -382,14 +388,14 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety) {
                             <span class="flex-shrink-0 w-6 h-6 rounded-full bg-green-800/60 text-green-300 text-xs font-bold flex items-center justify-center mt-0.5">0</span>
                             <div>
                                 <div class="text-sm text-white">Deny Patterns</div>
-                                <div class="text-xs text-slate-400">Blocks dangerous commands instantly (rm -rf, reverse shells, etc). <span class="text-green-400">Always on, ~0ms.</span></div>
+                                <div class="text-xs text-slate-400">Flags dangerous commands and requires your permission (rm -rf, reverse shells, etc). <span class="text-green-400">Always on, ~0ms.</span></div>
                             </div>
                         </div>
                         <div class="flex items-start gap-3 p-3 rounded bg-orange-900/20 border border-orange-700/40">
                             <span class="flex-shrink-0 w-6 h-6 rounded-full bg-orange-800/60 text-orange-300 text-xs font-bold flex items-center justify-center mt-0.5">1</span>
                             <div>
                                 <div class="text-sm text-white">Path Safety Rules <span class="text-xs text-orange-300 font-normal">(configurable below)</span></div>
-                                <div class="text-xs text-slate-400">Blocks access to sensitive files (.env, SSH keys, etc) and paths outside your project. Also guards Read/Edit/Write/Grep tools. Runs before permission rules so broad wildcards don't auto-approve secrets. <span class="text-orange-400">Deterministic, ~0ms.</span></div>
+                                <div class="text-xs text-slate-400">Requires permission for sensitive files (.env, SSH keys, etc) and paths outside your project. Also guards Read/Edit/Write/Grep tools. Runs before permission rules so broad wildcards don't auto-approve secrets. <span class="text-orange-400">Deterministic, ~0ms.</span></div>
                             </div>
                         </div>
                         <div class="flex items-start gap-3 p-3 rounded bg-slate-900/50 border border-slate-700/50">
@@ -496,6 +502,7 @@ function renderPathSafetySection(pathSafety) {
     const dirRules = rules.dir_rules || {};
 
     const watchedPaths = pathSafety.watched_paths || [];
+    const watchedExistence = pathSafety.watched_existence || {};
 
     const sectionOpacity = enabled ? '' : 'opacity-40 pointer-events-none';
 
@@ -536,14 +543,14 @@ function renderPathSafetySection(pathSafety) {
         <div class="flex items-center justify-between mb-3">
             <div class="flex items-center gap-3">
                 <span class="text-sm font-medium text-slate-300">Path Safety Rules</span>
-                <span id="ps-status-badge" class="text-xs px-2 py-0.5 rounded-full ${enabled ? 'bg-orange-900/60 text-orange-300' : 'bg-slate-700 text-slate-400'}">${enabled ? 'Active' : 'Disabled'}</span>
+                <span id="ps-status-badge" class="text-xs px-2 py-0.5 rounded-full ${enabled ? 'bg-green-900/60 text-green-300' : 'bg-slate-700 text-slate-400'}">${enabled ? 'Active' : 'Disabled'}</span>
             </div>
             <label class="toggle-switch" id="ps-master-toggle">
                 <input type="checkbox" ${enabled ? 'checked' : ''}>
                 <span class="toggle-slider"></span>
             </label>
         </div>
-        <p class="text-xs text-slate-500 mb-4">Blocks reads/writes to files that commonly contain secrets and access outside your project directory. Deterministic checks — no LLM needed.</p>
+        <p class="text-xs text-slate-500 mb-4">Requires permission for reads/writes to files that commonly contain secrets and access outside your project directory. Deterministic checks — no LLM needed.</p>
 
         <div id="ps-config-body" class="${sectionOpacity}">
             <!-- Sensitive File Patterns -->
@@ -586,6 +593,7 @@ function renderPathSafetySection(pathSafety) {
                         ${watchedPaths.length > 0 ? watchedPaths.map((p, i) => `
                             <div class="flex items-center gap-2 p-2 bg-red-900/20 rounded border border-red-800/30">
                                 <code class="text-xs text-red-300 flex-1 truncate">${escapeHtml(p)}</code>
+                                ${watchedExistence[p] === false ? '<span class="text-[10px] text-amber-400 whitespace-nowrap">(does not exist)</span>' : ''}
                                 <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1" data-index="${i}" title="Remove">&times;</button>
                             </div>
                         `).join('') : '<div class="text-xs text-slate-500 italic p-2">No watched paths. Add paths to always require permission when accessed.</div>'}
@@ -667,7 +675,7 @@ function bindPathSafetyEvents(pathSafety) {
                 const badge = document.getElementById('ps-status-badge');
                 if (badge) {
                     badge.textContent = enabled ? 'Active' : 'Disabled';
-                    badge.className = `text-xs px-2 py-0.5 rounded-full ${enabled ? 'bg-orange-900/60 text-orange-300' : 'bg-slate-700 text-slate-400'}`;
+                    badge.className = `text-xs px-2 py-0.5 rounded-full ${enabled ? 'bg-green-900/60 text-green-300' : 'bg-slate-700 text-slate-400'}`;
                 }
                 // Save only the enabled flag with the LAST SAVED state (not current UI state)
                 try {
@@ -678,6 +686,7 @@ function bindPathSafetyEvents(pathSafety) {
                         watched_paths: window._psInitialState.watched_paths,
                     };
                     await api.put('/api/settings/gatekeeper/path-safety', saved);
+                    window._psInitialState.enabled = enabled;
                     showToast(`Path safety ${enabled ? 'enabled' : 'disabled'}`, 'success');
                 } catch (e) {
                     input.checked = !enabled;
@@ -688,7 +697,7 @@ function bindPathSafetyEvents(pathSafety) {
                     }
                     if (badge) {
                         badge.textContent = !enabled ? 'Active' : 'Disabled';
-                        badge.className = `text-xs px-2 py-0.5 rounded-full ${!enabled ? 'bg-orange-900/60 text-orange-300' : 'bg-slate-700 text-slate-400'}`;
+                        badge.className = `text-xs px-2 py-0.5 rounded-full ${!enabled ? 'bg-green-900/60 text-green-300' : 'bg-slate-700 text-slate-400'}`;
                     }
                     showToast(e.message || 'Toggle failed', 'error');
                 } finally {
@@ -783,7 +792,11 @@ function bindPathSafetyEvents(pathSafety) {
         }
     };
 
+    let _watchedPending = false;
     const _addWatchedPath = async () => {
+        if (_watchedPending) return;
+        _watchedPending = true;
+        try {
         const val = (watchedInput ? watchedInput.value : '').trim();
         if (!val) return;
         _hideWatchedError();
@@ -817,7 +830,7 @@ function bindPathSafetyEvents(pathSafety) {
                 _showWatchedError('Path already watched (resolves to same location)');
                 return;
             }
-            _insertWatchedRow(list, res.resolved || val);
+            _insertWatchedRow(list, res.resolved || val, res.exists);
             watchedInput.value = '';
 
             // Auto-save watched paths only — use saved state for other fields to avoid
@@ -857,6 +870,7 @@ function bindPathSafetyEvents(pathSafety) {
         } catch (e) {
             _showWatchedError(e.message || 'Validation failed');
         }
+        } finally { _watchedPending = false; }
     };
 
     if (addWatchedBtn) addWatchedBtn.addEventListener('click', _addWatchedPath);
@@ -896,6 +910,7 @@ function bindPathSafetyEvents(pathSafety) {
                 await api.put('/api/settings/gatekeeper/path-safety', state);
                 // Update initial state to new saved values
                 window._psInitialState = {
+                    enabled: state.enabled,
                     disabled_patterns: [...state.disabled_patterns],
                     allowed_paths: [...state.allowed_paths],
                     watched_paths: [...state.watched_paths],
@@ -957,16 +972,18 @@ function _rebindRemovePathButtons() {
 }
 
 
-function _insertWatchedRow(list, path) {
+function _insertWatchedRow(list, path, exists) {
     // Remove placeholder if present
     const placeholder = list.querySelector('.italic');
     if (placeholder) placeholder.remove();
 
     const idx = list.querySelectorAll('.ps-remove-watched').length;
+    const existsBadge = exists === false ? '<span class="text-[10px] text-amber-400 whitespace-nowrap">(does not exist)</span>' : '';
     const row = document.createElement('div');
     row.className = 'flex items-center gap-2 p-2 bg-red-900/20 rounded border border-red-800/30';
     row.innerHTML = `
         <code class="text-xs text-red-300 flex-1 truncate">${escapeHtml(path)}</code>
+        ${existsBadge}
         <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1" data-index="${idx}" title="Remove">&times;</button>
     `;
     list.appendChild(row);
@@ -1331,6 +1348,7 @@ async function loadPromptEditor() {
                 <span id="ph-command" class="flex items-center gap-1"></span>
                 <span id="ph-cwd" class="flex items-center gap-1"></span>
                 <span id="ph-file_context" class="flex items-center gap-1"></span>
+                <span id="ph-watched_paths" class="flex items-center gap-1"></span>
             </div>
             <div id="prompt-validation-error" class="mt-2 text-xs text-red-400 hidden"></div>
             <div class="flex items-center justify-between mt-3 pt-3 border-t border-slate-700">
@@ -1361,6 +1379,7 @@ function validatePromptPlaceholders() {
         { id: 'ph-command', token: '{command}' },
         { id: 'ph-cwd', token: '{cwd}' },
         { id: 'ph-file_context', token: '{file_context}' },
+        { id: 'ph-watched_paths', token: '{watched_paths}' },
     ];
 
     let allPresent = true;
@@ -1391,7 +1410,7 @@ function bindPromptEditorEvents() {
         textarea.addEventListener('input', () => {
             const valid = validatePromptPlaceholders();
             errorEl.classList.toggle('hidden', valid);
-            if (!valid) errorEl.textContent = 'Save disabled \u2014 all three placeholders are required.';
+            if (!valid) errorEl.textContent = 'Save disabled \u2014 all four placeholders are required.';
             const changed = textarea.value !== content.dataset.originalText;
             if (saveBtn) saveBtn.disabled = !valid || !changed;
             if (statusEl) statusEl.textContent = changed ? 'Unsaved changes' : '';
