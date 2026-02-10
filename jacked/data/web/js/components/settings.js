@@ -495,6 +495,8 @@ function renderPathSafetySection(pathSafety) {
     const fileRules = rules.file_rules || {};
     const dirRules = rules.dir_rules || {};
 
+    const watchedPaths = pathSafety.watched_paths || [];
+
     const sectionOpacity = enabled ? '' : 'opacity-40 pointer-events-none';
 
     const fileCheckboxes = Object.entries(fileRules).map(([key, rule]) => {
@@ -570,6 +572,35 @@ function renderPathSafetySection(pathSafety) {
                 </div>
             </div>
 
+            <!-- Watched Paths -->
+            <div class="mb-4">
+                <div id="ps-watched-header" class="flex items-center justify-between cursor-pointer select-none mb-2">
+                    <span class="text-xs font-medium text-red-400 uppercase tracking-wider">Watched Paths (always require permission)</span>
+                    <svg id="ps-watched-chevron" class="w-4 h-4 text-slate-500 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                </div>
+                <div id="ps-watched-content" class="hidden">
+                    <p class="text-[10px] text-slate-500 mb-2">Files under these paths will always trigger a permission prompt, even inside your project.</p>
+                    <div id="ps-watched-list" class="space-y-1 mb-2">
+                        ${watchedPaths.length > 0 ? watchedPaths.map((p, i) => `
+                            <div class="flex items-center gap-2 p-2 bg-red-900/20 rounded border border-red-800/30">
+                                <code class="text-xs text-red-300 flex-1 truncate">${escapeHtml(p)}</code>
+                                <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1" data-index="${i}" title="Remove">&times;</button>
+                            </div>
+                        `).join('') : '<div class="text-xs text-slate-500 italic p-2">No watched paths. Add paths to always require permission when accessed.</div>'}
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <input id="ps-new-watched" type="text" placeholder="e.g. C:/Users/jack/production-configs"
+                               class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-red-500">
+                        <button id="ps-add-watched" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition-colors">+ Add</button>
+                        <button id="ps-browse-watched" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition-colors">Browse</button>
+                    </div>
+                    <div id="ps-watched-error" class="text-xs text-red-400 mt-1 hidden"></div>
+                    <div id="ps-dir-browser" class="hidden mt-2 bg-slate-900 border border-slate-700 rounded-lg p-3"></div>
+                </div>
+            </div>
+
             <!-- Allowed Paths -->
             <div class="mb-4">
                 <div id="ps-paths-header" class="flex items-center justify-between cursor-pointer select-none mb-2">
@@ -590,6 +621,15 @@ function renderPathSafetySection(pathSafety) {
                 </div>
             </div>
 
+            <!-- Unsaved changes banner -->
+            <div id="ps-unsaved-banner" class="hidden mb-3 p-3 bg-amber-900/30 border border-amber-600/50 rounded-lg flex items-center justify-between">
+                <span class="text-xs text-amber-300 font-medium">You have unsaved changes</span>
+                <div class="flex gap-2">
+                    <button id="ps-banner-save" class="px-3 py-1 text-xs bg-amber-600 hover:bg-amber-500 text-white rounded transition-colors">Save Now</button>
+                    <button id="ps-banner-discard" class="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors">Discard</button>
+                </div>
+            </div>
+
             <!-- Save button -->
             <div class="flex items-center justify-end pt-2">
                 <button id="btn-ps-save" class="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm rounded transition-colors">Save Path Rules</button>
@@ -602,9 +642,12 @@ function renderPathSafetySection(pathSafety) {
 function bindPathSafetyEvents(pathSafety) {
     // Store initial state for dirty tracking
     window._psInitialState = {
+        enabled: pathSafety.enabled !== undefined ? pathSafety.enabled : true,
         disabled_patterns: [...(pathSafety.disabled_patterns || [])],
         allowed_paths: [...(pathSafety.allowed_paths || [])],
+        watched_paths: [...(pathSafety.watched_paths || [])],
     };
+    window._settingsDirty = false;
 
     // Master toggle — saves only enabled state (not unsaved checkbox changes)
     const masterToggle = document.getElementById('ps-master-toggle');
@@ -632,6 +675,7 @@ function bindPathSafetyEvents(pathSafety) {
                         enabled,
                         disabled_patterns: window._psInitialState.disabled_patterns,
                         allowed_paths: window._psInitialState.allowed_paths,
+                        watched_paths: window._psInitialState.watched_paths,
                     };
                     await api.put('/api/settings/gatekeeper/path-safety', saved);
                     showToast(`Path safety ${enabled ? 'enabled' : 'disabled'}`, 'success');
@@ -657,6 +701,7 @@ function bindPathSafetyEvents(pathSafety) {
     // Collapsible sections
     _bindCollapsible('ps-files-header', 'ps-files-content', 'ps-files-chevron');
     _bindCollapsible('ps-dirs-header', 'ps-dirs-content', 'ps-dirs-chevron');
+    _bindCollapsible('ps-watched-header', 'ps-watched-content', 'ps-watched-chevron');
     _bindCollapsible('ps-paths-header', 'ps-paths-content', 'ps-paths-chevron');
 
     // Track dirty state on pattern checkboxes
@@ -711,8 +756,134 @@ function bindPathSafetyEvents(pathSafety) {
         });
     }
 
-    // Remove path buttons
+    // Remove path buttons (allowed paths)
     _rebindRemovePathButtons();
+
+    // --- Watched paths ---
+    const addWatchedBtn = document.getElementById('ps-add-watched');
+    const watchedInput = document.getElementById('ps-new-watched');
+    const watchedError = document.getElementById('ps-watched-error');
+
+    const _showWatchedError = (msg) => {
+        if (watchedError) {
+            watchedError.textContent = msg;
+            watchedError.className = 'text-xs text-red-400 mt-1';
+        }
+    };
+    const _showWatchedWarning = (msg) => {
+        if (watchedError) {
+            watchedError.textContent = msg;
+            watchedError.className = 'text-xs text-amber-400 mt-1';
+        }
+    };
+    const _hideWatchedError = () => {
+        if (watchedError) {
+            watchedError.textContent = '';
+            watchedError.className = 'text-xs text-red-400 mt-1 hidden';
+        }
+    };
+
+    const _addWatchedPath = async () => {
+        const val = (watchedInput ? watchedInput.value : '').trim();
+        if (!val) return;
+        _hideWatchedError();
+
+        const list = document.getElementById('ps-watched-list');
+        if (!list) return;
+
+        // Client-side 20-path limit
+        const currentPaths = list.querySelectorAll('code');
+        if (currentPaths.length >= 20) {
+            _showWatchedError('Maximum 20 watched paths');
+            return;
+        }
+
+        // Duplicate detection
+        const existingPaths = Array.from(currentPaths).map(el => el.textContent.trim());
+        if (existingPaths.includes(val)) {
+            _showWatchedError('Path already watched');
+            return;
+        }
+
+        // Validate via API
+        try {
+            const res = await api.post('/api/settings/gatekeeper/validate-path', { path: val });
+            if (!res.valid) {
+                _showWatchedError(res.reason || 'Invalid path');
+                return;
+            }
+            // Check resolved form for duplicates too
+            if (res.resolved && existingPaths.includes(res.resolved)) {
+                _showWatchedError('Path already watched (resolves to same location)');
+                return;
+            }
+            _insertWatchedRow(list, res.resolved || val);
+            watchedInput.value = '';
+
+            // Auto-save watched paths only — use saved state for other fields to avoid
+            // accidentally persisting unsaved pattern/allowed-path changes
+            try {
+                const freshWatched = [];
+                document.querySelectorAll('#ps-watched-list code').forEach(el => {
+                    const p = el.textContent.trim();
+                    if (p) freshWatched.push(p);
+                });
+                const init = window._psInitialState || {};
+                const saveState = {
+                    enabled: init.enabled !== undefined ? init.enabled : true,
+                    disabled_patterns: init.disabled_patterns || [],
+                    allowed_paths: init.allowed_paths || [],
+                    watched_paths: freshWatched,
+                };
+                await api.put('/api/settings/gatekeeper/path-safety', saveState);
+                window._psInitialState.watched_paths = [...freshWatched];
+                _updatePathSafetyDirtyState();
+            } catch (saveErr) {
+                showToast('Path added but failed to save — click Save Path Rules', 'error');
+            }
+
+            // Show warnings inline (persistent, not a vanishing toast)
+            const warningParts = [];
+            if (res.warning) warningParts.push(res.warning);
+            const allowedCodes = document.querySelectorAll('#ps-paths-list code');
+            const allowedPaths = Array.from(allowedCodes).map(el => el.textContent.trim());
+            const resolvedPath = res.resolved || val;
+            if (allowedPaths.some(ap => resolvedPath.toLowerCase() === ap.toLowerCase())) {
+                warningParts.push('also in Allowed Paths');
+            }
+            if (warningParts.length > 0) {
+                _showWatchedWarning(warningParts.join(' | '));
+            }
+        } catch (e) {
+            _showWatchedError(e.message || 'Validation failed');
+        }
+    };
+
+    if (addWatchedBtn) addWatchedBtn.addEventListener('click', _addWatchedPath);
+    if (watchedInput) {
+        watchedInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') _addWatchedPath();
+        });
+    }
+
+    // Remove watched path buttons
+    _rebindRemoveWatchedButtons();
+
+    // Browse button
+    const browseBtn = document.getElementById('ps-browse-watched');
+    if (browseBtn) {
+        browseBtn.addEventListener('click', () => {
+            const browser = document.getElementById('ps-dir-browser');
+            if (!browser) return;
+            if (!browser.classList.contains('hidden')) {
+                browser.classList.add('hidden');
+                return;
+            }
+            // Start browsing from user home or the input value
+            const startPath = (watchedInput ? watchedInput.value : '').trim() || '';
+            _loadDirBrowser(startPath);
+        });
+    }
 
     // Save button
     const saveBtn = document.getElementById('btn-ps-save');
@@ -727,6 +898,7 @@ function bindPathSafetyEvents(pathSafety) {
                 window._psInitialState = {
                     disabled_patterns: [...state.disabled_patterns],
                     allowed_paths: [...state.allowed_paths],
+                    watched_paths: [...state.watched_paths],
                 };
                 _updatePathSafetyDirtyState();
                 showToast('Path safety rules saved', 'success');
@@ -736,6 +908,21 @@ function bindPathSafetyEvents(pathSafety) {
                 saveBtn.disabled = false;
                 _updatePathSafetyDirtyState();
             }
+        });
+    }
+
+    // Banner "Save Now" button — triggers same save as main button
+    const bannerSave = document.getElementById('ps-banner-save');
+    if (bannerSave && saveBtn) {
+        bannerSave.addEventListener('click', () => saveBtn.click());
+    }
+
+    // Banner "Discard" button — reload gatekeeper tab from server
+    const bannerDiscard = document.getElementById('ps-banner-discard');
+    if (bannerDiscard) {
+        bannerDiscard.addEventListener('click', async () => {
+            window._settingsDirty = false;
+            await renderSettingsTab('gatekeeper');
         });
     }
 }
@@ -770,19 +957,157 @@ function _rebindRemovePathButtons() {
 }
 
 
+function _insertWatchedRow(list, path) {
+    // Remove placeholder if present
+    const placeholder = list.querySelector('.italic');
+    if (placeholder) placeholder.remove();
+
+    const idx = list.querySelectorAll('.ps-remove-watched').length;
+    const row = document.createElement('div');
+    row.className = 'flex items-center gap-2 p-2 bg-red-900/20 rounded border border-red-800/30';
+    row.innerHTML = `
+        <code class="text-xs text-red-300 flex-1 truncate">${escapeHtml(path)}</code>
+        <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1" data-index="${idx}" title="Remove">&times;</button>
+    `;
+    list.appendChild(row);
+    _rebindRemoveWatchedButtons();
+    _updatePathSafetyDirtyState();
+}
+
+
+function _rebindRemoveWatchedButtons() {
+    document.querySelectorAll('.ps-remove-watched').forEach(btn => {
+        btn.onclick = async () => {
+            const row = btn.closest('.flex.items-center');
+            if (row) row.remove();
+            const list = document.getElementById('ps-watched-list');
+            if (list && list.children.length === 0) {
+                list.innerHTML = '<div class="text-xs text-slate-500 italic p-2">No watched paths. Add paths to always require permission when accessed.</div>';
+            }
+            // Auto-save watched paths only — preserve saved state for other fields
+            try {
+                const freshWatched = [];
+                document.querySelectorAll('#ps-watched-list code').forEach(el => {
+                    const p = el.textContent.trim();
+                    if (p) freshWatched.push(p);
+                });
+                const init = window._psInitialState || {};
+                const saveState = {
+                    enabled: init.enabled !== undefined ? init.enabled : true,
+                    disabled_patterns: init.disabled_patterns || [],
+                    allowed_paths: init.allowed_paths || [],
+                    watched_paths: freshWatched,
+                };
+                await api.put('/api/settings/gatekeeper/path-safety', saveState);
+                window._psInitialState.watched_paths = [...freshWatched];
+                _updatePathSafetyDirtyState();
+            } catch (e) {
+                showToast('Remove failed to save — click Save Path Rules', 'error');
+            }
+        };
+    });
+}
+
+
+async function _loadDirBrowser(startPath) {
+    const browser = document.getElementById('ps-dir-browser');
+    if (!browser) return;
+
+    browser.classList.remove('hidden');
+    browser.innerHTML = '<div class="text-xs text-slate-400">Loading...</div>';
+
+    try {
+        const res = await api.post('/api/settings/gatekeeper/browse-path', { path: startPath || '' });
+        const current = res.current || '';
+        const parent = res.parent || '';
+        const dirs = res.directories || [];
+
+        let html = `
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs text-slate-400 font-mono truncate flex-1" title="${escapeHtml(current)}">${escapeHtml(current)}</span>
+                <button id="ps-dir-close" class="text-xs text-slate-500 hover:text-slate-300 px-1 ml-2" title="Close">&times;</button>
+            </div>
+        `;
+
+        if (parent) {
+            html += `<div class="ps-dir-entry flex items-center gap-1 px-2 py-1 rounded cursor-pointer hover:bg-slate-800 text-xs text-blue-400" data-path="${escapeHtml(parent)}">
+                <span>&#8593;</span> <span>..</span>
+            </div>`;
+        }
+
+        if (dirs.length === 0) {
+            html += '<div class="text-xs text-slate-500 italic px-2 py-1">No subdirectories</div>';
+        } else {
+            for (const d of dirs) {
+                const fullPath = current.replace(/\\/g, '/').replace(/\/$/, '') + '/' + d;
+                html += `<div class="ps-dir-entry flex items-center gap-1 px-2 py-1 rounded cursor-pointer hover:bg-slate-800 text-xs text-slate-300" data-path="${escapeHtml(fullPath)}">
+                    <span class="text-yellow-500">&#128193;</span> <span>${escapeHtml(d)}</span>
+                </div>`;
+            }
+        }
+
+        html += `<div class="mt-2 pt-2 border-t border-slate-700">
+            <button id="ps-dir-select" class="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 text-white rounded transition-colors" data-path="${escapeHtml(current)}">Select this folder</button>
+        </div>`;
+
+        browser.innerHTML = html;
+
+        // Bind close button
+        const closeBtn = document.getElementById('ps-dir-close');
+        if (closeBtn) closeBtn.addEventListener('click', () => browser.classList.add('hidden'));
+
+        // Bind directory entries for navigation
+        browser.querySelectorAll('.ps-dir-entry').forEach(entry => {
+            entry.addEventListener('click', () => {
+                const navPath = entry.dataset.path;
+                if (navPath) _loadDirBrowser(navPath);
+            });
+        });
+
+        // Bind select button
+        const selectBtn = document.getElementById('ps-dir-select');
+        if (selectBtn) {
+            selectBtn.addEventListener('click', () => {
+                const selectedPath = selectBtn.dataset.path;
+                const watchedInput = document.getElementById('ps-new-watched');
+                if (watchedInput && selectedPath) {
+                    watchedInput.value = selectedPath.replace(/\\/g, '/');
+                }
+                browser.classList.add('hidden');
+            });
+        }
+    } catch (e) {
+        browser.innerHTML = `<div class="text-xs text-red-400">${escapeHtml(e.message || 'Browse failed')}</div>
+            <button id="ps-dir-close-err" class="text-xs text-slate-500 hover:text-slate-300 mt-1">Close</button>`;
+        const closeBtn = document.getElementById('ps-dir-close-err');
+        if (closeBtn) closeBtn.addEventListener('click', () => browser.classList.add('hidden'));
+    }
+}
+
+
 function _updatePathSafetyDirtyState() {
     const current = _collectPathSafetyState();
-    const initial = window._psInitialState || { disabled_patterns: [], allowed_paths: [] };
+    const initial = window._psInitialState || { disabled_patterns: [], allowed_paths: [], watched_paths: [] };
 
     const patternsChanged = JSON.stringify([...current.disabled_patterns].sort()) !== JSON.stringify([...initial.disabled_patterns].sort());
     const pathsChanged = JSON.stringify(current.allowed_paths) !== JSON.stringify(initial.allowed_paths);
-    const isDirty = patternsChanged || pathsChanged;
+    const watchedChanged = JSON.stringify(current.watched_paths) !== JSON.stringify(initial.watched_paths || []);
+    const isDirty = patternsChanged || pathsChanged || watchedChanged;
+
+    // Global flag for beforeunload and tab switch guards
+    window._settingsDirty = isDirty;
 
     const saveBtn = document.getElementById('btn-ps-save');
     if (saveBtn) {
         saveBtn.textContent = isDirty ? 'Save Path Rules *' : 'Save Path Rules';
         saveBtn.classList.toggle('ring-2', isDirty);
         saveBtn.classList.toggle('ring-orange-400', isDirty);
+    }
+
+    // Show/hide unsaved changes banner
+    const banner = document.getElementById('ps-unsaved-banner');
+    if (banner) {
+        banner.classList.toggle('hidden', !isDirty);
     }
 }
 
@@ -806,7 +1131,14 @@ function _collectPathSafetyState() {
         if (path) allowedPaths.push(path);
     });
 
-    return { enabled, disabled_patterns: disabledPatterns, allowed_paths: allowedPaths };
+    // Collect watched paths
+    const watchedPaths = [];
+    document.querySelectorAll('#ps-watched-list code').forEach(el => {
+        const path = el.textContent.trim();
+        if (path) watchedPaths.push(path);
+    });
+
+    return { enabled, disabled_patterns: disabledPatterns, allowed_paths: allowedPaths, watched_paths: watchedPaths };
 }
 
 

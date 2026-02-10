@@ -59,6 +59,15 @@ class PathSafetyConfigRequest(BaseModel):
     enabled: bool = True
     allowed_paths: list[str] = []
     disabled_patterns: list[str] = []
+    watched_paths: list[str] = []
+
+
+class PathValidateRequest(BaseModel):
+    path: str
+
+
+class PathBrowseRequest(BaseModel):
+    path: str = ""
 
 
 class ProjectActivity(BaseModel):
@@ -785,7 +794,7 @@ async def get_path_safety_config(request: Request):
 
     db = getattr(request.app.state, "db", None)
 
-    config = {"enabled": True, "allowed_paths": [], "disabled_patterns": []}
+    config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []}
 
     if db is not None:
         raw = db.get_setting("gatekeeper.path_safety")
@@ -799,6 +808,7 @@ async def get_path_safety_config(request: Request):
         "enabled": config.get("enabled", True),
         "allowed_paths": config.get("allowed_paths", []),
         "disabled_patterns": config.get("disabled_patterns", []),
+        "watched_paths": config.get("watched_paths", []),
         "available_rules": get_path_safety_rules_metadata(),
     }
 
@@ -849,14 +859,155 @@ async def update_path_safety_config(body: PathSafetyConfigRequest, request: Requ
             content={"error": {"message": f"Unknown pattern keys: {', '.join(invalid)}", "code": "INVALID_PATTERN_KEY"}},
         )
 
+    # Validate watched_paths
+    from pathlib import Path as _Path
+    import os as _os
+
+    if len(body.watched_paths) > 20:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": "Maximum 20 watched paths", "code": "TOO_MANY_WATCHED"}},
+        )
+    resolved_watched = []
+    for wp in body.watched_paths:
+        if len(wp) > 500:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"error": {"message": f"Watched path too long (max 500 chars): {wp[:50]}...", "code": "PATH_TOO_LONG"}},
+            )
+        normalized = wp.replace("\\", "/").rstrip("/")
+        # Only hard-reject Unix root (matches literally everything)
+        if _os.name != "nt" and normalized == "":
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"error": {"message": "Root path (/) not allowed — matches everything", "code": "ROOT_PATH_REJECTED"}},
+            )
+        # Try resolve, fall back to normalized raw for unmounted drives
+        try:
+            resolved = str(_Path(wp).resolve()).replace("\\", "/").rstrip("/")
+        except Exception:
+            resolved = normalized
+            if _os.name == "nt" and len(resolved) >= 2:
+                resolved = resolved[0].upper() + resolved[1:]
+        resolved_watched.append(resolved)
+
     config = {
         "enabled": body.enabled,
         "allowed_paths": body.allowed_paths,
         "disabled_patterns": body.disabled_patterns,
+        "watched_paths": resolved_watched,
     }
     db.set_setting("gatekeeper.path_safety", json.dumps(config))
 
     return {"updated": True, **config}
+
+
+@router.post("/settings/gatekeeper/validate-path")
+async def validate_path(body: PathValidateRequest):
+    """Validate a filesystem path for use as a watched/allowed path."""
+    from pathlib import Path as _Path
+    import os as _os
+
+    raw = body.path.strip()
+    if not raw:
+        return {"valid": False, "reason": "Empty path"}
+
+    # Hard-reject root path (matches literally everything)
+    normalized_raw = raw.replace("\\", "/").rstrip("/")
+    if normalized_raw == "":
+        return {"valid": False, "reason": "Root path (/) matches everything"}
+
+    # Try to resolve, but fall back to normalized raw if resolve fails (e.g., unmounted drive)
+    try:
+        resolved = _Path(raw).resolve()
+        resolved_str = str(resolved).replace("\\", "/").rstrip("/")
+    except Exception:
+        resolved_str = normalized_raw
+        if _os.name == "nt":
+            resolved_str = resolved_str[0].upper() + resolved_str[1:] if len(resolved_str) >= 2 else resolved_str
+
+    warnings = []
+
+    # Warn (don't reject) for broad paths
+    is_drive_root = (len(resolved_str) == 2 and resolved_str[1] == ":") or \
+                    (len(resolved_str) == 3 and resolved_str[1] == ":" and resolved_str[2] == "/")
+    if is_drive_root:
+        warnings.append(f"Drive root — matches all files on {resolved_str}")
+
+    try:
+        home_dir = str(_Path.home()).replace("\\", "/").rstrip("/")
+        if resolved_str.replace("/", "").lower() == home_dir.replace("/", "").lower():
+            warnings.append("Home directory — very broad, matches all your user files")
+    except Exception:
+        pass
+
+    # Check existence (soft — non-existent paths are allowed with warning)
+    try:
+        p = _Path(resolved_str) if not is_drive_root else _Path(resolved_str + "/")
+        exists = p.exists()
+        is_dir = p.is_dir() if exists else None
+    except Exception:
+        exists = False
+        is_dir = None
+
+    if not exists:
+        warnings.append("does not exist on this machine")
+
+    result = {"valid": True, "resolved": resolved_str}
+    if is_dir is not None:
+        result["is_directory"] = is_dir
+    if not exists:
+        result["exists"] = False
+    if warnings:
+        result["warning"] = " | ".join(warnings)
+    return result
+
+
+@router.post("/settings/gatekeeper/browse-path")
+async def browse_path(body: PathBrowseRequest):
+    """List subdirectories of a given path for the directory browser."""
+    from pathlib import Path as _Path
+
+    raw = body.path.strip()
+    if not raw:
+        target = _Path.home()
+    else:
+        try:
+            target = _Path(raw).resolve()
+        except Exception:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"error": {"message": "Invalid path", "code": "INVALID_PATH"}},
+            )
+
+    if not target.is_dir():
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": "Not a directory", "code": "NOT_DIRECTORY"}},
+        )
+
+    current = str(target).replace("\\", "/")
+    parent_path = str(target.parent).replace("\\", "/") if target.parent != target else None
+
+    directories = []
+    try:
+        for entry in sorted(target.iterdir()):
+            if len(directories) >= 100:
+                break
+            try:
+                if entry.is_dir() and not entry.name.startswith("."):
+                    directories.append(entry.name)
+            except PermissionError:
+                continue
+            except OSError:
+                continue
+    except PermissionError:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"error": {"message": "Permission denied", "code": "PERMISSION_DENIED"}},
+        )
+
+    return {"current": current, "parent": parent_path, "directories": directories}
 
 
 # --- Generic settings (parameterized routes AFTER static ones) ---
