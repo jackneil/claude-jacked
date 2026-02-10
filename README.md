@@ -1,32 +1,17 @@
 # claude-jacked
 
-**Smart reviewers, quick commands, and session search for Claude Code.** Catch bugs before they ship, search past conversations, and auto-approve safe commands — all from within Claude Code.
+**A control panel for Claude Code.** Smart reviewers, security automation, session search, and a web dashboard to manage it all — without touching a config file.
+
+![jacked dashboard — accounts](docs/screenshots/dashboard-accounts.png)
 
 ---
 
 ## What You Get
 
-- **Catch mistakes before they ship** — Built-in reviewers check for security issues, complexity, and common bugs.
-- **Quick commands** — `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules` for common workflows.
-- **Find past solutions instantly** — Search past Claude sessions by meaning, not keywords. *(requires [search] extra)*
-- **Work from any computer** — Start on your desktop, continue on your laptop. *(requires [search] extra)*
-- **Auto-approve safe commands** — Security gatekeeper evaluates bash commands so you only get interrupted for risky ones. *(requires [security] extra)*
-- **Sound notifications** — Get audio alerts when Claude needs your attention or finishes a task.
-
----
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [What's Included](#whats-included)
-- [Using the Session Search](#using-the-session-search)
-- [Working with Your Team](#working-with-your-team)
-- [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
-- [Security Gatekeeper](#security-gatekeeper)
-- [Sound Notifications](#sound-notifications)
-- [Uninstall](#uninstall)
-- [Common Issues](#common-issues)
-- [Advanced / Technical Reference](#advanced--technical-reference)
+- **Stop clicking "approve" on every terminal command** — Claude Code asks permission for every bash command it runs. The security gatekeeper handles the safe ones automatically, so you only get interrupted when something is actually risky.
+- **Catch bugs before they ship** — Automatic code quality checks review your work for security holes, complexity, missing error handling, and test gaps. 10 built-in reviewers, always watching.
+- **Find any past conversation** — Search your Claude history by describing what you were working on. Works across machines, works across teammates. *(requires [search] extra)*
+- **Manage everything from a web dashboard** — Toggle features on and off, configure the security system, monitor decisions, track usage — all from your browser. No config files, no terminal commands.
 
 ---
 
@@ -34,15 +19,15 @@
 
 ### Option 1: Let Claude Install It
 
-Copy this into Claude Code and it will walk you through the options:
+Paste this into Claude Code and it handles everything:
 
 ```
 Install claude-jacked for me. Use AskUserQuestion to ask me which features I want:
 
 1. First check if pipx and jacked are already installed
 2. Ask me which install tier I want:
-   - BASE: Smart reviewers, commands (/dc, /pr, /learn, etc.), behavioral rules
-   - SEARCH: Everything above + session search across machines (requires Qdrant Cloud ~$30/mo)
+   - BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard
+   - SEARCH: Everything above + search past Claude sessions across machines (requires Qdrant Cloud)
    - SECURITY: Everything above + auto-approve safe bash commands (fewer permission prompts)
    - ALL: Everything
 3. Install based on my choice:
@@ -52,53 +37,106 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
    - ALL: pipx install "claude-jacked[all]" && jacked install --force --security
 4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
 5. Verify with: jacked --help
-6. If I chose SECURITY or ALL, show me how to monitor the gatekeeper log:
-   - Mac/Linux: tail -f ~/.claude/hooks-debug.log
-   - Windows PowerShell: Get-Content ~\.claude\hooks-debug.log -Wait -Tail 20
-   - Windows Git Bash: tail -f ~/.claude/hooks-debug.log
+6. Launch the dashboard: jacked webux
 ```
 
 ### Option 2: Manual Install
 
-**Core (reviewers, commands, behavioral rules):**
+Run once from anywhere — installs globally to `~/.claude/` and applies to all your Claude Code sessions:
+
 ```bash
 pipx install claude-jacked
 jacked install --force
+jacked webux              # opens your dashboard at localhost:8321
 ```
 
-**Add session search (optional):**
+**Want more?** Add optional extras:
+
 ```bash
-pipx install "claude-jacked[search]"
-jacked install --force
-# Then set up Qdrant Cloud credentials (see below)
+# Add session search (needs Qdrant Cloud ~$30/mo)
+pipx install "claude-jacked[search]" --force && jacked install --force
+
+# Add security gatekeeper (auto-approves safe bash commands)
+pipx install "claude-jacked[security]" --force && jacked install --force --security
+
+# Everything
+pipx install "claude-jacked[all]" --force && jacked install --force --security
 ```
 
-**Add security gatekeeper (optional):**
-```bash
-pipx install "claude-jacked[security]"
-jacked install --force --security
-```
+---
 
-**Everything:**
-```bash
-pipx install "claude-jacked[all]"
-jacked install --force --security
-```
+## Your Dashboard
+
+The web dashboard ships with every install. Run `jacked webux` to open it.
+
+### Toggle Features On and Off
+
+Enable or disable any of the 10 built-in code reviewers and 6 slash commands with one click. Each card shows what it does so you know what you're turning on.
+
+![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
+
+### Monitor Security Decisions
+
+Every bash command the gatekeeper evaluates is logged. See the decision, the method used, the full command, and the LLM's reasoning — all filterable by session. Export or purge logs anytime.
+
+![Gatekeeper Logs](docs/screenshots/dashboard-logs-detail.png)
+
+### Track Everything
+
+Approval rates, which evaluation methods are being used, command frequency, and system health — all at a glance.
+
+![Analytics](docs/screenshots/dashboard-analytics.png)
+
+<details>
+<summary><strong>More Dashboard Views</strong></summary>
+
+**Security Gatekeeper Configuration** — Configure the 4-tier evaluation pipeline, choose the LLM model, set the evaluation method, manage API keys, and edit the LLM prompt — all from the Gatekeeper tab.
+
+![Settings — Gatekeeper](docs/screenshots/dashboard-settings-gatekeeper.png)
+
+**Feature Toggles** — Toggle hooks (session indexing, sound notifications) and knowledge documents (behavioral rules, skills, reference docs) on and off.
+
+![Settings — Features](docs/screenshots/dashboard-settings-features.png)
+
+**Commands** — Enable or disable slash commands (`/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`).
+
+![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
+
+</details>
+
+---
+
+## Table of Contents
+
+- [What's Included](#whats-included)
+- [Web Dashboard](#web-dashboard)
+- [Security Gatekeeper](#security-gatekeeper)
+- [Session Search](#session-search)
+- [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
+- [Sound Notifications](#sound-notifications)
+- [Uninstall / Troubleshooting](#uninstall--troubleshooting)
+- [Cloud Database Setup (Qdrant)](#cloud-database-setup-qdrant)
+- [Version History](#version-history)
+- [Advanced / Technical Reference](#advanced--technical-reference)
 
 ---
 
 ## What's Included
 
-### Base (`pip install claude-jacked`)
+### Base (`pipx install claude-jacked`)
 
 | Feature | What It Does |
 |---------|--------------|
-| **10 Smart Reviewers** | AI assistants that check your code for bugs, security issues, and complexity |
-| **Quick Commands** | `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules` |
-| **Behavioral Rules** | Auto-triggers for jacked commands, lesson tracking, plan-first workflow |
+| **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
+| **6 Slash Commands** | `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules` |
+| **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
+| **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
+| **Account Management** | Track Claude accounts, usage limits, subscription status |
+| **Feature Toggles** | Enable/disable any reviewer, command, or hook from the dashboard |
+| **Analytics** | Approval rates, command usage, system health |
 
-### Search Extra (`pip install "claude-jacked[search]"`)
+### Search Extra (`pipx install "claude-jacked[search]"`)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -106,30 +144,115 @@ jacked install --force --security
 | **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
 | **Team Sharing** | Search your teammates' sessions (with their permission) |
 
-### Security Extra (`pip install "claude-jacked[security]"`)
+### Security Extra (`pipx install "claude-jacked[security]"`)
 
 | Feature | What It Does |
 |---------|--------------|
-| **Security Gatekeeper** | Auto-approves safe bash commands, blocks dangerous ones, asks you about ambiguous ones |
-| **Customizable Prompt** | Tune the LLM's safety evaluation via `~/.claude/gatekeeper-prompt.txt` |
+| **Security Gatekeeper** | Auto-approves safe bash commands, blocks dangerous ones, asks about ambiguous ones |
+| **Shell Injection Defense** | Detects shell operators (`&&`, `|`, `;`, `>`, `` ` ``, `$()`) to prevent chaining attacks |
+| **File Context Analysis** | Reads referenced scripts and evaluates what code actually does |
+| **Customizable Prompt** | Tune the safety evaluation via the dashboard or `~/.claude/gatekeeper-prompt.txt` |
 | **Permission Audit** | Scans your permission rules for dangerous wildcards that bypass the gatekeeper |
-| **Log Redaction** | Passwords, API keys, and tokens are automatically redacted from debug logs |
+| **Session-Tagged Logs** | Every decision tagged with session ID for multi-session tracking |
+| **Log Redaction** | Passwords, API keys, and tokens automatically redacted from logs |
 
 ---
 
-## Using the Session Search
+## Web Dashboard
 
-Once installed, you can search your past Claude sessions right from within Claude Code.
+```bash
+jacked webux                    # Opens dashboard at localhost:8321
+jacked webux --port 9000        # Custom port
+jacked webux --no-browser       # Start server without opening browser
+```
 
-### Example: Finding Past Work
+The dashboard is a local web app that runs on your machine. All data stays in `~/.claude/jacked.db` — nothing is sent anywhere.
 
-You're working on user authentication and remember solving something similar before:
+**5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Gatekeeper / Features / Advanced), Logs, Analytics.
+
+---
+
+## Security Gatekeeper
+
+The security gatekeeper intercepts every bash command Claude runs and decides whether to auto-approve it or ask you first. About 90% of commands resolve in under 2 milliseconds.
+
+### How It Works
+
+A 4-tier evaluation chain, fastest first:
+
+| Tier | Speed | What It Does |
+|------|-------|--------------|
+| **Deny patterns** | <1ms | Blocks dangerous commands (sudo, rm -rf, reverse shells, database DROP, etc.) |
+| **Permission rules** | <1ms | Checks commands already approved in your Claude settings |
+| **Local allowlist** | <1ms | Matches safe patterns (specific git/gh/docker/make subcommands, pytest, etc.) |
+| **LLM evaluation** | ~2s | Sends ambiguous commands to an LLM with file context for judgment |
+
+Commands containing shell operators (`&&`, `||`, `;`, `|`, etc.) always go to the LLM — they're never auto-approved by the local allowlist.
+
+### Install / Uninstall
+
+```bash
+pipx install "claude-jacked[security]"
+jacked install --force --security
+```
+
+To remove just the security hook:
+```bash
+jacked uninstall --security
+```
+
+### Configuration
+
+Configure the gatekeeper from the **dashboard** (Settings > Gatekeeper tab) or the CLI:
+
+- **LLM model:** Haiku (fastest, cheapest), Sonnet, or Opus
+- **Evaluation method:** API First, CLI First, API Only, or CLI Only
+- **Custom prompt:** Edit the LLM evaluation prompt from the dashboard or via `jacked gatekeeper show`
+
+### Faster LLM Evaluation
+
+With an Anthropic API key, the gatekeeper calls the API directly (~2s) instead of spawning a CLI process (~8s):
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+```
+
+Or set the API key in the dashboard under Settings > Gatekeeper > API Key Override.
+
+### Debug Logging
+
+Every decision is logged to `~/.claude/hooks-debug.log`, tagged with session IDs:
+
+```
+2025-02-07T11:36:34 [87fd8847] EVALUATING: ls -la /tmp
+2025-02-07T11:36:34 [87fd8847] LOCAL SAID: YES (0.001s)
+2025-02-07T11:36:34 [87fd8847] DECISION: ALLOW (0.001s)
+```
+
+Or view decisions in the dashboard under **Logs** — filterable, searchable, exportable.
+
+### Permission Audit
+
+If you've set broad permission wildcards in Claude Code (like `Bash(python:*)`), those commands bypass the gatekeeper entirely. The audit catches this:
+
+```bash
+jacked gatekeeper audit           # Scan permission rules
+jacked gatekeeper audit --log     # Also review recent auto-approved commands
+```
+
+Sensitive data (passwords, API keys, tokens) is automatically redacted from all logs.
+
+---
+
+## Session Search
+
+Once installed with the `[search]` extra, search your past Claude sessions from within Claude Code.
+
+### Finding Past Work
 
 ```
 /jacked user authentication login
 ```
-
-Claude will show you matching sessions:
 
 ```
 Search Results:
@@ -139,11 +262,7 @@ Search Results:
 3  78%    @sam  1w ago   shared-lib     OAuth2 integration with Google...
 ```
 
-Pick one to load that context into your current session.
-
-### Example: Resuming Work from Another Computer
-
-You started building a feature on your desktop. Now you're on your laptop:
+### Resuming Work from Another Computer
 
 ```
 /jacked that shopping cart feature I was building
@@ -151,27 +270,9 @@ You started building a feature on your desktop. Now you're on your laptop:
 
 Claude finds it and you can continue right where you left off.
 
-### Example: Learning from Teammates
+### Team Sharing
 
-Your teammate Sam already built something similar:
-
-```
-/jacked how did Sam implement the payment system
-```
-
-You can see Sam's approach without bothering them.
-
----
-
-## Working with Your Team
-
-Share knowledge across your team by using the same cloud database.
-
-### Setting Up Team Sharing
-
-1. **One person** creates a Qdrant Cloud account and shares the credentials
-2. **Everyone** adds the same credentials to their computer
-3. **Each person** sets their name so sessions are attributed correctly
+Share knowledge across your team by using the same cloud database:
 
 ```bash
 # Everyone uses the same database
@@ -182,12 +283,8 @@ export QDRANT_CLAUDE_SESSIONS_API_KEY="team-api-key"
 export JACKED_USER_NAME="sarah"
 ```
 
-### Searching Team Sessions
-
 ```
-/jacked payment processing           # Shows your work first, then teammates
-/jacked payment processing --mine    # Only your sessions
-/jacked payment processing --user sam   # Only Sam's sessions
+/jacked how did Sam implement the payment system
 ```
 
 ---
@@ -225,128 +322,6 @@ Use the double-check reviewer to review what we just built
 
 ---
 
-## Security Gatekeeper
-
-The security gatekeeper is a PreToolUse hook that intercepts every bash command Claude runs and decides whether to auto-approve it or ask you first.
-
-### How It Works
-
-A 4-tier evaluation chain, fastest first:
-
-| Tier | Speed | What It Does |
-|------|-------|--------------|
-| **Deny patterns** | <1ms | Blocks dangerous commands (sudo, rm -rf /, disk wipe, etc.) |
-| **Permission rules** | <1ms | Checks commands already approved in your Claude settings |
-| **Local allowlist** | <1ms | Matches safe patterns (git, pytest, linting, docker, etc.) |
-| **LLM evaluation** | ~2s | Sends ambiguous commands to Haiku for safety evaluation |
-
-About 90% of commands resolve in under 2 milliseconds. The LLM tier also reads the contents of referenced Python/SQL/shell scripts and evaluates what the code actually does.
-
-### Install / Uninstall
-
-The security gatekeeper is opt-in. To enable it:
-
-```bash
-pip install "claude-jacked[security]"
-jacked install --force --security
-```
-
-To remove just the security hook:
-```bash
-jacked uninstall --security
-```
-
-### Debug Logging
-
-The security gatekeeper logs every decision to `~/.claude/hooks-debug.log`.
-
-**Live monitoring (watch decisions in real-time):**
-
-Mac/Linux:
-```bash
-tail -f ~/.claude/hooks-debug.log
-```
-
-Windows (PowerShell):
-```powershell
-Get-Content ~\.claude\hooks-debug.log -Wait -Tail 20
-```
-
-Windows (Git Bash):
-```bash
-tail -f ~/.claude/hooks-debug.log
-```
-
-**Read full log:**
-```bash
-cat ~/.claude/hooks-debug.log
-```
-
-**Verbose debug mode** (logs extra detail about each evaluation tier):
-```bash
-export JACKED_HOOK_DEBUG=1
-```
-
-### Faster LLM Evaluation
-
-If you have an Anthropic API key, the gatekeeper uses the SDK directly (~2s) instead of the CLI fallback (~8s):
-
-```bash
-pip install anthropic               # or: pip install claude-jacked[security]
-export ANTHROPIC_API_KEY="sk-..."
-```
-
-### Customize the Gatekeeper Prompt
-
-The gatekeeper uses an LLM prompt to evaluate ambiguous commands. You can customize it:
-
-```bash
-# View the current prompt
-jacked gatekeeper show
-
-# Edit the prompt file directly
-# (created automatically during install)
-~/.claude/gatekeeper-prompt.txt
-
-# Compare your changes against the built-in default
-jacked gatekeeper diff
-
-# Reset to built-in default
-jacked gatekeeper reset
-```
-
-Your custom prompt must include these placeholders: `{command}`, `{cwd}`, `{file_context}`. The gatekeeper will fall back to the built-in prompt if your custom prompt has invalid placeholders.
-
-### Permission Rule Audit
-
-If you've set broad permission wildcards in Claude Code (like `Bash(python:*)` or `Bash(curl:*)`), those commands bypass the gatekeeper entirely — no LLM evaluation, no safety check. The audit command catches this:
-
-```bash
-# Scan your permission rules for dangerous wildcards
-jacked gatekeeper audit
-
-# Also send recent auto-approved commands to the LLM for review
-jacked gatekeeper audit --log
-
-# Scan more entries (default: 50)
-jacked gatekeeper audit --log -n 100
-```
-
-The static audit also runs automatically when you `jacked install --security`. Every 100 permission auto-approvals, the gatekeeper logs a reminder to run the audit.
-
-### Log Redaction
-
-The gatekeeper automatically redacts sensitive data from `~/.claude/hooks-debug.log`:
-
-- Connection strings (`postgresql://user:***@host`)
-- Environment variables (`PGPASSWORD=***`, `ANTHROPIC_API_KEY=***`)
-- CLI flags (`--password ***`, `--token ***`)
-- Bearer tokens, AWS access keys, and `sk-...` API keys
-
-No configuration needed — this happens automatically.
-
----
-
 ## Sound Notifications
 
 Get audio alerts so you don't have to watch the terminal:
@@ -358,110 +333,73 @@ jacked install --force --sounds
 - **Notification sound** — Plays when Claude needs your input
 - **Completion sound** — Plays when Claude finishes a task
 
-Works on Windows, Mac, and Linux. To remove sounds later:
-```bash
-jacked uninstall --sounds
-```
+Works on Windows, Mac, and Linux. To remove: `jacked uninstall --sounds`
 
 ---
 
-## Uninstall
+## Uninstall / Troubleshooting
 
-**Remove everything:**
+### Uninstall
+
 ```bash
 jacked uninstall && pipx uninstall claude-jacked
 ```
 
-**Or one-liner:**
-```bash
-curl -sSL https://raw.githubusercontent.com/jackneil/claude-jacked/master/uninstall.sh | bash
-```
+Your cloud database stays intact — reinstall anytime without losing history.
 
-Your cloud database stays intact, so you won't lose your history if you reinstall later.
+### Common Issues
 
----
+**"jacked: command not found"** — Run `pipx ensurepath` and restart your terminal.
 
-## Common Issues
+**Search isn't working** — You need Qdrant Cloud set up first. Ask Claude: `Help me set up Qdrant Cloud for jacked`
 
-### "I installed it but search isn't working"
+**Sessions not showing up** — Run `jacked backfill` to index existing sessions.
 
-You need to set up the cloud database first. Ask Claude:
-```
-Help me set up Qdrant Cloud for jacked
-```
-
-### "It says 'jacked: command not found'"
-
-The install didn't add jacked to your PATH. Try:
-```bash
-pipx ensurepath
-```
-Then restart your terminal.
-
-### "My sessions aren't showing up in search"
-
-Run this to index your existing sessions:
-```bash
-jacked backfill
-```
-
-### "I'm on Windows and getting weird errors"
-
-Claude Code on Windows uses Git Bash, which can have path issues. Ask Claude:
-```
-Help me fix jacked path issues on Windows
-```
+**Windows errors** — Claude Code on Windows uses Git Bash, which can have path issues. Ask Claude: `Help me fix jacked path issues on Windows`
 
 ---
 
 ## Cloud Database Setup (Qdrant)
 
-> **This is only needed if you installed the `[search]` extra.** The base install works fine without Qdrant.
+> **Only needed for the `[search]` extra.** The base install works without Qdrant.
 
-The session search feature stores your conversations in a cloud database so you can access them from any computer.
-
-### Why Qdrant?
-
-- **Smart search** — Find sessions by meaning, not just keywords
-- **Works everywhere** — Access from any computer
-- **Team sharing** — Everyone can search the same database
-- **You control it** — Your data stays in your own database
-
-### Setting Up Qdrant Cloud
-
-1. Install the search extra: `pip install "claude-jacked[search]"`
+1. Install the search extra: `pipx install "claude-jacked[search]"`
 2. Go to [cloud.qdrant.io](https://cloud.qdrant.io) and create an account
-3. Create a new cluster (the paid tier ~$30/month is required for the search features)
+3. Create a cluster (paid tier ~$30/month required)
 4. Copy your cluster URL and API key
-5. Add them to your shell profile:
+5. Add to your shell profile:
 
-**Mac/Linux** — Add to `~/.bashrc` or `~/.zshrc`:
 ```bash
 export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
 export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
 ```
 
-**Windows** — Add to your environment variables, or add to `~/.bashrc` in Git Bash.
-
-6. Restart your terminal and run:
+6. Restart terminal and run:
 ```bash
-jacked backfill    # Index your existing sessions
-jacked status      # Verify it's working
+jacked backfill    # Index existing sessions
+jacked status      # Verify connectivity
 ```
 
 ---
 
 ## Security Note
 
-**Your conversations are sent to Qdrant Cloud.** This includes:
-- Everything you and Claude discuss
-- Code snippets you share
-- File paths on your computer
+**Your conversations are sent to Qdrant Cloud** (if using [search]). This includes everything you and Claude discuss, code snippets, and file paths.
 
-**Recommendations:**
-- Don't paste passwords or API keys in Claude sessions
-- Keep your Qdrant API key private
-- For sensitive work, consider self-hosting Qdrant
+**Recommendations:** Don't paste passwords or API keys in Claude sessions. Keep your Qdrant API key private. For sensitive work, consider self-hosting Qdrant.
+
+---
+
+## Version History
+
+| Version | Changes |
+|---------|---------|
+| **0.4.0** | **Web dashboard** with 5-page local UI (Accounts, Installations, Settings, Logs, Analytics). Feature toggle API — enable/disable agents, commands, hooks, knowledge from the browser. Settings redesigned as tabbed interface. Account management with OAuth, usage monitoring, multi-account priority ordering. Gatekeeper log viewer with session filtering, search, export, purge. Analytics dashboard. Web deps (FastAPI, uvicorn) now included in base install. |
+| **0.3.11** | Security hardening: shell operator detection, tightened safe prefixes, expanded deny patterns, file context prompt injection defense, path traversal prevention. Session ID tags in logs. LLM reason logging. 375 tests. |
+| **0.3.10** | Fix format string explosion, qdrant test skip fix. |
+| **0.3.9** | Permission safety audit, README catchup. |
+| **0.3.8** | Log redaction, psql deny patterns, customizable LLM prompt. |
+| **0.3.7** | JSON LLM responses, `parse_llm_response()`, 148 unit tests. |
 
 ---
 
@@ -486,24 +424,25 @@ jacked cleardb                     # Delete all your data
 
 # Setup
 jacked install --force              # Install agents, commands, rules
-jacked install --force --search    # Also add session indexing hook
 jacked install --force --security  # Also add security gatekeeper hook
 jacked install --force --sounds    # Also add sound notifications
 jacked uninstall                   # Remove from Claude Code
 jacked uninstall --sounds          # Remove only sounds
 jacked uninstall --security        # Remove only security hook
-jacked backfill                    # Index all existing sessions (requires [search])
-jacked backfill --force            # Re-index everything
-jacked status                      # Check connectivity (requires [search])
-jacked configure --show            # Show current config
+jacked backfill                    # Index all existing sessions
+jacked status                      # Check connectivity
 
 # Security Gatekeeper
 jacked gatekeeper show             # Print current LLM prompt
 jacked gatekeeper reset            # Reset prompt to built-in default
 jacked gatekeeper diff             # Compare custom vs built-in prompt
-jacked gatekeeper audit            # Audit permission rules for dangerous wildcards
-jacked gatekeeper audit --log      # Also scan recent auto-approved commands via LLM
-jacked gatekeeper audit --log -n 100  # Scan last 100 entries
+jacked gatekeeper audit            # Audit permission rules
+jacked gatekeeper audit --log      # Also scan recent auto-approved commands
+
+# Dashboard
+jacked webux                       # Open web dashboard
+jacked webux --port 9000           # Custom port
+jacked webux --no-browser          # Server only, no auto-open
 ```
 
 </details>
@@ -511,7 +450,7 @@ jacked gatekeeper audit --log -n 100  # Scan last 100 entries
 <details>
 <summary><strong>Environment Variables</strong></summary>
 
-**Required:**
+**Required (for [search] only):**
 | Variable | Description |
 |----------|-------------|
 | `QDRANT_CLAUDE_SESSIONS_ENDPOINT` | Your Qdrant Cloud URL |
@@ -530,44 +469,51 @@ jacked gatekeeper audit --log -n 100  # Scan last 100 entries
 </details>
 
 <details>
+<summary><strong>Web Dashboard Architecture</strong></summary>
+
+The dashboard is a local web application:
+
+- **Backend:** FastAPI (Python) serving a REST API
+- **Database:** SQLite at `~/.claude/jacked.db`
+- **Frontend:** Vanilla JS + Tailwind CSS (no build step, no npm)
+- **Server:** Uvicorn, runs at `localhost:8321`
+
+All data stays on your machine. The dashboard reads Claude Code's configuration files (`~/.claude/settings.json`, `~/.claude/agents/`, etc.) and provides a visual interface for managing them.
+
+**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`
+
+</details>
+
+<details>
 <summary><strong>How It Works (Technical)</strong></summary>
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  YOUR MACHINE                                               │
-│                                                             │
-│  Claude Code                                                │
-│  ├── Stop hook → jacked index (after every response)        │
-│  └── /jacked skill → search + load context                  │
-│                                                             │
-│  ~/.claude/projects/                                        │
-│  └── {repo}/                                                │
-│      └── {session}.jsonl  ←── parsed and indexed            │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            │ HTTPS
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  QDRANT CLOUD                                               │
-│                                                             │
-│  • Server-side embedding (no local ML needed)               │
-│  • Vectors + transcripts stored                             │
-│  • Accessible from any machine                              │
-└─────────────────────────────────────────────────────────────┘
++---------------------------------------------------------+
+|  YOUR MACHINE                                           |
+|                                                         |
+|  Claude Code                                            |
+|  +-- Stop hook -> jacked index (after every response)   |
+|  +-- /jacked skill -> search + load context             |
+|                                                         |
+|  ~/.claude/projects/                                    |
+|  +-- {repo}/                                            |
+|      +-- {session}.jsonl  <-- parsed and indexed        |
++---------------------------------------------------------+
+                            |
+                            | HTTPS
+                            v
++---------------------------------------------------------+
+|  QDRANT CLOUD                                           |
+|                                                         |
+|  - Server-side embedding (no local ML needed)           |
+|  - Vectors + transcripts stored                         |
+|  - Accessible from any machine                          |
++---------------------------------------------------------+
 ```
 
-**Indexing:** After each Claude response, a hook automatically indexes the session to Qdrant. The indexer extracts:
-- Plan files (implementation strategies)
-- Agent summaries (exploration results)
-- Summary labels (chapter titles from auto-compaction)
-- User messages (for intent matching)
+**Indexing:** After each Claude response, a hook automatically indexes the session. The indexer extracts plan files, agent summaries, labels, and user messages.
 
-**Retrieval modes:**
-- `smart` (default): Plan + summaries + labels (~5-10K tokens)
-- `full`: Complete transcript (50-200K tokens)
-- `plan`: Just the plan file
-- `agents`: Just agent summaries
-- `labels`: Just summary labels (tiny)
+**Retrieval modes:** `smart` (default), `full`, `plan`, `agents`, `labels`
 
 </details>
 
@@ -592,33 +538,18 @@ jacked gatekeeper audit --log -n 100  # Scan last 100 entries
 <details>
 <summary><strong>Hook Configuration</strong></summary>
 
-The `jacked install` command adds hooks to `~/.claude/settings.json` based on installed extras:
+The `jacked install` command adds hooks to `~/.claude/settings.json`:
 
 ```json
-// With [search] extra installed:
 {
   "hooks": {
     "Stop": [{
       "matcher": "",
-      "hooks": [{
-        "type": "command",
-        "command": "jacked index --repo \"$CLAUDE_PROJECT_DIR\"",
-        "async": true
-      }]
-    }]
-  }
-}
-
-// With --security flag:
-{
-  "hooks": {
+      "hooks": [{"type": "command", "command": "jacked index --repo \"$CLAUDE_PROJECT_DIR\"", "async": true}]
+    }],
     "PreToolUse": [{
       "matcher": "Bash",
-      "hooks": [{
-        "type": "command",
-        "command": "python /path/to/security_gatekeeper.py",
-        "timeout": 30
-      }]
+      "hooks": [{"type": "command", "command": "python /path/to/security_gatekeeper.py", "timeout": 30}]
     }]
   }
 }
@@ -627,7 +558,7 @@ The `jacked install` command adds hooks to `~/.claude/settings.json` based on in
 </details>
 
 <details>
-<summary><strong>Guided Install Prompt (for Claude)</strong></summary>
+<summary><strong>Guided Install Prompt (Full)</strong></summary>
 
 Copy this into Claude Code for a guided installation:
 
@@ -645,9 +576,9 @@ Use AskUserQuestion with these options:
 
 Question: "Which jacked features do you want?"
 Options:
-- BASE (Recommended): Smart reviewers (/dc, /pr, /learn, /redo, /techdebt), 10 agents, behavioral rules. No external services needed.
+- BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard. No external services needed.
 - SEARCH: Everything in BASE + search past Claude sessions across machines. Requires Qdrant Cloud (~$30/mo).
-- SECURITY: Everything in BASE + auto-approve safe bash commands. Fewer permission prompts, uses Anthropic API.
+- SECURITY: Everything in BASE + auto-approve safe bash commands. Fewer permission prompts.
 - ALL: Everything. Requires Qdrant Cloud + Anthropic API key for fastest security evaluation.
 
 PHASE 3 - INSTALL:
@@ -657,27 +588,14 @@ Based on user choice:
 - SECURITY: pipx install "claude-jacked[security]" && jacked install --force --security
 - ALL: pipx install "claude-jacked[all]" && jacked install --force --security
 
-PHASE 4 - POST-INSTALL (if SEARCH or ALL):
-Help user set up Qdrant Cloud:
-1. Go to cloud.qdrant.io, create account
-2. Create cluster (paid tier required)
-3. Copy endpoint URL and API key
-4. Add to shell profile:
-   export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://..."
-   export QDRANT_CLAUDE_SESSIONS_API_KEY="..."
-5. Restart terminal
-6. Run: jacked backfill
+PHASE 4 - POST-INSTALL:
+- Launch dashboard: jacked webux
+- If SEARCH or ALL: help set up Qdrant Cloud credentials
+- If SECURITY or ALL: show how to monitor gatekeeper in the dashboard (Logs page)
 
 PHASE 5 - VERIFY:
-- jacked --help (should show all commands)
-- jacked configure --show (if SEARCH installed)
-- If SECURITY or ALL: show user how to monitor gatekeeper decisions:
-  Mac/Linux: tail -f ~/.claude/hooks-debug.log
-  Windows PowerShell: Get-Content ~\.claude\hooks-debug.log -Wait -Tail 20
-  Windows Git Bash: tail -f ~/.claude/hooks-debug.log
-
-WINDOWS NOTE: If env vars not visible in Git Bash, check Windows system env vars:
-powershell.exe -Command "[System.Environment]::GetEnvironmentVariable('QDRANT_CLAUDE_SESSIONS_ENDPOINT', 'User')"
+- jacked --help
+- jacked webux (confirm dashboard opens)
 ```
 
 </details>
@@ -687,22 +605,13 @@ powershell.exe -Command "[System.Environment]::GetEnvironmentVariable('QDRANT_CL
 
 Claude Code uses Git Bash on Windows, which can cause path issues.
 
-**Where jacked is installed:**
-```
-C:\Users\<username>\pipx\venvs\claude-jacked\Scripts\jacked.exe
-```
-
 **If "jacked" isn't found:**
 ```bash
-# Find it
-where jacked
-
-# Or add to PATH
 pipx ensurepath
+# Then restart your terminal
 ```
 
 **If paths are getting mangled:**
-Use forward slashes in Git Bash:
 ```bash
 /c/Users/jack/pipx/venvs/claude-jacked/Scripts/jacked.exe status
 ```

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-jacked"
-version = "0.3.10"
+version = "0.5.0"
 description = "Smart reviewers, commands, and session search for Claude Code"
 readme = "README.md"
 license = "MIT"
@@ -26,6 +26,10 @@ dependencies = [
     "click>=8.0.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "httpx>=0.24",
+    "aiohttp>=3.9.0",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +39,7 @@ search = [
 security = [
     "anthropic>=0.40.0",
 ]
+web = []
 all = [
     "qdrant-client>=1.7.0",
     "anthropic>=0.40.0",
@@ -44,6 +49,10 @@ dev = [
     "pytest-cov>=4.0.0",
     "qdrant-client>=1.7.0",
     "anthropic>=0.40.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "httpx>=0.24",
+    "aiohttp>=3.9.0",
 ]
 
 [project.scripts]

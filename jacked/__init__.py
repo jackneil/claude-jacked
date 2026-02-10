@@ -1,14 +1,14 @@
 """
 Claude Jacked - Smart reviewers, commands, and session search for Claude Code.
 
-Base install provides agents, commands, and behavioral rules.
+Base install provides agents, commands, behavioral rules, and a web dashboard.
 Install extras for additional features:
   pip install "claude-jacked[search]"    — session search via Qdrant
   pip install "claude-jacked[security]"  — security gatekeeper hook
   pip install "claude-jacked[all]"       — everything
 """
 
-__version__ = "0.3.10"
+__version__ = "0.5.0"
 
 
 def _qdrant_available() -> bool:
