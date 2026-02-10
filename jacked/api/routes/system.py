@@ -71,6 +71,12 @@ class ProjectActivity(BaseModel):
     last_activity: Optional[str] = None
     first_seen: Optional[str] = None
     unique_sessions: int = 0
+    has_guardrails: bool = False
+    guardrails_file: Optional[str] = None
+    has_lint_hook: bool = False
+    detected_language: Optional[str] = None
+    has_lessons: bool = False
+    lessons_count: int = 0
 
 
 class InstalledComponent(BaseModel):
@@ -158,6 +164,176 @@ def refresh_version(request: Request):
             pass
 
     return _version_response(result)
+
+
+class ProjectInitRequest(BaseModel):
+    repo_path: str
+    language: Optional[Literal["python", "node", "rust", "go"]] = None
+    force: bool = False
+
+
+def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONResponse]:
+    """Validate repo_path for init endpoints: exists, has .git, is known."""
+    from pathlib import Path
+
+    p = Path(repo_path)
+    if not p.is_dir():
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": f"Not a directory: {repo_path}", "code": "NOT_DIRECTORY"}},
+        )
+    if not (p / ".git").is_dir():
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": f"No .git directory in: {repo_path}", "code": "NOT_GIT_REPO"}},
+        )
+    # Verify project is known to jacked (has activity in DB)
+    db = getattr(request.app.state, "db", None)
+    if db is not None:
+        try:
+            rows = db.get_project_activity_summary(limit=100)
+            known_paths = {r["repo_path"] for r in rows if r.get("repo_path")}
+            normalized = str(p).replace("\\", "/")
+            if normalized not in known_paths and str(p) not in known_paths:
+                return JSONResponse(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    content={"error": {"message": f"Unknown project: {repo_path}. Must have jacked activity.", "code": "UNKNOWN_PROJECT"}},
+                )
+        except Exception:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"error": {"message": "Database unavailable for project verification", "code": "DB_ERROR"}},
+            )
+    return None
+
+
+@router.post("/project/guardrails-init")
+async def project_guardrails_init(body: ProjectInitRequest, request: Request):
+    """Create JACKED_GUARDRAILS.md in a project from templates."""
+    error = _validate_project_path(body.repo_path, request)
+    if error:
+        return error
+
+    from jacked.guardrails import create_guardrails
+    result = create_guardrails(body.repo_path, language=body.language, force=body.force)
+    return result
+
+
+@router.post("/project/lint-hook-init")
+async def project_lint_hook_init(body: ProjectInitRequest, request: Request):
+    """Install a pre-push lint hook in a project's .git/hooks/."""
+    error = _validate_project_path(body.repo_path, request)
+    if error:
+        return error
+
+    from jacked.guardrails import install_hook
+    result = install_hook(body.repo_path, language=body.language, force=body.force)
+    return result
+
+
+class LessonItem(BaseModel):
+    index: int
+    strike: int = 1
+    text: str
+
+    model_config = {"str_max_length": 2000}
+
+
+class LessonsUpdateRequest(BaseModel):
+    repo_path: str
+    lessons: list[LessonItem]
+
+
+@router.get("/project/lessons")
+async def get_project_lessons(repo_path: str, request: Request):
+    """Read and parse lessons.md for a project."""
+    from pathlib import Path
+    import re
+
+    error = _validate_project_path(repo_path, request)
+    if error:
+        return error
+
+    lessons_path = Path(repo_path) / "lessons.md"
+    if not lessons_path.exists():
+        return {"exists": False, "lessons": []}
+
+    try:
+        text = lessons_path.read_text(encoding="utf-8")
+    except Exception:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": {"message": "Failed to read lessons.md", "code": "READ_ERROR"}},
+        )
+
+    lessons = []
+    pattern = re.compile(r"^- \[(\d+)x\]\s+(.+)$")
+    for idx, line in enumerate(text.splitlines()):
+        line = line.strip()
+        m = pattern.match(line)
+        if m:
+            lessons.append({"index": idx, "strike": int(m.group(1)), "text": m.group(2)})
+        elif line.startswith("- "):
+            lessons.append({"index": idx, "strike": 0, "text": line[2:]})
+
+    return {"exists": True, "lessons": lessons}
+
+
+@router.put("/project/lessons")
+async def update_project_lessons(body: LessonsUpdateRequest, request: Request):
+    """Write updated lessons back to lessons.md."""
+    from pathlib import Path
+
+    if len(body.lessons) > 200:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": "Too many lessons (max 200)", "code": "TOO_MANY"}},
+        )
+
+    error = _validate_project_path(body.repo_path, request)
+    if error:
+        return error
+
+    lessons_path = Path(body.repo_path) / "lessons.md"
+
+    # Preserve any header content (lines before the first lesson bullet)
+    header_lines = []
+    if lessons_path.exists():
+        try:
+            existing = lessons_path.read_text(encoding="utf-8")
+            for line in existing.splitlines():
+                if line.strip().startswith("- "):
+                    break
+                header_lines.append(line)
+        except Exception:
+            pass
+
+    # Default header if file is new or had none
+    if not header_lines:
+        header_lines = ["# Lessons", ""]
+
+    # Build lesson lines, filtering out empty text and stripping newlines
+    lesson_lines = []
+    for lesson in body.lessons:
+        text = lesson.text.replace("\n", " ").replace("\r", " ").strip()
+        if not text:
+            continue
+        if lesson.strike > 0:
+            lesson_lines.append(f"- [{lesson.strike}x] {text}")
+        else:
+            lesson_lines.append(f"- {text}")
+
+    content = "\n".join(header_lines + lesson_lines) + "\n"
+
+    try:
+        lessons_path.write_text(content, encoding="utf-8")
+    except Exception:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": {"message": "Failed to write lessons.md", "code": "WRITE_ERROR"}},
+        )
+
+    return {"saved": True, "count": len(lesson_lines)}
 
 
 @router.get("/installations", response_model=list[InstallationResponse])
@@ -255,8 +431,11 @@ async def installations_overview(request: Request):
         try:
             rows = db.get_project_activity_summary(limit=20)
             total_projects = len(rows)
+            from jacked.guardrails import check_project_setup
+
             for row in rows:
                 rp = row["repo_path"]
+                setup = check_project_setup(rp) if rp else {}
                 projects.append(ProjectActivity(
                     repo_path=rp,
                     repo_name=Path(rp).name if rp else "unknown",
@@ -267,6 +446,12 @@ async def installations_overview(request: Request):
                     last_activity=row.get("last_activity"),
                     first_seen=row.get("first_seen"),
                     unique_sessions=row.get("unique_sessions") or 0,
+                    has_guardrails=setup.get("has_guardrails", False),
+                    guardrails_file=setup.get("guardrails_file"),
+                    has_lint_hook=setup.get("has_lint_hook", False),
+                    detected_language=setup.get("detected_language"),
+                    has_lessons=setup.get("has_lessons", False),
+                    lessons_count=setup.get("lessons_count", 0),
                 ))
         except Exception:
             pass

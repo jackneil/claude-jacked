@@ -21,6 +21,9 @@ Read this when the user asks about jacked features, installation, gatekeeper, lo
 | `~/.claude/skills/jacked/SKILL.md` | /jacked session search skill |
 | `~/.claude/hooks-debug.log` | Security gatekeeper decision log |
 | `~/.claude/gatekeeper-prompt.txt` | Custom gatekeeper LLM prompt (optional, user-created) |
+| `~/.claude/jacked-guardrails/*.md` | Guardrails templates (base + 4 languages) |
+| `~/.claude/jacked-hooks/*.sh` | Git hook templates (installed extensionless) |
+| `<project>/JACKED_GUARDRAILS.md` | Per-project coding standards (created by `jacked guardrails init`) |
 
 ## CLI Commands
 
@@ -36,8 +39,34 @@ jacked backfill [--force]                           # Index existing sessions (r
 jacked status                                       # Check Qdrant connectivity (requires [search])
 jacked check-version                              # Check for newer PyPI version
 jacked configure --show                             # Show current configuration
+jacked init [--repo PATH] [--language LANG]          # Set up guardrails + lint hook in project
+jacked guardrails init [--repo PATH] [--force]       # Create JACKED_GUARDRAILS.md from templates
+jacked lint-hook init [--repo PATH] [--force]        # Install pre-push lint hook in .git/hooks/
 python -m jacked                                    # Alternative invocation
 ```
+
+## Guardrails System
+
+Language-specific coding standards enforced through templates and git hooks.
+
+**Templates** (`~/.claude/jacked-guardrails/`):
+- `base.md` — universal rules: size limits, structure, /dc before commits, lint before push
+- `python.md`, `node.md`, `rust.md`, `go.md` — language-specific tooling and patterns
+
+**Per-project setup** (`jacked init` or `jacked guardrails init`):
+- Auto-detects language from pyproject.toml/package.json/Cargo.toml/go.mod
+- Creates `JACKED_GUARDRAILS.md` in project root (base + language template)
+- Claude follows these because global CLAUDE.md says "follow JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md if they exist"
+
+**Git pre-push hook** (`jacked lint-hook init`):
+- Installs to `.git/hooks/pre-push` (extensionless, as git requires)
+- Runs language-appropriate linter before allowing push
+- Detects existing hook frameworks (husky, pre-commit, lefthook) and warns
+
+**Dashboard warnings**:
+- Projects with gatekeeper activity but no JACKED_GUARDRAILS.md show "No Guardrails" badge
+- Projects without our pre-push hook show "No Lint Hook" badge
+- One-click setup from dashboard creates guardrails and/or installs hooks
 
 ## Security Gatekeeper (requires [security] extra)
 
@@ -48,7 +77,7 @@ python -m jacked                                    # Alternative invocation
 3. **Local allowlist** (<1ms) -- Matches specific safe subcommands (24 git subcommands, specific gh/docker/make targets, pytest, linting tools, etc.) with shell operator detection
 4. **LLM evaluation** (~2-10s) -- Sends ambiguous commands to Haiku with file context analysis, returns JSON with reason
 
-**Shell operator detection:** Commands containing `&&`, `||`, `;`, `|`, `` ` ``, `$()`, `>`, `>>`, `<`, or newlines always bypass the local allowlist and go to LLM evaluation. This prevents attacks like `git status && curl evil.com` from being auto-approved.
+**Shell operator detection:** Commands containing `&`, `;`, `|`, `` ` ``, `$()`, `>`, `<`, or newlines are flagged as compound. For `&&` and `||` specifically: if ALL sub-commands are individually safe (match safe prefixes/patterns), the compound is auto-approved locally. If any sub-command is ambiguous or denied, the whole thing goes to LLM evaluation. Pipes, semicolons, backticks, and lone `&` always go to LLM.
 
 **File context analysis:** When a command references a Python, SQL, or shell script, the gatekeeper reads the file contents and includes them in the LLM prompt. Defenses include:
 - Path traversal prevention (files must be within the working directory)

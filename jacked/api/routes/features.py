@@ -687,8 +687,7 @@ def _disable_session_indexing_hook(settings: dict):
 
 def _enable_sound_hooks(settings: dict):
     """Add sound notification hooks."""
-    # Import the sound command generator from cli
-    from jacked.cli import _get_sound_command, _sound_hook_marker
+    from jacked.cli import _get_sound_command, _replace_stale_sound_hook, _sound_hook_marker
 
     marker = _sound_hook_marker()
 
@@ -700,6 +699,8 @@ def _enable_sound_hooks(settings: dict):
             "matcher": "",
             "hooks": [{"type": "command", "command": marker + _get_sound_command("notification")}]
         })
+    else:
+        _replace_stale_sound_hook(settings["hooks"]["Notification"], marker, "notification")
 
     # Stop sound hook
     if "Stop" not in settings["hooks"]:
@@ -709,6 +710,8 @@ def _enable_sound_hooks(settings: dict):
             "matcher": "",
             "hooks": [{"type": "command", "command": marker + _get_sound_command("complete")}]
         })
+    else:
+        _replace_stale_sound_hook(settings["hooks"]["Stop"], marker, "complete")
 
 
 def _disable_sound_hooks(settings: dict):

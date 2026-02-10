@@ -696,8 +696,11 @@ def log(category, name, session_id, repo):
     """Record a command/agent/hook invocation to the analytics DB."""
     import sqlite3
     from datetime import datetime
+    from pathlib import Path as _Path
     if not DB_PATH.exists():
         return
+    # Normalize repo_path to canonical forward-slash format
+    norm_repo = str(_Path(repo).resolve()).replace("\\", "/") if repo else ""
     table_map = {"command": "command_usage", "agent": "agent_invocations", "hook": "hook_executions"}
     name_col = {"command": "command_name", "agent": "agent_name", "hook": "hook_name"}
     table = table_map[category]
@@ -707,7 +710,7 @@ def log(category, name, session_id, repo):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             f"INSERT INTO {table} ({col}, timestamp, session_id, repo_path, success) VALUES (?, ?, ?, ?, ?)",
-            (name, datetime.utcnow().isoformat(), session_id or "", repo or "", True),
+            (name, datetime.utcnow().isoformat(), session_id or "", norm_repo, True),
         )
         conn.commit()
         conn.close()
@@ -843,11 +846,17 @@ def _sound_hook_marker() -> str:
 
 
 def _get_sound_command(hook_type: str) -> str:
-    """Generate cross-platform sound command (backgrounded, with fallbacks).
+    """Generate platform-specific sound command.
+
+    Detects OS at install time via sys.platform instead of runtime shell
+    detection, because Claude Code runs hooks through cmd.exe on Windows
+    which can't parse Unix shell syntax.
 
     Args:
         hook_type: 'notification' or 'complete'
     """
+    import sys
+
     if hook_type == "notification":
         win_sound = "Exclamation"
         mac_sound = "Basso.aiff"
@@ -857,27 +866,37 @@ def _get_sound_command(hook_type: str) -> str:
         mac_sound = "Glass.aiff"
         linux_sound = "complete.oga"
 
-    # Log hook execution in background, then play sound in background
+    if sys.platform == "win32":
+        return f'powershell -Command "[System.Media.SystemSounds]::{win_sound}.Play()"'
+
     log_cmd = f'(jacked log hook sound_{hook_type} 2>/dev/null &); '
 
-    # Use uname for detection, background with &, fallback to bell
+    if sys.platform == "darwin":
+        return log_cmd + f'afplay /System/Library/Sounds/{mac_sound} 2>/dev/null || printf "\\a"'
+
+    # Linux (including WSL)
     return (
         log_cmd +
-        '('
-        'OS=$(uname -s); '
-        'case "$OS" in '
-        f'Darwin) afplay /System/Library/Sounds/{mac_sound} 2>/dev/null || printf "\\a";; '
-        'Linux) '
-        '  if grep -qi microsoft /proc/version 2>/dev/null; then '
-        f'    powershell.exe -Command "[System.Media.SystemSounds]::{win_sound}.Play()" 2>/dev/null || printf "\\a"; '
-        '  else '
-        f'    paplay /usr/share/sounds/freedesktop/stereo/{linux_sound} 2>/dev/null || printf "\\a"; '
-        '  fi;; '
-        f'MINGW*|MSYS*|CYGWIN*) powershell -Command "[System.Media.SystemSounds]::{win_sound}.Play()" 2>/dev/null || printf "\\a";; '
-        '*) printf "\\a";; '
-        'esac'
-        ') &'
+        '(if grep -qi microsoft /proc/version 2>/dev/null; then '
+        f'powershell.exe -Command "[System.Media.SystemSounds]::{win_sound}.Play()" 2>/dev/null || printf "\\a"; '
+        'else '
+        f'paplay /usr/share/sounds/freedesktop/stereo/{linux_sound} 2>/dev/null || printf "\\a"; '
+        'fi)'
     )
+
+
+def _replace_stale_sound_hook(hook_entries: list, marker: str, hook_type: str) -> bool:
+    """Replace a stale Unix-style sound hook with the current platform-specific one.
+
+    Returns True if a replacement was made.
+    """
+    for entry in hook_entries:
+        for hook in entry.get("hooks", []):
+            cmd = str(hook.get("command", ""))
+            if marker in cmd and "uname" in cmd:
+                hook["command"] = marker + _get_sound_command(hook_type)
+                return True
+    return False
 
 
 def _install_sound_hooks(existing: dict, settings_path: Path):
@@ -897,10 +916,15 @@ def _install_sound_hooks(existing: dict, settings_path: Path):
             "hooks": [{"type": "command", "command": marker + _get_sound_command("notification")}]
         })
         console.print("[green][OK][/green] Added Notification sound hook")
+    elif _replace_stale_sound_hook(existing["hooks"]["Notification"], marker, "notification"):
+        console.print("[green][OK][/green] Updated Notification sound hook (fixed for this OS)")
     else:
         console.print("[yellow][-][/yellow] Notification sound hook exists")
 
     # Stop sound hook (separate from index)
+    if "Stop" not in existing["hooks"]:
+        existing["hooks"]["Stop"] = []
+
     stop_exists = any(marker in str(h) for h in existing["hooks"]["Stop"])
     if not stop_exists:
         existing["hooks"]["Stop"].append({
@@ -908,6 +932,8 @@ def _install_sound_hooks(existing: dict, settings_path: Path):
             "hooks": [{"type": "command", "command": marker + _get_sound_command("complete")}]
         })
         console.print("[green][OK][/green] Added Stop sound hook")
+    elif _replace_stale_sound_hook(existing["hooks"]["Stop"], marker, "complete"):
+        console.print("[green][OK][/green] Updated Stop sound hook (fixed for this OS)")
     else:
         console.print("[yellow][-][/yellow] Stop sound hook exists")
 
@@ -1503,6 +1529,18 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         claude_md_path = home / ".claude" / "CLAUDE.md"
         _install_behavioral_rules(claude_md_path, force=force)
 
+    # Deploy guardrails and hook templates
+    from jacked.guardrails import deploy_templates
+    deploy_result = deploy_templates(force=force)
+    g_count = sum(1 for t in deploy_result["guardrails"] if t.get("deployed"))
+    h_count = sum(1 for t in deploy_result["hooks"] if t.get("deployed"))
+    g_skip = sum(1 for t in deploy_result["guardrails"] if t.get("skipped"))
+    h_skip = sum(1 for t in deploy_result["hooks"] if t.get("skipped"))
+    if g_count or h_count:
+        console.print(f"[green][OK][/green] Deployed {g_count} guardrails + {h_count} hook templates")
+    if g_skip or h_skip:
+        console.print(f"[dim][-][/dim] Skipped {g_skip + h_skip} existing templates (use --force to overwrite)")
+
     # Ensure analytics DB exists
     try:
         from jacked.web.database import Database
@@ -1528,6 +1566,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print("  - Security gatekeeper (auto-approves safe Bash commands)")
     if not no_rules:
         console.print("  - Behavioral rules in CLAUDE.md")
+    console.print("  - Guardrails templates (run 'jacked init' in a project to set up)")
 
     # Show next steps based on what's installed
     console.print("\nNext steps:")
@@ -2024,6 +2063,99 @@ def gatekeeper_diff():
             console.print(f"[red]{line.rstrip()}[/red]")
         else:
             console.print(line.rstrip())
+
+
+# ── Guardrails CLI group ──────────────────────────────────────────────
+
+
+@main.group(name="guardrails")
+def guardrails_group():
+    """Manage design guardrails for projects."""
+    pass
+
+
+@guardrails_group.command(name="init")
+@click.option("--repo", type=click.Path(exists=True), default=".", help="Project root directory")
+@click.option("--language", type=click.Choice(["python", "node", "rust", "go"]), help="Override language detection")
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing JACKED_GUARDRAILS.md")
+def guardrails_init(repo: str, language: str, force: bool):
+    """Create JACKED_GUARDRAILS.md in a project from templates.
+
+    Auto-detects language from pyproject.toml, package.json, etc.
+
+    >>> # CLI command: jacked guardrails init
+    """
+    from jacked.guardrails import create_guardrails
+    result = create_guardrails(repo, language=language, force=force)
+    if result["created"]:
+        lang_label = f" ({result.get('language', 'base')})" if result.get("language") else ""
+        console.print(f"[green][OK][/green] Created {result['path']}{lang_label}")
+    else:
+        console.print(f"[yellow][-][/yellow] {result['reason']}")
+
+
+# ── Lint-Hook CLI group ──────────────────────────────────────────────
+
+
+@main.group(name="lint-hook")
+def lint_hook_group():
+    """Manage git pre-push lint hooks for projects."""
+    pass
+
+
+@lint_hook_group.command(name="init")
+@click.option("--repo", type=click.Path(exists=True), default=".", help="Project root directory")
+@click.option("--language", type=click.Choice(["python", "node", "rust", "go"]), help="Override language detection")
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing pre-push hook")
+def lint_hook_init(repo: str, language: str, force: bool):
+    """Install a pre-push lint hook in a project's .git/hooks/.
+
+    Auto-detects language and installs the appropriate linter check.
+
+    >>> # CLI command: jacked lint-hook init
+    """
+    from jacked.guardrails import install_hook
+    result = install_hook(repo, language=language, force=force)
+    if result["installed"]:
+        console.print(f"[green][OK][/green] Installed pre-push hook at {result['path']} ({result.get('language', '?')})")
+    else:
+        console.print(f"[yellow][-][/yellow] {result['reason']}")
+
+
+# ── Convenience init command ─────────────────────────────────────────
+
+
+@main.command(name="init")
+@click.option("--repo", type=click.Path(exists=True), default=".", help="Project root directory")
+@click.option("--language", type=click.Choice(["python", "node", "rust", "go"]), help="Override language detection")
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
+def init_project(repo: str, language: str, force: bool):
+    """Set up guardrails + lint hook in a project (does both).
+
+    Combines 'jacked guardrails init' + 'jacked lint-hook init'.
+
+    >>> # CLI command: jacked init
+    """
+    from jacked.guardrails import create_guardrails, install_hook
+
+    console.print(f"[bold]Setting up project: {repo}[/bold]\n")
+
+    # Guardrails
+    g_result = create_guardrails(repo, language=language, force=force)
+    if g_result["created"]:
+        lang_label = f" ({g_result.get('language', 'base')})" if g_result.get("language") else ""
+        console.print(f"[green][OK][/green] Created JACKED_GUARDRAILS.md{lang_label}")
+    else:
+        console.print(f"[yellow][-][/yellow] Guardrails: {g_result['reason']}")
+
+    # Lint hook
+    h_result = install_hook(repo, language=language, force=force)
+    if h_result["installed"]:
+        console.print(f"[green][OK][/green] Installed pre-push lint hook ({h_result.get('language', '?')})")
+    else:
+        console.print(f"[yellow][-][/yellow] Lint hook: {h_result['reason']}")
+
+    console.print("\n[bold]Done.[/bold]")
 
 
 if __name__ == "__main__":

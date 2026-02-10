@@ -29,6 +29,20 @@ Analyze:
 - Existing PR for this branch
 - Open issues that might be related
 
+### PHASE 1.5: LINT CHECK
+Before creating or updating a PR, check code quality:
+
+1. **Detect project type** from config files (pyproject.toml = Python, package.json = Node, Cargo.toml = Rust, go.mod = Go)
+2. **Run the appropriate linter**:
+   - Python: `ruff check .` (auto-fix with `ruff check --fix .` if issues found)
+   - Node: `npx eslint .` (auto-fix with `npx eslint --fix .` if issues found)
+   - Rust: `cargo clippy --all-targets -- -D warnings`
+   - Go: `go vet ./...`
+3. **Fix auto-fixable issues** silently, commit the fixes if any were applied
+4. **If unfixable lint errors remain**, warn the user and ask if they want to proceed anyway
+5. **Check if /dc was recently run** in this conversation. If not, suggest: "Consider running /dc before creating this PR."
+6. **Check guardrails compliance**: If JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md exists in the project root, read it and verify the PR changes comply with its rules (file sizes, structure, testing requirements). Flag any violations.
+
 ### PHASE 2: DECISION LOGIC
 
 **Case A: Uncommitted changes exist**
@@ -176,7 +190,7 @@ When updating existing PR:
 ### User Preferences
 - Current year: 2025
 - Branch naming: `jack_YYYYMMDD_<uniquebranchnumber>`
-- Python path: `C:/Users/jack/.conda/envs/krac_llm/python.exe`
+- Python path: `C:/Users/jack/.conda/envs/jacked/python.exe`
 - Uses doctest format for tests
 - Never use the word "fuck" in commits (use other profanity)
 
