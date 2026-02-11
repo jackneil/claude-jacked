@@ -11,6 +11,7 @@ let logsRefreshTimer = null;
 let logsFilter = 'ALL';
 let logsSearch = '';
 let logsActiveSession = 'ALL';
+let logsActiveRepo = 'ALL';
 let logsSessions = [];
 
 // ---------------------------------------------------------------------------
@@ -151,6 +152,11 @@ function renderSubTab() {
 // ============================================================================
 
 function renderGatekeeperSubTab(container) {
+    const uniqueRepos = getUniqueRepos(logsSessions);
+    const repoOptions = uniqueRepos.map(r =>
+        `<option value="${escapeHtml(r.toLowerCase())}" ${logsActiveRepo === r.toLowerCase() ? 'selected' : ''}>${escapeHtml(getRepoName(r))}</option>`
+    ).join('');
+
     container.innerHTML = `
         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
             <div class="text-sm text-slate-400">Security gatekeeper decisions</div>
@@ -162,6 +168,10 @@ function renderGatekeeperSubTab(container) {
                     <option value="ALL" ${logsFilter === 'ALL' ? 'selected' : ''}>All Decisions</option>
                     <option value="ALLOW" ${logsFilter === 'ALLOW' ? 'selected' : ''}>Allowed</option>
                     <option value="ASK_USER" ${logsFilter === 'ASK_USER' ? 'selected' : ''}>Asked User</option>
+                </select>
+                <select id="logs-repo-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
+                    <option value="ALL" ${logsActiveRepo === 'ALL' ? 'selected' : ''}>All Repos</option>
+                    ${repoOptions}
                 </select>
                 <label class="flex items-center gap-2 text-sm text-slate-400 cursor-pointer select-none">
                     <input id="logs-auto-refresh" type="checkbox" class="rounded" ${logsAutoRefresh ? 'checked' : ''}>
@@ -223,6 +233,16 @@ function bindGatekeeperLogsEvents() {
         });
     }
 
+    const repoFilterEl = document.getElementById('logs-repo-filter');
+    if (repoFilterEl) {
+        repoFilterEl.addEventListener('change', () => {
+            logsActiveRepo = repoFilterEl.value;
+            logsActiveSession = 'ALL';
+            renderFilteredSessions();
+            loadLogsData();
+        });
+    }
+
     const autoRefreshEl = document.getElementById('logs-auto-refresh');
     if (autoRefreshEl) {
         autoRefreshEl.addEventListener('change', () => {
@@ -244,6 +264,19 @@ function bindGatekeeperLogsEvents() {
 function getRepoName(repoPath) {
     if (!repoPath) return '';
     return repoPath.replace(/\\/g, '/').split('/').filter(Boolean).pop() || repoPath;
+}
+
+function getUniqueRepos(sessions) {
+    const seen = new Map();
+    for (const s of sessions) {
+        if (s.repo_path) {
+            const key = s.repo_path.toLowerCase();
+            if (!seen.has(key)) seen.set(key, s.repo_path);
+        }
+    }
+    return [...seen.values()].sort((a, b) =>
+        getRepoName(a).localeCompare(getRepoName(b))
+    );
 }
 
 function isSessionActive(lastSeen) {
@@ -315,6 +348,10 @@ async function loadSessions() {
         logsSessions = [];
     }
 
+    renderFilteredSessions();
+}
+
+function renderFilteredSessions() {
     const container = document.getElementById('logs-sessions');
     if (!container) return;
 
@@ -323,16 +360,24 @@ async function loadSessions() {
         return;
     }
 
-    container.innerHTML = renderSessionCards(logsSessions, logsActiveSession);
+    // Stale filter guard: reset if selected repo no longer in sessions
+    if (logsActiveRepo !== 'ALL') {
+        const repoExists = logsSessions.some(s =>
+            (s.repo_path || '').toLowerCase() === logsActiveRepo
+        );
+        if (!repoExists) logsActiveRepo = 'ALL';
+    }
 
-    container.querySelectorAll('.session-card').forEach(card => {
-        card.addEventListener('click', () => {
-            logsActiveSession = card.dataset.session;
-            container.innerHTML = renderSessionCards(logsSessions, logsActiveSession);
-            bindSessionCardClicks(container);
-            loadLogsData();
-        });
-    });
+    // Filter sessions by repo
+    let filtered = logsSessions;
+    if (logsActiveRepo !== 'ALL') {
+        filtered = logsSessions.filter(s =>
+            (s.repo_path || '').toLowerCase() === logsActiveRepo
+        );
+    }
+
+    container.innerHTML = renderSessionCards(filtered, logsActiveSession);
+    bindSessionCardClicks(container);
 }
 
 function bindSessionCardClicks(container) {
@@ -400,6 +445,9 @@ async function loadLogsData() {
             const q = logsSearch.toLowerCase();
             filtered = rows.filter(r => (r.command || '').toLowerCase().includes(q));
         }
+        if (logsActiveRepo !== 'ALL') {
+            filtered = filtered.filter(r => (r.repo_path || '').toLowerCase() === logsActiveRepo);
+        }
 
         if (filtered.length === 0) {
             container.innerHTML = `
@@ -437,7 +485,7 @@ async function loadLogsData() {
                         <span class="inline-block px-2 py-0.5 rounded text-xs font-medium ${colors.badge}">${escapeHtml(r.decision)}</span>
                     </td>
                     <td class="px-3 py-2 text-xs text-slate-300 whitespace-nowrap">${method}</td>
-                    <td class="px-3 py-2 text-sm font-mono text-slate-200 max-w-md truncate">${cmd}</td>
+                    <td class="px-3 py-2 text-sm font-mono text-slate-200 max-w-[200px] md:max-w-md truncate">${cmd}</td>
                     <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap text-right">${elapsed}</td>
                     ${showRepo
                         ? `<td class="px-3 py-2 text-xs text-slate-500 whitespace-nowrap font-mono">${escapeHtml(repo || session)}</td>`
