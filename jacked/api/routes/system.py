@@ -35,6 +35,7 @@ class InstallationResponse(BaseModel):
     agents_installed: Optional[list[str]] = None
     commands_installed: Optional[list[str]] = None
     guardrails_installed: bool = False
+    env_path: Optional[str] = None
     last_scanned_at: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -59,6 +60,15 @@ class PathSafetyConfigRequest(BaseModel):
     enabled: bool = True
     allowed_paths: list[str] = []
     disabled_patterns: list[str] = []
+    watched_paths: list[str] = []
+
+
+class PathValidateRequest(BaseModel):
+    path: str
+
+
+class PathBrowseRequest(BaseModel):
+    path: str = ""
 
 
 class ProjectActivity(BaseModel):
@@ -75,6 +85,7 @@ class ProjectActivity(BaseModel):
     guardrails_file: Optional[str] = None
     has_lint_hook: bool = False
     detected_language: Optional[str] = None
+    env_path: Optional[str] = None
     has_lessons: bool = False
     lessons_count: int = 0
 
@@ -231,6 +242,122 @@ async def project_lint_hook_init(body: ProjectInitRequest, request: Request):
     return result
 
 
+# --- Project Env endpoints ---
+
+class EnvUpdateRequest(BaseModel):
+    repo_path: str
+    env_path: str
+
+
+@router.get("/project/env")
+async def get_project_env(repo_path: str, request: Request):
+    """Get the configured Python env for a project.
+
+    >>> # GET /api/project/env?repo_path=/some/repo
+    """
+    from pathlib import Path
+    error = _validate_project_path(repo_path, request)
+    if error:
+        return error
+
+    env_path = None
+    source = None
+
+    # Read from .git/jacked/env
+    env_file = Path(repo_path) / ".git" / "jacked" / "env"
+    if env_file.exists():
+        try:
+            env_path = env_file.read_text(encoding="utf-8").strip()
+            source = "file"
+        except Exception:
+            pass
+
+    # Also check DB
+    db = getattr(request.app.state, "db", None)
+    if db and not env_path:
+        try:
+            inst = db.get_installation_by_repo(repo_path)
+            if inst and inst.get("env_path"):
+                env_path = inst["env_path"]
+                source = "db"
+        except Exception:
+            pass
+
+    return {"env_path": env_path, "source": source}
+
+
+@router.put("/project/env")
+async def update_project_env(body: EnvUpdateRequest, request: Request):
+    """Manually set the Python env path for a project.
+
+    >>> # PUT /api/project/env  {"repo_path": "...", "env_path": "..."}
+    """
+    from jacked.cli import _validate_env_path, _write_project_env
+
+    error = _validate_project_path(body.repo_path, request)
+    if error:
+        return error
+
+    # Validate the env path
+    validation_error = _validate_env_path(body.env_path)
+    if validation_error:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": validation_error, "code": "INVALID_ENV_PATH"}},
+        )
+
+    # Write to .git/jacked/env
+    _write_project_env(body.repo_path, body.env_path)
+
+    # Write to DB
+    db = getattr(request.app.state, "db", None)
+    if db:
+        try:
+            db.update_installation_env(body.repo_path, body.env_path)
+        except Exception:
+            pass
+
+    return {"env_path": body.env_path, "source": "manual"}
+
+
+@router.post("/project/env/detect")
+async def detect_project_env(body: ProjectInitRequest, request: Request):
+    """Auto-detect and store the Python env for a project.
+
+    >>> # POST /api/project/env/detect  {"repo_path": "..."}
+    """
+    from jacked.cli import _detect_project_env, _validate_env_path, _write_project_env
+
+    error = _validate_project_path(body.repo_path, request)
+    if error:
+        return error
+
+    env_path = _detect_project_env()
+    if not env_path:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error": {"message": "No Python env detected", "code": "NO_ENV_DETECTED"}},
+        )
+
+    validation_error = _validate_env_path(env_path)
+    if validation_error:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": validation_error, "code": "INVALID_ENV_PATH"}},
+        )
+
+    _write_project_env(body.repo_path, env_path)
+
+    db = getattr(request.app.state, "db", None)
+    if db:
+        try:
+            db.update_installation_env(body.repo_path, env_path)
+        except Exception:
+            pass
+
+    return {"env_path": env_path, "source": "auto"}
+
+
 class LessonItem(BaseModel):
     index: int
     strike: int = 1
@@ -371,7 +498,6 @@ async def installations_overview(request: Request):
     from jacked import __version__
     from jacked.api.routes.features import (
         CLAUDE_DIR,
-        DATA_ROOT,
         _detect_hook_installed,
         _detect_rules_status,
         _get_valid_agent_names,
@@ -450,6 +576,7 @@ async def installations_overview(request: Request):
                     guardrails_file=setup.get("guardrails_file"),
                     has_lint_hook=setup.get("has_lint_hook", False),
                     detected_language=setup.get("detected_language"),
+                    env_path=setup.get("env_path"),
                     has_lessons=setup.get("has_lessons", False),
                     lessons_count=setup.get("lessons_count", 0),
                 ))
@@ -714,7 +841,6 @@ async def test_gatekeeper_api_key(request: Request):
 @router.get("/settings/gatekeeper/prompt")
 async def get_gatekeeper_prompt():
     """Current gatekeeper prompt text and source. Never exposes internal paths."""
-    from pathlib import Path
 
     from jacked.data.hooks.security_gatekeeper import (
         PROMPT_PATH,
@@ -744,7 +870,7 @@ async def update_gatekeeper_prompt(body: PromptUpdateRequest):
     """Save a custom gatekeeper prompt. Validates required placeholders."""
     from jacked.data.hooks.security_gatekeeper import PROMPT_PATH
 
-    required = {"{command}", "{cwd}", "{file_context}"}
+    required = {"{command}", "{cwd}", "{file_context}", "{watched_paths}"}
     missing = [p for p in sorted(required) if p not in body.text]
     if missing:
         return JSONResponse(
@@ -785,7 +911,7 @@ async def get_path_safety_config(request: Request):
 
     db = getattr(request.app.state, "db", None)
 
-    config = {"enabled": True, "allowed_paths": [], "disabled_patterns": []}
+    config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []}
 
     if db is not None:
         raw = db.get_setting("gatekeeper.path_safety")
@@ -795,10 +921,22 @@ async def get_path_safety_config(request: Request):
             except (json.JSONDecodeError, TypeError):
                 pass
 
+    # Check existence of watched paths for per-row badges
+    from pathlib import Path as _Path
+    watched = config.get("watched_paths", [])
+    watched_existence = {}
+    for wp in watched:
+        try:
+            watched_existence[wp] = _Path(wp).exists() or _Path(wp + "/").exists()
+        except Exception:
+            watched_existence[wp] = False
+
     return {
         "enabled": config.get("enabled", True),
         "allowed_paths": config.get("allowed_paths", []),
         "disabled_patterns": config.get("disabled_patterns", []),
+        "watched_paths": watched,
+        "watched_existence": watched_existence,
         "available_rules": get_path_safety_rules_metadata(),
     }
 
@@ -849,14 +987,155 @@ async def update_path_safety_config(body: PathSafetyConfigRequest, request: Requ
             content={"error": {"message": f"Unknown pattern keys: {', '.join(invalid)}", "code": "INVALID_PATTERN_KEY"}},
         )
 
+    # Validate watched_paths
+    from pathlib import Path as _Path
+    import os as _os
+
+    if len(body.watched_paths) > 20:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": "Maximum 20 watched paths", "code": "TOO_MANY_WATCHED"}},
+        )
+    resolved_watched = []
+    for wp in body.watched_paths:
+        if len(wp) > 500:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"error": {"message": f"Watched path too long (max 500 chars): {wp[:50]}...", "code": "PATH_TOO_LONG"}},
+            )
+        normalized = wp.replace("\\", "/").rstrip("/")
+        # Only hard-reject Unix root (matches literally everything)
+        if _os.name != "nt" and normalized == "":
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"error": {"message": "Root path (/) not allowed — matches everything", "code": "ROOT_PATH_REJECTED"}},
+            )
+        # Try resolve, fall back to normalized raw for unmounted drives
+        try:
+            resolved = str(_Path(wp).resolve()).replace("\\", "/").rstrip("/")
+        except Exception:
+            resolved = normalized
+            if _os.name == "nt" and len(resolved) >= 2:
+                resolved = resolved[0].upper() + resolved[1:]
+        resolved_watched.append(resolved)
+
     config = {
         "enabled": body.enabled,
         "allowed_paths": body.allowed_paths,
         "disabled_patterns": body.disabled_patterns,
+        "watched_paths": resolved_watched,
     }
     db.set_setting("gatekeeper.path_safety", json.dumps(config))
 
     return {"updated": True, **config}
+
+
+@router.post("/settings/gatekeeper/validate-path")
+async def validate_path(body: PathValidateRequest):
+    """Validate a filesystem path for use as a watched/allowed path."""
+    from pathlib import Path as _Path
+    import os as _os
+
+    raw = body.path.strip()
+    if not raw:
+        return {"valid": False, "reason": "Empty path"}
+
+    # Hard-reject root path (matches literally everything)
+    normalized_raw = raw.replace("\\", "/").rstrip("/")
+    if normalized_raw == "":
+        return {"valid": False, "reason": "Root path (/) matches everything"}
+
+    # Try to resolve, but fall back to normalized raw if resolve fails (e.g., unmounted drive)
+    try:
+        resolved = _Path(raw).resolve()
+        resolved_str = str(resolved).replace("\\", "/").rstrip("/")
+    except Exception:
+        resolved_str = normalized_raw
+        if _os.name == "nt":
+            resolved_str = resolved_str[0].upper() + resolved_str[1:] if len(resolved_str) >= 2 else resolved_str
+
+    warnings = []
+
+    # Warn (don't reject) for broad paths
+    is_drive_root = (len(resolved_str) == 2 and resolved_str[1] == ":") or \
+                    (len(resolved_str) == 3 and resolved_str[1] == ":" and resolved_str[2] == "/")
+    if is_drive_root:
+        warnings.append(f"Drive root — matches all files on {resolved_str}")
+
+    try:
+        home_dir = str(_Path.home()).replace("\\", "/").rstrip("/")
+        if resolved_str.replace("/", "").lower() == home_dir.replace("/", "").lower():
+            warnings.append("Home directory — very broad, matches all your user files")
+    except Exception:
+        pass
+
+    # Check existence (soft — non-existent paths are allowed with warning)
+    try:
+        p = _Path(resolved_str) if not is_drive_root else _Path(resolved_str + "/")
+        exists = p.exists()
+        is_dir = p.is_dir() if exists else None
+    except Exception:
+        exists = False
+        is_dir = None
+
+    if not exists:
+        warnings.append("does not exist on this machine")
+
+    result = {"valid": True, "resolved": resolved_str}
+    if is_dir is not None:
+        result["is_directory"] = is_dir
+    if not exists:
+        result["exists"] = False
+    if warnings:
+        result["warning"] = " | ".join(warnings)
+    return result
+
+
+@router.post("/settings/gatekeeper/browse-path")
+async def browse_path(body: PathBrowseRequest):
+    """List subdirectories of a given path for the directory browser."""
+    from pathlib import Path as _Path
+
+    raw = body.path.strip()
+    if not raw:
+        target = _Path.home()
+    else:
+        try:
+            target = _Path(raw).resolve()
+        except Exception:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"error": {"message": "Invalid path", "code": "INVALID_PATH"}},
+            )
+
+    if not target.is_dir():
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": "Not a directory", "code": "NOT_DIRECTORY"}},
+        )
+
+    current = str(target).replace("\\", "/")
+    parent_path = str(target.parent).replace("\\", "/") if target.parent != target else None
+
+    directories = []
+    try:
+        for entry in sorted(target.iterdir()):
+            if len(directories) >= 100:
+                break
+            try:
+                if entry.is_dir() and not entry.name.startswith("."):
+                    directories.append(entry.name)
+            except PermissionError:
+                continue
+            except OSError:
+                continue
+    except PermissionError:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"error": {"message": "Permission denied", "code": "PERMISSION_DENIED"}},
+        )
+
+    return {"current": current, "parent": parent_path, "directories": directories}
 
 
 # --- Generic settings (parameterized routes AFTER static ones) ---

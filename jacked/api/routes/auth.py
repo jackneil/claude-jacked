@@ -17,7 +17,6 @@ from jacked.web.auth import (
     refresh_account_token,
     validate_account,
 )
-from jacked.web.database import Account
 from jacked.web.oauth import OAuthFlow, get_flow
 
 router = APIRouter()

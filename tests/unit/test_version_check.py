@@ -1,10 +1,7 @@
 """Tests for jacked.version_check module."""
 
 import json
-import os
-import tempfile
 import time
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from jacked import version_check as vc

@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, computed_field
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +80,7 @@ class Installation(BaseModel):
     agents_installed: Optional[str] = None
     commands_installed: Optional[str] = None
     guardrails_installed: bool = False
+    env_path: Optional[str] = None
     last_scanned_at: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -387,6 +388,14 @@ class Database:
                     conn.execute("ALTER TABLE accounts ADD COLUMN cached_usage_raw TEXT")
                 except sqlite3.OperationalError:
                     pass  # another worker beat us to it
+            # Migration: add env_path to installations
+            cursor = conn.execute("PRAGMA table_info(installations)")
+            cols = {row[1] for row in cursor.fetchall()}
+            if "env_path" not in cols:
+                try:
+                    conn.execute("ALTER TABLE installations ADD COLUMN env_path TEXT")
+                except sqlite3.OperationalError:
+                    pass
 
     def close(self) -> None:
         if hasattr(self._local, "connection") and self._local.connection:
@@ -823,6 +832,35 @@ class Database:
                 "DELETE FROM installations WHERE id = ?", (installation_id,)
             )
             return cursor.rowcount > 0
+
+    def update_installation_env(self, repo_path: str, env_path: str) -> bool:
+        """Update env_path for an installation by repo_path.
+
+        >>> db = Database(":memory:")
+        >>> inst = db.create_installation("/repo", "my-repo")
+        >>> db.update_installation_env("/repo", "/some/env")
+        True
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "UPDATE installations SET env_path = ? WHERE repo_path = ?",
+                (env_path, repo_path),
+            )
+            return cursor.rowcount > 0
+
+    def get_installation_by_repo(self, repo_path: str) -> Optional[dict]:
+        """Get an installation by repo_path.
+
+        >>> db = Database(":memory:")
+        >>> db.get_installation_by_repo("/nonexistent") is None
+        True
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM installations WHERE repo_path = ?", (repo_path,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
     # ==================================================================
     # Settings CRUD

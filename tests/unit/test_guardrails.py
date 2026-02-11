@@ -1,10 +1,8 @@
 """Tests for jacked.guardrails module."""
 
 import os
-import tempfile
 from pathlib import Path
 
-import pytest
 
 from jacked import guardrails
 

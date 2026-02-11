@@ -378,8 +378,8 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 
     console.print(table)
     console.print("\n[dim]📋 = has plan file | 🤖 = has agent summaries[/dim]")
-    console.print(f"[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]")
-    console.print(f"[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]")
+    console.print("[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]")
+    console.print("[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]")
 
     # Print session IDs for easy copy
     console.print("\nSession IDs:")
@@ -454,7 +454,7 @@ def retrieve(session_id: str, output: Optional[str], summary: bool, mode: str, m
 
     if session.is_local:
         resume_cmd = retriever.get_resume_command(session)
-        console.print(f"\n[green][OK] Session exists locally![/green]")
+        console.print("\n[green][OK] Session exists locally![/green]")
         console.print(f"To resume natively: [bold]{resume_cmd}[/bold]")
 
     if summary:
@@ -755,7 +755,7 @@ def configure(show: bool):
 
     console.print("[bold cyan]Team/Identity (Optional):[/bold cyan]\n")
     console.print("  JACKED_USER_NAME")
-    console.print(f"    Your name for session attribution (default: git user.name or system user)")
+    console.print("    Your name for session attribution (default: git user.name or system user)")
     console.print(f"    Current: {os.getenv('JACKED_USER_NAME', SmartForkConfig._default_user_name())}\n")
 
     console.print("[bold cyan]Ranking Weights (Optional):[/bold cyan]\n")
@@ -1308,6 +1308,67 @@ def _remove_security_hook(settings_path: Path) -> bool:
     return False
 
 
+def _detect_project_env() -> str | None:
+    """Detect the project's Python env root from the running interpreter.
+
+    Prefers sys.executable (avoids detecting wrong env when running from
+    conda base).  Falls back to CONDA_PREFIX if sys.executable doesn't
+    look like an env.
+
+    >>> import sys; _detect_project_env() is None or isinstance(_detect_project_env(), str)
+    True
+    """
+    import os as _os
+
+    exe = Path(sys.executable).resolve()
+    # Windows: envs/jacked/python.exe  -> parent = envs/jacked
+    # Linux:   envs/jacked/bin/python  -> parent.parent = envs/jacked
+    for env_root in (exe.parent, exe.parent.parent):
+        if (env_root / "conda-meta").exists() or (env_root / "pyvenv.cfg").exists():
+            return str(env_root).replace("\\", "/")
+
+    prefix = _os.environ.get("CONDA_PREFIX")
+    if prefix and (Path(prefix) / "conda-meta").exists():
+        return prefix.replace("\\", "/")
+    return None
+
+
+def _validate_env_path(env_path: str) -> str | None:
+    """Validate env_path is a real Python env.  Returns error message or None.
+
+    >>> _validate_env_path("") is not None
+    True
+    >>> _validate_env_path("relative/path") is not None
+    True
+    """
+    if not env_path or len(env_path) > 500:
+        return "Invalid path length"
+    if "\x00" in env_path or ".." in env_path:
+        return "Path contains invalid characters"
+    p = Path(env_path)
+    if not p.is_absolute():
+        return "Must be an absolute path"
+    if not (p / "conda-meta").exists() and not (p / "pyvenv.cfg").exists():
+        return "Not a recognized Python environment (no conda-meta or pyvenv.cfg)"
+    return None
+
+
+def _write_project_env(repo_path: str, env_path: str) -> bool:
+    """Write env path to .git/jacked/env for hook consumption.
+
+    Returns True if written, False if repo has no .git directory.
+
+    >>> # Only writes when .git exists
+    """
+    git_dir = Path(repo_path) / ".git"
+    if not git_dir.is_dir():
+        return False
+    jacked_dir = git_dir / "jacked"
+    jacked_dir.mkdir(parents=True, exist_ok=True)
+    (jacked_dir / "env").write_text(env_path + "\n", encoding="utf-8")
+    return True
+
+
 @main.command()
 @click.option("--sounds", is_flag=True, help="Install sound notification hooks")
 @click.option("--search", is_flag=True, help="Install session indexing hook (requires [search] extra)")
@@ -1321,7 +1382,6 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     Use --search to add session indexing (requires qdrant-client).
     Use --security to add security gatekeeper (requires anthropic SDK).
     """
-    import os
     import json
     import shutil
 
@@ -1383,13 +1443,13 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             existing["hooks"]["Stop"].append(hook_config_stop)
             settings_path.parent.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(json.dumps(existing, indent=2))
-            console.print(f"[green][OK][/green] Added Stop hook (session indexing)")
+            console.print("[green][OK][/green] Added Stop hook (session indexing)")
         elif needs_async_update:
             existing["hooks"]["Stop"][hook_index] = hook_config_stop
             settings_path.write_text(json.dumps(existing, indent=2))
-            console.print(f"[green][OK][/green] Updated Stop hook with async: true")
+            console.print("[green][OK][/green] Updated Stop hook with async: true")
         else:
-            console.print(f"[yellow][-][/yellow] Stop hook already configured")
+            console.print("[yellow][-][/yellow] Stop hook already configured")
     else:
         console.print("[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)")
 
@@ -1403,7 +1463,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 
     if skill_src.exists():
         shutil.copy(skill_src, skill_dst)
-        console.print(f"[green][OK][/green] Installed skill: /jacked")
+        console.print("[green][OK][/green] Installed skill: /jacked")
     else:
         console.print(f"[yellow][-][/yellow] Skill file not found at {skill_src}")
 
@@ -1460,7 +1520,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             msg += f" ({skipped} unchanged)"
         console.print(msg)
     else:
-        console.print(f"[yellow][-][/yellow] Agents directory not found")
+        console.print("[yellow][-][/yellow] Agents directory not found")
 
     # Install commands (symlink for editable, copy otherwise)
     commands_src = pkg_root / "commands"
@@ -1500,7 +1560,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             msg += f" ({skipped} unchanged)"
         console.print(msg)
     else:
-        console.print(f"[yellow][-][/yellow] Commands directory not found")
+        console.print("[yellow][-][/yellow] Commands directory not found")
 
     # Install sound hooks if requested
     if sounds:
@@ -1518,7 +1578,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                 console.print(f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]")
                 for pat, _, prefix, reason in warns:
                     console.print(f"  [red][WARN][/red] {pat} — {reason}")
-                console.print(f"[dim]Run 'jacked gatekeeper audit' for full details[/dim]")
+                console.print("[dim]Run 'jacked gatekeeper audit' for full details[/dim]")
             else:
                 console.print("[green][AUDIT] Permission rules look clean[/green]")
     else:
@@ -1548,6 +1608,27 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print("[green][OK][/green] Analytics database ready")
     except Exception:
         console.print("[dim][-][/dim] Analytics database setup skipped")
+
+    # Detect and store project env if we're inside a git repo
+    import os as _os
+    cwd = _os.getcwd()
+    if (Path(cwd) / ".git").is_dir():
+        env_path = _detect_project_env()
+        if env_path:
+            err = _validate_env_path(env_path)
+            if err is None:
+                if _write_project_env(cwd, env_path):
+                    console.print(f"[green][OK][/green] Project env: {env_path}")
+                    # Also store in DB if available
+                    try:
+                        db = Database()
+                        db.update_installation_env(cwd, env_path)
+                    except Exception:
+                        pass
+            else:
+                console.print(f"[dim][-][/dim] Detected env failed validation: {err}")
+        else:
+            console.print("[dim][-][/dim] No project env detected")
 
     console.print("\n[bold]Installation complete![/bold]")
     console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
@@ -1651,19 +1732,19 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                     settings_path.write_text(json.dumps(settings, indent=2))
                     console.print(f"[green][OK][/green] Removed Stop hook from {settings_path}")
                 else:
-                    console.print(f"[yellow][-][/yellow] No jacked hook found in settings")
+                    console.print("[yellow][-][/yellow] No jacked hook found in settings")
         except (json.JSONDecodeError, KeyError) as e:
             console.print(f"[red][FAIL][/red] Error reading settings: {e}")
     else:
-        console.print(f"[yellow][-][/yellow] No settings.json found")
+        console.print("[yellow][-][/yellow] No settings.json found")
 
     # Remove skill directory
     skill_dir = home / ".claude" / "skills" / "jacked"
     if skill_dir.exists():
         shutil.rmtree(skill_dir)
-        console.print(f"[green][OK][/green] Removed skill: /jacked")
+        console.print("[green][OK][/green] Removed skill: /jacked")
     else:
-        console.print(f"[yellow][-][/yellow] Skill not found")
+        console.print("[yellow][-][/yellow] Skill not found")
 
     # Remove jacked reference doc
     ref_path = home / ".claude" / "jacked-reference.md"
@@ -1684,9 +1765,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         if agent_count > 0:
             console.print(f"[green][OK][/green] Removed {agent_count} agents")
         else:
-            console.print(f"[yellow][-][/yellow] No jacked agents found")
+            console.print("[yellow][-][/yellow] No jacked agents found")
     else:
-        console.print(f"[yellow][-][/yellow] Agents directory not found")
+        console.print("[yellow][-][/yellow] Agents directory not found")
 
     # Remove only jacked-installed commands (not the whole directory!)
     commands_src = pkg_root / "commands"
@@ -1701,9 +1782,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         if cmd_count > 0:
             console.print(f"[green][OK][/green] Removed {cmd_count} commands")
         else:
-            console.print(f"[yellow][-][/yellow] No jacked commands found")
+            console.print("[yellow][-][/yellow] No jacked commands found")
     else:
-        console.print(f"[yellow][-][/yellow] Commands directory not found")
+        console.print("[yellow][-][/yellow] Commands directory not found")
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print("\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]")
@@ -1755,7 +1836,7 @@ def gatekeeper_reset(yes: bool):
 
     PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
     PROMPT_PATH.write_text(SECURITY_PROMPT, encoding="utf-8")
-    console.print(f"[green][OK][/green] Reset gatekeeper prompt to built-in default")
+    console.print("[green][OK][/green] Reset gatekeeper prompt to built-in default")
     console.print(f"[dim]{PROMPT_PATH}[/dim]")
 
 
@@ -1922,7 +2003,7 @@ def gatekeeper_audit(scan_log, limit):
         if level == "WARN":
             console.print(f"  [red][WARN][/red] {pat} — {reason}")
             console.print(f"         Gatekeeper deny patterns won't catch all {prefix} inline code.")
-            console.print(f"         Consider removing and letting the gatekeeper evaluate individually.\n")
+            console.print("         Consider removing and letting the gatekeeper evaluate individually.\n")
             warn_count += 1
         elif level == "INFO":
             console.print(f"  [yellow][INFO][/yellow] {pat} — {reason}")
@@ -1934,7 +2015,7 @@ def gatekeeper_audit(scan_log, limit):
     console.print(f"\n{warn_count} warnings, {info_count} info, {ok_count} OK")
 
     if warn_count > 0:
-        console.print(f"\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]")
+        console.print("\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]")
 
     # Log scanning
     if scan_log:
@@ -2118,6 +2199,12 @@ def lint_hook_init(repo: str, language: str, force: bool):
     result = install_hook(repo, language=language, force=force)
     if result["installed"]:
         console.print(f"[green][OK][/green] Installed pre-push hook at {result['path']} ({result.get('language', '?')})")
+        # Store project env so the hook can find the right tool
+        repo_path = str(Path(repo).resolve())
+        env_path = _detect_project_env()
+        if env_path and _validate_env_path(env_path) is None:
+            if _write_project_env(repo_path, env_path):
+                console.print(f"[green][OK][/green] Project env: {env_path}")
     else:
         console.print(f"[yellow][-][/yellow] {result['reason']}")
 
@@ -2154,6 +2241,13 @@ def init_project(repo: str, language: str, force: bool):
         console.print(f"[green][OK][/green] Installed pre-push lint hook ({h_result.get('language', '?')})")
     else:
         console.print(f"[yellow][-][/yellow] Lint hook: {h_result['reason']}")
+
+    # Store project env for hook tool discovery
+    repo_path = str(Path(repo).resolve())
+    env_path = _detect_project_env()
+    if env_path and _validate_env_path(env_path) is None:
+        if _write_project_env(repo_path, env_path):
+            console.print(f"[green][OK][/green] Project env: {env_path}")
 
     console.print("\n[bold]Done.[/bold]")
 

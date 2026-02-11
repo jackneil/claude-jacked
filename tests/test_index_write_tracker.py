@@ -4,10 +4,9 @@ import pytest
 import sqlite3
 import threading
 import time
-from pathlib import Path
 from unittest.mock import Mock
 
-from jacked.index_write_tracker import IndexWriteTracker, DB_PATH, MAX_SEED_POINTS
+from jacked.index_write_tracker import IndexWriteTracker, MAX_SEED_POINTS
 
 
 class TestIndexWriteTrackerInit:
@@ -15,12 +14,12 @@ class TestIndexWriteTrackerInit:
 
     def test_creates_db_file_on_init(self, tmp_db_path):
         """DB file created in tmp directory when IndexWriteTracker initialized."""
-        tracker = IndexWriteTracker("test_config_hash")
+        IndexWriteTracker("test_config_hash")
         assert tmp_db_path.exists()
 
     def test_creates_tables_on_init(self, tmp_db_path):
         """indexed_points and session_meta tables created with correct schema."""
-        tracker = IndexWriteTracker("test_config_hash")
+        IndexWriteTracker("test_config_hash")
 
         conn = sqlite3.connect(tmp_db_path)
         cursor = conn.cursor()
@@ -41,7 +40,7 @@ class TestIndexWriteTrackerInit:
 
     def test_wal_mode_enabled(self, tmp_db_path):
         """SQLite WAL mode is enabled for concurrent access."""
-        tracker = IndexWriteTracker("test_config_hash")
+        IndexWriteTracker("test_config_hash")
 
         conn = sqlite3.connect(tmp_db_path)
         cursor = conn.cursor()

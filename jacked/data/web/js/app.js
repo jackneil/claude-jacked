@@ -381,8 +381,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Start account polling
     startPolling();
 
-    // Hash change listener
+    // Unsaved changes guard — warn on page close/refresh
+    window.addEventListener('beforeunload', (e) => {
+        if (window._settingsDirty) {
+            e.preventDefault();
+        }
+    });
+
+    // Hash change listener — guard against leaving settings with unsaved changes
+    let _suppressHashChange = false;
     window.addEventListener('hashchange', () => {
+        if (_suppressHashChange) { _suppressHashChange = false; return; }
+        if (window._settingsDirty) {
+            const leave = confirm('You have unsaved settings changes. Leave without saving?');
+            if (!leave) {
+                _suppressHashChange = true;
+                window.location.hash = 'settings';
+                return;
+            }
+            window._settingsDirty = false;
+        }
         renderRoute(getRoute());
     });
 

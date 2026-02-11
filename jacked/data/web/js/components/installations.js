@@ -208,12 +208,12 @@ function renderProjectCard(project) {
         const gFile = project.guardrails_file ? escapeHtml(project.guardrails_file) : 'JACKED_GUARDRAILS.md';
         warningBadges += `<span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-green-900/40 text-green-400 border border-green-700/50" title="${gFile}">Guardrails</span>`;
     } else {
-        warningBadges += `<span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-yellow-900/40 text-yellow-400 border border-yellow-700/50 cursor-pointer jacked-init-guardrails" data-repo="${escapeHtml(project.repo_path)}" title="Click to create JACKED_GUARDRAILS.md">No Guardrails</span>`;
+        warningBadges += `<span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-yellow-900/40 text-yellow-400 border border-yellow-700/50 cursor-pointer jacked-init-guardrails" data-repo="${escapeHtml(project.repo_path)}" data-lang="${escapeHtml(project.detected_language || '')}" title="Click to create JACKED_GUARDRAILS.md">No Guardrails</span>`;
     }
     if (project.has_lint_hook) {
         warningBadges += `<span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-green-900/40 text-green-400 border border-green-700/50" title="pre-push lint hook installed">Lint Hook</span>`;
     } else {
-        warningBadges += `<span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-orange-900/40 text-orange-400 border border-orange-700/50 cursor-pointer jacked-init-lint-hook" data-repo="${escapeHtml(project.repo_path)}" title="Click to install pre-push lint hook">No Lint Hook</span>`;
+        warningBadges += `<span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-orange-900/40 text-orange-400 border border-orange-700/50 cursor-pointer jacked-init-lint-hook" data-repo="${escapeHtml(project.repo_path)}" data-lang="${escapeHtml(project.detected_language || '')}" title="Click to install pre-push lint hook">No Lint Hook</span>`;
     }
     if (project.detected_language) {
         warningBadges += `<span class="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded bg-slate-700/50 text-slate-400">${escapeHtml(project.detected_language)}</span>`;
@@ -225,6 +225,33 @@ function renderProjectCard(project) {
     } else {
         warningBadges += `<span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-500 border border-slate-700">No Lessons</span>`;
     }
+
+    // Env path row
+    const envId = 'env-panel-' + _repoToId(project.repo_path);
+    let envRow = '';
+    if (project.env_path) {
+        envRow = `
+            <div class="flex items-center gap-1.5 mb-2 text-[10px]">
+                <span class="text-slate-500">Env:</span>
+                <span class="text-cyan-400 font-mono truncate max-w-[200px]" title="${escapeHtml(project.env_path)}">${escapeHtml(project.env_path)}</span>
+                <button class="jacked-edit-env text-slate-600 hover:text-cyan-400 transition-colors" data-repo="${escapeHtml(project.repo_path)}" title="Edit env path">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
+                </button>
+            </div>`;
+    } else {
+        envRow = `
+            <div class="flex items-center gap-1.5 mb-2 text-[10px]">
+                <span class="text-slate-500">Env:</span>
+                <span class="text-slate-600">Not configured</span>
+                <button class="jacked-detect-env text-slate-600 hover:text-cyan-400 transition-colors" data-repo="${escapeHtml(project.repo_path)}" title="Auto-detect env">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+                </button>
+                <button class="jacked-edit-env text-slate-600 hover:text-cyan-400 transition-colors" data-repo="${escapeHtml(project.repo_path)}" title="Set env path manually">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
+                </button>
+            </div>`;
+    }
+    envRow += `<div id="${envId}" class="hidden mb-2"></div>`;
 
     const badgesRow = warningBadges ? `<div class="flex flex-wrap gap-1 mb-2">${warningBadges}</div>` : '';
     const cardId = 'lessons-panel-' + _repoToId(project.repo_path);
@@ -239,6 +266,7 @@ function renderProjectCard(project) {
                 <span class="text-[10px] text-slate-500 whitespace-nowrap ml-2">Last: ${lastActivity}</span>
             </div>
             ${badgesRow}
+            ${envRow}
             <div class="flex flex-col gap-1.5">
                 ${statsHtml}
             </div>
@@ -248,15 +276,52 @@ function renderProjectCard(project) {
 }
 
 /**
- * One-click: create JACKED_GUARDRAILS.md for a project.
+ * Language-to-linter mapping for confirmation dialogs.
  */
-async function _initGuardrails(repoPath) {
+const LANG_LINTER = {
+    python: { linter: 'ruff', cmd: 'ruff check .' },
+    node:   { linter: 'eslint', cmd: 'npx eslint .' },
+    rust:   { linter: 'clippy', cmd: 'cargo clippy --all-targets -- -D warnings' },
+    go:     { linter: 'go vet', cmd: 'go vet ./...' },
+};
+
+/**
+ * Confirm + create JACKED_GUARDRAILS.md for a project.
+ */
+async function _initGuardrails(repoPath, lang) {
+    const langLabel = lang ? `<code>${escapeHtml(lang)}</code> project` : 'this project';
+    const html = `
+        <div style="margin-bottom:0.75rem">
+            Creates <code>JACKED_GUARDRAILS.md</code> in ${langLabel} with coding standards,
+            review rules, and safety constraints for Claude Code.
+        </div>
+        <div style="margin-bottom:0.5rem"><strong style="color:#e2e8f0">What it does:</strong></div>
+        <ul style="text-align:left;padding-left:1.2rem;margin:0 0 0.75rem 0;list-style:disc">
+            <li>Writes a guardrails template${lang ? ' tailored for <code>' + escapeHtml(lang) + '</code>' : ''}</li>
+            <li>Claude reads this file for project-specific rules</li>
+            <li>Does <em>not</em> modify any existing files</li>
+        </ul>
+        <div><strong style="color:#e2e8f0">File:</strong> <code>${escapeHtml(repoPath)}/JACKED_GUARDRAILS.md</code></div>
+    `;
+
+    const result = await Swal.fire({
+        title: 'Install Guardrails?',
+        html: html,
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: 'Create Guardrails',
+        cancelButtonText: 'Cancel',
+        focusCancel: true,
+    });
+
+    if (!result.isConfirmed) return;
+
     try {
-        const result = await api.post('/api/project/guardrails-init', { repo_path: repoPath });
-        if (result.created) {
-            showToast('Guardrails created: ' + (result.language || 'base'), 'success');
+        const res = await api.post('/api/project/guardrails-init', { repo_path: repoPath });
+        if (res.created) {
+            showToast('Guardrails created: ' + (res.language || 'base'), 'success');
         } else {
-            showToast('Guardrails: ' + (result.reason || 'unknown error'), 'warning');
+            showToast('Guardrails: ' + (res.reason || 'unknown error'), 'warning');
         }
         loadInstallationsData();
     } catch (e) {
@@ -265,15 +330,45 @@ async function _initGuardrails(repoPath) {
 }
 
 /**
- * One-click: install pre-push lint hook for a project.
+ * Confirm + install pre-push lint hook for a project.
  */
-async function _initLintHook(repoPath) {
+async function _initLintHook(repoPath, lang) {
+    const info = LANG_LINTER[lang] || { linter: 'linter', cmd: '<linter> .' };
+    const langLabel = lang ? `<code>${escapeHtml(lang)}</code>` : 'detected language';
+    const html = `
+        <div style="margin-bottom:0.75rem">
+            Installs a git <code>pre-push</code> hook that runs <code>${escapeHtml(info.linter)}</code>
+            before allowing pushes to the remote.
+        </div>
+        <div style="margin-bottom:0.5rem"><strong style="color:#e2e8f0">What it does:</strong></div>
+        <ul style="text-align:left;padding-left:1.2rem;margin:0 0 0.75rem 0;list-style:disc">
+            <li>Creates <code>.git/hooks/pre-push</code></li>
+            <li>Runs <code>${escapeHtml(info.cmd)}</code> before each push</li>
+            <li>Blocks push if lint errors are found</li>
+            <li>Automatically finds ${escapeHtml(info.linter)} across envs</li>
+        </ul>
+        <div><strong style="color:#e2e8f0">Language:</strong> ${langLabel}</div>
+        <div><strong style="color:#e2e8f0">Linter:</strong> <code>${escapeHtml(info.linter)}</code></div>
+    `;
+
+    const result = await Swal.fire({
+        title: 'Install Lint Hook?',
+        html: html,
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: 'Install Hook',
+        cancelButtonText: 'Cancel',
+        focusCancel: true,
+    });
+
+    if (!result.isConfirmed) return;
+
     try {
-        const result = await api.post('/api/project/lint-hook-init', { repo_path: repoPath });
-        if (result.installed) {
-            showToast('Lint hook installed: ' + (result.language || '?'), 'success');
+        const res = await api.post('/api/project/lint-hook-init', { repo_path: repoPath });
+        if (res.installed) {
+            showToast('Lint hook installed: ' + (res.language || '?'), 'success');
         } else {
-            showToast('Lint hook: ' + (result.reason || 'unknown error'), 'warning');
+            showToast('Lint hook: ' + (res.reason || 'unknown error'), 'warning');
         }
         loadInstallationsData();
     } catch (e) {
@@ -425,18 +520,83 @@ function _deleteLessonRow(row) {
 }
 
 /**
+ * Auto-detect env for a project.
+ */
+async function _detectEnv(repoPath) {
+    try {
+        const result = await api.post('/api/project/env/detect', { repo_path: repoPath });
+        showToast('Env detected: ' + result.env_path, 'success');
+        loadInstallationsData();
+    } catch (e) {
+        showToast('Env detection: ' + (e.message || 'failed'), 'warning');
+    }
+}
+
+/**
+ * Show inline env editor for a project.
+ */
+function _showEnvEditor(repoPath) {
+    const panelId = 'env-panel-' + _repoToId(repoPath);
+    const panel = document.getElementById(panelId);
+    if (!panel) return;
+
+    if (!panel.classList.contains('hidden')) {
+        panel.classList.add('hidden');
+        panel.innerHTML = '';
+        return;
+    }
+
+    panel.classList.remove('hidden');
+    panel.innerHTML = `
+        <div class="flex items-center gap-1.5">
+            <input type="text" class="env-path-input flex-1 bg-slate-900/50 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 outline-none focus:border-cyan-600 transition-colors font-mono" placeholder="/path/to/env" value="">
+            <button class="env-save-btn text-[10px] px-2 py-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white transition-colors" data-repo="${escapeHtml(repoPath)}">Save</button>
+            <button class="env-cancel-btn text-[10px] px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors">Cancel</button>
+        </div>
+        <div class="env-error text-[10px] text-red-400 mt-1 hidden"></div>
+    `;
+
+    const input = panel.querySelector('.env-path-input');
+    if (input) input.focus();
+}
+
+/**
+ * Save env path from inline editor.
+ */
+async function _saveEnvPath(repoPath, panel) {
+    const input = panel.querySelector('.env-path-input');
+    const errorEl = panel.querySelector('.env-error');
+    if (!input) return;
+
+    const envPath = input.value.trim();
+    if (!envPath) {
+        if (errorEl) { errorEl.textContent = 'Path cannot be empty'; errorEl.classList.remove('hidden'); }
+        return;
+    }
+
+    try {
+        await api.put('/api/project/env', { repo_path: repoPath, env_path: envPath });
+        showToast('Env path saved', 'success');
+        loadInstallationsData();
+    } catch (e) {
+        const msg = e.message || 'Save failed';
+        if (errorEl) { errorEl.textContent = msg; errorEl.classList.remove('hidden'); }
+    }
+}
+
+/**
  * Attach click handlers to warning badges via event delegation (prevents XSS).
  */
 function _bindBadgeClicks(root) {
     root.addEventListener('click', function(e) {
         const guardrailsBtn = e.target.closest('.jacked-init-guardrails');
         if (guardrailsBtn) {
-            _initGuardrails(guardrailsBtn.dataset.repo);
+            _initGuardrails(guardrailsBtn.dataset.repo, guardrailsBtn.dataset.lang);
             return;
         }
         const lintBtn = e.target.closest('.jacked-init-lint-hook');
         if (lintBtn) {
-            _initLintHook(lintBtn.dataset.repo);
+            _initLintHook(lintBtn.dataset.repo, lintBtn.dataset.lang);
             return;
         }
         const lessonsBtn = e.target.closest('.jacked-toggle-lessons');
@@ -454,6 +614,28 @@ function _bindBadgeClicks(root) {
         if (deleteBtn) {
             const row = deleteBtn.closest('.lesson-row');
             if (row) _deleteLessonRow(row);
+            return;
+        }
+        const detectEnvBtn = e.target.closest('.jacked-detect-env');
+        if (detectEnvBtn) {
+            _detectEnv(detectEnvBtn.dataset.repo);
+            return;
+        }
+        const editEnvBtn = e.target.closest('.jacked-edit-env');
+        if (editEnvBtn) {
+            _showEnvEditor(editEnvBtn.dataset.repo);
+            return;
+        }
+        const envSaveBtn = e.target.closest('.env-save-btn');
+        if (envSaveBtn) {
+            const panel = envSaveBtn.closest('[id^="env-panel-"]');
+            if (panel) _saveEnvPath(envSaveBtn.dataset.repo, panel);
+            return;
+        }
+        const envCancelBtn = e.target.closest('.env-cancel-btn');
+        if (envCancelBtn) {
+            const panel = envCancelBtn.closest('[id^="env-panel-"]');
+            if (panel) { panel.classList.add('hidden'); panel.innerHTML = ''; }
             return;
         }
     });

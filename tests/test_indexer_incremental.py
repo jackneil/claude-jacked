@@ -3,19 +3,9 @@
 import pytest
 pytest.importorskip("qdrant_client")
 
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime
+from unittest.mock import patch
 
 from jacked.indexer import SessionIndexer
-from jacked.config import content_hash
-from jacked.transcript import (
-    EnrichedTranscript,
-    TranscriptMessage,
-    PlanFile,
-    AgentSummary,
-    SummaryLabel,
-)
 
 
 class TestSessionIndexerInit:
@@ -129,7 +119,6 @@ class TestIndexSessionIncremental:
         with patch("jacked.indexer.parse_jsonl_file_enriched", return_value=transcript1):
             result1 = indexer.index_session(session_file, "/c/test/repo")
             assert result1["indexed"] is True
-            first_count = result1["new_points"]
 
         # Second transcript with 3 messages (1 new)
         msgs2 = [
@@ -176,8 +165,7 @@ class TestIndexSessionIncremental:
         )
 
         with patch("jacked.indexer.parse_jsonl_file_enriched", return_value=transcript1):
-            result1 = indexer.index_session(session_file, "/c/test/repo")
-            chunks_first = result1["chunks"]
+            indexer.index_session(session_file, "/c/test/repo")
 
         # Second transcript with different content
         transcript2 = sample_transcript(
@@ -418,8 +406,7 @@ class TestBuildIncrementalPoints:
         )
 
         with patch("jacked.indexer.parse_jsonl_file_enriched", return_value=transcript1):
-            result1 = indexer.index_session(session_file, "/c/test/repo")
-            first_chunks = result1["chunks"]
+            indexer.index_session(session_file, "/c/test/repo")
 
         # Second transcript - longer (appended content)
         transcript2 = sample_transcript(

@@ -7,7 +7,6 @@ hook installation for jacked-managed projects.
 
 from __future__ import annotations
 
-import os
 import shutil
 import stat
 from pathlib import Path
@@ -279,6 +278,7 @@ def check_project_setup(repo_path: str | Path) -> dict:
         "guardrails_file": None,
         "has_lint_hook": False,
         "detected_language": None,
+        "env_path": None,
         "has_lessons": False,
         "lessons_count": 0,
     }
@@ -309,7 +309,17 @@ def check_project_setup(repo_path: str | Path) -> dict:
         result["has_lessons"] = True
         try:
             text = lessons_file.read_text(encoding="utf-8")
-            result["lessons_count"] = sum(1 for line in text.splitlines() if line.strip().startswith("- ["))
+            result["lessons_count"] = sum(1 for line in text.splitlines() if line.strip().startswith("- "))
+        except Exception:
+            pass
+
+    # Read .git/jacked/env if present
+    env_file = repo / ".git" / "jacked" / "env"
+    if env_file.exists():
+        try:
+            env_path = env_file.read_text(encoding="utf-8").strip()
+            if env_path:
+                result["env_path"] = env_path
         except Exception:
             pass
 
