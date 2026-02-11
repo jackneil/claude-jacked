@@ -1030,17 +1030,29 @@ def _check_file_tool_permissions(tool_name: str, file_path: str) -> bool:
     return bool(patterns) and any(p == tool_name for p in patterns)
 
 
-def _handle_file_tool(tool_name: str, tool_input: dict, cwd: str, session_id: str):
+def _handle_file_tool(tool_name: str, tool_input: dict, cwd: str, session_id: str) -> None:
     """Handle Read/Edit/Write/Grep/Glob/NotebookEdit PreToolUse events.
 
-    For file tools, Claude Code auto-approves by default (no hook needed).
-    So we must explicitly DENY unsafe paths — silent exit = allow.
+    Decision flow (security checks FIRST, matching Bash handler invariant):
+    1. Path safety (sensitive files, watched paths, outside project) → deny
+    2. Permission rules (user-configured allow patterns) → emit allow
+    3. Otherwise safe → emit allow
 
-    Decision flow:
-    1. Check if user already approved via permissions → allow (silent exit)
-    2. Check path safety (outside project, sensitive files, watched paths) → deny with message
-    3. Otherwise → allow (silent exit)
+    Deny always wins over permissions — a broad wildcard like Read(/:*)
+    must never auto-approve .env or SSH keys.
+
+    On unexpected exception: silent return (no output) = fail-open to Claude
+    Code's own protection. This matches the hook contract where exit 0 with
+    no output means "hook has no opinion".
     """
+    try:
+        _handle_file_tool_inner(tool_name, tool_input, cwd, session_id)
+    except Exception as exc:
+        log(f"PATH SAFETY [{tool_name}]: EXCEPTION {type(exc).__name__}: {exc}")
+
+
+def _handle_file_tool_inner(tool_name: str, tool_input: dict, cwd: str, session_id: str) -> None:
+    """Inner implementation — wrapped by _handle_file_tool for crash safety."""
     start = time.time()
     repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace("\\", "/")
 
@@ -1050,14 +1062,13 @@ def _handle_file_tool(tool_name: str, tool_input: dict, cwd: str, session_id: st
         _record_hook_execution((time.time() - start) * 1000, session_id, repo_path)
         return  # no path to check, allow
 
-    # Step 1: Check if already approved via permissions
-    if _check_file_tool_permissions(tool_name, file_path):
-        elapsed = time.time() - start
-        log(f"PATH SAFETY [{tool_name}]: PERMS ALLOW {file_path[:100]} ({elapsed:.3f}s)")
-        _record_decision("ALLOW", f"[{tool_name}] {file_path[:200]}", "PERMS", None, elapsed * 1000, session_id, repo_path)
-        return  # silent exit = allow
+    # Reject null bytes — never a legitimate file path, can bypass regex checks
+    if "\x00" in file_path:
+        log(f"PATH SAFETY [{tool_name}]: DENY null byte in path")
+        _emit_deny(f"Path safety: invalid path (null byte) — {Path(file_path.replace(chr(0), '')).name}")
+        return
 
-    # Step 2: Path safety check
+    # Step 1: Path safety check FIRST — security always wins over permissions
     config = _read_path_safety_config()
     reason = _check_path_safety(file_path, cwd, config)
     if reason:
@@ -1068,10 +1079,29 @@ def _handle_file_tool(tool_name: str, tool_input: dict, cwd: str, session_id: st
         _emit_deny(msg)
         return
 
-    # Step 3: Safe — silent exit = allow
+    # Step 2: Check if already approved via permission rules
+    if _check_file_tool_permissions(tool_name, file_path):
+        elapsed = time.time() - start
+        log(f"PATH SAFETY [{tool_name}]: PERMS ALLOW {file_path[:100]} ({elapsed:.3f}s)")
+        _record_decision("ALLOW", f"[{tool_name}] {file_path[:200]}", "PERMS", None, elapsed * 1000, session_id, repo_path)
+        emit_allow()
+        return
+
+    # Step 3: Safe — emit allow so Claude Code auto-approves
+    # Floor check: even with path safety disabled, never auto-approve sensitive files.
+    # Uses empty disabled_patterns [] deliberately — the floor is the full sensitive
+    # ruleset regardless of user overrides, because disabled=False means "I turned off
+    # path safety" not "I want .env auto-approved".
+    if not config.get("enabled", True):
+        sensitive = _is_path_sensitive(file_path, [])
+        if sensitive:
+            _record_hook_execution((time.time() - start) * 1000, session_id, repo_path)
+            return  # silent exit — let Claude Code's own protection handle it
+
     elapsed = time.time() - start
     log_debug(f"PATH SAFETY [{tool_name}]: ALLOW {file_path[:100]} ({elapsed:.3f}s)")
-    _record_hook_execution(elapsed * 1000, session_id, repo_path)
+    emit_allow()
+    _record_decision("ALLOW", f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", None, elapsed * 1000, session_id, repo_path)
 
 
 # --- Path safety metadata export ---
@@ -1304,6 +1334,23 @@ def main():
         log(f"DECISION: ASK USER ({elapsed:.3f}s)")
         _record_decision("ASK_USER", command, "PATH_SAFETY", bash_path_reason, elapsed * 1000, sid, repo_path)
         sys.exit(0)  # silent exit → Claude Code asks user
+
+    # Floor check: even with path safety disabled, never auto-approve commands
+    # that reference sensitive files. Uses empty disabled_patterns [] so the
+    # full sensitive ruleset applies regardless of user overrides.
+    if not ps_config.get("enabled", True):
+        for rule in SENSITIVE_FILE_RULES.values():
+            if rule["pattern"].search(command):
+                elapsed = time.time() - start
+                log(f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)")
+                _record_decision("ASK_USER", command, "PATH_SAFETY_FLOOR", rule["label"], elapsed * 1000, sid, repo_path)
+                sys.exit(0)
+        for rule in SENSITIVE_DIR_RULES.values():
+            if rule["pattern"].search(command):
+                elapsed = time.time() - start
+                log(f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)")
+                _record_decision("ASK_USER", command, "PATH_SAFETY_FLOOR", rule["label"], elapsed * 1000, sid, repo_path)
+                sys.exit(0)
 
     # Tier 2: Check Claude's own permission rules
     if check_permissions(command, cwd):

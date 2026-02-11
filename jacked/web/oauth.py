@@ -456,6 +456,7 @@ class OAuthFlow:
                 seven_day=seven_day.get("utilization"),
                 five_hour_resets_at=five_hour.get("resets_at"),
                 seven_day_resets_at=seven_day.get("resets_at"),
+                raw=usage,
             )
 
         # Mark as valid

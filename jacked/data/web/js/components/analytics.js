@@ -88,7 +88,7 @@ function renderGatekeeperStats(data) {
     return `
         <div>
             <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Security Gatekeeper</h3>
-            <div class="grid grid-cols-3 gap-3 mb-3">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
                 <div class="stat-card">
                     <div class="text-2xl font-bold text-white">${total.toLocaleString()}</div>
                     <div class="text-xs text-slate-400 mt-1">Total Decisions</div>
@@ -133,7 +133,7 @@ function renderAgentStats(data) {
     return `
         <div>
             <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Top Agents</h3>
-            <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden">
+            <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-x-auto">
                 <table class="data-table">
                     <thead><tr><th class="text-left">Agent</th><th class="text-center">Invocations</th><th class="text-center">Avg Duration</th></tr></thead>
                     <tbody>${rowsHtml}</tbody>
@@ -175,7 +175,7 @@ function renderHookStats(data) {
     return `
         <div>
             <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Hook Health</h3>
-            <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden">
+            <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-x-auto">
                 <table class="data-table">
                     <thead><tr><th class="text-left">Hook</th><th class="text-center">Executions</th><th class="text-center">Success Rate</th><th class="text-center">Avg Duration</th></tr></thead>
                     <tbody>${rowsHtml}</tbody>
@@ -199,7 +199,7 @@ function renderLessonStats(data) {
     return `
         <div>
             <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Lessons</h3>
-            <div class="grid grid-cols-3 gap-3">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div class="stat-card">
                     <div class="text-2xl font-bold text-blue-400">${active}</div>
                     <div class="text-xs text-slate-400 mt-1">Active (Learning)</div>

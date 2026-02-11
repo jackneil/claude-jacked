@@ -6,7 +6,7 @@
 // ---------------------------------------------------------------------------
 // Gatekeeper state (preserved from original)
 // ---------------------------------------------------------------------------
-let logsAutoRefresh = false;
+let logsAutoRefresh = true;
 let logsRefreshTimer = null;
 let logsFilter = 'ALL';
 let logsSearch = '';
@@ -127,11 +127,10 @@ function renderSubTab() {
     const container = document.getElementById('logs-subtab-content');
     if (!container) return;
 
-    // Stop auto-refresh when switching sub-tabs (each tab manages its own)
+    // Stop existing timer when switching sub-tabs (preserve preference)
     if (logsRefreshTimer) {
         clearInterval(logsRefreshTimer);
         logsRefreshTimer = null;
-        logsAutoRefresh = false;
     }
 
     switch (logsSubTab) {
@@ -139,6 +138,11 @@ function renderSubTab() {
         case 'hooks':      renderHookLogs(container); break;
         case 'version-checks': renderVersionCheckLogs(container); break;
         default: container.innerHTML = '<div class="text-slate-500 p-4">Unknown log type</div>';
+    }
+
+    // Restart auto-refresh if enabled (handles initial load + tab switches)
+    if (logsAutoRefresh) {
+        toggleLogsAutoRefresh(true);
     }
 }
 
@@ -148,11 +152,11 @@ function renderSubTab() {
 
 function renderGatekeeperSubTab(container) {
     container.innerHTML = `
-        <div class="flex items-center justify-between mb-4">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
             <div class="text-sm text-slate-400">Security gatekeeper decisions</div>
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-2">
                 <input id="logs-search" type="text" placeholder="Search commands..."
-                    class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 w-48"
+                    class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 w-full sm:w-48"
                     value="${escapeHtml(logsSearch)}">
                 <select id="logs-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
                     <option value="ALL" ${logsFilter === 'ALL' ? 'selected' : ''}>All Decisions</option>
@@ -615,7 +619,7 @@ function showLogsToast(msg, isError) {
 
     const toast = document.createElement('div');
     toast.id = 'logs-toast';
-    toast.className = `fixed bottom-6 right-6 px-4 py-2.5 rounded-lg text-sm font-medium shadow-lg z-50 transition-opacity duration-300 ${
+    toast.className = `fixed bottom-2 right-2 md:bottom-6 md:right-6 left-2 md:left-auto max-w-[calc(100vw-1rem)] md:max-w-sm px-4 py-2.5 rounded-lg text-sm font-medium shadow-lg z-50 transition-opacity duration-300 ${
         isError ? 'bg-red-800 text-red-100 border border-red-600' : 'bg-green-800 text-green-100 border border-green-600'
     }`;
     toast.textContent = msg;
@@ -638,7 +642,6 @@ function toggleLogsAutoRefresh(enabled) {
             if (window.jackedState.activeRoute !== 'logs') {
                 clearInterval(logsRefreshTimer);
                 logsRefreshTimer = null;
-                logsAutoRefresh = false;
                 return;
             }
             switch (logsSubTab) {
@@ -656,9 +659,9 @@ function toggleLogsAutoRefresh(enabled) {
 
 async function renderHookLogs(container) {
     container.innerHTML = `
-        <div class="flex items-center justify-between mb-4">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
             <div class="text-sm text-slate-400">Hook execution history</div>
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-2">
                 <label class="flex items-center gap-2 text-sm text-slate-400 cursor-pointer select-none">
                     <input id="hook-auto-refresh" type="checkbox" class="rounded" ${logsAutoRefresh ? 'checked' : ''}>
                     Auto-refresh
@@ -769,9 +772,9 @@ async function loadHookLogsData() {
 
 async function renderVersionCheckLogs(container) {
     container.innerHTML = `
-        <div class="flex items-center justify-between mb-4">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
             <div class="text-sm text-slate-400">Version check history</div>
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-2">
                 <label class="flex items-center gap-2 text-sm text-slate-400 cursor-pointer select-none">
                     <input id="ver-auto-refresh" type="checkbox" class="rounded" ${logsAutoRefresh ? 'checked' : ''}>
                     Auto-refresh
