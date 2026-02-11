@@ -1308,6 +1308,67 @@ def _remove_security_hook(settings_path: Path) -> bool:
     return False
 
 
+def _detect_project_env() -> str | None:
+    """Detect the project's Python env root from the running interpreter.
+
+    Prefers sys.executable (avoids detecting wrong env when running from
+    conda base).  Falls back to CONDA_PREFIX if sys.executable doesn't
+    look like an env.
+
+    >>> import sys; _detect_project_env() is None or isinstance(_detect_project_env(), str)
+    True
+    """
+    import os as _os
+
+    exe = Path(sys.executable).resolve()
+    # Windows: envs/jacked/python.exe  -> parent = envs/jacked
+    # Linux:   envs/jacked/bin/python  -> parent.parent = envs/jacked
+    for env_root in (exe.parent, exe.parent.parent):
+        if (env_root / "conda-meta").exists() or (env_root / "pyvenv.cfg").exists():
+            return str(env_root).replace("\\", "/")
+
+    prefix = _os.environ.get("CONDA_PREFIX")
+    if prefix and (Path(prefix) / "conda-meta").exists():
+        return prefix.replace("\\", "/")
+    return None
+
+
+def _validate_env_path(env_path: str) -> str | None:
+    """Validate env_path is a real Python env.  Returns error message or None.
+
+    >>> _validate_env_path("") is not None
+    True
+    >>> _validate_env_path("relative/path") is not None
+    True
+    """
+    if not env_path or len(env_path) > 500:
+        return "Invalid path length"
+    if "\x00" in env_path or ".." in env_path:
+        return "Path contains invalid characters"
+    p = Path(env_path)
+    if not p.is_absolute():
+        return "Must be an absolute path"
+    if not (p / "conda-meta").exists() and not (p / "pyvenv.cfg").exists():
+        return "Not a recognized Python environment (no conda-meta or pyvenv.cfg)"
+    return None
+
+
+def _write_project_env(repo_path: str, env_path: str) -> bool:
+    """Write env path to .git/jacked/env for hook consumption.
+
+    Returns True if written, False if repo has no .git directory.
+
+    >>> # Only writes when .git exists
+    """
+    git_dir = Path(repo_path) / ".git"
+    if not git_dir.is_dir():
+        return False
+    jacked_dir = git_dir / "jacked"
+    jacked_dir.mkdir(parents=True, exist_ok=True)
+    (jacked_dir / "env").write_text(env_path + "\n", encoding="utf-8")
+    return True
+
+
 @main.command()
 @click.option("--sounds", is_flag=True, help="Install sound notification hooks")
 @click.option("--search", is_flag=True, help="Install session indexing hook (requires [search] extra)")
@@ -1548,6 +1609,27 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print("[green][OK][/green] Analytics database ready")
     except Exception:
         console.print("[dim][-][/dim] Analytics database setup skipped")
+
+    # Detect and store project env if we're inside a git repo
+    import os as _os
+    cwd = _os.getcwd()
+    if (Path(cwd) / ".git").is_dir():
+        env_path = _detect_project_env()
+        if env_path:
+            err = _validate_env_path(env_path)
+            if err is None:
+                if _write_project_env(cwd, env_path):
+                    console.print(f"[green][OK][/green] Project env: {env_path}")
+                    # Also store in DB if available
+                    try:
+                        db = Database()
+                        db.update_installation_env(cwd, env_path)
+                    except Exception:
+                        pass
+            else:
+                console.print(f"[dim][-][/dim] Detected env failed validation: {err}")
+        else:
+            console.print("[dim][-][/dim] No project env detected")
 
     console.print("\n[bold]Installation complete![/bold]")
     console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
@@ -2118,6 +2200,12 @@ def lint_hook_init(repo: str, language: str, force: bool):
     result = install_hook(repo, language=language, force=force)
     if result["installed"]:
         console.print(f"[green][OK][/green] Installed pre-push hook at {result['path']} ({result.get('language', '?')})")
+        # Store project env so the hook can find the right tool
+        repo_path = str(Path(repo).resolve())
+        env_path = _detect_project_env()
+        if env_path and _validate_env_path(env_path) is None:
+            if _write_project_env(repo_path, env_path):
+                console.print(f"[green][OK][/green] Project env: {env_path}")
     else:
         console.print(f"[yellow][-][/yellow] {result['reason']}")
 
@@ -2154,6 +2242,13 @@ def init_project(repo: str, language: str, force: bool):
         console.print(f"[green][OK][/green] Installed pre-push lint hook ({h_result.get('language', '?')})")
     else:
         console.print(f"[yellow][-][/yellow] Lint hook: {h_result['reason']}")
+
+    # Store project env for hook tool discovery
+    repo_path = str(Path(repo).resolve())
+    env_path = _detect_project_env()
+    if env_path and _validate_env_path(env_path) is None:
+        if _write_project_env(repo_path, env_path):
+            console.print(f"[green][OK][/green] Project env: {env_path}")
 
     console.print("\n[bold]Done.[/bold]")
 

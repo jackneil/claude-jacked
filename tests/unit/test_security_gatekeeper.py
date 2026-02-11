@@ -519,6 +519,42 @@ class TestCompoundCommands:
         """
         assert gk.local_evaluate("cd /tmp && git status") == "YES"
 
+    def test_trailing_background_ampersand_auto_approved(self):
+        """Trailing & (background a safe command) should auto-approve.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("git status &")
+        'YES'
+        """
+        assert gk.local_evaluate("git status &") == "YES"
+
+    def test_jacked_with_redirect_and_background(self):
+        """jacked command with 2>/dev/null & should auto-approve.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("jacked log command dc 2>/dev/null &")
+        'YES'
+        """
+        assert gk.local_evaluate("jacked log command dc 2>/dev/null &") == "YES"
+
+    def test_safe_command_with_stderr_redirect_and_background(self):
+        """2>&1 & combo should auto-approve for safe commands.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("git diff 2>&1 &")
+        'YES'
+        """
+        assert gk.local_evaluate("git diff 2>&1 &") == "YES"
+
+    def test_mid_command_ampersand_still_goes_to_llm(self):
+        """Mid-command & (not trailing) should still go to LLM.
+
+        >>> from jacked.data.hooks.security_gatekeeper import local_evaluate
+        >>> local_evaluate("git status & curl example.com") is None
+        True
+        """
+        assert gk.local_evaluate("git status & curl example.com") is None
+
 
 # ---------------------------------------------------------------------------
 # Safe pipe evaluation

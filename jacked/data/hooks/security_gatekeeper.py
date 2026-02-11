@@ -136,11 +136,11 @@ ENV_ASSIGN_RE = re.compile(r"""^(?:\w+=(?:"[^"]*"|'[^']*'|\S+)\s+)+""")
 VERSION_HELP_RE = re.compile(r'^\S+\s+(-[Vv]|--version|-h|--help)\s*$')
 
 # Shell operators that chain/pipe commands — compound commands are NOT safe for prefix matching
-# Lone & (background exec) is caught by (?<![&])&(?![&]) — matches & but not &&
+# Lone & (background exec) is caught here; trailing & is pre-stripped by SAFE_REDIRECT_RE
 SHELL_OPERATOR_RE = re.compile(r'[;\n|`<>]|&&|(?<![&])&(?![&])|\$\(')
 
 # Safe stderr redirects that should NOT trigger SHELL_OPERATOR_RE (2>&1, 2>/dev/null)
-SAFE_REDIRECT_RE = re.compile(r'\s+2>&1\s*$|\s+2>/dev/null\s*$')
+SAFE_REDIRECT_RE = re.compile(r'\s+2>&1(?:\s+&)?\s*$|\s+2>/dev/null(?:\s+&)?\s*$|\s+&\s*$')
 
 # Safe: python -m with known safe modules only
 # No -c or -e patterns — arbitrary code execution can't be safely regex-matched

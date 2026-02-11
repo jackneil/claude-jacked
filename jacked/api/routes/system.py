@@ -35,6 +35,7 @@ class InstallationResponse(BaseModel):
     agents_installed: Optional[list[str]] = None
     commands_installed: Optional[list[str]] = None
     guardrails_installed: bool = False
+    env_path: Optional[str] = None
     last_scanned_at: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -84,6 +85,7 @@ class ProjectActivity(BaseModel):
     guardrails_file: Optional[str] = None
     has_lint_hook: bool = False
     detected_language: Optional[str] = None
+    env_path: Optional[str] = None
     has_lessons: bool = False
     lessons_count: int = 0
 
@@ -238,6 +240,122 @@ async def project_lint_hook_init(body: ProjectInitRequest, request: Request):
     from jacked.guardrails import install_hook
     result = install_hook(body.repo_path, language=body.language, force=body.force)
     return result
+
+
+# --- Project Env endpoints ---
+
+class EnvUpdateRequest(BaseModel):
+    repo_path: str
+    env_path: str
+
+
+@router.get("/project/env")
+async def get_project_env(repo_path: str, request: Request):
+    """Get the configured Python env for a project.
+
+    >>> # GET /api/project/env?repo_path=/some/repo
+    """
+    from pathlib import Path
+    error = _validate_project_path(repo_path, request)
+    if error:
+        return error
+
+    env_path = None
+    source = None
+
+    # Read from .git/jacked/env
+    env_file = Path(repo_path) / ".git" / "jacked" / "env"
+    if env_file.exists():
+        try:
+            env_path = env_file.read_text(encoding="utf-8").strip()
+            source = "file"
+        except Exception:
+            pass
+
+    # Also check DB
+    db = getattr(request.app.state, "db", None)
+    if db and not env_path:
+        try:
+            inst = db.get_installation_by_repo(repo_path)
+            if inst and inst.get("env_path"):
+                env_path = inst["env_path"]
+                source = "db"
+        except Exception:
+            pass
+
+    return {"env_path": env_path, "source": source}
+
+
+@router.put("/project/env")
+async def update_project_env(body: EnvUpdateRequest, request: Request):
+    """Manually set the Python env path for a project.
+
+    >>> # PUT /api/project/env  {"repo_path": "...", "env_path": "..."}
+    """
+    from jacked.cli import _validate_env_path, _write_project_env
+
+    error = _validate_project_path(body.repo_path, request)
+    if error:
+        return error
+
+    # Validate the env path
+    validation_error = _validate_env_path(body.env_path)
+    if validation_error:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": validation_error, "code": "INVALID_ENV_PATH"}},
+        )
+
+    # Write to .git/jacked/env
+    _write_project_env(body.repo_path, body.env_path)
+
+    # Write to DB
+    db = getattr(request.app.state, "db", None)
+    if db:
+        try:
+            db.update_installation_env(body.repo_path, body.env_path)
+        except Exception:
+            pass
+
+    return {"env_path": body.env_path, "source": "manual"}
+
+
+@router.post("/project/env/detect")
+async def detect_project_env(body: ProjectInitRequest, request: Request):
+    """Auto-detect and store the Python env for a project.
+
+    >>> # POST /api/project/env/detect  {"repo_path": "..."}
+    """
+    from jacked.cli import _detect_project_env, _validate_env_path, _write_project_env
+
+    error = _validate_project_path(body.repo_path, request)
+    if error:
+        return error
+
+    env_path = _detect_project_env()
+    if not env_path:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error": {"message": "No Python env detected", "code": "NO_ENV_DETECTED"}},
+        )
+
+    validation_error = _validate_env_path(env_path)
+    if validation_error:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": validation_error, "code": "INVALID_ENV_PATH"}},
+        )
+
+    _write_project_env(body.repo_path, env_path)
+
+    db = getattr(request.app.state, "db", None)
+    if db:
+        try:
+            db.update_installation_env(body.repo_path, env_path)
+        except Exception:
+            pass
+
+    return {"env_path": env_path, "source": "auto"}
 
 
 class LessonItem(BaseModel):
@@ -459,6 +577,7 @@ async def installations_overview(request: Request):
                     guardrails_file=setup.get("guardrails_file"),
                     has_lint_hook=setup.get("has_lint_hook", False),
                     detected_language=setup.get("detected_language"),
+                    env_path=setup.get("env_path"),
                     has_lessons=setup.get("has_lessons", False),
                     lessons_count=setup.get("lessons_count", 0),
                 ))
