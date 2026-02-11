@@ -152,11 +152,6 @@ function renderSubTab() {
 // ============================================================================
 
 function renderGatekeeperSubTab(container) {
-    const uniqueRepos = getUniqueRepos(logsSessions);
-    const repoOptions = uniqueRepos.map(r =>
-        `<option value="${escapeHtml(r.toLowerCase())}" ${logsActiveRepo === r.toLowerCase() ? 'selected' : ''}>${escapeHtml(getRepoName(r))}</option>`
-    ).join('');
-
     container.innerHTML = `
         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
             <div class="text-sm text-slate-400">Security gatekeeper decisions</div>
@@ -170,8 +165,7 @@ function renderGatekeeperSubTab(container) {
                     <option value="ASK_USER" ${logsFilter === 'ASK_USER' ? 'selected' : ''}>Asked User</option>
                 </select>
                 <select id="logs-repo-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
-                    <option value="ALL" ${logsActiveRepo === 'ALL' ? 'selected' : ''}>All Repos</option>
-                    ${repoOptions}
+                    <option value="ALL">All Repos</option>
                 </select>
                 <label class="flex items-center gap-2 text-sm text-slate-400 cursor-pointer select-none">
                     <input id="logs-auto-refresh" type="checkbox" class="rounded" ${logsAutoRefresh ? 'checked' : ''}>
@@ -378,14 +372,25 @@ function renderFilteredSessions() {
 
     container.innerHTML = renderSessionCards(filtered, logsActiveSession);
     bindSessionCardClicks(container);
+    updateRepoDropdown();
+}
+
+function updateRepoDropdown() {
+    const select = document.getElementById('logs-repo-filter');
+    if (!select) return;
+    const uniqueRepos = getUniqueRepos(logsSessions);
+    const options = ['<option value="ALL"' + (logsActiveRepo === 'ALL' ? ' selected' : '') + '>All Repos</option>']
+        .concat(uniqueRepos.map(r =>
+            `<option value="${escapeHtml(r.toLowerCase())}"${logsActiveRepo === r.toLowerCase() ? ' selected' : ''}>${escapeHtml(getRepoName(r))}</option>`
+        ));
+    select.innerHTML = options.join('');
 }
 
 function bindSessionCardClicks(container) {
     container.querySelectorAll('.session-card').forEach(card => {
         card.addEventListener('click', () => {
             logsActiveSession = card.dataset.session;
-            container.innerHTML = renderSessionCards(logsSessions, logsActiveSession);
-            bindSessionCardClicks(container);
+            renderFilteredSessions();
             loadLogsData();
         });
     });
