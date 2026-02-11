@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, computed_field
 
 
 # ---------------------------------------------------------------------------

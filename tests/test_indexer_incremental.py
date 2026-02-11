@@ -3,19 +3,9 @@
 import pytest
 pytest.importorskip("qdrant_client")
 
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime
+from unittest.mock import patch
 
 from jacked.indexer import SessionIndexer
-from jacked.config import content_hash
-from jacked.transcript import (
-    EnrichedTranscript,
-    TranscriptMessage,
-    PlanFile,
-    AgentSummary,
-    SummaryLabel,
-)
 
 
 class TestSessionIndexerInit:

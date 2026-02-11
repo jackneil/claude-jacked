@@ -4,10 +4,9 @@ import pytest
 import sqlite3
 import threading
 import time
-from pathlib import Path
 from unittest.mock import Mock
 
-from jacked.index_write_tracker import IndexWriteTracker, DB_PATH, MAX_SEED_POINTS
+from jacked.index_write_tracker import IndexWriteTracker, MAX_SEED_POINTS
 
 
 class TestIndexWriteTrackerInit:

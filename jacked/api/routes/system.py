@@ -498,7 +498,6 @@ async def installations_overview(request: Request):
     from jacked import __version__
     from jacked.api.routes.features import (
         CLAUDE_DIR,
-        DATA_ROOT,
         _detect_hook_installed,
         _detect_rules_status,
         _get_valid_agent_names,
@@ -842,7 +841,6 @@ async def test_gatekeeper_api_key(request: Request):
 @router.get("/settings/gatekeeper/prompt")
 async def get_gatekeeper_prompt():
     """Current gatekeeper prompt text and source. Never exposes internal paths."""
-    from pathlib import Path
 
     from jacked.data.hooks.security_gatekeeper import (
         PROMPT_PATH,

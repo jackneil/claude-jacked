@@ -1,6 +1,5 @@
 """Tests for sound hook generation and installation."""
 
-import pytest
 from unittest.mock import patch
 
 

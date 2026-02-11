@@ -378,8 +378,8 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 
     console.print(table)
     console.print("\n[dim]📋 = has plan file | 🤖 = has agent summaries[/dim]")
-    console.print(f"[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]")
-    console.print(f"[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]")
+    console.print("[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]")
+    console.print("[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]")
 
     # Print session IDs for easy copy
     console.print("\nSession IDs:")
@@ -454,7 +454,7 @@ def retrieve(session_id: str, output: Optional[str], summary: bool, mode: str, m
 
     if session.is_local:
         resume_cmd = retriever.get_resume_command(session)
-        console.print(f"\n[green][OK] Session exists locally![/green]")
+        console.print("\n[green][OK] Session exists locally![/green]")
         console.print(f"To resume natively: [bold]{resume_cmd}[/bold]")
 
     if summary:
@@ -755,7 +755,7 @@ def configure(show: bool):
 
     console.print("[bold cyan]Team/Identity (Optional):[/bold cyan]\n")
     console.print("  JACKED_USER_NAME")
-    console.print(f"    Your name for session attribution (default: git user.name or system user)")
+    console.print("    Your name for session attribution (default: git user.name or system user)")
     console.print(f"    Current: {os.getenv('JACKED_USER_NAME', SmartForkConfig._default_user_name())}\n")
 
     console.print("[bold cyan]Ranking Weights (Optional):[/bold cyan]\n")
@@ -1382,7 +1382,6 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     Use --search to add session indexing (requires qdrant-client).
     Use --security to add security gatekeeper (requires anthropic SDK).
     """
-    import os
     import json
     import shutil
 
@@ -1444,13 +1443,13 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             existing["hooks"]["Stop"].append(hook_config_stop)
             settings_path.parent.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(json.dumps(existing, indent=2))
-            console.print(f"[green][OK][/green] Added Stop hook (session indexing)")
+            console.print("[green][OK][/green] Added Stop hook (session indexing)")
         elif needs_async_update:
             existing["hooks"]["Stop"][hook_index] = hook_config_stop
             settings_path.write_text(json.dumps(existing, indent=2))
-            console.print(f"[green][OK][/green] Updated Stop hook with async: true")
+            console.print("[green][OK][/green] Updated Stop hook with async: true")
         else:
-            console.print(f"[yellow][-][/yellow] Stop hook already configured")
+            console.print("[yellow][-][/yellow] Stop hook already configured")
     else:
         console.print("[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)")
 
@@ -1464,7 +1463,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 
     if skill_src.exists():
         shutil.copy(skill_src, skill_dst)
-        console.print(f"[green][OK][/green] Installed skill: /jacked")
+        console.print("[green][OK][/green] Installed skill: /jacked")
     else:
         console.print(f"[yellow][-][/yellow] Skill file not found at {skill_src}")
 
@@ -1521,7 +1520,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             msg += f" ({skipped} unchanged)"
         console.print(msg)
     else:
-        console.print(f"[yellow][-][/yellow] Agents directory not found")
+        console.print("[yellow][-][/yellow] Agents directory not found")
 
     # Install commands (symlink for editable, copy otherwise)
     commands_src = pkg_root / "commands"
@@ -1561,7 +1560,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             msg += f" ({skipped} unchanged)"
         console.print(msg)
     else:
-        console.print(f"[yellow][-][/yellow] Commands directory not found")
+        console.print("[yellow][-][/yellow] Commands directory not found")
 
     # Install sound hooks if requested
     if sounds:
@@ -1579,7 +1578,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                 console.print(f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]")
                 for pat, _, prefix, reason in warns:
                     console.print(f"  [red][WARN][/red] {pat} — {reason}")
-                console.print(f"[dim]Run 'jacked gatekeeper audit' for full details[/dim]")
+                console.print("[dim]Run 'jacked gatekeeper audit' for full details[/dim]")
             else:
                 console.print("[green][AUDIT] Permission rules look clean[/green]")
     else:
@@ -1733,19 +1732,19 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                     settings_path.write_text(json.dumps(settings, indent=2))
                     console.print(f"[green][OK][/green] Removed Stop hook from {settings_path}")
                 else:
-                    console.print(f"[yellow][-][/yellow] No jacked hook found in settings")
+                    console.print("[yellow][-][/yellow] No jacked hook found in settings")
         except (json.JSONDecodeError, KeyError) as e:
             console.print(f"[red][FAIL][/red] Error reading settings: {e}")
     else:
-        console.print(f"[yellow][-][/yellow] No settings.json found")
+        console.print("[yellow][-][/yellow] No settings.json found")
 
     # Remove skill directory
     skill_dir = home / ".claude" / "skills" / "jacked"
     if skill_dir.exists():
         shutil.rmtree(skill_dir)
-        console.print(f"[green][OK][/green] Removed skill: /jacked")
+        console.print("[green][OK][/green] Removed skill: /jacked")
     else:
-        console.print(f"[yellow][-][/yellow] Skill not found")
+        console.print("[yellow][-][/yellow] Skill not found")
 
     # Remove jacked reference doc
     ref_path = home / ".claude" / "jacked-reference.md"
@@ -1766,9 +1765,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         if agent_count > 0:
             console.print(f"[green][OK][/green] Removed {agent_count} agents")
         else:
-            console.print(f"[yellow][-][/yellow] No jacked agents found")
+            console.print("[yellow][-][/yellow] No jacked agents found")
     else:
-        console.print(f"[yellow][-][/yellow] Agents directory not found")
+        console.print("[yellow][-][/yellow] Agents directory not found")
 
     # Remove only jacked-installed commands (not the whole directory!)
     commands_src = pkg_root / "commands"
@@ -1783,9 +1782,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         if cmd_count > 0:
             console.print(f"[green][OK][/green] Removed {cmd_count} commands")
         else:
-            console.print(f"[yellow][-][/yellow] No jacked commands found")
+            console.print("[yellow][-][/yellow] No jacked commands found")
     else:
-        console.print(f"[yellow][-][/yellow] Commands directory not found")
+        console.print("[yellow][-][/yellow] Commands directory not found")
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print("\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]")
@@ -1837,7 +1836,7 @@ def gatekeeper_reset(yes: bool):
 
     PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
     PROMPT_PATH.write_text(SECURITY_PROMPT, encoding="utf-8")
-    console.print(f"[green][OK][/green] Reset gatekeeper prompt to built-in default")
+    console.print("[green][OK][/green] Reset gatekeeper prompt to built-in default")
     console.print(f"[dim]{PROMPT_PATH}[/dim]")
 
 
@@ -2004,7 +2003,7 @@ def gatekeeper_audit(scan_log, limit):
         if level == "WARN":
             console.print(f"  [red][WARN][/red] {pat} — {reason}")
             console.print(f"         Gatekeeper deny patterns won't catch all {prefix} inline code.")
-            console.print(f"         Consider removing and letting the gatekeeper evaluate individually.\n")
+            console.print("         Consider removing and letting the gatekeeper evaluate individually.\n")
             warn_count += 1
         elif level == "INFO":
             console.print(f"  [yellow][INFO][/yellow] {pat} — {reason}")
@@ -2016,7 +2015,7 @@ def gatekeeper_audit(scan_log, limit):
     console.print(f"\n{warn_count} warnings, {info_count} info, {ok_count} OK")
 
     if warn_count > 0:
-        console.print(f"\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]")
+        console.print("\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]")
 
     # Log scanning
     if scan_log:

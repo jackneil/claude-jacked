@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -474,7 +474,7 @@ async def _toggle_file_feature(src: Path, dst: Path, enabled: bool, name: str, c
         if not src.exists():
             return JSONResponse(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                content={"error": {"message": f"Source file not found. Reinstall jacked.", "code": "SOURCE_UNAVAILABLE"}},
+                content={"error": {"message": "Source file not found. Reinstall jacked.", "code": "SOURCE_UNAVAILABLE"}},
             )
         dst.parent.mkdir(parents=True, exist_ok=True)
         # Path traversal final check
@@ -843,7 +843,7 @@ async def set_claude_env(name: str, body: EnvToggleRequest):
             except (ValueError, TypeError):
                 return JSONResponse(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    content={"error": {"message": f"Value must be a number", "code": "INVALID_VALUE"}},
+                    content={"error": {"message": "Value must be a number", "code": "INVALID_VALUE"}},
                 )
             num = max(meta["min"], min(meta["max"], num))
             settings["env"][name] = str(num)
@@ -875,7 +875,7 @@ async def set_claude_key(name: str, body: DirectSettingRequest):
             if not isinstance(body.value, bool):
                 return JSONResponse(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    content={"error": {"message": f"Value must be a boolean (true/false)", "code": "INVALID_VALUE"}},
+                    content={"error": {"message": "Value must be a boolean (true/false)", "code": "INVALID_VALUE"}},
                 )
             settings[name] = body.value
         elif meta["type"] == "number":
@@ -884,7 +884,7 @@ async def set_claude_key(name: str, body: DirectSettingRequest):
             except (ValueError, TypeError):
                 return JSONResponse(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    content={"error": {"message": f"Value must be a number", "code": "INVALID_VALUE"}},
+                    content={"error": {"message": "Value must be a number", "code": "INVALID_VALUE"}},
                 )
             lo = meta.get("min", num)
             hi = meta.get("max", num)

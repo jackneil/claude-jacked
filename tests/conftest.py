@@ -2,13 +2,12 @@
 
 import pytest
 from pathlib import Path
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock
 from datetime import datetime
 
 from jacked.config import SmartForkConfig
 from jacked.transcript import (
     EnrichedTranscript,
-    ParsedTranscript,
     TranscriptMessage,
     PlanFile,
     AgentSummary,

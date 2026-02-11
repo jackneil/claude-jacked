@@ -207,7 +207,7 @@ class OAuthFlow:
 
         # Open browser
         webbrowser.open(auth_url)
-        logger.info(f"Opened browser for OAuth authorization")
+        logger.info("Opened browser for OAuth authorization")
 
         # Wait for callback in background — don't block the API response
         asyncio.create_task(self._wait_for_callback(runner))
