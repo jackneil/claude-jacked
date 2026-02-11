@@ -275,7 +275,6 @@ class OAuthFlow:
             # Step 1: Exchange code for tokens
             tokens = await self._exchange_code(client, code)
 
-            email = tokens.get("email", "unknown")
             access_token = tokens["access_token"]
 
             # Step 2: Optionally create API key (changes token lifecycle)

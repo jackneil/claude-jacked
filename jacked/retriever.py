@@ -50,13 +50,13 @@ class SessionContent:
         return {
             "plan": _tokens(self.plan or ""),
             "subagent_summaries": sum(_tokens(s) for s in self.subagent_summaries),
-            "summary_labels": sum(_tokens(l) for l in self.summary_labels),
+            "summary_labels": sum(_tokens(lb) for lb in self.summary_labels),
             "user_messages": sum(_tokens(m) for m in self.user_messages),
             "chunks": sum(_tokens(c) for c in self.chunks),
             "total": (
                 _tokens(self.plan or "") +
                 sum(_tokens(s) for s in self.subagent_summaries) +
-                sum(_tokens(l) for l in self.summary_labels) +
+                sum(_tokens(lb) for lb in self.summary_labels) +
                 sum(_tokens(m) for m in self.user_messages)
                 # Don't include chunks in total by default (full mode only)
             ),
@@ -446,7 +446,6 @@ class SessionRetriever:
         """
         parts = []
         tokens_used = 0
-        max_chars = max_tokens * CHARS_PER_TOKEN
 
         def _add_if_fits(text: str, label: str) -> bool:
             """Add text if it fits in budget."""

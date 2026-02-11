@@ -18,7 +18,7 @@ from unittest.mock import patch
 GATEKEEPER_DIR = Path(__file__).resolve().parent.parent.parent / "jacked" / "data" / "hooks"
 sys.path.insert(0, str(GATEKEEPER_DIR))
 
-import security_gatekeeper as gk
+import security_gatekeeper as gk  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
