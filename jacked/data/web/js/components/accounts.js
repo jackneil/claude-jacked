@@ -179,10 +179,16 @@ function renderAccounts(accounts) {
         <div class="max-w-3xl">
             <div class="flex items-center justify-between mb-5">
                 <h2 class="text-xl font-semibold text-white">Accounts</h2>
-                <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
-                    Add Account
-                </button>
+                <div class="flex items-center gap-2">
+                    <button id="btn-refresh-all-usage" class="flex items-center gap-2 px-4 py-2 text-slate-300 hover:text-white hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-600 transition-colors">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        Refresh All Usage
+                    </button>
+                    <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+                        Add Account
+                    </button>
+                </div>
             </div>
             ${bannerHtml}
             <div id="oauth-flow-status"></div>
@@ -250,9 +256,6 @@ function renderAccountCard(acct, idx, total) {
         actionsHtml += `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}">Re-auth</button>`;
     }
     actionsHtml += `
-            <button class="btn-refresh-usage text-xs px-3 py-1.5 text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors" data-id="${acct.id}" title="Refresh usage">
-                <svg class="w-3.5 h-3.5 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-            </button>
             <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition-colors" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
             <button class="btn-delete text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded transition-colors" data-id="${acct.id}" title="Delete account">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
@@ -363,19 +366,30 @@ function bindAccountEvents() {
         });
     });
 
-    // Refresh usage buttons
-    document.querySelectorAll('.btn-refresh-usage').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const id = btn.dataset.id;
+    // Refresh All Usage button
+    const refreshAllBtn = document.getElementById('btn-refresh-all-usage');
+    if (refreshAllBtn) {
+        refreshAllBtn.addEventListener('click', async () => {
+            const originalHtml = refreshAllBtn.innerHTML;
+            refreshAllBtn.disabled = true;
+            refreshAllBtn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Refreshing...';
             try {
-                await api.post(`/api/auth/accounts/${id}/refresh-usage`);
-                showToast('Usage refreshed', 'success');
+                const result = await api.post('/api/auth/accounts/refresh-all-usage');
+                if (result.refreshed === 0 && result.failed === 0) {
+                    showToast('No active accounts to refresh', 'warning');
+                } else if (result.failed > 0) {
+                    showToast(`Usage refreshed (${result.refreshed} ok, ${result.failed} failed)`, 'warning');
+                } else {
+                    showToast(`Usage refreshed for ${result.refreshed} account${result.refreshed !== 1 ? 's' : ''}`, 'success');
+                }
                 await refreshAndRender();
             } catch (e) {
                 showToast(e.message, 'error');
             }
+            refreshAllBtn.disabled = false;
+            refreshAllBtn.innerHTML = originalHtml;
         });
-    });
+    }
 
     // Priority up/down
     document.querySelectorAll('.btn-priority-up').forEach(btn => {

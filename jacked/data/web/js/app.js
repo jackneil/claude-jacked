@@ -296,7 +296,7 @@ function showToast(message, type = 'info', duration = 4000) {
     };
 
     const toast = document.createElement('div');
-    toast.className = `toast border rounded-lg px-4 py-3 text-sm shadow-lg max-w-sm ${colors[type] || colors.info}`;
+    toast.className = `toast border rounded-lg px-4 py-3 text-sm shadow-lg max-w-full md:max-w-sm ${colors[type] || colors.info}`;
     toast.textContent = message;
     container.appendChild(toast);
 
@@ -416,4 +416,69 @@ document.addEventListener('DOMContentLoaded', async () => {
             showToast('All data refreshed', 'success');
         });
     }
+
+    // Mobile sidebar toggle
+    const sidebar = document.getElementById('sidebar');
+    const sidebarToggle = document.getElementById('sidebar-toggle');
+    const sidebarBackdrop = document.getElementById('sidebar-backdrop');
+
+    function openSidebar() {
+        sidebar.classList.remove('hidden');
+        sidebar.classList.add('flex', 'flex-col');
+        sidebarBackdrop.classList.remove('hidden');
+        document.body.classList.add('overflow-hidden');
+    }
+
+    function closeSidebar() {
+        sidebar.classList.add('hidden');
+        sidebar.classList.remove('flex', 'flex-col');
+        sidebarBackdrop.classList.add('hidden');
+        document.body.classList.remove('overflow-hidden');
+    }
+
+    if (sidebarToggle) {
+        sidebarToggle.addEventListener('click', () => {
+            if (sidebar.classList.contains('hidden')) {
+                openSidebar();
+            } else {
+                closeSidebar();
+            }
+        });
+    }
+
+    if (sidebarBackdrop) {
+        sidebarBackdrop.addEventListener('click', closeSidebar);
+    }
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !sidebarBackdrop.classList.contains('hidden')) {
+            closeSidebar();
+        }
+    });
+
+    // Close sidebar on nav link click (mobile)
+    document.querySelectorAll('.nav-link').forEach(link => {
+        link.addEventListener('click', () => {
+            if (window.innerWidth < 768) {
+                closeSidebar();
+            }
+        });
+    });
+
+    // Reset sidebar state when crossing md breakpoint
+    window.matchMedia('(min-width: 768px)').addEventListener('change', (e) => {
+        if (e.matches) {
+            // Crossed to desktop — reset mobile sidebar state
+            sidebar.classList.remove('flex', 'flex-col');
+            sidebar.classList.remove('hidden');
+            sidebarBackdrop.classList.add('hidden');
+            document.body.classList.remove('overflow-hidden');
+        } else {
+            // Crossed to mobile — hide sidebar
+            sidebar.classList.add('hidden');
+            sidebar.classList.remove('flex', 'flex-col');
+            sidebarBackdrop.classList.add('hidden');
+            document.body.classList.remove('overflow-hidden');
+        }
+    });
 });

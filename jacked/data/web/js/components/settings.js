@@ -2105,7 +2105,7 @@ function renderAdvancedTab(container) {
     }
 
     container.innerHTML = `
-        <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden">
+        <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-x-auto">
             ${tableHtml}
         </div>
 

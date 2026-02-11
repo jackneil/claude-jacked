@@ -2279,3 +2279,269 @@ class TestReadGatekeeperConfig:
         db_path = self._make_db(tmp_path, {"gatekeeper.eval_method": "cli_first"})
         config = gk._read_gatekeeper_config(db_path=db_path)
         assert config["eval_method"] == "cli_first"
+
+
+# ---------------------------------------------------------------------------
+# _handle_file_tool — file tool auto-approve / deny
+# ---------------------------------------------------------------------------
+
+class TestHandleFileTool:
+    """Tests for _handle_file_tool emit_allow / _emit_deny decisions.
+
+    Verifies the security invariant: path safety runs BEFORE permission
+    rules, so broad wildcards can never auto-approve sensitive files.
+    """
+
+    def _safe_config(self):
+        """Config with path safety enabled and no special paths."""
+        return {
+            "enabled": True,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+
+    def test_safe_in_project_file_emits_allow(self, capsys, tmp_path):
+        """Safe file inside the project directory emits allow JSON.
+
+        >>> # In-project main.py → emit_allow()
+        """
+        test_file = tmp_path / "main.py"
+        test_file.write_text("print('hi')")
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_read_path_safety_config', return_value=self._safe_config()), \
+             patch.object(gk, '_check_file_tool_permissions', return_value=False), \
+             patch.object(gk, '_record_decision'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": str(test_file)}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    def test_permission_match_emits_allow(self, capsys, tmp_path):
+        """File matching a permission rule (after passing safety) emits allow JSON.
+
+        >>> # Path safe + permission match → emit_allow()
+        """
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_read_path_safety_config', return_value=self._safe_config()), \
+             patch.object(gk, '_check_path_safety', return_value=None), \
+             patch.object(gk, '_check_file_tool_permissions', return_value=True), \
+             patch.object(gk, '_record_decision'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": "/some/allowed/file.txt"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    def test_sensitive_file_emits_deny(self, capsys, tmp_path):
+        """Sensitive file (.env) emits deny JSON regardless of permissions.
+
+        >>> # .env file → _emit_deny() before perms check
+        """
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_read_path_safety_config', return_value=self._safe_config()), \
+             patch.object(gk, '_check_path_safety', return_value="sensitive file (.env files)"), \
+             patch.object(gk, '_record_decision'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": ".env"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert ".env" in output["hookSpecificOutput"]["message"]
+
+    def test_sensitive_file_denied_despite_permission_match(self, capsys, tmp_path):
+        """Sensitive file denied even when permission rules would allow it.
+
+        >>> # Security invariant: deny wins over permissions
+        """
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_read_path_safety_config', return_value=self._safe_config()), \
+             patch.object(gk, '_check_path_safety', return_value="sensitive file (.env files)"), \
+             patch.object(gk, '_check_file_tool_permissions', return_value=True), \
+             patch.object(gk, '_record_decision'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": ".env"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        # Deny wins — permission match is never reached
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_disabled_config_sensitive_file_silent_exit(self, capsys, tmp_path):
+        """config.enabled=False + sensitive file → no output (silent exit).
+
+        >>> # Path safety disabled + .env → let Claude Code handle it
+        """
+        cwd = str(tmp_path)
+        disabled_config = {
+            "enabled": False,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+
+        with patch.object(gk, '_read_path_safety_config', return_value=disabled_config), \
+             patch.object(gk, '_check_path_safety', return_value=None), \
+             patch.object(gk, '_check_file_tool_permissions', return_value=False), \
+             patch.object(gk, '_is_path_sensitive', return_value="sensitive file (.env files)"), \
+             patch.object(gk, '_record_hook_execution'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": ".env"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+
+    def test_disabled_config_safe_file_emits_allow(self, capsys, tmp_path):
+        """config.enabled=False + safe file → emits allow JSON.
+
+        >>> # Path safety disabled + main.py → emit_allow()
+        """
+        cwd = str(tmp_path)
+        disabled_config = {
+            "enabled": False,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+
+        with patch.object(gk, '_read_path_safety_config', return_value=disabled_config), \
+             patch.object(gk, '_check_path_safety', return_value=None), \
+             patch.object(gk, '_check_file_tool_permissions', return_value=False), \
+             patch.object(gk, '_is_path_sensitive', return_value=None), \
+             patch.object(gk, '_record_decision'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": "main.py"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    def test_empty_file_path_silent_exit(self, capsys, tmp_path):
+        """Empty file_path → no output (silent exit).
+
+        >>> # No path to check → silent exit
+        """
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_record_hook_execution'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": ""}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+
+    def test_grep_path_key_emits_allow(self, capsys, tmp_path):
+        """Grep tool uses 'path' key — still emits allow for safe paths.
+
+        >>> # Grep uses tool_input["path"], not "file_path"
+        """
+        test_file = tmp_path / "search_target.py"
+        test_file.write_text("code")
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_read_path_safety_config', return_value=self._safe_config()), \
+             patch.object(gk, '_check_file_tool_permissions', return_value=False), \
+             patch.object(gk, '_record_decision'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Grep", {"path": str(test_file)}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    def test_notebook_path_key_emits_allow(self, capsys, tmp_path):
+        """NotebookEdit uses 'notebook_path' key — still emits allow for safe paths.
+
+        >>> # NotebookEdit uses tool_input["notebook_path"]
+        """
+        nb = tmp_path / "analysis.ipynb"
+        nb.write_text("{}")
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_read_path_safety_config', return_value=self._safe_config()), \
+             patch.object(gk, '_check_file_tool_permissions', return_value=False), \
+             patch.object(gk, '_record_decision'), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("NotebookEdit", {"notebook_path": str(nb)}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    def test_null_byte_in_path_denied(self, capsys, tmp_path):
+        """Null byte in file path emits deny — prevents regex bypass.
+
+        >>> # Null bytes are never legitimate in file paths
+        """
+        cwd = str(tmp_path)
+
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": "/safe.py\x00.env"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "null byte" in output["hookSpecificOutput"]["message"]
+
+    def test_exception_in_inner_is_silent(self, capsys, tmp_path):
+        """Unhandled exception in inner function → silent exit (no output).
+
+        >>> # Exception = fail-open, Claude Code decides
+        """
+        cwd = str(tmp_path)
+
+        with patch.object(gk, '_read_path_safety_config', side_effect=RuntimeError("DB locked")), \
+             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}):
+            gk._handle_file_tool("Read", {"file_path": "main.py"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        # No JSON output — silent exit, Claude Code decides
+        assert captured.out.strip() == "" or "permissionDecision" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Bash handler floor check — path safety disabled
+# ---------------------------------------------------------------------------
+
+class TestBashFloorCheck:
+    """Floor check prevents auto-approving sensitive files when path safety disabled."""
+
+    def test_cat_env_blocked_when_disabled(self):
+        """cat .env should NOT auto-approve when path safety is disabled.
+
+        >>> # Disabled path safety + cat .env → floor check catches it
+        """
+        config = {"enabled": False, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []}
+        # _check_bash_path_safety returns None (disabled)
+        assert gk._check_bash_path_safety("cat .env", "/tmp", config) is None
+        # But the sensitive file regex still matches the command
+        matched = any(rule["pattern"].search("cat .env") for rule in gk.SENSITIVE_FILE_RULES.values())
+        assert matched is True
+
+    def test_cat_ssh_key_blocked_when_disabled(self):
+        """cat ~/.ssh/id_rsa should NOT auto-approve when path safety disabled.
+
+        >>> # Disabled + SSH key → floor check catches it
+        """
+        config = {"enabled": False, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []}
+        assert gk._check_bash_path_safety("cat ~/.ssh/id_rsa", "/tmp", config) is None
+        matched = any(rule["pattern"].search("cat ~/.ssh/id_rsa") for rule in gk.SENSITIVE_DIR_RULES.values())
+        assert matched is True
+
+    def test_safe_command_unaffected_when_disabled(self):
+        """git status should still auto-approve when path safety disabled.
+
+        >>> # Disabled + safe command → no floor check match
+        """
+        file_matched = any(rule["pattern"].search("git status") for rule in gk.SENSITIVE_FILE_RULES.values())
+        dir_matched = any(rule["pattern"].search("git status") for rule in gk.SENSITIVE_DIR_RULES.values())
+        assert file_matched is False
+        assert dir_matched is False
