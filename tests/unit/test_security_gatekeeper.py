@@ -2517,10 +2517,10 @@ class TestHandleFileTool:
         output = json.loads(captured.out.strip())
         assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
 
-    def test_sensitive_file_emits_deny(self, capsys, tmp_path):
-        """Sensitive file (.env) emits deny JSON regardless of permissions.
+    def test_sensitive_file_emits_ask(self, capsys, tmp_path):
+        """Sensitive file (.env) emits ask JSON so user decides.
 
-        >>> # .env file → _emit_deny() before perms check
+        >>> # .env file → _emit_ask() before perms check
         """
         cwd = str(tmp_path)
 
@@ -2538,13 +2538,13 @@ class TestHandleFileTool:
 
         captured = capsys.readouterr()
         output = json.loads(captured.out.strip())
-        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert ".env" in output["hookSpecificOutput"]["message"]
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert ".env" in output["hookSpecificOutput"]["permissionDecisionReason"]
 
-    def test_sensitive_file_denied_despite_permission_match(self, capsys, tmp_path):
-        """Sensitive file denied even when permission rules would allow it.
+    def test_sensitive_file_asks_despite_permission_match(self, capsys, tmp_path):
+        """Sensitive file asks user even when permission rules would allow it.
 
-        >>> # Security invariant: deny wins over permissions
+        >>> # Security invariant: ask wins over permissions
         """
         cwd = str(tmp_path)
 
@@ -2563,8 +2563,8 @@ class TestHandleFileTool:
 
         captured = capsys.readouterr()
         output = json.loads(captured.out.strip())
-        # Deny wins — permission match is never reached
-        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        # Ask wins — permission match is never reached
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
 
     def test_disabled_config_sensitive_file_silent_exit(self, capsys, tmp_path):
         """config.enabled=False + sensitive file → no output (silent exit).
@@ -2700,7 +2700,7 @@ class TestHandleFileTool:
         captured = capsys.readouterr()
         output = json.loads(captured.out.strip())
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert "null byte" in output["hookSpecificOutput"]["message"]
+        assert "null byte" in output["hookSpecificOutput"]["permissionDecisionReason"]
 
     def test_exception_in_inner_is_silent(self, capsys, tmp_path):
         """Unhandled exception in inner function → silent exit (no output).

@@ -1171,12 +1171,32 @@ def _check_bash_path_safety(command: str, cwd: str, config: dict) -> str | None:
 
 
 def _emit_deny(message: str):
-    """Emit a deny decision for PreToolUse hooks."""
+    """Emit a deny decision for PreToolUse hooks.
+
+    Reserved for attack vectors (null bytes) where user approval is inappropriate.
+    For normal safety violations, use _emit_ask() instead.
+    """
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "message": message,
+            "permissionDecisionReason": message,
+        }
+    }
+    print(json.dumps(output))
+
+
+def _emit_ask(reason: str):
+    """Emit an ask decision for PreToolUse hooks.
+
+    Prompts the user to approve/deny with context about why it was flagged.
+    Used for path safety violations where the user should decide.
+    """
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
         }
     }
     print(json.dumps(output))
@@ -1230,30 +1250,41 @@ def _check_file_tool_permissions(tool_name: str, file_path: str) -> bool:
 
 
 def _handle_file_tool(
-    tool_name: str, tool_input: dict, cwd: str, session_id: str
+    tool_name: str,
+    tool_input: dict,
+    cwd: str,
+    session_id: str,
+    permission_mode: str = "default",
 ) -> None:
     """Handle Read/Edit/Write/Grep/Glob/NotebookEdit PreToolUse events.
 
     Decision flow (security checks FIRST, matching Bash handler invariant):
-    1. Path safety (sensitive files, watched paths, outside project) → deny
-    2. Permission rules (user-configured allow patterns) → emit allow
-    3. Otherwise safe → emit allow
+    1. Null bytes → hard deny (attack vector, never legitimate)
+    2. Path safety (sensitive files, watched paths, outside project) → ask user
+       (or hard deny in bypassPermissions/dontAsk mode where no human is present)
+    3. Permission rules (user-configured allow patterns) → emit allow
+    4. Otherwise safe → emit allow
 
-    Deny always wins over permissions — a broad wildcard like Read(/:*)
-    must never auto-approve .env or SSH keys.
+    Path safety asks the user instead of hard-blocking, matching the Bash
+    handler's behavior. A broad wildcard like Read(/:*) still cannot bypass
+    the ask — security check runs first.
 
     On unexpected exception: silent return (no output) = fail-open to Claude
     Code's own protection. This matches the hook contract where exit 0 with
     no output means "hook has no opinion".
     """
     try:
-        _handle_file_tool_inner(tool_name, tool_input, cwd, session_id)
+        _handle_file_tool_inner(tool_name, tool_input, cwd, session_id, permission_mode)
     except Exception as exc:
         log(f"PATH SAFETY [{tool_name}]: EXCEPTION {type(exc).__name__}: {exc}")
 
 
 def _handle_file_tool_inner(
-    tool_name: str, tool_input: dict, cwd: str, session_id: str
+    tool_name: str,
+    tool_input: dict,
+    cwd: str,
+    session_id: str,
+    permission_mode: str = "default",
 ) -> None:
     """Inner implementation — wrapped by _handle_file_tool for crash safety."""
     start = time.time()
@@ -1285,11 +1316,15 @@ def _handle_file_tool_inner(
     if reason:
         elapsed = time.time() - start
         msg = f"Path safety: {reason} — {Path(file_path).name}"
+        # In headless modes (bypassPermissions/dontAsk), hard deny since no
+        # human is present to answer an ask prompt.
+        headless = permission_mode in ("bypassPermissions", "dontAsk")
+        decision = "DENY" if headless else "ASK_USER"
         log(
-            f"PATH SAFETY [{tool_name}]: DENY {file_path[:100]} — {reason} ({elapsed:.3f}s)"
+            f"PATH SAFETY [{tool_name}]: {decision} {file_path[:100]} — {reason} ({elapsed:.3f}s)"
         )
         _record_decision(
-            "DENY",
+            decision,
             f"[{tool_name}] {file_path[:200]}",
             "PATH_SAFETY",
             reason,
@@ -1297,7 +1332,10 @@ def _handle_file_tool_inner(
             session_id,
             repo_path,
         )
-        _emit_deny(msg)
+        if headless:
+            _emit_deny(msg)
+        else:
+            _emit_ask(msg)
         return
 
     # Step 2: Check if already approved via permission rules
@@ -1573,9 +1611,11 @@ def main():
     sid = hook_input.get("session_id", "")
     _session_tag = f"[{sid[:8]}] " if sid else ""
 
+    permission_mode = hook_input.get("permission_mode", "default")
+
     # Dispatch: file tools use path safety only
     if tool_name in ("Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"):
-        _handle_file_tool(tool_name, tool_input, cwd, sid)
+        _handle_file_tool(tool_name, tool_input, cwd, sid, permission_mode)
         sys.exit(0)
 
     # Below here: Bash tool handling

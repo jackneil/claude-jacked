@@ -461,7 +461,7 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety) {
                 <div>
                     <label class="block text-sm font-medium text-slate-300 mb-2">API Key Override</label>
                     <div class="flex items-center gap-2">
-                        <input id="gk-api-key" type="password" placeholder="Leave empty to use ANTHROPIC_API_KEY env var"
+                        <input id="gk-api-key" type="password" placeholder="${config.api_key_set && config.api_key_source === 'db' ? 'API key saved \u2014 enter new value to replace' : 'Leave empty to use ANTHROPIC_API_KEY env var'}"
                                class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
                         <button id="btn-gk-toggle-key" class="px-3 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors" title="Show/hide">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
@@ -1276,13 +1276,17 @@ function bindGatekeeperEvents(config, hookInstalled, pathSafety) {
     if (testBtn) {
         testBtn.addEventListener('click', async () => {
             const resultEl = document.getElementById('gk-key-test-result');
+            const apiKeyInput = document.getElementById('gk-api-key');
             testBtn.disabled = true;
             testBtn.textContent = 'Testing...';
             resultEl.innerHTML = '';
             try {
-                const result = await api.post('/api/settings/gatekeeper/test-api-key');
+                const payload = apiKeyInput?.value?.trim() ? { api_key: apiKeyInput.value.trim() } : {};
+                const result = await api.post('/api/settings/gatekeeper/test-api-key', payload);
+                const sourceLabel = { input: 'from input', db: 'from saved config', env: 'from env var' };
+                const sourceText = result.source ? ` (${sourceLabel[result.source] || result.source})` : '';
                 resultEl.innerHTML = result.success
-                    ? '<span class="text-green-400">API key works</span>'
+                    ? `<span class="text-green-400">API key works${escapeHtml(sourceText)}</span>`
                     : `<span class="text-red-400">${escapeHtml(result.error)}</span>`;
             } catch (e) {
                 resultEl.innerHTML = `<span class="text-red-400">${escapeHtml(e.message)}</span>`;
