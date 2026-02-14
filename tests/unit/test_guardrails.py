@@ -141,7 +141,7 @@ class TestCreateGuardrails:
         >>> from jacked.guardrails import create_guardrails
         >>> d = tempfile.mkdtemp()
         >>> result = create_guardrails(d, language='python')
-        >>> 'Design Guardrails' in open(result['path']).read()
+        >>> 'Design Guardrails' in open(result['path'], encoding='utf-8').read()
         True
         """
         result = guardrails.create_guardrails(tmp_path, language="python")
@@ -157,7 +157,7 @@ class TestCreateGuardrails:
         >>> from jacked.guardrails import create_guardrails
         >>> d = tempfile.mkdtemp()
         >>> result = create_guardrails(d, language='python')
-        >>> 'ruff' in open(result['path']).read()
+        >>> 'ruff' in open(result['path'], encoding='utf-8').read()
         True
         """
         result = guardrails.create_guardrails(tmp_path, language="python")
@@ -172,7 +172,7 @@ class TestCreateGuardrails:
         >>> from jacked.guardrails import create_guardrails
         >>> d = tempfile.mkdtemp()
         >>> result = create_guardrails(d, language='node')
-        >>> 'eslint' in open(result['path']).read()
+        >>> 'eslint' in open(result['path'], encoding='utf-8').read()
         True
         """
         result = guardrails.create_guardrails(tmp_path, language="node")
@@ -541,7 +541,9 @@ class TestCheckProjectSetup:
         """
         git_hooks = tmp_path / ".git" / "hooks"
         git_hooks.mkdir(parents=True)
-        (git_hooks / "pre-push").write_text("#!/bin/sh\n# jacked-lint-hook\nruff check .\n")
+        (git_hooks / "pre-push").write_text(
+            "#!/bin/sh\n# jacked-lint-hook\nruff check .\n"
+        )
         result = guardrails.check_project_setup(tmp_path)
         assert result["has_lint_hook"] is True
 
@@ -609,7 +611,9 @@ class TestCheckProjectSetup:
         (tmp_path / "pyproject.toml").touch()
         git_hooks = tmp_path / ".git" / "hooks"
         git_hooks.mkdir(parents=True)
-        (git_hooks / "pre-push").write_text("#!/bin/sh\n# jacked-lint-hook\nruff check .\n")
+        (git_hooks / "pre-push").write_text(
+            "#!/bin/sh\n# jacked-lint-hook\nruff check .\n"
+        )
         result = guardrails.check_project_setup(tmp_path)
         assert result["has_guardrails"] is True
         assert result["guardrails_file"] == "JACKED_GUARDRAILS.md"
@@ -713,32 +717,38 @@ class TestTemplateContent:
         """All hook templates contain the jacked marker.
 
         >>> from jacked.guardrails import HOOK_TEMPLATES, HOOK_MARKER
-        >>> all(HOOK_MARKER in (HOOK_TEMPLATES / f'pre-push-{l}.sh').read_text() for l in ['python', 'node', 'rust', 'go'])
+        >>> all(HOOK_MARKER in (HOOK_TEMPLATES / f'pre-push-{l}.sh').read_text(encoding='utf-8') for l in ['python', 'node', 'rust', 'go'])
         True
         """
         for lang in ["python", "node", "rust", "go"]:
-            content = (guardrails.HOOK_TEMPLATES / f"pre-push-{lang}.sh").read_text(encoding="utf-8")
+            content = (guardrails.HOOK_TEMPLATES / f"pre-push-{lang}.sh").read_text(
+                encoding="utf-8"
+            )
             assert guardrails.HOOK_MARKER in content
 
     def test_hook_templates_have_shebang(self):
         """All hook templates start with #!/bin/sh.
 
         >>> from jacked.guardrails import HOOK_TEMPLATES
-        >>> all((HOOK_TEMPLATES / f'pre-push-{l}.sh').read_text().startswith('#!/bin/sh') for l in ['python', 'node', 'rust', 'go'])
+        >>> all((HOOK_TEMPLATES / f'pre-push-{l}.sh').read_text(encoding='utf-8').startswith('#!/bin/sh') for l in ['python', 'node', 'rust', 'go'])
         True
         """
         for lang in ["python", "node", "rust", "go"]:
-            content = (guardrails.HOOK_TEMPLATES / f"pre-push-{lang}.sh").read_text(encoding="utf-8")
+            content = (guardrails.HOOK_TEMPLATES / f"pre-push-{lang}.sh").read_text(
+                encoding="utf-8"
+            )
             assert content.startswith("#!/bin/sh")
 
     def test_base_template_has_quality_gates(self):
         """Base template includes /dc and linter enforcement rules.
 
         >>> from jacked.guardrails import GUARDRAILS_TEMPLATES
-        >>> content = (GUARDRAILS_TEMPLATES / 'base.md').read_text()
+        >>> content = (GUARDRAILS_TEMPLATES / 'base.md').read_text(encoding='utf-8')
         >>> '/dc' in content and 'linter' in content
         True
         """
-        content = (guardrails.GUARDRAILS_TEMPLATES / "base.md").read_text(encoding="utf-8")
+        content = (guardrails.GUARDRAILS_TEMPLATES / "base.md").read_text(
+            encoding="utf-8"
+        )
         assert "/dc" in content
         assert "linter" in content

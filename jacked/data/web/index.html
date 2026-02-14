@@ -21,7 +21,8 @@
         }
     </script>
     <link rel="stylesheet" href="/css/style.css">
-    <link rel="icon" href="/assets/favicon.ico" type="image/x-icon">
+    <link rel="stylesheet" href="/css/swal-dark.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💪</text></svg>">
 </head>
 <body class="bg-slate-900 text-slate-200 min-h-screen flex">
 
@@ -83,13 +84,20 @@
     <div id="toast-container" class="fixed bottom-2 right-2 md:bottom-4 md:right-4 left-2 md:left-auto flex flex-col gap-2 z-50 max-w-[calc(100vw-1rem)] md:max-w-sm"></div>
 
     <!-- Scripts -->
+    <script src="/js/websocket.js"></script>
+    <script src="/js/utils.js"></script>
     <script src="/js/app.js"></script>
     <script src="/js/components/header.js"></script>
     <script src="/js/components/usage.js"></script>
     <script src="/js/components/accounts.js"></script>
+    <script src="/js/components/sessions.js"></script>
+    <script src="/js/components/account-actions.js"></script>
     <script src="/js/components/installations.js"></script>
     <script src="/js/components/settings.js"></script>
     <script src="/js/components/logs.js"></script>
+    <script src="/js/components/logs-gatekeeper.js"></script>
+    <script src="/js/components/logs-hooks.js"></script>
+    <script src="/js/components/logs-version-checks.js"></script>
     <script src="/js/components/analytics.js"></script>
 </body>
 </html>

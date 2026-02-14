@@ -55,17 +55,23 @@ def _require_search(command_name: str) -> bool:
     """Check if qdrant-client is installed. If not, print helpful error and return False."""
     try:
         import qdrant_client  # noqa: F401
+
         return True
     except ImportError:
         console.print(f"[red]Error:[/red] '{command_name}' requires the search extra.")
-        console.print('\nInstall it with:')
+        console.print("\nInstall it with:")
         console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
         console.print('  [bold]pipx install "claude-jacked\[search]"[/bold]')
         return False
 
 
 DB_PATH = Path.home() / ".claude" / "jacked.db"
-_VALID_TABLES = {"command_usage", "agent_invocations", "hook_executions", "version_checks"}
+_VALID_TABLES = {
+    "command_usage",
+    "agent_invocations",
+    "hook_executions",
+    "version_checks",
+}
 
 
 def _log_to_db(table: str, **kwargs):
@@ -76,13 +82,14 @@ def _log_to_db(table: str, **kwargs):
 
     def _do_write():
         import sqlite3
-        from datetime import datetime
+        from datetime import datetime, timezone
+
         if not DB_PATH.exists():
             return
         try:
             conn = sqlite3.connect(str(DB_PATH), timeout=0.5)
             conn.execute("PRAGMA journal_mode=WAL")
-            kwargs.setdefault("timestamp", datetime.utcnow().isoformat())
+            kwargs.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
             cols = ", ".join(kwargs.keys())
             placeholders = ", ".join("?" for _ in kwargs)
             conn.execute(
@@ -121,6 +128,7 @@ def index(session: Optional[str], repo: Optional[str]):
     """
     import os
     import time
+
     _index_start = time.time()
 
     # Check if qdrant is available
@@ -133,7 +141,7 @@ def index(session: Optional[str], repo: Optional[str]):
             sys.exit(0)
         else:
             console.print("[red]Error:[/red] 'index' requires the search extra.")
-            console.print('\nInstall it with:')
+            console.print("\nInstall it with:")
             console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
             sys.exit(1)
 
@@ -154,23 +162,30 @@ def index(session: Optional[str], repo: Optional[str]):
             # It's a file path
             repo_path = repo or os.getenv("CLAUDE_PROJECT_DIR", "")
             if not repo_path:
-                console.print("[red]Error:[/red] --repo is required when indexing a file path")
+                console.print(
+                    "[red]Error:[/red] --repo is required when indexing a file path"
+                )
                 sys.exit(1)
         else:
             # Assume it's a session ID, find the file
             if not repo:
                 repo = os.getenv("CLAUDE_PROJECT_DIR")
             if not repo:
-                console.print("[red]Error:[/red] --repo or CLAUDE_PROJECT_DIR is required")
+                console.print(
+                    "[red]Error:[/red] --repo or CLAUDE_PROJECT_DIR is required"
+                )
                 sys.exit(1)
 
             from jacked.config import get_session_dir_for_repo
+
             session_dir = get_session_dir_for_repo(config.claude_projects_dir, repo)
             session_path = session_dir / f"{session}.jsonl"
             repo_path = repo
 
             if not session_path.exists():
-                console.print(f"[red]Error:[/red] Session file not found: {session_path}")
+                console.print(
+                    f"[red]Error:[/red] Session file not found: {session_path}"
+                )
                 sys.exit(1)
     else:
         # Index current session
@@ -178,11 +193,14 @@ def index(session: Optional[str], repo: Optional[str]):
         repo_path = os.getenv("CLAUDE_PROJECT_DIR")
 
         if not session_id or not repo_path:
-            console.print("[red]Error:[/red] CLAUDE_SESSION_ID and CLAUDE_PROJECT_DIR not set")
+            console.print(
+                "[red]Error:[/red] CLAUDE_SESSION_ID and CLAUDE_PROJECT_DIR not set"
+            )
             console.print("Provide a session path or run from within a Claude session")
             sys.exit(1)
 
         from jacked.config import get_session_dir_for_repo
+
         session_dir = get_session_dir_for_repo(config.claude_projects_dir, repo_path)
         session_path = session_dir / f"{session_id}.jsonl"
 
@@ -204,21 +222,26 @@ def index(session: Optional[str], repo: Optional[str]):
             f"{result['summary_labels']}l {result['user_messages']}u {result['chunks']}c"
         )
     elif result.get("skipped"):
-        console.print(f"[yellow][-][/yellow] Session {result['session_id']} unchanged, skipped")
+        console.print(
+            f"[yellow][-][/yellow] Session {result['session_id']} unchanged, skipped"
+        )
     else:
         console.print(f"[red][FAIL][/red] Failed: {result.get('error')}")
         _log_to_db(
             "hook_executions",
-            hook_type="Stop", hook_name="session_indexing",
+            hook_type="Stop",
+            hook_name="session_indexing",
             session_id=os.getenv("CLAUDE_SESSION_ID", ""),
             repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
-            success=False, duration_ms=(time.time() - _index_start) * 1000,
+            success=False,
+            duration_ms=(time.time() - _index_start) * 1000,
         )
         sys.exit(1)
 
     _log_to_db(
         "hook_executions",
-        hook_type="Stop", hook_name="session_indexing",
+        hook_type="Stop",
+        hook_name="session_indexing",
         session_id=os.getenv("CLAUDE_SESSION_ID", ""),
         repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
         success=result.get("indexed", False),
@@ -270,11 +293,20 @@ def backfill(repo: Optional[str], force: bool):
 @click.option("--mine", "-m", is_flag=True, help="Only show my sessions")
 @click.option("--user", "-u", help="Only show sessions from this user")
 @click.option(
-    "--type", "-t", "content_types",
+    "--type",
+    "-t",
+    "content_types",
     multiple=True,
-    help="Filter by content type (plan, subagent_summary, summary_label, user_message, chunk)"
+    help="Filter by content type (plan, subagent_summary, summary_label, user_message, chunk)",
 )
-def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Optional[str], content_types: tuple):
+def search(
+    query: str,
+    repo: Optional[str],
+    limit: int,
+    mine: bool,
+    user: Optional[str],
+    content_types: tuple,
+):
     """Search for sessions by semantic similarity with multi-factor ranking.
 
     Requires: pip install "claude-jacked[search]"
@@ -286,7 +318,8 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
     from jacked.searcher import SessionSearcher
 
     _log_to_db(
-        "command_usage", command_name="search",
+        "command_usage",
+        command_name="search",
         repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
         session_id=os.getenv("CLAUDE_SESSION_ID", ""),
     )
@@ -335,6 +368,7 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
         # Format relative time
         if result.timestamp:
             from datetime import datetime, timezone
+
             now = datetime.now(timezone.utc)
             ts = result.timestamp
             if ts.tzinfo is None:
@@ -355,7 +389,11 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
         else:
             age_str = "?"
 
-        preview = result.intent_preview[:40] + "..." if len(result.intent_preview) > 40 else result.intent_preview
+        preview = (
+            result.intent_preview[:40] + "..."
+            if len(result.intent_preview) > 40
+            else result.intent_preview
+        )
         user_display = "YOU" if result.is_own else f"@{result.user_name}"
 
         # Content indicators
@@ -378,8 +416,12 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 
     console.print(table)
     console.print("\n[dim]📋 = has plan file | 🤖 = has agent summaries[/dim]")
-    console.print("[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]")
-    console.print("[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]")
+    console.print(
+        "[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]"
+    )
+    console.print(
+        "[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]"
+    )
 
     # Print session IDs for easy copy
     console.print("\nSession IDs:")
@@ -392,14 +434,24 @@ def search(query: str, repo: Optional[str], limit: int, mine: bool, user: Option
 @click.option("--output", "-o", type=click.Path(), help="Save output to file")
 @click.option("--summary", "-s", is_flag=True, help="Show summary instead of content")
 @click.option(
-    "--mode", "-m",
+    "--mode",
+    "-m",
     type=click.Choice(["smart", "plan", "labels", "agents", "full"]),
     default="smart",
-    help="Retrieval mode (default: smart)"
+    help="Retrieval mode (default: smart)",
 )
-@click.option("--max-tokens", "-t", default=15000, help="Max token budget for smart mode")
+@click.option(
+    "--max-tokens", "-t", default=15000, help="Max token budget for smart mode"
+)
 @click.option("--inject", "-i", is_flag=True, help="Format for context injection")
-def retrieve(session_id: str, output: Optional[str], summary: bool, mode: str, max_tokens: int, inject: bool):
+def retrieve(
+    session_id: str,
+    output: Optional[str],
+    summary: bool,
+    mode: str,
+    max_tokens: int,
+    inject: bool,
+):
     """Retrieve a session's context with smart mode support.
 
     Requires: pip install "claude-jacked[search]"
@@ -433,24 +485,35 @@ def retrieve(session_id: str, output: Optional[str], summary: bool, mode: str, m
     if session.content.plan:
         content_parts.append(f"Plan: {tokens['plan']} tokens")
     if session.content.subagent_summaries:
-        content_parts.append(f"Agent summaries: {len(session.content.subagent_summaries)} ({tokens['subagent_summaries']} tokens)")
+        content_parts.append(
+            f"Agent summaries: {len(session.content.subagent_summaries)} ({tokens['subagent_summaries']} tokens)"
+        )
     if session.content.summary_labels:
-        content_parts.append(f"Labels: {len(session.content.summary_labels)} ({tokens['summary_labels']} tokens)")
+        content_parts.append(
+            f"Labels: {len(session.content.summary_labels)} ({tokens['summary_labels']} tokens)"
+        )
     if session.content.user_messages:
-        content_parts.append(f"User messages: {len(session.content.user_messages)} ({tokens['user_messages']} tokens)")
+        content_parts.append(
+            f"User messages: {len(session.content.user_messages)} ({tokens['user_messages']} tokens)"
+        )
     if session.content.chunks:
-        content_parts.append(f"Transcript chunks: {len(session.content.chunks)} ({tokens['chunks']} tokens)")
+        content_parts.append(
+            f"Transcript chunks: {len(session.content.chunks)} ({tokens['chunks']} tokens)"
+        )
 
-    console.print(Panel(
-        f"Session: {session.session_id}\n"
-        f"Repository: {session.repo_name}\n"
-        f"Machine: {session.machine}\n"
-        f"Age: {session.format_relative_time()}\n"
-        f"Local: {'Yes' if session.is_local else 'No'}\n"
-        f"\nContent available:\n  " + "\n  ".join(content_parts) +
-        f"\n\nEstimated tokens (smart): {tokens['total']}",
-        title="Session Info",
-    ))
+    console.print(
+        Panel(
+            f"Session: {session.session_id}\n"
+            f"Repository: {session.repo_name}\n"
+            f"Machine: {session.machine}\n"
+            f"Age: {session.format_relative_time()}\n"
+            f"Local: {'Yes' if session.is_local else 'No'}\n"
+            f"\nContent available:\n  "
+            + "\n  ".join(content_parts)
+            + f"\n\nEstimated tokens (smart): {tokens['total']}",
+            title="Session Info",
+        )
+    )
 
     if session.is_local:
         resume_cmd = retriever.get_resume_command(session)
@@ -559,14 +622,16 @@ def cleardb():
         console.print(f"[yellow]No data found for user '{user_name}'[/yellow]")
         return
 
-    console.print(Panel(
-        f"[bold red]WARNING: This will permanently delete ALL your indexed data![/bold red]\n\n"
-        f"User: [cyan]{user_name}[/cyan]\n"
-        f"Points to delete: [red]{count}[/red]\n\n"
-        f"This only affects YOUR data. Teammates' data will be untouched.\n"
-        f"After clearing, run 'jacked backfill' to re-index.",
-        title="Clear Database",
-    ))
+    console.print(
+        Panel(
+            f"[bold red]WARNING: This will permanently delete ALL your indexed data![/bold red]\n\n"
+            f"User: [cyan]{user_name}[/cyan]\n"
+            f"Points to delete: [red]{count}[/red]\n\n"
+            f"This only affects YOUR data. Teammates' data will be untouched.\n"
+            f"After clearing, run 'jacked backfill' to re-index.",
+            title="Clear Database",
+        )
+    )
 
     # Require typing confirmation phrase
     console.print("\n[bold]To confirm, type: DELETE MY DATA[/bold]")
@@ -578,7 +643,9 @@ def cleardb():
 
     # Do the delete
     deleted = client.delete_by_user(user_name)
-    console.print(f"\n[green][OK][/green] Deleted {deleted} points for user '{user_name}'")
+    console.print(
+        f"\n[green][OK][/green] Deleted {deleted} points for user '{user_name}'"
+    )
     console.print("\n[dim]Run 'jacked backfill' to re-index your sessions[/dim]")
 
 
@@ -592,13 +659,15 @@ def status():
 
     config = get_config()
 
-    console.print(Panel(
-        f"Endpoint: {config.qdrant_endpoint}\n"
-        f"Collection: {config.collection_name}\n"
-        f"Projects Dir: {config.claude_projects_dir}\n"
-        f"Machine: {config.machine_name}",
-        title="Configuration",
-    ))
+    console.print(
+        Panel(
+            f"Endpoint: {config.qdrant_endpoint}\n"
+            f"Collection: {config.collection_name}\n"
+            f"Projects Dir: {config.claude_projects_dir}\n"
+            f"Machine: {config.machine_name}",
+            title="Configuration",
+        )
+    )
 
     # Check Qdrant connectivity
     client = QdrantSessionClient(config)
@@ -615,19 +684,23 @@ def status():
         progress.remove_task(task)
 
     if info:
-        console.print(Panel(
-            f"Status: [green]{info['status']}[/green]\n"
-            f"Points: {info['points_count']}\n"
-            f"Segments: {info['segments_count']}\n"
-            f"Indexed Vectors: {info['indexed_vectors_count']}",
-            title="Qdrant Collection",
-        ))
+        console.print(
+            Panel(
+                f"Status: [green]{info['status']}[/green]\n"
+                f"Points: {info['points_count']}\n"
+                f"Segments: {info['segments_count']}\n"
+                f"Indexed Vectors: {info['indexed_vectors_count']}",
+                title="Qdrant Collection",
+            )
+        )
     else:
-        console.print(Panel(
-            "[red]Collection not found or Qdrant unreachable[/red]\n"
-            "Run 'jacked backfill' to create collection and index sessions",
-            title="Qdrant Status",
-        ))
+        console.print(
+            Panel(
+                "[red]Collection not found or Qdrant unreachable[/red]\n"
+                "Run 'jacked backfill' to create collection and index sessions",
+                title="Qdrant Status",
+            )
+        )
 
 
 @main.command(name="webux")
@@ -641,9 +714,15 @@ def webux(host: str, port: int, no_browser: bool, reload: bool):
         import uvicorn  # noqa: F401
     except ImportError:
         console.print("[red]Error:[/red] webux requires the web extra.")
-        console.print('Install it with:')
+        console.print("Install it with:")
         console.print('  [bold]pip install "claude-jacked[web]"[/bold]')
         sys.exit(1)
+
+    # Propagate host/port to app via env vars (used for dynamic CORS + WebSocket origin checks)
+    import os as _os
+
+    _os.environ["JACKED_HOST"] = host
+    _os.environ["JACKED_PORT"] = str(port)
 
     url = f"http://{host}:{port}"
     console.print(f"[bold]Starting jacked dashboard at {url}[/bold]")
@@ -652,6 +731,7 @@ def webux(host: str, port: int, no_browser: bool, reload: bool):
 
     if not no_browser:
         import webbrowser
+
         webbrowser.open(url)
 
     uvicorn.run(
@@ -676,13 +756,18 @@ def check_version():
 
     _log_to_db(
         "version_checks",
-        current_version=__version__, latest_version=result["latest"],
+        current_version=__version__,
+        latest_version=result["latest"],
         outdated=result["outdated"],
     )
 
     if result["outdated"]:
-        console.print(f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}")
-        console.print("Run: [bold]pipx upgrade claude-jacked[/bold]  or  [bold]pip install -U claude-jacked[/bold]")
+        console.print(
+            f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}"
+        )
+        console.print(
+            "Run: [bold]pipx upgrade claude-jacked[/bold]  or  [bold]pip install -U claude-jacked[/bold]"
+        )
     else:
         console.print(f"[green]Up to date:[/green] {__version__}")
 
@@ -695,13 +780,18 @@ def check_version():
 def log(category, name, session_id, repo):
     """Record a command/agent/hook invocation to the analytics DB."""
     import sqlite3
-    from datetime import datetime
+    from datetime import datetime, timezone
     from pathlib import Path as _Path
+
     if not DB_PATH.exists():
         return
     # Normalize repo_path to canonical forward-slash format
     norm_repo = str(_Path(repo).resolve()).replace("\\", "/") if repo else ""
-    table_map = {"command": "command_usage", "agent": "agent_invocations", "hook": "hook_executions"}
+    table_map = {
+        "command": "command_usage",
+        "agent": "agent_invocations",
+        "hook": "hook_executions",
+    }
     name_col = {"command": "command_name", "agent": "agent_name", "hook": "hook_name"}
     table = table_map[category]
     col = name_col[category]
@@ -710,7 +800,13 @@ def log(category, name, session_id, repo):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             f"INSERT INTO {table} ({col}, timestamp, session_id, repo_path, success) VALUES (?, ?, ?, ?, ?)",
-            (name, datetime.utcnow().isoformat(), session_id or "", norm_repo, True),
+            (
+                name,
+                datetime.now(timezone.utc).isoformat(),
+                session_id or "",
+                norm_repo,
+                True,
+            ),
         )
         conn.commit()
         conn.close()
@@ -729,18 +825,20 @@ def configure(show: bool):
         console.print("[bold]Current Configuration[/bold]\n")
         try:
             config = get_config()
-            console.print(Panel(
-                f"User: [cyan]{config.user_name}[/cyan]\n"
-                f"Machine: {config.machine_name}\n"
-                f"Qdrant Endpoint: {config.qdrant_endpoint[:50]}...\n"
-                f"Collection: {config.collection_name}\n"
-                f"Projects Dir: {config.claude_projects_dir}\n"
-                f"\n[bold]Ranking Weights:[/bold]\n"
-                f"  Teammate weight: {config.teammate_weight}\n"
-                f"  Other repo weight: {config.other_repo_weight}\n"
-                f"  Time decay half-life: {config.time_decay_halflife_weeks} weeks",
-                title="Active Config",
-            ))
+            console.print(
+                Panel(
+                    f"User: [cyan]{config.user_name}[/cyan]\n"
+                    f"Machine: {config.machine_name}\n"
+                    f"Qdrant Endpoint: {config.qdrant_endpoint[:50]}...\n"
+                    f"Collection: {config.collection_name}\n"
+                    f"Projects Dir: {config.claude_projects_dir}\n"
+                    f"\n[bold]Ranking Weights:[/bold]\n"
+                    f"  Teammate weight: {config.teammate_weight}\n"
+                    f"  Other repo weight: {config.other_repo_weight}\n"
+                    f"  Time decay half-life: {config.time_decay_halflife_weeks} weeks",
+                    title="Active Config",
+                )
+            )
         except Exception as e:
             console.print(f"[red]Error loading config:[/red] {e}")
         return
@@ -755,8 +853,12 @@ def configure(show: bool):
 
     console.print("[bold cyan]Team/Identity (Optional):[/bold cyan]\n")
     console.print("  JACKED_USER_NAME")
-    console.print("    Your name for session attribution (default: git user.name or system user)")
-    console.print(f"    Current: {os.getenv('JACKED_USER_NAME', SmartForkConfig._default_user_name())}\n")
+    console.print(
+        "    Your name for session attribution (default: git user.name or system user)"
+    )
+    console.print(
+        f"    Current: {os.getenv('JACKED_USER_NAME', SmartForkConfig._default_user_name())}\n"
+    )
 
     console.print("[bold cyan]Ranking Weights (Optional):[/bold cyan]\n")
     console.print("  JACKED_TEAMMATE_WEIGHT")
@@ -767,16 +869,16 @@ def configure(show: bool):
     console.print("    Weeks until session relevance halves (default: 35)\n")
 
     console.print("[bold]Example shell profile setup:[/bold]\n")
-    console.print('  # Required')
-    console.print('  export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"')
+    console.print("  # Required")
+    console.print(
+        '  export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"'
+    )
     console.print('  export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"')
-    console.print('')
-    console.print('  # Team setup (optional)')
+    console.print("")
+    console.print("  # Team setup (optional)")
     console.print('  export JACKED_USER_NAME="yourname"')
-    console.print('')
+    console.print("")
     console.print("[dim]Run 'jacked configure --show' to see current values[/dim]")
-
-
 
 
 def _get_data_root() -> Path:
@@ -869,19 +971,21 @@ def _get_sound_command(hook_type: str) -> str:
     if sys.platform == "win32":
         return f'powershell -Command "[System.Media.SystemSounds]::{win_sound}.Play()"'
 
-    log_cmd = f'(jacked log hook sound_{hook_type} 2>/dev/null &); '
+    log_cmd = f"(jacked log hook sound_{hook_type} 2>/dev/null &); "
 
     if sys.platform == "darwin":
-        return log_cmd + f'afplay /System/Library/Sounds/{mac_sound} 2>/dev/null || printf "\\a"'
+        return (
+            log_cmd
+            + f'afplay /System/Library/Sounds/{mac_sound} 2>/dev/null || printf "\\a"'
+        )
 
     # Linux (including WSL)
     return (
-        log_cmd +
-        '(if grep -qi microsoft /proc/version 2>/dev/null; then '
+        log_cmd + "(if grep -qi microsoft /proc/version 2>/dev/null; then "
         f'powershell.exe -Command "[System.Media.SystemSounds]::{win_sound}.Play()" 2>/dev/null || printf "\\a"; '
-        'else '
+        "else "
         f'paplay /usr/share/sounds/freedesktop/stereo/{linux_sound} 2>/dev/null || printf "\\a"; '
-        'fi)'
+        "fi)"
     )
 
 
@@ -911,13 +1015,24 @@ def _install_sound_hooks(existing: dict, settings_path: Path):
 
     notif_exists = any(marker in str(h) for h in existing["hooks"]["Notification"])
     if not notif_exists:
-        existing["hooks"]["Notification"].append({
-            "matcher": "",
-            "hooks": [{"type": "command", "command": marker + _get_sound_command("notification")}]
-        })
+        existing["hooks"]["Notification"].append(
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": marker + _get_sound_command("notification"),
+                    }
+                ],
+            }
+        )
         console.print("[green][OK][/green] Added Notification sound hook")
-    elif _replace_stale_sound_hook(existing["hooks"]["Notification"], marker, "notification"):
-        console.print("[green][OK][/green] Updated Notification sound hook (fixed for this OS)")
+    elif _replace_stale_sound_hook(
+        existing["hooks"]["Notification"], marker, "notification"
+    ):
+        console.print(
+            "[green][OK][/green] Updated Notification sound hook (fixed for this OS)"
+        )
     else:
         console.print("[yellow][-][/yellow] Notification sound hook exists")
 
@@ -927,10 +1042,17 @@ def _install_sound_hooks(existing: dict, settings_path: Path):
 
     stop_exists = any(marker in str(h) for h in existing["hooks"]["Stop"])
     if not stop_exists:
-        existing["hooks"]["Stop"].append({
-            "matcher": "",
-            "hooks": [{"type": "command", "command": marker + _get_sound_command("complete")}]
-        })
+        existing["hooks"]["Stop"].append(
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": marker + _get_sound_command("complete"),
+                    }
+                ],
+            }
+        )
         console.print("[green][OK][/green] Added Stop sound hook")
     elif _replace_stale_sound_hook(existing["hooks"]["Stop"], marker, "complete"):
         console.print("[green][OK][/green] Updated Stop sound hook (fixed for this OS)")
@@ -947,7 +1069,7 @@ def _remove_sound_hooks(settings_path: Path) -> bool:
     if not settings_path.exists():
         return False
 
-    settings = json.loads(settings_path.read_text())
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
     marker = _sound_hook_marker()
     modified = False
 
@@ -955,8 +1077,7 @@ def _remove_sound_hooks(settings_path: Path) -> bool:
         if hook_type in settings.get("hooks", {}):
             before = len(settings["hooks"][hook_type])
             settings["hooks"][hook_type] = [
-                h for h in settings["hooks"][hook_type]
-                if marker not in str(h)
+                h for h in settings["hooks"][hook_type] if marker not in str(h)
             ]
             if len(settings["hooks"][hook_type]) < before:
                 console.print(f"[green][OK][/green] Removed {hook_type} sound hook")
@@ -1019,8 +1140,12 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
     if has_start != has_end:
         which = "start" if has_start else "end"
         missing = "end" if has_start else "start"
-        console.print(f"[red][FAIL][/red] Found {which} marker but no {missing} marker in CLAUDE.md")
-        console.print("Your CLAUDE.md has a corrupted jacked rules block. Please fix it manually:")
+        console.print(
+            f"[red][FAIL][/red] Found {which} marker but no {missing} marker in CLAUDE.md"
+        )
+        console.print(
+            "Your CLAUDE.md has a corrupted jacked rules block. Please fix it manually:"
+        )
         console.print(f"  Start marker: {start_marker}")
         console.print(f"  End marker: {end_marker}")
         return
@@ -1033,13 +1158,19 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
         existing_block = existing_content[start_idx:end_idx].strip()
 
         if existing_block == rules_text:
-            console.print("[yellow][-][/yellow] Behavioral rules already configured correctly")
+            console.print(
+                "[yellow][-][/yellow] Behavioral rules already configured correctly"
+            )
             return
         else:
             # Version upgrade needed
             console.print("\n[bold]Behavioral rules update available:[/bold]")
             console.print(f"[dim]{rules_text}[/dim]")
-            if not force and sys.stdin.isatty() and not click.confirm("Update behavioral rules in CLAUDE.md?"):
+            if (
+                not force
+                and sys.stdin.isatty()
+                and not click.confirm("Update behavioral rules in CLAUDE.md?")
+            ):
                 console.print("[yellow][-][/yellow] Skipped behavioral rules update")
                 return
 
@@ -1061,16 +1192,24 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
             try:
                 claude_md_path.write_text(new_content, encoding="utf-8")
             except PermissionError:
-                console.print(f"[red][FAIL][/red] Permission denied writing to {claude_md_path}")
+                console.print(
+                    f"[red][FAIL][/red] Permission denied writing to {claude_md_path}"
+                )
                 console.print("Check file permissions and try again.")
                 return
-            console.print("[green][OK][/green] Updated behavioral rules to latest version")
+            console.print(
+                "[green][OK][/green] Updated behavioral rules to latest version"
+            )
             return
 
     # Fresh install - show and confirm
     console.print("\n[bold]Proposed behavioral rules for ~/.claude/CLAUDE.md:[/bold]")
     console.print(f"[dim]{rules_text}[/dim]")
-    if not force and sys.stdin.isatty() and not click.confirm("Add these behavioral rules to your global CLAUDE.md?"):
+    if (
+        not force
+        and sys.stdin.isatty()
+        and not click.confirm("Add these behavioral rules to your global CLAUDE.md?")
+    ):
         console.print("[yellow][-][/yellow] Skipped behavioral rules")
         return
 
@@ -1096,7 +1235,9 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
     try:
         claude_md_path.write_text(new_content, encoding="utf-8")
     except PermissionError:
-        console.print(f"[red][FAIL][/red] Permission denied writing to {claude_md_path}")
+        console.print(
+            f"[red][FAIL][/red] Permission denied writing to {claude_md_path}"
+        )
         console.print("Check file permissions and try again.")
         return
     console.print("[green][OK][/green] Installed behavioral rules in CLAUDE.md")
@@ -1134,7 +1275,9 @@ def _remove_behavioral_rules(claude_md_path: Path) -> bool:
     try:
         claude_md_path.write_text(new_content, encoding="utf-8")
     except PermissionError:
-        console.print(f"[red][FAIL][/red] Permission denied writing to {claude_md_path}")
+        console.print(
+            f"[red][FAIL][/red] Permission denied writing to {claude_md_path}"
+        )
         return False
     return True
 
@@ -1143,6 +1286,125 @@ def _security_hook_marker() -> str:
     """Marker to identify jacked security gatekeeper hooks."""
     return "# jacked-security"
 
+
+def _session_tracker_marker() -> str:
+    """Marker to identify jacked session-account tracker hooks."""
+    return "# jacked-session-tracker"
+
+
+SESSION_TRACKER_EVENTS = [
+    ("SessionStart", ""),
+    ("Notification", "auth_success"),
+    ("SessionEnd", ""),
+    ("Stop", ""),
+]
+
+
+def _install_session_tracker_hook(existing: dict, settings_path: Path):
+    """Install session-account tracker hooks for SessionStart, Notification(auth_success), SessionEnd, and Stop (heartbeat).
+
+    Registers hooks that track which Anthropic account each Claude Code session
+    is using by reading ~/.claude/.credentials.json at session start and on re-auth.
+    The Stop hook fires a throttled heartbeat to keep sessions visible in the dashboard.
+    """
+    import json
+    import shutil
+
+    marker = _session_tracker_marker()
+    script_path = _get_data_root() / "hooks" / "session_account_tracker.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] Session tracker script not found: {script_path}"
+        )
+        console.print("[yellow]Skipping session tracker installation[/yellow]")
+        return
+
+    python_exe = sys.executable
+    if not python_exe or not Path(python_exe).exists():
+        python_exe = shutil.which("python3") or shutil.which("python") or "python"
+
+    python_path = str(Path(python_exe)).replace("\\", "/")
+    script_str = str(script_path).replace("\\", "/")
+    command_str = f"{python_path} {script_str}"
+
+    modified = False
+    for event_name, matcher in SESSION_TRACKER_EVENTS:
+        if event_name not in existing["hooks"]:
+            existing["hooks"][event_name] = []
+
+        # Find existing hook for this event+matcher
+        hook_index = None
+        needs_upgrade = False
+        for i, hook_entry in enumerate(existing["hooks"][event_name]):
+            hook_str = str(hook_entry)
+            entry_matcher = hook_entry.get("matcher", "")
+            if entry_matcher == matcher and (
+                marker in hook_str or "session_account_tracker" in hook_str
+            ):
+                hook_index = i
+                for h in hook_entry.get("hooks", []):
+                    if h.get("command", "") != command_str:
+                        needs_upgrade = True
+                break
+
+        if hook_index is not None and not needs_upgrade:
+            continue
+
+        hook_entry = {
+            "matcher": matcher,
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command_str,
+                    "async": True,
+                }
+            ],
+        }
+
+        if hook_index is not None and needs_upgrade:
+            existing["hooks"][event_name][hook_index] = hook_entry
+            modified = True
+        else:
+            existing["hooks"][event_name].append(hook_entry)
+            modified = True
+
+    if not modified:
+        console.print("[yellow][-][/yellow] Session tracker hooks already configured")
+        return
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(existing, indent=2))
+    events_str = ", ".join(e for e, _ in SESSION_TRACKER_EVENTS)
+    console.print(f"[green][OK][/green] Installed session tracker for: {events_str}")
+
+    # Post-install verification: warn if any expected event is missing
+    _verify_session_tracker_hooks(existing)
+
+
+def _verify_session_tracker_hooks(settings: dict):
+    """Verify all SESSION_TRACKER_EVENTS are present in the hooks config.
+
+    Prints a warning for any event that's missing its session_account_tracker
+    entry.  Called after install to catch partial writes or manual edits.
+
+    >>> _verify_session_tracker_hooks({"hooks": {
+    ...     "SessionStart": [{"hooks": [{"command": "session_account_tracker"}]}],
+    ...     "Notification": [{"hooks": [{"command": "session_account_tracker"}]}],
+    ...     "SessionEnd": [{"hooks": [{"command": "session_account_tracker"}]}],
+    ...     "Stop": [{"hooks": [{"command": "session_account_tracker"}]}],
+    ... }})
+
+    >>> _verify_session_tracker_hooks({"hooks": {"SessionStart": []}})  # doctest: +SKIP
+    """
+    hooks = settings.get("hooks", {})
+    for event_name, _ in SESSION_TRACKER_EVENTS:
+        entries = hooks.get(event_name, [])
+        found = any("session_account_tracker" in str(e) for e in entries)
+        if not found:
+            console.print(
+                f"[yellow][WARN][/yellow] Session tracker missing for {event_name}"
+            )
 
 
 GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep"]
@@ -1164,7 +1426,9 @@ def _install_security_hook(existing: dict, settings_path: Path):
     script_path = _get_data_root() / "hooks" / "security_gatekeeper.py"
 
     if not script_path.exists():
-        console.print(f"[red][FAIL][/red] Security gatekeeper script not found: {script_path}")
+        console.print(
+            f"[red][FAIL][/red] Security gatekeeper script not found: {script_path}"
+        )
         console.print("[yellow]Skipping security gatekeeper installation[/yellow]")
         return
 
@@ -1183,11 +1447,14 @@ def _install_security_hook(existing: dict, settings_path: Path):
         old_hooks = existing["hooks"]["PermissionRequest"]
         before = len(old_hooks)
         existing["hooks"]["PermissionRequest"] = [
-            h for h in old_hooks
+            h
+            for h in old_hooks
             if marker not in str(h) and "security_gatekeeper" not in str(h)
         ]
         if len(existing["hooks"]["PermissionRequest"]) < before:
-            console.print("[green][OK][/green] Migrated security hook from PermissionRequest to PreToolUse")
+            console.print(
+                "[green][OK][/green] Migrated security hook from PermissionRequest to PreToolUse"
+            )
 
     if "PreToolUse" not in existing["hooks"]:
         existing["hooks"]["PreToolUse"] = []
@@ -1201,7 +1468,9 @@ def _install_security_hook(existing: dict, settings_path: Path):
         for i, hook_entry in enumerate(existing["hooks"]["PreToolUse"]):
             hook_str = str(hook_entry)
             entry_matcher = hook_entry.get("matcher", "")
-            if entry_matcher == tool and (marker in hook_str or "security_gatekeeper" in hook_str):
+            if entry_matcher == tool and (
+                marker in hook_str or "security_gatekeeper" in hook_str
+            ):
                 hook_index = i
                 for h in hook_entry.get("hooks", []):
                     if h.get("command", "") != command_str:
@@ -1213,11 +1482,13 @@ def _install_security_hook(existing: dict, settings_path: Path):
 
         hook_entry = {
             "matcher": tool,
-            "hooks": [{
-                "type": "command",
-                "command": command_str,
-                "timeout": 30,
-            }]
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command_str,
+                    "timeout": 30,
+                }
+            ],
         }
 
         if hook_index is not None and needs_upgrade:
@@ -1228,7 +1499,9 @@ def _install_security_hook(existing: dict, settings_path: Path):
             modified = True
 
     if not modified:
-        console.print("[yellow][-][/yellow] Security gatekeeper hooks already configured")
+        console.print(
+            "[yellow][-][/yellow] Security gatekeeper hooks already configured"
+        )
         return
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1240,6 +1513,7 @@ def _install_security_hook(existing: dict, settings_path: Path):
     # this automatically, but it goes stale on upgrades and triggers warnings).
     # Users who want a custom prompt can create it manually.
     from jacked.data.hooks import security_gatekeeper as gk
+
     prompt_path = Path.home() / ".claude" / "gatekeeper-prompt.txt"
     if prompt_path.exists():
         try:
@@ -1247,14 +1521,23 @@ def _install_security_hook(existing: dict, settings_path: Path):
             # If it's an unmodified built-in prompt (current or stale), remove it
             if existing_prompt == gk.SECURITY_PROMPT.strip():
                 prompt_path.unlink()
-                console.print("[dim][-][/dim] Removed default gatekeeper prompt (built-in is used automatically)")
+                console.print(
+                    "[dim][-][/dim] Removed default gatekeeper prompt (built-in is used automatically)"
+                )
             else:
                 # Check if it's a stale built-in that's missing required placeholders
-                if not all(p in existing_prompt for p in ["{command}", "{cwd}", "{file_context}"]):
+                if not all(
+                    p in existing_prompt
+                    for p in ["{command}", "{cwd}", "{file_context}"]
+                ):
                     prompt_path.unlink()
-                    console.print("[yellow][OK][/yellow] Removed stale gatekeeper prompt (missing required placeholders)")
+                    console.print(
+                        "[yellow][OK][/yellow] Removed stale gatekeeper prompt (missing required placeholders)"
+                    )
                 else:
-                    console.print("[yellow][-][/yellow] Custom gatekeeper prompt detected (not overwriting)")
+                    console.print(
+                        "[yellow][-][/yellow] Custom gatekeeper prompt detected (not overwriting)"
+                    )
         except Exception:
             pass
 
@@ -1269,7 +1552,7 @@ def _remove_security_hook(settings_path: Path) -> bool:
     if not settings_path.exists():
         return False
 
-    settings = json.loads(settings_path.read_text())
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
     marker = _security_hook_marker()
     modified = False
 
@@ -1278,7 +1561,8 @@ def _remove_security_hook(settings_path: Path) -> bool:
             continue
         before = len(settings["hooks"][hook_type])
         settings["hooks"][hook_type] = [
-            h for h in settings["hooks"][hook_type]
+            h
+            for h in settings["hooks"][hook_type]
             if marker not in str(h) and "security_gatekeeper" not in str(h)
         ]
         if len(settings["hooks"][hook_type]) < before:
@@ -1292,17 +1576,55 @@ def _remove_security_hook(settings_path: Path) -> bool:
         if prompt_path.exists():
             try:
                 from jacked.data.hooks import security_gatekeeper as gk
+
                 existing_prompt = prompt_path.read_text(encoding="utf-8").strip()
                 if existing_prompt == gk.SECURITY_PROMPT.strip():
                     prompt_path.unlink()
                     console.print("[dim][-][/dim] Removed default gatekeeper prompt")
-                elif not all(p in existing_prompt for p in ["{command}", "{cwd}", "{file_context}"]):
+                elif not all(
+                    p in existing_prompt
+                    for p in ["{command}", "{cwd}", "{file_context}"]
+                ):
                     prompt_path.unlink()
-                    console.print("[dim][-][/dim] Removed stale gatekeeper prompt (missing placeholders)")
+                    console.print(
+                        "[dim][-][/dim] Removed stale gatekeeper prompt (missing placeholders)"
+                    )
                 else:
-                    console.print("[yellow][-][/yellow] Keeping custom gatekeeper prompt file")
+                    console.print(
+                        "[yellow][-][/yellow] Keeping custom gatekeeper prompt file"
+                    )
             except Exception:
                 pass
+        return True
+
+    return False
+
+
+def _remove_session_tracker_hooks(settings_path: Path) -> bool:
+    """Remove jacked session-account tracker hooks. Returns True if removed."""
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    modified = False
+
+    for event_name, _ in SESSION_TRACKER_EVENTS:
+        if event_name not in settings.get("hooks", {}):
+            continue
+        before = len(settings["hooks"][event_name])
+        settings["hooks"][event_name] = [
+            h
+            for h in settings["hooks"][event_name]
+            if "session_account_tracker" not in str(h)
+        ]
+        if len(settings["hooks"][event_name]) < before:
+            modified = True
+
+    if modified:
+        settings_path.write_text(json.dumps(settings, indent=2))
+        console.print("[green][OK][/green] Removed session tracker hooks")
         return True
 
     return False
@@ -1371,10 +1693,23 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
 
 @main.command()
 @click.option("--sounds", is_flag=True, help="Install sound notification hooks")
-@click.option("--search", is_flag=True, help="Install session indexing hook (requires [search] extra)")
-@click.option("--security", is_flag=True, help="Install security gatekeeper hook (requires [security] extra)")
+@click.option(
+    "--search",
+    is_flag=True,
+    help="Install session indexing hook (requires [search] extra)",
+)
+@click.option(
+    "--security",
+    is_flag=True,
+    help="Install security gatekeeper hook (requires [security] extra)",
+)
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
-@click.option("--force", "-f", is_flag=True, help="Overwrite existing agents/commands without prompting")
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Overwrite existing agents/commands without prompting",
+)
 def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: bool):
     """Auto-install skill, agents, commands, and optional hooks.
 
@@ -1392,6 +1727,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     has_qdrant = False
     try:
         import qdrant_client  # noqa: F401
+
         has_qdrant = True
     except ImportError:
         pass
@@ -1405,7 +1741,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     settings_path = home / ".claude" / "settings.json"
     if settings_path.exists():
         try:
-            existing = json.loads(settings_path.read_text())
+            existing = json.loads(settings_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
     else:
@@ -1424,9 +1760,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                 {
                     "type": "command",
                     "command": 'jacked index --repo "$CLAUDE_PROJECT_DIR"',
-                    "async": True
+                    "async": True,
                 }
-            ]
+            ],
         }
 
         hook_index = None
@@ -1451,7 +1787,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         else:
             console.print("[yellow][-][/yellow] Stop hook already configured")
     else:
-        console.print("[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)")
+        console.print(
+            "[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)"
+        )
 
     # Copy skill file with Python path templating
     # Claude Code expects skills in subdirectories with SKILL.md
@@ -1506,10 +1844,14 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                     pass
             # Existing file with same content — skip unless --force
             if not force and not dst_file.is_symlink() and dst_file.exists():
-                if agent_file.read_text(encoding="utf-8") == dst_file.read_text(encoding="utf-8"):
+                if agent_file.read_text(encoding="utf-8") == dst_file.read_text(
+                    encoding="utf-8"
+                ):
                     skipped += 1
                     continue
-                if sys.stdin.isatty() and not click.confirm(f"Agent '{agent_file.name}' exists with different content. Overwrite?"):
+                if sys.stdin.isatty() and not click.confirm(
+                    f"Agent '{agent_file.name}' exists with different content. Overwrite?"
+                ):
                     console.print(f"[yellow][-][/yellow] Skipped {agent_file.name}")
                     continue
             link_method = _link_or_copy(agent_file, dst_file)
@@ -1546,10 +1888,14 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                     pass
             # Existing file with same content — skip unless --force
             if not force and not dst_file.is_symlink() and dst_file.exists():
-                if cmd_file.read_text(encoding="utf-8") == dst_file.read_text(encoding="utf-8"):
+                if cmd_file.read_text(encoding="utf-8") == dst_file.read_text(
+                    encoding="utf-8"
+                ):
                     skipped += 1
                     continue
-                if sys.stdin.isatty() and not click.confirm(f"Command '{cmd_file.name}' exists with different content. Overwrite?"):
+                if sys.stdin.isatty() and not click.confirm(
+                    f"Command '{cmd_file.name}' exists with different content. Overwrite?"
+                ):
                     console.print(f"[yellow][-][/yellow] Skipped {cmd_file.name}")
                     continue
             link_method = _link_or_copy(cmd_file, dst_file)
@@ -1575,14 +1921,23 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         if audit_results:
             warns = [r for r in audit_results if r[1] == "WARN"]
             if warns:
-                console.print(f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]")
+                console.print(
+                    f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]"
+                )
                 for pat, _, prefix, reason in warns:
                     console.print(f"  [red][WARN][/red] {pat} — {reason}")
-                console.print("[dim]Run 'jacked gatekeeper audit' for full details[/dim]")
+                console.print(
+                    "[dim]Run 'jacked gatekeeper audit' for full details[/dim]"
+                )
             else:
                 console.print("[green][AUDIT] Permission rules look clean[/green]")
     else:
-        console.print("[dim][-][/dim] Skipping security gatekeeper (use --security to enable)")
+        console.print(
+            "[dim][-][/dim] Skipping security gatekeeper (use --security to enable)"
+        )
+
+    # Install session-account tracker hooks (always — lightweight, no deps)
+    _install_session_tracker_hook(existing, settings_path)
 
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
@@ -1591,19 +1946,25 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 
     # Deploy guardrails and hook templates
     from jacked.guardrails import deploy_templates
+
     deploy_result = deploy_templates(force=force)
     g_count = sum(1 for t in deploy_result["guardrails"] if t.get("deployed"))
     h_count = sum(1 for t in deploy_result["hooks"] if t.get("deployed"))
     g_skip = sum(1 for t in deploy_result["guardrails"] if t.get("skipped"))
     h_skip = sum(1 for t in deploy_result["hooks"] if t.get("skipped"))
     if g_count or h_count:
-        console.print(f"[green][OK][/green] Deployed {g_count} guardrails + {h_count} hook templates")
+        console.print(
+            f"[green][OK][/green] Deployed {g_count} guardrails + {h_count} hook templates"
+        )
     if g_skip or h_skip:
-        console.print(f"[dim][-][/dim] Skipped {g_skip + h_skip} existing templates (use --force to overwrite)")
+        console.print(
+            f"[dim][-][/dim] Skipped {g_skip + h_skip} existing templates (use --force to overwrite)"
+        )
 
     # Ensure analytics DB exists
     try:
         from jacked.web.database import Database
+
         Database()
         console.print("[green][OK][/green] Analytics database ready")
     except Exception:
@@ -1611,6 +1972,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 
     # Detect and store project env if we're inside a git repo
     import os as _os
+
     cwd = _os.getcwd()
     if (Path(cwd) / ".git").is_dir():
         env_path = _detect_project_env()
@@ -1631,7 +1993,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             console.print("[dim][-][/dim] No project env detected")
 
     console.print("\n[bold]Installation complete![/bold]")
-    console.print("\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]")
+    console.print(
+        "\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]"
+    )
     console.print("\nWhat you get:")
     console.print("  - /jacked - Search past Claude sessions")
     console.print("  - /dc - Double-check reviewer")
@@ -1658,8 +2022,12 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print("  4. Use '/jacked <description>' to search past sessions")
     else:
         console.print("\nOptional extras:")
-        console.print('  pip install "claude-jacked\[search]"    # Session search via Qdrant')
-        console.print('  pip install "claude-jacked\[security]"  # Auto-approve safe Bash commands')
+        console.print(
+            '  pip install "claude-jacked\[search]"    # Session search via Qdrant'
+        )
+        console.print(
+            '  pip install "claude-jacked\[security]"  # Auto-approve safe Bash commands'
+        )
         console.print('  pip install "claude-jacked\[all]"       # Everything')
 
 
@@ -1667,7 +2035,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 @click.option("--sounds", is_flag=True, help="Remove only sound hooks")
 @click.option("--security", is_flag=True, help="Remove only security gatekeeper hook")
-@click.option("--rules", is_flag=True, help="Remove only behavioral rules from CLAUDE.md")
+@click.option(
+    "--rules", is_flag=True, help="Remove only behavioral rules from CLAUDE.md"
+)
 def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     """Remove jacked hooks, skill, agents, and commands from Claude Code."""
     import json
@@ -1703,15 +2073,18 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         return
 
     if not yes:
-        if not click.confirm("Remove jacked from Claude Code? (This won't delete your Qdrant index)"):
+        if not click.confirm(
+            "Remove jacked from Claude Code? (This won't delete your Qdrant index)"
+        ):
             console.print("Cancelled")
             return
 
     console.print("[bold]Uninstalling Jacked...[/bold]\n")
 
-    # Also remove sound, security hooks, and behavioral rules during full uninstall
+    # Also remove sound, security, session tracker hooks, and behavioral rules during full uninstall
     _remove_sound_hooks(settings_path)
     _remove_security_hook(settings_path)
+    _remove_session_tracker_hooks(settings_path)
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):
         console.print("[green][OK][/green] Removed behavioral rules from CLAUDE.md")
@@ -1719,20 +2092,25 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     # Remove Stop hook from settings.json
     if settings_path.exists():
         try:
-            settings = json.loads(settings_path.read_text())
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
             if "hooks" in settings and "Stop" in settings["hooks"]:
                 # Filter out jacked hooks
                 original_count = len(settings["hooks"]["Stop"])
                 settings["hooks"]["Stop"] = [
-                    h for h in settings["hooks"]["Stop"]
+                    h
+                    for h in settings["hooks"]["Stop"]
                     if "jacked" not in str(h.get("hooks", []))
                 ]
                 removed_count = original_count - len(settings["hooks"]["Stop"])
                 if removed_count > 0:
                     settings_path.write_text(json.dumps(settings, indent=2))
-                    console.print(f"[green][OK][/green] Removed Stop hook from {settings_path}")
+                    console.print(
+                        f"[green][OK][/green] Removed Stop hook from {settings_path}"
+                    )
                 else:
-                    console.print("[yellow][-][/yellow] No jacked hook found in settings")
+                    console.print(
+                        "[yellow][-][/yellow] No jacked hook found in settings"
+                    )
         except (json.JSONDecodeError, KeyError) as e:
             console.print(f"[red][FAIL][/red] Error reading settings: {e}")
     else:
@@ -1787,7 +2165,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         console.print("[yellow][-][/yellow] Commands directory not found")
 
     console.print("\n[bold]Uninstall complete![/bold]")
-    console.print("\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]")
+    console.print(
+        "\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]"
+    )
 
 
 @main.group()
@@ -1826,7 +2206,9 @@ def gatekeeper_reset(yes: bool):
             try:
                 current = PROMPT_PATH.read_text(encoding="utf-8").strip()
                 if current == SECURITY_PROMPT.strip():
-                    console.print("[yellow]Prompt is already the built-in default[/yellow]")
+                    console.print(
+                        "[yellow]Prompt is already the built-in default[/yellow]"
+                    )
                     return
             except Exception:
                 pass
@@ -1868,11 +2250,42 @@ MEDIUM_RISK_PREFIXES = {
 
 # Prefixes that are always low-risk and get [OK]
 LOW_RISK_PREFIXES = {
-    "git", "gh", "grep", "rg", "find", "fd", "ls", "dir", "pwd",
-    "echo", "which", "where", "env", "printenv", "npm", "pip",
-    "pytest", "make", "cargo", "go", "docker", "jacked", "claude",
-    "npx", "tsc", "ruff", "flake8", "pylint", "mypy", "eslint",
-    "prettier", "black", "isort", "jest", "conda", "pipx",
+    "git",
+    "gh",
+    "grep",
+    "rg",
+    "find",
+    "fd",
+    "ls",
+    "dir",
+    "pwd",
+    "echo",
+    "which",
+    "where",
+    "env",
+    "printenv",
+    "npm",
+    "pip",
+    "pytest",
+    "make",
+    "cargo",
+    "go",
+    "docker",
+    "jacked",
+    "claude",
+    "npx",
+    "tsc",
+    "ruff",
+    "flake8",
+    "pylint",
+    "mypy",
+    "eslint",
+    "prettier",
+    "black",
+    "isort",
+    "jest",
+    "conda",
+    "pipx",
 }
 
 
@@ -1921,6 +2334,7 @@ def _scan_permission_rules() -> list[tuple[str, str, str, str]]:
     Returns list of (pattern, level, prefix, reason).
     """
     from jacked.data.hooks.security_gatekeeper import _load_permissions
+
     results = []
     seen = set()
 
@@ -1973,7 +2387,12 @@ def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
 
 
 @gatekeeper.command(name="audit")
-@click.option("--log", "scan_log", is_flag=True, help="Also scan recent auto-approved commands via LLM")
+@click.option(
+    "--log",
+    "scan_log",
+    is_flag=True,
+    help="Also scan recent auto-approved commands via LLM",
+)
 @click.option("--limit", "-n", default=50, help="Number of recent log entries to scan")
 def gatekeeper_audit(scan_log, limit):
     """Audit permission rules for dangerous wildcards."""
@@ -1992,7 +2411,9 @@ def gatekeeper_audit(scan_log, limit):
 
     if not results:
         console.print("[yellow]No Bash permission rules found[/yellow]")
-        console.print("[dim]Permission rules are set via Claude Code's /permissions command[/dim]")
+        console.print(
+            "[dim]Permission rules are set via Claude Code's /permissions command[/dim]"
+        )
         return
 
     warn_count = 0
@@ -2002,8 +2423,12 @@ def gatekeeper_audit(scan_log, limit):
     for pat, level, prefix, reason in results:
         if level == "WARN":
             console.print(f"  [red][WARN][/red] {pat} — {reason}")
-            console.print(f"         Gatekeeper deny patterns won't catch all {prefix} inline code.")
-            console.print("         Consider removing and letting the gatekeeper evaluate individually.\n")
+            console.print(
+                f"         Gatekeeper deny patterns won't catch all {prefix} inline code."
+            )
+            console.print(
+                "         Consider removing and letting the gatekeeper evaluate individually.\n"
+            )
             warn_count += 1
         elif level == "INFO":
             console.print(f"  [yellow][INFO][/yellow] {pat} — {reason}")
@@ -2015,11 +2440,15 @@ def gatekeeper_audit(scan_log, limit):
     console.print(f"\n{warn_count} warnings, {info_count} info, {ok_count} OK")
 
     if warn_count > 0:
-        console.print("\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]")
+        console.print(
+            "\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]"
+        )
 
     # Log scanning
     if scan_log:
-        console.print(f"\n[bold]Scanning last {limit} auto-approved commands from hooks-debug.log...[/bold]\n")
+        console.print(
+            f"\n[bold]Scanning last {limit} auto-approved commands from hooks-debug.log...[/bold]\n"
+        )
 
         commands = _parse_log_for_perms_commands(LOG_PATH, limit=limit)
         if not commands:
@@ -2028,7 +2457,7 @@ def gatekeeper_audit(scan_log, limit):
             return
 
         # Send to LLM for evaluation
-        cmd_list = "\n".join(f"  {i+1}. {cmd}" for i, cmd in enumerate(commands))
+        cmd_list = "\n".join(f"  {i + 1}. {cmd}" for i, cmd in enumerate(commands))
         audit_prompt = f"""You are a security auditor. Review these {len(commands)} Bash commands that were auto-approved via permission rules (bypassing LLM evaluation).
 
 Flag any that look dangerous — data exfiltration, destructive operations, arbitrary code execution, secret access, etc. Most will be safe.
@@ -2041,24 +2470,33 @@ Respond with ONLY a JSON object:
 
 If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
 
-        console.print(f"[dim]Sending {len(commands)} commands to LLM for review...[/dim]")
+        console.print(
+            f"[dim]Sending {len(commands)} commands to LLM for review...[/dim]"
+        )
 
         try:
             import anthropic
+
             api_key = os.environ.get("ANTHROPIC_API_KEY", "")
             if not api_key:
-                console.print("[red]ANTHROPIC_API_KEY not set — cannot run LLM audit[/red]")
-                console.print("[dim]Set ANTHROPIC_API_KEY or install anthropic SDK[/dim]")
+                console.print(
+                    "[red]ANTHROPIC_API_KEY not set — cannot run LLM audit[/red]"
+                )
+                console.print(
+                    "[dim]Set ANTHROPIC_API_KEY or install anthropic SDK[/dim]"
+                )
                 return
 
             # Use configured model from gatekeeper settings if available
             audit_model = "claude-haiku-4-5-20251001"
             try:
                 import sys as _sys
+
                 _gk_dir = str(Path(__file__).resolve().parent / "data" / "hooks")
                 if _gk_dir not in _sys.path:
                     _sys.path.insert(0, _gk_dir)
                 from security_gatekeeper import _read_gatekeeper_config
+
                 gk_config = _read_gatekeeper_config()
                 audit_model = gk_config["model"]
                 api_key = gk_config["api_key"] or api_key
@@ -2087,15 +2525,23 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
                     console.print(f"         LLM says: {item.get('reason', '?')}\n")
             console.print(f"{safe_count}/{len(commands)} commands look safe.")
             if flagged:
-                console.print(f"[red]{len(flagged)} commands flagged[/red] — consider tightening your permission rules.")
+                console.print(
+                    f"[red]{len(flagged)} commands flagged[/red] — consider tightening your permission rules."
+                )
             else:
                 console.print("[green]No dangerous commands found.[/green]")
 
         except ImportError:
-            console.print("[red]anthropic SDK not installed — cannot run LLM audit[/red]")
-            console.print('[dim]Install it: pip install "claude-jacked[security]"[/dim]')
+            console.print(
+                "[red]anthropic SDK not installed — cannot run LLM audit[/red]"
+            )
+            console.print(
+                '[dim]Install it: pip install "claude-jacked[security]"[/dim]'
+            )
         except json.JSONDecodeError:
-            console.print(f"[yellow]LLM returned non-JSON response:[/yellow] {text[:200]}")
+            console.print(
+                f"[yellow]LLM returned non-JSON response:[/yellow] {text[:200]}"
+            )
         except Exception as e:
             console.print(f"[red]LLM audit failed:[/red] {e}")
 
@@ -2105,7 +2551,9 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
             state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             count = state.get("perms_count", 0)
             if count > 0:
-                console.print(f"\n[dim]Total permission auto-approvals since last reset: {count}[/dim]")
+                console.print(
+                    f"\n[dim]Total permission auto-approvals since last reset: {count}[/dim]"
+                )
         except Exception:
             pass
 
@@ -2117,7 +2565,9 @@ def gatekeeper_diff():
     from jacked.data.hooks.security_gatekeeper import SECURITY_PROMPT, PROMPT_PATH
 
     if not PROMPT_PATH.exists():
-        console.print("[yellow]No custom prompt file found — using built-in default[/yellow]")
+        console.print(
+            "[yellow]No custom prompt file found — using built-in default[/yellow]"
+        )
         console.print(f"[dim]Create one at: {PROMPT_PATH}[/dim]")
         return
 
@@ -2128,7 +2578,9 @@ def gatekeeper_diff():
         return
 
     if custom.strip() == SECURITY_PROMPT.strip():
-        console.print("[green]No differences — custom prompt matches built-in default[/green]")
+        console.print(
+            "[green]No differences — custom prompt matches built-in default[/green]"
+        )
         return
 
     diff = difflib.unified_diff(
@@ -2138,9 +2590,9 @@ def gatekeeper_diff():
         tofile=str(PROMPT_PATH),
     )
     for line in diff:
-        if line.startswith('+') and not line.startswith('+++'):
+        if line.startswith("+") and not line.startswith("+++"):
             console.print(f"[green]{line.rstrip()}[/green]")
-        elif line.startswith('-') and not line.startswith('---'):
+        elif line.startswith("-") and not line.startswith("---"):
             console.print(f"[red]{line.rstrip()}[/red]")
         else:
             console.print(line.rstrip())
@@ -2156,9 +2608,17 @@ def guardrails_group():
 
 
 @guardrails_group.command(name="init")
-@click.option("--repo", type=click.Path(exists=True), default=".", help="Project root directory")
-@click.option("--language", type=click.Choice(["python", "node", "rust", "go"]), help="Override language detection")
-@click.option("--force", "-f", is_flag=True, help="Overwrite existing JACKED_GUARDRAILS.md")
+@click.option(
+    "--repo", type=click.Path(exists=True), default=".", help="Project root directory"
+)
+@click.option(
+    "--language",
+    type=click.Choice(["python", "node", "rust", "go"]),
+    help="Override language detection",
+)
+@click.option(
+    "--force", "-f", is_flag=True, help="Overwrite existing JACKED_GUARDRAILS.md"
+)
 def guardrails_init(repo: str, language: str, force: bool):
     """Create JACKED_GUARDRAILS.md in a project from templates.
 
@@ -2167,9 +2627,12 @@ def guardrails_init(repo: str, language: str, force: bool):
     >>> # CLI command: jacked guardrails init
     """
     from jacked.guardrails import create_guardrails
+
     result = create_guardrails(repo, language=language, force=force)
     if result["created"]:
-        lang_label = f" ({result.get('language', 'base')})" if result.get("language") else ""
+        lang_label = (
+            f" ({result.get('language', 'base')})" if result.get("language") else ""
+        )
         console.print(f"[green][OK][/green] Created {result['path']}{lang_label}")
     else:
         console.print(f"[yellow][-][/yellow] {result['reason']}")
@@ -2185,8 +2648,14 @@ def lint_hook_group():
 
 
 @lint_hook_group.command(name="init")
-@click.option("--repo", type=click.Path(exists=True), default=".", help="Project root directory")
-@click.option("--language", type=click.Choice(["python", "node", "rust", "go"]), help="Override language detection")
+@click.option(
+    "--repo", type=click.Path(exists=True), default=".", help="Project root directory"
+)
+@click.option(
+    "--language",
+    type=click.Choice(["python", "node", "rust", "go"]),
+    help="Override language detection",
+)
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing pre-push hook")
 def lint_hook_init(repo: str, language: str, force: bool):
     """Install a pre-push lint hook in a project's .git/hooks/.
@@ -2196,9 +2665,12 @@ def lint_hook_init(repo: str, language: str, force: bool):
     >>> # CLI command: jacked lint-hook init
     """
     from jacked.guardrails import install_hook
+
     result = install_hook(repo, language=language, force=force)
     if result["installed"]:
-        console.print(f"[green][OK][/green] Installed pre-push hook at {result['path']} ({result.get('language', '?')})")
+        console.print(
+            f"[green][OK][/green] Installed pre-push hook at {result['path']} ({result.get('language', '?')})"
+        )
         # Store project env so the hook can find the right tool
         repo_path = str(Path(repo).resolve())
         env_path = _detect_project_env()
@@ -2213,8 +2685,14 @@ def lint_hook_init(repo: str, language: str, force: bool):
 
 
 @main.command(name="init")
-@click.option("--repo", type=click.Path(exists=True), default=".", help="Project root directory")
-@click.option("--language", type=click.Choice(["python", "node", "rust", "go"]), help="Override language detection")
+@click.option(
+    "--repo", type=click.Path(exists=True), default=".", help="Project root directory"
+)
+@click.option(
+    "--language",
+    type=click.Choice(["python", "node", "rust", "go"]),
+    help="Override language detection",
+)
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
 def init_project(repo: str, language: str, force: bool):
     """Set up guardrails + lint hook in a project (does both).
@@ -2230,7 +2708,9 @@ def init_project(repo: str, language: str, force: bool):
     # Guardrails
     g_result = create_guardrails(repo, language=language, force=force)
     if g_result["created"]:
-        lang_label = f" ({g_result.get('language', 'base')})" if g_result.get("language") else ""
+        lang_label = (
+            f" ({g_result.get('language', 'base')})" if g_result.get("language") else ""
+        )
         console.print(f"[green][OK][/green] Created JACKED_GUARDRAILS.md{lang_label}")
     else:
         console.print(f"[yellow][-][/yellow] Guardrails: {g_result['reason']}")
@@ -2238,7 +2718,9 @@ def init_project(repo: str, language: str, force: bool):
     # Lint hook
     h_result = install_hook(repo, language=language, force=force)
     if h_result["installed"]:
-        console.print(f"[green][OK][/green] Installed pre-push lint hook ({h_result.get('language', '?')})")
+        console.print(
+            f"[green][OK][/green] Installed pre-push lint hook ({h_result.get('language', '?')})"
+        )
     else:
         console.print(f"[yellow][-][/yellow] Lint hook: {h_result['reason']}")
 

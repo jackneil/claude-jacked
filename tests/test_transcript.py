@@ -173,7 +173,7 @@ class TestParseJsonlFile:
             },
         ]
 
-        with open(session_file, "w") as f:
+        with open(session_file, "w", encoding="utf-8") as f:
             for line in lines:
                 f.write(json.dumps(line) + "\n")
 
@@ -207,7 +207,7 @@ class TestParseJsonlFile:
             },
         ]
 
-        with open(session_file, "w") as f:
+        with open(session_file, "w", encoding="utf-8") as f:
             for line in lines:
                 f.write(json.dumps(line) + "\n")
 

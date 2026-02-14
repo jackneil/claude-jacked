@@ -14,6 +14,7 @@ Output format (PreToolUse):
   Pass:   exit 0, no output (normal permission check)
   Error:  exit 0, no output (fail-open)
 """
+
 import json
 import os
 import re
@@ -40,17 +41,23 @@ AUDIT_NUDGE_INTERVAL = 100
 
 _REDACT_PATTERNS = [
     # connection strings: protocol://user:PASS@host
-    re.compile(r'(://[^:]+:)([^@]+)(@)', re.IGNORECASE),
+    re.compile(r"(://[^:]+:)([^@]+)(@)", re.IGNORECASE),
     # env var assignments with sensitive names
-    re.compile(r'(\b(?:PASSWORD|PGPASSWORD|MYSQL_PWD|API_KEY|SECRET|TOKEN|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY)\s*=\s*)[^\s"\']+', re.IGNORECASE),
+    re.compile(
+        r'(\b(?:PASSWORD|PGPASSWORD|MYSQL_PWD|API_KEY|SECRET|TOKEN|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY)\s*=\s*)[^\s"\']+',
+        re.IGNORECASE,
+    ),
     # CLI flags with sensitive names (--password VALUE and --password=VALUE, including quoted)
-    re.compile(r'(--(?:password|token|secret|api-key|apikey)[\s=])(?:"[^"]*"|\'[^\']*\'|\S+)', re.IGNORECASE),
+    re.compile(
+        r'(--(?:password|token|secret|api-key|apikey)[\s=])(?:"[^"]*"|\'[^\']*\'|\S+)',
+        re.IGNORECASE,
+    ),
     # Bearer tokens
-    re.compile(r'(Bearer\s+)\S+', re.IGNORECASE),
+    re.compile(r"(Bearer\s+)\S+", re.IGNORECASE),
     # AWS access key IDs
-    re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     # Generic sk-... API keys (OpenAI, Anthropic style)
-    re.compile(r'\bsk-[a-zA-Z0-9_-]{20,}\b'),
+    re.compile(r"\bsk-[a-zA-Z0-9_-]{20,}\b"),
 ]
 
 
@@ -58,8 +65,13 @@ def _redact(msg: str) -> str:
     """Redact sensitive values (passwords, keys, tokens) from log messages."""
     for pattern in _REDACT_PATTERNS:
         msg = pattern.sub(
-            lambda m: m.group(1) + '***' + (m.group(3) if m.lastindex and m.lastindex >= 3 else '')
-            if m.lastindex else '***',
+            lambda m: (
+                m.group(1)
+                + "***"
+                + (m.group(3) if m.lastindex and m.lastindex >= 3 else "")
+                if m.lastindex
+                else "***"
+            ),
             msg,
         )
     return msg
@@ -69,57 +81,152 @@ def _redact(msg: str) -> str:
 
 SAFE_PREFIXES = [
     # git — specific subcommands only (excludes config, clone, submodule, filter-branch)
-    "git status", "git diff", "git log", "git show", "git branch", "git tag",
-    "git add", "git commit", "git checkout", "git switch", "git merge",
-    "git rebase", "git pull", "git push", "git fetch", "git stash",
-    "git blame", "git ls-files", "git remote", "git rev-parse",
-    "git describe", "git shortlog", "git cherry-pick",
-    "git reset --soft", "git reset --mixed", "git reset HEAD",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "git tag",
+    "git add",
+    "git commit",
+    "git checkout",
+    "git switch",
+    "git merge",
+    "git rebase",
+    "git pull",
+    "git push",
+    "git fetch",
+    "git stash",
+    "git blame",
+    "git ls-files",
+    "git remote",
+    "git rev-parse",
+    "git describe",
+    "git shortlog",
+    "git cherry-pick",
+    "git reset --soft",
+    "git reset --mixed",
+    "git reset HEAD",
     # filesystem read-only
-    "ls ", "dir ", "dir\t",
-    "cat ", "head ", "tail ",
-    "grep ", "rg ", "fd ", "find ",
-    "wc ", "file ", "stat ", "du ", "df ",
-    "pwd", "echo ",
-    "which ", "where ", "where.exe", "type ",
-    "env ", "printenv ",
+    "ls ",
+    "dir ",
+    "dir\t",
+    "cat ",
+    "head ",
+    "tail ",
+    "grep ",
+    "rg ",
+    "fd ",
+    "find ",
+    "wc ",
+    "file ",
+    "stat ",
+    "du ",
+    "df ",
+    "pwd",
+    "echo ",
+    "which ",
+    "where ",
+    "where.exe",
+    "type ",
+    "env ",
+    "printenv ",
     # pip — info + safe install modes only
-    "pip list", "pip show", "pip freeze",
-    "pip install -e ", "pip install -r ",
+    "pip list",
+    "pip show",
+    "pip freeze",
+    "pip install -e ",
+    "pip install -r ",
     # npm — info + known scripts
-    "npm ls", "npm info", "npm outdated",
-    "npm test", "npm run test", "npm run build", "npm run dev", "npm run start", "npm start",
-    "conda list", "pipx list",
+    "npm ls",
+    "npm info",
+    "npm outdated",
+    "npm test",
+    "npm run test",
+    "npm run build",
+    "npm run dev",
+    "npm run start",
+    "npm start",
+    "conda list",
+    "pipx list",
     # testing & linting
-    "pytest", "python -m pytest", "python3 -m pytest",
-    "jest ", "cargo test", "go test",
-    "ruff ", "flake8 ", "pylint ", "mypy ", "eslint ", "prettier ", "black ", "isort ",
+    "pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+    "jest ",
+    "cargo test",
+    "go test",
+    "ruff ",
+    "flake8 ",
+    "pylint ",
+    "mypy ",
+    "eslint ",
+    "prettier ",
+    "black ",
+    "isort ",
     # build tools
-    "cargo build", "cargo clippy", "go build", "tsc ",
+    "cargo build",
+    "cargo clippy",
+    "go build",
+    "tsc ",
     # make — specific conventional targets only (excludes arbitrary Makefile targets)
-    "make test", "make check", "make build", "make clean", "make install",
-    "make lint", "make format", "make dev",
+    "make test",
+    "make check",
+    "make build",
+    "make clean",
+    "make install",
+    "make lint",
+    "make format",
+    "make dev",
     # gh — specific subcommands only (excludes gh api, gh repo create/delete)
-    "gh pr ", "gh issue ", "gh repo view", "gh repo list",
-    "gh status", "gh auth status", "gh run list", "gh run view",
-    "jacked ", "claude ", "cd ",
+    "gh pr ",
+    "gh issue ",
+    "gh repo view",
+    "gh repo list",
+    "gh status",
+    "gh auth status",
+    "gh run list",
+    "gh run view",
+    "jacked ",
+    "claude ",
+    "cd ",
     # docker — read-only + safe compose subcommands (excludes compose exec/run)
-    "docker ps", "docker images", "docker logs ",
+    "docker ps",
+    "docker images",
+    "docker logs ",
     "docker build",
-    "docker compose up", "docker compose down", "docker compose build",
-    "docker compose logs", "docker compose ps",
+    "docker compose up",
+    "docker compose down",
+    "docker compose build",
+    "docker compose logs",
+    "docker compose ps",
     # windows
-    "powershell Get-Content", "powershell Get-ChildItem",
+    "powershell Get-Content",
+    "powershell Get-ChildItem",
     # npx REMOVED — downloads and executes arbitrary npm packages
 ]
 
 # Exact matches (command IS this, nothing more)
 SAFE_EXACT = {
-    "ls", "dir", "pwd", "env", "printenv", "git status", "git diff",
-    "git log", "git branch", "git stash list", "git fetch",
-    "pip list", "pip freeze",
-    "conda list", "npm ls", "npm test", "npm start",
-    "docker ps", "docker images",
+    "ls",
+    "dir",
+    "pwd",
+    "env",
+    "printenv",
+    "git status",
+    "git diff",
+    "git log",
+    "git branch",
+    "git stash list",
+    "git fetch",
+    "pip list",
+    "pip freeze",
+    "conda list",
+    "npm ls",
+    "npm test",
+    "npm start",
+    "docker ps",
+    "docker images",
     "true",
 }
 
@@ -127,36 +234,58 @@ SAFE_EXACT = {
 # e.g., C:/Users/jack/.conda/envs/krac_llm/python.exe → python
 # Uses \S* (not .*) so it only strips the path from the first token,
 # not from argument paths later in the command.
-PATH_STRIP_RE = re.compile(r'^(?:\S*[/\\])?([^/\\\s]+?)(?:\.exe)?(?:\s|$)', re.IGNORECASE)
+PATH_STRIP_RE = re.compile(
+    r"^(?:\S*[/\\])?([^/\\\s]+?)(?:\.exe)?(?:\s|$)", re.IGNORECASE
+)
 
 # Strip leading env var assignments: HOME=/x PATH="/y:$PATH" cmd → cmd
 ENV_ASSIGN_RE = re.compile(r"""^(?:\w+=(?:"[^"]*"|'[^']*'|\S+)\s+)+""")
 
 # Universal safe: any command that just asks for version or help
-VERSION_HELP_RE = re.compile(r'^\S+\s+(-[Vv]|--version|-h|--help)\s*$')
+VERSION_HELP_RE = re.compile(r"^\S+\s+(-[Vv]|--version|-h|--help)\s*$")
 
 # Shell operators that chain/pipe commands — compound commands are NOT safe for prefix matching
 # Lone & (background exec) is caught here; trailing & is pre-stripped by SAFE_REDIRECT_RE
-SHELL_OPERATOR_RE = re.compile(r'[;\n|`<>]|&&|(?<![&])&(?![&])|\$\(')
+SHELL_OPERATOR_RE = re.compile(r"[;\n|`<>]|&&|(?<![&])&(?![&])|\$\(")
 
 # Safe stderr redirects that should NOT trigger SHELL_OPERATOR_RE (2>&1, 2>/dev/null)
-SAFE_REDIRECT_RE = re.compile(r'\s+2>&1(?:\s+&)?\s*$|\s+2>/dev/null(?:\s+&)?\s*$|\s+&\s*$')
+SAFE_REDIRECT_RE = re.compile(
+    r"\s+2>&1(?:\s+&)?\s*$|\s+2>/dev/null(?:\s+&)?\s*$|\s+&\s*$"
+)
 
 # Safe: python -m with known safe modules only
 # No -c or -e patterns — arbitrary code execution can't be safely regex-matched
 SAFE_PYTHON_PATTERNS = [
-    re.compile(r'python[23]?(?:\.exe)?\s+-m\s+(?:pytest|pip|jacked|http\.server|json\.tool|venv|ensurepip)', re.IGNORECASE),
+    re.compile(
+        r"python[23]?(?:\.exe)?\s+-m\s+(?:pytest|pip|jacked|http\.server|json\.tool|venv|ensurepip)",
+        re.IGNORECASE,
+    ),
 ]
 
 # Pipe-specific safe lists — more restrictive than SAFE_PREFIXES.
 # Sources: commands that produce bounded, non-sensitive output.
 # Excluded: cat, echo, find, grep (standalone), env, printenv — data exfiltration risk.
 SAFE_PIPE_SOURCES = [
-    "git log", "git status", "git diff", "git show", "git branch", "git tag",
-    "git ls-files", "git remote", "git describe", "git shortlog",
-    "ls ", "dir ", "pip list", "pip show", "pip freeze",
-    "npm ls", "npm info", "npm outdated",
-    "docker ps", "docker images",
+    "git log",
+    "git status",
+    "git diff",
+    "git show",
+    "git branch",
+    "git tag",
+    "git ls-files",
+    "git remote",
+    "git describe",
+    "git shortlog",
+    "ls ",
+    "dir ",
+    "pip list",
+    "pip show",
+    "pip freeze",
+    "npm ls",
+    "npm info",
+    "npm outdated",
+    "docker ps",
+    "docker images",
     "jacked ",
 ]
 
@@ -165,7 +294,7 @@ SAFE_PIPE_SOURCES = [
 SAFE_PIPE_SINKS = {"head", "tail", "wc", "grep", "sort", "uniq", "cut", "tr"}
 
 # Regex to split on pipe (|) but NOT logical OR (||)
-PIPE_SPLIT_RE = re.compile(r'(?<!\|)\|(?!\|)')
+PIPE_SPLIT_RE = re.compile(r"(?<!\|)\|(?!\|)")
 
 # Commands with these anywhere are dangerous
 # --- Sensitive file/directory rules for path safety ---
@@ -181,67 +310,69 @@ _END = r"""["']?$"""
 
 SENSITIVE_FILE_RULES = {
     "env": {
-        "pattern": re.compile(_SEP + r'\.env(?:\..+)?' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.env(?:\..+)?" + _END, re.IGNORECASE),
         "label": ".env files",
         "desc": ".env, .env.local, .env.production — typically contain API keys and secrets",
     },
     "secrets": {
-        "pattern": re.compile(_SEP + r'\.?secrets?(?:\..+)?' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.?secrets?(?:\..+)?" + _END, re.IGNORECASE),
         "label": "Secrets files",
         "desc": ".secret, .secrets, secrets.json",
     },
     "credentials": {
-        "pattern": re.compile(_SEP + r'\.?credentials(?:\..+)?' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.?credentials(?:\..+)?" + _END, re.IGNORECASE),
         "label": "Credentials files",
         "desc": "credentials.json, .credentials",
     },
     "ssh_keys": {
-        "pattern": re.compile(_SEP + r'id_(?:rsa|ed25519|ecdsa|dsa)\b', re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"id_(?:rsa|ed25519|ecdsa|dsa)\b", re.IGNORECASE),
         "label": "SSH private keys",
         "desc": "id_rsa, id_ed25519, id_ecdsa",
     },
     "netrc": {
-        "pattern": re.compile(_SEP + r'\.netrc' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.netrc" + _END, re.IGNORECASE),
         "label": ".netrc",
         "desc": "Network authentication credentials",
     },
     "git_credentials": {
-        "pattern": re.compile(_SEP + r'\.git-credentials' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.git-credentials" + _END, re.IGNORECASE),
         "label": ".git-credentials",
         "desc": "Stored git passwords/tokens",
     },
     "npmrc": {
-        "pattern": re.compile(_SEP + r'\.npmrc' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.npmrc" + _END, re.IGNORECASE),
         "label": ".npmrc",
         "desc": "npm auth tokens",
     },
     "pypirc": {
-        "pattern": re.compile(_SEP + r'\.pypirc' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.pypirc" + _END, re.IGNORECASE),
         "label": ".pypirc",
         "desc": "PyPI upload tokens",
     },
     "htpasswd": {
-        "pattern": re.compile(_SEP + r'\.?htpasswd\b', re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.?htpasswd\b", re.IGNORECASE),
         "label": "htpasswd",
         "desc": "Apache password files",
     },
     "pkcs12": {
-        "pattern": re.compile(r'\.p12' + _END + r'|\.pfx' + _END, re.IGNORECASE),
+        "pattern": re.compile(r"\.p12" + _END + r"|\.pfx" + _END, re.IGNORECASE),
         "label": "PKCS12 keystores",
         "desc": ".p12, .pfx certificate bundles with private keys",
     },
     "token_files": {
-        "pattern": re.compile(_SEP + r'\.?token(?:\.(?:json|txt|yml|yaml))?' + _END, re.IGNORECASE),
+        "pattern": re.compile(
+            _SEP + r"\.?token(?:\.(?:json|txt|yml|yaml))?" + _END, re.IGNORECASE
+        ),
         "label": "Token files",
         "desc": "token.json, .token, token.txt",
     },
     "keystore": {
-        "pattern": re.compile(_SEP + r'\.?keystore(?:\..+)?' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.?keystore(?:\..+)?" + _END, re.IGNORECASE),
         "label": "Keystores",
         "desc": "Java keystores, Android signing keystores",
     },
     "master_key": {
-        "pattern": re.compile(_SEP + r'master\.key' + _END, re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"master\.key" + _END, re.IGNORECASE),
         "label": "master.key",
         "desc": "Rails master encryption key",
     },
@@ -249,22 +380,22 @@ SENSITIVE_FILE_RULES = {
 
 SENSITIVE_DIR_RULES = {
     "ssh_dir": {
-        "pattern": re.compile(_SEP + r'\.ssh(?:[/\\]|' + _END + r')', re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.ssh(?:[/\\]|" + _END + r")", re.IGNORECASE),
         "label": ".ssh/ directory",
         "desc": "SSH keys, config, known_hosts",
     },
     "aws_dir": {
-        "pattern": re.compile(_SEP + r'\.aws(?:[/\\]|' + _END + r')', re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.aws(?:[/\\]|" + _END + r")", re.IGNORECASE),
         "label": ".aws/ directory",
         "desc": "AWS credentials and config",
     },
     "kube_dir": {
-        "pattern": re.compile(_SEP + r'\.kube(?:[/\\]|' + _END + r')', re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.kube(?:[/\\]|" + _END + r")", re.IGNORECASE),
         "label": ".kube/ directory",
         "desc": "Kubernetes cluster credentials",
     },
     "gnupg_dir": {
-        "pattern": re.compile(_SEP + r'\.gnupg(?:[/\\]|' + _END + r')', re.IGNORECASE),
+        "pattern": re.compile(_SEP + r"\.gnupg(?:[/\\]|" + _END + r")", re.IGNORECASE),
         "label": ".gnupg/ directory",
         "desc": "GPG private keys and keyrings",
     },
@@ -272,42 +403,48 @@ SENSITIVE_DIR_RULES = {
 
 
 DENY_PATTERNS = [
-    re.compile(r'\bsudo[\s\t]'),
-    re.compile(r'\bsu\s+-'),
-    re.compile(r'\brunas\s'),
-    re.compile(r'\bdoas\s'),
-    re.compile(r'\brm\s+-rf\s+/'),
-    re.compile(r'\brm\s+-rf\s+~'),
-    re.compile(r'\brm\s+-rf\s+\$HOME'),
-    re.compile(r'\brm\s+-rf\s+[A-Z]:\\', re.IGNORECASE),
-    re.compile(r'\bdd\s+if='),
-    re.compile(r'\bmkfs\b'),
-    re.compile(r'\bfdisk\b'),
-    re.compile(r'\bdiskpart\b'),
-    re.compile(r'\bformat\s+[A-Z]:', re.IGNORECASE),
+    re.compile(r"\bsudo[\s\t]"),
+    re.compile(r"\bsu\s+-"),
+    re.compile(r"\brunas\s"),
+    re.compile(r"\bdoas\s"),
+    re.compile(r"\brm\s+-rf\s+/"),
+    re.compile(r"\brm\s+-rf\s+~"),
+    re.compile(r"\brm\s+-rf\s+\$HOME"),
+    re.compile(r"\brm\s+-rf\s+[A-Z]:\\", re.IGNORECASE),
+    re.compile(r"\bdd\s+if="),
+    re.compile(r"\bmkfs\b"),
+    re.compile(r"\bfdisk\b"),
+    re.compile(r"\bdiskpart\b"),
+    re.compile(r"\bformat\s+[A-Z]:", re.IGNORECASE),
     # ANY command reading sensitive credential/key paths (not just cat)
-    re.compile(r'(?:cat|head|tail|less|more|strings|grep|awk|sed|type|Get-Content)\s+.*(?:~/?\.|/home/\w+/\.|\.)(?:ssh|aws|kube|gnupg)/', re.IGNORECASE),
-    re.compile(r'(?:cat|head|tail|less|more|strings|grep|awk|sed|type|Get-Content)\s+.*/etc/(?:passwd|shadow|sudoers)', re.IGNORECASE),
+    re.compile(
+        r"(?:cat|head|tail|less|more|strings|grep|awk|sed|type|Get-Content)\s+.*(?:~/?\.|/home/\w+/\.|\.)(?:ssh|aws|kube|gnupg)/",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:cat|head|tail|less|more|strings|grep|awk|sed|type|Get-Content)\s+.*/etc/(?:passwd|shadow|sudoers)",
+        re.IGNORECASE,
+    ),
     # base64 decode in any form (pipe, here-string, file) — let LLM decide if legitimate
-    re.compile(r'\bbase64\s+(?:-d|--decode)'),
-    re.compile(r'powershell\s+-[Ee](?:ncodedCommand)?\s'),
-    re.compile(r'\bnc\s+-l'),
-    re.compile(r'\bncat\b.*-l'),
-    re.compile(r'\b(?:bash|sh|zsh|dash|ksh)\s+-i\s+>&\s+/dev/tcp'),
-    re.compile(r'\breg\s+(?:add|delete)\b', re.IGNORECASE),
-    re.compile(r'\bcrontab\b'),
-    re.compile(r'\bschtasks\b', re.IGNORECASE),
-    re.compile(r'\bchmod\s+777\b'),
-    re.compile(r'\bkill\s+-9\s+1\b'),
+    re.compile(r"\bbase64\s+(?:-d|--decode)"),
+    re.compile(r"powershell\s+-[Ee](?:ncodedCommand)?\s"),
+    re.compile(r"\bnc\s+-l"),
+    re.compile(r"\bncat\b.*-l"),
+    re.compile(r"\b(?:bash|sh|zsh|dash|ksh)\s+-i\s+>&\s+/dev/tcp"),
+    re.compile(r"\breg\s+(?:add|delete)\b", re.IGNORECASE),
+    re.compile(r"\bcrontab\b"),
+    re.compile(r"\bschtasks\b", re.IGNORECASE),
+    re.compile(r"\bchmod\s+777\b"),
+    re.compile(r"\bkill\s+-9\s+1\b"),
     # psql with obviously destructive SQL inline
     re.compile(r'psql\b.*-c\s+["\']?\s*(?:DROP|TRUNCATE)\b', re.IGNORECASE),
     # Scripting language eval flags — arbitrary code execution
-    re.compile(r'\bperl\s+-e\b'),
-    re.compile(r'\bruby\s+-e\b'),
+    re.compile(r"\bperl\s+-e\b"),
+    re.compile(r"\bruby\s+-e\b"),
     # Destructive database ops (additional forms)
     re.compile(r'\bpsql\b.*--command\s+["\']?\s*(?:DROP|TRUNCATE)\b', re.IGNORECASE),
     re.compile(r'\bmysql\b.*-e\s+["\']?\s*(?:DROP|TRUNCATE)\b', re.IGNORECASE),
-    re.compile(r'\bmongo\b.*--eval\s', re.IGNORECASE),
+    re.compile(r"\bmongo\b.*--eval\s", re.IGNORECASE),
 ]
 
 SECURITY_PROMPT = r"""You are a security gatekeeper. Evaluate whether this Bash command is safe to auto-approve.
@@ -356,7 +493,9 @@ _PLACEHOLDER_RE = re.compile(r"\{(command|cwd|file_context|watched_paths)\}")
 _REQUIRED_PLACEHOLDERS = {"{command}", "{cwd}", "{file_context}", "{watched_paths}"}
 
 
-def _substitute_prompt(template: str, command: str, cwd: str, file_context: str, watched_paths: str = "") -> str:
+def _substitute_prompt(
+    template: str, command: str, cwd: str, file_context: str, watched_paths: str = ""
+) -> str:
     """Single-pass placeholder substitution that ignores other {braces}.
 
     Unlike str.format(), this does NOT interpret {safe}, {reason}, etc.
@@ -364,7 +503,12 @@ def _substitute_prompt(template: str, command: str, cwd: str, file_context: str,
     Single-pass means substituted values are never re-scanned, preventing
     cross-contamination if a command contains literal '{cwd}' etc.
     """
-    replacements = {"command": command, "cwd": cwd, "file_context": file_context, "watched_paths": watched_paths}
+    replacements = {
+        "command": command,
+        "cwd": cwd,
+        "file_context": file_context,
+        "watched_paths": watched_paths,
+    }
     return _PLACEHOLDER_RE.sub(lambda m: replacements[m.group(1)], template)
 
 
@@ -377,7 +521,14 @@ def _load_prompt() -> str:
     if PROMPT_PATH.exists():
         try:
             custom = PROMPT_PATH.read_text(encoding="utf-8").strip()
-            if _REQUIRED_PLACEHOLDERS.issubset(set(re.findall(r"\{command\}|\{cwd\}|\{file_context\}|\{watched_paths\}", custom))):
+            if _REQUIRED_PLACEHOLDERS.issubset(
+                set(
+                    re.findall(
+                        r"\{command\}|\{cwd\}|\{file_context\}|\{watched_paths\}",
+                        custom,
+                    )
+                )
+            ):
                 return custom
             log("WARNING: Custom prompt missing required placeholders, using built-in")
         except Exception:
@@ -393,7 +544,9 @@ _session_tag = ""  # Set in main(), used by _write_log()
 def _write_log(msg: str):
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {_session_tag}{_redact(msg)}\n")
+            f.write(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {_session_tag}{_redact(msg)}\n"
+            )
     except Exception:
         pass
 
@@ -410,17 +563,24 @@ def log_debug(msg: str):
 def _increment_perms_counter():
     """Increment perms auto-approve counter, nudge every AUDIT_NUDGE_INTERVAL."""
     try:
-        state = json.loads(STATE_PATH.read_text(encoding="utf-8")) if STATE_PATH.exists() else {}
+        state = (
+            json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            if STATE_PATH.exists()
+            else {}
+        )
         count = state.get("perms_count", 0) + 1
         state["perms_count"] = count
         STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
         if count % AUDIT_NUDGE_INTERVAL == 0:
-            log(f"TIP: {count} commands auto-approved via permission rules since last audit. Run 'jacked gatekeeper audit --log' to review.")
+            log(
+                f"TIP: {count} commands auto-approved via permission rules since last audit. Run 'jacked gatekeeper audit --log' to review."
+            )
     except Exception:
         pass
 
 
 # --- Permission rules from Claude settings ---
+
 
 def _load_permissions(settings_path: Path) -> list[str]:
     """Load Bash permission allow patterns from a settings JSON file."""
@@ -429,7 +589,8 @@ def _load_permissions(settings_path: Path) -> list[str]:
             return []
         data = json.loads(settings_path.read_text(encoding="utf-8"))
         return [
-            p for p in data.get("permissions", {}).get("allow", [])
+            p
+            for p in data.get("permissions", {}).get("allow", [])
             if isinstance(p, str) and p.startswith("Bash(")
         ]
     except Exception:
@@ -477,6 +638,7 @@ def check_permissions(command: str, cwd: str) -> bool:
 
 # --- Local pattern evaluation ---
 
+
 def _get_base_command(command: str) -> str:
     """Extract the base command name, stripping path prefixes.
 
@@ -486,14 +648,14 @@ def _get_base_command(command: str) -> str:
     m = PATH_STRIP_RE.match(stripped)
     if m:
         base = m.group(1)
-        rest = stripped[m.end():].lstrip() if m.end() < len(stripped) else ""
+        rest = stripped[m.end() :].lstrip() if m.end() < len(stripped) else ""
         return f"{base} {rest}".strip() if rest else base
     return stripped
 
 
 def _strip_env_prefix(cmd: str) -> str:
     """Strip leading env var assignments: HOME=/x PATH="/y" cmd → cmd"""
-    return ENV_ASSIGN_RE.sub('', cmd).strip()
+    return ENV_ASSIGN_RE.sub("", cmd).strip()
 
 
 def _is_pipe_safe(cmd: str) -> bool:
@@ -506,16 +668,15 @@ def _is_pipe_safe(cmd: str) -> bool:
     if len(pipe_parts) < 2:
         return False
 
-    source = SAFE_REDIRECT_RE.sub('', pipe_parts[0]).strip()
-    source_ok = (
-        any(source.startswith(p) for p in SAFE_PIPE_SOURCES)
-        or any(p.search(source) for p in SAFE_PYTHON_PATTERNS)
+    source = SAFE_REDIRECT_RE.sub("", pipe_parts[0]).strip()
+    source_ok = any(source.startswith(p) for p in SAFE_PIPE_SOURCES) or any(
+        p.search(source) for p in SAFE_PYTHON_PATTERNS
     )
     if not source_ok:
         return False
 
     for sink_part in pipe_parts[1:]:
-        sink = SAFE_REDIRECT_RE.sub('', sink_part).strip()
+        sink = SAFE_REDIRECT_RE.sub("", sink_part).strip()
         if not sink:
             continue
         sink_base = sink.split()[0] if sink.split() else ""
@@ -563,19 +724,21 @@ def local_evaluate(command: str) -> str | None:
             return "NO"
 
     # Strip safe stderr redirects before checking for shell operators
-    cmd_for_ops = SAFE_REDIRECT_RE.sub('', cmd)
+    cmd_for_ops = SAFE_REDIRECT_RE.sub("", cmd)
 
     # Try compound command evaluation: if ONLY && and || present, split and check each part
     # Semicolons, backticks, $() still go to LLM — only &&, ||, and | are safe to split
-    neutralized = cmd_for_ops.replace('&&', '\x00').replace('||', '\x00').replace('|', '\x00')
+    neutralized = (
+        cmd_for_ops.replace("&&", "\x00").replace("||", "\x00").replace("|", "\x00")
+    )
     # Strip safe redirects from neutralized string too (2>&1 between operators has a >)
-    neutralized_clean = re.sub(r'\s+2>&1|\s+2>/dev/null', '', neutralized)
-    if '\x00' in neutralized_clean and not SHELL_OPERATOR_RE.search(neutralized_clean):
-        parts = re.split(r'&&|\|\|', cmd_for_ops)
+    neutralized_clean = re.sub(r"\s+2>&1|\s+2>/dev/null", "", neutralized)
+    if "\x00" in neutralized_clean and not SHELL_OPERATOR_RE.search(neutralized_clean):
+        parts = re.split(r"&&|\|\|", cmd_for_ops)
         all_safe = True
         for part in parts:
             # Strip safe redirects from each sub-command (2>&1 may not be at overall end)
-            part = SAFE_REDIRECT_RE.sub('', part).strip()
+            part = SAFE_REDIRECT_RE.sub("", part).strip()
             if not part:
                 continue
             # If this sub-part has a pipe, evaluate with restricted pipe handler
@@ -611,6 +774,7 @@ def local_evaluate(command: str) -> str | None:
 
 # --- File context for API/CLI ---
 
+
 def extract_file_paths(command: str) -> list[str]:
     EXT_RE = re.compile(r'[^\s"\']+\.(?:py|sql|sh|js|ts|bat|ps1|rb|go|rs)\b')
     return EXT_RE.findall(command)
@@ -618,7 +782,9 @@ def extract_file_paths(command: str) -> list[str]:
 
 def _sanitize_file_content(content: str) -> str:
     """Escape file boundary markers to prevent prompt injection via file contents."""
-    return content.replace("--- FILE:", "--- FILE\\:").replace("--- END FILE ---", "--- END FILE \\---")
+    return content.replace("--- FILE:", "--- FILE\\:").replace(
+        "--- END FILE ---", "--- END FILE \\---"
+    )
 
 
 def read_file_context(command: str, cwd: str) -> str:
@@ -629,7 +795,11 @@ def read_file_context(command: str, cwd: str) -> str:
     cwd_resolved = Path(cwd).resolve()
     for rel_path in paths[:3]:
         try:
-            full_path = Path(cwd) / rel_path if not Path(rel_path).is_absolute() else Path(rel_path)
+            full_path = (
+                Path(cwd) / rel_path
+                if not Path(rel_path).is_absolute()
+                else Path(rel_path)
+            )
             full_path = full_path.resolve()
             # Reject paths that escape the working directory
             try:
@@ -640,15 +810,22 @@ def read_file_context(command: str, cwd: str) -> str:
             if full_path.exists() and full_path.stat().st_size <= MAX_FILE_READ:
                 content = full_path.read_text(encoding="utf-8", errors="replace")
                 content = _sanitize_file_content(content)
-                context_parts.append(f"--- FILE: {rel_path} ---\n{content}\n--- END FILE ---")
+                context_parts.append(
+                    f"--- FILE: {rel_path} ---\n{content}\n--- END FILE ---"
+                )
         except Exception:
             continue
     if not context_parts:
         return ""
-    return "\nREFERENCED FILE CONTENTS (evaluate what this code does):\n" + "\n".join(context_parts) + "\n"
+    return (
+        "\nREFERENCED FILE CONTENTS (evaluate what this code does):\n"
+        + "\n".join(context_parts)
+        + "\n"
+    )
 
 
 # --- Gatekeeper config from DB ---
+
 
 def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     """Read gatekeeper config from SQLite settings table.
@@ -679,6 +856,7 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     try:
         conn = _sqlite3.connect(str(target), timeout=2.0)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         cursor = conn.execute(
             "SELECT key, value FROM settings WHERE key IN (?, ?, ?)",
             ("gatekeeper.model", "gatekeeper.eval_method", "gatekeeper.api_key"),
@@ -720,6 +898,7 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
 
 # --- Path safety config from DB ---
 
+
 def _read_path_safety_config(db_path: Path | None = None) -> dict:
     """Read path safety config from SQLite settings table.
 
@@ -738,7 +917,12 @@ def _read_path_safety_config(db_path: Path | None = None) -> dict:
     """
     import sqlite3 as _sqlite3
 
-    defaults = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []}
+    defaults = {
+        "enabled": True,
+        "allowed_paths": [],
+        "disabled_patterns": [],
+        "watched_paths": [],
+    }
 
     target = db_path or DB_PATH
     if not target.exists():
@@ -747,6 +931,7 @@ def _read_path_safety_config(db_path: Path | None = None) -> dict:
     try:
         conn = _sqlite3.connect(str(target), timeout=2.0)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         cursor = conn.execute(
             "SELECT value FROM settings WHERE key = ?",
             ("gatekeeper.path_safety",),
@@ -767,6 +952,7 @@ def _read_path_safety_config(db_path: Path | None = None) -> dict:
 
 
 # --- Path safety checks ---
+
 
 def _is_path_sensitive(path_str: str, disabled_patterns: list[str]) -> str | None:
     """Check if path matches any enabled sensitive file/dir pattern.
@@ -795,7 +981,9 @@ def _is_path_sensitive(path_str: str, disabled_patterns: list[str]) -> str | Non
     return None
 
 
-def _is_outside_project(file_path: str, cwd: str, allowed_paths: list[str]) -> str | None:
+def _is_outside_project(
+    file_path: str, cwd: str, allowed_paths: list[str]
+) -> str | None:
     """Check if path is outside CWD or on different drive. Respects allowed_paths.
 
     Returns reason string if outside, None if OK.
@@ -826,7 +1014,9 @@ def _is_outside_project(file_path: str, cwd: str, allowed_paths: list[str]) -> s
         # Windows: different drive letter
         if target.drive and cwd_resolved.drive:
             if target.drive.upper() != cwd_resolved.drive.upper():
-                return f"different drive ({target.drive} vs project {cwd_resolved.drive})"
+                return (
+                    f"different drive ({target.drive} vs project {cwd_resolved.drive})"
+                )
 
         # Outside CWD tree
         try:
@@ -847,6 +1037,7 @@ def _normalize_path(p: str) -> str:
     '/home/user/project'
     """
     import os as _os
+
     result = p.replace("\\", "/").rstrip("/")
     if _os.name == "nt":
         result = result.lower()
@@ -945,7 +1136,7 @@ def _check_bash_path_safety(command: str, cwd: str, config: dict) -> str | None:
     watched = config.get("watched_paths", [])
     if watched:
         # Extract absolute paths: Windows (C:/... or C:\...) and Unix (/...)
-        abs_paths = re.findall(r'[A-Za-z]:[/\\]\S*|/\S+', command)
+        abs_paths = re.findall(r"[A-Za-z]:[/\\]\S*|/\S+", command)
         for ap in abs_paths:
             # Strip trailing quotes/parens that regex may have captured
             ap = ap.rstrip("\"'`);,")
@@ -955,21 +1146,29 @@ def _check_bash_path_safety(command: str, cwd: str, config: dict) -> str | None:
 
     # Absolute paths on different drive (Windows)
     try:
-        cwd_drive = Path(cwd).resolve().drive.upper() if Path(cwd).resolve().drive else ""
+        cwd_drive = (
+            Path(cwd).resolve().drive.upper() if Path(cwd).resolve().drive else ""
+        )
     except Exception:
         cwd_drive = ""
     if cwd_drive:
         allowed = config.get("allowed_paths", [])
-        drive_paths = re.findall(r'\b([A-Za-z]):[/\\]\S*', command)
+        drive_paths = re.findall(r"\b([A-Za-z]):[/\\]\S*", command)
         for match in drive_paths:
             drive = match.upper() if isinstance(match, str) else match[0].upper()
             if drive != cwd_drive[0]:
-                if not any(ap.replace("\\", "/").upper().startswith(f"{drive}:") for ap in allowed):
-                    return f"references different drive ({drive}: vs project {cwd_drive})"
+                if not any(
+                    ap.replace("\\", "/").upper().startswith(f"{drive}:")
+                    for ap in allowed
+                ):
+                    return (
+                        f"references different drive ({drive}: vs project {cwd_drive})"
+                    )
     return None
 
 
 # --- File tool handler (Read/Edit/Write/Grep) ---
+
 
 def _emit_deny(message: str):
     """Emit a deny decision for PreToolUse hooks."""
@@ -1018,7 +1217,7 @@ def _check_file_tool_permissions(tool_name: str, file_path: str) -> bool:
     """
     patterns = _load_tool_permissions(tool_name)
     for pat in patterns:
-        inner = pat[len(tool_name) + 1:]  # strip 'Read('
+        inner = pat[len(tool_name) + 1 :]  # strip 'Read('
         if inner.endswith(")"):
             inner = inner[:-1]
         if inner.endswith(":*"):
@@ -1030,7 +1229,9 @@ def _check_file_tool_permissions(tool_name: str, file_path: str) -> bool:
     return bool(patterns) and any(p == tool_name for p in patterns)
 
 
-def _handle_file_tool(tool_name: str, tool_input: dict, cwd: str, session_id: str) -> None:
+def _handle_file_tool(
+    tool_name: str, tool_input: dict, cwd: str, session_id: str
+) -> None:
     """Handle Read/Edit/Write/Grep/Glob/NotebookEdit PreToolUse events.
 
     Decision flow (security checks FIRST, matching Bash handler invariant):
@@ -1051,13 +1252,21 @@ def _handle_file_tool(tool_name: str, tool_input: dict, cwd: str, session_id: st
         log(f"PATH SAFETY [{tool_name}]: EXCEPTION {type(exc).__name__}: {exc}")
 
 
-def _handle_file_tool_inner(tool_name: str, tool_input: dict, cwd: str, session_id: str) -> None:
+def _handle_file_tool_inner(
+    tool_name: str, tool_input: dict, cwd: str, session_id: str
+) -> None:
     """Inner implementation — wrapped by _handle_file_tool for crash safety."""
     start = time.time()
-    repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace("\\", "/")
+    repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace(
+        "\\", "/"
+    )
 
     # Extract file path from tool input (different tools use different keys)
-    file_path = tool_input.get("file_path", "") or tool_input.get("path", "") or tool_input.get("notebook_path", "")
+    file_path = (
+        tool_input.get("file_path", "")
+        or tool_input.get("path", "")
+        or tool_input.get("notebook_path", "")
+    )
     if not file_path:
         _record_hook_execution((time.time() - start) * 1000, session_id, repo_path)
         return  # no path to check, allow
@@ -1065,7 +1274,9 @@ def _handle_file_tool_inner(tool_name: str, tool_input: dict, cwd: str, session_
     # Reject null bytes — never a legitimate file path, can bypass regex checks
     if "\x00" in file_path:
         log(f"PATH SAFETY [{tool_name}]: DENY null byte in path")
-        _emit_deny(f"Path safety: invalid path (null byte) — {Path(file_path.replace(chr(0), '')).name}")
+        _emit_deny(
+            f"Path safety: invalid path (null byte) — {Path(file_path.replace(chr(0), '')).name}"
+        )
         return
 
     # Step 1: Path safety check FIRST — security always wins over permissions
@@ -1074,16 +1285,36 @@ def _handle_file_tool_inner(tool_name: str, tool_input: dict, cwd: str, session_
     if reason:
         elapsed = time.time() - start
         msg = f"Path safety: {reason} — {Path(file_path).name}"
-        log(f"PATH SAFETY [{tool_name}]: DENY {file_path[:100]} — {reason} ({elapsed:.3f}s)")
-        _record_decision("DENY", f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", reason, elapsed * 1000, session_id, repo_path)
+        log(
+            f"PATH SAFETY [{tool_name}]: DENY {file_path[:100]} — {reason} ({elapsed:.3f}s)"
+        )
+        _record_decision(
+            "DENY",
+            f"[{tool_name}] {file_path[:200]}",
+            "PATH_SAFETY",
+            reason,
+            elapsed * 1000,
+            session_id,
+            repo_path,
+        )
         _emit_deny(msg)
         return
 
     # Step 2: Check if already approved via permission rules
     if _check_file_tool_permissions(tool_name, file_path):
         elapsed = time.time() - start
-        log(f"PATH SAFETY [{tool_name}]: PERMS ALLOW {file_path[:100]} ({elapsed:.3f}s)")
-        _record_decision("ALLOW", f"[{tool_name}] {file_path[:200]}", "PERMS", None, elapsed * 1000, session_id, repo_path)
+        log(
+            f"PATH SAFETY [{tool_name}]: PERMS ALLOW {file_path[:100]} ({elapsed:.3f}s)"
+        )
+        _record_decision(
+            "ALLOW",
+            f"[{tool_name}] {file_path[:200]}",
+            "PERMS",
+            None,
+            elapsed * 1000,
+            session_id,
+            repo_path,
+        )
         emit_allow()
         return
 
@@ -1101,10 +1332,19 @@ def _handle_file_tool_inner(tool_name: str, tool_input: dict, cwd: str, session_
     elapsed = time.time() - start
     log_debug(f"PATH SAFETY [{tool_name}]: ALLOW {file_path[:100]} ({elapsed:.3f}s)")
     emit_allow()
-    _record_decision("ALLOW", f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", None, elapsed * 1000, session_id, repo_path)
+    _record_decision(
+        "ALLOW",
+        f"[{tool_name}] {file_path[:200]}",
+        "PATH_SAFETY",
+        None,
+        elapsed * 1000,
+        session_id,
+        repo_path,
+    )
 
 
 # --- Path safety metadata export ---
+
 
 def get_path_safety_rules_metadata() -> dict:
     """Return metadata about all sensitive file/dir rules for UI display.
@@ -1118,12 +1358,19 @@ def get_path_safety_rules_metadata() -> dict:
     '.env files'
     """
     return {
-        "file_rules": {k: {"label": v["label"], "desc": v["desc"]} for k, v in SENSITIVE_FILE_RULES.items()},
-        "dir_rules": {k: {"label": v["label"], "desc": v["desc"]} for k, v in SENSITIVE_DIR_RULES.items()},
+        "file_rules": {
+            k: {"label": v["label"], "desc": v["desc"]}
+            for k, v in SENSITIVE_FILE_RULES.items()
+        },
+        "dir_rules": {
+            k: {"label": v["label"], "desc": v["desc"]}
+            for k, v in SENSITIVE_DIR_RULES.items()
+        },
     }
 
 
 # --- API / CLI evaluation ---
+
 
 def evaluate_via_api(prompt: str, model: str = MODEL, api_key: str = "") -> str | None:
     try:
@@ -1168,6 +1415,7 @@ def evaluate_via_cli(prompt: str, model_short: str = "haiku") -> str | None:
 
 # --- LLM response parsing ---
 
+
 def parse_llm_response(response: str) -> tuple[bool | None, str]:
     """Parse LLM response (JSON or text fallback). Returns (safe, reason).
 
@@ -1203,6 +1451,7 @@ def parse_llm_response(response: str) -> tuple[bool | None, str]:
 
 # --- Output helpers ---
 
+
 def emit_allow():
     output = {
         "hookSpecificOutput": {
@@ -1219,19 +1468,28 @@ def _record_hook_execution(elapsed_ms, session_id, repo_path):
 
     def _do_write():
         import sqlite3 as _sqlite3
-        from datetime import datetime as _dt
+        from datetime import datetime as _dt, timezone as _tz
+
         target = DB_PATH
         if not target.exists():
             return
         try:
             conn = _sqlite3.connect(str(target), timeout=0.5)
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
             conn.execute(
                 """INSERT INTO hook_executions
                    (hook_type, hook_name, timestamp, session_id, success, duration_ms, repo_path)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                ("PreToolUse", "security_gatekeeper", _dt.utcnow().isoformat(),
-                 session_id, True, elapsed_ms, repo_path),
+                (
+                    "PreToolUse",
+                    "security_gatekeeper",
+                    _dt.now(_tz.utc).isoformat(),
+                    session_id,
+                    True,
+                    elapsed_ms,
+                    repo_path,
+                ),
             )
             conn.commit()
             conn.close()
@@ -1246,24 +1504,37 @@ def _record_hook_execution(elapsed_ms, session_id, repo_path):
         pass
 
 
-def _record_decision(decision, command, method, reason, elapsed_ms, session_id, repo_path):
+def _record_decision(
+    decision, command, method, reason, elapsed_ms, session_id, repo_path
+):
     """Fire-and-forget DB write in a daemon thread. Never blocks, never crashes."""
     import threading
 
     def _do_write():
         import sqlite3 as _sqlite3
-        from datetime import datetime as _dt
+        from datetime import datetime as _dt, timezone as _tz
+
         target = DB_PATH
         if not target.exists():
             return
         try:
             conn = _sqlite3.connect(str(target), timeout=0.5)
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
             conn.execute(
                 """INSERT INTO gatekeeper_decisions
                    (timestamp, command, decision, method, reason, elapsed_ms, session_id, repo_path)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (_dt.utcnow().isoformat(), (command or "")[:1000], decision, method, reason, elapsed_ms, session_id, repo_path),
+                (
+                    _dt.now(_tz.utc).isoformat(),
+                    (command or "")[:1000],
+                    decision,
+                    method,
+                    reason,
+                    elapsed_ms,
+                    session_id,
+                    repo_path,
+                ),
             )
             conn.commit()
             conn.close()
@@ -1282,6 +1553,7 @@ def _record_decision(decision, command, method, reason, elapsed_ms, session_id, 
 
 # --- Main ---
 
+
 def main():
     start = time.time()
 
@@ -1293,7 +1565,9 @@ def main():
     tool_name = hook_input.get("tool_name", "Bash")
     tool_input = hook_input.get("tool_input", {})
     cwd = hook_input.get("cwd", "")
-    repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace("\\", "/")
+    repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace(
+        "\\", "/"
+    )
 
     global _session_tag
     sid = hook_input.get("session_id", "")
@@ -1319,7 +1593,15 @@ def main():
             elapsed = time.time() - start
             log(f"DENY MATCH ({elapsed:.3f}s)")
             log(f"DECISION: ASK USER ({elapsed:.3f}s)")
-            _record_decision("ASK_USER", command, "DENY_PATTERN", pattern.pattern[:200], elapsed * 1000, sid, repo_path)
+            _record_decision(
+                "ASK_USER",
+                command,
+                "DENY_PATTERN",
+                pattern.pattern[:200],
+                elapsed * 1000,
+                sid,
+                repo_path,
+            )
             sys.exit(0)
 
     # Tier 1: Path safety — deterministic check for sensitive files
@@ -1332,7 +1614,15 @@ def main():
         elapsed = time.time() - start
         log(f"PATH SAFETY [Bash]: {bash_path_reason} ({elapsed:.3f}s)")
         log(f"DECISION: ASK USER ({elapsed:.3f}s)")
-        _record_decision("ASK_USER", command, "PATH_SAFETY", bash_path_reason, elapsed * 1000, sid, repo_path)
+        _record_decision(
+            "ASK_USER",
+            command,
+            "PATH_SAFETY",
+            bash_path_reason,
+            elapsed * 1000,
+            sid,
+            repo_path,
+        )
         sys.exit(0)  # silent exit → Claude Code asks user
 
     # Floor check: even with path safety disabled, never auto-approve commands
@@ -1342,14 +1632,34 @@ def main():
         for rule in SENSITIVE_FILE_RULES.values():
             if rule["pattern"].search(command):
                 elapsed = time.time() - start
-                log(f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)")
-                _record_decision("ASK_USER", command, "PATH_SAFETY_FLOOR", rule["label"], elapsed * 1000, sid, repo_path)
+                log(
+                    f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)"
+                )
+                _record_decision(
+                    "ASK_USER",
+                    command,
+                    "PATH_SAFETY_FLOOR",
+                    rule["label"],
+                    elapsed * 1000,
+                    sid,
+                    repo_path,
+                )
                 sys.exit(0)
         for rule in SENSITIVE_DIR_RULES.values():
             if rule["pattern"].search(command):
                 elapsed = time.time() - start
-                log(f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)")
-                _record_decision("ASK_USER", command, "PATH_SAFETY_FLOOR", rule["label"], elapsed * 1000, sid, repo_path)
+                log(
+                    f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)"
+                )
+                _record_decision(
+                    "ASK_USER",
+                    command,
+                    "PATH_SAFETY_FLOOR",
+                    rule["label"],
+                    elapsed * 1000,
+                    sid,
+                    repo_path,
+                )
                 sys.exit(0)
 
     # Tier 2: Check Claude's own permission rules
@@ -1359,7 +1669,9 @@ def main():
         log(f"DECISION: ALLOW ({elapsed:.3f}s)")
         _increment_perms_counter()
         emit_allow()
-        _record_decision("ALLOW", command, "PERMS", None, elapsed * 1000, sid, repo_path)
+        _record_decision(
+            "ALLOW", command, "PERMS", None, elapsed * 1000, sid, repo_path
+        )
         sys.exit(0)
 
     # Tier 3: Local allowlist matching (deny already checked above)
@@ -1369,14 +1681,18 @@ def main():
         log(f"LOCAL SAID: YES ({elapsed:.3f}s)")
         log(f"DECISION: ALLOW ({elapsed:.3f}s)")
         emit_allow()
-        _record_decision("ALLOW", command, "LOCAL", None, elapsed * 1000, sid, repo_path)
+        _record_decision(
+            "ALLOW", command, "LOCAL", None, elapsed * 1000, sid, repo_path
+        )
         sys.exit(0)
     elif local_result == "NO":
         # Shouldn't hit this since deny checked above, but just in case
         elapsed = time.time() - start
         log(f"LOCAL SAID: NO ({elapsed:.3f}s)")
         log(f"DECISION: ASK USER ({elapsed:.3f}s)")
-        _record_decision("ASK_USER", command, "LOCAL", None, elapsed * 1000, sid, repo_path)
+        _record_decision(
+            "ASK_USER", command, "LOCAL", None, elapsed * 1000, sid, repo_path
+        )
         sys.exit(0)
 
     # Tier 4+5: LLM evaluation for ambiguous commands (with 1 retry)
@@ -1389,17 +1705,29 @@ def main():
     file_context = read_file_context(command, cwd)
     # Build watched paths block for the trusted section of the prompt
     watched_block = ""
-    watched = ps_config.get("watched_paths", []) if ps_config.get("enabled", True) else []
+    watched = (
+        ps_config.get("watched_paths", []) if ps_config.get("enabled", True) else []
+    )
     if watched:
-        watched_block = "WATCHED PATHS (ALWAYS deny access to these paths and their children):\n"
+        watched_block = (
+            "WATCHED PATHS (ALWAYS deny access to these paths and their children):\n"
+        )
         for wp in watched:
             watched_block += f"  - {wp}\n"
         watched_block += f"Working directory: {cwd}\n"
         watched_block += 'If this command reads, writes, lists, or accesses ANY file under a watched path (resolve relative paths from working directory), respond {"safe": false, "reason": "accesses watched path: <path>"}.\n'
     template = _load_prompt()
     if watched and "{watched_paths}" not in template:
-        log("WARNING: Custom prompt missing {watched_paths} placeholder — LLM cannot enforce watched paths")
-    prompt = _substitute_prompt(template, command=command, cwd=cwd, file_context=file_context, watched_paths=watched_block)
+        log(
+            "WARNING: Custom prompt missing {watched_paths} placeholder — LLM cannot enforce watched paths"
+        )
+    prompt = _substitute_prompt(
+        template,
+        command=command,
+        cwd=cwd,
+        file_context=file_context,
+        watched_paths=watched_block,
+    )
 
     response = None
     method = f"API:{model_short}"
@@ -1427,7 +1755,15 @@ def main():
 
     if response is None:
         log(f"DECISION: ASK USER (no response after retry, {elapsed:.1f}s)")
-        _record_decision("ASK_USER", command, "NONE", "no response after retry", elapsed * 1000, sid, repo_path)
+        _record_decision(
+            "ASK_USER",
+            command,
+            "NONE",
+            "no response after retry",
+            elapsed * 1000,
+            sid,
+            repo_path,
+        )
         sys.exit(0)
 
     log_debug(f"{method} RAW: {response.strip()}")
@@ -1440,13 +1776,17 @@ def main():
         else:
             log(f"DECISION: ALLOW [{method}] ({elapsed:.1f}s)")
         emit_allow()
-        _record_decision("ALLOW", command, method, reason, elapsed * 1000, sid, repo_path)
+        _record_decision(
+            "ALLOW", command, method, reason, elapsed * 1000, sid, repo_path
+        )
     else:
         if reason:
             log(f"DECISION: ASK USER [{method}] - {reason} ({elapsed:.1f}s)")
         else:
             log(f"DECISION: ASK USER [{method}] ({elapsed:.1f}s)")
-        _record_decision("ASK_USER", command, method, reason, elapsed * 1000, sid, repo_path)
+        _record_decision(
+            "ASK_USER", command, method, reason, elapsed * 1000, sid, repo_path
+        )
 
     sys.exit(0)
 

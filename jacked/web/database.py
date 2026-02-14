@@ -13,16 +13,20 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, computed_field
 
+# Sessions without a heartbeat within this window are considered stale
+SESSION_STALENESS_MINUTES = 60
+
 
 # ---------------------------------------------------------------------------
 # Pydantic v2 Models
 # ---------------------------------------------------------------------------
+
 
 class Account(BaseModel):
     """Pydantic v2 model for an account row."""
@@ -299,6 +303,22 @@ CREATE TABLE IF NOT EXISTS version_checks (
     outdated BOOLEAN,
     cache_hit BOOLEAN
 );
+
+CREATE TABLE IF NOT EXISTS session_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    account_id INTEGER,
+    email TEXT,
+    detected_at TEXT NOT NULL,
+    ended_at TEXT,
+    last_activity_at TEXT,
+    detection_method TEXT,
+    repo_path TEXT,
+    is_subagent BOOLEAN DEFAULT 0,
+    parent_session_id TEXT,
+    agent_type TEXT,
+    UNIQUE(session_id, detected_at)
+);
 """
 
 INDEXES_SQL = """
@@ -317,6 +337,9 @@ CREATE INDEX IF NOT EXISTS idx_version_checks_ts ON version_checks(timestamp);
 CREATE INDEX IF NOT EXISTS idx_gatekeeper_repo ON gatekeeper_decisions(repo_path);
 CREATE INDEX IF NOT EXISTS idx_command_usage_repo ON command_usage(repo_path);
 CREATE INDEX IF NOT EXISTS idx_hook_executions_repo ON hook_executions(repo_path);
+CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
+CREATE INDEX IF NOT EXISTS idx_sa_account ON session_accounts(account_id);
+CREATE INDEX IF NOT EXISTS idx_sa_active ON session_accounts(ended_at, last_activity_at, detected_at);
 """
 
 
@@ -379,13 +402,15 @@ class Database:
     def _init_schema(self) -> None:
         with self._writer() as conn:
             conn.executescript(SCHEMA_SQL)
-            conn.executescript(INDEXES_SQL)
+            # Migrations run BEFORE indexes (indexes may reference new columns)
             # Migration: add cached_usage_raw if missing (existing DBs)
             cursor = conn.execute("PRAGMA table_info(accounts)")
             cols = {row[1] for row in cursor.fetchall()}
             if "cached_usage_raw" not in cols:
                 try:
-                    conn.execute("ALTER TABLE accounts ADD COLUMN cached_usage_raw TEXT")
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN cached_usage_raw TEXT"
+                    )
                 except sqlite3.OperationalError:
                     pass  # another worker beat us to it
             # Migration: add env_path to installations
@@ -396,6 +421,56 @@ class Database:
                     conn.execute("ALTER TABLE installations ADD COLUMN env_path TEXT")
                 except sqlite3.OperationalError:
                     pass
+            # Migration: add last_activity_at to session_accounts
+            cursor = conn.execute("PRAGMA table_info(session_accounts)")
+            cols = {row[1] for row in cursor.fetchall()}
+            if "last_activity_at" not in cols:
+                try:
+                    conn.execute(
+                        "ALTER TABLE session_accounts ADD COLUMN last_activity_at TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            # Migration: add subagent tracking columns to session_accounts
+            cursor = conn.execute("PRAGMA table_info(session_accounts)")
+            cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_def in [
+                ("is_subagent", "BOOLEAN DEFAULT 0"),
+                ("parent_session_id", "TEXT"),
+                ("agent_type", "TEXT"),
+            ]:
+                if col_name not in cols:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE session_accounts ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+            # Indexes (after migrations so new columns exist)
+            conn.executescript(INDEXES_SQL)
+            # Migration: rebuild idx_sa_active to cover last_activity_at
+            try:
+                conn.execute("DROP INDEX IF EXISTS idx_sa_active")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sa_active "
+                    "ON session_accounts(ended_at, last_activity_at, detected_at)"
+                )
+            except sqlite3.OperationalError:
+                pass
+            # Cleanup: end duplicate open session-account records.
+            # Keeps only the newest open row per (session_id, account_id).
+            try:
+                conn.execute(
+                    """UPDATE session_accounts SET ended_at = datetime('now')
+                       WHERE ended_at IS NULL
+                         AND id NOT IN (
+                             SELECT MAX(id) FROM session_accounts
+                             WHERE ended_at IS NULL
+                             GROUP BY session_id, COALESCE(account_id, '')
+                         )"""
+                )
+            except sqlite3.OperationalError:
+                pass
 
     def close(self) -> None:
         if hasattr(self._local, "connection") and self._local.connection:
@@ -429,7 +504,7 @@ class Database:
         >>> acct["email"]
         'test@example.com'
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         with self._writer() as conn:
             # Determine priority for new accounts
@@ -466,9 +541,18 @@ class Database:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    email, access_token, refresh_token, expires_at, display_name,
-                    scopes, subscription_type, rate_limit_tier, has_extra_usage,
-                    priority, now, now,
+                    email,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    display_name,
+                    scopes,
+                    subscription_type,
+                    rate_limit_tier,
+                    has_extra_usage,
+                    priority,
+                    now,
+                    now,
                 ),
             )
 
@@ -492,7 +576,7 @@ class Database:
             return dict(row) if row else None
 
     def get_account_by_email(self, email: str) -> Optional[dict]:
-        """Get an account by email (excludes soft-deleted).
+        """Get an account by email, case-insensitive (excludes soft-deleted).
 
         >>> db = Database(":memory:")
         >>> db.get_account_by_email("nobody@nowhere.com") is None
@@ -500,7 +584,7 @@ class Database:
         """
         with self._reader() as conn:
             cursor = conn.execute(
-                "SELECT * FROM accounts WHERE email = ? AND is_deleted = 0",
+                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) AND is_deleted = 0",
                 (email,),
             )
             row = cursor.fetchone()
@@ -532,15 +616,32 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     # Whitelist of columns allowed in update_account
-    _ACCOUNT_UPDATE_COLS = frozenset({
-        "display_name", "access_token", "refresh_token", "expires_at",
-        "scopes", "subscription_type", "rate_limit_tier", "has_extra_usage",
-        "is_active", "last_used_at", "priority",
-        "cached_usage_5h", "cached_usage_7d",
-        "cached_5h_resets_at", "cached_7d_resets_at", "usage_cached_at", "cached_usage_raw",
-        "last_error", "last_error_at", "consecutive_failures",
-        "last_validated_at", "validation_status",
-    })
+    _ACCOUNT_UPDATE_COLS = frozenset(
+        {
+            "display_name",
+            "access_token",
+            "refresh_token",
+            "expires_at",
+            "scopes",
+            "subscription_type",
+            "rate_limit_tier",
+            "has_extra_usage",
+            "is_active",
+            "last_used_at",
+            "priority",
+            "cached_usage_5h",
+            "cached_usage_7d",
+            "cached_5h_resets_at",
+            "cached_7d_resets_at",
+            "usage_cached_at",
+            "cached_usage_raw",
+            "last_error",
+            "last_error_at",
+            "consecutive_failures",
+            "last_validated_at",
+            "validation_status",
+        }
+    )
 
     def update_account(self, account_id: int, **kwargs: Any) -> bool:
         """Update an account by ID.
@@ -557,7 +658,7 @@ class Database:
         if invalid_cols:
             raise ValueError(f"Invalid columns for account update: {invalid_cols}")
 
-        kwargs["updated_at"] = datetime.utcnow().isoformat()
+        kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
         set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
         values = list(kwargs.values()) + [account_id]
 
@@ -578,7 +679,7 @@ class Database:
         >>> db.get_account(acct["id"]) is None
         True
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             cursor = conn.execute(
                 "UPDATE accounts SET is_deleted = 1, updated_at = ? WHERE id = ? AND is_deleted = 0",
@@ -597,7 +698,7 @@ class Database:
         >>> accounts[0]["email"]
         'b@t.com'
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             for i, aid in enumerate(account_ids):
                 conn.execute(
@@ -622,7 +723,9 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_fallback_account(self, exclude_ids: Optional[list[int]] = None) -> Optional[dict]:
+    def get_fallback_account(
+        self, exclude_ids: Optional[list[int]] = None
+    ) -> Optional[dict]:
         """Get a fallback account using the design doc ordering from section 13.
 
         >>> db = Database(":memory:")
@@ -699,7 +802,7 @@ class Database:
         >>> db.record_account_error(acct["id"], "test error")
         True
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             if increment_failures:
                 cursor = conn.execute(
@@ -721,22 +824,28 @@ class Database:
             return cursor.rowcount > 0
 
     def clear_account_errors(self, account_id: int) -> bool:
-        """Clear error state for an account.
+        """Clear error state for an account and mark as valid.
+
+        Called after a successful API response, so the token is known-good.
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
         >>> db.clear_account_errors(acct["id"])
         True
+        >>> db.get_account(acct["id"])["validation_status"]
+        'valid'
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             cursor = conn.execute(
                 """UPDATE accounts SET
+                    validation_status = 'valid',
                     last_error = NULL, last_error_at = NULL,
                     consecutive_failures = 0, last_used_at = ?,
+                    last_validated_at = ?,
                     updated_at = ?
                    WHERE id = ?""",
-                (now, now, account_id),
+                (now, int(time.time()), now, account_id),
             )
             return cursor.rowcount > 0
 
@@ -762,7 +871,7 @@ class Database:
         >>> inst["repo_name"]
         'my-repo'
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             conn.execute(
                 """INSERT INTO installations (
@@ -781,9 +890,16 @@ class Database:
                     last_scanned_at = excluded.last_scanned_at
                 """,
                 (
-                    repo_path, repo_name, jacked_version, hooks_installed,
-                    rules_installed, agents_installed, commands_installed,
-                    guardrails_installed, now, now,
+                    repo_path,
+                    repo_name,
+                    jacked_version,
+                    hooks_installed,
+                    rules_installed,
+                    agents_installed,
+                    commands_installed,
+                    guardrails_installed,
+                    now,
+                    now,
                 ),
             )
             cursor = conn.execute(
@@ -800,9 +916,7 @@ class Database:
         []
         """
         with self._reader() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM installations ORDER BY repo_name ASC"
-            )
+            cursor = conn.execute("SELECT * FROM installations ORDER BY repo_name ASC")
             return [dict(row) for row in cursor.fetchall()]
 
     def get_installation(self, installation_id: int) -> Optional[dict]:
@@ -886,7 +1000,7 @@ class Database:
         >>> db.get_setting("theme")
         '"dark"'
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             conn.execute(
                 """INSERT INTO settings (key, value, updated_at)
@@ -943,7 +1057,7 @@ class Database:
         >>> rid > 0
         True
         """
-        ts = timestamp or datetime.utcnow().isoformat()
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
         # Truncate command to 1000 chars per design doc
         if command and len(command) > 1000:
             command = command[:1000]
@@ -953,31 +1067,71 @@ class Database:
                 """INSERT INTO gatekeeper_decisions
                    (timestamp, command, decision, method, reason, elapsed_ms, session_id, repo_path)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (ts, command, decision, method, reason, elapsed_ms, session_id, repo_path),
+                (
+                    ts,
+                    command,
+                    decision,
+                    method,
+                    reason,
+                    elapsed_ms,
+                    session_id,
+                    repo_path,
+                ),
             )
             return cursor.lastrowid or 0
 
     def list_gatekeeper_decisions(
-        self, limit: int = 100, session_id: Optional[str] = None,
-    ) -> list[dict]:
-        """List recent gatekeeper decisions, optionally filtered by session.
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        filters: Optional[dict] = None,
+    ) -> dict:
+        """List recent gatekeeper decisions with server-side filters and pagination.
+
+        Returns ``{"rows": [...], "total": N}`` where total is the
+        filtered count *before* LIMIT/OFFSET.
+
+        ``filters`` keys: session_id, decision, method, command_search, repo_path.
 
         >>> db = Database(":memory:")
         >>> db.list_gatekeeper_decisions()
-        []
+        {'rows': [], 'total': 0}
+        >>> db.list_gatekeeper_decisions(filters={"decision": "ALLOW"})
+        {'rows': [], 'total': 0}
         """
+        f = filters or {}
+        conditions: list[str] = []
+        params: list = []
+
+        if f.get("session_id"):
+            conditions.append("session_id = ?")
+            params.append(f["session_id"])
+        if f.get("decision"):
+            conditions.append("decision = ?")
+            params.append(f["decision"])
+        if f.get("method"):
+            conditions.append("method = ?")
+            params.append(f["method"])
+        if f.get("command_search"):
+            conditions.append("command LIKE ?")
+            params.append(f"%{f['command_search']}%")
+        if f.get("repo_path"):
+            conditions.append("LOWER(repo_path) = LOWER(?)")
+            params.append(f["repo_path"])
+
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
         with self._reader() as conn:
-            if session_id:
-                cursor = conn.execute(
-                    "SELECT * FROM gatekeeper_decisions WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
-                    (session_id, limit),
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT * FROM gatekeeper_decisions ORDER BY timestamp DESC LIMIT ?",
-                    (limit,),
-                )
-            return [dict(row) for row in cursor.fetchall()]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM gatekeeper_decisions{where}",
+                params,
+            ).fetchone()[0]
+
+            cursor = conn.execute(
+                f"SELECT * FROM gatekeeper_decisions{where} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            )
+            return {"rows": [dict(row) for row in cursor.fetchall()], "total": total}
 
     def list_gatekeeper_sessions(self, limit: int = 50) -> list[dict]:
         """Aggregate gatekeeper decisions grouped by session.
@@ -1005,7 +1159,9 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def purge_gatekeeper_decisions(
-        self, before_iso: Optional[str] = None, session_id: Optional[str] = None,
+        self,
+        before_iso: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> int:
         """Delete gatekeeper decisions by age or session. Returns rows deleted.
 
@@ -1017,7 +1173,7 @@ class Database:
         >>> db.purge_gatekeeper_decisions(session_id="sess1")
         1
         >>> db.list_gatekeeper_decisions()
-        []
+        {'rows': [], 'total': 0}
         """
         with self._writer() as conn:
             if session_id:
@@ -1077,7 +1233,7 @@ class Database:
         >>> rid > 0
         True
         """
-        ts = timestamp or datetime.utcnow().isoformat()
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO command_usage
@@ -1110,15 +1266,24 @@ class Database:
         >>> rid > 0
         True
         """
-        ts = timestamp or datetime.utcnow().isoformat()
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO agent_invocations
                    (agent_name, timestamp, session_id, spawned_by, success,
                     duration_ms, tasks_completed, errors, repo_path)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (agent_name, ts, session_id, spawned_by, success,
-                 duration_ms, tasks_completed, errors, repo_path),
+                (
+                    agent_name,
+                    ts,
+                    session_id,
+                    spawned_by,
+                    success,
+                    duration_ms,
+                    tasks_completed,
+                    errors,
+                    repo_path,
+                ),
             )
             return cursor.lastrowid or 0
 
@@ -1158,15 +1323,23 @@ class Database:
         >>> rid > 0
         True
         """
-        ts = timestamp or datetime.utcnow().isoformat()
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO hook_executions
                    (hook_type, hook_name, timestamp, session_id, success,
                     duration_ms, error_msg, repo_path)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (hook_type, hook_name, ts, session_id, success,
-                 duration_ms, error_msg, repo_path),
+                (
+                    hook_type,
+                    hook_name,
+                    ts,
+                    session_id,
+                    success,
+                    duration_ms,
+                    error_msg,
+                    repo_path,
+                ),
             )
             return cursor.lastrowid or 0
 
@@ -1190,19 +1363,29 @@ class Database:
         >>> rid > 0
         True
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO lessons
                    (content, project_id, failure_count, status,
                     source_session_id, tags, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (content, project_id, failure_count, status,
-                 source_session_id, tags, now, now),
+                (
+                    content,
+                    project_id,
+                    failure_count,
+                    status,
+                    source_session_id,
+                    tags,
+                    now,
+                    now,
+                ),
             )
             return cursor.lastrowid or 0
 
-    def list_lessons(self, status: Optional[str] = None, limit: int = 100) -> list[dict]:
+    def list_lessons(
+        self, status: Optional[str] = None, limit: int = 100
+    ) -> list[dict]:
         """List lessons, optionally filtered by status.
 
         >>> db = Database(":memory:")
@@ -1235,7 +1418,7 @@ class Database:
         if invalid:
             raise ValueError(f"Invalid columns for lesson update: {invalid}")
 
-        kwargs["updated_at"] = datetime.utcnow().isoformat()
+        kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
         set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
         values = list(kwargs.values()) + [lesson_id]
 
@@ -1263,7 +1446,7 @@ class Database:
         >>> rid > 0
         True
         """
-        ts = datetime.utcnow().isoformat()
+        ts = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO version_checks
@@ -1272,6 +1455,236 @@ class Database:
                 (ts, current_version, latest_version, outdated, cache_hit),
             )
             return cursor.lastrowid or 0
+
+    # ==================================================================
+    # Session-Account Tracking
+    # ==================================================================
+
+    def record_session_account(
+        self,
+        session_id: str,
+        account_id: Optional[int] = None,
+        email: Optional[str] = None,
+        detection_method: Optional[str] = None,
+        repo_path: Optional[str] = None,
+    ) -> int:
+        """Record which account a session is using.
+
+        Closes stale records for different accounts on the same session and
+        prevents duplicate rows for the same session+account combo.
+
+        >>> db = Database(":memory:")
+        >>> rid = db.record_session_account("sess-1", account_id=1, email="a@b.com", detection_method="session_start")
+        >>> rid > 0
+        True
+        >>> rows = db.get_session_accounts("sess-1")
+        >>> len(rows)
+        1
+        >>> rows[0]["email"]
+        'a@b.com'
+        >>> rid2 = db.record_session_account("sess-1", account_id=1, email="a@b.com", detection_method="session_start")
+        >>> len(db.get_session_accounts("sess-1"))
+        1
+        >>> rid3 = db.record_session_account("sess-1", account_id=2, email="b@b.com", detection_method="session_start")
+        >>> rows = db.get_session_accounts("sess-1")
+        >>> sum(1 for r in rows if r["ended_at"] is None)
+        1
+        >>> rows[0]["account_id"]
+        2
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            # End any open records for this session under a DIFFERENT account
+            # (account_id != ? doesn't match NULLs, so OR account_id IS NULL)
+            if account_id is not None:
+                conn.execute(
+                    """UPDATE session_accounts SET ended_at = ?
+                       WHERE session_id = ? AND ended_at IS NULL
+                         AND (account_id != ? OR account_id IS NULL)""",
+                    (ts, session_id, account_id),
+                )
+
+            # Check if open record already exists for same session+account
+            # (IS used instead of = for NULL-safe comparison)
+            existing = conn.execute(
+                """SELECT id FROM session_accounts
+                   WHERE session_id = ? AND account_id IS ? AND ended_at IS NULL
+                   LIMIT 1""",
+                (session_id, account_id),
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE session_accounts SET last_activity_at = ? WHERE id = ?",
+                    (ts, existing[0]),
+                )
+                return existing[0]
+
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO session_accounts
+                   (session_id, account_id, email, detected_at, last_activity_at,
+                    detection_method, repo_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, account_id, email, ts, ts, detection_method, repo_path),
+            )
+            return cursor.lastrowid or 0
+
+    def end_session_account(self, session_id: str) -> bool:
+        """Mark the latest session-account record as ended.
+
+        >>> db = Database(":memory:")
+        >>> _ = db.record_session_account("sess-1", account_id=1, email="a@b.com")
+        >>> db.end_session_account("sess-1")
+        True
+        >>> rows = db.get_session_accounts("sess-1")
+        >>> rows[0]["ended_at"] is not None
+        True
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts SET ended_at = ?
+                   WHERE session_id = ? AND ended_at IS NULL""",
+                (ts, session_id),
+            )
+            return cursor.rowcount > 0
+
+    def heartbeat_session(self, session_id: str) -> bool:
+        """Update last_activity_at for the most recent open session record.
+
+        Only updates the newest open record, not all of them.
+
+        >>> db = Database(":memory:")
+        >>> _ = db.record_session_account("sess-1", account_id=1, email="a@b.com")
+        >>> db.heartbeat_session("sess-1")
+        True
+        >>> db.heartbeat_session("nonexistent")
+        False
+        >>> db.end_session_account("sess-1")
+        True
+        >>> db.heartbeat_session("sess-1")
+        False
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts SET last_activity_at = ?
+                   WHERE id = (
+                       SELECT id FROM session_accounts
+                       WHERE session_id = ? AND ended_at IS NULL
+                       ORDER BY detected_at DESC LIMIT 1
+                   )""",
+                (ts, session_id),
+            )
+            return cursor.rowcount > 0
+
+    def get_session_accounts(self, session_id: str) -> list:
+        """Get account spans for a session.
+
+        >>> db = Database(":memory:")
+        >>> db.get_session_accounts("nonexistent")
+        []
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT id, session_id, account_id, email, detected_at,
+                          ended_at, detection_method, repo_path
+                   FROM session_accounts
+                   WHERE session_id = ?
+                   ORDER BY detected_at DESC""",
+                (session_id,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_account_sessions(self, account_id: int, limit: int = 50) -> list:
+        """Get recent sessions that used a given account.
+
+        >>> db = Database(":memory:")
+        >>> db.get_account_sessions(999)
+        []
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT id, session_id, account_id, email, detected_at,
+                          ended_at, detection_method, repo_path
+                   FROM session_accounts
+                   WHERE account_id = ?
+                   ORDER BY detected_at DESC
+                   LIMIT ?""",
+                (account_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_active_sessions(
+        self, staleness_minutes: int = SESSION_STALENESS_MINUTES
+    ) -> list:
+        """Get session-account records with recent heartbeat activity.
+
+        Uses COALESCE(last_activity_at, detected_at) with a configurable
+        staleness window (default 60 min, clamped to 5-120).
+        Sessions fade from view when idle but are NOT permanently closed —
+        a heartbeat update makes them reappear (resurrection).
+
+        >>> db = Database(":memory:")
+        >>> db.get_active_sessions()
+        []
+        >>> _ = db.record_session_account("s1", account_id=1, email="a@b.com", repo_path="/repo/a")
+        >>> active = db.get_active_sessions()
+        >>> len(active)
+        1
+        >>> active[0]["repo_path"]
+        '/repo/a'
+        >>> active[0]["last_activity_at"] is not None
+        True
+        """
+        clamped = max(5, min(120, staleness_minutes))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT session_id, account_id, email,
+                          MIN(detected_at) AS detected_at,
+                          detection_method, repo_path,
+                          MAX(COALESCE(last_activity_at, detected_at)) AS last_activity_at,
+                          is_subagent, parent_session_id, agent_type
+                   FROM session_accounts
+                   WHERE ended_at IS NULL
+                     AND COALESCE(last_activity_at, detected_at) > ?
+                   GROUP BY session_id, account_id
+                   ORDER BY last_activity_at DESC""",
+                (cutoff,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def lookup_session_by_suffix(self, suffix: str, limit: int = 10) -> list:
+        """Find session-account records by session_id suffix.
+
+        Requires at least 8 characters. LIKE wildcards in the suffix
+        are escaped to prevent broad matches.
+
+        >>> db = Database(":memory:")
+        >>> db.lookup_session_by_suffix("short")
+        []
+        >>> db.lookup_session_by_suffix("abcd1234")
+        []
+        >>> db.lookup_session_by_suffix("%")
+        []
+        """
+        if len(suffix) < 8:
+            return []
+        # Escape LIKE wildcards — backslash first to avoid double-escaping
+        safe = suffix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT session_id, account_id, email, repo_path,
+                          detected_at, ended_at,
+                          COALESCE(last_activity_at, detected_at) AS last_activity_at
+                   FROM session_accounts
+                   WHERE session_id LIKE '%' || ? ESCAPE '\\'
+                   ORDER BY detected_at DESC
+                   LIMIT ?""",
+                (safe, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     # ==================================================================
     # Analytics Query Methods (for API routes)
@@ -1357,8 +1770,12 @@ class Database:
                 {
                     "command": row["command_name"],
                     "count": row["count"],
-                    "success_rate": round(row["successes"] / row["count"] * 100, 1) if row["count"] else 0,
-                    "avg_duration_ms": round(row["avg_ms"], 2) if row["avg_ms"] else None,
+                    "success_rate": round(row["successes"] / row["count"] * 100, 1)
+                    if row["count"]
+                    else 0,
+                    "avg_duration_ms": round(row["avg_ms"], 2)
+                    if row["avg_ms"]
+                    else None,
                 }
                 for row in cursor.fetchall()
             ]
@@ -1394,8 +1811,12 @@ class Database:
                 {
                     "agent": row["agent_name"],
                     "count": row["count"],
-                    "success_rate": round(row["successes"] / row["count"] * 100, 1) if row["count"] else 0,
-                    "avg_duration_ms": round(row["avg_ms"], 2) if row["avg_ms"] else None,
+                    "success_rate": round(row["successes"] / row["count"] * 100, 1)
+                    if row["count"]
+                    else 0,
+                    "avg_duration_ms": round(row["avg_ms"], 2)
+                    if row["avg_ms"]
+                    else None,
                     "total_tasks": row["total_tasks"] or 0,
                     "total_errors": row["total_errors"] or 0,
                 }
@@ -1432,8 +1853,12 @@ class Database:
                     "hook_name": row["hook_name"],
                     "hook_type": row["hook_type"],
                     "count": row["count"],
-                    "success_rate": round(row["successes"] / row["count"] * 100, 1) if row["count"] else 0,
-                    "avg_duration_ms": round(row["avg_ms"], 2) if row["avg_ms"] else None,
+                    "success_rate": round(row["successes"] / row["count"] * 100, 1)
+                    if row["count"]
+                    else 0,
+                    "avg_duration_ms": round(row["avg_ms"], 2)
+                    if row["avg_ms"]
+                    else None,
                 }
                 for row in cursor.fetchall()
             ]
@@ -1546,7 +1971,9 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def list_command_usage(
-        self, limit: int = 200, command_name: Optional[str] = None,
+        self,
+        limit: int = 200,
+        command_name: Optional[str] = None,
     ) -> list[dict]:
         """List recent command usage logs, optionally filtered by command name.
 
@@ -1570,39 +1997,52 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def list_hook_executions(
-        self, limit: int = 200, hook_name: Optional[str] = None,
-    ) -> list[dict]:
-        """List recent hook execution logs, optionally filtered by hook name.
+        self,
+        limit: int = 200,
+        offset: int = 0,
+        hook_name: Optional[str] = None,
+    ) -> dict:
+        """List recent hook execution logs with pagination.
+
+        Returns ``{"rows": [...], "total": N}``.
 
         >>> db = Database(":memory:")
         >>> db.list_hook_executions()
-        []
+        {'rows': [], 'total': 0}
         >>> db.list_hook_executions(hook_name="session_indexing")
-        []
+        {'rows': [], 'total': 0}
         """
-        with self._reader() as conn:
-            if hook_name:
-                cursor = conn.execute(
-                    "SELECT * FROM hook_executions WHERE hook_name = ? ORDER BY timestamp DESC LIMIT ?",
-                    (hook_name, limit),
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT * FROM hook_executions ORDER BY timestamp DESC LIMIT ?",
-                    (limit,),
-                )
-            return [dict(row) for row in cursor.fetchall()]
+        where = ""
+        params: list = []
+        if hook_name:
+            where = " WHERE hook_name = ?"
+            params.append(hook_name)
 
-    def list_version_checks(self, limit: int = 100) -> list[dict]:
-        """List recent version check logs.
+        with self._reader() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM hook_executions{where}",
+                params,
+            ).fetchone()[0]
+
+            cursor = conn.execute(
+                f"SELECT * FROM hook_executions{where} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            )
+            return {"rows": [dict(row) for row in cursor.fetchall()], "total": total}
+
+    def list_version_checks(self, limit: int = 100, offset: int = 0) -> dict:
+        """List recent version check logs with pagination.
+
+        Returns ``{"rows": [...], "total": N}``.
 
         >>> db = Database(":memory:")
         >>> db.list_version_checks()
-        []
+        {'rows': [], 'total': 0}
         """
         with self._reader() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM version_checks").fetchone()[0]
             cursor = conn.execute(
-                "SELECT * FROM version_checks ORDER BY timestamp DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM version_checks ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             )
-            return [dict(row) for row in cursor.fetchall()]
+            return {"rows": [dict(row) for row in cursor.fetchall()], "total": total}

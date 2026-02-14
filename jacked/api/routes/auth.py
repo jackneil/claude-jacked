@@ -1,4 +1,4 @@
-"""Auth routes -- 10 account management endpoints.
+"""Auth routes -- account management endpoints.
 
 Handles OAuth flow initiation/polling, account CRUD, token refresh,
 usage cache refresh, and account validation.
@@ -23,6 +23,7 @@ router = APIRouter()
 
 
 # --- Pydantic v2 request/response models ---
+
 
 class ModelUsage(BaseModel):
     """Per-model 7-day usage breakdown."""
@@ -127,6 +128,7 @@ class BulkUsageRefreshResponse(BaseModel):
 
 # --- Helpers ---
 
+
 def _parse_usage_details(
     raw_json: Optional[str],
 ) -> tuple[Optional[dict[str, ModelUsage]], Optional[ExtraUsage]]:
@@ -151,7 +153,12 @@ def _parse_usage_details(
 
     # Per-model: extract seven_day_* keys
     per_model: dict[str, ModelUsage] = {}
-    for key in ("seven_day_sonnet", "seven_day_opus", "seven_day_oauth_apps", "seven_day_cowork"):
+    for key in (
+        "seven_day_sonnet",
+        "seven_day_opus",
+        "seven_day_oauth_apps",
+        "seven_day_cowork",
+    ):
         val = data.get(key)
         if val is not None and isinstance(val, dict):
             per_model[key.removeprefix("seven_day_")] = ModelUsage(
@@ -165,10 +172,12 @@ def _parse_usage_details(
     extra_raw = data.get("extra_usage")
     extra = None
     if isinstance(extra_raw, dict):
+        raw_limit = extra_raw.get("monthly_limit")
+        raw_used = extra_raw.get("used_credits")
         extra = ExtraUsage(
             is_enabled=extra_raw.get("is_enabled", False),
-            monthly_limit=extra_raw.get("monthly_limit"),
-            used_credits=extra_raw.get("used_credits"),
+            monthly_limit=raw_limit / 100 if raw_limit is not None else None,
+            used_credits=raw_used / 100 if raw_used is not None else None,
             utilization=extra_raw.get("utilization"),
         )
 
@@ -205,14 +214,22 @@ def _get_db(request: Request):
 def _db_unavailable():
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+        content={
+            "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+        },
     )
 
 
 def _not_found(detail: str):
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
-        content={"error": {"message": "Account not found", "code": "NOT_FOUND", "detail": detail}},
+        content={
+            "error": {
+                "message": "Account not found",
+                "code": "NOT_FOUND",
+                "detail": detail,
+            }
+        },
     )
 
 
@@ -255,7 +272,7 @@ def _account_to_response(row: dict) -> AccountResponse:
 
 # --- Routes ---
 
-# 1. POST /api/auth/accounts/add — Start OAuth flow
+
 @router.post("/accounts/add")
 async def start_add_account(request: Request):
     """Start OAuth flow to add a new account. Returns flow_id for polling."""
@@ -269,13 +286,14 @@ async def start_add_account(request: Request):
     if "error" in result:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": {"message": result["error"], "code": "OAUTH_START_FAILED"}},
+            content={
+                "error": {"message": result["error"], "code": "OAUTH_START_FAILED"}
+            },
         )
 
     return result
 
 
-# 2. GET /api/auth/flow/{flow_id} — Poll OAuth flow status
 @router.get("/flow/{flow_id}", response_model=FlowStatusResponse)
 async def get_flow_status(flow_id: str):
     """Poll OAuth flow status. Returns pending/completed/error/not_found."""
@@ -293,7 +311,6 @@ async def get_flow_status(flow_id: str):
     )
 
 
-# 3. GET /api/auth/accounts — List all accounts
 @router.get("/accounts", response_model=list[AccountResponse])
 async def list_accounts(request: Request, include_inactive: bool = False):
     """List all accounts, ordered by priority. Active only by default."""
@@ -305,7 +322,6 @@ async def list_accounts(request: Request, include_inactive: bool = False):
     return [_account_to_response(row) for row in rows]
 
 
-# 4. PATCH /api/auth/accounts/{id} — Update account
 @router.patch("/accounts/{account_id}")
 async def update_account(account_id: int, body: AccountPatchRequest, request: Request):
     """Update display_name and/or is_active for an account."""
@@ -326,7 +342,9 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
     if not updates:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": {"message": "No fields to update", "code": "VALIDATION_ERROR"}},
+            content={
+                "error": {"message": "No fields to update", "code": "VALIDATION_ERROR"}
+            },
         )
 
     db.update_account(account_id, **updates)
@@ -335,7 +353,6 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
     return _account_to_response(updated)
 
 
-# 5. DELETE /api/auth/accounts/{id} — Soft-delete account
 @router.delete("/accounts/{account_id}")
 async def delete_account(account_id: int, request: Request):
     """Soft-delete an account. Cannot delete primary while others exist."""
@@ -353,18 +370,19 @@ async def delete_account(account_id: int, request: Request):
         if len(other_active) > 1:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content={"error": {
-                    "message": "Cannot delete primary account while other active accounts exist",
-                    "code": "CANNOT_DELETE_PRIMARY",
-                    "detail": "Set a different account as primary first, or delete other accounts.",
-                }},
+                content={
+                    "error": {
+                        "message": "Cannot delete primary account while other active accounts exist",
+                        "code": "CANNOT_DELETE_PRIMARY",
+                        "detail": "Set a different account as primary first, or delete other accounts.",
+                    }
+                },
             )
 
     db.delete_account(account_id)
     return {"deleted": True, "account_id": account_id}
 
 
-# 6. POST /api/auth/accounts/reorder — Reorder priorities
 @router.post("/accounts/reorder")
 async def reorder_accounts(body: ReorderRequest, request: Request):
     """Reorder account priorities. Index position becomes priority value."""
@@ -375,7 +393,12 @@ async def reorder_accounts(body: ReorderRequest, request: Request):
     if not body.order:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": {"message": "order list cannot be empty", "code": "VALIDATION_ERROR"}},
+            content={
+                "error": {
+                    "message": "order list cannot be empty",
+                    "code": "VALIDATION_ERROR",
+                }
+            },
         )
 
     db.reorder_accounts(body.order)
@@ -385,7 +408,6 @@ async def reorder_accounts(body: ReorderRequest, request: Request):
     return [_account_to_response(row) for row in rows]
 
 
-# 7. POST /api/auth/accounts/{id}/refresh — Force token refresh
 @router.post("/accounts/{account_id}/refresh", response_model=RefreshResponse)
 async def refresh_token(account_id: int, request: Request):
     """Force token refresh for an account."""
@@ -409,12 +431,17 @@ async def refresh_token(account_id: int, request: Request):
 
     # Re-read account to get the error that was recorded
     updated = db.get_account(account_id)
-    error_msg = updated.get("last_error", "Token refresh failed") if updated else "Token refresh failed"
+    error_msg = (
+        updated.get("last_error", "Token refresh failed")
+        if updated
+        else "Token refresh failed"
+    )
     return RefreshResponse(success=False, error=error_msg)
 
 
-# 8. POST /api/auth/accounts/{id}/refresh-usage — Refresh usage for one account
-@router.post("/accounts/{account_id}/refresh-usage", response_model=UsageRefreshResponse)
+@router.post(
+    "/accounts/{account_id}/refresh-usage", response_model=UsageRefreshResponse
+)
 async def refresh_usage(account_id: int, request: Request):
     """Refresh usage cache for a single account."""
     db = _get_db(request)
@@ -430,7 +457,12 @@ async def refresh_usage(account_id: int, request: Request):
     if usage_data is None:
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            content={"error": {"message": "Failed to fetch usage from Anthropic API", "code": "USAGE_FETCH_FAILED"}},
+            content={
+                "error": {
+                    "message": "Failed to fetch usage from Anthropic API",
+                    "code": "USAGE_FETCH_FAILED",
+                }
+            },
         )
 
     # Re-read to get updated cache values
@@ -443,7 +475,6 @@ async def refresh_usage(account_id: int, request: Request):
     )
 
 
-# 9. POST /api/auth/accounts/refresh-all-usage — Refresh usage for all active accounts
 @router.post("/accounts/refresh-all-usage", response_model=BulkUsageRefreshResponse)
 async def refresh_all_usage(request: Request):
     """Refresh usage cache for all active accounts."""
@@ -462,20 +493,24 @@ async def refresh_all_usage(request: Request):
             refreshed += 1
             five_hour = usage_data.get("five_hour", {})
             seven_day = usage_data.get("seven_day", {})
-            results.append({
-                "account_id": acct["id"],
-                "email": acct["email"],
-                "success": True,
-                "cached_usage_5h": five_hour.get("utilization"),
-                "cached_usage_7d": seven_day.get("utilization"),
-            })
+            results.append(
+                {
+                    "account_id": acct["id"],
+                    "email": acct["email"],
+                    "success": True,
+                    "cached_usage_5h": five_hour.get("utilization"),
+                    "cached_usage_7d": seven_day.get("utilization"),
+                }
+            )
         else:
             failed += 1
-            results.append({
-                "account_id": acct["id"],
-                "email": acct["email"],
-                "success": False,
-            })
+            results.append(
+                {
+                    "account_id": acct["id"],
+                    "email": acct["email"],
+                    "success": False,
+                }
+            )
 
     return BulkUsageRefreshResponse(
         refreshed=refreshed,
@@ -484,7 +519,6 @@ async def refresh_all_usage(request: Request):
     )
 
 
-# 10. POST /api/auth/accounts/{id}/validate — Validate token
 @router.post("/accounts/{account_id}/validate", response_model=ValidateResponse)
 async def validate_token(account_id: int, request: Request):
     """Validate that an account's token is still working (calls profile API)."""

@@ -11,9 +11,11 @@ All API interactions follow design doc section 4 header matrix.
 """
 
 import asyncio
+import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -126,10 +128,9 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
                     if error_data.get("error") == "invalid_grant":
                         db.update_account(
                             account_id,
-                            is_active=False,
                             validation_status="invalid",
-                            last_error="Refresh token expired or revoked",
-                            last_error_at=datetime.utcnow().isoformat(),
+                            last_error="Refresh token expired or revoked — re-authenticate to fix",
+                            last_error_at=datetime.now(timezone.utc).isoformat(),
                         )
                         logger.warning(
                             f"Account {account_id}: invalid_grant — marked invalid"
@@ -143,7 +144,7 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
                     account_id,
                     validation_status="invalid",
                     last_error=f"Token revoked (HTTP {resp.status_code})",
-                    last_error_at=datetime.utcnow().isoformat(),
+                    last_error_at=datetime.now(timezone.utc).isoformat(),
                 )
                 return False
 
@@ -169,7 +170,9 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
 
     except httpx.TimeoutException:
         logger.warning(f"Account {account_id}: timeout during token refresh")
-        db.record_account_error(account_id, "Timeout during token refresh", increment_failures=False)
+        db.record_account_error(
+            account_id, "Timeout during token refresh", increment_failures=False
+        )
         return False
     except Exception as e:
         logger.error(f"Account {account_id}: refresh error: {e}")
@@ -358,7 +361,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     validation_status="invalid",
                     last_validated_at=int(time.time()),
                     last_error=f"Token invalid (HTTP {resp.status_code})",
-                    last_error_at=datetime.utcnow().isoformat(),
+                    last_error_at=datetime.now(timezone.utc).isoformat(),
                 )
                 return {
                     "valid": False,
@@ -371,7 +374,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     account_id,
                     validation_status=account.get("validation_status", "unknown"),
                     last_error="Rate limited during validation",
-                    last_error_at=datetime.utcnow().isoformat(),
+                    last_error_at=datetime.now(timezone.utc).isoformat(),
                 )
                 return {"valid": False, "error": "Rate limited — try again later"}
 
@@ -379,7 +382,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
                 account_id,
                 validation_status="unknown",
                 last_error=f"Validation HTTP {resp.status_code}",
-                last_error_at=datetime.utcnow().isoformat(),
+                last_error_at=datetime.now(timezone.utc).isoformat(),
             )
             return {"valid": False, "error": f"Unexpected HTTP {resp.status_code}"}
 
@@ -395,7 +398,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
             account_id,
             validation_status="unknown",
             last_error=str(e),
-            last_error_at=datetime.utcnow().isoformat(),
+            last_error_at=datetime.now(timezone.utc).isoformat(),
         )
         return {"valid": False, "error": str(e)}
 
@@ -441,9 +444,37 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     now = int(time.time())
     result = {"checked": 0, "refreshed": 0, "skipped": 0, "failed": 0}
 
+    # Read active account from credential file — skip it (Claude Code owns its refresh)
+    # Layer 1: _jackedAccountId, Layer 2: email from ~/.claude.json
+    active_account_id = None
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if cred_path.exists() and not cred_path.is_symlink():
+        try:
+            cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
+            active_account_id = cred_data.get("_jackedAccountId")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if active_account_id is None:
+        claude_config = Path.home() / ".claude.json"
+        if claude_config.exists() and not claude_config.is_symlink():
+            try:
+                config = json.loads(claude_config.read_text(encoding="utf-8"))
+                email = config.get("oauthAccount", {}).get("emailAddress")
+                if email:
+                    acct = db.get_account_by_email(email)
+                    if acct:
+                        active_account_id = acct["id"]
+            except (json.JSONDecodeError, OSError):
+                pass
+
     accounts = db.list_accounts(include_inactive=False)
     for account in accounts:
         result["checked"] += 1
+
+        # Skip account currently active in Claude Code (it refreshes its own tokens)
+        if active_account_id is not None and account["id"] == active_account_id:
+            result["skipped"] += 1
+            continue
 
         # Skip API key accounts (no refresh_token)
         if not account.get("refresh_token"):
