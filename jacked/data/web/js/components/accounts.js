@@ -1,7 +1,7 @@
 /**
- * jacked web dashboard — accounts component
- * Full account management: list, add, delete, reorder, validate, re-auth.
- * Enhanced with per-model usage breakdowns, extra usage credits, cache age.
+ * jacked web dashboard — accounts component (rendering)
+ * Account list, cards, usage bars, expandable details.
+ * Action handlers live in account-actions.js.
  */
 
 // Model display name mapping
@@ -76,7 +76,6 @@ function renderPerModelBars(usage) {
     for (const [key, model] of Object.entries(usage.per_model)) {
         const label = MODEL_DISPLAY_NAMES[key] || key;
         const pct = model.utilization || 0;
-        // Reuse renderUsageBar with no elapsed marker for per-model
         html += renderUsageBar(pct, model.resets_at, null, label);
     }
     return html;
@@ -121,6 +120,7 @@ function renderExtraUsageCredits(usage) {
     `;
 }
 
+
 /**
  * Render expandable details section for an account.
  */
@@ -129,7 +129,6 @@ function renderExpandableDetails(acct) {
     const hasPerModel = usage && usage.per_model && Object.keys(usage.per_model).length > 0;
     const hasExtraUsage = usage && usage.extra_usage && usage.extra_usage.is_enabled;
 
-    // Don't show expand button if there's nothing to expand
     if (!hasPerModel && !hasExtraUsage) {
         return '';
     }
@@ -148,53 +147,40 @@ function renderExpandableDetails(acct) {
 }
 
 /**
- * Render the full accounts page.
+ * Render action buttons for an account card.
  */
-function renderAccounts(accounts) {
-    // Filter out deleted
-    const visible = (accounts || []).filter(a => !a.is_deleted);
+function renderActionButtons(acct) {
+    const status = getAccountStatus(acct);
+    const isActiveInCC = window.jackedState.activeCredentialAccountId === acct.id;
 
-    if (visible.length === 0) {
-        return renderEmptyState();
+    // Set Active / Active badge (left side, primary action)
+    let setActiveHtml = '';
+    if (isActiveInCC) {
+        setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
+    } else if (status === 'valid' || status === 'unknown') {
+        setActiveHtml = `<button class="btn-set-active text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Set Active</button>`;
     }
 
-    // Check for any global errors
-    const invalidCount = visible.filter(a => a.validation_status === 'invalid').length;
-    let bannerHtml = '';
-    if (invalidCount > 0) {
-        bannerHtml = `
-            <div class="bg-orange-900/30 border border-orange-700 rounded-lg px-4 py-3 mb-4 text-sm text-orange-200">
-                <strong>${invalidCount} account${invalidCount > 1 ? 's' : ''}</strong> require${invalidCount === 1 ? 's' : ''} re-authentication.
-                Tokens may have expired or been revoked.
-            </div>
-        `;
+    // Re-auth button (if invalid/expired)
+    const showReauth = status === 'invalid' || status === 'expired';
+    let reauthHtml = '';
+    if (showReauth) {
+        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}">Re-auth</button>`;
     }
 
-    // Sort by priority
-    const sorted = [...visible].sort((a, b) => (a.priority || 0) - (b.priority || 0));
-
-    const cardsHtml = sorted.map((acct, idx) => renderAccountCard(acct, idx, sorted.length)).join('');
+    // Toggle active/disabled
+    const toggleLabel = acct.is_active ? 'Disable' : 'Enable';
+    const toggleClass = acct.is_active ? 'text-yellow-400 hover:text-yellow-300' : 'text-green-400 hover:text-green-300';
 
     return `
-        <div class="max-w-3xl">
-            <div class="flex items-center justify-between mb-5">
-                <h2 class="text-xl font-semibold text-white">Accounts</h2>
-                <div class="flex items-center gap-2">
-                    <button id="btn-refresh-all-usage" class="flex items-center gap-2 px-4 py-2 text-slate-300 hover:text-white hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-600 transition-colors">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-                        Refresh All Usage
-                    </button>
-                    <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
-                        Add Account
-                    </button>
-                </div>
-            </div>
-            ${bannerHtml}
-            <div id="oauth-flow-status"></div>
-            <div id="accounts-list" class="flex flex-col gap-3">
-                ${cardsHtml}
-            </div>
+        <div class="flex items-center gap-2 mt-3 pt-3 border-t border-slate-700/50">
+            ${setActiveHtml}
+            <div class="flex-1"></div>
+            ${reauthHtml}
+            <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition-colors" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
+            <button class="btn-delete text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded transition-colors" data-id="${acct.id}" title="Delete account">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+            </button>
         </div>
     `;
 }
@@ -220,13 +206,11 @@ function renderAccountCard(acct, idx, total) {
         statusBadge = '<span class="badge badge-muted">Disabled</span>';
     }
 
-    // Usage bars (from top-level cached fields)
+    // Usage bars
     const elapsed5h = computeElapsedFraction5h(acct.cached_5h_resets_at);
     const elapsed7d = computeElapsedFraction7d(acct.cached_7d_resets_at);
     const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, elapsed5h, '5h limit');
     const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, elapsed7d, '7d limit');
-
-    // Cache age
     const cacheAgeHtml = renderCacheAge(acct.usage_cached_at);
 
     // Priority reorder buttons
@@ -243,40 +227,20 @@ function renderAccountCard(acct, idx, total) {
         </div>
     ` : '<div class="w-6 mr-2"></div>';
 
-    // Action buttons
-    const showReauth = status === 'invalid' || status === 'expired';
-    const toggleLabel = acct.is_active ? 'Disable' : 'Enable';
-    const toggleClass = acct.is_active ? 'text-yellow-400 hover:text-yellow-300' : 'text-green-400 hover:text-green-300';
-
-    let actionsHtml = `
-        <div class="flex items-center gap-2 mt-3 pt-3 border-t border-slate-700/50">
-            <div class="flex-1"></div>
-    `;
-    if (showReauth) {
-        actionsHtml += `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}">Re-auth</button>`;
-    }
-    actionsHtml += `
-            <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition-colors" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
-            <button class="btn-delete text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded transition-colors" data-id="${acct.id}" title="Delete account">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-            </button>
-    `;
-    actionsHtml += '</div>';
-
     // Error display
     let errorHtml = '';
     if (acct.last_error) {
         errorHtml = `<div class="text-xs text-red-400 mt-2">${escapeHtml(acct.last_error)}</div>`;
     }
 
-    // Extra usage flag (badge in header)
+    // Extra usage flag
     let extraUsageHtml = '';
     if (acct.has_extra_usage) {
         extraUsageHtml = '<span class="badge badge-success ml-2">Extra Usage</span>';
     }
 
-    // Expandable details (per-model bars, extra usage credits)
     const detailsHtml = renderExpandableDetails(acct);
+    const actionsHtml = renderActionButtons(acct);
 
     return `
         <div class="bg-slate-800 border border-slate-700 rounded-lg p-4 card-hover" data-account-id="${acct.id}">
@@ -298,6 +262,7 @@ function renderAccountCard(acct, idx, total) {
                     <div class="ml-5">
                         ${usage5h}
                         ${usage7d}
+                        ${renderActiveSessions(acct)}
                         ${detailsHtml}
                     </div>
                     ${errorHtml ? '<div class="ml-5">' + errorHtml + '</div>' : ''}
@@ -305,6 +270,63 @@ function renderAccountCard(acct, idx, total) {
                 </div>
             </div>
             <div class="delete-confirm-container hidden" data-id="${acct.id}"></div>
+        </div>
+    `;
+}
+
+/**
+ * Render the full accounts page.
+ */
+function renderAccounts(accounts) {
+    const visible = (accounts || []).filter(a => !a.is_deleted);
+
+    if (visible.length === 0) {
+        return renderEmptyState();
+    }
+
+    const invalidCount = visible.filter(a => a.validation_status === 'invalid').length;
+    let bannerHtml = '';
+    if (invalidCount > 0) {
+        bannerHtml = `
+            <div class="bg-orange-900/30 border border-orange-700 rounded-lg px-4 py-3 mb-4 text-sm text-orange-200">
+                <strong>${invalidCount} account${invalidCount > 1 ? 's' : ''}</strong> require${invalidCount === 1 ? 's' : ''} re-authentication.
+                Tokens may have expired or been revoked.
+            </div>
+        `;
+    }
+
+    const sorted = [...visible].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+    const cardsHtml = sorted.map((acct, idx) => renderAccountCard(acct, idx, sorted.length)).join('');
+
+    return `
+        <div class="max-w-3xl">
+            <div class="flex items-center justify-between mb-5">
+                <h2 class="text-xl font-semibold text-white">Accounts</h2>
+                <div class="flex items-center gap-2">
+                    <button id="btn-refresh-all-usage" class="flex items-center gap-2 px-4 py-2 text-slate-300 hover:text-white hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-600 transition-colors">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        Refresh All Usage
+                    </button>
+                    <div class="flex items-center gap-1.5" title="Auto-refresh usage every 60s">
+                        <span class="text-xs text-slate-400">Auto</span>
+                        <label class="toggle-switch toggle-sm">
+                            <input type="checkbox" id="chk-auto-refresh">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+                        Add Account
+                    </button>
+                </div>
+            </div>
+            ${bannerHtml}
+            <div id="oauth-flow-status"></div>
+            ${typeof renderSessionControls === 'function' ? renderSessionControls() : ''}
+            ${typeof renderSessionLookupResult === 'function' ? renderSessionLookupResult() : ''}
+            <div id="accounts-list" class="flex flex-col gap-3">
+                ${cardsHtml}
+            </div>
         </div>
     `;
 }
@@ -327,257 +349,4 @@ function renderEmptyState() {
             <div id="oauth-flow-status" class="mt-4"></div>
         </div>
     `;
-}
-
-// ---------------------------------------------------------------------------
-// Event binding
-// ---------------------------------------------------------------------------
-function bindAccountEvents() {
-    // Add Account button
-    document.querySelectorAll('#btn-add-account').forEach(btn => {
-        btn.addEventListener('click', startAddAccountFlow);
-    });
-
-    // Re-auth buttons
-    document.querySelectorAll('.btn-reauth').forEach(btn => {
-        btn.addEventListener('click', () => startAddAccountFlow());
-    });
-
-    // Toggle active/disabled
-    document.querySelectorAll('.btn-toggle').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const id = btn.dataset.id;
-            const isActive = btn.dataset.active === 'true';
-            try {
-                await api.patch(`/api/auth/accounts/${id}`, { is_active: !isActive });
-                showToast(isActive ? 'Account disabled' : 'Account enabled', 'success');
-                await refreshAndRender();
-            } catch (e) {
-                showToast(e.message, 'error');
-            }
-        });
-    });
-
-    // Delete buttons
-    document.querySelectorAll('.btn-delete').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const id = btn.dataset.id;
-            showDeleteConfirm(id);
-        });
-    });
-
-    // Refresh All Usage button
-    const refreshAllBtn = document.getElementById('btn-refresh-all-usage');
-    if (refreshAllBtn) {
-        refreshAllBtn.addEventListener('click', async () => {
-            const originalHtml = refreshAllBtn.innerHTML;
-            refreshAllBtn.disabled = true;
-            refreshAllBtn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Refreshing...';
-            try {
-                const result = await api.post('/api/auth/accounts/refresh-all-usage');
-                if (result.refreshed === 0 && result.failed === 0) {
-                    showToast('No active accounts to refresh', 'warning');
-                } else if (result.failed > 0) {
-                    showToast(`Usage refreshed (${result.refreshed} ok, ${result.failed} failed)`, 'warning');
-                } else {
-                    showToast(`Usage refreshed for ${result.refreshed} account${result.refreshed !== 1 ? 's' : ''}`, 'success');
-                }
-                await refreshAndRender();
-            } catch (e) {
-                showToast(e.message, 'error');
-            }
-            refreshAllBtn.disabled = false;
-            refreshAllBtn.innerHTML = originalHtml;
-        });
-    }
-
-    // Priority up/down
-    document.querySelectorAll('.btn-priority-up').forEach(btn => {
-        btn.addEventListener('click', () => handlePriorityMove(btn.dataset.id, -1));
-    });
-    document.querySelectorAll('.btn-priority-down').forEach(btn => {
-        btn.addEventListener('click', () => handlePriorityMove(btn.dataset.id, 1));
-    });
-
-    // Expandable details toggle
-    document.querySelectorAll('.btn-toggle-details').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const id = btn.dataset.id;
-            const details = document.querySelector(`.account-details[data-details-id="${id}"]`);
-            const arrow = btn.querySelector('.details-arrow');
-            if (!details) return;
-
-            if (details.classList.contains('hidden')) {
-                details.classList.remove('hidden');
-                if (arrow) arrow.innerHTML = '&#9650;';
-                btn.childNodes[0].textContent = 'Hide details ';
-            } else {
-                details.classList.add('hidden');
-                if (arrow) arrow.innerHTML = '&#9660;';
-                btn.childNodes[0].textContent = 'Show details ';
-            }
-        });
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Priority reorder
-// ---------------------------------------------------------------------------
-async function handlePriorityMove(accountId, direction) {
-    const sorted = [...window.jackedState.accounts]
-        .filter(a => !a.is_deleted)
-        .sort((a, b) => (a.priority || 0) - (b.priority || 0));
-
-    const idx = sorted.findIndex(a => String(a.id) === String(accountId));
-    if (idx < 0) return;
-
-    const newIdx = idx + direction;
-    if (newIdx < 0 || newIdx >= sorted.length) return;
-
-    // Swap
-    [sorted[idx], sorted[newIdx]] = [sorted[newIdx], sorted[idx]];
-    const order = sorted.map(a => a.id);
-
-    try {
-        await api.post('/api/auth/accounts/reorder', { order });
-        await refreshAndRender();
-    } catch (e) {
-        showToast(e.message, 'error');
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Delete confirmation
-// ---------------------------------------------------------------------------
-function showDeleteConfirm(accountId) {
-    const container = document.querySelector(`.delete-confirm-container[data-id="${accountId}"]`);
-    if (!container) return;
-
-    container.classList.remove('hidden');
-    container.innerHTML = `
-        <div class="delete-confirm flex items-center gap-3 mt-3 pt-3 border-t border-red-800/50 text-sm">
-            <span class="text-red-300">Remove this account?</span>
-            <button class="btn-confirm-yes px-3 py-1 bg-red-600 hover:bg-red-500 text-white text-xs rounded transition-colors" data-id="${accountId}">Yes, Remove</button>
-            <button class="btn-confirm-cancel px-3 py-1 text-slate-400 hover:text-white text-xs rounded transition-colors" data-id="${accountId}">Cancel</button>
-        </div>
-    `;
-
-    // Auto-cancel after 5 seconds
-    const timer = setTimeout(() => hideDeleteConfirm(accountId), 5000);
-    container.dataset.timer = timer;
-
-    container.querySelector('.btn-confirm-yes').addEventListener('click', async () => {
-        clearTimeout(timer);
-        try {
-            await api.delete(`/api/auth/accounts/${accountId}`);
-            showToast('Account removed', 'success');
-            await refreshAndRender();
-        } catch (e) {
-            showToast(e.message, 'error');
-        }
-    });
-
-    container.querySelector('.btn-confirm-cancel').addEventListener('click', () => {
-        clearTimeout(timer);
-        hideDeleteConfirm(accountId);
-    });
-}
-
-function hideDeleteConfirm(accountId) {
-    const container = document.querySelector(`.delete-confirm-container[data-id="${accountId}"]`);
-    if (!container) return;
-    if (container.dataset.timer) clearTimeout(Number(container.dataset.timer));
-    container.classList.add('hidden');
-    container.innerHTML = '';
-}
-
-// ---------------------------------------------------------------------------
-// OAuth add-account flow
-// ---------------------------------------------------------------------------
-async function startAddAccountFlow() {
-    const statusEl = document.getElementById('oauth-flow-status');
-    if (!statusEl) return;
-
-    statusEl.innerHTML = `
-        <div class="bg-blue-900/30 border border-blue-700 rounded-lg px-4 py-3 text-sm text-blue-200 flex items-center gap-3">
-            <div class="spinner"></div>
-            <div>
-                <div class="font-medium">Waiting for authorization...</div>
-                <div class="text-xs text-blue-300 mt-1">A browser window should open. Complete the authorization there.</div>
-            </div>
-        </div>
-    `;
-
-    let flowId;
-    try {
-        const result = await api.post('/api/auth/accounts/add');
-        flowId = result.flow_id;
-    } catch (e) {
-        statusEl.innerHTML = `
-            <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
-                Failed to start auth flow: ${escapeHtml(e.message)}
-            </div>
-        `;
-        return;
-    }
-
-    if (!flowId) {
-        statusEl.innerHTML = `
-            <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
-                No flow ID returned from server
-            </div>
-        `;
-        return;
-    }
-
-    // Poll every 1s, timeout at 2 minutes
-    let elapsed = 0;
-    const maxWait = 120;
-    const pollInterval = setInterval(async () => {
-        elapsed++;
-        if (elapsed > maxWait) {
-            clearInterval(pollInterval);
-            statusEl.innerHTML = `
-                <div class="bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-200">
-                    Authorization timed out after 2 minutes. Please try again.
-                </div>
-            `;
-            return;
-        }
-
-        try {
-            const poll = await api.get(`/api/auth/flow/${flowId}`);
-
-            if (poll.status === 'completed') {
-                clearInterval(pollInterval);
-                statusEl.innerHTML = `
-                    <div class="bg-green-900/30 border border-green-700 rounded-lg px-4 py-3 text-sm text-green-200">
-                        Account connected successfully!
-                    </div>
-                `;
-                setTimeout(() => { statusEl.innerHTML = ''; }, 3000);
-                await refreshAndRender();
-            } else if (poll.status === 'error') {
-                clearInterval(pollInterval);
-                statusEl.innerHTML = `
-                    <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
-                        Authorization failed: ${escapeHtml(poll.error || 'Unknown error')}
-                    </div>
-                `;
-            }
-            // status === 'pending' — keep polling
-        } catch (e) {
-            // not_found means flow expired
-            if (e.status === 404) {
-                clearInterval(pollInterval);
-                statusEl.innerHTML = `
-                    <div class="bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-200">
-                        Authorization flow expired. Please try again.
-                    </div>
-                `;
-            }
-        }
-    }, 1000);
-
-    window.jackedState.flowPolling = pollInterval;
 }

@@ -44,11 +44,19 @@ function renderSettings(settings) {
 function bindSettingsEvents() {
     const tabs = document.querySelectorAll('.settings-tab');
     tabs.forEach(tab => {
-        tab.addEventListener('click', () => {
+        tab.addEventListener('click', async () => {
             // Guard against losing unsaved changes when switching sub-tabs
             if (window._settingsDirty) {
-                const leave = confirm('You have unsaved settings changes. Leave without saving?');
-                if (!leave) return;
+                const result = await Swal.fire({
+                    title: 'Unsaved Changes',
+                    text: 'You have unsaved settings changes. Leave without saving?',
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: 'Leave',
+                    cancelButtonText: 'Stay',
+                    focusCancel: true,
+                });
+                if (!result.isConfirmed) return;
                 window._settingsDirty = false;
             }
             tabs.forEach(t => t.classList.remove('active'));

@@ -138,9 +138,11 @@ class TestGetLatestPypiVersion:
         >>> # With mock, get_latest_pypi_version returns the version from JSON
         """
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "info": {"version": "0.4.0"},
-        }).encode("utf-8")
+        mock_response.read.return_value = json.dumps(
+            {
+                "info": {"version": "0.4.0"},
+            }
+        ).encode("utf-8")
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -154,6 +156,7 @@ class TestGetLatestPypiVersion:
         >>> # Timeout returns None gracefully
         """
         from urllib.error import URLError
+
         with patch("urllib.request.urlopen", side_effect=URLError("timeout")):
             result = vc.get_latest_pypi_version()
         assert result is None
@@ -178,7 +181,9 @@ class TestGetLatestPypiVersion:
         >>> # Missing structure returns None
         """
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({"unexpected": "data"}).encode("utf-8")
+        mock_response.read.return_value = json.dumps({"unexpected": "data"}).encode(
+            "utf-8"
+        )
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -205,10 +210,14 @@ class TestCheckVersionCached:
         >>> # Cache within TTL skips PyPI
         """
         cache_file = tmp_path / "version-cache.json"
-        cache_file.write_text(json.dumps({
-            "checked_at": time.time(),
-            "latest": "0.4.0",
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "checked_at": time.time(),
+                    "latest": "0.4.0",
+                }
+            )
+        )
 
         with patch.object(vc, "VERSION_CACHE", cache_file):
             with patch.object(vc, "get_latest_pypi_version") as mock_pypi:
@@ -227,10 +236,14 @@ class TestCheckVersionCached:
         >>> # Same version = not outdated
         """
         cache_file = tmp_path / "version-cache.json"
-        cache_file.write_text(json.dumps({
-            "checked_at": time.time(),
-            "latest": "0.3.11",
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "checked_at": time.time(),
+                    "latest": "0.3.11",
+                }
+            )
+        )
 
         with patch.object(vc, "VERSION_CACHE", cache_file):
             result = vc.check_version_cached("0.3.11")
@@ -245,10 +258,14 @@ class TestCheckVersionCached:
         >>> # Local 0.4.0 > PyPI 0.3.10 = ahead
         """
         cache_file = tmp_path / "version-cache.json"
-        cache_file.write_text(json.dumps({
-            "checked_at": time.time(),
-            "latest": "0.3.10",
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "checked_at": time.time(),
+                    "latest": "0.3.10",
+                }
+            )
+        )
 
         with patch.object(vc, "VERSION_CACHE", cache_file):
             result = vc.check_version_cached("0.4.0")
@@ -263,15 +280,21 @@ class TestCheckVersionCached:
         >>> # Old cache forces network call
         """
         cache_file = tmp_path / "version-cache.json"
-        cache_file.write_text(json.dumps({
-            "checked_at": time.time() - 90000,  # >24h ago
-            "latest": "0.3.10",
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "checked_at": time.time() - 90000,  # >24h ago
+                    "latest": "0.3.10",
+                }
+            )
+        )
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "info": {"version": "0.4.0"},
-        }).encode("utf-8")
+        mock_response.read.return_value = json.dumps(
+            {
+                "info": {"version": "0.4.0"},
+            }
+        ).encode("utf-8")
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -290,9 +313,11 @@ class TestCheckVersionCached:
         cache_file = tmp_path / "nonexistent-cache.json"
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "info": {"version": "0.3.11"},
-        }).encode("utf-8")
+        mock_response.read.return_value = json.dumps(
+            {
+                "info": {"version": "0.3.11"},
+            }
+        ).encode("utf-8")
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -304,7 +329,7 @@ class TestCheckVersionCached:
         assert result["outdated"] is False
         # Verify cache was written
         assert cache_file.exists()
-        cached = json.loads(cache_file.read_text())
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
         assert cached["latest"] == "0.3.11"
 
     def test_corrupt_cache_hits_pypi(self, tmp_path):
@@ -316,9 +341,11 @@ class TestCheckVersionCached:
         cache_file.write_text("not valid json {{{")
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "info": {"version": "0.4.0"},
-        }).encode("utf-8")
+        mock_response.read.return_value = json.dumps(
+            {
+                "info": {"version": "0.4.0"},
+            }
+        ).encode("utf-8")
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -337,6 +364,7 @@ class TestCheckVersionCached:
         cache_file = tmp_path / "nonexistent-cache.json"
 
         from urllib.error import URLError
+
         with patch.object(vc, "VERSION_CACHE", cache_file):
             with patch("urllib.request.urlopen", side_effect=URLError("timeout")):
                 result = vc.check_version_cached("0.3.11")
@@ -349,15 +377,21 @@ class TestCheckVersionCached:
         >>> # Future checked_at = cache expired, hit PyPI
         """
         cache_file = tmp_path / "version-cache.json"
-        cache_file.write_text(json.dumps({
-            "checked_at": time.time() + 999999,  # Far in the future
-            "latest": "0.1.0",
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "checked_at": time.time() + 999999,  # Far in the future
+                    "latest": "0.1.0",
+                }
+            )
+        )
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "info": {"version": "0.4.0"},
-        }).encode("utf-8")
+        mock_response.read.return_value = json.dumps(
+            {
+                "info": {"version": "0.4.0"},
+            }
+        ).encode("utf-8")
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -374,10 +408,14 @@ class TestCheckVersionCached:
         >>> # Empty latest in cache = None
         """
         cache_file = tmp_path / "version-cache.json"
-        cache_file.write_text(json.dumps({
-            "checked_at": time.time(),
-            "latest": "",
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "checked_at": time.time(),
+                    "latest": "",
+                }
+            )
+        )
 
         with patch.object(vc, "VERSION_CACHE", cache_file):
             result = vc.check_version_cached("0.3.11")
@@ -390,20 +428,28 @@ class TestCheckVersionCached:
         >>> # Fresh cache + force=True = still calls PyPI
         """
         cache_file = tmp_path / "version-cache.json"
-        cache_file.write_text(json.dumps({
-            "checked_at": time.time(),
-            "latest": "0.3.10",
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "checked_at": time.time(),
+                    "latest": "0.3.10",
+                }
+            )
+        )
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "info": {"version": "0.4.0"},
-        }).encode("utf-8")
+        mock_response.read.return_value = json.dumps(
+            {
+                "info": {"version": "0.4.0"},
+            }
+        ).encode("utf-8")
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
         with patch.object(vc, "VERSION_CACHE", cache_file):
-            with patch("urllib.request.urlopen", return_value=mock_response) as mock_pypi:
+            with patch(
+                "urllib.request.urlopen", return_value=mock_response
+            ) as mock_pypi:
                 result = vc.check_version_cached("0.3.11", force=True)
                 mock_pypi.assert_called_once()
 

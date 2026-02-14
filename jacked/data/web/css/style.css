@@ -205,24 +205,6 @@
     }
 }
 
-/* Scrollbar styling */
-::-webkit-scrollbar {
-    width: 8px;
-}
-
-::-webkit-scrollbar-track {
-    background: #0f172a;
-}
-
-::-webkit-scrollbar-thumb {
-    background: #334155;
-    border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-    background: #475569;
-}
-
 /* Priority arrows */
 .priority-btn {
     padding: 2px;
@@ -364,6 +346,11 @@
     background-color: transparent;
 }
 
+/* Small toggle variant (inline with buttons) */
+.toggle-switch.toggle-sm { width: 32px; height: 18px; }
+.toggle-switch.toggle-sm .toggle-slider::before { width: 12px; height: 12px; }
+.toggle-switch.toggle-sm input:checked + .toggle-slider::before { transform: translateX(14px); }
+
 /* Feature card */
 .feature-card {
     background-color: #1e293b;
@@ -448,64 +435,56 @@
     to { transform: rotate(360deg); }
 }
 
-/* ── SweetAlert2 dark theme overrides ──────────────────────────────── */
-
-.swal2-popup {
-    background: #1e293b !important;
-    color: #e2e8f0 !important;
-    border: 1px solid #334155 !important;
-    border-radius: 0.75rem !important;
+/* Logs live/paused indicator */
+.logs-live-indicator {
+    animation: pulse 1.5s ease-in-out infinite;
 }
 
-.swal2-title {
-    color: #f8fafc !important;
-    font-size: 1.15rem !important;
+/* Pagination controls */
+.pagination-controls select,
+.pagination-controls button {
+    transition: border-color 150ms ease, color 150ms ease;
 }
 
-.swal2-html-container {
-    color: #94a3b8 !important;
-    font-size: 0.85rem !important;
-    line-height: 1.6 !important;
-    text-align: left !important;
+/* Active repo tags */
+.active-repo-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
 }
 
-.swal2-confirm {
-    background: #4f46e5 !important;
-    border-radius: 0.375rem !important;
-    font-size: 0.8rem !important;
-    padding: 0.5rem 1.25rem !important;
+.active-repo-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    font-size: 11px;
+    font-weight: 500;
+    background-color: rgba(56, 189, 248, 0.12);
+    color: #7dd3fc;
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: default;
 }
 
-.swal2-confirm:hover {
-    background: #4338ca !important;
+.active-repo-tag.subagent-tag {
+    opacity: 0.55;
+    background-color: rgba(139, 92, 246, 0.12);
+    color: #c4b5fd;
+    border-color: rgba(139, 92, 246, 0.2);
+    font-size: 10px;
 }
 
-.swal2-cancel {
-    background: #334155 !important;
-    color: #cbd5e1 !important;
-    border-radius: 0.375rem !important;
-    font-size: 0.8rem !important;
-    padding: 0.5rem 1.25rem !important;
+/* Repo group chevron + sessions animation + lookup highlight */
+.repo-group-chevron { transition: transform 200ms ease; display: inline-block; }
+.repo-group-chevron.expanded { transform: rotate(90deg); }
+.repo-group-sessions { animation: fadeSlideIn 200ms ease-out; }
+.account-card-highlight { animation: cardHighlight 3s ease-out; }
+@keyframes cardHighlight {
+    0% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.5); }
+    100% { box-shadow: none; }
 }
 
-.swal2-cancel:hover {
-    background: #475569 !important;
-}
-
-.swal2-actions {
-    gap: 0.5rem !important;
-}
-
-.swal2-icon {
-    border-color: #334155 !important;
-    color: #94a3b8 !important;
-}
-
-.swal2-popup code {
-    background: #0f172a;
-    color: #67e8f9;
-    padding: 0.15rem 0.4rem;
-    border-radius: 0.25rem;
-    font-size: 0.8rem;
-    font-family: ui-monospace, monospace;
-}

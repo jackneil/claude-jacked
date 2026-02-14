@@ -12,8 +12,18 @@ window.jackedState = {
     settings: {},
     version: { current: '', latest: '', outdated: false },
     activeRoute: 'accounts',
+    activeCredentialAccountId: null,
+    activeSessions: {},
     polling: null,
     flowPolling: null,
+    logsPaused: false,
+    logsInFlight: false,
+    // Session display preferences (persisted via localStorage)
+    sessionStalenessMs: parseInt(localStorage.getItem('jacked_session_staleness') || '3600000'),
+    sessionGroupByRepo: localStorage.getItem('jacked_session_group_repo') === '1',
+    sessionShowSubagents: localStorage.getItem('jacked_session_show_subagents') !== '0',
+    expandedRepoGroups: new Set(),
+    sessionLookupResult: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -173,17 +183,74 @@ async function loadVersion() {
     }
 }
 
+async function loadActiveSessions() {
+    try {
+        const mins = Math.round(window.jackedState.sessionStalenessMs / 60000) || 60;
+        const data = await api.get(`/api/auth/active-sessions?staleness=${mins}`);
+        window.jackedState.activeSessions = data.sessions || {};
+    } catch (e) {
+        console.error('Failed to load active sessions:', e);
+    }
+}
+
 async function loadAllData() {
     await Promise.all([
         loadAccounts(),
+        loadActiveSessions(),
         loadSettings(),
         loadVersion(),
+        typeof loadActiveCredential === 'function' ? loadActiveCredential() : Promise.resolve(),
     ]);
 }
 
 async function refreshAndRender() {
     await loadAllData();
     renderRoute(getRoute());
+}
+
+// ---------------------------------------------------------------------------
+// Centralized accounts re-render (preserves UI expansion state)
+// ---------------------------------------------------------------------------
+function rerenderAccountsView() {
+    if (window.jackedState.activeRoute !== 'accounts') return;
+    if (typeof renderAccounts !== 'function') return;
+
+    const content = document.getElementById('content');
+    // Save expanded account details
+    const expandedDetails = new Set();
+    document.querySelectorAll('.account-details:not(.hidden)').forEach(el => {
+        expandedDetails.add(el.dataset.detailsId);
+    });
+    // Save expanded repo groups
+    const savedRepoGroups = new Set(window.jackedState.expandedRepoGroups);
+    // Save session lookup input value
+    const savedLookupValue = document.getElementById('inp-session-lookup')?.value || '';
+
+    content.innerHTML = renderAccounts(window.jackedState.accounts);
+    if (typeof bindAccountEvents === 'function') bindAccountEvents();
+
+    // Restore expanded details
+    expandedDetails.forEach(id => {
+        const details = document.querySelector(`.account-details[data-details-id="${id}"]`);
+        const btn = document.querySelector(`.btn-toggle-details[data-id="${id}"]`);
+        if (details) {
+            details.classList.remove('hidden');
+            const arrow = btn?.querySelector('.details-arrow');
+            if (arrow) arrow.innerHTML = '&#9650;';
+            if (btn) btn.childNodes[0].textContent = 'Hide details ';
+        }
+    });
+    // Restore session lookup input value
+    const restoredInput = document.getElementById('inp-session-lookup');
+    if (restoredInput && savedLookupValue) restoredInput.value = savedLookupValue;
+    // Restore repo group expansion
+    window.jackedState.expandedRepoGroups = savedRepoGroups;
+    savedRepoGroups.forEach(key => {
+        const sessionsEl = [...document.querySelectorAll('.repo-group-sessions')].find(el => el.dataset.groupKey === key);
+        const chevron = [...document.querySelectorAll('.repo-group-chevron')].find(el => el.dataset.groupKey === key);
+        if (sessionsEl) sessionsEl.classList.remove('hidden');
+        if (chevron) chevron.classList.add('expanded');
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -194,84 +261,46 @@ async function autoValidateStaleAccounts() {
     const oneHourAgo = now - 3600;
     const maxValidations = 5;
 
-    // Collect stale accounts that need validation
     const stale = window.jackedState.accounts.filter(acct => {
         if (!acct.is_active) return false;
         if (acct.validation_status === 'checking') return false;
-        if (acct.validation_status === 'invalid') return false;  // needs re-auth, not re-validation
+        if (acct.validation_status === 'invalid') return false;
         if (acct.last_validated_at && acct.last_validated_at > oneHourAgo) return false;
         return true;
     }).slice(0, maxValidations);
 
-    // Sequential with 1s delay to avoid thundering herd
     for (const acct of stale) {
         try {
             await api.post(`/api/auth/accounts/${acct.id}/validate`);
         } catch {
             // swallow — validation errors are recorded server-side
         }
-        // 1s delay between validations
         if (stale.indexOf(acct) < stale.length - 1) {
             await new Promise(r => setTimeout(r, 1000));
         }
     }
 
-    // Single re-render after all validations complete (avoids flickering)
     if (stale.length > 0) {
         await loadAccounts();
-        if (window.jackedState.activeRoute === 'accounts' && typeof renderAccounts === 'function') {
-            const content = document.getElementById('content');
-            // Preserve expanded details state
-            const expanded = new Set();
-            document.querySelectorAll('.account-details:not(.hidden)').forEach(el => {
-                expanded.add(el.dataset.detailsId);
-            });
-            content.innerHTML = renderAccounts(window.jackedState.accounts);
-            if (typeof bindAccountEvents === 'function') bindAccountEvents();
-            // Restore expanded details state
-            expanded.forEach(id => {
-                const details = document.querySelector(`.account-details[data-details-id="${id}"]`);
-                const btn = document.querySelector(`.btn-toggle-details[data-id="${id}"]`);
-                if (details) {
-                    details.classList.remove('hidden');
-                    const arrow = btn?.querySelector('.details-arrow');
-                    if (arrow) arrow.innerHTML = '&#9650;';
-                    if (btn) btn.childNodes[0].textContent = 'Hide details ';
-                }
-            });
-        }
+        rerenderAccountsView();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Polling
+// Polling (30s default, 120s when WebSocket connected)
 // ---------------------------------------------------------------------------
+function _currentPollInterval() {
+    return (typeof jackedWS !== 'undefined' && jackedWS.isConnected()) ? 120000 : 30000;
+}
+
 function startPolling() {
     stopPolling();
     window.jackedState.polling = setInterval(async () => {
+        if (typeof _accountActionInFlight !== 'undefined' && _accountActionInFlight) return;
         await loadAccounts();
-        if (window.jackedState.activeRoute === 'accounts' && typeof renderAccounts === 'function') {
-            const content = document.getElementById('content');
-            // Preserve expanded details state across polling re-renders
-            const expanded = new Set();
-            document.querySelectorAll('.account-details:not(.hidden)').forEach(el => {
-                expanded.add(el.dataset.detailsId);
-            });
-            content.innerHTML = renderAccounts(window.jackedState.accounts);
-            if (typeof bindAccountEvents === 'function') bindAccountEvents();
-            // Restore expanded details state
-            expanded.forEach(id => {
-                const details = document.querySelector(`.account-details[data-details-id="${id}"]`);
-                const btn = document.querySelector(`.btn-toggle-details[data-id="${id}"]`);
-                if (details) {
-                    details.classList.remove('hidden');
-                    const arrow = btn?.querySelector('.details-arrow');
-                    if (arrow) arrow.innerHTML = '&#9650;';
-                    if (btn) btn.childNodes[0].textContent = 'Hide details ';
-                }
-            });
-        }
-    }, 30000);
+        await loadActiveSessions();
+        rerenderAccountsView();
+    }, _currentPollInterval());
 }
 
 function stopPolling() {
@@ -307,64 +336,6 @@ function showToast(message, type = 'info', duration = 4000) {
 }
 
 // ---------------------------------------------------------------------------
-// Utility: escape HTML
-// ---------------------------------------------------------------------------
-function escapeHtml(str) {
-    if (!str) return '';
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
-
-// ---------------------------------------------------------------------------
-// Utility: format dates
-// ---------------------------------------------------------------------------
-function formatResetTime(isoStr) {
-    if (!isoStr) return '';
-    try {
-        const d = new Date(isoStr);
-        const now = new Date();
-
-        // Same day? Show time only
-        if (d.toDateString() === now.toDateString()) {
-            return 'resets ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-        }
-
-        // Different day — show short date
-        return 'resets ' + d.toLocaleDateString([], { month: 'short', day: 'numeric' });
-    } catch {
-        return '';
-    }
-}
-
-function timeAgo(isoStr) {
-    if (!isoStr) return 'never';
-    try {
-        const d = new Date(isoStr);
-        const seconds = Math.floor((Date.now() - d.getTime()) / 1000);
-        if (seconds < 60) return 'just now';
-        if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
-        if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
-        return Math.floor(seconds / 86400) + 'd ago';
-    } catch {
-        return 'unknown';
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Utility: format unix timestamps
-// ---------------------------------------------------------------------------
-function formatUnixResetTime(unixSeconds) {
-    if (!unixSeconds) return '';
-    return formatResetTime(new Date(unixSeconds * 1000).toISOString());
-}
-
-function timeAgoFromUnix(unixSeconds) {
-    if (unixSeconds === null || unixSeconds === undefined) return 'never';
-    return timeAgo(new Date(unixSeconds * 1000).toISOString());
-}
-
-// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', async () => {
@@ -381,6 +352,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Start account polling
     startPolling();
 
+    // Connect WebSocket event bus (handlers defined in websocket.js)
+    if (typeof jackedWS !== 'undefined') {
+        jackedWS.connect();
+    }
+
     // Unsaved changes guard — warn on page close/refresh
     window.addEventListener('beforeunload', (e) => {
         if (window._settingsDirty) {
@@ -390,11 +366,19 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Hash change listener — guard against leaving settings with unsaved changes
     let _suppressHashChange = false;
-    window.addEventListener('hashchange', () => {
+    window.addEventListener('hashchange', async () => {
         if (_suppressHashChange) { _suppressHashChange = false; return; }
         if (window._settingsDirty) {
-            const leave = confirm('You have unsaved settings changes. Leave without saving?');
-            if (!leave) {
+            const result = await Swal.fire({
+                title: 'Unsaved Changes',
+                text: 'You have unsaved settings changes. Leave without saving?',
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonText: 'Leave',
+                cancelButtonText: 'Stay',
+                focusCancel: true,
+            });
+            if (!result.isConfirmed) {
                 _suppressHashChange = true;
                 window.location.hash = 'settings';
                 return;

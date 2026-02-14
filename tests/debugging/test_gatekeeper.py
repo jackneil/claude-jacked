@@ -7,6 +7,7 @@ test API/CLI tiers to keep it fast and offline.
 
 Run: python tests/debugging/test_gatekeeper.py
 """
+
 import json
 import os
 import subprocess
@@ -55,7 +56,7 @@ def run_gatekeeper(command: str, cwd: str = CWD) -> tuple[str, float]:
     return result.stdout.strip(), elapsed
 
 
-def test_case(name: str, command: str, expect_allow: bool, max_time: float = 1.0):
+def run_case(name: str, command: str, expect_allow: bool, max_time: float = 1.0):
     """Run a single test case."""
     stdout, elapsed = run_gatekeeper(command)
 
@@ -81,66 +82,92 @@ def test_case(name: str, command: str, expect_allow: bool, max_time: float = 1.0
 def main():
     results = []
     print("\n=== Permission-matched (from settings.json allow rules) ===")
-    results.append(test_case("gh pr list --repo foo", "gh pr list --repo foo", expect_allow=True))
-    results.append(test_case("cat somefile.txt", "cat somefile.txt", expect_allow=True))
-    results.append(test_case("find . -name '*.py'", "find . -name '*.py'", expect_allow=True))
-    results.append(test_case("grep -r TODO .", "grep -r TODO .", expect_allow=True))
+    results.append(
+        run_case("gh pr list --repo foo", "gh pr list --repo foo", expect_allow=True)
+    )
+    results.append(run_case("cat somefile.txt", "cat somefile.txt", expect_allow=True))
+    results.append(
+        run_case("find . -name '*.py'", "find . -name '*.py'", expect_allow=True)
+    )
+    results.append(run_case("grep -r TODO .", "grep -r TODO .", expect_allow=True))
 
     print("\n=== Local allowlist (hardcoded safe patterns) ===")
-    results.append(test_case("git status", "git status", expect_allow=True))
-    results.append(test_case("git log --oneline", "git log --oneline", expect_allow=True))
-    results.append(test_case("echo hello", "echo hello", expect_allow=True))
-    results.append(test_case("ls -la", "ls -la", expect_allow=True))
-    results.append(test_case("pip list", "pip list", expect_allow=True))
-    results.append(test_case("pip freeze", "pip freeze", expect_allow=True))
-    results.append(test_case("pytest tests/", "pytest tests/", expect_allow=True))
-    results.append(test_case("npm test", "npm test", expect_allow=True))
-    results.append(test_case("ruff check .", "ruff check .", expect_allow=True))
-    results.append(test_case("gh issue list", "gh issue list", expect_allow=True))
-    results.append(test_case("docker ps", "docker ps", expect_allow=True))
+    results.append(run_case("git status", "git status", expect_allow=True))
+    results.append(
+        run_case("git log --oneline", "git log --oneline", expect_allow=True)
+    )
+    results.append(run_case("echo hello", "echo hello", expect_allow=True))
+    results.append(run_case("ls -la", "ls -la", expect_allow=True))
+    results.append(run_case("pip list", "pip list", expect_allow=True))
+    results.append(run_case("pip freeze", "pip freeze", expect_allow=True))
+    results.append(run_case("pytest tests/", "pytest tests/", expect_allow=True))
+    results.append(run_case("npm test", "npm test", expect_allow=True))
+    results.append(run_case("ruff check .", "ruff check .", expect_allow=True))
+    results.append(run_case("gh issue list", "gh issue list", expect_allow=True))
+    results.append(run_case("docker ps", "docker ps", expect_allow=True))
 
     print("\n=== Path-stripped allowlist (full path to python/node) ===")
-    results.append(test_case(
-        "python.exe -c print(42) [ambiguous, falls to LLM]",
-        f'{sys.executable} -c "print(42)"',
-        expect_allow=False,
-    ))
-    results.append(test_case(
-        "python.exe -m pytest",
-        f"{sys.executable} -m pytest tests/ -v",
-        expect_allow=True,
-    ))
-    results.append(test_case(
-        "python.exe -m pip list",
-        f"{sys.executable} -m pip list",
-        expect_allow=True,
-    ))
+    results.append(
+        run_case(
+            "python.exe -c print(42) [ambiguous, falls to LLM]",
+            f'{sys.executable} -c "print(42)"',
+            expect_allow=False,
+        )
+    )
+    results.append(
+        run_case(
+            "python.exe -m pytest",
+            f"{sys.executable} -m pytest tests/ -v",
+            expect_allow=True,
+        )
+    )
+    results.append(
+        run_case(
+            "python.exe -m pip list",
+            f"{sys.executable} -m pip list",
+            expect_allow=True,
+        )
+    )
 
     print("\n=== Version/help flags (universal safe) ===")
-    results.append(test_case("npm --version", "npm --version", expect_allow=True))
-    results.append(test_case("node --version", "node --version", expect_allow=True))
-    results.append(test_case("python --help", "python --help", expect_allow=True))
+    results.append(run_case("npm --version", "npm --version", expect_allow=True))
+    results.append(run_case("node --version", "node --version", expect_allow=True))
+    results.append(run_case("python --help", "python --help", expect_allow=True))
 
     print("\n=== Denylisted (should show dialog) ===")
-    results.append(test_case("rm -rf /", "rm -rf /", expect_allow=False))
-    results.append(test_case("rm -rf ~", "rm -rf ~", expect_allow=False))
-    results.append(test_case("rm -rf /*", "rm -rf /*", expect_allow=False))
-    results.append(test_case("sudo apt install foo", "sudo apt install foo", expect_allow=False))
-    results.append(test_case("cat ~/.ssh/id_rsa", "cat ~/.ssh/id_rsa", expect_allow=False))
-    results.append(test_case("dd if=/dev/zero", "dd if=/dev/zero of=/dev/sda", expect_allow=False))
-    results.append(test_case("chmod 777 /etc", "chmod 777 /etc", expect_allow=False))
-    results.append(test_case("schtasks /create", "schtasks /create /tn task", expect_allow=False))
-    results.append(test_case("reg add HKLM", "reg add HKLM\\SOFTWARE\\foo", expect_allow=False))
-    results.append(test_case(
-        "powershell -EncodedCommand",
-        "powershell -EncodedCommand ZWNobyAiaGFja2VkIg==",
-        expect_allow=False,
-    ))
-    results.append(test_case(
-        "base64 --decode pipe",
-        "echo payload | base64 --decode | sh",
-        expect_allow=False,
-    ))
+    results.append(run_case("rm -rf /", "rm -rf /", expect_allow=False))
+    results.append(run_case("rm -rf ~", "rm -rf ~", expect_allow=False))
+    results.append(run_case("rm -rf /*", "rm -rf /*", expect_allow=False))
+    results.append(
+        run_case("sudo apt install foo", "sudo apt install foo", expect_allow=False)
+    )
+    results.append(
+        run_case("cat ~/.ssh/id_rsa", "cat ~/.ssh/id_rsa", expect_allow=False)
+    )
+    results.append(
+        run_case("dd if=/dev/zero", "dd if=/dev/zero of=/dev/sda", expect_allow=False)
+    )
+    results.append(run_case("chmod 777 /etc", "chmod 777 /etc", expect_allow=False))
+    results.append(
+        run_case("schtasks /create", "schtasks /create /tn task", expect_allow=False)
+    )
+    results.append(
+        run_case("reg add HKLM", "reg add HKLM\\SOFTWARE\\foo", expect_allow=False)
+    )
+    results.append(
+        run_case(
+            "powershell -EncodedCommand",
+            "powershell -EncodedCommand ZWNobyAiaGFja2VkIg==",
+            expect_allow=False,
+        )
+    )
+    results.append(
+        run_case(
+            "base64 --decode pipe",
+            "echo payload | base64 --decode | sh",
+            expect_allow=False,
+        )
+    )
 
     passed = sum(results)
     total = len(results)

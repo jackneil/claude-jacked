@@ -14,7 +14,7 @@ Content types indexed:
 import logging
 import uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from qdrant_client.http import models
@@ -60,7 +60,9 @@ class SessionIndexer:
         >>> indexer.index_session(Path('session.jsonl'), '/c/Github/repo')  # doctest: +SKIP
     """
 
-    def __init__(self, config: SmartForkConfig, client: Optional[QdrantSessionClient] = None):
+    def __init__(
+        self, config: SmartForkConfig, client: Optional[QdrantSessionClient] = None
+    ):
         """
         Initialize the indexer.
 
@@ -133,19 +135,25 @@ class SessionIndexer:
 
             # Config changed? Clear and re-seed from Qdrant
             if meta and meta["config_hash"] != self._config_hash:
-                logger.info(f"Config changed for session {session_id}, re-seeding from Qdrant")
+                logger.info(
+                    f"Config changed for session {session_id}, re-seeding from Qdrant"
+                )
                 self._tracker.clear_session(session_id)
                 meta = None
 
             # Previous crash mid-indexing? Force re-index
             if meta and meta["status"] == "indexing":
-                logger.info(f"Session {session_id} was interrupted mid-index, forcing re-seed")
+                logger.info(
+                    f"Session {session_id} was interrupted mid-index, forcing re-seed"
+                )
                 force = True
 
             # Cache miss or force? Seed from Qdrant (source of truth, THIS USER ONLY)
             if meta is None or force:
                 self._tracker.clear_session(session_id)
-                self._tracker.seed_from_qdrant(session_id, self.client, self.config.user_name)
+                self._tracker.seed_from_qdrant(
+                    session_id, self.client, self.config.user_name
+                )
 
             # Get what's already indexed
             indexed = self._tracker.get_session_state(session_id)
@@ -169,7 +177,9 @@ class SessionIndexer:
 
             # Record what we indexed in tracker
             for content_type, idx, hash_val, point_id in points_metadata:
-                self._tracker.record_indexed(session_id, content_type, idx, hash_val, str(point_id))
+                self._tracker.record_indexed(
+                    session_id, content_type, idx, hash_val, str(point_id)
+                )
 
             self._tracker.mark_complete(session_id)
 
@@ -216,7 +226,9 @@ class SessionIndexer:
         Returns:
             UUID5 string for the point
         """
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{session_id}:{content_type}:{index}"))
+        return str(
+            uuid.uuid5(uuid.NAMESPACE_DNS, f"{session_id}:{content_type}:{index}")
+        )
 
     def _build_incremental_points(
         self,
@@ -245,7 +257,7 @@ class SessionIndexer:
         timestamp_str = (
             transcript.timestamp.isoformat()
             if transcript.timestamp
-            else datetime.now().isoformat()
+            else datetime.now(timezone.utc).isoformat()
         )
 
         # Base payload for all points
@@ -315,7 +327,9 @@ class SessionIndexer:
         for i, agent_summary in enumerate(transcript.agent_summaries):
             summary_hash = content_hash(agent_summary.summary_text)
             if indexed.get(("subagent_summary", i)) != summary_hash:
-                point_id = self._make_point_id(transcript.session_id, "subagent_summary", i)
+                point_id = self._make_point_id(
+                    transcript.session_id, "subagent_summary", i
+                )
                 points_to_index.append(
                     models.PointStruct(
                         id=point_id,
@@ -340,7 +354,9 @@ class SessionIndexer:
         for i, label in enumerate(transcript.summary_labels):
             label_hash = content_hash(label.label)
             if indexed.get(("summary_label", i)) != label_hash:
-                point_id = self._make_point_id(transcript.session_id, "summary_label", i)
+                point_id = self._make_point_id(
+                    transcript.session_id, "summary_label", i
+                )
                 points_to_index.append(
                     models.PointStruct(
                         id=point_id,

@@ -11,6 +11,7 @@ router = APIRouter()
 
 # --- Pydantic v2 response models ---
 
+
 class HealthResponse(BaseModel):
     status: str
     db: bool
@@ -112,6 +113,7 @@ class InstallationsOverview(BaseModel):
 
 # --- Routes ---
 
+
 @router.get("/health", response_model=HealthResponse)
 async def health_check(request: Request):
     """Health check. Returns DB connectivity status."""
@@ -131,9 +133,13 @@ def _version_response(result: dict | None) -> "VersionResponse":
     checked_iso = None
     next_iso = None
     if result.get("checked_at"):
-        checked_iso = datetime.fromtimestamp(result["checked_at"], tz=timezone.utc).isoformat()
+        checked_iso = datetime.fromtimestamp(
+            result["checked_at"], tz=timezone.utc
+        ).isoformat()
     if result.get("next_check_at"):
-        next_iso = datetime.fromtimestamp(result["next_check_at"], tz=timezone.utc).isoformat()
+        next_iso = datetime.fromtimestamp(
+            result["next_check_at"], tz=timezone.utc
+        ).isoformat()
 
     return VersionResponse(
         current=__version__,
@@ -191,12 +197,22 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
     if not p.is_dir():
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": f"Not a directory: {repo_path}", "code": "NOT_DIRECTORY"}},
+            content={
+                "error": {
+                    "message": f"Not a directory: {repo_path}",
+                    "code": "NOT_DIRECTORY",
+                }
+            },
         )
     if not (p / ".git").is_dir():
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": f"No .git directory in: {repo_path}", "code": "NOT_GIT_REPO"}},
+            content={
+                "error": {
+                    "message": f"No .git directory in: {repo_path}",
+                    "code": "NOT_GIT_REPO",
+                }
+            },
         )
     # Verify project is known to jacked (has activity in DB)
     db = getattr(request.app.state, "db", None)
@@ -208,12 +224,22 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
             if normalized not in known_paths and str(p) not in known_paths:
                 return JSONResponse(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    content={"error": {"message": f"Unknown project: {repo_path}. Must have jacked activity.", "code": "UNKNOWN_PROJECT"}},
+                    content={
+                        "error": {
+                            "message": f"Unknown project: {repo_path}. Must have jacked activity.",
+                            "code": "UNKNOWN_PROJECT",
+                        }
+                    },
                 )
         except Exception:
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={"error": {"message": "Database unavailable for project verification", "code": "DB_ERROR"}},
+                content={
+                    "error": {
+                        "message": "Database unavailable for project verification",
+                        "code": "DB_ERROR",
+                    }
+                },
             )
     return None
 
@@ -226,6 +252,7 @@ async def project_guardrails_init(body: ProjectInitRequest, request: Request):
         return error
 
     from jacked.guardrails import create_guardrails
+
     result = create_guardrails(body.repo_path, language=body.language, force=body.force)
     return result
 
@@ -238,11 +265,13 @@ async def project_lint_hook_init(body: ProjectInitRequest, request: Request):
         return error
 
     from jacked.guardrails import install_hook
+
     result = install_hook(body.repo_path, language=body.language, force=body.force)
     return result
 
 
 # --- Project Env endpoints ---
+
 
 class EnvUpdateRequest(BaseModel):
     repo_path: str
@@ -256,6 +285,7 @@ async def get_project_env(repo_path: str, request: Request):
     >>> # GET /api/project/env?repo_path=/some/repo
     """
     from pathlib import Path
+
     error = _validate_project_path(repo_path, request)
     if error:
         return error
@@ -303,7 +333,9 @@ async def update_project_env(body: EnvUpdateRequest, request: Request):
     if validation_error:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": validation_error, "code": "INVALID_ENV_PATH"}},
+            content={
+                "error": {"message": validation_error, "code": "INVALID_ENV_PATH"}
+            },
         )
 
     # Write to .git/jacked/env
@@ -336,14 +368,21 @@ async def detect_project_env(body: ProjectInitRequest, request: Request):
     if not env_path:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
-            content={"error": {"message": "No Python env detected", "code": "NO_ENV_DETECTED"}},
+            content={
+                "error": {
+                    "message": "No Python env detected",
+                    "code": "NO_ENV_DETECTED",
+                }
+            },
         )
 
     validation_error = _validate_env_path(env_path)
     if validation_error:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": validation_error, "code": "INVALID_ENV_PATH"}},
+            content={
+                "error": {"message": validation_error, "code": "INVALID_ENV_PATH"}
+            },
         )
 
     _write_project_env(body.repo_path, env_path)
@@ -390,7 +429,9 @@ async def get_project_lessons(repo_path: str, request: Request):
     except Exception:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": {"message": "Failed to read lessons.md", "code": "READ_ERROR"}},
+            content={
+                "error": {"message": "Failed to read lessons.md", "code": "READ_ERROR"}
+            },
         )
 
     lessons = []
@@ -399,7 +440,9 @@ async def get_project_lessons(repo_path: str, request: Request):
         line = line.strip()
         m = pattern.match(line)
         if m:
-            lessons.append({"index": idx, "strike": int(m.group(1)), "text": m.group(2)})
+            lessons.append(
+                {"index": idx, "strike": int(m.group(1)), "text": m.group(2)}
+            )
         elif line.startswith("- "):
             lessons.append({"index": idx, "strike": 0, "text": line[2:]})
 
@@ -414,7 +457,9 @@ async def update_project_lessons(body: LessonsUpdateRequest, request: Request):
     if len(body.lessons) > 200:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": "Too many lessons (max 200)", "code": "TOO_MANY"}},
+            content={
+                "error": {"message": "Too many lessons (max 200)", "code": "TOO_MANY"}
+            },
         )
 
     error = _validate_project_path(body.repo_path, request)
@@ -457,7 +502,12 @@ async def update_project_lessons(body: LessonsUpdateRequest, request: Request):
     except Exception:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": {"message": "Failed to write lessons.md", "code": "WRITE_ERROR"}},
+            content={
+                "error": {
+                    "message": "Failed to write lessons.md",
+                    "code": "WRITE_ERROR",
+                }
+            },
         )
 
     return {"saved": True, "count": len(lesson_lines)}
@@ -472,7 +522,9 @@ async def list_installations(request: Request):
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     rows = db.list_installations()
@@ -514,7 +566,11 @@ async def installations_overview(request: Request):
     agents = []
     for name in agent_names:
         installed = (agents_dst / f"{name}.md").exists()
-        agents.append(InstalledComponent(name=name, display_name=_name_to_display(name), installed=installed))
+        agents.append(
+            InstalledComponent(
+                name=name, display_name=_name_to_display(name), installed=installed
+            )
+        )
 
     # Commands
     command_names = _get_valid_command_names()
@@ -522,13 +578,29 @@ async def installations_overview(request: Request):
     commands = []
     for name in command_names:
         installed = (commands_dst / f"{name}.md").exists()
-        commands.append(InstalledComponent(name=name, display_name=_name_to_display(name), installed=installed))
+        commands.append(
+            InstalledComponent(
+                name=name, display_name=_name_to_display(name), installed=installed
+            )
+        )
 
     # Hooks
     hooks = [
-        InstalledComponent(name="security_gatekeeper", display_name="Gatekeeper", installed=_detect_hook_installed(settings, "security_gatekeeper")),
-        InstalledComponent(name="session_indexing", display_name="Indexing", installed=_detect_hook_installed(settings, "session_indexing")),
-        InstalledComponent(name="sounds", display_name="Sounds", installed=_detect_hook_installed(settings, "sounds")),
+        InstalledComponent(
+            name="security_gatekeeper",
+            display_name="Gatekeeper",
+            installed=_detect_hook_installed(settings, "security_gatekeeper"),
+        ),
+        InstalledComponent(
+            name="session_indexing",
+            display_name="Indexing",
+            installed=_detect_hook_installed(settings, "session_indexing"),
+        ),
+        InstalledComponent(
+            name="sounds",
+            display_name="Sounds",
+            installed=_detect_hook_installed(settings, "sounds"),
+        ),
     ]
 
     # Knowledge
@@ -536,9 +608,17 @@ async def installations_overview(request: Request):
     skill_installed = (CLAUDE_DIR / "skills" / "jacked" / "SKILL.md").exists()
     ref_installed = (CLAUDE_DIR / "jacked-reference.md").exists()
     knowledge = [
-        InstalledComponent(name="rules", display_name="Rules", installed=rules_status.get("installed", False)),
-        InstalledComponent(name="skill", display_name="Skill", installed=skill_installed),
-        InstalledComponent(name="reference", display_name="Reference", installed=ref_installed),
+        InstalledComponent(
+            name="rules",
+            display_name="Rules",
+            installed=rules_status.get("installed", False),
+        ),
+        InstalledComponent(
+            name="skill", display_name="Skill", installed=skill_installed
+        ),
+        InstalledComponent(
+            name="reference", display_name="Reference", installed=ref_installed
+        ),
     ]
 
     global_install = GlobalInstallation(
@@ -562,24 +642,26 @@ async def installations_overview(request: Request):
             for row in rows:
                 rp = row["repo_path"]
                 setup = check_project_setup(rp) if rp else {}
-                projects.append(ProjectActivity(
-                    repo_path=rp,
-                    repo_name=Path(rp).name if rp else "unknown",
-                    gatekeeper_decisions=row.get("gatekeeper_decisions") or 0,
-                    gatekeeper_allowed=row.get("gatekeeper_allowed") or 0,
-                    commands_run=row.get("commands_run") or 0,
-                    hook_executions=row.get("hook_executions") or 0,
-                    last_activity=row.get("last_activity"),
-                    first_seen=row.get("first_seen"),
-                    unique_sessions=row.get("unique_sessions") or 0,
-                    has_guardrails=setup.get("has_guardrails", False),
-                    guardrails_file=setup.get("guardrails_file"),
-                    has_lint_hook=setup.get("has_lint_hook", False),
-                    detected_language=setup.get("detected_language"),
-                    env_path=setup.get("env_path"),
-                    has_lessons=setup.get("has_lessons", False),
-                    lessons_count=setup.get("lessons_count", 0),
-                ))
+                projects.append(
+                    ProjectActivity(
+                        repo_path=rp,
+                        repo_name=Path(rp).name if rp else "unknown",
+                        gatekeeper_decisions=row.get("gatekeeper_decisions") or 0,
+                        gatekeeper_allowed=row.get("gatekeeper_allowed") or 0,
+                        commands_run=row.get("commands_run") or 0,
+                        hook_executions=row.get("hook_executions") or 0,
+                        last_activity=row.get("last_activity"),
+                        first_seen=row.get("first_seen"),
+                        unique_sessions=row.get("unique_sessions") or 0,
+                        has_guardrails=setup.get("has_guardrails", False),
+                        guardrails_file=setup.get("guardrails_file"),
+                        has_lint_hook=setup.get("has_lint_hook", False),
+                        detected_language=setup.get("detected_language"),
+                        env_path=setup.get("env_path"),
+                        has_lessons=setup.get("has_lessons", False),
+                        lessons_count=setup.get("lessons_count", 0),
+                    )
+                )
         except Exception:
             pass
 
@@ -592,6 +674,7 @@ async def installations_overview(request: Request):
 
 # --- Gatekeeper logs ---
 
+
 @router.get("/logs/sessions")
 async def get_gatekeeper_sessions(request: Request):
     """Session summaries for gatekeeper decisions."""
@@ -599,7 +682,9 @@ async def get_gatekeeper_sessions(request: Request):
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     return db.list_gatekeeper_sessions(limit=50)
@@ -609,27 +694,52 @@ async def get_gatekeeper_sessions(request: Request):
 async def get_gatekeeper_logs(
     request: Request,
     limit: int = 200,
+    offset: int = 0,
     decision: Optional[str] = None,
     method: Optional[str] = None,
     session_id: Optional[str] = None,
+    command_search: Optional[str] = None,
+    repo_path: Optional[str] = None,
 ):
-    """Recent gatekeeper decisions from DB. Newest first."""
+    """Recent gatekeeper decisions from DB. Newest first, server-side filtered."""
     db = getattr(request.app.state, "db", None)
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
-    clamped = min(max(limit, 1), 1000)
-    rows = db.list_gatekeeper_decisions(limit=clamped, session_id=session_id)
+    clamped_limit = min(max(limit, 1), 1000)
+    clamped_offset = max(offset, 0)
 
+    if decision and decision not in ("ALLOW", "ASK_USER"):
+        decision = None
+
+    filters = {}
+    if session_id:
+        filters["session_id"] = session_id
     if decision:
-        rows = [r for r in rows if r.get("decision") == decision]
+        filters["decision"] = decision
     if method:
-        rows = [r for r in rows if r.get("method") == method]
+        filters["method"] = method
+    if command_search:
+        filters["command_search"] = command_search
+    if repo_path:
+        filters["repo_path"] = repo_path
 
-    return rows
+    result = db.list_gatekeeper_decisions(
+        limit=clamped_limit,
+        offset=clamped_offset,
+        filters=filters,
+    )
+    return {
+        "rows": result["rows"],
+        "total": result["total"],
+        "limit": clamped_limit,
+        "offset": clamped_offset,
+    }
 
 
 @router.delete("/logs/gatekeeper")
@@ -639,18 +749,20 @@ async def purge_gatekeeper_logs(
     session_id: Optional[str] = None,
 ):
     """Purge gatekeeper decisions by age or session."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     db = getattr(request.app.state, "db", None)
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     before_iso = None
     if older_than_days is not None:
-        cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
         before_iso = cutoff.isoformat()
 
     count = db.purge_gatekeeper_decisions(before_iso=before_iso, session_id=session_id)
@@ -672,7 +784,9 @@ async def export_gatekeeper_logs(
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     rows = db.export_gatekeeper_decisions(session_id=session_id, decision=decision)
@@ -681,8 +795,9 @@ async def export_gatekeeper_logs(
     if session_id:
         suffix = f"-{session_id[:8]}"
 
-    from datetime import datetime
-    datestamp = datetime.utcnow().strftime("%Y%m%d")
+    from datetime import datetime, timezone
+
+    datestamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     filename = f"gatekeeper-logs{suffix}-{datestamp}.json"
 
     return Response(
@@ -694,34 +809,54 @@ async def export_gatekeeper_logs(
 
 # --- Additional log endpoints (hooks, version checks) ---
 
+
 @router.get("/logs/hooks")
 async def list_hook_logs(
     request: Request,
     limit: int = 200,
+    offset: int = 0,
     hook_name: Optional[str] = None,
 ):
-    """List hook execution logs."""
+    """List hook execution logs with pagination."""
     db = getattr(request.app.state, "db", None)
     if db is None:
-        return {"logs": []}
-    limit = max(1, min(500, limit))
-    return {"logs": db.list_hook_executions(limit=limit, hook_name=hook_name)}
+        return {"logs": [], "total": 0, "limit": limit, "offset": offset}
+    clamped_limit = max(1, min(500, limit))
+    clamped_offset = max(offset, 0)
+    result = db.list_hook_executions(
+        limit=clamped_limit, offset=clamped_offset, hook_name=hook_name
+    )
+    return {
+        "logs": result["rows"],
+        "total": result["total"],
+        "limit": clamped_limit,
+        "offset": clamped_offset,
+    }
 
 
 @router.get("/logs/version-checks")
 async def list_version_check_logs(
     request: Request,
     limit: int = 100,
+    offset: int = 0,
 ):
-    """List version check logs."""
+    """List version check logs with pagination."""
     db = getattr(request.app.state, "db", None)
     if db is None:
-        return {"logs": []}
-    limit = max(1, min(200, limit))
-    return {"logs": db.list_version_checks(limit=limit)}
+        return {"logs": [], "total": 0, "limit": limit, "offset": offset}
+    clamped_limit = max(1, min(200, limit))
+    clamped_offset = max(offset, 0)
+    result = db.list_version_checks(limit=clamped_limit, offset=clamped_offset)
+    return {
+        "logs": result["rows"],
+        "total": result["total"],
+        "limit": clamped_limit,
+        "offset": clamped_offset,
+    }
 
 
 # --- Gatekeeper config (static routes BEFORE parameterized /{key}) ---
+
 
 @router.get("/settings/gatekeeper")
 async def get_gatekeeper_config(request: Request):
@@ -783,7 +918,9 @@ async def update_gatekeeper_config(body: GatekeeperConfigRequest, request: Reque
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     db.set_setting("gatekeeper.model", json.dumps(body.model))
@@ -819,10 +956,14 @@ async def test_gatekeeper_api_key(request: Request):
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
     if not api_key:
-        return {"success": False, "error": "No API key configured (check DB or ANTHROPIC_API_KEY env var)"}
+        return {
+            "success": False,
+            "error": "No API key configured (check DB or ANTHROPIC_API_KEY env var)",
+        }
 
     try:
         import anthropic
+
         client = anthropic.Anthropic(api_key=api_key, timeout=10.0)
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -831,12 +972,16 @@ async def test_gatekeeper_api_key(request: Request):
         )
         return {"success": True, "response": response.content[0].text.strip()[:20]}
     except ImportError:
-        return {"success": False, "error": "anthropic SDK not installed (pip install anthropic)"}
+        return {
+            "success": False,
+            "error": "anthropic SDK not installed (pip install anthropic)",
+        }
     except Exception as e:
         return {"success": False, "error": str(e)[:200]}
 
 
 # --- Gatekeeper prompt ---
+
 
 @router.get("/settings/gatekeeper/prompt")
 async def get_gatekeeper_prompt():
@@ -902,6 +1047,7 @@ async def delete_gatekeeper_prompt():
 
 # --- Gatekeeper path safety config ---
 
+
 @router.get("/settings/gatekeeper/path-safety")
 async def get_path_safety_config(request: Request):
     """Path safety config + available rules metadata."""
@@ -911,7 +1057,12 @@ async def get_path_safety_config(request: Request):
 
     db = getattr(request.app.state, "db", None)
 
-    config = {"enabled": True, "allowed_paths": [], "disabled_patterns": [], "watched_paths": []}
+    config = {
+        "enabled": True,
+        "allowed_paths": [],
+        "disabled_patterns": [],
+        "watched_paths": [],
+    }
 
     if db is not None:
         raw = db.get_setting("gatekeeper.path_safety")
@@ -923,6 +1074,7 @@ async def get_path_safety_config(request: Request):
 
     # Check existence of watched paths for per-row badges
     from pathlib import Path as _Path
+
     watched = config.get("watched_paths", [])
     watched_existence = {}
     for wp in watched:
@@ -955,27 +1107,44 @@ async def update_path_safety_config(body: PathSafetyConfigRequest, request: Requ
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     # Validate allowed_paths
     if len(body.allowed_paths) > 20:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": "Maximum 20 allowed paths", "code": "TOO_MANY_PATHS"}},
+            content={
+                "error": {
+                    "message": "Maximum 20 allowed paths",
+                    "code": "TOO_MANY_PATHS",
+                }
+            },
         )
     for p in body.allowed_paths:
         if len(p) > 500:
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"error": {"message": f"Path too long (max 500 chars): {p[:50]}...", "code": "PATH_TOO_LONG"}},
+                content={
+                    "error": {
+                        "message": f"Path too long (max 500 chars): {p[:50]}...",
+                        "code": "PATH_TOO_LONG",
+                    }
+                },
             )
         # Reject root-level paths that would disable the entire project boundary
         normalized = p.replace("\\", "/").rstrip("/")
         if normalized in ("", "/") or (len(normalized) == 2 and normalized[1] == ":"):
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"error": {"message": f"Root paths not allowed (would disable project boundary): {p}", "code": "ROOT_PATH_REJECTED"}},
+                content={
+                    "error": {
+                        "message": f"Root paths not allowed (would disable project boundary): {p}",
+                        "code": "ROOT_PATH_REJECTED",
+                    }
+                },
             )
 
     # Validate disabled_patterns — must be known rule keys
@@ -984,7 +1153,12 @@ async def update_path_safety_config(body: PathSafetyConfigRequest, request: Requ
     if invalid:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": f"Unknown pattern keys: {', '.join(invalid)}", "code": "INVALID_PATTERN_KEY"}},
+            content={
+                "error": {
+                    "message": f"Unknown pattern keys: {', '.join(invalid)}",
+                    "code": "INVALID_PATTERN_KEY",
+                }
+            },
         )
 
     # Validate watched_paths
@@ -994,21 +1168,36 @@ async def update_path_safety_config(body: PathSafetyConfigRequest, request: Requ
     if len(body.watched_paths) > 20:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": {"message": "Maximum 20 watched paths", "code": "TOO_MANY_WATCHED"}},
+            content={
+                "error": {
+                    "message": "Maximum 20 watched paths",
+                    "code": "TOO_MANY_WATCHED",
+                }
+            },
         )
     resolved_watched = []
     for wp in body.watched_paths:
         if len(wp) > 500:
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"error": {"message": f"Watched path too long (max 500 chars): {wp[:50]}...", "code": "PATH_TOO_LONG"}},
+                content={
+                    "error": {
+                        "message": f"Watched path too long (max 500 chars): {wp[:50]}...",
+                        "code": "PATH_TOO_LONG",
+                    }
+                },
             )
         normalized = wp.replace("\\", "/").rstrip("/")
         # Only hard-reject Unix root (matches literally everything)
         if _os.name != "nt" and normalized == "":
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"error": {"message": "Root path (/) not allowed — matches everything", "code": "ROOT_PATH_REJECTED"}},
+                content={
+                    "error": {
+                        "message": "Root path (/) not allowed — matches everything",
+                        "code": "ROOT_PATH_REJECTED",
+                    }
+                },
             )
         # Try resolve, fall back to normalized raw for unmounted drives
         try:
@@ -1052,13 +1241,18 @@ async def validate_path(body: PathValidateRequest):
     except Exception:
         resolved_str = normalized_raw
         if _os.name == "nt":
-            resolved_str = resolved_str[0].upper() + resolved_str[1:] if len(resolved_str) >= 2 else resolved_str
+            resolved_str = (
+                resolved_str[0].upper() + resolved_str[1:]
+                if len(resolved_str) >= 2
+                else resolved_str
+            )
 
     warnings = []
 
     # Warn (don't reject) for broad paths
-    is_drive_root = (len(resolved_str) == 2 and resolved_str[1] == ":") or \
-                    (len(resolved_str) == 3 and resolved_str[1] == ":" and resolved_str[2] == "/")
+    is_drive_root = (len(resolved_str) == 2 and resolved_str[1] == ":") or (
+        len(resolved_str) == 3 and resolved_str[1] == ":" and resolved_str[2] == "/"
+    )
     if is_drive_root:
         warnings.append(f"Drive root — matches all files on {resolved_str}")
 
@@ -1115,7 +1309,9 @@ async def browse_path(body: PathBrowseRequest):
         )
 
     current = str(target).replace("\\", "/")
-    parent_path = str(target.parent).replace("\\", "/") if target.parent != target else None
+    parent_path = (
+        str(target.parent).replace("\\", "/") if target.parent != target else None
+    )
 
     directories = []
     try:
@@ -1132,13 +1328,16 @@ async def browse_path(body: PathBrowseRequest):
     except PermissionError:
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
-            content={"error": {"message": "Permission denied", "code": "PERMISSION_DENIED"}},
+            content={
+                "error": {"message": "Permission denied", "code": "PERMISSION_DENIED"}
+            },
         )
 
     return {"current": current, "parent": parent_path, "directories": directories}
 
 
 # --- Generic settings (parameterized routes AFTER static ones) ---
+
 
 @router.get("/settings", response_model=list[SettingResponse])
 async def get_settings(request: Request):
@@ -1149,7 +1348,9 @@ async def get_settings(request: Request):
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     rows = db.list_settings()
@@ -1177,7 +1378,9 @@ async def update_setting(key: str, body: SettingUpdateRequest, request: Request)
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     value_str = json.dumps(body.value)
@@ -1192,13 +1395,17 @@ async def delete_setting(key: str, request: Request):
     if db is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
         )
 
     deleted = db.delete_setting(key)
     if not deleted:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
-            content={"error": {"message": f"Setting '{key}' not found", "code": "NOT_FOUND"}},
+            content={
+                "error": {"message": f"Setting '{key}' not found", "code": "NOT_FOUND"}
+            },
         )
     return {"key": key, "deleted": True}
