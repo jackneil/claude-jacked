@@ -46,6 +46,44 @@ def read_platform_credentials() -> dict | None:
     return None
 
 
+def write_platform_credentials(data: dict) -> bool:
+    """Write credentials to the platform's native credential store.
+
+    macOS: Keychain ("Claude Code-credentials")
+    Linux/Windows: no-op (they use .credentials.json)
+
+    Returns True if written successfully, False otherwise.
+
+    >>> write_platform_credentials({}) if sys.platform != "darwin" else True
+    True
+    """
+    if sys.platform != "darwin":
+        return True  # no-op on non-macOS (file write is sufficient)
+    try:
+        json_data = json.dumps(data, separators=(",", ":"))
+        # Delete existing entry (ignore failure if not found)
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-s", "Claude Code-credentials"],
+            capture_output=True, timeout=5,
+        )
+        # Add new entry
+        result = subprocess.run(
+            ["security", "add-generic-password",
+             "-s", "Claude Code-credentials",
+             "-a", "Claude Code",
+             "-w", json_data],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            logger.warning("Keychain write failed: %s", result.stderr.strip())
+            return False
+        return True
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("Keychain write error: %s", exc)
+        return False
+
+
 def sync_credential_tokens(db, cred_data: dict) -> bool:
     """Sync tokens from credential file back to DB.
 
