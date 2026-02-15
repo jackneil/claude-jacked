@@ -1655,6 +1655,44 @@ class Database:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def reassign_sessions(
+        self, from_account_id: int, to_account_id: int, since_iso: str
+    ) -> int:
+        """Reassign sessions from one account to another.
+
+        Batch-fixes wrongly-tagged sessions. Updates both account_id and email.
+        Both account IDs must exist and the target must not be deleted.
+
+        Args:
+            from_account_id: Source account (wrongly tagged)
+            to_account_id: Target account (correct)
+            since_iso: ISO timestamp cutoff — only sessions after this are reassigned
+
+        Returns:
+            Count of sessions reassigned
+
+        >>> db = Database(":memory:")
+        >>> db.reassign_sessions(1, 2, "2025-01-01T00:00:00Z")
+        0
+        """
+        from_acct = self.get_account(from_account_id)
+        to_acct = self.get_account(to_account_id)
+        if not from_acct:
+            raise ValueError(f"Source account {from_account_id} not found")
+        if not to_acct:
+            raise ValueError(f"Target account {to_account_id} not found")
+        if to_acct.get("is_deleted"):
+            raise ValueError(f"Target account {to_account_id} is deleted")
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts
+                   SET account_id = ?, email = ?
+                   WHERE account_id = ? AND detected_at > ?""",
+                (to_account_id, to_acct["email"], from_account_id, since_iso),
+            )
+            return cursor.rowcount
+
     def lookup_session_by_suffix(self, suffix: str, limit: int = 10) -> list:
         """Find session-account records by session_id suffix.
 

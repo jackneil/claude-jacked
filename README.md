@@ -24,17 +24,17 @@ Paste this into Claude Code and it handles everything:
 ```
 Install claude-jacked for me. Use AskUserQuestion to ask me which features I want:
 
-1. First check if pipx and jacked are already installed
+1. First check if uv and jacked are already installed (if uv is missing: curl -LsSf https://astral.sh/uv/install.sh | sh)
 2. Ask me which install tier I want:
    - BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard
    - SEARCH: Everything above + search past Claude sessions across machines (requires Qdrant Cloud)
    - SECURITY: Everything above + auto-approve safe bash commands (fewer permission prompts)
    - ALL: Everything
 3. Install based on my choice:
-   - BASE: pipx install claude-jacked && jacked install --force
-   - SEARCH: pipx install "claude-jacked[search]" && jacked install --force
-   - SECURITY: pipx install "claude-jacked[security]" && jacked install --force --security
-   - ALL: pipx install "claude-jacked[all]" && jacked install --force --security
+   - BASE: uv tool install claude-jacked && jacked install --force
+   - SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
+   - SECURITY: uv tool install "claude-jacked[security]" && jacked install --force --security
+   - ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
 4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
 5. Verify with: jacked --help
 6. Launch the dashboard: jacked webux
@@ -45,23 +45,27 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
 Run once from anywhere — installs globally to `~/.claude/` and applies to all your Claude Code sessions:
 
 ```bash
-pipx install claude-jacked
+uv tool install claude-jacked
 jacked install --force
 jacked webux              # opens your dashboard at localhost:8321
 ```
+
+> **Don't have uv?** Install it first: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Mac/Linux) or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
 
 **Want more?** Add optional extras:
 
 ```bash
 # Add session search (needs Qdrant Cloud ~$30/mo)
-pipx install "claude-jacked[search]" --force && jacked install --force
+uv tool install "claude-jacked[search]" --force && jacked install --force
 
 # Add security gatekeeper (auto-approves safe bash commands)
-pipx install "claude-jacked[security]" --force && jacked install --force --security
+uv tool install "claude-jacked[security]" --force && jacked install --force --security
 
 # Everything
-pipx install "claude-jacked[all]" --force && jacked install --force --security
+uv tool install "claude-jacked[all]" --force && jacked install --force --security
 ```
+
+> **Previously installed via pipx?** Uninstall it first: `pipx uninstall claude-jacked`
 
 ---
 
@@ -123,7 +127,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ## What's Included
 
-### Base (`pipx install claude-jacked`)
+### Base (`uv tool install claude-jacked`)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -136,7 +140,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Feature Toggles** | Enable/disable any reviewer, command, or hook from the dashboard |
 | **Analytics** | Approval rates, command usage, system health |
 
-### Search Extra (`pipx install "claude-jacked[search]"`)
+### Search Extra (`uv tool install "claude-jacked[search]"`)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -144,7 +148,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
 | **Team Sharing** | Search your teammates' sessions (with their permission) |
 
-### Security Extra (`pipx install "claude-jacked[security]"`)
+### Security Extra (`uv tool install "claude-jacked[security]"`)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -192,7 +196,7 @@ Commands containing shell operators (`&&`, `||`, `;`, `|`, etc.) always go to th
 ### Install / Uninstall
 
 ```bash
-pipx install "claude-jacked[security]"
+uv tool install "claude-jacked[security]"
 jacked install --force --security
 ```
 
@@ -342,14 +346,14 @@ Works on Windows, Mac, and Linux. To remove: `jacked uninstall --sounds`
 ### Uninstall
 
 ```bash
-jacked uninstall && pipx uninstall claude-jacked
+jacked uninstall && uv tool uninstall claude-jacked
 ```
 
 Your cloud database stays intact — reinstall anytime without losing history.
 
 ### Common Issues
 
-**"jacked: command not found"** — Run `pipx ensurepath` and restart your terminal.
+**"jacked: command not found"** — Run `uv tool update-shell` and restart your terminal.
 
 **Search isn't working** — You need Qdrant Cloud set up first. Ask Claude: `Help me set up Qdrant Cloud for jacked`
 
@@ -363,7 +367,7 @@ Your cloud database stays intact — reinstall anytime without losing history.
 
 > **Only needed for the `[search]` extra.** The base install works without Qdrant.
 
-1. Install the search extra: `pipx install "claude-jacked[search]"`
+1. Install the search extra: `uv tool install "claude-jacked[search]"`
 2. Go to [cloud.qdrant.io](https://cloud.qdrant.io) and create an account
 3. Create a cluster (paid tier ~$30/month required)
 4. Copy your cluster URL and API key
@@ -567,7 +571,7 @@ Install claude-jacked for me. Use the AskUserQuestion tool to guide me through o
 
 PHASE 1 - DIAGNOSTICS:
 - Detect OS (Windows/Mac/Linux)
-- Check: pipx --version (if missing: pip install pipx && pipx ensurepath)
+- Check: uv --version (if missing: curl -LsSf https://astral.sh/uv/install.sh | sh on Mac/Linux, powershell -c "irm https://astral.sh/uv/install.ps1 | iex" on Windows)
 - Check: jacked --version (to see if already installed)
 - Check ~/.claude/settings.json for existing hooks
 
@@ -583,10 +587,10 @@ Options:
 
 PHASE 3 - INSTALL:
 Based on user choice:
-- BASE: pipx install claude-jacked && jacked install --force
-- SEARCH: pipx install "claude-jacked[search]" && jacked install --force
-- SECURITY: pipx install "claude-jacked[security]" && jacked install --force --security
-- ALL: pipx install "claude-jacked[all]" && jacked install --force --security
+- BASE: uv tool install claude-jacked && jacked install --force
+- SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
+- SECURITY: uv tool install "claude-jacked[security]" && jacked install --force --security
+- ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
 
 PHASE 4 - POST-INSTALL:
 - Launch dashboard: jacked webux
@@ -607,13 +611,15 @@ Claude Code uses Git Bash on Windows, which can cause path issues.
 
 **If "jacked" isn't found:**
 ```bash
-pipx ensurepath
+uv tool update-shell
 # Then restart your terminal
 ```
 
 **If paths are getting mangled:**
 ```bash
-/c/Users/jack/pipx/venvs/claude-jacked/Scripts/jacked.exe status
+# Find the uv tools bin directory
+uv tool dir
+# Use the full path to jacked if needed
 ```
 
 </details>

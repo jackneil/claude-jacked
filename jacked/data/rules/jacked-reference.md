@@ -6,7 +6,7 @@ Read this when the user asks about jacked features, installation, gatekeeper, lo
 ## What Jacked Is
 
 - Toolkit for Claude Code: smart reviewers, quick commands, session search, security gatekeeper
-- Installed via pipx or pip, configured via `jacked install`
+- Installed via `uv tool install`, configured via `jacked install`
 - Source: https://github.com/jackneil/claude-jacked
 
 ## File Locations
@@ -124,9 +124,9 @@ The gatekeeper logs to `~/.claude/hooks-debug.log`. Key log patterns:
 |---------|----------|
 | "WARNING: Custom prompt missing required placeholders" | Stale prompt file. Run `jacked gatekeeper reset` |
 | No DECISION logged after WARNING | Old gatekeeper version. Run `jacked uninstall --security && jacked install --security` |
-| Hook not running your code changes | Check `~/.claude/settings.json` hook path -- may point to stale pipx/pip install instead of current env |
+| Hook not running your code changes | Check `~/.claude/settings.json` hook path -- may point to stale uv/pip install instead of current env |
 | Commands taking 8-10s instead of 2s | Set `ANTHROPIC_API_KEY` for direct API access instead of CLI fallback |
-| "jacked: command not found" | Run `pipx ensurepath` and restart terminal |
+| "jacked: command not found" | Run `uv tool update-shell` and restart terminal |
 | Too many permission prompts | Safe commands should be auto-approved. Check gatekeeper log for what's hitting LLM tier |
 | Permission wildcards bypassing gatekeeper | Run `jacked gatekeeper audit --log` to find dangerous patterns |
 

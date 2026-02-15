@@ -2,9 +2,9 @@
 
 Tests the 3-layer matching logic used by both get_active_credential (API)
 and _match_token_to_account (session tracker hook):
-  Layer 1: ~/.claude.json email (case-insensitive)
-  Layer 2: _jackedAccountId in credential data
-  Layer 3: Exact access_token match
+  Layer 1: _jackedAccountId stamp — strongest, explicitly set by jacked.
+  Layer 2: Exact access_token match — cryptographically unique.
+  Layer 3: Email from ~/.claude.json — weakest, Claude Code can change independently.
 
 Also tests the _update_claude_config_email write helper.
 """
@@ -312,14 +312,14 @@ def test_no_db_returns_none():
 
 
 # ------------------------------------------------------------------
-# Layer priority: Layer 1 wins over Layer 2 and 3
+# Layer priority: Layer 1 (_jackedAccountId) wins over Layer 2 and 3
 # ------------------------------------------------------------------
 
 
-def test_layer1_takes_priority_over_layer2():
-    """Layer 1 (email) wins even when _jackedAccountId points elsewhere.
+def test_layer1_stamp_takes_priority_over_token_and_email():
+    """Layer 1 (_jackedAccountId stamp) wins even when token and email point elsewhere.
 
-    >>> test_layer1_takes_priority_over_layer2()
+    >>> test_layer1_stamp_takes_priority_over_token_and_email()
     """
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -329,6 +329,7 @@ def test_layer1_takes_priority_over_layer2():
             json.dumps({"oauthAccount": {"emailAddress": "alice@test.com"}}),
             encoding="utf-8",
         )
+        # _jackedAccountId=2 (bob), but token matches bob and email matches alice
         cred_data = {"_jackedAccountId": 2, "claudeAiOauth": {"accessToken": "tok_bob"}}
 
         with (
@@ -339,9 +340,9 @@ def test_layer1_takes_priority_over_layer2():
         ):
             acct_id, email = _match_token_to_account("tok_bob", cred_data=cred_data)
 
-        # Layer 1 wins: alice, not bob
-        assert acct_id == 1
-        assert email == "alice@test.com"
+        # Layer 1 (_jackedAccountId=2) wins: bob, not alice
+        assert acct_id == 2
+        assert email == "bob@test.com"
 
 
 # ------------------------------------------------------------------

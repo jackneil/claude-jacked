@@ -30,34 +30,62 @@ CRED_PATH = Path.home() / ".claude" / ".credentials.json"
 def _get_cred_data() -> tuple[str | None, dict | None]:
     """Read the credential file, return (access_token, full_data).
 
+    Tries file first (works on all platforms), then macOS Keychain fallback.
     Single read — callers reuse full_data for Layer 2 matching.
 
     >>> token, data = _get_cred_data()
     >>> token is None or isinstance(token, str)
     True
     """
+    # Try file first (works on Linux, Windows, and macOS if jacked created it)
     try:
-        if not CRED_PATH.exists():
-            return None, None
-        data = json.loads(CRED_PATH.read_text(encoding="utf-8"))
-        token = data.get("claudeAiOauth", {}).get("accessToken")
-        return token, data
+        if CRED_PATH.exists():
+            data = json.loads(CRED_PATH.read_text(encoding="utf-8"))
+            token = data.get("claudeAiOauth", {}).get("accessToken")
+            return token, data
     except (json.JSONDecodeError, OSError, AttributeError):
-        return None, None
+        pass
+
+    # Fallback: macOS Keychain (Claude Code stores creds here on Mac)
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout.strip())
+                token = data.get("claudeAiOauth", {}).get("accessToken")
+                return token, data
+        except (json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+            print(f"[jacked] keychain read failed: {exc}", file=sys.stderr)
+
+    return None, None
 
 
 CLAUDE_CONFIG = Path.home() / ".claude.json"
 
 
 def _match_token_to_account(
-    token: str,
+    token: str | None,
     cred_data: dict | None = None,
 ) -> tuple[int | None, str | None]:
     """Match the active account using layered matching.
 
-    Layer 1: Read ~/.claude.json email, case-insensitive match against DB.
-    Layer 2: Check _jackedAccountId in credential data (passed from caller).
-    Layer 3: Exact access_token match (fallback).
+    Layer priority (must stay in sync with credentials.py:get_active_credential,
+    credential_sync.py:sync_credential_tokens, and auth.py:refresh_all_expiring_tokens):
+
+    Layer 1: _jackedAccountId stamp — strongest, explicitly set by jacked.
+    Layer 2: Exact access_token match — cryptographically unique.
+    Layer 3: Email from ~/.claude.json — weakest, Claude Code can change independently.
+
+    Note: there is a ~3s race window after Claude Code overwrites .credentials.json
+    (removing the stamp) and before the watcher re-stamps it.  During this window,
+    a SessionStart could fall through to Layer 2/3.  This is acceptable — adding
+    sync logic here would violate the hook's fire-and-forget contract.
 
     Returns (account_id, email) or (None, None) if no match.
 
@@ -73,7 +101,27 @@ def _match_token_to_account(
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout = 5000")
 
-            # Layer 1: Read ~/.claude.json for email identity
+            # Layer 1: _jackedAccountId stamp (strongest — user's explicit choice)
+            if cred_data is not None:
+                jacked_id = cred_data.get("_jackedAccountId")
+                if jacked_id is not None:
+                    row = conn.execute(
+                        "SELECT id, email FROM accounts WHERE id = ? AND is_deleted = 0",
+                        (jacked_id,),
+                    ).fetchone()
+                    if row:
+                        return row[0], row[1]
+
+            # Layer 2: Exact access_token match (cryptographically unique)
+            if token:
+                row = conn.execute(
+                    "SELECT id, email FROM accounts WHERE access_token = ? AND is_deleted = 0",
+                    (token,),
+                ).fetchone()
+                if row:
+                    return row[0], row[1]
+
+            # Layer 3: Email from ~/.claude.json (weakest — can drift independently)
             if CLAUDE_CONFIG.exists() and not CLAUDE_CONFIG.is_symlink():
                 try:
                     config = json.loads(CLAUDE_CONFIG.read_text(encoding="utf-8"))
@@ -89,25 +137,6 @@ def _match_token_to_account(
                             return row[0], row[1]
                 except (json.JSONDecodeError, OSError):
                     pass
-
-            # Layer 2: Check _jackedAccountId (reuses cred_data from caller)
-            if cred_data is not None:
-                jacked_id = cred_data.get("_jackedAccountId")
-                if jacked_id is not None:
-                    row = conn.execute(
-                        "SELECT id, email FROM accounts WHERE id = ? AND is_deleted = 0",
-                        (jacked_id,),
-                    ).fetchone()
-                    if row:
-                        return row[0], row[1]
-
-            # Layer 3: Exact access_token match (fallback)
-            row = conn.execute(
-                "SELECT id, email FROM accounts WHERE access_token = ? AND is_deleted = 0",
-                (token,),
-            ).fetchone()
-            if row:
-                return row[0], row[1]
         finally:
             conn.close()
     except Exception:
@@ -370,21 +399,15 @@ def _handle_event(event: str, session_id: str, repo_path: str | None):
 
     # SessionStart or Notification(auth_success) — detect account
     token, cred_data = _get_cred_data()
-    if not token:
-        ts = _record_session(session_id, None, None, event.lower(), repo_path)
-        if event == "SessionStart":
-            _tag_subagent(session_id, ts)
-        return
-
     account_id, email = _match_token_to_account(token, cred_data)
 
+    method = "auth_success" if event == "Notification" else "session_start"
+
     if event == "Notification":
-        # auth_success — close previous record first
         _end_session(session_id)
-        _record_session(session_id, account_id, email, "auth_success", repo_path)
+        _record_session(session_id, account_id, email, method, repo_path)
     else:
-        # SessionStart
-        ts = _record_session(session_id, account_id, email, "session_start", repo_path)
+        ts = _record_session(session_id, account_id, email, method, repo_path)
         _tag_subagent(session_id, ts)
 
     if account_id is not None:

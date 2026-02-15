@@ -511,6 +511,8 @@ function renderPathSafetySection(pathSafety) {
 
     const watchedPaths = pathSafety.watched_paths || [];
     const watchedExistence = pathSafety.watched_existence || {};
+    const outsideReads = pathSafety.outside_reads || 'ask';
+    const outsideWrites = pathSafety.outside_writes || 'ask';
 
     const sectionOpacity = enabled ? '' : 'opacity-40 pointer-events-none';
 
@@ -584,6 +586,41 @@ function renderPathSafetySection(pathSafety) {
                 </div>
                 <div id="ps-dirs-content" class="hidden space-y-0.5">
                     ${dirCheckboxes}
+                </div>
+            </div>
+
+            <!-- Outside Project Behavior -->
+            <div class="mb-4">
+                <div id="ps-outside-header" class="flex items-center justify-between cursor-pointer select-none mb-2">
+                    <span class="text-xs font-medium text-slate-400 uppercase tracking-wider">Outside Project Behavior</span>
+                    <svg id="ps-outside-chevron" class="w-4 h-4 text-slate-500 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                </div>
+                <div id="ps-outside-content" class="hidden">
+                    <p class="text-[10px] text-slate-500 mb-3">Controls what happens when Claude accesses files outside your project directory. "Defer to Claude Code" stays silent and lets Claude Code's session permissions handle repeat approvals. Sensitive files and watched paths always require permission regardless.</p>
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <div class="text-sm text-white">Outside-project reads</div>
+                                <div class="text-[10px] text-slate-500">Read, Grep, Glob</div>
+                            </div>
+                            <select id="ps-outside-reads" class="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-orange-500">
+                                <option value="ask" ${outsideReads === 'ask' ? 'selected' : ''}>Always ask</option>
+                                <option value="defer" ${outsideReads === 'defer' ? 'selected' : ''}>Defer to Claude Code</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <div class="text-sm text-white">Outside-project writes</div>
+                                <div class="text-[10px] text-slate-500">Edit, Write, NotebookEdit</div>
+                            </div>
+                            <select id="ps-outside-writes" class="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-orange-500">
+                                <option value="ask" ${outsideWrites === 'ask' ? 'selected' : ''}>Always ask</option>
+                                <option value="defer" ${outsideWrites === 'defer' ? 'selected' : ''}>Defer to Claude Code</option>
+                            </select>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -662,6 +699,8 @@ function bindPathSafetyEvents(pathSafety) {
         disabled_patterns: [...(pathSafety.disabled_patterns || [])],
         allowed_paths: [...(pathSafety.allowed_paths || [])],
         watched_paths: [...(pathSafety.watched_paths || [])],
+        outside_reads: pathSafety.outside_reads || 'ask',
+        outside_writes: pathSafety.outside_writes || 'ask',
     };
     window._settingsDirty = false;
 
@@ -692,6 +731,8 @@ function bindPathSafetyEvents(pathSafety) {
                         disabled_patterns: window._psInitialState.disabled_patterns,
                         allowed_paths: window._psInitialState.allowed_paths,
                         watched_paths: window._psInitialState.watched_paths,
+                        outside_reads: window._psInitialState.outside_reads || 'ask',
+                        outside_writes: window._psInitialState.outside_writes || 'ask',
                     };
                     await api.put('/api/settings/gatekeeper/path-safety', saved);
                     window._psInitialState.enabled = enabled;
@@ -718,6 +759,7 @@ function bindPathSafetyEvents(pathSafety) {
     // Collapsible sections
     _bindCollapsible('ps-files-header', 'ps-files-content', 'ps-files-chevron');
     _bindCollapsible('ps-dirs-header', 'ps-dirs-content', 'ps-dirs-chevron');
+    _bindCollapsible('ps-outside-header', 'ps-outside-content', 'ps-outside-chevron');
     _bindCollapsible('ps-watched-header', 'ps-watched-content', 'ps-watched-chevron');
     _bindCollapsible('ps-paths-header', 'ps-paths-content', 'ps-paths-chevron');
 
@@ -725,6 +767,12 @@ function bindPathSafetyEvents(pathSafety) {
     document.querySelectorAll('.ps-pattern-toggle').forEach(cb => {
         cb.addEventListener('change', () => _updatePathSafetyDirtyState());
     });
+
+    // Track dirty state on outside-project selects
+    const outsideReadsSelect = document.getElementById('ps-outside-reads');
+    const outsideWritesSelect = document.getElementById('ps-outside-writes');
+    if (outsideReadsSelect) outsideReadsSelect.addEventListener('change', () => _updatePathSafetyDirtyState());
+    if (outsideWritesSelect) outsideWritesSelect.addEventListener('change', () => _updatePathSafetyDirtyState());
 
     // Add path
     const addBtn = document.getElementById('ps-add-path');
@@ -855,6 +903,8 @@ function bindPathSafetyEvents(pathSafety) {
                     disabled_patterns: init.disabled_patterns || [],
                     allowed_paths: init.allowed_paths || [],
                     watched_paths: freshWatched,
+                    outside_reads: init.outside_reads || 'ask',
+                    outside_writes: init.outside_writes || 'ask',
                 };
                 await api.put('/api/settings/gatekeeper/path-safety', saveState);
                 window._psInitialState.watched_paths = [...freshWatched];
@@ -922,6 +972,8 @@ function bindPathSafetyEvents(pathSafety) {
                     disabled_patterns: [...state.disabled_patterns],
                     allowed_paths: [...state.allowed_paths],
                     watched_paths: [...state.watched_paths],
+                    outside_reads: state.outside_reads || 'ask',
+                    outside_writes: state.outside_writes || 'ask',
                 };
                 _updatePathSafetyDirtyState();
                 showToast('Path safety rules saved', 'success');
@@ -1022,6 +1074,8 @@ function _rebindRemoveWatchedButtons() {
                     disabled_patterns: init.disabled_patterns || [],
                     allowed_paths: init.allowed_paths || [],
                     watched_paths: freshWatched,
+                    outside_reads: init.outside_reads || 'ask',
+                    outside_writes: init.outside_writes || 'ask',
                 };
                 await api.put('/api/settings/gatekeeper/path-safety', saveState);
                 window._psInitialState.watched_paths = [...freshWatched];
@@ -1117,7 +1171,8 @@ function _updatePathSafetyDirtyState() {
     const patternsChanged = JSON.stringify([...current.disabled_patterns].sort()) !== JSON.stringify([...initial.disabled_patterns].sort());
     const pathsChanged = JSON.stringify(current.allowed_paths) !== JSON.stringify(initial.allowed_paths);
     const watchedChanged = JSON.stringify(current.watched_paths) !== JSON.stringify(initial.watched_paths || []);
-    const isDirty = patternsChanged || pathsChanged || watchedChanged;
+    const outsideChanged = current.outside_reads !== (initial.outside_reads || 'ask') || current.outside_writes !== (initial.outside_writes || 'ask');
+    const isDirty = patternsChanged || pathsChanged || watchedChanged || outsideChanged;
 
     // Global flag for beforeunload and tab switch guards
     window._settingsDirty = isDirty;
@@ -1163,7 +1218,13 @@ function _collectPathSafetyState() {
         if (path) watchedPaths.push(path);
     });
 
-    return { enabled, disabled_patterns: disabledPatterns, allowed_paths: allowedPaths, watched_paths: watchedPaths };
+    // Collect outside-project settings
+    const outsideReadsEl = document.getElementById('ps-outside-reads');
+    const outsideWritesEl = document.getElementById('ps-outside-writes');
+    const outside_reads = outsideReadsEl ? outsideReadsEl.value : 'ask';
+    const outside_writes = outsideWritesEl ? outsideWritesEl.value : 'ask';
+
+    return { enabled, disabled_patterns: disabledPatterns, allowed_paths: allowedPaths, watched_paths: watchedPaths, outside_reads, outside_writes };
 }
 
 

@@ -266,8 +266,12 @@ async def use_account(account_id: int, request: Request):
 async def get_active_credential(request: Request):
     """Read Claude Code's credential file and match to a jacked account.
 
-    Uses layered matching: (1) ~/.claude.json email (case-insensitive),
-    (2) _jackedAccountId in credential file, (3) exact access_token match.
+    Layer priority (must stay in sync with session_account_tracker.py,
+    credential_sync.py, and auth.py):
+
+    Layer 1: _jackedAccountId stamp — strongest, explicitly set by jacked.
+    Layer 2: Exact access_token match — cryptographically unique.
+    Layer 3: Email from ~/.claude.json — weakest, Claude Code can change independently.
 
     >>> # Returns null account_id if no match found
     """
@@ -275,7 +279,46 @@ async def get_active_credential(request: Request):
     if db is None:
         return ActiveCredentialResponse()
 
-    # Layer 1: Read ~/.claude.json for the active account email
+    # Read credential file for layers 1 & 2
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    data = None
+    access_token = None
+    if cred_path.exists() and not cred_path.is_symlink():
+        try:
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+            access_token = data.get("claudeAiOauth", {}).get("accessToken")
+        except (json.JSONDecodeError, OSError, AttributeError):
+            pass
+
+    # Fallback: macOS Keychain (file may not exist on Mac)
+    if access_token is None:
+        from jacked.api.credential_sync import read_platform_credentials
+
+        platform_data = read_platform_credentials()
+        if platform_data:
+            data = platform_data
+            access_token = platform_data.get("claudeAiOauth", {}).get("accessToken")
+
+    # Layer 1: _jackedAccountId stamp (strongest — user's explicit choice)
+    if data is not None:
+        jacked_id = data.get("_jackedAccountId")
+        if jacked_id is not None:
+            acct = db.get_account(jacked_id)
+            if acct and not acct.get("is_deleted"):
+                return ActiveCredentialResponse(
+                    account_id=acct["id"], email=acct["email"]
+                )
+
+    # Layer 2: Exact access_token match (cryptographically unique)
+    if access_token:
+        accounts = db.list_accounts(include_inactive=True)
+        for acct in accounts:
+            if acct.get("access_token") == access_token and not acct.get("is_deleted"):
+                return ActiveCredentialResponse(
+                    account_id=acct["id"], email=acct["email"]
+                )
+
+    # Layer 3: Email from ~/.claude.json (weakest — can drift independently)
     claude_config = Path.home() / ".claude.json"
     if claude_config.exists() and not claude_config.is_symlink():
         try:
@@ -290,33 +333,6 @@ async def get_active_credential(request: Request):
                         )
         except (json.JSONDecodeError, OSError):
             pass
-
-    # Read credential file for layers 2 & 3
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if not cred_path.exists() or cred_path.is_symlink():
-        return ActiveCredentialResponse()
-
-    try:
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, AttributeError):
-        return ActiveCredentialResponse()
-
-    # Layer 2: Check _jackedAccountId embedded by "Set Active"
-    jacked_id = data.get("_jackedAccountId")
-    if jacked_id is not None:
-        acct = db.get_account(jacked_id)
-        if acct and not acct.get("is_deleted"):
-            return ActiveCredentialResponse(account_id=acct["id"], email=acct["email"])
-
-    # Layer 3: Exact access_token match (fallback)
-    access_token = data.get("claudeAiOauth", {}).get("accessToken")
-    if access_token:
-        accounts = db.list_accounts(include_inactive=True)
-        for acct in accounts:
-            if acct.get("access_token") == access_token:
-                return ActiveCredentialResponse(
-                    account_id=acct["id"], email=acct["email"]
-                )
 
     return ActiveCredentialResponse()
 

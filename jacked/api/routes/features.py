@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -253,14 +253,35 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
     hooks = settings.get("hooks", {})
 
     if hook_name == "security_gatekeeper":
-        for entry in hooks.get("PreToolUse", []):
-            if SECURITY_MARKER in str(entry) or "security_gatekeeper" in str(entry):
-                return True
-        # Check legacy PermissionRequest too
-        for entry in hooks.get("PermissionRequest", []):
-            if SECURITY_MARKER in str(entry) or "security_gatekeeper" in str(entry):
-                return True
-        return False
+        # Check if hook entries are registered in settings.json
+        registered = any(
+            "security_gatekeeper" in str(entry)
+            for entry in hooks.get("PreToolUse", [])
+        ) or any(
+            "security_gatekeeper" in str(entry)
+            for entry in hooks.get("PermissionRequest", [])
+        )
+        if not registered:
+            return False
+        # Check DB flag for runtime enabled state.
+        # Direct sqlite3 read to avoid needing Request/db param propagation.
+        import json as _json
+        import sqlite3 as _sqlite3
+        db_path = Path.home() / ".claude" / "jacked.db"
+        if not db_path.exists():
+            return True  # No DB = default enabled
+        try:
+            with _sqlite3.connect(str(db_path), timeout=2.0) as conn:
+                cursor = conn.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    ("gatekeeper.enabled",),
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return _json.loads(row[0]) is not False
+            return True  # No flag = default enabled
+        except Exception:
+            return True  # Fail-open
 
     if hook_name == "session_indexing":
         for entry in hooks.get("Stop", []):
@@ -406,6 +427,7 @@ async def toggle_feature(
     category: Literal["agents", "commands", "hooks", "knowledge"],
     name: str,
     body: FeatureToggleRequest,
+    request: Request,
 ):
     """Enable or disable a feature."""
     # Validate name
@@ -450,7 +472,8 @@ async def toggle_feature(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 content={"error": {"message": f"Unknown hook: {name}", "code": "INVALID_FEATURE"}},
             )
-        return await _toggle_hook(name, body.enabled)
+        db = getattr(request.app.state, "db", None)
+        return await _toggle_hook(name, body.enabled, db=db)
 
     if category == "knowledge":
         if name not in VALID_KNOWLEDGE:
@@ -493,18 +516,28 @@ async def _toggle_file_feature(src: Path, dst: Path, enabled: bool, name: str, c
     return {"name": name, "category": category, "enabled": enabled}
 
 
-async def _toggle_hook(name: str, enabled: bool):
-    """Enable/disable a hook in settings.json."""
+async def _toggle_hook(name: str, enabled: bool, db=None):
+    """Enable/disable a hook.
+
+    For security_gatekeeper: writes DB flag (takes effect immediately)
+    and ensures all tool matchers are registered in settings.json.
+    For other hooks: adds/removes entries from settings.json.
+    """
     async with _settings_lock:
         settings = _read_settings_json()
         if "hooks" not in settings:
             settings["hooks"] = {}
 
         if name == "security_gatekeeper":
-            if enabled:
-                _enable_security_hook(settings)
-            else:
-                _disable_security_hook(settings)
+            # Write DB flag — gatekeeper checks this on every invocation,
+            # so toggle takes effect immediately without restarting Claude Code.
+            if db is not None:
+                import json
+                db.set_setting("gatekeeper.enabled", json.dumps(enabled))
+            # Ensure all 7 tool matchers are registered (idempotent repair).
+            # Hook entries stay in settings.json permanently — the DB flag
+            # controls whether the hook actually runs.
+            _ensure_gatekeeper_hooks(settings)
 
         elif name == "session_indexing":
             if enabled:
@@ -614,8 +647,15 @@ async def _toggle_rules(enabled: bool):
 
 # --- Hook enable/disable helpers ---
 
-def _enable_security_hook(settings: dict):
-    """Add security gatekeeper hook to settings."""
+GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"]
+
+
+def _ensure_gatekeeper_hooks(settings: dict):
+    """Ensure all gatekeeper hook entries are registered for every tool.
+
+    Idempotent — only adds missing matchers without duplicating existing ones.
+    Used by both initial install and toggle repair.
+    """
     python_exe = sys.executable
     if not python_exe or not Path(python_exe).exists():
         python_exe = shutil.which("python3") or shutil.which("python") or "python"
@@ -628,20 +668,20 @@ def _enable_security_hook(settings: dict):
     if "PreToolUse" not in settings["hooks"]:
         settings["hooks"]["PreToolUse"] = []
 
-    # Check if already installed
-    for entry in settings["hooks"]["PreToolUse"]:
-        if SECURITY_MARKER in str(entry) or "security_gatekeeper" in str(entry):
-            return
+    for tool in GATEKEEPER_TOOLS:
+        already = any(
+            entry.get("matcher") == tool and "security_gatekeeper" in str(entry)
+            for entry in settings["hooks"]["PreToolUse"]
+        )
+        if not already:
+            settings["hooks"]["PreToolUse"].append({
+                "matcher": tool,
+                "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
+            })
 
-    hook_entry = {
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": command_str,
-            "timeout": 30,
-        }]
-    }
-    settings["hooks"]["PreToolUse"].append(hook_entry)
+
+# Keep old name as alias for backwards compatibility with CLI installer
+_enable_security_hook = _ensure_gatekeeper_hooks
 
 
 def _disable_security_hook(settings: dict):

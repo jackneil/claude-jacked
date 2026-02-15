@@ -149,6 +149,7 @@ SAFE_PREFIXES = [
     "npm start",
     "conda list",
     "pipx list",
+    "uv tool list",
     # testing & linting
     "pytest",
     "python -m pytest",
@@ -470,7 +471,7 @@ NOT safe:
 - Destructive SQL: DROP, DELETE, UPDATE, INSERT, ALTER, TRUNCATE, GRANT, REVOKE, EXEC
 - Scripts calling shutil.rmtree, os.remove, os.system, subprocess with dangerous args
 - Encoded/obfuscated payloads, system config modification
-- Package installs from registries (pip install <pkg>, pipx install, npm install <pkg>, cargo install, gem install, go install) — executes arbitrary code from the internet. Only pip install -e (local editable) and pip install -r (from requirements file) are safe.
+- Package installs from registries (pip install <pkg>, pipx install, uv tool install, uv pip install, npm install <pkg>, cargo install, gem install, go install) — executes arbitrary code from the internet. Only pip install -e (local editable) and pip install -r (from requirements file) are safe.
 - Anything you're unsure about
 
 IMPORTANT: When file contents are provided, evaluate what the code ACTUALLY DOES, not just function names.
@@ -831,10 +832,12 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     """Read gatekeeper config from SQLite settings table.
 
     Fast raw sqlite3 read (<5ms). Returns dict with keys:
-      model, model_short, eval_method, api_key
+      enabled, model, model_short, eval_method, api_key
     Falls back to defaults if DB doesn't exist or settings not found.
 
     >>> config = _read_gatekeeper_config(Path("/nonexistent/path.db"))
+    >>> config["enabled"]
+    True
     >>> config["model_short"]
     'haiku'
     >>> config["eval_method"]
@@ -843,6 +846,7 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     import sqlite3 as _sqlite3
 
     defaults = {
+        "enabled": True,
         "model": MODEL_MAP["haiku"],
         "model_short": "haiku",
         "eval_method": "api_first",
@@ -858,12 +862,13 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout = 5000")
         cursor = conn.execute(
-            "SELECT key, value FROM settings WHERE key IN (?, ?, ?)",
-            ("gatekeeper.model", "gatekeeper.eval_method", "gatekeeper.api_key"),
+            "SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)",
+            ("gatekeeper.enabled", "gatekeeper.model", "gatekeeper.eval_method", "gatekeeper.api_key"),
         )
         rows = {row[0]: row[1] for row in cursor.fetchall()}
         conn.close()
-    except Exception:
+    except Exception as exc:
+        log(f"GATEKEEPER CONFIG READ FAILED: {exc}")
         return defaults
 
     # Parse model
@@ -884,6 +889,15 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
         method = method_raw or "api_first"
     if method in ("api_first", "cli_first", "api_only", "cli_only"):
         defaults["eval_method"] = method
+
+    # Parse enabled flag — json.loads returns Python bool singleton,
+    # so `is not False` is an identity check (correct for True/False literals).
+    enabled_raw = rows.get("gatekeeper.enabled", "")
+    if enabled_raw:
+        try:
+            defaults["enabled"] = json.loads(enabled_raw) is not False
+        except (ValueError, TypeError):
+            pass  # Keep default True
 
     # Parse api_key
     key_raw = rows.get("gatekeeper.api_key", "")
@@ -922,6 +936,8 @@ def _read_path_safety_config(db_path: Path | None = None) -> dict:
         "allowed_paths": [],
         "disabled_patterns": [],
         "watched_paths": [],
+        "outside_reads": "ask",
+        "outside_writes": "ask",
     }
 
     target = db_path or DB_PATH
@@ -945,6 +961,8 @@ def _read_path_safety_config(db_path: Path | None = None) -> dict:
                 "allowed_paths": data.get("allowed_paths", []),
                 "disabled_patterns": data.get("disabled_patterns", []),
                 "watched_paths": data.get("watched_paths", []),
+                "outside_reads": data.get("outside_reads", "ask"),
+                "outside_writes": data.get("outside_writes", "ask"),
             }
     except Exception:
         pass
@@ -1310,33 +1328,74 @@ def _handle_file_tool_inner(
         )
         return
 
-    # Step 1: Path safety check FIRST — security always wins over permissions
+    # Step 1: Path safety checks FIRST — security always wins over permissions.
+    # Split into three calls (watched → sensitive → outside-project) so that
+    # "defer" on outside-project can never bypass sensitive file checks.
     config = _read_path_safety_config()
-    reason = _check_path_safety(file_path, cwd, config)
-    if reason:
-        elapsed = time.time() - start
-        msg = f"Path safety: {reason} — {Path(file_path).name}"
-        # In headless modes (bypassPermissions/dontAsk), hard deny since no
-        # human is present to answer an ask prompt.
-        headless = permission_mode in ("bypassPermissions", "dontAsk")
-        decision = "DENY" if headless else "ASK_USER"
-        log(
-            f"PATH SAFETY [{tool_name}]: {decision} {file_path[:100]} — {reason} ({elapsed:.3f}s)"
-        )
-        _record_decision(
-            decision,
-            f"[{tool_name}] {file_path[:200]}",
-            "PATH_SAFETY",
-            reason,
-            elapsed * 1000,
-            session_id,
-            repo_path,
-        )
-        if headless:
-            _emit_deny(msg)
-        else:
-            _emit_ask(msg)
-        return
+    headless = permission_mode in ("bypassPermissions", "dontAsk")
+
+    # Resolve symlinks once — sensitive check must see the real target
+    # to prevent symlink bypasses (e.g. /tmp/x -> ~/.ssh/id_rsa).
+    try:
+        resolved_path = str(Path(file_path).resolve())
+    except (OSError, ValueError):
+        resolved_path = file_path
+
+    if config.get("enabled", True):
+
+        # 1. Watched paths — always ask (highest priority)
+        reason = _is_watched_path(file_path, cwd, config.get("watched_paths", []))
+        if reason:
+            elapsed = time.time() - start
+            msg = f"Path safety: {reason} — {Path(file_path).name}"
+            decision = "DENY" if headless else "ASK_USER"
+            log(f"PATH SAFETY [{tool_name}]: {decision} {file_path[:100]} — {reason} ({elapsed:.3f}s)")
+            _record_decision(decision, f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", reason, elapsed * 1000, session_id, repo_path)
+            if headless:
+                _emit_deny(msg)
+            else:
+                _emit_ask(msg)
+            return
+
+        # 2. Sensitive files — always ask (BEFORE outside-project to prevent defer bypass)
+        reason = _is_path_sensitive(resolved_path, config.get("disabled_patterns", []))
+        if reason:
+            elapsed = time.time() - start
+            msg = f"Path safety: {reason} — {Path(file_path).name}"
+            decision = "DENY" if headless else "ASK_USER"
+            log(f"PATH SAFETY [{tool_name}]: {decision} {file_path[:100]} — {reason} ({elapsed:.3f}s)")
+            _record_decision(decision, f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", reason, elapsed * 1000, session_id, repo_path)
+            if headless:
+                _emit_deny(msg)
+            else:
+                _emit_ask(msg)
+            return
+
+        # 3. Outside project — configurable via outside_reads / outside_writes
+        reason = _is_outside_project(file_path, cwd, config.get("allowed_paths", []))
+        if reason:
+            read_tools = {"Read", "Grep", "Glob"}
+            setting_key = "outside_reads" if tool_name in read_tools else "outside_writes"
+            behavior = config.get(setting_key, "ask")
+
+            if behavior == "defer" and not headless:
+                # Silent exit — let Claude Code's session permissions handle it
+                elapsed = time.time() - start
+                log(f"PATH SAFETY [{tool_name}]: DEFER_TO_CC {file_path[:100]} — {reason} ({elapsed:.3f}s)")
+                _record_decision("DEFER_TO_CC", f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", reason, elapsed * 1000, session_id, repo_path)
+                _record_hook_execution(elapsed * 1000, session_id, repo_path)
+                return  # no output = Claude Code decides
+            else:
+                elapsed = time.time() - start
+                msg = f"Path safety: {reason} — {Path(file_path).name}"
+                decision = "DENY" if headless else "ASK_USER"
+                log(f"PATH SAFETY [{tool_name}]: {decision} {file_path[:100]} — {reason} ({elapsed:.3f}s)")
+                _record_decision(decision, f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", reason, elapsed * 1000, session_id, repo_path)
+                if headless:
+                    _emit_deny(msg)
+                else:
+                    _emit_ask(msg)
+                return
 
     # Step 2: Check if already approved via permission rules
     if _check_file_tool_permissions(tool_name, file_path):
@@ -1362,7 +1421,7 @@ def _handle_file_tool_inner(
     # ruleset regardless of user overrides, because disabled=False means "I turned off
     # path safety" not "I want .env auto-approved".
     if not config.get("enabled", True):
-        sensitive = _is_path_sensitive(file_path, [])
+        sensitive = _is_path_sensitive(resolved_path, [])
         if sensitive:
             _record_hook_execution((time.time() - start) * 1000, session_id, repo_path)
             return  # silent exit — let Claude Code's own protection handle it
@@ -1613,6 +1672,14 @@ def main():
 
     permission_mode = hook_input.get("permission_mode", "default")
 
+    # Early exit if gatekeeper is disabled via dashboard toggle.
+    # DB flag checked on every invocation so toggle takes effect immediately
+    # without restarting Claude Code sessions.
+    gk_config = _read_gatekeeper_config()
+    if not gk_config.get("enabled", True):
+        log("GATEKEEPER DISABLED via dashboard — exiting")
+        sys.exit(0)
+
     # Dispatch: file tools use path safety only
     if tool_name in ("Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"):
         _handle_file_tool(tool_name, tool_input, cwd, sid, permission_mode)
@@ -1736,11 +1803,11 @@ def main():
         sys.exit(0)
 
     # Tier 4+5: LLM evaluation for ambiguous commands (with 1 retry)
-    config = _read_gatekeeper_config()
-    model = config["model"]
-    model_short = config["model_short"]
-    eval_method = config["eval_method"]
-    api_key = config["api_key"]
+    # Reuse gk_config from early exit check to avoid duplicate DB read
+    model = gk_config["model"]
+    model_short = gk_config["model_short"]
+    eval_method = gk_config["eval_method"]
+    api_key = gk_config["api_key"]
 
     file_context = read_file_context(command, cwd)
     # Build watched paths block for the trusted section of the prompt

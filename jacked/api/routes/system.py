@@ -66,6 +66,8 @@ class PathSafetyConfigRequest(BaseModel):
     allowed_paths: list[str] = []
     disabled_patterns: list[str] = []
     watched_paths: list[str] = []
+    outside_reads: str = "ask"
+    outside_writes: str = "ask"
 
 
 class PathValidateRequest(BaseModel):
@@ -994,7 +996,7 @@ async def test_gatekeeper_api_key(body: TestApiKeyRequest, request: Request):
         return {
             "success": False,
             "source": source,
-            "error": "anthropic SDK not installed (pip install anthropic)",
+            "error": "anthropic SDK not installed (uv tool install \"claude-jacked[security]\")",
         }
     except Exception as e:
         return {"success": False, "source": source, "error": str(e)[:200]}
@@ -1109,6 +1111,8 @@ async def get_path_safety_config(request: Request):
         "disabled_patterns": config.get("disabled_patterns", []),
         "watched_paths": watched,
         "watched_existence": watched_existence,
+        "outside_reads": config.get("outside_reads", "ask"),
+        "outside_writes": config.get("outside_writes", "ask"),
         "available_rules": get_path_safety_rules_metadata(),
     }
 
@@ -1228,11 +1232,36 @@ async def update_path_safety_config(body: PathSafetyConfigRequest, request: Requ
                 resolved = resolved[0].upper() + resolved[1:]
         resolved_watched.append(resolved)
 
+    # Validate outside_reads / outside_writes
+    valid_outside = ("ask", "defer")
+    if body.outside_reads not in valid_outside:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"outside_reads must be one of {valid_outside}",
+                    "code": "INVALID_OUTSIDE_SETTING",
+                }
+            },
+        )
+    if body.outside_writes not in valid_outside:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"outside_writes must be one of {valid_outside}",
+                    "code": "INVALID_OUTSIDE_SETTING",
+                }
+            },
+        )
+
     config = {
         "enabled": body.enabled,
         "allowed_paths": body.allowed_paths,
         "disabled_patterns": body.disabled_patterns,
         "watched_paths": resolved_watched,
+        "outside_reads": body.outside_reads,
+        "outside_writes": body.outside_writes,
     }
     db.set_setting("gatekeeper.path_safety", json.dumps(config))
 
