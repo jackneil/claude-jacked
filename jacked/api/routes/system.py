@@ -57,6 +57,10 @@ class GatekeeperConfigRequest(BaseModel):
     api_key: Optional[str] = None
 
 
+class TestApiKeyRequest(BaseModel):
+    api_key: Optional[str] = None
+
+
 class PathSafetyConfigRequest(BaseModel):
     enabled: bool = True
     allowed_paths: list[str] = []
@@ -936,28 +940,39 @@ async def update_gatekeeper_config(body: GatekeeperConfigRequest, request: Reque
 
 
 @router.post("/settings/gatekeeper/test-api-key")
-async def test_gatekeeper_api_key(request: Request):
+async def test_gatekeeper_api_key(body: TestApiKeyRequest, request: Request):
     """Test if the configured API key works with a minimal request."""
     import json
     import os
 
     db = getattr(request.app.state, "db", None)
     api_key = ""
+    source = None
 
-    if db is not None:
+    # Priority: request body (unsaved input) > saved DB key > env var
+    if body.api_key:
+        api_key = body.api_key
+        source = "input"
+
+    if not api_key and db is not None:
         key_raw = db.get_setting("gatekeeper.api_key")
         if key_raw:
             try:
                 api_key = json.loads(key_raw)
             except (json.JSONDecodeError, TypeError):
                 api_key = key_raw
+            if api_key:
+                source = "db"
 
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            source = "env"
 
     if not api_key:
         return {
             "success": False,
+            "source": None,
             "error": "No API key configured (check DB or ANTHROPIC_API_KEY env var)",
         }
 
@@ -970,14 +985,19 @@ async def test_gatekeeper_api_key(request: Request):
             max_tokens=5,
             messages=[{"role": "user", "content": "Say OK"}],
         )
-        return {"success": True, "response": response.content[0].text.strip()[:20]}
+        return {
+            "success": True,
+            "source": source,
+            "response": response.content[0].text.strip()[:20],
+        }
     except ImportError:
         return {
             "success": False,
+            "source": source,
             "error": "anthropic SDK not installed (pip install anthropic)",
         }
     except Exception as e:
-        return {"success": False, "error": str(e)[:200]}
+        return {"success": False, "source": source, "error": str(e)[:200]}
 
 
 # --- Gatekeeper prompt ---

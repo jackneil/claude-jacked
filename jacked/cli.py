@@ -1407,13 +1407,13 @@ def _verify_session_tracker_hooks(settings: dict):
             )
 
 
-GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep"]
+GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"]
 
 
 def _install_security_hook(existing: dict, settings_path: Path):
     """Install security gatekeeper hooks for Bash + file tool PreToolUse events.
 
-    Installs one PreToolUse hook entry per tool matcher (Bash, Read, Edit, Write, Grep).
+    Installs one PreToolUse hook entry per tool matcher (Bash, Read, Edit, Write, Grep, Glob, NotebookEdit).
     Bash hook evaluates commands through the full 4-tier pipeline.
     File tool hooks enforce path safety rules (sensitive files, outside-project access).
 
