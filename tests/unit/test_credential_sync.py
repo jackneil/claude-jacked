@@ -17,6 +17,7 @@ from jacked.api.credential_sync import (
     read_platform_credentials,
     re_stamp_jacked_account_id,
     sync_credential_tokens,
+    write_platform_credentials,
 )
 from jacked.web.database import Database
 
@@ -999,3 +1000,84 @@ def test_create_missing_cred_file_from_keychain():
             assert acct["validation_status"] == "valid"
         finally:
             db.close()
+
+
+# ------------------------------------------------------------------
+# write_platform_credentials: macOS Keychain
+# ------------------------------------------------------------------
+
+
+def test_write_platform_credentials_macos():
+    """Writes credentials to macOS Keychain via security commands.
+
+    >>> test_write_platform_credentials_macos()
+    """
+    cred_data = {
+        "_jackedAccountId": 1,
+        "claudeAiOauth": {"accessToken": "test_token"},
+    }
+    mock_delete = mock.MagicMock()
+    mock_delete.returncode = 0
+    mock_add = mock.MagicMock()
+    mock_add.returncode = 0
+
+    with (
+        mock.patch("jacked.api.credential_sync.sys") as mock_sys,
+        mock.patch(
+            "jacked.api.credential_sync.subprocess.run",
+            side_effect=[mock_delete, mock_add],
+        ) as mock_run,
+    ):
+        mock_sys.platform = "darwin"
+        result = write_platform_credentials(cred_data)
+
+    assert result is True
+    assert mock_run.call_count == 2
+    # First call: delete existing
+    delete_args = mock_run.call_args_list[0][0][0]
+    assert "delete-generic-password" in delete_args
+    # Second call: add new
+    add_args = mock_run.call_args_list[1][0][0]
+    assert "add-generic-password" in add_args
+    assert "Claude Code-credentials" in add_args
+    # Verify JSON data was passed via -w flag
+    w_index = add_args.index("-w")
+    json_str = add_args[w_index + 1]
+    parsed = json.loads(json_str)
+    assert parsed["_jackedAccountId"] == 1
+
+
+def test_write_platform_credentials_linux_noop():
+    """Returns True (no-op) on Linux — file write is sufficient.
+
+    >>> test_write_platform_credentials_linux_noop()
+    """
+    with mock.patch("jacked.api.credential_sync.sys") as mock_sys:
+        mock_sys.platform = "linux"
+        result = write_platform_credentials({"claudeAiOauth": {"accessToken": "x"}})
+
+    assert result is True
+
+
+def test_write_platform_credentials_keychain_error():
+    """Returns False when keychain add command fails.
+
+    >>> test_write_platform_credentials_keychain_error()
+    """
+    mock_delete = mock.MagicMock()
+    mock_delete.returncode = 0
+    mock_add = mock.MagicMock()
+    mock_add.returncode = 1
+    mock_add.stderr = "errSecAuthFailed"
+
+    with (
+        mock.patch("jacked.api.credential_sync.sys") as mock_sys,
+        mock.patch(
+            "jacked.api.credential_sync.subprocess.run",
+            side_effect=[mock_delete, mock_add],
+        ),
+    ):
+        mock_sys.platform = "darwin"
+        result = write_platform_credentials({"claudeAiOauth": {"accessToken": "x"}})
+
+    assert result is False

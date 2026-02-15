@@ -254,7 +254,12 @@ async def use_account(account_id: int, request: Request):
             },
         )
 
-    # Update ~/.claude.json so Layer 1 matching picks up the new account
+    # Also write to platform credential store (macOS Keychain)
+    from jacked.api.credential_sync import write_platform_credentials
+
+    write_platform_credentials(existing)
+
+    # Update ~/.claude.json so Layer 3 matching picks up the new account
     _update_claude_config_email(
         account["email"], display_name=account.get("display_name")
     )
