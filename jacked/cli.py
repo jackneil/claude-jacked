@@ -60,8 +60,7 @@ def _require_search(command_name: str) -> bool:
     except ImportError:
         console.print(f"[red]Error:[/red] '{command_name}' requires the search extra.")
         console.print("\nInstall it with:")
-        console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
-        console.print('  [bold]pipx install "claude-jacked\[search]"[/bold]')
+        console.print('  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
         return False
 
 
@@ -124,7 +123,7 @@ def index(session: Optional[str], repo: Optional[str]):
     Index a Claude session to Qdrant.
 
     If SESSION is not provided, indexes the current session (from CLAUDE_SESSION_ID).
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     import os
     import time
@@ -142,7 +141,7 @@ def index(session: Optional[str], repo: Optional[str]):
         else:
             console.print("[red]Error:[/red] 'index' requires the search extra.")
             console.print("\nInstall it with:")
-            console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
+            console.print('  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
             sys.exit(1)
 
     from jacked.indexer import SessionIndexer
@@ -253,7 +252,7 @@ def index(session: Optional[str], repo: Optional[str]):
 @click.option("--repo", "-r", help="Filter by repository name pattern")
 @click.option("--force", "-f", is_flag=True, help="Re-index all sessions")
 def backfill(repo: Optional[str], force: bool):
-    """Index all existing Claude sessions. Requires: pip install "claude-jacked[search]" """
+    """Index all existing Claude sessions. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("backfill"):
         sys.exit(1)
 
@@ -309,7 +308,7 @@ def search(
 ):
     """Search for sessions by semantic similarity with multi-factor ranking.
 
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     if not _require_search("search"):
         sys.exit(1)
@@ -454,7 +453,7 @@ def retrieve(
 ):
     """Retrieve a session's context with smart mode support.
 
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     if not _require_search("retrieve"):
         sys.exit(1)
@@ -540,7 +539,7 @@ def retrieve(
 @click.option("--repo", "-r", help="Filter by repository path")
 @click.option("--limit", "-n", default=20, help="Maximum results")
 def list_sessions(repo: Optional[str], limit: int):
-    """List indexed sessions. Requires: pip install "claude-jacked[search]" """
+    """List indexed sessions. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("sessions"):
         sys.exit(1)
 
@@ -581,7 +580,7 @@ def list_sessions(repo: Optional[str], limit: int):
 @click.argument("session_id")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 def delete(session_id: str, yes: bool):
-    """Delete a session from the index. Requires: pip install "claude-jacked[search]" """
+    """Delete a session from the index. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("delete"):
         sys.exit(1)
 
@@ -604,7 +603,7 @@ def cleardb():
     """
     Delete ALL your indexed data from Qdrant.
 
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     if not _require_search("cleardb"):
         sys.exit(1)
@@ -651,7 +650,7 @@ def cleardb():
 
 @main.command()
 def status():
-    """Show indexing health and Qdrant connectivity. Requires: pip install "claude-jacked[search]" """
+    """Show indexing health and Qdrant connectivity. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("status"):
         sys.exit(1)
 
@@ -715,7 +714,7 @@ def webux(host: str, port: int, no_browser: bool, reload: bool):
     except ImportError:
         console.print("[red]Error:[/red] webux requires the web extra.")
         console.print("Install it with:")
-        console.print('  [bold]pip install "claude-jacked[web]"[/bold]')
+        console.print('  [bold]uv tool install "claude-jacked\[web]" --force[/bold]')
         sys.exit(1)
 
     # Propagate host/port to app via env vars (used for dynamic CORS + WebSocket origin checks)
@@ -766,7 +765,7 @@ def check_version():
             f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}"
         )
         console.print(
-            "Run: [bold]pipx upgrade claude-jacked[/bold]  or  [bold]pip install -U claude-jacked[/bold]"
+            "Run: [bold]uv tool upgrade claude-jacked[/bold]"
         )
     else:
         console.print(f"[green]Up to date:[/green] {__version__}")
@@ -2023,12 +2022,12 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     else:
         console.print("\nOptional extras:")
         console.print(
-            '  pip install "claude-jacked\[search]"    # Session search via Qdrant'
+            '  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
         )
         console.print(
-            '  pip install "claude-jacked\[security]"  # Auto-approve safe Bash commands'
+            '  uv tool install "claude-jacked\[security]" --force  # Auto-approve safe Bash commands'
         )
-        console.print('  pip install "claude-jacked\[all]"       # Everything')
+        console.print('  uv tool install "claude-jacked\[all]" --force       # Everything')
 
 
 @main.command()
@@ -2166,7 +2165,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(
-        "\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]"
+        "\n[dim]Note: Your Qdrant index is still intact. Run 'uv tool uninstall claude-jacked' to fully remove.[/dim]"
     )
 
 
@@ -2239,6 +2238,7 @@ HIGH_RISK_PREFIXES = {
     "ssh": "remote command execution",
     "scp": "file transfer to remote",
     "rsync": "file transfer to remote",
+    "uv": "uv run executes arbitrary code, uv tool install runs arbitrary packages",
     "nc": "raw network connections",
     "ncat": "raw network connections",
     "netcat": "raw network connections",
@@ -2536,7 +2536,7 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
                 "[red]anthropic SDK not installed — cannot run LLM audit[/red]"
             )
             console.print(
-                '[dim]Install it: pip install "claude-jacked[security]"[/dim]'
+                '[dim]Install it: uv tool install "claude-jacked[security]" --force[/dim]'
             )
         except json.JSONDecodeError:
             console.print(

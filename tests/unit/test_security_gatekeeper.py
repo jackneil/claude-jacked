@@ -344,6 +344,10 @@ class TestLocalEvaluateSafe:
             == "YES"
         )
 
+    def test_uv_tool_list(self):
+        """uv tool list is read-only and should be auto-approved."""
+        assert gk.local_evaluate("uv tool list") == "YES"
+
     def test_python_m_jacked_log(self):
         """python -m jacked should be auto-approved like direct jacked invocation.
 
@@ -378,6 +382,14 @@ class TestLocalEvaluateAmbiguous:
 
     def test_pipx_install(self):
         assert gk.local_evaluate("pipx install claude-jacked") is None
+
+    def test_uv_tool_install(self):
+        """uv tool install should NOT be auto-approved locally."""
+        assert gk.local_evaluate("uv tool install claude-jacked") is None
+
+    def test_uv_run(self):
+        """uv run should NOT be auto-approved locally."""
+        assert gk.local_evaluate("uv run script.py") is None
 
     def test_npm_install_package(self):
         assert gk.local_evaluate("npm install express") is None
@@ -2446,6 +2458,59 @@ class TestReadGatekeeperConfig:
         config = gk._read_gatekeeper_config(db_path=db_path)
         assert config["eval_method"] == "cli_first"
 
+    # --- enabled flag tests ---
+
+    def test_enabled_true_when_no_db(self, tmp_path):
+        """Enabled defaults to True when DB doesn't exist."""
+        fake_db = tmp_path / "nonexistent.db"
+        config = gk._read_gatekeeper_config(db_path=fake_db)
+        assert config["enabled"] is True
+
+    def test_enabled_true_when_key_missing(self, tmp_path):
+        """Enabled defaults to True when gatekeeper.enabled key not in DB."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.model": "haiku"})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["enabled"] is True
+
+    def test_enabled_true_when_flag_true(self, tmp_path):
+        """Enabled is True when DB flag is true."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.enabled": True})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["enabled"] is True
+
+    def test_enabled_false_when_flag_false(self, tmp_path):
+        """Enabled is False when DB flag is false."""
+        db_path = self._make_db(tmp_path, {"gatekeeper.enabled": False})
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["enabled"] is False
+
+    def test_enabled_true_when_empty_db(self, tmp_path):
+        """Enabled defaults to True when DB has no rows."""
+        db_path = self._make_db(tmp_path)
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["enabled"] is True
+
+    def test_enabled_true_when_corrupted_db(self, tmp_path):
+        """Enabled defaults to True when DB is corrupted (fail-open)."""
+        db_path = tmp_path / "jacked.db"
+        db_path.write_text("not a database")
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["enabled"] is True
+
+    def test_enabled_true_when_corrupt_value(self, tmp_path):
+        """Enabled defaults to True when value is not valid JSON."""
+        db_path = self._make_db(tmp_path)
+        # Write a raw non-JSON value directly
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)",
+            ("gatekeeper.enabled", "not-json"),
+        )
+        conn.commit()
+        conn.close()
+        config = gk._read_gatekeeper_config(db_path=db_path)
+        assert config["enabled"] is True
+
 
 # ---------------------------------------------------------------------------
 # _handle_file_tool — file tool auto-approve / deny
@@ -2504,7 +2569,9 @@ class TestHandleFileTool:
             patch.object(
                 gk, "_read_path_safety_config", return_value=self._safe_config()
             ),
-            patch.object(gk, "_check_path_safety", return_value=None),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_is_outside_project", return_value=None),
             patch.object(gk, "_check_file_tool_permissions", return_value=True),
             patch.object(gk, "_record_decision"),
             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
@@ -2528,8 +2595,9 @@ class TestHandleFileTool:
             patch.object(
                 gk, "_read_path_safety_config", return_value=self._safe_config()
             ),
+            patch.object(gk, "_is_watched_path", return_value=None),
             patch.object(
-                gk, "_check_path_safety", return_value="sensitive file (.env files)"
+                gk, "_is_path_sensitive", return_value="sensitive file (.env files)"
             ),
             patch.object(gk, "_record_decision"),
             patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
@@ -2552,8 +2620,9 @@ class TestHandleFileTool:
             patch.object(
                 gk, "_read_path_safety_config", return_value=self._safe_config()
             ),
+            patch.object(gk, "_is_watched_path", return_value=None),
             patch.object(
-                gk, "_check_path_safety", return_value="sensitive file (.env files)"
+                gk, "_is_path_sensitive", return_value="sensitive file (.env files)"
             ),
             patch.object(gk, "_check_file_tool_permissions", return_value=True),
             patch.object(gk, "_record_decision"),
@@ -2581,7 +2650,6 @@ class TestHandleFileTool:
 
         with (
             patch.object(gk, "_read_path_safety_config", return_value=disabled_config),
-            patch.object(gk, "_check_path_safety", return_value=None),
             patch.object(gk, "_check_file_tool_permissions", return_value=False),
             patch.object(
                 gk, "_is_path_sensitive", return_value="sensitive file (.env files)"
@@ -2609,7 +2677,6 @@ class TestHandleFileTool:
 
         with (
             patch.object(gk, "_read_path_safety_config", return_value=disabled_config),
-            patch.object(gk, "_check_path_safety", return_value=None),
             patch.object(gk, "_check_file_tool_permissions", return_value=False),
             patch.object(gk, "_is_path_sensitive", return_value=None),
             patch.object(gk, "_record_decision"),
@@ -2720,6 +2787,183 @@ class TestHandleFileTool:
         captured = capsys.readouterr()
         # No JSON output — silent exit, Claude Code decides
         assert captured.out.strip() == "" or "permissionDecision" not in captured.out
+
+    def _defer_config(self, outside_reads="defer", outside_writes="defer"):
+        """Config with outside-project defer enabled."""
+        return {
+            "enabled": True,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+            "outside_reads": outside_reads,
+            "outside_writes": outside_writes,
+        }
+
+    def test_outside_read_defer_silent_exit(self, capsys, tmp_path):
+        """Outside-project Read with outside_reads=defer → no output (Claude Code decides).
+
+        >>> # Defer = silent exit, Claude Code's session perms handle it
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config()),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_is_outside_project", return_value="outside project directory"),
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "_record_hook_execution"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Read", {"file_path": "/other/dir/file.py"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+
+    def test_outside_grep_defer_silent_exit(self, capsys, tmp_path):
+        """Outside-project Grep with outside_reads=defer → no output.
+
+        >>> # Grep is a read tool, uses outside_reads setting
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config()),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_is_outside_project", return_value="outside project directory"),
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "_record_hook_execution"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Grep", {"path": "/other/dir"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+
+    def test_outside_write_defer_silent_exit(self, capsys, tmp_path):
+        """Outside-project Edit with outside_writes=defer → no output.
+
+        >>> # Edit is a write tool, uses outside_writes setting
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config()),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_is_outside_project", return_value="outside project directory"),
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "_record_hook_execution"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Edit", {"file_path": "/other/dir/file.py"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+
+    def test_outside_read_ask_emits_ask(self, capsys, tmp_path):
+        """Outside-project Read with outside_reads=ask → emits ask (current behavior).
+
+        >>> # ask = always prompt, same as before
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config(outside_reads="ask")),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_is_outside_project", return_value="outside project directory"),
+            patch.object(gk, "_record_decision"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Read", {"file_path": "/other/dir/file.py"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+    def test_outside_write_ask_when_reads_defer(self, capsys, tmp_path):
+        """Outside-project Edit with outside_reads=defer but outside_writes=ask → emits ask.
+
+        >>> # Write tools use outside_writes, not outside_reads
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config(outside_reads="defer", outside_writes="ask")),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_is_outside_project", return_value="outside project directory"),
+            patch.object(gk, "_record_decision"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Edit", {"file_path": "/other/dir/file.py"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+    def test_sensitive_file_asks_despite_defer(self, capsys, tmp_path):
+        """Sensitive file (.env) still asks even with defer enabled.
+
+        >>> # Security invariant: sensitive > defer
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config()),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value="sensitive file (.env files)"),
+            patch.object(gk, "_record_decision"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Read", {"file_path": "/other/.env"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert ".env" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_watched_path_asks_despite_defer(self, capsys, tmp_path):
+        """Watched path still asks even with defer enabled.
+
+        >>> # Security invariant: watched > defer
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config()),
+            patch.object(gk, "_is_watched_path", return_value="watched path match"),
+            patch.object(gk, "_record_decision"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Read", {"file_path": "/watched/secret.txt"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+    def test_outside_defer_denied_in_headless(self, capsys, tmp_path):
+        """Outside-project with defer in headless mode → deny (not defer).
+
+        >>> # Headless = no human, defer would be unsafe
+        """
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._defer_config()),
+            patch.object(gk, "_is_watched_path", return_value=None),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_is_outside_project", return_value="outside project directory"),
+            patch.object(gk, "_record_decision"),
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Read", {"file_path": "/other/file.py"}, cwd, "test-session", permission_mode="bypassPermissions")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 # ---------------------------------------------------------------------------

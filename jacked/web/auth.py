@@ -52,7 +52,9 @@ def should_refresh(account: dict) -> bool:
     return time.time() > account["expires_at"] - 300
 
 
-async def refresh_account_token(account_id: int, db: Database) -> bool:
+async def refresh_account_token(
+    account_id: int, db: Database, *, is_active_account: bool = False
+) -> bool:
     """Refresh an account's token if needed.
 
     Implements design doc section 10 refresh logic:
@@ -60,8 +62,12 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
     - Skip if token not near expiry
     - POST to TOKEN_URL with JSON body
     - Handle token rotation (new refresh_token in response)
-    - Handle invalid_grant → mark account invalid
+    - Handle invalid_grant → mark account invalid (unless active account — race with Claude Code)
     - After successful refresh, also refresh profile metadata
+
+    Args:
+        is_active_account: If True, don't mark invalid on invalid_grant (Claude Code
+            may have already rotated the token, making our stale refresh token fail).
 
     Returns True if token is valid (either still fresh or successfully refreshed).
     """
@@ -126,6 +132,16 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
                 try:
                     error_data = resp.json()
                     if error_data.get("error") == "invalid_grant":
+                        if is_active_account:
+                            # Claude Code likely already refreshed and rotated the token.
+                            # Don't mark invalid — credential watcher will heal when
+                            # Claude Code writes the new token to disk.
+                            logger.warning(
+                                "Account %d: invalid_grant (likely Claude Code "
+                                "already refreshed) — not marking invalid",
+                                account_id,
+                            )
+                            return False
                         db.update_account(
                             account_id,
                             validation_status="invalid",
@@ -445,15 +461,42 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     result = {"checked": 0, "refreshed": 0, "skipped": 0, "failed": 0}
 
     # Read active account from credential file — skip it (Claude Code owns its refresh)
-    # Layer 1: _jackedAccountId, Layer 2: email from ~/.claude.json
+    # Layer priority (must stay in sync with session_account_tracker.py,
+    # credentials.py:get_active_credential, and credential_sync.py):
+    # Layer 1: _jackedAccountId stamp, Layer 2: token match, Layer 3: email
     active_account_id = None
     cred_path = Path.home() / ".claude" / ".credentials.json"
+    cred_access_token = None
     if cred_path.exists() and not cred_path.is_symlink():
         try:
             cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
             active_account_id = cred_data.get("_jackedAccountId")
+            cred_access_token = (
+                cred_data.get("claudeAiOauth", {}).get("accessToken")
+            )
         except (json.JSONDecodeError, OSError):
             pass
+
+    # Fallback: macOS Keychain (file may not exist on Mac)
+    if cred_access_token is None:
+        from jacked.api.credential_sync import read_platform_credentials
+
+        platform_data = read_platform_credentials()
+        if platform_data:
+            if active_account_id is None:
+                active_account_id = platform_data.get("_jackedAccountId")
+            cred_access_token = platform_data.get("claudeAiOauth", {}).get("accessToken")
+
+    # Layer 2: Exact token match
+    if active_account_id is None and cred_access_token:
+        all_accts = db.list_accounts(include_inactive=True)
+        for acct in all_accts:
+            if acct.get("access_token") == cred_access_token and not acct.get(
+                "is_deleted"
+            ):
+                active_account_id = acct["id"]
+                break
+    # Layer 3: Email from ~/.claude.json (weakest)
     if active_account_id is None:
         claude_config = Path.home() / ".claude.json"
         if claude_config.exists() and not claude_config.is_symlink():
@@ -471,10 +514,17 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     for account in accounts:
         result["checked"] += 1
 
-        # Skip account currently active in Claude Code (it refreshes its own tokens)
-        if active_account_id is not None and account["id"] == active_account_id:
-            result["skipped"] += 1
-            continue
+        # Skip active Claude Code account — unless its token already expired
+        # (Claude Code refreshes internally but doesn't always update .credentials.json)
+        is_active = active_account_id is not None and account["id"] == active_account_id
+        if is_active:
+            if now < (account.get("expires_at") or 0):
+                result["skipped"] += 1
+                continue
+            logger.warning(
+                "Active account %d token expired — stepping in to refresh",
+                account["id"],
+            )
 
         # Skip API key accounts (no refresh_token)
         if not account.get("refresh_token"):
@@ -482,7 +532,7 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
             continue
 
         # Skip if not expiring within buffer
-        if now < account["expires_at"] - buffer_seconds:
+        if now < (account.get("expires_at") or 0) - buffer_seconds:
             result["skipped"] += 1
             continue
 
@@ -493,7 +543,9 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
             continue
 
         async with lock:
-            success = await refresh_account_token(account["id"], db)
+            success = await refresh_account_token(
+                account["id"], db, is_active_account=is_active
+            )
             if success:
                 result["refreshed"] += 1
             else:

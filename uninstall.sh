@@ -14,10 +14,10 @@ if command -v jacked &> /dev/null; then
     echo ""
 fi
 
-# Uninstall via pipx
-if command -v pipx &> /dev/null; then
+# Uninstall via uv
+if command -v uv &> /dev/null; then
     echo "Removing claude-jacked package..."
-    pipx uninstall claude-jacked 2>/dev/null || echo "Package not installed via pipx"
+    uv tool uninstall claude-jacked 2>/dev/null || echo "Package not installed via uv"
 fi
 
 echo ""

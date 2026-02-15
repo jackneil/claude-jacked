@@ -149,7 +149,7 @@ After injection, summarize:
 
 - If search returns no results: "No matching sessions found. Try a different description or run `jacked backfill` to index your sessions."
 - If retrieve fails: "Session not found in index. It may have been deleted or the session ID is invalid."
-- If jacked command not found: "jacked not installed or not on PATH. Run `pipx install claude-jacked` to install."
+- If jacked command not found: "jacked not installed or not on PATH. Run `uv tool install claude-jacked` to install."
 
 ## Notes
 

@@ -24,7 +24,7 @@ function _buildTooltip(current, latest, outdated, ahead, checkedAt, nextCheckAt)
     const lines = [];
     if (outdated && latest) {
         lines.push(`Update available: v${current} \u2192 v${latest}`);
-        lines.push('pip install -U claude-jacked');
+        lines.push('uv tool upgrade claude-jacked');
     } else if (ahead && latest) {
         lines.push(`v${current} — ahead of PyPI (v${latest})`);
         lines.push('Running unreleased build');
