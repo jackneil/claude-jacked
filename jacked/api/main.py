@@ -20,7 +20,11 @@ from jacked.api.credential_sync import (
     re_stamp_jacked_account_id,
     sync_credential_tokens,
 )
-from jacked.api.watchers import logs_watch_loop, session_accounts_watch_loop
+from jacked.api.watchers import (
+    logs_watch_loop,
+    process_alive_sweeper_loop,
+    session_accounts_watch_loop,
+)
 from jacked.api.websocket import WebSocketRegistry
 
 logger = logging.getLogger(__name__)
@@ -31,6 +35,7 @@ WEB_DIR = Path(__file__).parent.parent / "data" / "web"
 TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes
 CRED_WATCH_INTERVAL = 3  # seconds between credential file checks
 WS_KEEPALIVE_INTERVAL = 30  # seconds between WebSocket pings
+HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
 
 
 def _build_allowed_origins(host: str, port: int) -> list[str]:
@@ -47,16 +52,24 @@ def _build_allowed_origins(host: str, port: int) -> list[str]:
 
 
 async def _credentials_watch_loop(app: FastAPI):
-    """Watch Claude Code's credential file for external changes.
+    """Watch Claude Code's credential file and keychain for external changes.
 
-    Polls every 3 seconds.  When the mtime changes, broadcasts a
+    Polls file mtime every 3 seconds.  When the mtime changes, broadcasts a
     ``credentials_changed`` event through the WebSocket registry.
     Self-writes from the ``/use`` endpoint are suppressed via mtime
     comparison.  External changes trigger a token sync back to the DB.
+
+    On macOS, also polls the Keychain every ~30s (10 cycles) because Claude Code
+    writes refreshed tokens to Keychain only — the file doesn't change.
     """
     cred_path = Path.home() / ".claude" / ".credentials.json"
     last_mtime: float | None = None
     _last_bootstrap_attempt = 0.0
+
+    # Keychain polling state (macOS only)
+    KEYCHAIN_POLL_EVERY = 10  # ~30s at 3s interval
+    keychain_cycle = 0
+    last_keychain_token: str | None = None
 
     # Seed initial mtime
     try:
@@ -133,7 +146,38 @@ async def _credentials_watch_loop(app: FastAPI):
                     "Credential file changed — notified %d client(s)",
                     registry.client_count,
                 )
-        elif current_mtime is None:
+        # Keychain polling: detect token changes Claude Code writes only to Keychain
+        keychain_cycle += 1
+        if keychain_cycle >= KEYCHAIN_POLL_EVERY:
+            keychain_cycle = 0
+            try:
+                kc_data = await asyncio.to_thread(read_platform_credentials)
+                if kc_data:
+                    kc_token = kc_data.get("claudeAiOauth", {}).get("accessToken")
+                    if kc_token and kc_token != last_keychain_token:
+                        last_keychain_token = kc_token
+                        db = getattr(app.state, "db", None)
+                        if db is not None:
+                            await asyncio.to_thread(sync_credential_tokens, db, kc_data)
+                            stamp_mtime = await asyncio.to_thread(
+                                re_stamp_jacked_account_id, db, kc_data, cred_path
+                            )
+                            if stamp_mtime is not None:
+                                last_mtime = stamp_mtime
+                                app.state.cred_last_written_mtime = stamp_mtime
+                        registry = getattr(app.state, "ws_registry", None)
+                        if registry and registry.client_count > 0:
+                            await registry.broadcast(
+                                "credentials_changed", source="keychain_watcher"
+                            )
+                            logger.info(
+                                "Keychain token change detected — notified %d client(s)",
+                                registry.client_count,
+                            )
+            except Exception as exc:
+                logger.debug("Keychain poll failed (non-fatal): %s", exc)
+
+        if current_mtime is None:
             # File missing (deleted or never existed) — try to recreate
             now = time.monotonic()
             if now - _last_bootstrap_attempt >= 60:
@@ -177,6 +221,22 @@ async def _token_refresh_loop():
             logger.warning("Token refresh loop error: %s", e)
 
 
+async def _heal_sweep_loop():
+    """Background task to heal stuck accounts every 5 minutes.
+
+    Recovers accounts with validation_status 'invalid' or 'unknown'
+    by attempting token refresh or profile validation.
+    """
+    while True:
+        await asyncio.sleep(HEAL_SWEEP_INTERVAL)
+        try:
+            from jacked.web.auth import heal_invalid_accounts
+
+            await heal_invalid_accounts()
+        except Exception as e:
+            logger.warning("Heal sweep error: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
@@ -189,6 +249,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Database init failed: %s", e)
         app.state.db = None
+
+    # Startup: apply token recovery file (if DB update failed last run)
+    if app.state.db is not None:
+        try:
+            from jacked.web.token_recovery import apply_token_recovery
+
+            apply_token_recovery(app.state.db)
+        except Exception as e:
+            logger.debug("Token recovery at startup: %s", e)
+
+    # Startup: prune old known_refresh_tokens entries
+    if app.state.db is not None:
+        try:
+            if hasattr(app.state.db, "prune_old_refresh_tokens"):
+                app.state.db.prune_old_refresh_tokens()
+        except Exception as e:
+            logger.debug("RT prune at startup: %s", e)
 
     # WebSocket registry + host/port/origin config
     app.state.ws_registry = WebSocketRegistry()
@@ -210,15 +287,19 @@ async def lifespan(app: FastAPI):
     cred_watch_task = asyncio.create_task(_credentials_watch_loop(app))
     session_watch_task = asyncio.create_task(session_accounts_watch_loop(app))
     logs_watch_task = asyncio.create_task(logs_watch_loop(app))
+    sweeper_task = asyncio.create_task(process_alive_sweeper_loop(app))
+    heal_task = asyncio.create_task(_heal_sweep_loop())
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started credential file watcher (every 3s)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started logs watcher (every 3s)")
+    logger.info("Started process-alive sweeper (every 60s)")
+    logger.info("Started heal sweep (every 5min)")
 
     yield
 
     # Shutdown: cancel background tasks
-    for task in (refresh_task, cred_watch_task, session_watch_task, logs_watch_task):
+    for task in (refresh_task, cred_watch_task, session_watch_task, logs_watch_task, sweeper_task, heal_task):
         task.cancel()
         try:
             await task

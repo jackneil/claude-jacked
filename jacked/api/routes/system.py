@@ -1385,6 +1385,91 @@ async def browse_path(body: PathBrowseRequest):
     return {"current": current, "parent": parent_path, "directories": directories}
 
 
+# --- Gatekeeper command categories ---
+
+
+class CommandCategoriesRequest(BaseModel):
+    categories: dict[str, Literal["allow", "evaluate", "ask"]]
+
+
+@router.get("/settings/gatekeeper/command-categories")
+async def get_command_categories(request: Request):
+    """Command category metadata + current mode overrides."""
+    import json
+
+    from jacked.data.hooks.security_gatekeeper import get_command_categories_metadata
+
+    db = getattr(request.app.state, "db", None)
+
+    metadata = get_command_categories_metadata()
+
+    # Read current overrides from DB
+    overrides: dict = {}
+    if db is not None:
+        raw = db.get_setting("gatekeeper.command_categories")
+        if raw:
+            try:
+                overrides = json.loads(raw)
+                if not isinstance(overrides, dict):
+                    overrides = {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Merge: current mode = override if present, else default
+    categories = {}
+    for key, meta in metadata.items():
+        mode = overrides.get(key, meta["default_mode"])
+        if mode not in ("allow", "evaluate", "ask"):
+            mode = meta["default_mode"]
+        categories[key] = {
+            **meta,
+            "current_mode": mode,
+        }
+
+    return {"categories": categories}
+
+
+@router.put("/settings/gatekeeper/command-categories")
+async def update_command_categories(body: CommandCategoriesRequest, request: Request):
+    """Save command category mode overrides."""
+    import json
+
+    from jacked.data.hooks.security_gatekeeper import COMMAND_CATEGORIES
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
+        )
+
+    # Validate keys — only known categories accepted
+    invalid = [k for k in body.categories if k not in COMMAND_CATEGORIES]
+    if invalid:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Unknown category keys: {', '.join(invalid)}",
+                    "code": "INVALID_CATEGORY_KEY",
+                }
+            },
+        )
+
+    # Only store overrides that differ from defaults (keeps DB clean)
+    overrides = {}
+    for key, mode in body.categories.items():
+        default = COMMAND_CATEGORIES[key]["default_mode"]
+        if mode != default:
+            overrides[key] = mode
+
+    db.set_setting("gatekeeper.command_categories", json.dumps(overrides))
+
+    return {"updated": True, "overrides": overrides}
+
+
 # --- Generic settings (parameterized routes AFTER static ones) ---
 
 
@@ -1418,10 +1503,31 @@ async def get_settings(request: Request):
     return results
 
 
+_PROTECTED_SETTING_KEYS = {
+    "gatekeeper.command_categories",
+    "gatekeeper.path_safety",
+    "gatekeeper.api_key",
+    "gatekeeper.model",
+    "gatekeeper.eval_method",
+    "gatekeeper.enabled",
+}
+
+
 @router.put("/settings/{key}")
 async def update_setting(key: str, body: SettingUpdateRequest, request: Request):
     """Update a setting."""
     import json
+
+    if key in _PROTECTED_SETTING_KEYS:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Use the dedicated endpoint for '{key}'",
+                    "code": "PROTECTED_KEY",
+                }
+            },
+        )
 
     db = getattr(request.app.state, "db", None)
     if db is None:
@@ -1440,6 +1546,17 @@ async def update_setting(key: str, body: SettingUpdateRequest, request: Request)
 @router.delete("/settings/{key}")
 async def delete_setting(key: str, request: Request):
     """Delete a setting by key."""
+    if key in _PROTECTED_SETTING_KEYS:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Use the dedicated endpoint for '{key}'",
+                    "code": "PROTECTED_KEY",
+                }
+            },
+        )
+
     db = getattr(request.app.state, "db", None)
     if db is None:
         return JSONResponse(

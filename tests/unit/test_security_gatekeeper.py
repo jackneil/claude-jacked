@@ -231,8 +231,9 @@ class TestLocalEvaluateSafe:
     def test_git_log(self):
         assert gk.local_evaluate("git log --oneline -5") == "YES"
 
-    def test_git_push(self):
-        assert gk.local_evaluate("git push origin master") == "YES"
+    def test_git_push_ambiguous(self):
+        """git push catch-all moved to COMMAND_CATEGORIES — ambiguous in local_evaluate."""
+        assert gk.local_evaluate("git push origin master") is None
 
     def test_echo(self):
         assert gk.local_evaluate("echo hello world") == "YES"
@@ -323,8 +324,9 @@ class TestLocalEvaluateSafe:
     def test_python_m_pip(self):
         assert gk.local_evaluate("python -m pip list") == "YES"
 
-    def test_python_m_http_server(self):
-        assert gk.local_evaluate("python -m http.server 8000") == "YES"
+    def test_python_m_http_server_not_safe(self):
+        """http.server exposes working directory without auth — not auto-approved."""
+        assert gk.local_evaluate("python -m http.server 8000") is None
 
     def test_python_m_json_tool(self):
         assert gk.local_evaluate("python -m json.tool data.json") == "YES"
@@ -1647,14 +1649,16 @@ class TestTightenedPrefixes:
     def test_git_submodule_ambiguous(self):
         assert gk.local_evaluate("git submodule add http://evil.com/malware") is None
 
-    def test_git_push_still_safe(self):
-        assert gk.local_evaluate("git push origin main") == "YES"
+    def test_git_push_now_ambiguous(self):
+        """git push catch-all moved to COMMAND_CATEGORIES — ambiguous in local_evaluate."""
+        assert gk.local_evaluate("git push origin main") is None
 
     def test_git_add_still_safe(self):
         assert gk.local_evaluate("git add .") == "YES"
 
-    def test_git_commit_still_safe(self):
-        assert gk.local_evaluate("git commit -m 'fix'") == "YES"
+    def test_git_commit_now_ambiguous(self):
+        """git commit catch-all moved to COMMAND_CATEGORIES — ambiguous in local_evaluate."""
+        assert gk.local_evaluate("git commit -m 'fix'") is None
 
     def test_npx_removed(self):
         assert gk.local_evaluate("npx evil-package") is None
@@ -1728,6 +1732,112 @@ class TestTightenedPrefixes:
 
     def test_printenv_bare_still_safe(self):
         assert gk.local_evaluate("printenv") == "YES"
+
+
+# ---------------------------------------------------------------------------
+# git commit/push deny patterns — never auto-approve
+# ---------------------------------------------------------------------------
+
+
+class TestGitCommitPushDeny:
+    """Destructive git patterns are DENY_PATTERNS; catch-all commit/push moved to COMMAND_CATEGORIES."""
+
+    # --- git push force variants ---
+
+    def test_git_push_force(self):
+        assert gk.local_evaluate("git push --force origin feature") == "NO"
+
+    def test_git_push_force_short(self):
+        assert gk.local_evaluate("git push -f origin main") == "NO"
+
+    def test_git_push_combined_short_flags(self):
+        """Combined short flags: -fu, -fv should still be caught."""
+        assert gk.local_evaluate("git push -fu origin main") == "NO"
+
+    def test_git_push_force_with_lease(self):
+        assert gk.local_evaluate("git push --force-with-lease origin feature") == "NO"
+
+    def test_git_push_force_if_includes(self):
+        assert gk.local_evaluate("git push --force-if-includes origin main") == "NO"
+
+    # --- git push delete ---
+
+    def test_git_push_delete(self):
+        assert gk.local_evaluate("git push --delete origin old-branch") == "NO"
+
+    # --- git commit amend ---
+
+    def test_git_commit_amend(self):
+        assert gk.local_evaluate("git commit --amend") == "NO"
+
+    def test_git_commit_amend_no_edit(self):
+        assert gk.local_evaluate("git commit --amend --no-edit") == "NO"
+
+    # --- catch-all: git push/commit moved to COMMAND_CATEGORIES (ambiguous in local_evaluate) ---
+
+    def test_git_push_bare(self):
+        """Catch-all git push is now in COMMAND_CATEGORIES, not DENY_PATTERNS."""
+        assert gk.local_evaluate("git push") is None
+
+    def test_git_push_feature_branch(self):
+        assert gk.local_evaluate("git push origin feature-branch") is None
+
+    def test_git_push_set_upstream(self):
+        assert gk.local_evaluate("git push -u origin main") is None
+
+    def test_git_push_set_upstream_long(self):
+        assert gk.local_evaluate("git push --set-upstream origin master") is None
+
+    def test_git_commit_regular(self):
+        assert gk.local_evaluate("git commit -m 'fix typo'") is None
+
+    def test_git_commit_bare(self):
+        assert gk.local_evaluate("git commit") is None
+
+    # --- compound commands with git commit/push (ambiguous, not denied) ---
+
+    def test_compound_git_add_commit(self):
+        """git add safe + git commit ambiguous → overall None (not all parts safe)."""
+        assert gk.local_evaluate("git add . && git commit -m 'x'") is None
+
+    def test_compound_git_add_commit_push(self):
+        assert gk.local_evaluate("git add . && git commit -m 'x' && git push") is None
+
+    # --- compound commands with DESTRUCTIVE git patterns still denied ---
+
+    def test_compound_git_add_commit_amend(self):
+        """git commit --amend stays hardcoded in DENY_PATTERNS."""
+        assert gk.local_evaluate("git add . && git commit --amend") == "NO"
+
+    def test_compound_git_push_force(self):
+        """git push --force stays hardcoded in DENY_PATTERNS."""
+        assert gk.local_evaluate("git add . && git push --force") == "NO"
+
+    # --- non-regression: other git ops still safe ---
+
+    def test_git_status_still_safe(self):
+        assert gk.local_evaluate("git status") == "YES"
+
+    def test_git_diff_still_safe(self):
+        assert gk.local_evaluate("git diff HEAD~1") == "YES"
+
+    def test_git_log_still_safe(self):
+        assert gk.local_evaluate("git log --oneline -5") == "YES"
+
+    def test_git_add_still_safe(self):
+        assert gk.local_evaluate("git add .") == "YES"
+
+    def test_git_fetch_still_safe(self):
+        assert gk.local_evaluate("git fetch origin") == "YES"
+
+    def test_git_pull_still_safe(self):
+        assert gk.local_evaluate("git pull") == "YES"
+
+    def test_git_branch_still_safe(self):
+        assert gk.local_evaluate("git branch -a") == "YES"
+
+    def test_git_stash_still_safe(self):
+        assert gk.local_evaluate("git stash") == "YES"
 
 
 # ---------------------------------------------------------------------------
@@ -3027,3 +3137,335 @@ class TestBashFloorCheck:
         )
         assert file_matched is False
         assert dir_matched is False
+
+
+# ---------------------------------------------------------------------------
+# Command categories — configurable command classification
+# ---------------------------------------------------------------------------
+
+
+class TestCommandCategories:
+    """Tests for COMMAND_CATEGORIES matching, modes, and precedence."""
+
+    # --- _check_command_categories: basic matching ---
+
+    def test_no_match_returns_none(self):
+        """Commands that don't match any category return (None, [], '')."""
+        mode, keys, ctx = gk._check_command_categories("ls -la", {})
+        assert mode is None
+        assert keys == []
+        assert ctx == ""
+
+    def test_network_matches_curl(self):
+        mode, keys, ctx = gk._check_command_categories("curl http://example.com", {})
+        assert mode == "evaluate"
+        assert "network" in keys
+        assert "HTTP GET" in ctx
+
+    def test_network_matches_wget(self):
+        mode, keys, _ = gk._check_command_categories("wget http://example.com/file.tar.gz", {})
+        assert mode == "evaluate"
+        assert "network" in keys
+
+    def test_package_install_matches_pip(self):
+        mode, keys, _ = gk._check_command_categories("pip install requests", {})
+        assert mode == "evaluate"
+        assert "package_install" in keys
+
+    def test_package_install_matches_npm(self):
+        mode, keys, _ = gk._check_command_categories("npm install lodash", {})
+        assert mode == "evaluate"
+        assert "package_install" in keys
+
+    def test_package_install_matches_uv_pip(self):
+        mode, keys, _ = gk._check_command_categories("uv pip install flask", {})
+        assert mode == "evaluate"
+        assert "package_install" in keys
+
+    def test_pip_install_e_not_matched(self):
+        """pip install -e (editable) should NOT match package_install pattern."""
+        mode, keys, _ = gk._check_command_categories("pip install -e .", {})
+        assert "package_install" not in keys
+
+    def test_pip_install_r_not_matched(self):
+        """pip install -r (requirements) should NOT match package_install pattern."""
+        mode, keys, _ = gk._check_command_categories("pip install -r requirements.txt", {})
+        assert "package_install" not in keys
+
+    def test_file_ops_matches_mv(self):
+        mode, keys, _ = gk._check_command_categories("mv src/old.py src/new.py", {})
+        assert mode == "evaluate"
+        assert "file_ops" in keys
+
+    def test_file_ops_matches_cp(self):
+        mode, keys, _ = gk._check_command_categories("cp file.txt backup/", {})
+        assert mode == "evaluate"
+        assert "file_ops" in keys
+
+    def test_npx_default_ask(self):
+        mode, keys, _ = gk._check_command_categories("npx prettier --write .", {})
+        assert mode == "ask"
+        assert "npx_bunx" in keys
+
+    def test_bunx_default_ask(self):
+        mode, keys, _ = gk._check_command_categories("bunx eslint .", {})
+        assert mode == "ask"
+        assert "npx_bunx" in keys
+
+    def test_git_write_matches_push(self):
+        mode, keys, _ = gk._check_command_categories("git push origin main", {})
+        assert mode == "ask"
+        assert "git_write" in keys
+
+    def test_git_write_matches_commit(self):
+        mode, keys, _ = gk._check_command_categories("git commit -m 'msg'", {})
+        assert mode == "ask"
+        assert "git_write" in keys
+
+    def test_docker_exec_matches(self):
+        mode, keys, _ = gk._check_command_categories("docker exec -it mycontainer bash", {})
+        assert mode == "evaluate"
+        assert "docker_exec" in keys
+
+    def test_docker_run_matches(self):
+        mode, keys, _ = gk._check_command_categories("docker run nginx", {})
+        assert mode == "evaluate"
+        assert "docker_exec" in keys
+
+    def test_docker_compose_exec(self):
+        mode, keys, _ = gk._check_command_categories("docker compose exec web bash", {})
+        assert mode == "evaluate"
+        assert "docker_exec" in keys
+
+    # --- false-positive prevention ---
+
+    def test_git_fetch_not_categorized_as_network(self):
+        """git fetch must NOT match the network category (fetch pattern was removed)."""
+        mode, keys, _ = gk._check_command_categories("git fetch origin", {})
+        assert "network" not in keys
+
+    def test_git_fetch_still_safe_with_network_ask(self):
+        """git fetch should remain safe even if network is set to 'ask'."""
+        mode, keys, _ = gk._check_command_categories("git fetch origin", {"network": "ask"})
+        assert "network" not in keys
+
+    # --- DENY_PATTERNS case-insensitive rm ---
+
+    def test_rm_capital_R_denied(self):
+        """rm -Rf / (capital R) must be caught by DENY_PATTERNS."""
+        assert gk.local_evaluate("rm -Rf /") == "NO"
+
+    def test_rm_capital_RF_abs_path_denied(self):
+        """rm -RF with absolute path is denied (recursive force delete)."""
+        assert gk.local_evaluate("rm -RF /home") == "NO"
+
+    def test_rm_capital_R_root_denied(self):
+        assert gk.local_evaluate("rm -R /") == "NO"
+
+    # --- docker privileged/host-mount hardcoded deny ---
+
+    def test_docker_run_privileged_denied(self):
+        """docker run --privileged stays hardcoded in DENY_PATTERNS."""
+        assert gk.local_evaluate("docker run --privileged alpine") == "NO"
+
+    def test_docker_run_host_mount_denied(self):
+        """docker run -v /:/host stays hardcoded in DENY_PATTERNS."""
+        assert gk.local_evaluate("docker run -v /:/host alpine") == "NO"
+
+    # --- mode overrides ---
+
+    def test_override_to_allow(self):
+        mode, keys, _ = gk._check_command_categories("curl http://example.com", {"network": "allow"})
+        assert mode == "allow"
+        assert "network" in keys
+
+    def test_override_to_ask(self):
+        mode, keys, _ = gk._check_command_categories("curl http://example.com", {"network": "ask"})
+        assert mode == "ask"
+        assert "network" in keys
+
+    def test_override_git_write_to_allow(self):
+        mode, keys, _ = gk._check_command_categories("git push", {"git_write": "allow"})
+        assert mode == "allow"
+        assert "git_write" in keys
+
+    def test_override_git_write_to_evaluate(self):
+        mode, keys, ctx = gk._check_command_categories("git push", {"git_write": "evaluate"})
+        assert mode == "evaluate"
+        assert "git_write" in keys
+        assert "{branch}" in ctx  # placeholder for git branch injection
+
+    def test_invalid_override_falls_back_to_default(self):
+        """Invalid mode in overrides falls back to category default_mode."""
+        mode, _, _ = gk._check_command_categories("curl http://example.com", {"network": "invalid_mode"})
+        assert mode == "evaluate"  # default for network
+
+    # --- multi-category precedence ---
+
+    def test_multi_category_ask_wins(self):
+        """If any matched category is 'ask', result is 'ask'."""
+        # curl | pip install — matches network (evaluate) + package_install (evaluate)
+        # Override one to ask
+        mode, keys, _ = gk._check_command_categories(
+            "curl http://example.com | pip install something",
+            {"network": "ask"},
+        )
+        assert mode == "ask"
+        assert "network" in keys
+
+    def test_multi_category_evaluate_over_allow(self):
+        """If no 'ask' but any 'evaluate', result is 'evaluate'."""
+        mode, keys, _ = gk._check_command_categories(
+            "curl http://example.com | pip install something",
+            {"network": "allow"},  # allow + evaluate = evaluate
+        )
+        assert mode == "evaluate"
+
+    def test_multi_category_all_allow(self):
+        """Only 'allow' if ALL matching categories are 'allow'."""
+        mode, keys, _ = gk._check_command_categories(
+            "curl http://example.com | pip install something",
+            {"network": "allow", "package_install": "allow"},
+        )
+        assert mode == "allow"
+
+    def test_multi_category_contexts_merged(self):
+        """LLM contexts from all matched categories should be merged."""
+        _, _, ctx = gk._check_command_categories(
+            "curl http://example.com | pip install something",
+            {},
+        )
+        assert "HTTP GET" in ctx
+        assert "well-known packages" in ctx
+
+    # --- hardcoded DENY_PATTERNS override category "allow" ---
+
+    def test_force_push_still_denied_even_if_category_allow(self):
+        """--force stays in DENY_PATTERNS, not overridable."""
+        assert gk.local_evaluate("git push --force origin main") == "NO"
+
+    def test_force_push_lease_still_denied(self):
+        assert gk.local_evaluate("git push --force-with-lease origin feature") == "NO"
+
+    def test_delete_push_still_denied(self):
+        assert gk.local_evaluate("git push --delete origin old-branch") == "NO"
+
+    def test_amend_commit_still_denied(self):
+        assert gk.local_evaluate("git commit --amend") == "NO"
+
+    # --- _get_git_branch ---
+
+    def test_get_git_branch_returns_string(self, tmp_path):
+        """Should always return a string."""
+        result = gk._get_git_branch(str(tmp_path))
+        assert isinstance(result, str)
+
+    def test_get_git_branch_non_repo_returns_unknown(self, tmp_path):
+        """Non-git directory should return 'unknown'."""
+        result = gk._get_git_branch(str(tmp_path))
+        assert result == "unknown"
+
+    def test_get_git_branch_in_repo(self):
+        """In our actual repo, should return a real branch name."""
+        import os
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        result = gk._get_git_branch(repo_root)
+        assert result != "unknown"
+        assert len(result) > 0
+
+    # --- _read_command_categories_config ---
+
+    def test_read_config_nonexistent_db(self, tmp_path):
+        result = gk._read_command_categories_config(tmp_path / "nonexistent.db")
+        assert result == {}
+
+    def test_read_config_empty_db(self, tmp_path):
+        """DB exists but has no settings table or no matching key."""
+        import sqlite3
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+        result = gk._read_command_categories_config(db_path)
+        assert result == {}
+
+    def test_read_config_with_overrides(self, tmp_path):
+        """DB with valid overrides should return them."""
+        import sqlite3
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)",
+            ("gatekeeper.command_categories", json.dumps({"network": "allow", "npx_bunx": "evaluate"})),
+        )
+        conn.commit()
+        conn.close()
+        result = gk._read_command_categories_config(db_path)
+        assert result == {"network": "allow", "npx_bunx": "evaluate"}
+
+    # --- get_command_categories_metadata ---
+
+    def test_metadata_has_all_categories(self):
+        meta = gk.get_command_categories_metadata()
+        expected_keys = {"network", "package_install", "file_ops", "npx_bunx", "git_write", "docker_exec"}
+        assert set(meta.keys()) == expected_keys
+
+    def test_metadata_fields(self):
+        meta = gk.get_command_categories_metadata()
+        for key, data in meta.items():
+            assert "label" in data
+            assert "desc" in data
+            assert "default_mode" in data
+            assert data["default_mode"] in ("allow", "evaluate", "ask")
+
+    def test_metadata_network_label(self):
+        meta = gk.get_command_categories_metadata()
+        assert meta["network"]["label"] == "Network Requests"
+        assert meta["network"]["default_mode"] == "evaluate"
+
+    def test_metadata_git_write_default_ask(self):
+        meta = gk.get_command_categories_metadata()
+        assert meta["git_write"]["default_mode"] == "ask"
+
+    def test_metadata_npx_bunx_default_ask(self):
+        meta = gk.get_command_categories_metadata()
+        assert meta["npx_bunx"]["default_mode"] == "ask"
+
+    # --- _category_allow_patterns integration ---
+
+    def test_category_allow_patterns_default_empty(self):
+        """Module-level _category_allow_patterns should be empty by default."""
+        assert gk._category_allow_patterns == []
+
+    def test_is_locally_safe_checks_category_patterns(self):
+        """When _category_allow_patterns is populated, _is_locally_safe should use them."""
+        import re
+        old_patterns = gk._category_allow_patterns[:]
+        try:
+            gk._category_allow_patterns = [re.compile(r"\bcurl\b")]
+            assert gk._is_locally_safe("curl http://example.com") == "YES"
+        finally:
+            gk._category_allow_patterns = old_patterns
+
+    def test_is_locally_safe_without_category_patterns(self):
+        """Without category patterns, curl should be ambiguous."""
+        old_patterns = gk._category_allow_patterns[:]
+        try:
+            gk._category_allow_patterns = []
+            assert gk._is_locally_safe("curl http://example.com") is None
+        finally:
+            gk._category_allow_patterns = old_patterns
+
+    # --- LLM context text quality ---
+
+    def test_llm_context_nonempty(self):
+        """Every category should have non-empty llm_context."""
+        for key, cat in gk.COMMAND_CATEGORIES.items():
+            assert cat["llm_context"], f"{key} has empty llm_context"
+
+    def test_git_write_context_has_branch_placeholder(self):
+        """git_write context should have {branch} for injection."""
+        ctx = gk.COMMAND_CATEGORIES["git_write"]["llm_context"]
+        assert "{branch}" in ctx

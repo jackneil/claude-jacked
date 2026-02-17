@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Session-account tracker hook for Claude Code.
 
-Handles four hook events:
+Handles five hook events:
   - SessionStart: Record which account this session is using
   - Notification(auth_success): User re-authenticated — close old, record new
   - SessionEnd: Mark the session-account record as ended
   - Stop: Heartbeat — update last_activity_at (throttled to every 5 min)
+  - UserPromptSubmit: Heartbeat — same as Stop (catches wake-from-sleep)
 
 Reads ~/.claude/.credentials.json to identify the active token, then
 matches it against jacked's accounts DB to find the account.
@@ -69,22 +70,26 @@ def _get_cred_data() -> tuple[str | None, dict | None]:
 CLAUDE_CONFIG = Path.home() / ".claude.json"
 
 
+LAYER3_FRESHNESS_SECONDS = 10
+
+
 def _match_token_to_account(
     token: str | None,
     cred_data: dict | None = None,
 ) -> tuple[int | None, str | None]:
     """Match the active account using layered matching.
 
-    Layer priority (must stay in sync with credentials.py:get_active_credential,
-    credential_sync.py:sync_credential_tokens, and auth.py:refresh_all_expiring_tokens):
+    Layer priority (must stay in sync with credential_sync.py shared matcher):
 
-    Layer 1: _jackedAccountId stamp — strongest, explicitly set by jacked.
-    Layer 2: Exact access_token match — cryptographically unique.
-    Layer 3: Email from ~/.claude.json — weakest, Claude Code can change independently.
+    Layer 1:    _jackedAccountId stamp — strongest, explicitly set by jacked.
+    Layer 2:    Exact access_token match — cryptographically unique.
+    Layer 2.5:  Exact refresh_token match — weeks-lived, survives AT rotation.
+    Layer 2.75: known_refresh_tokens table — historical RT → account mapping.
+    Layer 3:    Email from ~/.claude.json — staleness-gated (only if mtime < 10s).
 
     Note: there is a ~3s race window after Claude Code overwrites .credentials.json
     (removing the stamp) and before the watcher re-stamps it.  During this window,
-    a SessionStart could fall through to Layer 2/3.  This is acceptable — adding
+    a SessionStart could fall through to Layer 2+.  This is acceptable — adding
     sync logic here would violate the hook's fire-and-forget contract.
 
     Returns (account_id, email) or (None, None) if no match.
@@ -121,20 +126,67 @@ def _match_token_to_account(
                 if row:
                     return row[0], row[1]
 
-            # Layer 3: Email from ~/.claude.json (weakest — can drift independently)
-            if CLAUDE_CONFIG.exists() and not CLAUDE_CONFIG.is_symlink():
-                try:
-                    config = json.loads(CLAUDE_CONFIG.read_text(encoding="utf-8"))
-                    email = config.get("oauthAccount", {}).get("emailAddress")
-                    if email:
+            # Layer 2.5: Exact refresh_token match (current DB RT)
+            if cred_data is not None:
+                cred_rt = cred_data.get("claudeAiOauth", {}).get("refreshToken")
+                if cred_rt:
+                    row = conn.execute(
+                        "SELECT id, email FROM accounts WHERE refresh_token = ? AND is_deleted = 0",
+                        (cred_rt,),
+                    ).fetchone()
+                    if row:
+                        return row[0], row[1]
+
+            # Layer 2.75: known_refresh_tokens table (may not exist yet)
+            if cred_data is not None:
+                cred_rt = cred_data.get("claudeAiOauth", {}).get("refreshToken")
+                if cred_rt:
+                    try:
                         row = conn.execute(
-                            "SELECT id, email FROM accounts "
-                            "WHERE LOWER(email) = LOWER(?) AND is_deleted = 0 "
-                            "ORDER BY priority ASC, id ASC LIMIT 1",
-                            (email,),
+                            "SELECT account_id FROM known_refresh_tokens WHERE refresh_token = ?",
+                            (cred_rt,),
                         ).fetchone()
                         if row:
-                            return row[0], row[1]
+                            acct_row = conn.execute(
+                                "SELECT id, email FROM accounts WHERE id = ? AND is_deleted = 0",
+                                (row[0],),
+                            ).fetchone()
+                            if acct_row:
+                                return acct_row[0], acct_row[1]
+                    except sqlite3.OperationalError:
+                        pass  # Table doesn't exist yet — skip layer
+
+            # Layer 2.85: Single-account optimization (unambiguous when only 1 OAuth account)
+            try:
+                oauth_rows = conn.execute(
+                    "SELECT id, email FROM accounts "
+                    "WHERE refresh_token IS NOT NULL AND is_deleted = 0",
+                ).fetchall()
+                if len(oauth_rows) == 1:
+                    return oauth_rows[0][0], oauth_rows[0][1]
+            except sqlite3.OperationalError:
+                pass
+
+            # Layer 3: Staleness-gated email from ~/.claude.json
+            if CLAUDE_CONFIG.exists() and not CLAUDE_CONFIG.is_symlink():
+                try:
+                    config_mtime = CLAUDE_CONFIG.stat().st_mtime
+                    if time.time() - config_mtime <= LAYER3_FRESHNESS_SECONDS:
+                        config = json.loads(
+                            CLAUDE_CONFIG.read_text(encoding="utf-8")
+                        )
+                        email = config.get("oauthAccount", {}).get(
+                            "emailAddress"
+                        )
+                        if email:
+                            row = conn.execute(
+                                "SELECT id, email FROM accounts "
+                                "WHERE LOWER(email) = LOWER(?) AND is_deleted = 0 "
+                                "ORDER BY priority ASC, id ASC LIMIT 1",
+                                (email,),
+                            ).fetchone()
+                            if row:
+                                return row[0], row[1]
                 except (json.JSONDecodeError, OSError):
                     pass
         finally:
@@ -388,12 +440,13 @@ def _handle_event(event: str, session_id: str, repo_path: str | None):
 
     >>> _handle_event("SessionEnd", "test-sess", None)
     >>> _handle_event("Stop", "test-sess", None)
+    >>> _handle_event("UserPromptSubmit", "test-sess", None)
     """
     if event == "SessionEnd":
         _end_session(session_id)
         return
 
-    if event == "Stop":
+    if event in ("Stop", "UserPromptSubmit"):
         _heartbeat_session(session_id)
         return
 
@@ -435,7 +488,7 @@ def main():
         return
 
     # Only handle our events
-    if event not in ("SessionStart", "Notification", "SessionEnd", "Stop"):
+    if event not in ("SessionStart", "Notification", "SessionEnd", "Stop", "UserPromptSubmit"):
         return
 
     # Fire-and-forget: daemon thread so we don't block Claude Code

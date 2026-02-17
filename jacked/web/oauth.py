@@ -466,5 +466,10 @@ class OAuthFlow:
             last_validated_at=int(time.time()),
         )
 
+        # Record initial RT for Layer 2.75 matching
+        rt = tokens.get("refresh_token")
+        if rt and hasattr(self.db, "record_refresh_token"):
+            self.db.record_refresh_token(rt, account["id"])
+
         logger.info(f"Account stored: {email} (id={account['id']})")
         return account

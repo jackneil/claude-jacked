@@ -65,8 +65,6 @@ uv tool install "claude-jacked[security]" --force && jacked install --force --se
 uv tool install "claude-jacked[all]" --force && jacked install --force --security
 ```
 
-> **Previously installed via pipx?** Uninstall it first: `pipx uninstall claude-jacked`
-
 ---
 
 ## Your Dashboard

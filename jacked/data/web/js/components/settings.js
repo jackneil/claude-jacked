@@ -293,17 +293,25 @@ async function renderGatekeeperTab(container) {
     `;
 
     try {
-        const [config, features, pathSafety] = await Promise.all([
+        const results = await Promise.allSettled([
             api.get('/api/settings/gatekeeper'),
             loadFeatures(),
             api.get('/api/settings/gatekeeper/path-safety'),
+            api.get('/api/settings/gatekeeper/command-categories'),
         ]);
+
+        // Core config (index 0) is required; others degrade gracefully
+        if (results[0].status === 'rejected') throw results[0].reason;
+        const config = results[0].value;
+        const features = results[1].status === 'fulfilled' ? results[1].value : { hooks: [] };
+        const pathSafety = results[2].status === 'fulfilled' ? results[2].value : null;
+        const commandCategories = results[3].status === 'fulfilled' ? results[3].value : null;
 
         const gkHook = (features.hooks || []).find(h => h.name === 'security_gatekeeper');
         const hookInstalled = gkHook ? gkHook.installed : false;
 
-        container.innerHTML = renderGatekeeperContent(config, hookInstalled, pathSafety);
-        bindGatekeeperEvents(config, hookInstalled, pathSafety);
+        container.innerHTML = renderGatekeeperContent(config, hookInstalled, pathSafety, commandCategories);
+        bindGatekeeperEvents(config, hookInstalled, pathSafety, commandCategories);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -314,7 +322,7 @@ async function renderGatekeeperTab(container) {
     }
 }
 
-function renderGatekeeperContent(config, hookInstalled, pathSafety) {
+function renderGatekeeperContent(config, hookInstalled, pathSafety, commandCategories) {
     // On/off banner
     const bannerClass = hookInstalled ? 'bg-green-900/30 border-green-700/40' : 'bg-yellow-900/20 border-yellow-700/40';
     const bannerIcon = hookInstalled
@@ -435,6 +443,11 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety) {
                     ${renderPathSafetySection(pathSafety)}
                 </div>
 
+                <!-- Command Categories Config (collapsible) -->
+                <div class="border-t border-slate-700 pt-4 mt-2">
+                    ${renderCommandCategoriesSection(commandCategories)}
+                </div>
+
                 <!-- LLM Model Selection -->
                 <div>
                     <label class="block text-sm font-medium text-slate-300 mb-2">LLM Model</label>
@@ -502,6 +515,7 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety) {
 }
 
 function renderPathSafetySection(pathSafety) {
+    if (!pathSafety) return '<div class="text-xs text-slate-500 italic">Path safety config unavailable. <button onclick="renderSettingsTab(\'gatekeeper\')" class="text-blue-400 hover:text-blue-300">Retry</button></div>';
     const enabled = pathSafety.enabled !== false;
     const disabledPatterns = pathSafety.disabled_patterns || [];
     const allowedPaths = pathSafety.allowed_paths || [];
@@ -689,6 +703,165 @@ function renderPathSafetySection(pathSafety) {
             </div>
         </div>
     `;
+}
+
+
+function renderCommandCategoriesSection(commandCategories) {
+    const cats = commandCategories?.categories || {};
+    const modeColors = {
+        allow: { bg: 'bg-green-900/40', border: 'border-green-700/50', text: 'text-green-400', dot: 'bg-green-400' },
+        evaluate: { bg: 'bg-orange-900/30', border: 'border-orange-700/40', text: 'text-orange-400', dot: 'bg-orange-400' },
+        ask: { bg: 'bg-red-900/30', border: 'border-red-700/40', text: 'text-red-400', dot: 'bg-red-400' },
+    };
+    const modeLabels = { allow: 'Allow', evaluate: 'Evaluate', ask: 'Ask User' };
+
+    const rows = Object.entries(cats).map(([key, cat]) => {
+        const mode = cat.current_mode || cat.default_mode;
+        const isDefault = mode === cat.default_mode;
+        const colors = modeColors[mode] || modeColors.evaluate;
+
+        const options = ['allow', 'evaluate', 'ask'].map(m => {
+            const selected = m === mode ? 'selected' : '';
+            const label = modeLabels[m] + (m === cat.default_mode ? ' (default)' : '');
+            return `<option value="${m}" ${selected}>${label}</option>`;
+        }).join('');
+
+        return `
+            <div class="flex items-center gap-3 p-3 rounded ${colors.bg} border ${colors.border} transition-all" data-cat-key="${escapeHtml(key)}">
+                <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full ${colors.dot} flex-shrink-0"></span>
+                        <span class="text-sm text-white font-medium">${escapeHtml(cat.label)}</span>
+                        ${!isDefault ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-300">modified</span>' : ''}
+                    </div>
+                    <div class="text-xs text-slate-400 mt-0.5 ml-4">${escapeHtml(cat.desc)}</div>
+                </div>
+                <select class="cc-mode-select bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500 flex-shrink-0"
+                        data-cat-key="${escapeHtml(key)}">
+                    ${options}
+                </select>
+            </div>
+        `;
+    }).join('');
+
+    return `
+        <div id="cc-section-header" class="flex items-center justify-between cursor-pointer select-none mb-3">
+            <div class="flex items-center gap-3">
+                <span class="text-sm font-medium text-slate-300">Command Categories</span>
+                <span class="text-xs px-2 py-0.5 rounded-full bg-blue-900/50 text-blue-300">${Object.keys(cats).length} categories</span>
+            </div>
+            <svg id="cc-chevron" class="w-5 h-5 text-slate-400 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+            </svg>
+        </div>
+        <div id="cc-section-content" class="hidden">
+            <p class="text-xs text-slate-500 mb-3">Configure how the gatekeeper handles specific command types. <span class="text-green-400">Allow</span> auto-approves, <span class="text-orange-400">Evaluate</span> sends to the LLM with category-specific guidance, <span class="text-red-400">Ask User</span> always prompts you.</p>
+            <div class="space-y-2 mb-4">
+                ${rows}
+            </div>
+            <div class="flex items-center justify-end">
+                <button id="btn-cc-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors">Save Categories</button>
+            </div>
+        </div>
+    `;
+}
+
+
+function bindCommandCategoriesEvents(commandCategories) {
+    // Collapsible toggle
+    const header = document.getElementById('cc-section-header');
+    const content = document.getElementById('cc-section-content');
+    const chevron = document.getElementById('cc-chevron');
+    if (header && content) {
+        header.addEventListener('click', () => {
+            const isHidden = content.classList.toggle('hidden');
+            if (chevron) chevron.style.transform = isHidden ? '' : 'rotate(180deg)';
+        });
+    }
+
+    // Mode change — update row colors live
+    const selects = document.querySelectorAll('.cc-mode-select');
+    const modeColors = {
+        allow: { bg: 'bg-green-900/40', border: 'border-green-700/50', dot: 'bg-green-400' },
+        evaluate: { bg: 'bg-orange-900/30', border: 'border-orange-700/40', dot: 'bg-orange-400' },
+        ask: { bg: 'bg-red-900/30', border: 'border-red-700/40', dot: 'bg-red-400' },
+    };
+    const allBgs = Object.values(modeColors).flatMap(c => [c.bg, c.border, c.dot]);
+
+    selects.forEach(select => {
+        select.addEventListener('change', async () => {
+            const key = select.dataset.catKey;
+            const mode = select.value;
+
+            // Warning for git_write → allow
+            if (key === 'git_write' && mode === 'allow') {
+                const result = await Swal.fire({
+                    title: 'Auto-approve git commits & pushes?',
+                    html: 'This will auto-approve all <code>git commit</code> and <code>git push</code> commands.<br><br><span class="text-green-400">Force push, branch deletion, and amend are still blocked by hardcoded rules.</span>',
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: 'Yes, allow',
+                    cancelButtonText: 'Cancel',
+                    focusCancel: true,
+                });
+                if (!result.isConfirmed) {
+                    // Revert select to previous value
+                    const cats = commandCategories?.categories || {};
+                    select.value = cats[key]?.current_mode || cats[key]?.default_mode || 'ask';
+                    return;
+                }
+            }
+
+            // Update row styling
+            const row = select.closest('[data-cat-key]');
+            if (row) {
+                const dot = row.querySelector('.rounded-full');
+                row.classList.remove(...allBgs);
+                const c = modeColors[mode] || modeColors.evaluate;
+                row.classList.add(c.bg, c.border);
+                if (dot) {
+                    dot.classList.remove(...allBgs);
+                    dot.classList.add(c.dot);
+                }
+                // Toggle "modified" badge
+                const cats = commandCategories?.categories || {};
+                const isDefault = mode === (cats[key]?.default_mode);
+                let badge = row.querySelector('.text-blue-300');
+                if (!isDefault && !badge) {
+                    const nameSpan = row.querySelector('.text-white.font-medium');
+                    if (nameSpan) {
+                        nameSpan.insertAdjacentHTML('afterend', ' <span class="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-300">modified</span>');
+                    }
+                } else if (isDefault && badge) {
+                    badge.remove();
+                }
+            }
+        });
+    });
+
+    // Save button
+    const saveBtn = document.getElementById('btn-cc-save');
+    if (saveBtn) {
+        saveBtn.addEventListener('click', async () => {
+            const categories = {};
+            selects.forEach(s => {
+                categories[s.dataset.catKey] = s.value;
+            });
+
+            try {
+                saveBtn.disabled = true;
+                saveBtn.textContent = 'Saving...';
+                await api.put('/api/settings/gatekeeper/command-categories', { categories });
+                showToast('Command categories saved', 'success');
+                await renderSettingsTab('gatekeeper');
+            } catch (e) {
+                showToast(e.message || 'Save failed', 'error');
+            } finally {
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Save Categories';
+            }
+        });
+    }
 }
 
 
@@ -1228,7 +1401,7 @@ function _collectPathSafetyState() {
 }
 
 
-function bindGatekeeperEvents(config, hookInstalled, pathSafety) {
+function bindGatekeeperEvents(config, hookInstalled, pathSafety, commandCategories) {
     // Hook toggle in banner
     const bannerToggle = document.querySelector('.toggle-switch[data-name="security_gatekeeper"][data-category="hooks"]');
     if (bannerToggle) {
@@ -1361,6 +1534,11 @@ function bindGatekeeperEvents(config, hookInstalled, pathSafety) {
     // Path safety events
     if (pathSafety) {
         bindPathSafetyEvents(pathSafety);
+    }
+
+    // Command categories events
+    if (commandCategories) {
+        bindCommandCategoriesEvents(commandCategories);
     }
 
     // Prompt editor collapsible

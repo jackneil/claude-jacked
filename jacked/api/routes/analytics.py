@@ -77,7 +77,7 @@ async def gatekeeper_stats(request: Request, days: int = Query(default=7, ge=1, 
         return _db_unavailable()
 
     cutoff = _get_cutoff_iso(days)
-    all_rows = db.list_gatekeeper_decisions(limit=10000)
+    all_rows = db.list_gatekeeper_decisions(limit=10000)["rows"]
     rows = _filter_by_date(all_rows, cutoff)
 
     total = len(rows)
@@ -165,7 +165,7 @@ async def hook_stats(request: Request, days: int = Query(default=7, ge=1, le=365
         return _db_unavailable()
 
     cutoff = _get_cutoff_iso(days)
-    all_rows = db.list_hook_executions(limit=10000)
+    all_rows = db.list_hook_executions(limit=10000)["rows"]
     rows = _filter_by_date(all_rows, cutoff)
 
     total = len(rows)

@@ -1296,6 +1296,7 @@ SESSION_TRACKER_EVENTS = [
     ("Notification", "auth_success"),
     ("SessionEnd", ""),
     ("Stop", ""),
+    ("UserPromptSubmit", ""),
 ]
 
 
