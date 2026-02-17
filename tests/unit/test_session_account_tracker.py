@@ -213,3 +213,52 @@ def test_handle_event_notification_closes_old_session():
 
     mock_end.assert_called_once_with("test-sess")
     mock_record.assert_called_once_with("test-sess", 1, "a@test.com", "auth_success", "/repo")
+
+
+# ------------------------------------------------------------------
+# UserPromptSubmit: heartbeat only, no credential reads
+# ------------------------------------------------------------------
+
+
+def test_user_prompt_submit_triggers_heartbeat():
+    """UserPromptSubmit calls _heartbeat_session, not _record_session or _get_cred_data.
+
+    >>> test_user_prompt_submit_triggers_heartbeat()
+    """
+    with (
+        mock.patch.object(sat, "_heartbeat_session") as mock_hb,
+        mock.patch.object(sat, "_get_cred_data") as mock_cred,
+        mock.patch.object(sat, "_record_session") as mock_record,
+    ):
+        sat._handle_event("UserPromptSubmit", "test-sess", "/repo")
+
+    mock_hb.assert_called_once_with("test-sess")
+    mock_cred.assert_not_called()
+    mock_record.assert_not_called()
+
+
+def test_user_prompt_submit_passes_main_event_filter():
+    """main() allows UserPromptSubmit through its event allowlist.
+
+    >>> test_user_prompt_submit_passes_main_event_filter()
+    """
+    input_data = json.dumps({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "sess-ups-001",
+        "cwd": "/test/project",
+    })
+    with (
+        mock.patch.object(sat, "sys") as mock_sys,
+        mock.patch.object(sat, "_handle_event") as mock_handle,
+        mock.patch("threading.Thread") as mock_thread,
+    ):
+        mock_sys.stdin.read.return_value = input_data
+        mock_thread_instance = mock.MagicMock()
+        mock_thread.return_value = mock_thread_instance
+
+        sat.main()
+
+    mock_thread.assert_called_once()
+    call_args = mock_thread.call_args
+    assert call_args[1]["args"] == ("UserPromptSubmit", "sess-ups-001", "/test/project")
+    mock_thread_instance.start.assert_called_once()

@@ -452,7 +452,12 @@ async def refresh_usage(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    usage_data = await fetch_usage(account_id, db)
+    # Use live token for the active Claude Code account (DB token may be stale)
+    from jacked.api.credential_sync import detect_active_account
+
+    active_id, live_token = detect_active_account(db)
+    token_override = live_token if (active_id and account_id == active_id) else None
+    usage_data = await fetch_usage(account_id, db, access_token=token_override)
 
     if usage_data is None:
         return JSONResponse(
@@ -487,8 +492,14 @@ async def refresh_all_usage(request: Request):
     failed = 0
     results = []
 
+    # Use live token for the active Claude Code account (DB token may be stale)
+    from jacked.api.credential_sync import detect_active_account
+
+    active_id, live_token = detect_active_account(db)
+
     for acct in accounts:
-        usage_data = await fetch_usage(acct["id"], db)
+        token_override = live_token if (active_id and acct["id"] == active_id) else None
+        usage_data = await fetch_usage(acct["id"], db, access_token=token_override)
         if usage_data is not None:
             refreshed += 1
             five_hour = usage_data.get("five_hour", {})
@@ -504,11 +515,13 @@ async def refresh_all_usage(request: Request):
             )
         else:
             failed += 1
+            updated_acct = db.get_account(acct["id"])
             results.append(
                 {
                     "account_id": acct["id"],
                     "email": acct["email"],
                     "success": False,
+                    "error": updated_acct.get("last_error") if updated_acct else None,
                 }
             )
 

@@ -22,6 +22,9 @@ from pydantic import BaseModel, computed_field
 # Sessions without a heartbeat within this window are considered stale
 SESSION_STALENESS_MINUTES = 60
 
+# Sessions with no Claude process alive for this long are auto-closed
+DEAD_SESSION_HOURS = 4
+
 
 # ---------------------------------------------------------------------------
 # Pydantic v2 Models
@@ -319,6 +322,15 @@ CREATE TABLE IF NOT EXISTS session_accounts (
     agent_type TEXT,
     UNIQUE(session_id, detected_at)
 );
+
+-- Refresh token history: maps every RT ever seen to its account.
+-- Used for Layer 2.75 matching when current DB RT doesn't match
+-- (e.g., after token rotation by Claude Code).
+CREATE TABLE IF NOT EXISTS known_refresh_tokens (
+    refresh_token TEXT PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    seen_at INTEGER NOT NULL
+);
 """
 
 INDEXES_SQL = """
@@ -340,6 +352,7 @@ CREATE INDEX IF NOT EXISTS idx_hook_executions_repo ON hook_executions(repo_path
 CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_account ON session_accounts(account_id);
 CREATE INDEX IF NOT EXISTS idx_sa_active ON session_accounts(ended_at, last_activity_at, detected_at);
+CREATE INDEX IF NOT EXISTS idx_krt_account ON known_refresh_tokens(account_id);
 """
 
 
@@ -454,6 +467,17 @@ class Database:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_sa_active "
                     "ON session_accounts(ended_at, last_activity_at, detected_at)"
+                )
+            except sqlite3.OperationalError:
+                pass
+            # Migration: seed known_refresh_tokens from existing accounts
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO known_refresh_tokens
+                       (refresh_token, account_id, seen_at)
+                       SELECT refresh_token, id, CAST(strftime('%s','now') AS INTEGER)
+                       FROM accounts
+                       WHERE refresh_token IS NOT NULL AND is_deleted = 0"""
                 )
             except sqlite3.OperationalError:
                 pass
@@ -848,6 +872,79 @@ class Database:
                 (now, int(time.time()), now, account_id),
             )
             return cursor.rowcount > 0
+
+    # ==================================================================
+    # Known Refresh Tokens
+    # ==================================================================
+
+    def record_refresh_token(self, refresh_token: str, account_id: int):
+        """Record a refresh_token → account_id mapping for Layer 2.75 matching.
+
+        Called whenever we see a refresh token: after sync, after refresh,
+        after OAuth flow, after /use endpoint.  INSERT OR REPLACE so the
+        latest account_id wins if the same RT is reused (shouldn't happen,
+        but handles edge cases).
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("u@t.com", "tok", 9999999999, refresh_token="rt1")
+        >>> db.record_refresh_token("rt1", acct["id"])
+        >>> db.lookup_refresh_token("rt1") == acct["id"]
+        True
+        """
+        if not refresh_token:
+            return
+        with self._writer() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO known_refresh_tokens
+                   (refresh_token, account_id, seen_at) VALUES (?, ?, ?)""",
+                (refresh_token, account_id, int(time.time())),
+            )
+
+    def lookup_refresh_token(self, refresh_token: str) -> int | None:
+        """Look up account_id for a known refresh_token (Layer 2.75).
+
+        Returns account_id or None if the RT has never been recorded.
+
+        >>> db = Database(":memory:")
+        >>> db.lookup_refresh_token("nonexistent") is None
+        True
+        """
+        if not refresh_token:
+            return None
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT account_id FROM known_refresh_tokens WHERE refresh_token = ?",
+                (refresh_token,),
+            ).fetchone()
+            return row[0] if row else None
+
+    def prune_old_refresh_tokens(self, max_age_days: int = 30):
+        """Remove entries older than max_age_days + enforce count cap (10k).
+
+        Called at startup and periodically by background loop.
+
+        >>> db = Database(":memory:")
+        >>> db.prune_old_refresh_tokens()
+        """
+        cutoff = int(time.time()) - (max_age_days * 86400)
+        with self._writer() as conn:
+            conn.execute(
+                "DELETE FROM known_refresh_tokens WHERE seen_at < ?", (cutoff,)
+            )
+            # Safety net: cap at 10k entries to prevent unbounded growth
+            count = conn.execute(
+                "SELECT COUNT(*) FROM known_refresh_tokens"
+            ).fetchone()[0]
+            if count > 10000:
+                conn.execute(
+                    """DELETE FROM known_refresh_tokens
+                       WHERE rowid IN (
+                           SELECT rowid FROM known_refresh_tokens
+                           ORDER BY seen_at ASC
+                           LIMIT ?
+                       )""",
+                    (count - 10000,),
+                )
 
     # ==================================================================
     # Installation CRUD
@@ -1654,6 +1751,79 @@ class Database:
                 (cutoff,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_stale_open_sessions(
+        self, staleness_minutes: int = SESSION_STALENESS_MINUTES
+    ) -> list:
+        """Get sessions that are stale (past staleness window) but not ended.
+
+        Inverse of get_active_sessions — returns sessions that have gone
+        silent but were never closed. Used by the process-alive sweeper.
+
+        >>> db = Database(":memory:")
+        >>> db.get_stale_open_sessions()
+        []
+        """
+        clamped = max(5, min(120, staleness_minutes))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT session_id,
+                          MAX(COALESCE(last_activity_at, detected_at)) AS last_activity_at,
+                          MIN(detected_at) AS detected_at
+                   FROM session_accounts
+                   WHERE ended_at IS NULL
+                     AND COALESCE(last_activity_at, detected_at) <= ?
+                   GROUP BY session_id
+                   ORDER BY last_activity_at ASC""",
+                (cutoff,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def bump_all_stale_sessions(
+        self, staleness_minutes: int = SESSION_STALENESS_MINUTES
+    ) -> int:
+        """Bump last_activity_at on all stale-but-open sessions.
+
+        Used by the process-alive sweeper when Claude processes are still
+        running. Returns the number of rows updated.
+
+        >>> db = Database(":memory:")
+        >>> db.bump_all_stale_sessions()
+        0
+        """
+        clamped = max(5, min(120, staleness_minutes))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts SET last_activity_at = ?
+                   WHERE ended_at IS NULL
+                     AND COALESCE(last_activity_at, detected_at) <= ?""",
+                (now, cutoff),
+            )
+            return cursor.rowcount
+
+    def close_dead_sessions(self, hours: int = DEAD_SESSION_HOURS) -> int:
+        """Close sessions that have been stale for more than `hours`.
+
+        Used by the process-alive sweeper when no Claude processes are
+        running. Returns the number of rows updated.
+
+        >>> db = Database(":memory:")
+        >>> db.close_dead_sessions()
+        0
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts SET ended_at = ?
+                   WHERE ended_at IS NULL
+                     AND COALESCE(last_activity_at, detected_at) <= ?""",
+                (now, cutoff),
+            )
+            return cursor.rowcount
 
     def reassign_sessions(
         self, from_account_id: int, to_account_id: int, since_iso: str

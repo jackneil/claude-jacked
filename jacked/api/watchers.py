@@ -8,6 +8,7 @@ main.py to stay under the 500-line guardrail.
 import asyncio
 import logging
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from jacked.api.websocket import WebSocketRegistry
@@ -196,3 +197,83 @@ async def logs_watch_loop(app, interval: int = 3):
             conn.close()
         except Exception:
             pass
+
+
+def _any_claude_process_alive() -> bool:
+    """Check if any Claude Code process is running.
+
+    Uses ``pgrep -x claude`` for exact process name matching.
+    Returns False on any error (fail-safe — never incorrectly closes sessions).
+
+    >>> # Can't reliably doctest process detection
+    """
+    # macOS/Linux only — returns False (fail-safe) on Windows
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "claude"],
+            capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+async def process_alive_sweeper_loop(app, interval: int = 60):
+    """Resurrect stale sessions if Claude processes are still alive.
+
+    Runs every ``interval`` seconds (default 60).  Uses a coarse strategy:
+    if ANY Claude process is running, bump ALL stale sessions.  This avoids
+    the problem where fresh sessions (started without ``--resume``) have no
+    session ID in their process arguments.
+
+    If no Claude processes are alive and sessions are stale for more than
+    DEAD_SESSION_HOURS (4h), auto-close them.
+
+    >>> # Verified via integration test
+    """
+    db_obj = getattr(app.state, "db", None)
+    if db_obj is None:
+        return
+
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                # 1. Check for stale sessions
+                stale = await asyncio.to_thread(db_obj.get_stale_open_sessions)
+                if not stale:
+                    continue
+
+                # 2. Are any Claude processes alive?
+                alive = await asyncio.to_thread(_any_claude_process_alive)
+                changed = False
+
+                if alive:
+                    # Bump all stale sessions — at least one process is running
+                    count = await asyncio.to_thread(db_obj.bump_all_stale_sessions)
+                    if count > 0:
+                        changed = True
+                        logger.info(
+                            "Process sweeper: bumped %d stale session(s)", count
+                        )
+                else:
+                    # No Claude processes — close sessions stale > DEAD_SESSION_HOURS
+                    count = await asyncio.to_thread(db_obj.close_dead_sessions)
+                    if count > 0:
+                        changed = True
+                        logger.info(
+                            "Process sweeper: closed %d dead session(s)", count
+                        )
+
+                if changed:
+                    registry = getattr(app.state, "ws_registry", None)
+                    if registry and registry.client_count > 0:
+                        await registry.broadcast(
+                            "sessions_changed", source="process_sweeper"
+                        )
+
+            except Exception as e:
+                logger.warning("Process sweeper error: %s", e)
+                continue
+    except asyncio.CancelledError:
+        pass

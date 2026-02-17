@@ -51,6 +51,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "qdrant-client>=1.7.0",
     "anthropic>=0.40.0",
+    "websockets>=12.0",
 ]
 
 [project.scripts]

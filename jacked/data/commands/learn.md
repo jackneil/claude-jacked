@@ -27,8 +27,8 @@ Extract the core lesson. Ask: "What's the GENERAL principle here, not just this 
 
 Check THREE places for existing coverage:
 1. **`lessons.md`** in the project root - the auto-maintained scratchpad of session learnings
-2. **Project-level CLAUDE.md** in the project root - permanent project rules
-3. **`~/.claude/CLAUDE.md`** (global) - permanent global rules
+2. **Project-level `CLAUDE.md`** in the project root - permanent project rules
+3. **User's global `CLAUDE.md`** (the one managed by Claude Code, typically in the user's Claude config directory) - permanent global rules
 
 For each, scan for:
 - Rules/lessons that already cover this topic (don't duplicate)
@@ -45,6 +45,7 @@ Write a concise rule following these principles:
 - **Lead with WHY** - the reason makes the rule stick
 - **Be concrete** - "ALWAYS use pydantic v2 for model definitions" not "use modern libraries"
 - **Be actionable** - Claude should know exactly what to do differently
+- **NEVER hardcode machine-specific paths** (e.g. `/Users/jack/...`, `/home/user/...`, `~/.local/share/uv/tools/...`). Use generic references like "the project root", "the Claude config directory", or `~/.claude/` when referring to well-known locations. These files get synced to the repo and must work for any contributor.
 
 Good examples:
 ```
@@ -58,6 +59,7 @@ Bad examples:
 - try to write better code (too vague)
 - remember to be careful with paths (not actionable)
 - there was a bug with the thing (not a rule)
+- check /Users/jack/.local/share/uv/tools/... (machine-specific path)
 ```
 
 ### Step 4: Write the Rule
@@ -65,7 +67,7 @@ Bad examples:
 Act confidently. Do NOT ask the user for permission — just write the rule.
 
 - **APPEND-ONLY**: Add the rule to the end of the file. Never edit or remove existing rules.
-- Default to the global `~/.claude/CLAUDE.md` unless the lesson is clearly project-specific, in which case use the project-level CLAUDE.md.
+- Default to the **user's global CLAUDE.md** unless the lesson is clearly project-specific, in which case use the project-level CLAUDE.md.
 - If CLAUDE.md doesn't exist, create it with a header comment.
 - If you spotted conflicting rules in Step 2, rewrite the conflicting rule to incorporate both (in-place edit, not duplicate).
 - If the file has 50+ rules, suggest running `/audit-rules` to consolidate.
@@ -79,4 +81,5 @@ After writing, give a brief summary (1-2 lines) of what was added and where. Don
 
 - NEVER invent lessons from nothing - if the conversation has no clear lesson, say so
 - NEVER duplicate an existing rule - update the existing one instead
-- ALWAYS default to global `~/.claude/CLAUDE.md` unless clearly project-specific
+- NEVER hardcode machine-specific absolute paths in rules or lessons — use generic/portable references
+- ALWAYS default to global CLAUDE.md unless clearly project-specific

@@ -101,7 +101,11 @@ function bindAccountEvents() {
                 if (result.refreshed === 0 && result.failed === 0) {
                     showToast('No active accounts to refresh', 'warning');
                 } else if (result.failed > 0) {
-                    showToast(`Usage refreshed (${result.refreshed} ok, ${result.failed} failed)`, 'warning');
+                    const failedAccounts = (result.results || [])
+                        .filter(r => !r.success)
+                        .map(r => r.email)
+                        .join(', ');
+                    showToast(`Usage refreshed (${result.refreshed} ok, ${result.failed} failed: ${failedAccounts})`, 'warning');
                 } else {
                     showToast(`Usage refreshed for ${result.refreshed} account${result.refreshed !== 1 ? 's' : ''}`, 'success');
                 }

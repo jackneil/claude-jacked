@@ -172,6 +172,23 @@ async def use_account(account_id: int, request: Request):
             },
         )
 
+    # Refresh token if near-expiry before writing to credential file
+    from jacked.web.auth import refresh_account_token, should_refresh
+
+    if account.get("refresh_token") and should_refresh(account):
+        refreshed = await refresh_account_token(account_id, db)
+        if refreshed:
+            account = db.get_account(account_id)
+            if not account:
+                return _not_found(f"No account with id={account_id}")
+            access_token = account.get("access_token", "")
+        else:
+            logger.warning(
+                "Token refresh failed for account %d before /use — "
+                "proceeding with current token",
+                account_id,
+            )
+
     # Parse scopes safely
     scopes = []
     raw_scopes = account.get("scopes")
@@ -234,7 +251,9 @@ async def use_account(account_id: int, request: Request):
             os.chmod(tmp_path, 0o600)
         except OSError:
             pass
-        os.replace(tmp_path, str(cred_path))
+        from jacked.api.credential_sync import _safe_replace
+
+        _safe_replace(tmp_path, str(cred_path))
         try:
             request.app.state.cred_last_written_mtime = cred_path.stat().st_mtime
         except OSError:
@@ -259,6 +278,11 @@ async def use_account(account_id: int, request: Request):
 
     write_platform_credentials(existing)
 
+    # Record RT for Layer 2.75 matching
+    rt = account.get("refresh_token")
+    if rt and hasattr(db, "record_refresh_token"):
+        db.record_refresh_token(rt, account_id)
+
     # Update ~/.claude.json so Layer 3 matching picks up the new account
     _update_claude_config_email(
         account["email"], display_name=account.get("display_name")
@@ -271,12 +295,8 @@ async def use_account(account_id: int, request: Request):
 async def get_active_credential(request: Request):
     """Read Claude Code's credential file and match to a jacked account.
 
-    Layer priority (must stay in sync with session_account_tracker.py,
-    credential_sync.py, and auth.py):
-
-    Layer 1: _jackedAccountId stamp — strongest, explicitly set by jacked.
-    Layer 2: Exact access_token match — cryptographically unique.
-    Layer 3: Email from ~/.claude.json — weakest, Claude Code can change independently.
+    Uses the shared match_credential_to_account() with all layers
+    (1→2→2.5→2.75→2.85→3, staleness-gated).
 
     >>> # Returns null account_id if no match found
     """
@@ -284,60 +304,34 @@ async def get_active_credential(request: Request):
     if db is None:
         return ActiveCredentialResponse()
 
-    # Read credential file for layers 1 & 2
+    from jacked.api.credential_sync import (
+        match_credential_to_account,
+        read_platform_credentials,
+    )
+
+    # Read credential file
     cred_path = Path.home() / ".claude" / ".credentials.json"
-    data = None
-    access_token = None
+    cred_data = None
     if cred_path.exists() and not cred_path.is_symlink():
         try:
-            data = json.loads(cred_path.read_text(encoding="utf-8"))
-            access_token = data.get("claudeAiOauth", {}).get("accessToken")
+            cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, AttributeError):
             pass
 
     # Fallback: macOS Keychain (file may not exist on Mac)
-    if access_token is None:
-        from jacked.api.credential_sync import read_platform_credentials
-
+    if cred_data is None or not cred_data.get("claudeAiOauth", {}).get("accessToken"):
         platform_data = read_platform_credentials()
         if platform_data:
-            data = platform_data
-            access_token = platform_data.get("claudeAiOauth", {}).get("accessToken")
+            cred_data = platform_data
 
-    # Layer 1: _jackedAccountId stamp (strongest — user's explicit choice)
-    if data is not None:
-        jacked_id = data.get("_jackedAccountId")
-        if jacked_id is not None:
-            acct = db.get_account(jacked_id)
-            if acct and not acct.get("is_deleted"):
-                return ActiveCredentialResponse(
-                    account_id=acct["id"], email=acct["email"]
-                )
+    if not cred_data:
+        return ActiveCredentialResponse()
 
-    # Layer 2: Exact access_token match (cryptographically unique)
-    if access_token:
-        accounts = db.list_accounts(include_inactive=True)
-        for acct in accounts:
-            if acct.get("access_token") == access_token and not acct.get("is_deleted"):
-                return ActiveCredentialResponse(
-                    account_id=acct["id"], email=acct["email"]
-                )
-
-    # Layer 3: Email from ~/.claude.json (weakest — can drift independently)
-    claude_config = Path.home() / ".claude.json"
-    if claude_config.exists() and not claude_config.is_symlink():
-        try:
-            config = json.loads(claude_config.read_text(encoding="utf-8"))
-            email = config.get("oauthAccount", {}).get("emailAddress")
-            if email:
-                accounts = db.list_accounts(include_inactive=True)
-                for acct in accounts:
-                    if acct.get("email", "").lower() == email.lower():
-                        return ActiveCredentialResponse(
-                            account_id=acct["id"], email=acct["email"]
-                        )
-        except (json.JSONDecodeError, OSError):
-            pass
+    account, _method = match_credential_to_account(db, cred_data)
+    if account:
+        return ActiveCredentialResponse(
+            account_id=account["id"], email=account["email"]
+        )
 
     return ActiveCredentialResponse()
 
