@@ -89,6 +89,83 @@ def _seed_claude_config(config_dir: Path) -> None:
         logger.debug("Failed to write per-account .claude.json: %s", exc)
 
 
+def _seed_workspace_trust(config_dir: Path) -> None:
+    """Copy workspace trust records from global config into per-account config.
+
+    Unlike _seed_claude_config (which runs once), this runs every launch so
+    newly trusted workspaces propagate to per-account dirs.  Only copies
+    hasTrustDialogAccepted and hasCompletedProjectOnboarding — not allowedTools,
+    MCP servers, or cost data.  Skips project paths that already exist in the
+    per-account config (non-destructive).
+    """
+    claude_json = config_dir / ".claude.json"
+    if claude_json.is_symlink():
+        return
+
+    global_config = Path.home() / ".claude.json"
+    if not global_config.is_file() or global_config.is_symlink():
+        return
+
+    try:
+        source = json.loads(global_config.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    global_projects = source.get("projects") if isinstance(source, dict) else None
+    if not isinstance(global_projects, dict):
+        return
+
+    # Read per-account config
+    local = {}
+    try:
+        local = json.loads(claude_json.read_text(encoding="utf-8"))
+        if not isinstance(local, dict):
+            local = {}
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.debug("Cannot parse per-account .claude.json for trust seeding: %s", exc)
+        return  # Don't clobber a file we can't parse
+
+    local_projects = local.setdefault("projects", {})
+    changed = False
+
+    for path, entry in global_projects.items():
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("hasTrustDialogAccepted"):
+            continue
+        # Don't overwrite existing per-account project entries
+        if path in local_projects:
+            continue
+        minimal = {"hasTrustDialogAccepted": True}
+        if entry.get("hasCompletedProjectOnboarding"):
+            minimal["hasCompletedProjectOnboarding"] = True
+        local_projects[path] = minimal
+        changed = True
+
+    if not changed:
+        return
+
+    # Atomic write
+    fd, tmp = tempfile.mkstemp(
+        dir=str(config_dir), prefix=".claude_json_tmp_", suffix=".json"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(local, f, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        _safe_replace(tmp, str(claude_json))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        logger.debug("Failed to write workspace trust to %s", claude_json)
+
+
 def _build_oauth_data(account: dict) -> dict:
     """Build Claude Code credential format from account dict.
 
@@ -158,6 +235,8 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
 
     # Seed .claude.json from global config to skip first-run setup screens
     _seed_claude_config(config_dir)
+    # Propagate workspace trust (runs every launch, not gated by onboarding)
+    _seed_workspace_trust(config_dir)
 
     cred_path = config_dir / ".credentials.json"
 

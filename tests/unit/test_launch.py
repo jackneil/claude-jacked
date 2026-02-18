@@ -54,6 +54,252 @@ def _make_db(tmp_path: Path) -> Database:
 
 
 # ---------------------------------------------------------------------------
+# _seed_workspace_trust
+# ---------------------------------------------------------------------------
+
+
+class TestSeedWorkspaceTrust:
+    def test_seeds_trust_from_global(self, tmp_path):
+        """Copies trusted projects from global config into per-account config."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text("{}")
+
+        global_config = {
+            "projects": {
+                "/Users/me/trusted-project": {
+                    "hasTrustDialogAccepted": True,
+                    "hasCompletedProjectOnboarding": True,
+                    "allowedTools": ["Bash"],
+                    "lastCost": 42.0,
+                },
+                "/Users/me/untrusted": {
+                    "hasTrustDialogAccepted": False,
+                },
+            }
+        }
+
+        (tmp_path / ".claude.json").write_text(json.dumps(global_config))
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        projects = result.get("projects", {})
+
+        # Trusted project should be seeded with minimal entry
+        assert "/Users/me/trusted-project" in projects
+        entry = projects["/Users/me/trusted-project"]
+        assert entry["hasTrustDialogAccepted"] is True
+        assert entry["hasCompletedProjectOnboarding"] is True
+        # Should NOT copy allowedTools or cost data
+        assert "allowedTools" not in entry
+        assert "lastCost" not in entry
+
+        # Untrusted project should NOT be seeded
+        assert "/Users/me/untrusted" not in projects
+
+    def test_skips_existing_project_entries(self, tmp_path):
+        """Doesn't overwrite per-account project entries that already exist."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+
+        existing_entry = {
+            "hasTrustDialogAccepted": True,
+            "allowedTools": ["Bash", "Read"],
+            "mcpServers": {"myserver": {}},
+            "lastCost": 99.0,
+        }
+        local_config = {"projects": {"/Users/me/project": existing_entry}}
+        (config_dir / ".claude.json").write_text(json.dumps(local_config))
+
+        global_config = {
+            "projects": {
+                "/Users/me/project": {
+                    "hasTrustDialogAccepted": True,
+                    "hasCompletedProjectOnboarding": True,
+                },
+            }
+        }
+        (tmp_path / ".claude.json").write_text(json.dumps(global_config))
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        entry = result["projects"]["/Users/me/project"]
+        # Original entry preserved completely
+        assert entry["allowedTools"] == ["Bash", "Read"]
+        assert entry["mcpServers"] == {"myserver": {}}
+        assert entry["lastCost"] == 99.0
+
+    def test_partial_overlap_seeds_only_new(self, tmp_path):
+        """Seeds project B but skips project A which already exists."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+
+        local_config = {
+            "projects": {
+                "/existing": {"hasTrustDialogAccepted": True, "allowedTools": ["X"]},
+            }
+        }
+        (config_dir / ".claude.json").write_text(json.dumps(local_config))
+
+        global_config = {
+            "projects": {
+                "/existing": {"hasTrustDialogAccepted": True},
+                "/new-project": {
+                    "hasTrustDialogAccepted": True,
+                    "hasCompletedProjectOnboarding": True,
+                },
+            }
+        }
+        (tmp_path / ".claude.json").write_text(json.dumps(global_config))
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        # Existing preserved
+        assert result["projects"]["/existing"]["allowedTools"] == ["X"]
+        # New one seeded
+        assert result["projects"]["/new-project"]["hasTrustDialogAccepted"] is True
+
+    def test_handles_missing_global_config(self, tmp_path):
+        """Gracefully does nothing when global .claude.json doesn't exist."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text("{}")
+
+        from jacked.launch import _seed_workspace_trust
+
+        # No global .claude.json exists at tmp_path
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result == {}
+
+    def test_skips_when_global_is_symlink(self, tmp_path):
+        """Skips seeding when global .claude.json is a symlink."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text("{}")
+
+        real_file = tmp_path / "real_claude.json"
+        real_file.write_text(json.dumps({
+            "projects": {"/proj": {"hasTrustDialogAccepted": True}}
+        }))
+        symlink = tmp_path / ".claude.json"
+        symlink.symlink_to(real_file)
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert "projects" not in result
+
+    def test_skips_when_local_is_symlink(self, tmp_path):
+        """Skips seeding when per-account .claude.json is a symlink."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+
+        real_file = tmp_path / "real_local.json"
+        real_file.write_text("{}")
+        (config_dir / ".claude.json").symlink_to(real_file)
+
+        (tmp_path / ".claude.json").write_text(json.dumps({
+            "projects": {"/proj": {"hasTrustDialogAccepted": True}}
+        }))
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        # Should not have been modified
+        result = json.loads(real_file.read_text())
+        assert "projects" not in result
+
+    def test_omits_onboarding_when_false(self, tmp_path):
+        """Omits hasCompletedProjectOnboarding when false/absent in global."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text("{}")
+
+        global_config = {
+            "projects": {
+                "/proj": {
+                    "hasTrustDialogAccepted": True,
+                    # hasCompletedProjectOnboarding absent
+                },
+            }
+        }
+        (tmp_path / ".claude.json").write_text(json.dumps(global_config))
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        entry = result["projects"]["/proj"]
+        assert entry == {"hasTrustDialogAccepted": True}
+        assert "hasCompletedProjectOnboarding" not in entry
+
+    def test_creates_file_when_local_missing(self, tmp_path):
+        """Creates .claude.json with trust when file doesn't exist yet."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        # No .claude.json created — function should handle FileNotFoundError
+
+        global_config = {
+            "projects": {
+                "/proj": {"hasTrustDialogAccepted": True},
+            }
+        }
+        (tmp_path / ".claude.json").write_text(json.dumps(global_config))
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result["projects"]["/proj"]["hasTrustDialogAccepted"] is True
+
+    def test_skips_malformed_local_config(self, tmp_path):
+        """Returns without clobbering a malformed per-account .claude.json."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        garbage = "not json {{{"
+        (config_dir / ".claude.json").write_text(garbage)
+
+        global_config = {
+            "projects": {
+                "/proj": {"hasTrustDialogAccepted": True},
+            }
+        }
+        (tmp_path / ".claude.json").write_text(json.dumps(global_config))
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        # File should be unchanged — not clobbered
+        assert (config_dir / ".claude.json").read_text() == garbage
+
+
+# ---------------------------------------------------------------------------
 # prepare_account_dir
 # ---------------------------------------------------------------------------
 
