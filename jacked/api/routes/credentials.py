@@ -251,7 +251,7 @@ async def use_account(account_id: int, request: Request):
             os.chmod(tmp_path, 0o600)
         except OSError:
             pass
-        from jacked.api.credential_sync import _safe_replace
+        from jacked.api.credential_helpers import _safe_replace
 
         _safe_replace(tmp_path, str(cred_path))
         try:

@@ -15,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 
 from jacked import __version__
 from jacked.api.credential_sync import (
-    create_missing_credentials_file,
     read_platform_credentials,
     re_stamp_jacked_account_id,
     sync_credential_tokens,
@@ -52,16 +51,11 @@ def _build_allowed_origins(host: str, port: int) -> list[str]:
 
 
 async def _credentials_watch_loop(app: FastAPI):
-    """Watch Claude Code's credential file and keychain for external changes.
+    """Watch credential file, keychain, and per-account dirs for changes.
 
-    Polls file mtime every 3 seconds.  When the mtime changes, broadcasts a
-    ``credentials_changed`` event through the WebSocket registry.
-    Self-writes from the ``/use`` endpoint are suppressed via mtime
-    comparison.  External changes trigger a token sync back to the DB.
-
-    On macOS, also polls the Keychain every ~30s (10 cycles) because Claude Code
-    writes refreshed tokens to Keychain only — the file doesn't change.
-    """
+    Polls file mtime every 3s. Self-writes suppressed via mtime comparison.
+    Also polls macOS Keychain every ~30s and per-account dirs under
+    ~/.claude/accounts/*/."""
     cred_path = Path.home() / ".claude" / ".credentials.json"
     last_mtime: float | None = None
     _last_bootstrap_attempt = 0.0
@@ -79,21 +73,20 @@ async def _credentials_watch_loop(app: FastAPI):
     except OSError:
         pass
 
+    from jacked.api.watchers import bootstrap_credentials_file, scan_account_credential_dirs
+
     # Bootstrap: if file doesn't exist at startup, try to create from keychain/DB
     if last_mtime is None:
         db = getattr(app.state, "db", None)
         if db is not None:
-            try:
-                created_mtime = await asyncio.to_thread(
-                    create_missing_credentials_file, db
-                )
-                if created_mtime is not None:
-                    last_mtime = created_mtime
-                    app.state.cred_last_written_mtime = created_mtime
-                    logger.info("Bootstrapped .credentials.json from keychain/DB")
-            except Exception as exc:
-                logger.debug("Startup credential bootstrap failed: %s", exc)
+            created_mtime = await asyncio.to_thread(bootstrap_credentials_file, db)
+            if created_mtime is not None:
+                last_mtime = created_mtime
+                app.state.cred_last_written_mtime = created_mtime
+                logger.info("Bootstrapped .credentials.json from keychain/DB")
         _last_bootstrap_attempt = time.monotonic()
+
+    account_mtimes: dict[int, float] = {}  # per-account dir tracking
 
     while True:
         await asyncio.sleep(CRED_WATCH_INTERVAL)
@@ -177,6 +170,16 @@ async def _credentials_watch_loop(app: FastAPI):
             except Exception as exc:
                 logger.debug("Keychain poll failed (non-fatal): %s", exc)
 
+        # Per-account credential dirs (jacked claude sessions)
+        db = getattr(app.state, "db", None)
+        if db is not None:
+            try:
+                account_mtimes = await asyncio.to_thread(
+                    scan_account_credential_dirs, db, account_mtimes
+                )
+            except Exception as exc:
+                logger.debug("Per-account scan failed (non-fatal): %s", exc)
+
         if current_mtime is None:
             # File missing (deleted or never existed) — try to recreate
             now = time.monotonic()
@@ -185,17 +188,12 @@ async def _credentials_watch_loop(app: FastAPI):
                 last_mtime = None
                 db = getattr(app.state, "db", None)
                 if db is not None:
-                    try:
-                        created_mtime = await asyncio.to_thread(
-                            create_missing_credentials_file, db
-                        )
-                        if created_mtime is not None:
-                            last_mtime = created_mtime
-                            app.state.cred_last_written_mtime = created_mtime
-                    except Exception as exc:
-                        logger.debug(
-                            "Credential file recreation failed (non-fatal): %s", exc
-                        )
+                    created_mtime = await asyncio.to_thread(
+                        bootstrap_credentials_file, db
+                    )
+                    if created_mtime is not None:
+                        last_mtime = created_mtime
+                        app.state.cred_last_written_mtime = created_mtime
 
 
 async def _token_refresh_loop():

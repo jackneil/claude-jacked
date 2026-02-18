@@ -131,6 +131,42 @@ function bindAccountEvents() {
         btn.addEventListener('click', () => handlePriorityMove(btn.dataset.id, 1));
     });
 
+    // Copy launch command buttons
+    document.querySelectorAll('.btn-copy-cmd').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const cmd = btn.dataset.cmd;
+            try {
+                await navigator.clipboard.writeText(cmd);
+                showToast(`Copied: ${cmd}`, 'success', 2000);
+            } catch {
+                // Fallback for insecure contexts — verify execCommand success
+                const ta = document.createElement('textarea');
+                ta.value = cmd;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                if (ok) {
+                    showToast(`Copied: ${cmd}`, 'success', 2000);
+                } else {
+                    showToast(`Copy failed \u2014 run manually: ${cmd}`, 'warning', 4000);
+                }
+            }
+        });
+    });
+
+    // Dismiss session tip banner
+    const dismissBtn = document.getElementById('btn-dismiss-tip');
+    if (dismissBtn) {
+        dismissBtn.addEventListener('click', () => {
+            localStorage.setItem('jacked_tip_dismissed', '1');
+            const banner = document.getElementById('session-tip-banner');
+            if (banner) banner.remove();
+        });
+    }
+
     // Auto-refresh toggle
     bindAutoRefreshToggle();
 

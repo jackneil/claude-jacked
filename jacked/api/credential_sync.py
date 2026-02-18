@@ -6,7 +6,6 @@ the old (now-dead) tokens.  This module syncs the file back to the DB.
 
 Also provides self-healing helpers:
 - re_stamp_jacked_account_id: re-adds the stamp when Claude Code removes it
-- create_missing_credentials_file: recreates the file from the default account
 
 Matching layer priority (shared across all callers):
   Layer 1:    _jackedAccountId stamp (strongest — user's explicit choice)
@@ -14,7 +13,8 @@ Matching layer priority (shared across all callers):
   Layer 2.5:  Exact refresh_token match (weeks-lived, survives AT rotation)
   Layer 2.75: known_refresh_tokens table (historical RT → account mapping)
   Layer 2.85: Single-account optimization (exactly 1 active OAuth account)
-  Layer 3:    Email from ~/.claude.json (staleness-gated — only if mtime < 10s)
+  Layer 3:    Email from ~/.claude.json (staleness-gated — only if mtime < 60s)
+  Fallback:   Profile API to identify token owner by email (auto-creates if new)
 """
 
 import json
@@ -26,12 +26,18 @@ import tempfile
 import time
 from pathlib import Path
 
+import httpx
+
+from jacked.api.credential_helpers import _safe_replace
+from jacked.web.oauth import OAUTH_BETA_HEADER, ORG_TYPE_MAP, PROFILE_URL
+
 logger = logging.getLogger(__name__)
 
 # Layer 3 freshness gate: only trust ~/.claude.json email if file was
 # modified within this many seconds.  Prevents stale email from a past
 # "Set Active" from contaminating a different account's tokens.
-LAYER3_FRESHNESS_SECONDS = 10
+# SYNC: keep in sync with session_account_tracker.py:73
+LAYER3_FRESHNESS_SECONDS = 60
 
 
 def read_platform_credentials() -> dict | None:
@@ -40,8 +46,7 @@ def read_platform_credentials() -> dict | None:
     macOS: Keychain ("Claude Code-credentials")
     Linux/Windows: not yet needed (still use .credentials.json)
 
-    Returns parsed dict (same shape as .credentials.json) or None.
-    """
+    Returns parsed dict (same shape as .credentials.json) or None."""
     if sys.platform != "darwin":
         return None
     try:
@@ -68,8 +73,7 @@ def write_platform_credentials(data: dict) -> bool:
     Returns True if written successfully, False otherwise.
 
     >>> write_platform_credentials({}) if sys.platform != "darwin" else True
-    True
-    """
+    True"""
     if sys.platform != "darwin":
         return True  # no-op on non-macOS (file write is sufficient)
     try:
@@ -97,9 +101,7 @@ def write_platform_credentials(data: dict) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Shared credential matching
-# ---------------------------------------------------------------------------
+# -- Shared credential matching ------------------------------------------------
 
 
 def match_credential_to_account(
@@ -119,14 +121,12 @@ def match_credential_to_account(
         include_layer3: If False, skip Layer 3 (email). Use for conservative
                        callers like create_missing_credentials_file().
 
-    Returns:
-        (account_dict, match_method) or (None, "none")
+    Returns (account_dict, match_method) or (None, "none").
 
     >>> match_credential_to_account(None, {})
     (None, 'none')
     >>> match_credential_to_account(None, {"claudeAiOauth": {"accessToken": "x"}})
-    (None, 'none')
-    """
+    (None, 'none')"""
     if db is None:
         return None, "none"
 
@@ -197,6 +197,82 @@ def match_credential_to_account(
     return None, "none"
 
 
+# -- Profile API fallback helpers ----------------------------------------------
+
+
+def _fetch_profile(access_token: str) -> dict | None:
+    """Call profile API to get full account+org data. ~200ms, sync.
+
+    Only triggers on unmatched tokens (rare — after /login with stale DB)."""
+    try:
+        resp = httpx.get(
+            PROFILE_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "anthropic-beta": OAUTH_BETA_HEADER,
+            },
+            timeout=5.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        logger.debug("Profile API HTTP %d", resp.status_code)
+    except Exception as exc:
+        logger.debug("Profile API call failed: %s", exc)
+    return None
+
+
+def _create_account_from_profile(db, profile: dict, oauth: dict) -> dict | None:
+    """Auto-create a jacked account from profile API data + credential tokens.
+
+    Same data extraction as oauth.py:_store_account() but triggered by
+    credential sync discovering an unknown account via profile API."""
+    acct_info = profile.get("account", {})
+    org = profile.get("organization", {})
+    email = acct_info.get("email")
+    if not email:
+        return None
+
+    # Map org type to subscription type (same as oauth.py:427)
+    org_type = org.get("organization_type", "")
+    subscription_type = ORG_TYPE_MAP.get(org_type)
+
+    # Parse expiry (credential file stores ms, DB stores seconds)
+    expires_at_ms = oauth.get("expiresAt", 0)
+    expires_at = (
+        int(expires_at_ms // 1000) if expires_at_ms else int(time.time()) + 28800
+    )
+
+    # Build scopes JSON from credential file
+    scopes_json = None
+    raw_scopes = oauth.get("scopes")
+    if raw_scopes and isinstance(raw_scopes, list):
+        scopes_json = json.dumps(raw_scopes)
+
+    account = db.create_account(
+        email=email,
+        access_token=oauth.get("accessToken", ""),
+        refresh_token=oauth.get("refreshToken"),
+        expires_at=expires_at,
+        display_name=acct_info.get("display_name"),
+        scopes=scopes_json,
+        subscription_type=subscription_type,
+        rate_limit_tier=org.get("rate_limit_tier"),
+        has_extra_usage=org.get("has_extra_usage_enabled", False),
+    )
+
+    # Mark valid + record RT for future matching
+    db.update_account(
+        account["id"],
+        validation_status="valid",
+        last_validated_at=int(time.time()),
+    )
+    rt = oauth.get("refreshToken")
+    if rt and hasattr(db, "record_refresh_token"):
+        db.record_refresh_token(rt, account["id"])
+
+    return account
+
+
 # ---------------------------------------------------------------------------
 # Token sync
 # ---------------------------------------------------------------------------
@@ -206,15 +282,14 @@ def sync_credential_tokens(db, cred_data: dict) -> bool:
     """Sync tokens from credential file back to DB.
 
     Uses match_credential_to_account() for layered matching.
-    After matching, records refresh tokens in known_refresh_tokens table.
-
+    Falls back to profile API when all layers fail (identifies token
+    owner by email, auto-creates account if new).
     Returns True if tokens were synced, False otherwise.
 
     >>> sync_credential_tokens(None, {})
     False
     >>> sync_credential_tokens(None, {"claudeAiOauth": {"accessToken": "x"}})
-    False
-    """
+    False"""
     if db is None:
         return False
 
@@ -226,8 +301,38 @@ def sync_credential_tokens(db, cred_data: dict) -> bool:
 
     account, method = match_credential_to_account(db, cred_data)
     if not account:
-        logger.debug("Token sync: no matching account found")
-        return False
+        # All matching layers failed — try profile API to identify token owner
+        profile = _fetch_profile(access_token)
+        if profile:
+            email = profile.get("account", {}).get("email")
+            if email:
+                account = db.get_account_by_email(email)
+                if account and not account.get("is_deleted"):
+                    method = "profile_api"
+                else:
+                    # New account — auto-create from profile + credential data
+                    account = _create_account_from_profile(db, profile, oauth)
+                    if account:
+                        method = "profile_api_created"
+                        logger.info(
+                            "Auto-created account %d (%s) from credential sync",
+                            account["id"],
+                            email,
+                        )
+                        return True  # account already has correct tokens
+                    logger.warning(
+                        "Token sync: failed to create account for %s", email
+                    )
+                    return False
+            else:
+                logger.debug("Token sync: profile API returned no email")
+                return False
+        else:
+            # Profile API failed (network/timeout) — retry next cycle
+            logger.debug(
+                "Token sync: no match and profile API failed, will retry"
+            )
+            return False
 
     # Record refresh tokens for Layer 2.75 future matching
     if hasattr(db, "record_refresh_token"):
@@ -240,11 +345,12 @@ def sync_credential_tokens(db, cred_data: dict) -> bool:
 
     # Only sync if tokens actually changed
     if account.get("access_token") == access_token:
-        # Tokens match — if account was marked invalid, set to "unknown"
-        # so the heal sweep can verify via API call.
-        if account.get("validation_status") == "invalid":
+        # Tokens match — if account is in error/unknown state, mark valid
+        # (token is actively used by Claude Code, so it's valid)
+        if account.get("validation_status") in ("invalid", "unknown"):
             updates = {
-                "validation_status": "unknown",
+                "validation_status": "valid",
+                "last_validated_at": int(time.time()),
                 "consecutive_failures": 0,
                 "last_error": None,
                 "last_error_at": None,
@@ -261,12 +367,14 @@ def sync_credential_tokens(db, cred_data: dict) -> bool:
     expires_at_ms = oauth.get("expiresAt", 0)
     expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
 
-    # Fresh tokens from Claude Code — mark "unknown" (heal sweep will verify)
+    # Fresh tokens from Claude Code — mark valid (actively used by CC)
     updates = {
         "access_token": access_token,
-        "validation_status": "unknown",
+        "validation_status": "valid",
+        "last_validated_at": int(time.time()),
         "consecutive_failures": 0,
         "last_error": None,
+        "last_error_at": None,
     }
     if refresh_token:
         updates["refresh_token"] = refresh_token
@@ -287,34 +395,13 @@ def sync_credential_tokens(db, cred_data: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _safe_replace(src: str, dst: str, *, retries: int = 3, delay: float = 0.1):
-    """os.replace() with retry for Windows PermissionError.
-
-    On Windows, os.replace() can fail if the target file is held open
-    by another process.  Retries with exponential backoff.
-    On macOS/Linux, this is equivalent to a single os.replace() call.
-    """
-    for attempt in range(retries):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if sys.platform != "win32" or attempt == retries - 1:
-                raise
-            time.sleep(delay * (2 ** attempt))
-
-
 def re_stamp_jacked_account_id(db, cred_data: dict, cred_path: Path) -> float | None:
     """Re-add _jackedAccountId stamp if Claude Code removed it.
 
     Called from the credential watcher after sync_credential_tokens().
-    Only writes if the stamp is actually missing (idempotent).
+    Returns mtime of written file, or None if no write was needed.
 
-    Returns the mtime of the written file (for watcher loop suppression),
-    or None if no write was needed.
-
-    >>> re_stamp_jacked_account_id(None, {}, Path("/tmp/fake"))
-    """
+    >>> re_stamp_jacked_account_id(None, {}, Path("/tmp/fake"))"""
     if db is None:
         return None
 
@@ -346,7 +433,7 @@ def re_stamp_jacked_account_id(db, cred_data: dict, cred_path: Path) -> float | 
                 os.chmod(tmp, 0o600)
             except OSError:
                 pass
-            _safe_replace(tmp, str(cred_path))
+            _safe_replace(tmp, str(cred_path))  # from credential_helpers
         except Exception:
             try:
                 os.unlink(tmp)
@@ -365,144 +452,6 @@ def re_stamp_jacked_account_id(db, cred_data: dict, cred_path: Path) -> float | 
 
 
 # ---------------------------------------------------------------------------
-# Credential file helpers
-# ---------------------------------------------------------------------------
-
-
-def _write_credential_file(cred_path: Path, data: dict) -> float:
-    """Write credential data to file atomically with secure permissions.
-
-    Returns mtime of written file. Raises on failure.
-    """
-    if cred_path.is_symlink():
-        raise OSError("Refusing to write through symlink")
-    cred_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        dir=str(cred_path.parent),
-        prefix=".credentials_tmp_",
-        suffix=".json",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        _safe_replace(tmp, str(cred_path))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    return cred_path.stat().st_mtime
-
-
-def create_missing_credentials_file(db) -> float | None:
-    """Recreate .credentials.json from keychain or default account when missing.
-
-    On macOS, tries the Keychain first (has the freshest token).
-    Falls back to creating from the default DB account.
-    Refuses to write through symlinks.
-
-    Uses include_layer3=False for matching since this is a mutating
-    operation at startup — conservative matching only.
-
-    Returns the mtime of the written file (for watcher loop suppression),
-    or None if no write was needed/possible.
-
-    >>> create_missing_credentials_file(None)
-    """
-    if db is None:
-        return None
-
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if cred_path.exists():
-        return None
-
-    # Security: refuse to write through symlinks
-    if cred_path.is_symlink():
-        logger.warning(
-            "Refusing to create .credentials.json — path is a symlink"
-        )
-        return None
-
-    # Try platform keychain first (has the freshest token)
-    keychain_data = read_platform_credentials()
-    if keychain_data:
-        oauth = keychain_data.get("claudeAiOauth", {})
-        access_token = oauth.get("accessToken")
-        if access_token:
-            # Conservative matching: no Layer 3 for mutating startup operation
-            account, _method = match_credential_to_account(
-                db, keychain_data, include_layer3=False
-            )
-            if account:
-                keychain_data["_jackedAccountId"] = account["id"]
-                # Sync fresh token to DB
-                sync_credential_tokens(db, keychain_data)
-            try:
-                mtime = _write_credential_file(cred_path, keychain_data)
-                logger.info(
-                    "Created .credentials.json from keychain (account=%s)",
-                    account["id"] if account else "unknown",
-                )
-                return mtime
-            except Exception as exc:
-                logger.warning("Failed to write keychain creds to file: %s", exc)
-
-    # Fallback: create from DB (existing logic)
-    accounts = db.list_accounts(include_inactive=False)
-    default_account = None
-    for acct in accounts:
-        if not acct.get("is_deleted") and acct.get("access_token"):
-            if default_account is None or acct.get("priority", 999) < default_account.get(
-                "priority", 999
-            ):
-                default_account = acct
-
-    if not default_account:
-        logger.debug("Cannot recreate .credentials.json: no default account found")
-        return None
-
-    # Parse scopes
-    scopes = []
-    raw_scopes = default_account.get("scopes")
-    if raw_scopes:
-        try:
-            parsed = json.loads(raw_scopes)
-            if isinstance(parsed, list):
-                scopes = parsed
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    cred_data = {
-        "_jackedAccountId": default_account["id"],
-        "claudeAiOauth": {
-            "accessToken": default_account["access_token"],
-            "refreshToken": default_account.get("refresh_token"),
-            "expiresAt": (default_account.get("expires_at") or 0) * 1000,
-            "scopes": scopes,
-            "subscriptionType": default_account.get("subscription_type"),
-            "rateLimitTier": default_account.get("rate_limit_tier"),
-        },
-    }
-
-    try:
-        mtime = _write_credential_file(cred_path, cred_data)
-        logger.info(
-            "Created missing .credentials.json for account %d (%s)",
-            default_account["id"],
-            default_account["email"],
-        )
-        return mtime
-    except Exception as exc:
-        logger.warning("Failed to create .credentials.json: %s", exc)
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Active account detection
 # ---------------------------------------------------------------------------
 
@@ -510,14 +459,10 @@ def create_missing_credentials_file(db) -> float | None:
 def detect_active_account(db) -> tuple[int | None, str | None]:
     """Detect the active Claude Code account and its live access token.
 
-    Reads credential file and keychain (macOS), then matches using
-    the shared match_credential_to_account() with all layers.
-
     Returns (account_id, live_access_token) or (None, None).
 
     >>> detect_active_account(None)
-    (None, None)
-    """
+    (None, None)"""
     if db is None:
         return None, None
 

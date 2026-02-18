@@ -5,7 +5,9 @@ usage cache refresh, and account validation.
 """
 
 import json
+import shutil
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Request, status
@@ -380,6 +382,12 @@ async def delete_account(account_id: int, request: Request):
             )
 
     db.delete_account(account_id)
+
+    # Remove per-account credential dir to prevent orphaned files
+    acct_dir = Path.home() / ".claude" / "accounts" / str(account_id)
+    if acct_dir.exists() and acct_dir.is_dir() and not acct_dir.is_symlink():
+        shutil.rmtree(acct_dir, ignore_errors=True)
+
     return {"deleted": True, "account_id": account_id}
 
 
