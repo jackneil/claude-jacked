@@ -60,7 +60,7 @@ def _require_search(command_name: str) -> bool:
     except ImportError:
         console.print(f"[red]Error:[/red] '{command_name}' requires the search extra.")
         console.print("\nInstall it with:")
-        console.print('  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
+        console.print(r'  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
         return False
 
 
@@ -141,7 +141,7 @@ def index(session: Optional[str], repo: Optional[str]):
         else:
             console.print("[red]Error:[/red] 'index' requires the search extra.")
             console.print("\nInstall it with:")
-            console.print('  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
+            console.print(r'  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
             sys.exit(1)
 
     from jacked.indexer import SessionIndexer
@@ -714,7 +714,7 @@ def webux(host: str, port: int, no_browser: bool, reload: bool):
     except ImportError:
         console.print("[red]Error:[/red] webux requires the web extra.")
         console.print("Install it with:")
-        console.print('  [bold]uv tool install "claude-jacked\[web]" --force[/bold]')
+        console.print(r'  [bold]uv tool install "claude-jacked\[web]" --force[/bold]')
         sys.exit(1)
 
     # Propagate host/port to app via env vars (used for dynamic CORS + WebSocket origin checks)
@@ -1788,7 +1788,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             console.print("[yellow][-][/yellow] Stop hook already configured")
     else:
         console.print(
-            "[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)"
+            r"[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)"
         )
 
     # Copy skill file with Python path templating
@@ -2023,12 +2023,12 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     else:
         console.print("\nOptional extras:")
         console.print(
-            '  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
+            r'  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
         )
         console.print(
-            '  uv tool install "claude-jacked\[security]" --force  # Auto-approve safe Bash commands'
+            r'  uv tool install "claude-jacked\[security]" --force  # Auto-approve safe Bash commands'
         )
-        console.print('  uv tool install "claude-jacked\[all]" --force       # Everything')
+        console.print(r'  uv tool install "claude-jacked\[all]" --force       # Everything')
 
 
 @main.command()
@@ -2680,6 +2680,62 @@ def lint_hook_init(repo: str, language: str, force: bool):
                 console.print(f"[green][OK][/green] Project env: {env_path}")
     else:
         console.print(f"[yellow][-][/yellow] {result['reason']}")
+
+
+# ── Launch Claude Code with per-account isolation ────────────────────
+
+
+@main.command(name="claude", context_settings={"ignore_unknown_options": True})
+@click.argument("account", required=False)
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def claude_cmd(account, claude_args):
+    """Launch Claude Code with per-account credential isolation.
+
+    ACCOUNT can be an integer ID or email address. If omitted, uses
+    the currently active account (set via dashboard "Use" button).
+
+    All additional arguments are passed through to claude.
+
+    Examples:
+        jacked claude 2
+        jacked claude alice@test.com
+        jacked claude 2 -p editor
+
+    >>> # CLI command: jacked claude [ACCOUNT] [CLAUDE_ARGS...]
+    """
+    from jacked.launch import launch_claude, prepare_account_dir, resolve_account
+    from jacked.web.database import Database
+
+    db_path = Path.home() / ".claude" / "jacked.db"
+    if not db_path.exists():
+        raise click.ClickException(
+            "jacked database not found. Run 'jacked webux' first to initialize."
+        )
+
+    db = Database(str(db_path))
+    try:
+        # Parse account ref: try int first, else string (email or None)
+        account_ref = None
+        if account is not None:
+            try:
+                account_ref = int(account)
+            except ValueError:
+                account_ref = account
+
+        acct = resolve_account(account_ref, db)
+        config_dir = prepare_account_dir(acct, db)
+        console.print(
+            f"Launching Claude Code as [bold]{acct['email']}[/bold] (account {acct['id']})..."
+        )
+    finally:
+        db.close()
+
+    # Strip leading "claude" if user pasted full `claude --resume ...` after the command
+    if claude_args and claude_args[0] == "claude":
+        claude_args = claude_args[1:]
+
+    # launch_claude replaces the process — db is closed above
+    launch_claude(config_dir, claude_args)
 
 
 # ── Convenience init command ─────────────────────────────────────────

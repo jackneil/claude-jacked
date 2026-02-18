@@ -13,8 +13,8 @@ import time
 from pathlib import Path
 from unittest import mock
 
+from jacked.api.credential_helpers import create_missing_credentials_file
 from jacked.api.credential_sync import (
-    create_missing_credentials_file,
     detect_active_account,
     read_platform_credentials,
     re_stamp_jacked_account_id,
@@ -74,7 +74,7 @@ def test_sync_tokens_via_jacked_account_id():
     """Syncs tokens when _jackedAccountId matches and tokens changed.
 
     Verifies: access_token, refresh_token, expires_at updated,
-    validation_status reset to 'unknown' (heal sweep will verify),
+    validation_status set to 'valid' (token is from active Claude Code session),
     consecutive_failures cleared, last_error cleared.
 
     >>> test_sync_tokens_via_jacked_account_id()
@@ -97,7 +97,7 @@ def test_sync_tokens_via_jacked_account_id():
             assert acct["access_token"] == "new_access_token"
             assert acct["refresh_token"] == "new_refresh_token"
             assert acct["expires_at"] == 1800000000  # converted to seconds
-            assert acct["validation_status"] == "unknown"
+            assert acct["validation_status"] == "valid"
             assert acct["consecutive_failures"] == 0
             assert acct["last_error"] is None
         finally:
@@ -203,7 +203,8 @@ def test_sync_tokens_unchanged_invalid_clears_error():
     """Clears error when tokens match but account is invalid.
 
     If the credential file has the same token as the DB and the account
-    is marked invalid, clear the error and mark 'unknown' for heal sweep.
+    is marked invalid, clear the error and mark 'valid' (token is actively
+    used by Claude Code).
 
     >>> test_sync_tokens_unchanged_invalid_clears_error()
     """
@@ -221,7 +222,7 @@ def test_sync_tokens_unchanged_invalid_clears_error():
             assert result is True
 
             acct = db.get_account(1)
-            assert acct["validation_status"] == "unknown"
+            assert acct["validation_status"] == "valid"
             assert acct["consecutive_failures"] == 0
             assert acct["last_error"] is None
         finally:
@@ -1395,7 +1396,6 @@ def test_use_account_refreshes_near_expiry_token():
 
     >>> test_use_account_refreshes_near_expiry_token()
     """
-    import asyncio
     import time
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
@@ -1822,7 +1822,7 @@ def test_force_resync_assigns_correctly():
             alice = db.get_account(1)
             assert alice["access_token"] == "fresh_from_cc"
             assert alice["refresh_token"] == "fresh_rt_from_cc"
-            assert alice["validation_status"] == "unknown"
+            assert alice["validation_status"] == "valid"
         finally:
             db.close()
 
@@ -1964,7 +1964,7 @@ def test_token_recovery_write_and_apply():
                 alice = db.get_account(1)
                 assert alice["access_token"] == "recovered_at"
                 assert alice["refresh_token"] == "recovered_rt"
-                assert alice["validation_status"] == "unknown"
+                assert alice["validation_status"] == "valid"
 
                 # Recovery file should be deleted
                 assert not recovery_path.exists()
@@ -2008,5 +2008,318 @@ def test_token_recovery_stale_file_ignored():
 
                 # Stale file should be deleted
                 assert not recovery_path.exists()
+        finally:
+            db.close()
+
+
+# ------------------------------------------------------------------
+# Profile API fallback tests
+# ------------------------------------------------------------------
+
+
+def _make_multiaccountdb(tmp_path: Path) -> Database:
+    """Create a test DB with 4 accounts (forces Layer 2.85 to skip).
+
+    >>> import tempfile; from pathlib import Path
+    >>> d = Path(tempfile.mkdtemp())
+    >>> db = _make_multiaccountdb(d)
+    >>> db.get_account(4)['email']
+    'dave@test.com'
+    """
+    db = Database(str(tmp_path / "test.db"))
+    with db._writer() as conn:
+        for i, (email, at, rt) in enumerate(
+            [
+                ("alice@test.com", "alice_at", "alice_rt"),
+                ("bob@test.com", "bob_at", "bob_rt"),
+                ("carol@test.com", "carol_at", "carol_rt"),
+                ("dave@test.com", "dave_at", "dave_rt"),
+            ],
+            start=1,
+        ):
+            conn.execute(
+                """INSERT INTO accounts
+                   (id, email, access_token, refresh_token, expires_at,
+                    is_active, is_deleted, validation_status,
+                    consecutive_failures, last_error)
+                   VALUES (?, ?, ?, ?, 1700000000,
+                           1, 0, 'valid', 0, NULL)""",
+                (i, email, at, rt),
+            )
+    return db
+
+
+def _profile_response(email="alice@test.com", display_name="Alice",
+                      org_type="claude_max", rate_limit_tier="default_claude_max_20x"):
+    """Build a mock profile API response dict."""
+    return {
+        "account": {
+            "uuid": "test-uuid",
+            "full_name": "Test User",
+            "display_name": display_name,
+            "email": email,
+            "has_claude_max": org_type == "claude_max",
+            "has_claude_pro": org_type == "claude_pro",
+        },
+        "organization": {
+            "uuid": "org-uuid",
+            "name": "Test Org",
+            "organization_type": org_type,
+            "rate_limit_tier": rate_limit_tier,
+            "has_extra_usage_enabled": True,
+        },
+    }
+
+
+def test_sync_tokens_profile_api_match():
+    """Profile API fallback matches existing account when all layers fail.
+
+    With 4 accounts and an unknown access token, layers 1-2.85 all miss.
+    Profile API returns alice@test.com -> matches account 1, syncs tokens.
+
+    >>> test_sync_tokens_profile_api_match()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        db = _make_multiaccountdb(tmp_path)
+        try:
+            cred_data = {
+                "claudeAiOauth": {
+                    "accessToken": "brand_new_token",
+                    "refreshToken": "brand_new_refresh",
+                    "expiresAt": 1900000000000,
+                },
+            }
+
+            mock_resp = mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = _profile_response(email="alice@test.com")
+
+            with mock.patch("jacked.api.credential_sync.httpx.get", return_value=mock_resp):
+                result = sync_credential_tokens(db, cred_data)
+
+            assert result is True
+            alice = db.get_account(1)
+            assert alice["access_token"] == "brand_new_token"
+            assert alice["refresh_token"] == "brand_new_refresh"
+            assert alice["validation_status"] == "valid"
+            assert alice["consecutive_failures"] == 0
+            assert alice["last_error"] is None
+        finally:
+            db.close()
+
+
+def test_sync_tokens_profile_api_creates_account():
+    """Profile API auto-creates account when email not in DB.
+
+    After /login with a new account, profile API returns an email that
+    doesn't match any existing account -> auto-creates it.
+
+    >>> test_sync_tokens_profile_api_creates_account()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        db = _make_multiaccountdb(tmp_path)
+        try:
+            cred_data = {
+                "claudeAiOauth": {
+                    "accessToken": "new_user_token",
+                    "refreshToken": "new_user_refresh",
+                    "expiresAt": 1900000000000,
+                    "scopes": ["user:inference", "user:profile"],
+                },
+            }
+
+            mock_resp = mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = _profile_response(
+                email="newuser@example.com",
+                display_name="New User",
+                org_type="claude_pro",
+                rate_limit_tier="default_claude_pro",
+            )
+
+            with mock.patch("jacked.api.credential_sync.httpx.get", return_value=mock_resp):
+                result = sync_credential_tokens(db, cred_data)
+
+            assert result is True
+
+            # Account should exist now
+            new_acct = db.get_account_by_email("newuser@example.com")
+            assert new_acct is not None
+            assert new_acct["access_token"] == "new_user_token"
+            assert new_acct["refresh_token"] == "new_user_refresh"
+            assert new_acct["validation_status"] == "valid"
+            assert new_acct["display_name"] == "New User"
+        finally:
+            db.close()
+
+
+def test_sync_tokens_profile_api_creates_with_org_data():
+    """Auto-created account gets correct subscription_type and rate_limit_tier.
+
+    >>> test_sync_tokens_profile_api_creates_with_org_data()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        db = _make_multiaccountdb(tmp_path)
+        try:
+            cred_data = {
+                "claudeAiOauth": {
+                    "accessToken": "max_user_token",
+                    "refreshToken": "max_user_refresh",
+                    "expiresAt": 1900000000000,
+                },
+            }
+
+            mock_resp = mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = _profile_response(
+                email="maxuser@example.com",
+                org_type="claude_max",
+                rate_limit_tier="default_claude_max_20x",
+            )
+
+            with mock.patch("jacked.api.credential_sync.httpx.get", return_value=mock_resp):
+                result = sync_credential_tokens(db, cred_data)
+
+            assert result is True
+            acct = db.get_account_by_email("maxuser@example.com")
+            assert acct is not None
+            assert acct["subscription_type"] == "max"
+            assert acct["rate_limit_tier"] == "default_claude_max_20x"
+        finally:
+            db.close()
+
+
+def test_sync_tokens_profile_api_timeout():
+    """Profile API timeout returns False (retry next cycle).
+
+    >>> test_sync_tokens_profile_api_timeout()
+    """
+    import httpx as _httpx
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        db = _make_multiaccountdb(tmp_path)
+        try:
+            cred_data = {
+                "claudeAiOauth": {
+                    "accessToken": "timeout_token",
+                    "refreshToken": "timeout_refresh",
+                    "expiresAt": 1900000000000,
+                },
+            }
+
+            with mock.patch(
+                "jacked.api.credential_sync.httpx.get",
+                side_effect=_httpx.TimeoutException("Connection timed out"),
+            ):
+                result = sync_credential_tokens(db, cred_data)
+
+            assert result is False
+
+            # No account should have changed
+            alice = db.get_account(1)
+            assert alice["access_token"] == "alice_at"
+        finally:
+            db.close()
+
+
+def test_sync_tokens_profile_api_401():
+    """Profile API 401 (expired token) returns False.
+
+    >>> test_sync_tokens_profile_api_401()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        db = _make_multiaccountdb(tmp_path)
+        try:
+            cred_data = {
+                "claudeAiOauth": {
+                    "accessToken": "expired_token",
+                    "refreshToken": "expired_refresh",
+                    "expiresAt": 1900000000000,
+                },
+            }
+
+            mock_resp = mock.MagicMock()
+            mock_resp.status_code = 401
+
+            with mock.patch("jacked.api.credential_sync.httpx.get", return_value=mock_resp):
+                result = sync_credential_tokens(db, cred_data)
+
+            assert result is False
+        finally:
+            db.close()
+
+
+def test_sync_tokens_profile_api_network_error():
+    """Profile API network error (ConnectError) returns False.
+
+    >>> test_sync_tokens_profile_api_network_error()
+    """
+    import httpx as _httpx
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        db = _make_multiaccountdb(tmp_path)
+        try:
+            cred_data = {
+                "claudeAiOauth": {
+                    "accessToken": "unreachable_token",
+                    "refreshToken": "unreachable_refresh",
+                    "expiresAt": 1900000000000,
+                },
+            }
+
+            with mock.patch(
+                "jacked.api.credential_sync.httpx.get",
+                side_effect=_httpx.ConnectError("Connection refused"),
+            ):
+                result = sync_credential_tokens(db, cred_data)
+
+            assert result is False
+        finally:
+            db.close()
+
+
+def test_sync_tokens_unknown_status_also_cleared():
+    """Account with validation_status='unknown' and matching token is cleared to 'valid'.
+
+    Verifies the broadened status check (was == 'invalid', now includes 'unknown').
+
+    >>> test_sync_tokens_unknown_status_also_cleared()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        db = Database(str(tmp_path / "test.db"))
+        try:
+            with db._writer() as conn:
+                conn.execute(
+                    """INSERT INTO accounts
+                       (id, email, access_token, refresh_token, expires_at,
+                        is_active, is_deleted, validation_status,
+                        consecutive_failures, last_error)
+                       VALUES (1, 'alice@test.com', 'same_token', 'same_refresh', 1700000000,
+                               1, 0, 'unknown', 2, 'Unknown state')"""
+                )
+
+            cred_data = {
+                "_jackedAccountId": 1,
+                "claudeAiOauth": {
+                    "accessToken": "same_token",
+                    "refreshToken": "same_refresh",
+                    "expiresAt": 1700000000000,
+                },
+            }
+
+            result = sync_credential_tokens(db, cred_data)
+            assert result is True
+
+            alice = db.get_account(1)
+            assert alice["validation_status"] == "valid"
+            assert alice["consecutive_failures"] == 0
+            assert alice["last_error"] is None
         finally:
             db.close()

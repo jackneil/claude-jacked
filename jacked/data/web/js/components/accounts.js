@@ -161,6 +161,13 @@ function renderActionButtons(acct) {
         setActiveHtml = `<button class="btn-set-active text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Set Active</button>`;
     }
 
+    // Copy launch command button
+    const copyCmd = `jacked claude ${acct.id}`;
+    const copyHtml = `<button class="btn-copy-cmd text-xs px-3 py-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded transition-colors" data-cmd="${escapeHtml(copyCmd)}" title="Copy launch command">
+        <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
+        ${escapeHtml(copyCmd)}
+    </button>`;
+
     // Re-auth button (if invalid/expired)
     const showReauth = status === 'invalid' || status === 'expired';
     let reauthHtml = '';
@@ -173,8 +180,9 @@ function renderActionButtons(acct) {
     const toggleClass = acct.is_active ? 'text-yellow-400 hover:text-yellow-300' : 'text-green-400 hover:text-green-300';
 
     return `
-        <div class="flex items-center gap-2 mt-3 pt-3 border-t border-slate-700/50">
+        <div class="flex items-center flex-wrap gap-2 mt-3 pt-3 border-t border-slate-700/50">
             ${setActiveHtml}
+            ${copyHtml}
             <div class="flex-1"></div>
             ${reauthHtml}
             <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition-colors" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
@@ -295,6 +303,23 @@ function renderAccounts(accounts) {
         `;
     }
 
+    // Session isolation tip banner (dismissible via localStorage)
+    let tipHtml = '';
+    if (!localStorage.getItem('jacked_tip_dismissed')) {
+        tipHtml = `
+            <div id="session-tip-banner" class="bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 mb-4 text-sm text-slate-300">
+                <div class="flex items-start justify-between">
+                    <div>
+                        <strong class="text-slate-200">Per-account sessions</strong> &mdash;
+                        Use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch Claude Code with isolated credentials per account.
+                        Supports pass-through args: <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude 2 --resume</code>
+                    </div>
+                    <button id="btn-dismiss-tip" class="text-slate-500 hover:text-slate-300 ml-3 shrink-0 text-lg leading-none" title="Dismiss">&times;</button>
+                </div>
+            </div>
+        `;
+    }
+
     const sorted = [...visible].sort((a, b) => (a.priority || 0) - (b.priority || 0));
     const cardsHtml = sorted.map((acct, idx) => renderAccountCard(acct, idx, sorted.length)).join('');
 
@@ -320,6 +345,7 @@ function renderAccounts(accounts) {
                     </button>
                 </div>
             </div>
+            ${tipHtml}
             ${bannerHtml}
             <div id="oauth-flow-status"></div>
             ${typeof renderSessionControls === 'function' ? renderSessionControls() : ''}

@@ -73,9 +73,11 @@ def force_resync_for_active_account(account_id: int, db) -> bool:
             expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
             updates = {
                 "access_token": at,
-                "validation_status": "unknown",  # heal sweep will verify
+                "validation_status": "valid",
+                "last_validated_at": int(time.time()),
                 "consecutive_failures": 0,
                 "last_error": None,
+                "last_error_at": None,
             }
             if rt:
                 updates["refresh_token"] = rt
@@ -223,9 +225,11 @@ def apply_token_recovery(db) -> bool:
     try:
         updates = {
             "access_token": access_token,
-            "validation_status": "unknown",
+            "validation_status": "valid",
+            "last_validated_at": int(time.time()),
             "consecutive_failures": 0,
             "last_error": None,
+            "last_error_at": None,
         }
         if refresh_token:
             updates["refresh_token"] = refresh_token

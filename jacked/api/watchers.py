@@ -6,9 +6,11 @@ main.py to stay under the 500-line guardrail.
 """
 
 import asyncio
+import json
 import logging
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 from jacked.api.websocket import WebSocketRegistry
@@ -277,3 +279,147 @@ async def process_alive_sweeper_loop(app, interval: int = 60):
                 continue
     except asyncio.CancelledError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Per-account credential dir watcher
+# ---------------------------------------------------------------------------
+
+ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
+
+
+def sync_credential_tokens_direct(db, cred_data: dict, account_id: int) -> bool:
+    """Sync tokens from per-account credential file directly to known account.
+
+    Skips matching layers — account_id is derived from the directory path.
+    Returns True if tokens were updated, False otherwise.
+
+    >>> sync_credential_tokens_direct(None, {}, 1)
+    False
+    """
+    if db is None:
+        return False
+
+    oauth = cred_data.get("claudeAiOauth", {})
+    access_token = oauth.get("accessToken")
+    if not access_token:
+        return False
+
+    account = db.get_account(account_id)
+    if not account or account.get("is_deleted"):
+        return False
+
+    # Record refresh token for Layer 2.75 future matching
+    refresh_token = oauth.get("refreshToken")
+    if hasattr(db, "record_refresh_token") and refresh_token:
+        db.record_refresh_token(refresh_token, account_id)
+
+    # Tokens unchanged — just ensure valid status
+    if account.get("access_token") == access_token:
+        if account.get("validation_status") in ("invalid", "unknown"):
+            db.update_account(
+                account_id,
+                validation_status="valid",
+                last_validated_at=int(time.time()),
+                consecutive_failures=0,
+                last_error=None,
+                last_error_at=None,
+            )
+            return True
+        return False
+
+    # Tokens changed — update DB
+    expires_at_ms = oauth.get("expiresAt", 0)
+    expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
+
+    updates = {
+        "access_token": access_token,
+        "validation_status": "valid",
+        "last_validated_at": int(time.time()),
+        "consecutive_failures": 0,
+        "last_error": None,
+        "last_error_at": None,
+    }
+    if refresh_token:
+        updates["refresh_token"] = refresh_token
+    if expires_at:
+        updates["expires_at"] = expires_at
+
+    db.update_account(account_id, **updates)
+    logger.info("Synced tokens for account %d from per-account dir", account_id)
+    return True
+
+
+def scan_account_credential_dirs(
+    db, account_mtimes: dict[int, float]
+) -> dict[int, float]:
+    """Scan per-account credential dirs and sync changed files.
+
+    Returns updated {account_id: mtime} dict.
+
+    >>> scan_account_credential_dirs(None, {})
+    {}
+    """
+    if db is None or not ACCOUNTS_DIR.exists():
+        return account_mtimes
+
+    updated = dict(account_mtimes)
+
+    try:
+        for cred_file in ACCOUNTS_DIR.glob("*/.credentials.json"):
+            # Validate dir name is a positive integer
+            dir_name = cred_file.parent.name
+            try:
+                account_id = int(dir_name)
+            except ValueError:
+                continue
+            if account_id <= 0:
+                continue
+
+            # Check mtime
+            try:
+                mtime = cred_file.stat().st_mtime
+            except OSError:
+                continue
+
+            if mtime == updated.get(account_id):
+                continue  # Unchanged
+
+            updated[account_id] = mtime
+
+            # Refuse symlinks
+            if cred_file.is_symlink():
+                continue
+
+            try:
+                data = json.loads(cred_file.read_text(encoding="utf-8"))
+                sync_credential_tokens_direct(db, data, account_id)
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.debug(
+                    "Per-account cred sync failed for %d: %s", account_id, exc
+                )
+
+    except OSError as exc:
+        logger.debug("Account dir scan failed: %s", exc)
+
+    return updated
+
+
+def bootstrap_credentials_file(db) -> float | None:
+    """Bootstrap .credentials.json from keychain/DB if missing.
+
+    Extracted from main.py to keep that file under 500 lines.
+    Returns mtime of created file, or None.
+
+    >>> bootstrap_credentials_file(None) is None
+    True
+    """
+    if db is None:
+        return None
+    try:
+        from jacked.api.credential_helpers import create_missing_credentials_file
+
+        return create_missing_credentials_file(db)
+    except Exception as exc:
+        logger.debug("Credential bootstrap failed: %s", exc)
+        return None
