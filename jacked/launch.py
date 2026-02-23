@@ -413,17 +413,19 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
             expires_at_ms = oauth.get("expiresAt", 0)
             expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
 
+            now = datetime.now(timezone.utc).isoformat()
             updates = [
                 "access_token = ?",
                 "validation_status = 'valid'",
                 "consecutive_failures = 0",
                 "last_error = NULL",
+                "updated_at = ?",
             ]
-            params: list = [access_token]
+            params: list = [access_token, now]
             if refresh_token:
                 updates.append("refresh_token = ?")
                 params.append(refresh_token)
-            if expires_at:
+            if expires_at is not None:
                 updates.append("expires_at = ?")
                 params.append(expires_at)
             params.append(account_id)
@@ -481,8 +483,10 @@ def _close_sessions_by_pid(pid: int, db_path: str) -> None:
         logger.debug("Session close by PID failed: %s", exc)
 
 
-def launch_claude(config_dir: Path, claude_args: tuple, db_path: str | None = None):
-    """Launch claude as a subprocess with credential sync.
+def launch_claude(
+    config_dir: Path, claude_args: tuple, db_path: str | None = None
+) -> None:
+    """Launch claude as a subprocess with credential sync.  Always raises SystemExit.
 
     Runs claude with CLAUDE_CONFIG_DIR set. A daemon thread syncs refreshed
     tokens back to DB every 30s. On exit, marks sessions ended by PID.

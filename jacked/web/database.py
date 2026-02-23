@@ -1684,15 +1684,23 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
         with self._reader() as conn:
             cursor = conn.execute(
-                """SELECT session_id,
-                          MAX(COALESCE(last_activity_at, detected_at)) AS last_activity_at,
-                          MIN(detected_at) AS detected_at,
-                          MAX(pid) AS pid
-                   FROM session_accounts
-                   WHERE ended_at IS NULL
-                     AND COALESCE(last_activity_at, detected_at) <= ?
-                   GROUP BY session_id
-                   ORDER BY last_activity_at ASC""",
+                """SELECT s.session_id,
+                          s.last_activity_at,
+                          s.detected_at,
+                          s.pid
+                   FROM session_accounts s
+                   INNER JOIN (
+                       SELECT session_id,
+                              MAX(COALESCE(last_activity_at, detected_at)) AS last_activity_at,
+                              MAX(detected_at) AS max_detected_at
+                       FROM session_accounts
+                       WHERE ended_at IS NULL
+                         AND COALESCE(last_activity_at, detected_at) <= ?
+                       GROUP BY session_id
+                   ) g ON s.session_id = g.session_id
+                      AND s.detected_at = g.max_detected_at
+                   WHERE s.ended_at IS NULL
+                   ORDER BY s.last_activity_at ASC""",
                 (cutoff,),
             )
             return [dict(row) for row in cursor.fetchall()]

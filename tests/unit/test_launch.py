@@ -553,6 +553,79 @@ class TestLaunchClaude:
 
 
 # ---------------------------------------------------------------------------
+# Token sync and PID cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestTokenSync:
+    def test_sync_tokens_from_file_updates_db(self, tmp_path):
+        """_sync_tokens_from_file writes changed tokens to DB."""
+        db = _make_db(tmp_path)
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "new_access",
+                "refreshToken": "new_refresh",
+                "expiresAt": 9999999999000,
+            }
+        }))
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        account = db.get_account(1)
+        assert account["access_token"] == "new_access"
+        assert account["refresh_token"] == "new_refresh"
+        assert account["validation_status"] == "valid"
+
+    def test_sync_tokens_noop_when_unchanged(self, tmp_path):
+        """_sync_tokens_from_file skips write when token hasn't changed."""
+        db = _make_db(tmp_path)
+        original = db.get_account(1)
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "alice_access",  # same as DB
+                "refreshToken": "alice_refresh",
+                "expiresAt": 9999999999000,
+            }
+        }))
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        # Should not have changed anything
+        account = db.get_account(1)
+        assert account["access_token"] == original["access_token"]
+
+    def test_close_sessions_by_pid(self, tmp_path):
+        """_close_sessions_by_pid marks matching open sessions as ended."""
+        db = _make_db(tmp_path)
+        db.record_session_account(
+            "sess-pid1", account_id=1, email="a@b.com", pid=12345
+        )
+        db.record_session_account(
+            "sess-pid2", account_id=1, email="a@b.com", pid=99999
+        )
+
+        from jacked.launch import _close_sessions_by_pid
+
+        _close_sessions_by_pid(12345, str(tmp_path / "test.db"))
+
+        rows1 = db.get_session_accounts("sess-pid1")
+        assert rows1[0]["ended_at"] is not None
+
+        rows2 = db.get_session_accounts("sess-pid2")
+        assert rows2[0]["ended_at"] is None  # different PID, not closed
+
+
+# ---------------------------------------------------------------------------
 # Hook CLAUDE_CONFIG_DIR support
 # ---------------------------------------------------------------------------
 
