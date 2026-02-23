@@ -292,6 +292,11 @@ class OAuthFlow:
             # Step 5: Store in database
             account = self._store_account(tokens, profile, usage)
 
+            # Step 6: Write to all credential stores (file, keychain, config)
+            from jacked.api.credential_helpers import sync_credential_to_all_stores
+
+            sync_credential_to_all_stores(account["id"], account)
+
             return {
                 "account_id": account.get("id"),
                 "email": account.get("email"),
@@ -465,11 +470,6 @@ class OAuthFlow:
             validation_status="valid",
             last_validated_at=int(time.time()),
         )
-
-        # Record initial RT for Layer 2.75 matching
-        rt = tokens.get("refresh_token")
-        if rt and hasattr(self.db, "record_refresh_token"):
-            self.db.record_refresh_token(rt, account["id"])
 
         logger.info(f"Account stored: {email} (id={account['id']})")
         return account

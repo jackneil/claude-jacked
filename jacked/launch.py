@@ -12,13 +12,20 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
+import threading
+import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
-from jacked.api.credential_helpers import _safe_replace
-from jacked.api.credential_sync import write_platform_credentials
+from jacked.api.credential_helpers import (
+    _safe_replace,
+    build_oauth_data,
+    write_platform_credentials,
+)
 from jacked.web.auth import should_refresh
 from jacked.web.database import Database
 
@@ -166,32 +173,54 @@ def _seed_workspace_trust(config_dir: Path) -> None:
         logger.debug("Failed to write workspace trust to %s", claude_json)
 
 
-def _build_oauth_data(account: dict) -> dict:
-    """Build Claude Code credential format from account dict.
+# Shared resources to symlink from global ~/.claude/ into per-account dirs.
+_SHARED_SYMLINKS_FILES = ("settings.json", "CLAUDE.md")
+_SHARED_SYMLINKS_DIRS = ("plugins", "agents", "commands", "skills", "projects")
 
-    Same structure as routes/credentials.py:204-211.
 
-    >>> _build_oauth_data({"access_token": "at", "refresh_token": "rt", "expires_at": 100, "scopes": None, "subscription_type": "max", "rate_limit_tier": "t1"})["accessToken"]
-    'at'
+def _ensure_shared_symlinks(config_dir: Path) -> None:
+    """Symlink shared resources from global ~/.claude/ into per-account dir.
+
+    Skips resources that don't exist globally or already have correct symlinks.
+    On Windows, falls back to directory junctions if symlink fails.
     """
-    scopes = None
-    raw_scopes = account.get("scopes")
-    if raw_scopes:
-        try:
-            parsed = json.loads(raw_scopes)
-            if isinstance(parsed, list):
-                scopes = parsed
-        except (json.JSONDecodeError, TypeError):
-            pass
+    global_dir = Path.home() / ".claude"
 
-    return {
-        "accessToken": account.get("access_token", ""),
-        "refreshToken": account.get("refresh_token"),
-        "expiresAt": account.get("expires_at", 0) * 1000,
-        "scopes": scopes,
-        "subscriptionType": account.get("subscription_type"),
-        "rateLimitTier": account.get("rate_limit_tier"),
-    }
+    for name in _SHARED_SYMLINKS_FILES + _SHARED_SYMLINKS_DIRS:
+        source = global_dir / name
+        target = config_dir / name
+
+        if not source.exists():
+            continue
+
+        # Already a correct symlink — skip
+        if target.is_symlink():
+            try:
+                if target.resolve() == source.resolve():
+                    continue
+            except OSError:
+                pass
+            # Wrong target — remove and recreate
+            target.unlink()
+
+        # Non-symlink file/dir exists (Claude Code created it) — skip
+        if target.exists():
+            continue
+
+        is_dir = source.is_dir()
+        try:
+            os.symlink(source, target, target_is_directory=is_dir)
+        except OSError:
+            if is_dir and os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(target), str(source)],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    logger.warning("Failed to create junction for %s", name)
+            else:
+                logger.warning("Failed to symlink %s (non-fatal)", name)
 
 
 def prepare_account_dir(account: dict, db: Database) -> Path:
@@ -237,6 +266,8 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     _seed_claude_config(config_dir)
     # Propagate workspace trust (runs every launch, not gated by onboarding)
     _seed_workspace_trust(config_dir)
+    # Symlink shared resources (settings, plugins, etc.) from global dir
+    _ensure_shared_symlinks(config_dir)
 
     cred_path = config_dir / ".credentials.json"
 
@@ -256,7 +287,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         except (json.JSONDecodeError, OSError):
             existing = {}
 
-    existing["claudeAiOauth"] = _build_oauth_data(account)
+    existing["claudeAiOauth"] = build_oauth_data(account)
     # No _jackedAccountId stamp — account_id is derived from directory path
 
     # Atomic write
@@ -301,10 +332,15 @@ def resolve_account(account_ref, db: Database) -> dict:
     account = None
 
     if account_ref is None:
-        # No arg — use currently active account from global cred file
-        from jacked.api.credential_sync import detect_active_account
-
-        acct_id, _token = detect_active_account(db)
+        # No arg — read stamp from global credential file
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+        acct_id = None
+        if cred_path.exists() and not cred_path.is_symlink():
+            try:
+                data = json.loads(cred_path.read_text(encoding="utf-8"))
+                acct_id = data.get("_jackedAccountId")
+            except (json.JSONDecodeError, OSError):
+                pass
         if acct_id is not None:
             account = db.get_account(acct_id)
         if not account:
@@ -340,11 +376,140 @@ def resolve_account(account_ref, db: Database) -> dict:
     return account
 
 
-def launch_claude(config_dir: Path, claude_args: tuple):
-    """Replace current process with claude, using isolated config dir.
+def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
+    """Read per-account .credentials.json and sync tokens back to DB.
 
-    >>> # launch_claude replaces the process — tested via mock in test_launch.py
+    Lightweight: uses raw sqlite3 to avoid importing Database class in threads.
+    """
+    cred_path = config_dir / ".credentials.json"
+    try:
+        if not cred_path.exists() or cred_path.is_symlink():
+            return
+        data = json.loads(cred_path.read_text(encoding="utf-8"))
+        oauth = data.get("claudeAiOauth", {})
+        access_token = oauth.get("accessToken")
+        if not access_token:
+            return
+
+        try:
+            account_id = int(config_dir.name)
+        except (ValueError, TypeError):
+            return
+
+        import sqlite3
+
+        conn = sqlite3.connect(db_path, timeout=2.0)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
+
+            row = conn.execute(
+                "SELECT access_token FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+            if row and row[0] == access_token:
+                return  # unchanged
+
+            refresh_token = oauth.get("refreshToken")
+            expires_at_ms = oauth.get("expiresAt", 0)
+            expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
+
+            updates = [
+                "access_token = ?",
+                "validation_status = 'valid'",
+                "consecutive_failures = 0",
+                "last_error = NULL",
+            ]
+            params: list = [access_token]
+            if refresh_token:
+                updates.append("refresh_token = ?")
+                params.append(refresh_token)
+            if expires_at:
+                updates.append("expires_at = ?")
+                params.append(expires_at)
+            params.append(account_id)
+
+            conn.execute(
+                f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            conn.commit()
+            logger.debug("Synced refreshed tokens for account %d", account_id)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Token sync failed (non-fatal): %s", exc)
+
+
+def _token_sync_loop(proc, config_dir: Path, db_path: str) -> None:
+    """Daemon thread: poll credential file and sync changes to DB."""
+    cred_path = config_dir / ".credentials.json"
+    last_mtime = None
+    try:
+        last_mtime = cred_path.stat().st_mtime if cred_path.exists() else None
+    except OSError:
+        pass
+
+    while proc.poll() is None:
+        _time.sleep(30)
+        try:
+            mtime = cred_path.stat().st_mtime if cred_path.exists() else None
+        except OSError:
+            continue
+        if mtime is not None and mtime != last_mtime:
+            last_mtime = mtime
+            _sync_tokens_from_file(config_dir, db_path)
+
+
+def _close_sessions_by_pid(pid: int, db_path: str) -> None:
+    """Mark all open sessions with the given PID as ended."""
+    import sqlite3
+
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(db_path, timeout=2.0)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute(
+                "UPDATE session_accounts SET ended_at = ? WHERE pid = ? AND ended_at IS NULL",
+                (ts, pid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Session close by PID failed: %s", exc)
+
+
+def launch_claude(config_dir: Path, claude_args: tuple, db_path: str | None = None):
+    """Launch claude as a subprocess with credential sync.
+
+    Runs claude with CLAUDE_CONFIG_DIR set. A daemon thread syncs refreshed
+    tokens back to DB every 30s. On exit, marks sessions ended by PID.
+
+    >>> # Tested via test_launch.py with mock subprocess
     """
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
-    os.execvpe("claude", ["claude", *claude_args], env)
+
+    proc = subprocess.Popen(["claude", *claude_args], env=env)
+
+    if db_path:
+        sync_thread = threading.Thread(
+            target=_token_sync_loop, args=(proc, config_dir, db_path), daemon=True
+        )
+        sync_thread.start()
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.terminate()
+
+    if db_path:
+        _sync_tokens_from_file(config_dir, db_path)
+        _close_sessions_by_pid(proc.pid, db_path)
+
+    raise SystemExit(proc.returncode or 0)

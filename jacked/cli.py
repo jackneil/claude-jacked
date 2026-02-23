@@ -2734,8 +2734,7 @@ def claude_cmd(account, claude_args):
     if claude_args and claude_args[0] == "claude":
         claude_args = claude_args[1:]
 
-    # launch_claude replaces the process — db is closed above
-    launch_claude(config_dir, claude_args)
+    launch_claude(config_dir, claude_args, db_path=str(db_path))
 
 
 # ── Convenience init command ─────────────────────────────────────────

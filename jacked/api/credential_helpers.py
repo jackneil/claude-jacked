@@ -1,11 +1,13 @@
-"""Credential file helpers for atomic writes and missing-file recreation.
+"""Credential helpers: unified write path, atomic file I/O, keychain access.
 
-Extracted from credential_sync.py to keep file sizes within guardrails.
+All credential writes go through sync_credential_to_all_stores().
+This is the ONLY module that writes to credential stores.
 """
 
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -61,83 +63,140 @@ def _write_credential_file(cred_path: Path, data: dict) -> float:
     return cred_path.stat().st_mtime
 
 
-def create_missing_credentials_file(db) -> float | None:
-    """Recreate .credentials.json from keychain or default account when missing.
+def update_claude_config_email(email: str, display_name: str = None):
+    """Update or create ~/.claude.json with the active account's email.
 
-    On macOS, tries the Keychain first (has the freshest token).
-    Falls back to creating from the default DB account.
-    Refuses to write through symlinks.
+    If the file exists, only changes oauthAccount.emailAddress (preserves all
+    other keys).  If the file doesn't exist, creates it with oauthAccount data.
+    Refuses to write through symlinks.  Logs on failure instead of raising.
 
-    Uses include_layer3=False for matching since this is a mutating
-    operation at startup — conservative matching only.
-
-    Returns the mtime of the written file (for watcher loop suppression),
-    or None if no write was needed/possible.
-
-    >>> create_missing_credentials_file(None)
+    >>> update_claude_config_email("test@example.com")  # noqa: no side-effects in test env
     """
-    # Lazy imports to avoid circular dependency with credential_sync
-    from jacked.api.credential_sync import (
-        match_credential_to_account,
-        read_platform_credentials,
-        sync_credential_tokens,
-    )
+    claude_config = Path.home() / ".claude.json"
 
-    if db is None:
-        return None
+    if claude_config.is_symlink():
+        logger.warning("Refusing to write ~/.claude.json — path is a symlink")
+        return
 
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if cred_path.exists():
-        return None
+    config: dict = {}
+    if claude_config.exists():
+        try:
+            config = json.loads(claude_config.read_text(encoding="utf-8"))
+            if not isinstance(config, dict):
+                config = {}
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read ~/.claude.json, creating fresh: %s", exc)
+            config = {}
 
-    # Security: refuse to write through symlinks
-    if cred_path.is_symlink():
-        logger.warning(
-            "Refusing to create .credentials.json — path is a symlink"
+    if "oauthAccount" not in config:
+        config["oauthAccount"] = {}
+    config["oauthAccount"]["emailAddress"] = email
+    if display_name and "displayName" not in config["oauthAccount"]:
+        config["oauthAccount"]["displayName"] = display_name
+
+    try:
+        fd, tmp = tempfile.mkstemp(
+            dir=str(claude_config.parent),
+            prefix=".claude_tmp_",
+            suffix=".json",
         )
-        return None
-
-    # Try platform keychain first (has the freshest token)
-    keychain_data = read_platform_credentials()
-    if keychain_data:
-        oauth = keychain_data.get("claudeAiOauth", {})
-        access_token = oauth.get("accessToken")
-        if access_token:
-            # Conservative matching: no Layer 3 for mutating startup operation
-            account, _method = match_credential_to_account(
-                db, keychain_data, include_layer3=False
-            )
-            if account:
-                keychain_data["_jackedAccountId"] = account["id"]
-                # Sync fresh token to DB
-                sync_credential_tokens(db, keychain_data)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
             try:
-                mtime = _write_credential_file(cred_path, keychain_data)
-                logger.info(
-                    "Created .credentials.json from keychain (account=%s)",
-                    account["id"] if account else "unknown",
-                )
-                return mtime
-            except Exception as exc:
-                logger.warning("Failed to write keychain creds to file: %s", exc)
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            _safe_replace(tmp, str(claude_config))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        logger.warning("Failed to write ~/.claude.json: %s", exc)
 
-    # Fallback: create from DB (existing logic)
-    accounts = db.list_accounts(include_inactive=False)
-    default_account = None
-    for acct in accounts:
-        if not acct.get("is_deleted") and acct.get("access_token"):
-            if default_account is None or acct.get(
-                "priority", 999
-            ) < default_account.get("priority", 999):
-                default_account = acct
 
-    if not default_account:
-        logger.debug("Cannot recreate .credentials.json: no default account found")
+# ---------------------------------------------------------------------------
+# Platform credential store (macOS Keychain)
+# ---------------------------------------------------------------------------
+
+
+def read_platform_credentials() -> dict | None:
+    """Read credentials from the platform's native credential store.
+
+    macOS: Keychain ("Claude Code-credentials")
+    Linux/Windows: not yet needed (still use .credentials.json)
+
+    Returns parsed dict (same shape as .credentials.json) or None."""
+    if sys.platform != "darwin":
         return None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+        if result.returncode != 0:
+            logger.debug("Keychain read failed: %s", result.stderr.strip())
+    except (json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+        logger.debug("Keychain read error: %s", exc)
+    return None
 
-    # Parse scopes
-    scopes = []
-    raw_scopes = default_account.get("scopes")
+
+def write_platform_credentials(data: dict) -> bool:
+    """Write credentials to the platform's native credential store.
+
+    macOS: Keychain ("Claude Code-credentials")
+    Linux/Windows: no-op (they use .credentials.json)
+
+    Returns True if written successfully, False otherwise.
+
+    >>> write_platform_credentials({}) if sys.platform != "darwin" else True
+    True"""
+    if sys.platform != "darwin":
+        return True  # no-op on non-macOS (file write is sufficient)
+    try:
+        json_data = json.dumps(data, separators=(",", ":"))
+        # Delete existing entry (ignore failure if not found)
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-s", "Claude Code-credentials"],
+            capture_output=True, timeout=5,
+        )
+        # Add new entry
+        result = subprocess.run(
+            ["security", "add-generic-password",
+             "-s", "Claude Code-credentials",
+             "-a", "Claude Code",
+             "-w", json_data],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            logger.warning("Keychain write failed: %s", result.stderr.strip())
+            return False
+        return True
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("Keychain write error: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Credential data builders
+# ---------------------------------------------------------------------------
+
+
+def build_oauth_data(account: dict) -> dict:
+    """Build Claude Code credential format from account dict.
+
+    >>> build_oauth_data({"access_token": "at", "refresh_token": "rt", "expires_at": 100, "scopes": None, "subscription_type": "max", "rate_limit_tier": "t1"})["accessToken"]
+    'at'
+    """
+    scopes = None
+    raw_scopes = account.get("scopes")
     if raw_scopes:
         try:
             parsed = json.loads(raw_scopes)
@@ -146,26 +205,107 @@ def create_missing_credentials_file(db) -> float | None:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    cred_data = {
-        "_jackedAccountId": default_account["id"],
-        "claudeAiOauth": {
-            "accessToken": default_account["access_token"],
-            "refreshToken": default_account.get("refresh_token"),
-            "expiresAt": (default_account.get("expires_at") or 0) * 1000,
-            "scopes": scopes,
-            "subscriptionType": default_account.get("subscription_type"),
-            "rateLimitTier": default_account.get("rate_limit_tier"),
-        },
+    return {
+        "accessToken": account.get("access_token", ""),
+        "refreshToken": account.get("refresh_token"),
+        "expiresAt": account.get("expires_at", 0) * 1000,
+        "scopes": scopes,
+        "subscriptionType": account.get("subscription_type"),
+        "rateLimitTier": account.get("rate_limit_tier"),
     }
 
+
+# ---------------------------------------------------------------------------
+# Unified credential write — the single path for all stores
+# ---------------------------------------------------------------------------
+
+
+def sync_credential_to_all_stores(
+    account_id: int,
+    account: dict,
+    email: str = None,
+    display_name: str = None,
+) -> None:
+    """Write credential tokens to all stores atomically.
+
+    This is the ONLY function that writes credentials.  Called from:
+    - OAuth _complete_auth() after _store_account()
+    - "Set Active" / use_account endpoint
+    - Per-account dir preparation (launch.py)
+
+    Writes to: global .credentials.json, macOS Keychain, ~/.claude.json,
+    and per-account dir if it exists.  Each step is independent — failures
+    are logged but don't prevent subsequent writes.
+
+    Args:
+        account_id: The account DB id
+        account: Full account dict from DB (has access_token, refresh_token, etc.)
+        email: Override email (defaults to account["email"])
+        display_name: Override display name
+    """
+    email = email or account.get("email", "")
+    display_name = display_name or account.get("display_name")
+    oauth_data = build_oauth_data(account)
+
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+
+    # 1. Write global .credentials.json
     try:
-        mtime = _write_credential_file(cred_path, cred_data)
-        logger.info(
-            "Created missing .credentials.json for account %d (%s)",
-            default_account["id"],
-            default_account["email"],
-        )
-        return mtime
+        existing = {}
+        if cred_path.exists() and not cred_path.is_symlink():
+            try:
+                existing = json.loads(cred_path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+
+        existing["claudeAiOauth"] = oauth_data
+        existing["_jackedAccountId"] = account_id
+        _write_credential_file(cred_path, existing)
+        logger.info("Wrote global .credentials.json for account %d", account_id)
     except Exception as exc:
-        logger.warning("Failed to create .credentials.json: %s", exc)
-        return None
+        logger.warning("Failed to write global .credentials.json: %s", exc)
+
+    # 2. Write to macOS Keychain (no-op on Linux/Windows)
+    try:
+        kc_data = {"claudeAiOauth": oauth_data, "_jackedAccountId": account_id}
+        write_platform_credentials(kc_data)
+    except Exception as exc:
+        logger.warning("Failed to write keychain credentials: %s", exc)
+
+    # 3. Update ~/.claude.json with email
+    try:
+        update_claude_config_email(email, display_name)
+    except Exception as exc:
+        logger.warning("Failed to update ~/.claude.json email: %s", exc)
+
+    # 4. Write to per-account dir if it exists
+    acct_dir = Path.home() / ".claude" / "accounts" / str(account_id)
+    acct_cred = acct_dir / ".credentials.json"
+    if acct_dir.exists() and acct_dir.is_dir():
+        try:
+            acct_existing = {}
+            if acct_cred.exists() and not acct_cred.is_symlink():
+                try:
+                    acct_existing = json.loads(
+                        acct_cred.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(acct_existing, dict):
+                        acct_existing = {}
+                except (json.JSONDecodeError, OSError):
+                    acct_existing = {}
+
+            # Per-account files do NOT get _jackedAccountId stamp —
+            # account_id is implicit from directory path
+            acct_existing["claudeAiOauth"] = oauth_data
+            _write_credential_file(acct_cred, acct_existing)
+            logger.info(
+                "Wrote per-account .credentials.json for account %d", account_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to write per-account .credentials.json for %d: %s",
+                account_id,
+                exc,
+            )

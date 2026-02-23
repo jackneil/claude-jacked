@@ -1,10 +1,12 @@
-"""Auth routes -- account management endpoints.
+"""Auth routes -- account management, credential switching, session queries.
 
 Handles OAuth flow initiation/polling, account CRUD, token refresh,
-usage cache refresh, and account validation.
+usage cache refresh, account validation, credential switching, and
+session-account queries.
 """
 
 import json
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -17,9 +19,12 @@ from pydantic import BaseModel
 from jacked.web.auth import (
     fetch_usage,
     refresh_account_token,
+    should_refresh,
     validate_account,
 )
 from jacked.web.oauth import OAuthFlow, get_flow
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -126,6 +131,16 @@ class BulkUsageRefreshResponse(BaseModel):
     refreshed: int
     failed: int
     results: list[dict] = []
+
+
+class UseAccountResponse(BaseModel):
+    status: str
+    email: str
+
+
+class ActiveCredentialResponse(BaseModel):
+    account_id: Optional[int] = None
+    email: Optional[str] = None
 
 
 # --- Helpers ---
@@ -460,12 +475,7 @@ async def refresh_usage(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    # Use live token for the active Claude Code account (DB token may be stale)
-    from jacked.api.credential_sync import detect_active_account
-
-    active_id, live_token = detect_active_account(db)
-    token_override = live_token if (active_id and account_id == active_id) else None
-    usage_data = await fetch_usage(account_id, db, access_token=token_override)
+    usage_data = await fetch_usage(account_id, db)
 
     if usage_data is None:
         return JSONResponse(
@@ -500,14 +510,8 @@ async def refresh_all_usage(request: Request):
     failed = 0
     results = []
 
-    # Use live token for the active Claude Code account (DB token may be stale)
-    from jacked.api.credential_sync import detect_active_account
-
-    active_id, live_token = detect_active_account(db)
-
     for acct in accounts:
-        token_override = live_token if (active_id and acct["id"] == active_id) else None
-        usage_data = await fetch_usage(acct["id"], db, access_token=token_override)
+        usage_data = await fetch_usage(acct["id"], db)
         if usage_data is not None:
             refreshed += 1
             five_hour = usage_data.get("five_hour", {})
@@ -556,3 +560,179 @@ async def validate_token(account_id: int, request: Request):
         valid=result["valid"],
         error=result.get("error"),
     )
+
+
+# --- Credential switching ---
+
+
+@router.post("/accounts/{account_id}/use", response_model=UseAccountResponse)
+async def use_account(account_id: int, request: Request):
+    """Write account credentials to Claude Code's credential stores.
+
+    Overwrites ~/.claude/.credentials.json, macOS Keychain, and ~/.claude.json
+    so the next Claude Code session starts with this account's tokens.
+    """
+    db = _get_db(request)
+    if db is None:
+        return _db_unavailable()
+
+    account = db.get_account(account_id)
+    if not account:
+        return _not_found(f"No account with id={account_id}")
+
+    if not account["is_active"]:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {"message": "Account is disabled", "code": "ACCOUNT_DISABLED"}
+            },
+        )
+
+    access_token = account.get("access_token", "")
+    if not access_token or not access_token.strip():
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {"message": "Account has no access token", "code": "NO_TOKEN"}
+            },
+        )
+
+    if account.get("validation_status") == "invalid":
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": "Token is invalid — re-authenticate first",
+                    "code": "TOKEN_INVALID",
+                }
+            },
+        )
+
+    # Refresh token if near-expiry before writing
+    if account.get("refresh_token") and should_refresh(account):
+        refreshed = await refresh_account_token(account_id, db)
+        if refreshed:
+            account = db.get_account(account_id)
+            if not account:
+                return _not_found(f"No account with id={account_id}")
+        else:
+            logger.warning(
+                "Token refresh failed for account %d before /use — "
+                "proceeding with current token",
+                account_id,
+            )
+
+    # Write to all credential stores in one call
+    from jacked.api.credential_helpers import sync_credential_to_all_stores
+
+    sync_credential_to_all_stores(account_id, account)
+
+    return UseAccountResponse(status="ok", email=account["email"])
+
+
+@router.get("/active-credential", response_model=ActiveCredentialResponse)
+async def get_active_credential(request: Request):
+    """Read credential file/keychain and match to a jacked account.
+
+    Simple 2-layer matching: stamp, then access_token.
+    """
+    db = _get_db(request)
+    if db is None:
+        return ActiveCredentialResponse()
+
+    from jacked.api.credential_helpers import read_platform_credentials
+
+    # Read credential file
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    cred_data = None
+    if cred_path.exists() and not cred_path.is_symlink():
+        try:
+            cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, AttributeError):
+            pass
+
+    # Fallback: macOS Keychain
+    if cred_data is None or not cred_data.get("claudeAiOauth", {}).get("accessToken"):
+        platform_data = read_platform_credentials()
+        if platform_data:
+            cred_data = platform_data
+
+    if not cred_data:
+        return ActiveCredentialResponse()
+
+    # Layer 1: _jackedAccountId stamp
+    jacked_id = cred_data.get("_jackedAccountId")
+    if jacked_id is not None:
+        account = db.get_account(jacked_id)
+        if account and not account.get("is_deleted"):
+            return ActiveCredentialResponse(
+                account_id=account["id"], email=account["email"]
+            )
+
+    # Layer 2: Exact access_token match
+    access_token = cred_data.get("claudeAiOauth", {}).get("accessToken")
+    if access_token:
+        accounts = db.list_accounts(include_inactive=True)
+        for acct in accounts:
+            if acct.get("access_token") == access_token and not acct.get("is_deleted"):
+                return ActiveCredentialResponse(
+                    account_id=acct["id"], email=acct["email"]
+                )
+
+    return ActiveCredentialResponse()
+
+
+# --- Session queries ---
+
+
+@router.get("/session-account")
+async def get_session_account(request: Request, session_id: str = ""):
+    """Get account records for a specific session."""
+    db = _get_db(request)
+    if db is None or not session_id:
+        return {"records": []}
+    if len(session_id) < 36:
+        return {"records": db.lookup_session_by_suffix(session_id)}
+    return {"records": db.get_session_accounts(session_id)}
+
+
+@router.get("/accounts/{account_id}/sessions")
+async def get_account_sessions(request: Request, account_id: int, limit: int = 50):
+    """Get recent sessions that used a given account."""
+    db = _get_db(request)
+    if db is None:
+        return {"sessions": []}
+    return {"sessions": db.get_account_sessions(account_id, limit=min(limit, 200))}
+
+
+@router.get("/active-sessions")
+async def get_active_sessions(request: Request, staleness: int = 60):
+    """Get all currently active sessions, grouped by account_id."""
+    db = _get_db(request)
+    if db is None:
+        return {"sessions": {}}
+
+    rows = db.get_active_sessions(staleness_minutes=staleness)
+
+    grouped: dict = {}
+    for row in rows:
+        acct_id = row.get("account_id")
+        if acct_id is None:
+            continue
+        key = str(acct_id)
+        if key not in grouped:
+            grouped[key] = []
+        sid = row.get("session_id", "")
+        grouped[key].append(
+            {
+                "repo_path": row.get("repo_path"),
+                "detected_at": row.get("detected_at"),
+                "last_activity_at": row.get("last_activity_at", ""),
+                "session_id": sid[-8:] if sid else "",
+                "is_subagent": bool(row.get("is_subagent")),
+                "parent_session_id": row.get("parent_session_id", ""),
+                "agent_type": row.get("agent_type", ""),
+            }
+        )
+
+    return {"sessions": grouped}

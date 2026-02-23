@@ -1,9 +1,10 @@
 """SQLite database layer for jacked web dashboard.
 
-9 tables across three concerns:
+10 tables across three concerns:
 - Account management: accounts, installations, settings
 - Analytics: gatekeeper_decisions, command_usage, agent_invocations,
              hook_executions, lessons, version_checks
+- Session tracking: session_accounts
 
 WAL mode for concurrent reads, single writer lock for atomic writes.
 """
@@ -320,17 +321,10 @@ CREATE TABLE IF NOT EXISTS session_accounts (
     is_subagent BOOLEAN DEFAULT 0,
     parent_session_id TEXT,
     agent_type TEXT,
+    pid INTEGER,
     UNIQUE(session_id, detected_at)
 );
 
--- Refresh token history: maps every RT ever seen to its account.
--- Used for Layer 2.75 matching when current DB RT doesn't match
--- (e.g., after token rotation by Claude Code).
-CREATE TABLE IF NOT EXISTS known_refresh_tokens (
-    refresh_token TEXT PRIMARY KEY,
-    account_id INTEGER NOT NULL,
-    seen_at INTEGER NOT NULL
-);
 """
 
 INDEXES_SQL = """
@@ -352,7 +346,6 @@ CREATE INDEX IF NOT EXISTS idx_hook_executions_repo ON hook_executions(repo_path
 CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_account ON session_accounts(account_id);
 CREATE INDEX IF NOT EXISTS idx_sa_active ON session_accounts(ended_at, last_activity_at, detected_at);
-CREATE INDEX IF NOT EXISTS idx_krt_account ON known_refresh_tokens(account_id);
 """
 
 
@@ -451,6 +444,7 @@ class Database:
                 ("is_subagent", "BOOLEAN DEFAULT 0"),
                 ("parent_session_id", "TEXT"),
                 ("agent_type", "TEXT"),
+                ("pid", "INTEGER"),
             ]:
                 if col_name not in cols:
                     try:
@@ -470,15 +464,9 @@ class Database:
                 )
             except sqlite3.OperationalError:
                 pass
-            # Migration: seed known_refresh_tokens from existing accounts
+            # Migration: drop known_refresh_tokens (no longer needed)
             try:
-                conn.execute(
-                    """INSERT OR IGNORE INTO known_refresh_tokens
-                       (refresh_token, account_id, seen_at)
-                       SELECT refresh_token, id, CAST(strftime('%s','now') AS INTEGER)
-                       FROM accounts
-                       WHERE refresh_token IS NOT NULL AND is_deleted = 0"""
-                )
+                conn.execute("DROP TABLE IF EXISTS known_refresh_tokens")
             except sqlite3.OperationalError:
                 pass
             # Cleanup: end duplicate open session-account records.
@@ -872,79 +860,6 @@ class Database:
                 (now, int(time.time()), now, account_id),
             )
             return cursor.rowcount > 0
-
-    # ==================================================================
-    # Known Refresh Tokens
-    # ==================================================================
-
-    def record_refresh_token(self, refresh_token: str, account_id: int):
-        """Record a refresh_token → account_id mapping for Layer 2.75 matching.
-
-        Called whenever we see a refresh token: after sync, after refresh,
-        after OAuth flow, after /use endpoint.  INSERT OR REPLACE so the
-        latest account_id wins if the same RT is reused (shouldn't happen,
-        but handles edge cases).
-
-        >>> db = Database(":memory:")
-        >>> acct = db.create_account("u@t.com", "tok", 9999999999, refresh_token="rt1")
-        >>> db.record_refresh_token("rt1", acct["id"])
-        >>> db.lookup_refresh_token("rt1") == acct["id"]
-        True
-        """
-        if not refresh_token:
-            return
-        with self._writer() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO known_refresh_tokens
-                   (refresh_token, account_id, seen_at) VALUES (?, ?, ?)""",
-                (refresh_token, account_id, int(time.time())),
-            )
-
-    def lookup_refresh_token(self, refresh_token: str) -> int | None:
-        """Look up account_id for a known refresh_token (Layer 2.75).
-
-        Returns account_id or None if the RT has never been recorded.
-
-        >>> db = Database(":memory:")
-        >>> db.lookup_refresh_token("nonexistent") is None
-        True
-        """
-        if not refresh_token:
-            return None
-        with self._reader() as conn:
-            row = conn.execute(
-                "SELECT account_id FROM known_refresh_tokens WHERE refresh_token = ?",
-                (refresh_token,),
-            ).fetchone()
-            return row[0] if row else None
-
-    def prune_old_refresh_tokens(self, max_age_days: int = 30):
-        """Remove entries older than max_age_days + enforce count cap (10k).
-
-        Called at startup and periodically by background loop.
-
-        >>> db = Database(":memory:")
-        >>> db.prune_old_refresh_tokens()
-        """
-        cutoff = int(time.time()) - (max_age_days * 86400)
-        with self._writer() as conn:
-            conn.execute(
-                "DELETE FROM known_refresh_tokens WHERE seen_at < ?", (cutoff,)
-            )
-            # Safety net: cap at 10k entries to prevent unbounded growth
-            count = conn.execute(
-                "SELECT COUNT(*) FROM known_refresh_tokens"
-            ).fetchone()[0]
-            if count > 10000:
-                conn.execute(
-                    """DELETE FROM known_refresh_tokens
-                       WHERE rowid IN (
-                           SELECT rowid FROM known_refresh_tokens
-                           ORDER BY seen_at ASC
-                           LIMIT ?
-                       )""",
-                    (count - 10000,),
-                )
 
     # ==================================================================
     # Installation CRUD
@@ -1564,6 +1479,7 @@ class Database:
         email: Optional[str] = None,
         detection_method: Optional[str] = None,
         repo_path: Optional[str] = None,
+        pid: Optional[int] = None,
     ) -> int:
         """Record which account a session is using.
 
@@ -1620,9 +1536,9 @@ class Database:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO session_accounts
                    (session_id, account_id, email, detected_at, last_activity_at,
-                    detection_method, repo_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (session_id, account_id, email, ts, ts, detection_method, repo_path),
+                    detection_method, repo_path, pid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, account_id, email, ts, ts, detection_method, repo_path, pid),
             )
             return cursor.lastrowid or 0
 
@@ -1685,7 +1601,7 @@ class Database:
         with self._reader() as conn:
             cursor = conn.execute(
                 """SELECT id, session_id, account_id, email, detected_at,
-                          ended_at, detection_method, repo_path
+                          ended_at, detection_method, repo_path, pid
                    FROM session_accounts
                    WHERE session_id = ?
                    ORDER BY detected_at DESC""",
@@ -1770,7 +1686,8 @@ class Database:
             cursor = conn.execute(
                 """SELECT session_id,
                           MAX(COALESCE(last_activity_at, detected_at)) AS last_activity_at,
-                          MIN(detected_at) AS detected_at
+                          MIN(detected_at) AS detected_at,
+                          MAX(pid) AS pid
                    FROM session_accounts
                    WHERE ended_at IS NULL
                      AND COALESCE(last_activity_at, detected_at) <= ?

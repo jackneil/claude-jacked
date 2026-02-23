@@ -1,16 +1,14 @@
 """Background watcher loops for the jacked dashboard.
 
 These async loops poll SQLite tables for changes and broadcast
-notifications through the WebSocket registry.  Extracted from
-main.py to stay under the 500-line guardrail.
+notifications through the WebSocket registry.
 """
 
 import asyncio
-import json
 import logging
+import os
 import sqlite3
 import subprocess
-import time
 from pathlib import Path
 
 from jacked.api.websocket import WebSocketRegistry
@@ -27,10 +25,7 @@ async def session_accounts_watch_loop(app, interval: int = 3):
     differ from cached values.
 
     Also forces a periodic broadcast every ~60s (20 cycles) to handle
-    time-based session expiry.  Heartbeat writes change data_version but
-    the secondary MAX(detected_at)/MAX(ended_at) check filters them out
-    (heartbeats only touch last_activity_at).  The periodic broadcast
-    ensures the dashboard re-evaluates the 60-minute read-side filter.
+    time-based session expiry.
 
     >>> # Verified via integration test
     """
@@ -220,16 +215,32 @@ def _any_claude_process_alive() -> bool:
         return False
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is alive.
+
+    >>> _is_pid_alive(1)  # init/launchd is always alive
+    True
+    >>> _is_pid_alive(999999999)
+    False
+    """
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0 = check existence, don't kill
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists but we can't signal it
+    except OSError:
+        return False
+
+
 async def process_alive_sweeper_loop(app, interval: int = 60):
-    """Resurrect stale sessions if Claude processes are still alive.
+    """Close sessions whose Claude process has exited.
 
-    Runs every ``interval`` seconds (default 60).  Uses a coarse strategy:
-    if ANY Claude process is running, bump ALL stale sessions.  This avoids
-    the problem where fresh sessions (started without ``--resume``) have no
-    session ID in their process arguments.
-
-    If no Claude processes are alive and sessions are stale for more than
-    DEAD_SESSION_HOURS (4h), auto-close them.
+    For sessions with a PID: check that specific PID.
+    For sessions without a PID: fall back to old "any claude running?" heuristic.
 
     >>> # Verified via integration test
     """
@@ -241,31 +252,49 @@ async def process_alive_sweeper_loop(app, interval: int = 60):
         while True:
             await asyncio.sleep(interval)
             try:
-                # 1. Check for stale sessions
                 stale = await asyncio.to_thread(db_obj.get_stale_open_sessions)
                 if not stale:
                     continue
 
-                # 2. Are any Claude processes alive?
-                alive = await asyncio.to_thread(_any_claude_process_alive)
                 changed = False
 
-                if alive:
-                    # Bump all stale sessions — at least one process is running
-                    count = await asyncio.to_thread(db_obj.bump_all_stale_sessions)
-                    if count > 0:
+                # Split into PID-tracked and non-PID sessions
+                pid_sessions = [s for s in stale if s.get("pid")]
+                no_pid_sessions = [s for s in stale if not s.get("pid")]
+
+                # PID-tracked: check each individually
+                for sess in pid_sessions:
+                    pid = sess["pid"]
+                    alive = await asyncio.to_thread(_is_pid_alive, pid)
+                    if alive:
+                        await asyncio.to_thread(
+                            db_obj.heartbeat_session, sess["session_id"]
+                        )
+                        changed = True
+                    else:
+                        await asyncio.to_thread(
+                            db_obj.end_session_account, sess["session_id"]
+                        )
                         changed = True
                         logger.info(
-                            "Process sweeper: bumped %d stale session(s)", count
+                            "Sweeper: closed session %s (PID %d dead)",
+                            sess["session_id"][-8:],
+                            pid,
                         )
-                else:
-                    # No Claude processes — close sessions stale > DEAD_SESSION_HOURS
-                    count = await asyncio.to_thread(db_obj.close_dead_sessions)
-                    if count > 0:
-                        changed = True
-                        logger.info(
-                            "Process sweeper: closed %d dead session(s)", count
+
+                # Non-PID: old heuristic fallback
+                if no_pid_sessions:
+                    alive = await asyncio.to_thread(_any_claude_process_alive)
+                    if alive:
+                        count = await asyncio.to_thread(
+                            db_obj.bump_all_stale_sessions
                         )
+                        if count > 0:
+                            changed = True
+                    else:
+                        count = await asyncio.to_thread(db_obj.close_dead_sessions)
+                        if count > 0:
+                            changed = True
 
                 if changed:
                     registry = getattr(app.state, "ws_registry", None)
@@ -279,147 +308,3 @@ async def process_alive_sweeper_loop(app, interval: int = 60):
                 continue
     except asyncio.CancelledError:
         pass
-
-
-# ---------------------------------------------------------------------------
-# Per-account credential dir watcher
-# ---------------------------------------------------------------------------
-
-ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
-
-
-def sync_credential_tokens_direct(db, cred_data: dict, account_id: int) -> bool:
-    """Sync tokens from per-account credential file directly to known account.
-
-    Skips matching layers — account_id is derived from the directory path.
-    Returns True if tokens were updated, False otherwise.
-
-    >>> sync_credential_tokens_direct(None, {}, 1)
-    False
-    """
-    if db is None:
-        return False
-
-    oauth = cred_data.get("claudeAiOauth", {})
-    access_token = oauth.get("accessToken")
-    if not access_token:
-        return False
-
-    account = db.get_account(account_id)
-    if not account or account.get("is_deleted"):
-        return False
-
-    # Record refresh token for Layer 2.75 future matching
-    refresh_token = oauth.get("refreshToken")
-    if hasattr(db, "record_refresh_token") and refresh_token:
-        db.record_refresh_token(refresh_token, account_id)
-
-    # Tokens unchanged — just ensure valid status
-    if account.get("access_token") == access_token:
-        if account.get("validation_status") in ("invalid", "unknown"):
-            db.update_account(
-                account_id,
-                validation_status="valid",
-                last_validated_at=int(time.time()),
-                consecutive_failures=0,
-                last_error=None,
-                last_error_at=None,
-            )
-            return True
-        return False
-
-    # Tokens changed — update DB
-    expires_at_ms = oauth.get("expiresAt", 0)
-    expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
-
-    updates = {
-        "access_token": access_token,
-        "validation_status": "valid",
-        "last_validated_at": int(time.time()),
-        "consecutive_failures": 0,
-        "last_error": None,
-        "last_error_at": None,
-    }
-    if refresh_token:
-        updates["refresh_token"] = refresh_token
-    if expires_at:
-        updates["expires_at"] = expires_at
-
-    db.update_account(account_id, **updates)
-    logger.info("Synced tokens for account %d from per-account dir", account_id)
-    return True
-
-
-def scan_account_credential_dirs(
-    db, account_mtimes: dict[int, float]
-) -> dict[int, float]:
-    """Scan per-account credential dirs and sync changed files.
-
-    Returns updated {account_id: mtime} dict.
-
-    >>> scan_account_credential_dirs(None, {})
-    {}
-    """
-    if db is None or not ACCOUNTS_DIR.exists():
-        return account_mtimes
-
-    updated = dict(account_mtimes)
-
-    try:
-        for cred_file in ACCOUNTS_DIR.glob("*/.credentials.json"):
-            # Validate dir name is a positive integer
-            dir_name = cred_file.parent.name
-            try:
-                account_id = int(dir_name)
-            except ValueError:
-                continue
-            if account_id <= 0:
-                continue
-
-            # Check mtime
-            try:
-                mtime = cred_file.stat().st_mtime
-            except OSError:
-                continue
-
-            if mtime == updated.get(account_id):
-                continue  # Unchanged
-
-            updated[account_id] = mtime
-
-            # Refuse symlinks
-            if cred_file.is_symlink():
-                continue
-
-            try:
-                data = json.loads(cred_file.read_text(encoding="utf-8"))
-                sync_credential_tokens_direct(db, data, account_id)
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.debug(
-                    "Per-account cred sync failed for %d: %s", account_id, exc
-                )
-
-    except OSError as exc:
-        logger.debug("Account dir scan failed: %s", exc)
-
-    return updated
-
-
-def bootstrap_credentials_file(db) -> float | None:
-    """Bootstrap .credentials.json from keychain/DB if missing.
-
-    Extracted from main.py to keep that file under 500 lines.
-    Returns mtime of created file, or None.
-
-    >>> bootstrap_credentials_file(None) is None
-    True
-    """
-    if db is None:
-        return None
-    try:
-        from jacked.api.credential_helpers import create_missing_credentials_file
-
-        return create_missing_credentials_file(db)
-    except Exception as exc:
-        logger.debug("Credential bootstrap failed: %s", exc)
-        return None

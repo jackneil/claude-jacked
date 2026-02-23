@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Session-account tracker hook for Claude Code.
 
-Handles: SessionStart, Notification(auth_success), SessionEnd, Stop,
-UserPromptSubmit.  Reads credentials to identify the active token, then
-matches against jacked's accounts DB.  Fire-and-forget via daemon thread.
+Handles four hook events:
+  - SessionStart: Record which account this session is using
+  - Notification(auth_success): User re-authenticated — close old, record new
+  - SessionEnd: Mark the session-account record as ended
+  - Stop: Heartbeat — update last_activity_at (throttled to every 5 min)
+
+Reads ~/.claude/.credentials.json to identify the active token, then
+matches it against jacked's accounts DB to find the account.
+
+Fire-and-forget: writes happen in a daemon thread so the hook returns
+quickly and never blocks Claude Code.
 """
 
 import json
 import os
-import re
 import sqlite3
 import sys
 import threading
@@ -19,64 +26,48 @@ from pathlib import Path
 DB_PATH = Path.home() / ".claude" / "jacked.db"
 CRED_PATH = Path.home() / ".claude" / ".credentials.json"
 ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
-_ACCOUNT_DIR_RE = re.compile(r"/accounts/(\d+)/?$")
 
 
 def _get_cred_data() -> tuple[str | None, dict | None]:
     """Read the credential file, return (access_token, full_data).
 
-    Checks CLAUDE_CONFIG_DIR first (set by ``jacked claude``), then global
-    file, then macOS Keychain fallback.
+    Checks CLAUDE_CONFIG_DIR first (per-account dirs), then global.
 
     >>> token, data = _get_cred_data()
     >>> token is None or isinstance(token, str)
     True
     """
-    # Per-account dir set by ``jacked claude`` — read from there first
+    # Per-account dir: CLAUDE_CONFIG_DIR is set by jacked claude <id>
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if config_dir:
-        cred_path = Path(config_dir) / ".credentials.json"
-        if cred_path.exists() and not cred_path.is_symlink():
-            try:
-                data = json.loads(cred_path.read_text(encoding="utf-8"))
-                token = data.get("claudeAiOauth", {}).get("accessToken")
-                return token, data
-            except (json.JSONDecodeError, OSError):
-                pass
-
-    # Global file (works on Linux, Windows, and macOS if jacked created it)
-    try:
-        if CRED_PATH.exists():
-            data = json.loads(CRED_PATH.read_text(encoding="utf-8"))
-            token = data.get("claudeAiOauth", {}).get("accessToken")
-            return token, data
-    except (json.JSONDecodeError, OSError, AttributeError):
-        pass
-
-    # Fallback: macOS Keychain (Claude Code stores creds here on Mac)
-    if sys.platform == "darwin":
+        config_cred = Path(config_dir) / ".credentials.json"
         try:
-            import subprocess
-            result = subprocess.run(
-                ["security", "find-generic-password",
-                 "-s", "Claude Code-credentials", "-w"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                data = json.loads(result.stdout.strip())
+            if config_cred.exists() and not config_cred.is_symlink():
+                data = json.loads(config_cred.read_text(encoding="utf-8"))
                 token = data.get("claudeAiOauth", {}).get("accessToken")
-                return token, data
-        except (json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
-            print(f"[jacked] keychain read failed: {exc}", file=sys.stderr)
+                if token:
+                    # Derive account_id from directory path
+                    try:
+                        acct_id = int(Path(config_dir).name)
+                        data["_jackedAccountId"] = acct_id
+                    except (ValueError, TypeError):
+                        pass
+                    return token, data
+        except (json.JSONDecodeError, OSError, AttributeError):
+            pass
 
-    return None, None
+    # Global credential file
+    try:
+        if not CRED_PATH.exists():
+            return None, None
+        data = json.loads(CRED_PATH.read_text(encoding="utf-8"))
+        token = data.get("claudeAiOauth", {}).get("accessToken")
+        return token, data
+    except (json.JSONDecodeError, OSError, AttributeError):
+        return None, None
 
 
 CLAUDE_CONFIG = Path.home() / ".claude.json"
-
-
-# SYNC: keep in sync with credential_sync.py:40
-LAYER3_FRESHNESS_SECONDS = 60
 
 
 def _match_token_to_account(
@@ -85,10 +76,9 @@ def _match_token_to_account(
 ) -> tuple[int | None, str | None]:
     """Match the active account using layered matching.
 
-    If CLAUDE_CONFIG_DIR points to ~/.claude/accounts/<id>/, returns that
-    account directly (no matching layers needed — path is authoritative).
-
-    Otherwise uses layered matching (see credential_sync.py for full docs).
+    Layer 1: Read ~/.claude.json email, case-insensitive match against DB.
+    Layer 2: Check _jackedAccountId in credential data (passed from caller).
+    Layer 3: Exact access_token match (fallback).
 
     Returns (account_id, email) or (None, None) if no match.
 
@@ -98,33 +88,30 @@ def _match_token_to_account(
     if not DB_PATH.exists():
         return None, None
 
-    # Path-based shortcut: CLAUDE_CONFIG_DIR → account_id from directory name
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    m = _ACCOUNT_DIR_RE.search(config_dir) if config_dir else None
-    if m:
-        acct_id = int(m.group(1))
-        if acct_id > 0:
-            try:
-                conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
-                try:
-                    row = conn.execute(
-                        "SELECT id, email FROM accounts WHERE id = ? AND is_deleted = 0",
-                        (acct_id,),
-                    ).fetchone()
-                    if row:
-                        return row[0], row[1]
-                finally:
-                    conn.close()
-            except Exception:
-                pass
-
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout = 5000")
 
-            # Layer 1: _jackedAccountId stamp (strongest — user's explicit choice)
+            # Layer 1: Read ~/.claude.json for email identity
+            if CLAUDE_CONFIG.exists() and not CLAUDE_CONFIG.is_symlink():
+                try:
+                    config = json.loads(CLAUDE_CONFIG.read_text(encoding="utf-8"))
+                    email = config.get("oauthAccount", {}).get("emailAddress")
+                    if email:
+                        row = conn.execute(
+                            "SELECT id, email FROM accounts "
+                            "WHERE LOWER(email) = LOWER(?) AND is_deleted = 0 "
+                            "ORDER BY priority ASC, id ASC LIMIT 1",
+                            (email,),
+                        ).fetchone()
+                        if row:
+                            return row[0], row[1]
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # Layer 2: Check _jackedAccountId (reuses cred_data from caller)
             if cred_data is not None:
                 jacked_id = cred_data.get("_jackedAccountId")
                 if jacked_id is not None:
@@ -135,7 +122,7 @@ def _match_token_to_account(
                     if row:
                         return row[0], row[1]
 
-            # Layer 2: Exact access_token match (cryptographically unique)
+            # Layer 3: Exact access_token match (fallback)
             if token:
                 row = conn.execute(
                     "SELECT id, email FROM accounts WHERE access_token = ? AND is_deleted = 0",
@@ -143,70 +130,6 @@ def _match_token_to_account(
                 ).fetchone()
                 if row:
                     return row[0], row[1]
-
-            # Layer 2.5: Exact refresh_token match (current DB RT)
-            if cred_data is not None:
-                cred_rt = cred_data.get("claudeAiOauth", {}).get("refreshToken")
-                if cred_rt:
-                    row = conn.execute(
-                        "SELECT id, email FROM accounts WHERE refresh_token = ? AND is_deleted = 0",
-                        (cred_rt,),
-                    ).fetchone()
-                    if row:
-                        return row[0], row[1]
-
-            # Layer 2.75: known_refresh_tokens table (may not exist yet)
-            if cred_data is not None:
-                cred_rt = cred_data.get("claudeAiOauth", {}).get("refreshToken")
-                if cred_rt:
-                    try:
-                        row = conn.execute(
-                            "SELECT account_id FROM known_refresh_tokens WHERE refresh_token = ?",
-                            (cred_rt,),
-                        ).fetchone()
-                        if row:
-                            acct_row = conn.execute(
-                                "SELECT id, email FROM accounts WHERE id = ? AND is_deleted = 0",
-                                (row[0],),
-                            ).fetchone()
-                            if acct_row:
-                                return acct_row[0], acct_row[1]
-                    except sqlite3.OperationalError:
-                        pass  # Table doesn't exist yet — skip layer
-
-            # Layer 2.85: Single-account optimization (unambiguous when only 1 OAuth account)
-            try:
-                oauth_rows = conn.execute(
-                    "SELECT id, email FROM accounts "
-                    "WHERE refresh_token IS NOT NULL AND is_deleted = 0",
-                ).fetchall()
-                if len(oauth_rows) == 1:
-                    return oauth_rows[0][0], oauth_rows[0][1]
-            except sqlite3.OperationalError:
-                pass
-
-            # Layer 3: Staleness-gated email from ~/.claude.json
-            if CLAUDE_CONFIG.exists() and not CLAUDE_CONFIG.is_symlink():
-                try:
-                    config_mtime = CLAUDE_CONFIG.stat().st_mtime
-                    if time.time() - config_mtime <= LAYER3_FRESHNESS_SECONDS:
-                        config = json.loads(
-                            CLAUDE_CONFIG.read_text(encoding="utf-8")
-                        )
-                        email = config.get("oauthAccount", {}).get(
-                            "emailAddress"
-                        )
-                        if email:
-                            row = conn.execute(
-                                "SELECT id, email FROM accounts "
-                                "WHERE LOWER(email) = LOWER(?) AND is_deleted = 0 "
-                                "ORDER BY priority ASC, id ASC LIMIT 1",
-                                (email,),
-                            ).fetchone()
-                            if row:
-                                return row[0], row[1]
-                except (json.JSONDecodeError, OSError):
-                    pass
         finally:
             conn.close()
     except Exception:
@@ -215,10 +138,14 @@ def _match_token_to_account(
 
 
 def _detect_subagent() -> tuple[bool, str | None, str | None]:
-    """Return (is_subagent, parent_session_id, agent_type) from env vars.
+    """Check env vars to determine if this is a subagent session.
 
-    >>> import os; [os.environ.pop(k, None) for k in ['CLAUDE_CODE_PARENT_SESSION_ID', 'CLAUDE_CODE_AGENT_TYPE', 'CLAUDE_CODE_AGENT_NAME']]
-    [None, None, None]
+    Returns (is_subagent, parent_session_id, agent_type).
+
+    >>> import os
+    >>> # Clear any test env vars
+    >>> for k in ['CLAUDE_CODE_PARENT_SESSION_ID', 'CLAUDE_CODE_AGENT_TYPE', 'CLAUDE_CODE_AGENT_NAME']:
+    ...     os.environ.pop(k, None)
     >>> _detect_subagent()
     (False, None, None)
     """
@@ -235,9 +162,16 @@ def _record_session(
     email: str | None,
     method: str,
     repo_path: str | None,
+    pid: int | None = None,
 ) -> str | None:
-    """Insert or refresh a session-account record. Returns detected_at or None.
+    """Insert or refresh a session-account record via raw sqlite3.
 
+    Closes stale records for different accounts on the same session and
+    prevents duplicate rows for the same session+account combo.
+
+    Returns the detected_at timestamp used, or None on failure.
+
+    >>> # Smoke test — doesn't crash on missing DB
     >>> _record_session("test", None, None, "test", None) is None
     True
     """
@@ -279,9 +213,9 @@ def _record_session(
                 conn.execute(
                     """INSERT OR IGNORE INTO session_accounts
                        (session_id, account_id, email, detected_at, last_activity_at,
-                        detection_method, repo_path)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (session_id, account_id, email, ts, ts, method, repo_path),
+                        detection_method, repo_path, pid)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, account_id, email, ts, ts, method, repo_path, pid),
                 )
             conn.commit()
             return ts
@@ -298,7 +232,10 @@ def _record_session(
 
 
 def _tag_subagent(session_id: str, detected_at: str | None):
-    """Best-effort tag of a session as subagent. Fails silently.
+    """Best-effort UPDATE to tag a session as a subagent.
+
+    Fails silently if columns don't exist yet (migration not run).
+    Zero impact on the core session record created by _record_session().
 
     >>> _tag_subagent("nonexistent", "2025-01-01T00:00:00Z")
     """
@@ -357,7 +294,10 @@ HEARTBEAT_THROTTLE_SECONDS = (
 
 
 def _heartbeat_session(session_id: str):
-    """Update last_activity_at, throttled to every 5 min.
+    """Update last_activity_at for an active session, throttled.
+
+    Only writes if last_activity_at is > 5 minutes old to avoid
+    excessive DB writes (Stop fires every Claude response).
 
     >>> _heartbeat_session("nonexistent")
     """
@@ -405,7 +345,10 @@ def _heartbeat_session(session_id: str):
 
 
 def _clear_account_error(account_id: int):
-    """Clear stale error when a live session proves creds work.
+    """Clear stale error on account when a live session proves creds work.
+
+    Only fires when validation_status='invalid' — no-op for healthy accounts.
+    Safe because credential_helpers.py handles token updates separately.
 
     >>> _clear_account_error(99999)
     """
@@ -424,7 +367,7 @@ def _clear_account_error(account_id: int):
                     consecutive_failures = 0,
                     last_validated_at = ?,
                     updated_at = ?
-                   WHERE id = ? AND validation_status IN ('invalid', 'unknown')""",
+                   WHERE id = ? AND validation_status = 'invalid'""",
                 (int(time.time()), ts, account_id),
             )
             conn.commit()
@@ -439,27 +382,29 @@ def _handle_event(event: str, session_id: str, repo_path: str | None):
 
     >>> _handle_event("SessionEnd", "test-sess", None)
     >>> _handle_event("Stop", "test-sess", None)
-    >>> _handle_event("UserPromptSubmit", "test-sess", None)
     """
     if event == "SessionEnd":
         _end_session(session_id)
         return
 
-    if event in ("Stop", "UserPromptSubmit"):
+    if event == "Stop":
         _heartbeat_session(session_id)
         return
 
     # SessionStart or Notification(auth_success) — detect account
     token, cred_data = _get_cred_data()
     account_id, email = _match_token_to_account(token, cred_data)
-
-    method = "auth_success" if event == "Notification" else "session_start"
+    pid = os.getppid()
 
     if event == "Notification":
+        # auth_success — close previous record first
         _end_session(session_id)
-        _record_session(session_id, account_id, email, method, repo_path)
+        _record_session(session_id, account_id, email, "auth_success", repo_path, pid)
     else:
-        ts = _record_session(session_id, account_id, email, method, repo_path)
+        # SessionStart
+        ts = _record_session(
+            session_id, account_id, email, "session_start", repo_path, pid
+        )
         _tag_subagent(session_id, ts)
 
     if account_id is not None:
@@ -487,7 +432,7 @@ def main():
         return
 
     # Only handle our events
-    if event not in ("SessionStart", "Notification", "SessionEnd", "Stop", "UserPromptSubmit"):
+    if event not in ("SessionStart", "Notification", "SessionEnd", "Stop"):
         return
 
     # Fire-and-forget: daemon thread so we don't block Claude Code

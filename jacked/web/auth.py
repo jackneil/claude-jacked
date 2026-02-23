@@ -11,9 +11,11 @@ All API interactions follow design doc section 4 header matrix.
 """
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -51,21 +53,16 @@ def should_refresh(account: dict) -> bool:
 
 
 async def refresh_account_token(
-    account_id: int, db: Database, *, is_active_account: bool = False
+    account_id: int, db: Database
 ) -> bool:
     """Refresh an account's token if needed.
 
-    Implements design doc section 10 refresh logic:
     - Skip if no refresh_token (API key account)
     - Skip if token not near expiry
     - POST to TOKEN_URL with JSON body
     - Handle token rotation (new refresh_token in response)
-    - Handle invalid_grant → mark account invalid (unless active account — race with Claude Code)
+    - Handle invalid_grant → record error, retry next cycle
     - After successful refresh, also refresh profile metadata
-
-    Args:
-        is_active_account: If True, don't mark invalid on invalid_grant (Claude Code
-            may have already rotated the token, making our stale refresh token fail).
 
     Returns True if token is valid (either still fresh or successfully refreshed).
     """
@@ -101,9 +98,7 @@ async def refresh_account_token(
                 new_refresh = tokens.get("refresh_token", account["refresh_token"])
                 new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
 
-                # CRITICAL: If DB update fails after consuming the refresh token,
-                # the old refresh token is gone and the new one wasn't saved.
-                # Retry with backoff, then fall back to recovery file.
+                # Update DB with new tokens (retry with backoff)
                 db_updated = False
                 for attempt in range(3):
                     try:
@@ -125,53 +120,58 @@ async def refresh_account_token(
                             await asyncio.sleep(0.1 * (2 ** attempt))
 
                 if not db_updated:
-                    # All retries failed — write recovery file
-                    from jacked.web.token_recovery import write_token_recovery
-                    write_token_recovery(
-                        account_id, tokens["access_token"],
-                        new_refresh, new_expires_at,
-                    )
                     logger.error(
                         "Token refresh succeeded but DB update FAILED for "
-                        "account %d after 3 attempts. Recovery file written.",
+                        "account %d after 3 attempts.",
                         account_id,
                     )
                     return False
 
-                # Record new RT for Layer 2.75 future matching
-                if hasattr(db, "record_refresh_token"):
-                    db.record_refresh_token(new_refresh, account_id)
-
                 logger.info(f"Token refreshed for account {account_id}")
+
+                # Propagate refreshed tokens to credential stores so Claude
+                # Code sees them without needing a manual "Set Active".
+                # Only write to global stores if this IS the active account
+                # (otherwise we'd overwrite a different account's credentials).
+                try:
+                    from jacked.api.credential_helpers import sync_credential_to_all_stores
+
+                    cred_path = Path.home() / ".claude" / ".credentials.json"
+                    is_active = False
+                    if cred_path.exists() and not cred_path.is_symlink():
+                        try:
+                            stamp = json.loads(cred_path.read_text(encoding="utf-8"))
+                            is_active = stamp.get("_jackedAccountId") == account_id
+                        except (json.JSONDecodeError, OSError):
+                            pass
+
+                    if is_active:
+                        refreshed_account = db.get_account(account_id)
+                        if refreshed_account:
+                            sync_credential_to_all_stores(
+                                account_id, refreshed_account,
+                                email=refreshed_account.get("email"),
+                                display_name=refreshed_account.get("display_name"),
+                            )
+                except Exception as sync_err:
+                    logger.warning(
+                        "Token refresh succeeded but credential store sync "
+                        "failed for account %d: %s", account_id, sync_err,
+                    )
 
                 # Also refresh profile metadata after successful refresh
                 await fetch_profile(account_id, db, access_token=tokens["access_token"])
 
                 return True
 
-            # Error handling per design doc section 4d
             if resp.status_code == 400:
                 try:
                     error_data = resp.json()
                     if error_data.get("error") == "invalid_grant":
-                        if is_active_account:
-                            # Claude Code already consumed our RT.  Force
-                            # re-sync from credential file/keychain — we KNOW
-                            # which account this is (bypasses matching).
-                            logger.warning(
-                                "Account %d: invalid_grant — forcing immediate re-sync",
-                                account_id,
-                            )
-                            from jacked.web.token_recovery import (
-                                force_resync_for_active_account,
-                            )
-                            force_resync_for_active_account(account_id, db)
-                            return False
-                        # Non-active: don't mark invalid — likely a race
-                        # with token rotation.  Will retry next cycle.
+                        # Refresh token was consumed (likely by Claude Code).
+                        # Don't mark invalid — will retry next cycle.
                         logger.warning(
-                            "Account %d: invalid_grant (non-active) — skipping, "
-                            "will retry next cycle",
+                            "Account %d: invalid_grant — will retry next cycle",
                             account_id,
                         )
                         db.record_account_error(
@@ -508,26 +508,9 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     now = int(time.time())
     result = {"checked": 0, "refreshed": 0, "skipped": 0, "failed": 0}
 
-    # Detect active Claude Code account — skip it (Claude Code owns its refresh)
-    from jacked.api.credential_sync import detect_active_account
-
-    active_account_id, _cred_access_token = detect_active_account(db)
-
     accounts = db.list_accounts(include_inactive=False)
     for account in accounts:
         result["checked"] += 1
-
-        # Skip active Claude Code account — unless its token already expired
-        # (Claude Code refreshes internally but doesn't always update .credentials.json)
-        is_active = active_account_id is not None and account["id"] == active_account_id
-        if is_active:
-            if now < (account.get("expires_at") or 0):
-                result["skipped"] += 1
-                continue
-            logger.warning(
-                "Active account %d token expired — stepping in to refresh",
-                account["id"],
-            )
 
         # Skip API key accounts (no refresh_token)
         if not account.get("refresh_token"):
@@ -546,9 +529,7 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
             continue
 
         async with lock:
-            success = await refresh_account_token(
-                account["id"], db, is_active_account=is_active
-            )
+            success = await refresh_account_token(account["id"], db)
             if success:
                 result["refreshed"] += 1
             else:
