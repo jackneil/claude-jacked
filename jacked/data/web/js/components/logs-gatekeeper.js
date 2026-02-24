@@ -1,5 +1,226 @@
 /** jacked web dashboard — Gatekeeper sub-tab (depends on logs.js) */
 
+let logsMethodFilter = 'ALL';
+let _methodOptions = [];  // cached method values from API
+
+// --- Pattern extraction ---
+const _MULTI_WORD_COMMANDS = new Set([
+    'git push', 'git commit', 'git pull', 'git checkout', 'git merge', 'git rebase',
+    'git clone', 'git fetch', 'git stash', 'git diff', 'git log', 'git add',
+    'npm install', 'npm run', 'npm test', 'npm start', 'npm exec',
+    'npx create', 'yarn add', 'yarn run',
+    'pip install', 'pip uninstall',
+    'docker exec', 'docker run', 'docker build', 'docker compose',
+    'cargo build', 'cargo test', 'cargo run',
+    'go build', 'go test', 'go run', 'go get',
+    'uv run', 'uv pip',
+]);
+
+function extractPattern(command, method) {
+    if (!command) return { pattern: '', type: 'permission' };
+
+    // PATH_SAFETY methods: extract file path
+    if (method === 'PATH_SAFETY' || method === 'PATH_SAFETY_FLOOR') {
+        const pathMatch = command.match(/^\[?\w+\]?\s+(\/\S+)/);
+        if (pathMatch) return { pattern: pathMatch[1], type: 'path' };
+    }
+
+    // Strip env var prefixes (FOO=bar BAR=baz cmd ...)
+    let cmd = command.replace(/^(\w+=\S+\s+)+/, '');
+
+    // Extract base command — check multi-word first
+    const parts = cmd.split(/\s+/);
+    const twoWord = parts.slice(0, 2).join(' ');
+    if (_MULTI_WORD_COMMANDS.has(twoWord)) {
+        return { pattern: `Bash(${twoWord}:*)`, type: 'permission' };
+    }
+
+    const base = parts[0] || '';
+    if (base) {
+        return { pattern: `Bash(${base}:*)`, type: 'permission' };
+    }
+    return { pattern: '', type: 'permission' };
+}
+
+// --- File-tool names (project-scope warning) ---
+const _FILE_TOOL_NAMES = new Set(['Read', 'Edit', 'Write', 'Grep', 'Glob', 'NotebookEdit']);
+
+function _isFileToolPattern(pattern) {
+    const match = pattern.match(/^(\w+)\(/);
+    return match && _FILE_TOOL_NAMES.has(match[1]);
+}
+
+// --- Always Allow modal ---
+function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
+    // Remove any existing modal
+    const existing = document.getElementById('always-allow-modal-overlay');
+    if (existing) existing.remove();
+
+    const isPath = type === 'path';
+    const repoName = repoPath ? repoPath.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
+
+    const overlay = document.createElement('div');
+    overlay.id = 'always-allow-modal-overlay';
+    overlay.className = 'fixed inset-0 bg-black/60 flex items-center justify-center z-50';
+
+    const modal = document.createElement('div');
+    modal.className = 'bg-slate-800 border border-slate-600 rounded-xl shadow-2xl w-full max-w-md mx-4 p-6';
+
+    // Title
+    const title = document.createElement('h3');
+    title.className = 'text-lg font-semibold text-white mb-4';
+    title.textContent = isPath ? 'Add Allowed Path' : 'Always Allow Rule';
+    modal.appendChild(title);
+
+    // Command preview
+    if (command) {
+        const cmdPreview = document.createElement('div');
+        cmdPreview.className = 'mb-4 bg-slate-900/50 rounded-lg px-3 py-2';
+        const cmdLabel = document.createElement('div');
+        cmdLabel.className = 'text-[10px] uppercase tracking-wider text-slate-500 mb-1';
+        cmdLabel.textContent = 'Command';
+        const cmdText = document.createElement('pre');
+        cmdText.className = 'text-xs font-mono text-slate-300 whitespace-pre-wrap break-all max-h-20 overflow-y-auto';
+        cmdText.textContent = command.length > 200 ? command.substring(0, 200) + '...' : command;
+        cmdPreview.appendChild(cmdLabel);
+        cmdPreview.appendChild(cmdText);
+        modal.appendChild(cmdPreview);
+    }
+
+    // Pattern input
+    const patternLabel = document.createElement('label');
+    patternLabel.className = 'block text-sm text-slate-300 mb-1';
+    patternLabel.textContent = isPath ? 'Path to allow:' : 'Permission pattern:';
+    modal.appendChild(patternLabel);
+
+    const patternInput = document.createElement('input');
+    patternInput.type = 'text';
+    patternInput.className = 'w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 mb-4';
+    patternInput.value = pattern;
+    modal.appendChild(patternInput);
+
+    // Scope selection (not for path type — paths always go to gatekeeper config)
+    let scopeGlobal = null;
+    let scopeProject = null;
+    const scopeWarning = document.createElement('div');
+    scopeWarning.className = 'text-xs text-yellow-400 mb-3 hidden';
+
+    if (!isPath) {
+        const scopeLabel = document.createElement('div');
+        scopeLabel.className = 'text-sm text-slate-300 mb-2';
+        scopeLabel.textContent = 'Scope:';
+        modal.appendChild(scopeLabel);
+
+        const scopeRow = document.createElement('div');
+        scopeRow.className = 'flex gap-3 mb-3';
+
+        scopeGlobal = document.createElement('label');
+        scopeGlobal.className = 'flex items-center gap-2 text-sm text-slate-300 cursor-pointer';
+        const radioGlobal = document.createElement('input');
+        radioGlobal.type = 'radio';
+        radioGlobal.name = 'aa-scope';
+        radioGlobal.value = 'global';
+        radioGlobal.checked = true;
+        radioGlobal.className = 'accent-blue-500';
+        scopeGlobal.appendChild(radioGlobal);
+        scopeGlobal.appendChild(document.createTextNode('Global'));
+        scopeRow.appendChild(scopeGlobal);
+
+        if (repoPath) {
+            scopeProject = document.createElement('label');
+            scopeProject.className = 'flex items-center gap-2 text-sm text-slate-300 cursor-pointer';
+            const radioProject = document.createElement('input');
+            radioProject.type = 'radio';
+            radioProject.name = 'aa-scope';
+            radioProject.value = 'project';
+            radioProject.className = 'accent-blue-500';
+            scopeProject.appendChild(radioProject);
+            const projText = document.createTextNode(`Project: ${repoName}`);
+            scopeProject.appendChild(projText);
+            scopeRow.appendChild(scopeProject);
+        }
+
+        modal.appendChild(scopeRow);
+        modal.appendChild(scopeWarning);
+
+        // Update warning on scope change and pattern change
+        const updateWarning = () => {
+            const selectedScope = modal.querySelector('input[name="aa-scope"]:checked')?.value || 'global';
+            const curPattern = patternInput.value.trim();
+            if (selectedScope === 'project' && _isFileToolPattern(curPattern)) {
+                scopeWarning.textContent = 'Note: File-tool rules (Read, Edit, Write, Grep, Glob, NotebookEdit) only apply at global scope. Bash rules work at both scopes.';
+                scopeWarning.classList.remove('hidden');
+            } else {
+                scopeWarning.classList.add('hidden');
+            }
+        };
+        scopeRow.addEventListener('change', updateWarning);
+        patternInput.addEventListener('input', updateWarning);
+    }
+
+    // Buttons
+    const btnRow = document.createElement('div');
+    btnRow.className = 'flex justify-end gap-3 mt-4';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'px-4 py-2 rounded-lg text-sm font-medium bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => overlay.remove());
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors';
+    addBtn.textContent = isPath ? 'Add Path' : 'Add Rule';
+    addBtn.addEventListener('click', async () => {
+        const val = patternInput.value.trim();
+        if (!val) return;
+
+        addBtn.disabled = true;
+        addBtn.textContent = 'Adding...';
+
+        try {
+            if (isPath) {
+                // Add allowed path via gatekeeper config API
+                const pathState = await api.get('/api/settings/gatekeeper/path-safety');
+                const allowed = pathState.allowed_paths || [];
+                if (!allowed.includes(val)) {
+                    allowed.push(val);
+                    pathState.allowed_paths = allowed;
+                    await api.put('/api/settings/gatekeeper/path-safety', pathState);
+                }
+            } else {
+                const scope = modal.querySelector('input[name="aa-scope"]:checked')?.value || 'global';
+                const payload = { pattern: val, list_name: 'allow', scope };
+                if (scope === 'project' && repoPath) {
+                    payload.repo_path = repoPath;
+                }
+                await api.post('/api/claude-settings/permissions/rule', payload);
+            }
+            overlay.remove();
+            showLogsToast(isPath ? `Added allowed path: ${val}` : `Added rule: ${val}`);
+        } catch (e) {
+            showLogsToast('Failed: ' + e.message, true);
+            addBtn.disabled = false;
+            addBtn.textContent = isPath ? 'Add Path' : 'Add Rule';
+        }
+    });
+
+    btnRow.appendChild(cancelBtn);
+    btnRow.appendChild(addBtn);
+    modal.appendChild(btnRow);
+
+    // Close on overlay click
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.remove();
+    });
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    // Focus pattern input
+    patternInput.focus();
+    patternInput.select();
+}
+
 // --- Gatekeeper sub-tab renderer ---
 function renderGatekeeperSubTab(container) {
     container.innerHTML = `
@@ -13,6 +234,10 @@ function renderGatekeeperSubTab(container) {
                     <option value="ALL" ${logsFilter === 'ALL' ? 'selected' : ''}>All Decisions</option>
                     <option value="ALLOW" ${logsFilter === 'ALLOW' ? 'selected' : ''}>Allowed</option>
                     <option value="ASK_USER" ${logsFilter === 'ASK_USER' ? 'selected' : ''}>Asked User</option>
+                </select>
+                <select id="logs-method-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
+                    <option value="ALL">All Methods</option>
+                    ${_methodOptions.map(m => `<option value="${escapeHtml(m)}" ${logsMethodFilter === m ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
                 </select>
                 <select id="logs-repo-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
                     <option value="ALL">All Repos</option>
@@ -50,6 +275,7 @@ function renderGatekeeperSubTab(container) {
     `;
 
     bindGatekeeperLogsEvents();
+    _loadMethodOptions();
     loadSessions().then(() => loadLogsData());
 }
 
@@ -59,6 +285,15 @@ function bindGatekeeperLogsEvents() {
     if (filterEl) {
         filterEl.addEventListener('change', () => {
             logsFilter = filterEl.value;
+            gkPage = 0;
+            loadLogsData();
+        });
+    }
+
+    const methodFilterEl = document.getElementById('logs-method-filter');
+    if (methodFilterEl) {
+        methodFilterEl.addEventListener('change', () => {
+            logsMethodFilter = methodFilterEl.value;
             gkPage = 0;
             loadLogsData();
         });
@@ -173,6 +408,23 @@ function renderSessionCards(sessions, activeId) {
     `;
 }
 
+async function _loadMethodOptions() {
+    try {
+        const data = await api.get('/api/logs/gatekeeper/methods');
+        _methodOptions = data.methods || [];
+        const select = document.getElementById('logs-method-filter');
+        if (select) {
+            const options = ['<option value="ALL">All Methods</option>']
+                .concat(_methodOptions.map(m =>
+                    `<option value="${escapeHtml(m)}" ${logsMethodFilter === m ? 'selected' : ''}>${escapeHtml(m)}</option>`
+                ));
+            select.innerHTML = options.join('');
+        }
+    } catch (e) {
+        console.error('Failed to load method options:', e);
+    }
+}
+
 async function loadSessions() {
     try {
         logsSessions = await api.get('/api/logs/sessions');
@@ -260,6 +512,7 @@ async function loadLogsData() {
     try {
         let url = `/api/logs/gatekeeper?limit=${gkPageSize}&offset=${gkPage * gkPageSize}`;
         if (logsFilter !== 'ALL') url += `&decision=${logsFilter}`;
+        if (logsMethodFilter !== 'ALL') url += `&method=${encodeURIComponent(logsMethodFilter)}`;
         if (logsActiveSession !== 'ALL') url += `&session_id=${encodeURIComponent(logsActiveSession)}`;
         if (logsSearch) url += `&command_search=${encodeURIComponent(logsSearch)}`;
         if (logsActiveRepo !== 'ALL') url += `&repo_path=${encodeURIComponent(logsActiveRepo)}`;
@@ -331,10 +584,17 @@ async function loadLogsData() {
                                 <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Reason</div>
                                 <div class="text-xs text-slate-300 italic">${reason}</div>
                             </div>` : ''}
-                            <div class="flex gap-6 text-xs text-slate-400">
+                            <div class="flex items-center gap-6 text-xs text-slate-400">
                                 <div><span class="text-slate-500">Session:</span> <span class="font-mono">${fullSession}</span></div>
                                 <div><span class="text-slate-500">Repo:</span> <span class="font-mono">${fullRepo}</span></div>
                                 <div><span class="text-slate-500">Elapsed:</span> ${elapsed}</div>
+                                ${r.decision === 'ASK_USER' ? `
+                                <button class="always-allow-btn ml-auto px-3 py-1 rounded-lg text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors"
+                                    data-command="${fullCmd}"
+                                    data-method="${method}"
+                                    data-repo="${fullRepo}">
+                                    ${r.method === 'PATH_SAFETY' || r.method === 'PATH_SAFETY_FLOOR' ? 'Add Allowed Path' : 'Always Allow'}
+                                </button>` : ''}
                             </div>
                         </div>
                     </td>
@@ -367,6 +627,17 @@ async function loadLogsData() {
             row.addEventListener('click', () => {
                 const detail = container.querySelector(`.log-detail[data-detail="${row.dataset.row}"]`);
                 if (detail) detail.classList.toggle('hidden');
+            });
+        });
+
+        container.querySelectorAll('.always-allow-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const command = btn.dataset.command;
+                const method = btn.dataset.method;
+                const repo = btn.dataset.repo;
+                const { pattern, type } = extractPattern(command, method);
+                showAlwaysAllowModal({ pattern, type, repoPath: repo, command });
             });
         });
     } catch (e) {
