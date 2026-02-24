@@ -584,10 +584,17 @@ async function loadLogsData() {
                                 <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Reason</div>
                                 <div class="text-xs text-slate-300 italic">${reason}</div>
                             </div>` : ''}
-                            <div class="flex gap-6 text-xs text-slate-400">
+                            <div class="flex items-center gap-6 text-xs text-slate-400">
                                 <div><span class="text-slate-500">Session:</span> <span class="font-mono">${fullSession}</span></div>
                                 <div><span class="text-slate-500">Repo:</span> <span class="font-mono">${fullRepo}</span></div>
                                 <div><span class="text-slate-500">Elapsed:</span> ${elapsed}</div>
+                                ${r.decision === 'ASK_USER' ? `
+                                <button class="always-allow-btn ml-auto px-3 py-1 rounded-lg text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors"
+                                    data-command="${fullCmd}"
+                                    data-method="${method}"
+                                    data-repo="${fullRepo}">
+                                    ${r.method === 'PATH_SAFETY' || r.method === 'PATH_SAFETY_FLOOR' ? 'Add Allowed Path' : 'Always Allow'}
+                                </button>` : ''}
                             </div>
                         </div>
                     </td>
@@ -620,6 +627,17 @@ async function loadLogsData() {
             row.addEventListener('click', () => {
                 const detail = container.querySelector(`.log-detail[data-detail="${row.dataset.row}"]`);
                 if (detail) detail.classList.toggle('hidden');
+            });
+        });
+
+        container.querySelectorAll('.always-allow-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const command = btn.dataset.command;
+                const method = btn.dataset.method;
+                const repo = btn.dataset.repo;
+                const { pattern, type } = extractPattern(command, method);
+                showAlwaysAllowModal({ pattern, type, repoPath: repo, command });
             });
         });
     } catch (e) {
