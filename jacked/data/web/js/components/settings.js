@@ -2044,6 +2044,25 @@ function _renderNumericSection(title, items) {
     `;
 }
 
+// --- Permissions scope state ---
+let _permScope = 'global';
+let _permProjectRepo = '';
+let _permProjectRepos = [];
+let _permProjectData = null;  // cached project permissions
+
+const _PERM_TEMPLATES = [
+    { label: 'WebFetch', pattern: 'WebFetch' },
+    { label: 'WebSearch', pattern: 'WebSearch' },
+    { label: 'curl', pattern: 'Bash(curl:*)' },
+    { label: 'wget', pattern: 'Bash(wget:*)' },
+    { label: 'git push', pattern: 'Bash(git push:*)' },
+    { label: 'git commit', pattern: 'Bash(git commit:*)' },
+    { label: 'npm install', pattern: 'Bash(npm install:*)' },
+    { label: 'pip install', pattern: 'Bash(pip install:*)' },
+    { label: 'docker', pattern: 'Bash(docker:*)' },
+    { label: 'make', pattern: 'Bash(make:*)' },
+];
+
 function _renderPermissionsSection(permissions) {
     const modeOptions = ['default', 'plan', 'bypassPermissions', 'acceptEdits'].map(m =>
         `<option value="${m}" ${permissions.defaultMode === m ? 'selected' : ''}>${m}</option>`
@@ -2078,23 +2097,61 @@ function _renderPermissionsSection(permissions) {
         `;
     }
 
+    // Templates row (only for allow list)
+    const templatesHtml = _PERM_TEMPLATES.map(t =>
+        `<button class="perm-template-btn px-2 py-0.5 text-[11px] bg-slate-700/60 hover:bg-blue-700/60 text-slate-300 hover:text-white rounded transition-colors font-mono" data-pattern="${escapeHtml(t.pattern)}">${escapeHtml(t.label)}</button>`
+    ).join('');
+
+    // Scope tabs
+    const globalActive = _permScope === 'global';
+    const projectActive = _permScope === 'project';
+
+    // Project repo dropdown
+    const repoOptions = _permProjectRepos.map(r => {
+        const name = r.replace(/\\/g, '/').split('/').filter(Boolean).pop() || r;
+        return `<option value="${escapeHtml(r)}" ${_permProjectRepo === r ? 'selected' : ''}>${escapeHtml(name)}</option>`;
+    }).join('');
+
+    // Decide which permissions to display
+    const displayPerms = projectActive && _permProjectData ? _permProjectData : permissions;
+
     return `
         <div class="mb-6">
             <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Permissions</h3>
-            <div class="p-3 bg-slate-900/50 rounded border border-slate-700/50 mb-3">
-                <div class="flex items-center justify-between">
-                    <div>
-                        <div class="text-sm text-white">Default Mode</div>
-                        <div class="text-xs text-slate-400">Permission mode Claude Code starts in</div>
-                    </div>
-                    <select id="perm-default-mode" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500">
-                        ${modeOptions}
-                    </select>
-                </div>
+
+            <div class="flex items-center gap-2 mb-3">
+                <button class="perm-scope-btn px-3 py-1 rounded-lg text-xs font-medium transition-colors ${globalActive ? 'bg-blue-700 text-white' : 'bg-slate-700 text-slate-400 hover:text-white'}" data-scope="global">Global</button>
+                <button class="perm-scope-btn px-3 py-1 rounded-lg text-xs font-medium transition-colors ${projectActive ? 'bg-blue-700 text-white' : 'bg-slate-700 text-slate-400 hover:text-white'}" data-scope="project">Project</button>
+                ${projectActive ? `
+                    <select id="perm-project-repo" class="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-blue-500">
+                        <option value="">Select project...</option>
+                        ${repoOptions}
+                    </select>` : ''}
+                ${projectActive ? '<div class="text-[10px] text-slate-500">settings.local.json</div>' : '<div class="text-[10px] text-slate-500">~/.claude/settings.json</div>'}
             </div>
-            ${renderList('Allow', permissions.allow, 'allow')}
-            ${renderList('Deny', permissions.deny, 'deny')}
-            ${renderList('Ask', permissions.ask, 'ask')}
+
+            ${projectActive && !_permProjectRepo ? `
+                <div class="text-xs text-slate-500 italic py-4 text-center">Select a project to view its permissions</div>
+            ` : `
+                <div class="p-3 bg-slate-900/50 rounded border border-slate-700/50 mb-3">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <div class="text-sm text-white">Default Mode</div>
+                            <div class="text-xs text-slate-400">Permission mode Claude Code starts in</div>
+                        </div>
+                        <select id="perm-default-mode" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500">
+                            ${modeOptions}
+                        </select>
+                    </div>
+                </div>
+                ${renderList('Allow', displayPerms.allow || [], 'allow')}
+                <div class="mb-3">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5">Quick-add templates</div>
+                    <div class="flex flex-wrap gap-1">${templatesHtml}</div>
+                </div>
+                ${renderList('Deny', displayPerms.deny || [], 'deny')}
+                ${renderList('Ask', displayPerms.ask || [], 'ask')}
+            `}
         </div>
     `;
 }
@@ -2178,12 +2235,60 @@ function _bindClaudeCodeEvents(container) {
         });
     });
 
+    // Permissions — scope tabs
+    container.querySelectorAll('.perm-scope-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            _permScope = btn.dataset.scope;
+            _permProjectData = null;
+            if (_permScope === 'project' && _permProjectRepos.length === 0) {
+                try {
+                    const sessions = await api.get('/api/logs/sessions');
+                    const seen = new Map();
+                    for (const s of sessions) {
+                        if (s.repo_path) {
+                            const key = s.repo_path.toLowerCase();
+                            if (!seen.has(key)) seen.set(key, s.repo_path);
+                        }
+                    }
+                    _permProjectRepos = [...seen.values()].sort();
+                } catch (e) { _permProjectRepos = []; }
+            }
+            await renderClaudeCodeTab(container);
+        });
+    });
+
+    // Permissions — project repo dropdown
+    const repoSelect = document.getElementById('perm-project-repo');
+    if (repoSelect) {
+        repoSelect.addEventListener('change', async () => {
+            _permProjectRepo = repoSelect.value;
+            if (_permProjectRepo) {
+                try {
+                    _permProjectData = await api.get(`/api/claude-settings/project-permissions?repo_path=${encodeURIComponent(_permProjectRepo)}`);
+                } catch (e) {
+                    _permProjectData = null;
+                    showToast(e.message || 'Failed to load project permissions', 'error');
+                }
+            } else {
+                _permProjectData = null;
+            }
+            await renderClaudeCodeTab(container);
+        });
+    }
+
     // Permissions — default mode dropdown
     const modeSelect = document.getElementById('perm-default-mode');
     if (modeSelect) {
         modeSelect.addEventListener('change', async () => {
             try {
-                await api.put('/api/claude-settings/permissions', { defaultMode: modeSelect.value });
+                if (_permScope === 'project' && _permProjectRepo) {
+                    await api.put('/api/claude-settings/project-permissions', {
+                        repo_path: _permProjectRepo,
+                        defaultMode: modeSelect.value,
+                    });
+                } else {
+                    await api.put('/api/claude-settings/permissions', { defaultMode: modeSelect.value });
+                }
                 showToast(`Default mode set to "${modeSelect.value}". Restart Claude Code.`, 'warning');
                 await refreshClaudeSettings();
             } catch (e) {
@@ -2192,20 +2297,29 @@ function _bindClaudeCodeEvents(container) {
         });
     }
 
-    // Permissions — remove rule
+    // Permissions — remove rule (scope-aware)
     container.querySelectorAll('.perm-remove-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const listName = btn.dataset.list;
             const index = parseInt(btn.dataset.index);
             try {
-                const current = await loadClaudeSettings();
-                const perms = { ...current.permissions };
-                const arr = [...(perms[listName] || [])];
-                arr.splice(index, 1);
-                perms[listName] = arr;
-                await api.put('/api/claude-settings/permissions', perms);
+                if (_permScope === 'project' && _permProjectRepo && _permProjectData) {
+                    const arr = [...(_permProjectData[listName] || [])];
+                    arr.splice(index, 1);
+                    const payload = { repo_path: _permProjectRepo };
+                    payload[listName] = arr;
+                    await api.put('/api/claude-settings/project-permissions', payload);
+                    _permProjectData[listName] = arr;
+                } else {
+                    const current = await loadClaudeSettings();
+                    const perms = { ...current.permissions };
+                    const arr = [...(perms[listName] || [])];
+                    arr.splice(index, 1);
+                    perms[listName] = arr;
+                    await api.put('/api/claude-settings/permissions', perms);
+                    await refreshClaudeSettings();
+                }
                 showToast(`Rule removed. Restart Claude Code.`, 'warning');
-                await refreshClaudeSettings();
                 await renderClaudeCodeTab(container);
             } catch (e) {
                 showToast(e.message || 'Remove failed', 'error');
@@ -2213,7 +2327,7 @@ function _bindClaudeCodeEvents(container) {
         });
     });
 
-    // Permissions — add rule
+    // Permissions — add rule (scope-aware)
     container.querySelectorAll('.perm-add-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const listName = btn.dataset.list;
@@ -2221,14 +2335,17 @@ function _bindClaudeCodeEvents(container) {
             const rule = input ? input.value.trim() : '';
             if (!rule) return;
             try {
-                const current = await loadClaudeSettings();
-                const perms = { ...current.permissions };
-                const arr = [...(perms[listName] || [])];
-                arr.push(rule);
-                perms[listName] = arr;
-                await api.put('/api/claude-settings/permissions', perms);
+                const payload = { pattern: rule, list_name: listName, scope: _permScope };
+                if (_permScope === 'project' && _permProjectRepo) {
+                    payload.repo_path = _permProjectRepo;
+                }
+                await api.post('/api/claude-settings/permissions/rule', payload);
                 showToast(`Rule added. Restart Claude Code.`, 'warning');
-                await refreshClaudeSettings();
+                if (_permScope === 'project' && _permProjectRepo) {
+                    _permProjectData = await api.get(`/api/claude-settings/project-permissions?repo_path=${encodeURIComponent(_permProjectRepo)}`);
+                } else {
+                    await refreshClaudeSettings();
+                }
                 await renderClaudeCodeTab(container);
             } catch (e) {
                 showToast(e.message || 'Add failed', 'error');
@@ -2242,6 +2359,29 @@ function _bindClaudeCodeEvents(container) {
             if (e.key === 'Enter') {
                 const btn = container.querySelector(`.perm-add-btn[data-list="${input.dataset.list}"]`);
                 if (btn) btn.click();
+            }
+        });
+    });
+
+    // Permissions — template buttons
+    container.querySelectorAll('.perm-template-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const pattern = btn.dataset.pattern;
+            try {
+                const payload = { pattern, list_name: 'allow', scope: _permScope };
+                if (_permScope === 'project' && _permProjectRepo) {
+                    payload.repo_path = _permProjectRepo;
+                }
+                await api.post('/api/claude-settings/permissions/rule', payload);
+                showToast(`Added ${pattern}. Restart Claude Code.`, 'warning');
+                if (_permScope === 'project' && _permProjectRepo) {
+                    _permProjectData = await api.get(`/api/claude-settings/project-permissions?repo_path=${encodeURIComponent(_permProjectRepo)}`);
+                } else {
+                    await refreshClaudeSettings();
+                }
+                await renderClaudeCodeTab(container);
+            } catch (e) {
+                showToast(e.message || 'Add failed', 'error');
             }
         });
     });
