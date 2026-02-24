@@ -1177,6 +1177,19 @@ class Database:
             )
             return cursor.lastrowid or 0
 
+    def list_gatekeeper_methods(self) -> list[str]:
+        """Return distinct method values from gatekeeper_decisions.
+
+        >>> db = Database(":memory:")
+        >>> db.list_gatekeeper_methods()
+        []
+        """
+        with self._reader() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT method FROM gatekeeper_decisions WHERE method IS NOT NULL ORDER BY method"
+            ).fetchall()
+            return [r[0] for r in rows]
+
     def list_gatekeeper_decisions(
         self,
         limit: int = 100,

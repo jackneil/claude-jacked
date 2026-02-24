@@ -1,5 +1,8 @@
 /** jacked web dashboard — Gatekeeper sub-tab (depends on logs.js) */
 
+let logsMethodFilter = 'ALL';
+let _methodOptions = [];  // cached method values from API
+
 // --- Gatekeeper sub-tab renderer ---
 function renderGatekeeperSubTab(container) {
     container.innerHTML = `
@@ -13,6 +16,10 @@ function renderGatekeeperSubTab(container) {
                     <option value="ALL" ${logsFilter === 'ALL' ? 'selected' : ''}>All Decisions</option>
                     <option value="ALLOW" ${logsFilter === 'ALLOW' ? 'selected' : ''}>Allowed</option>
                     <option value="ASK_USER" ${logsFilter === 'ASK_USER' ? 'selected' : ''}>Asked User</option>
+                </select>
+                <select id="logs-method-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
+                    <option value="ALL">All Methods</option>
+                    ${_methodOptions.map(m => `<option value="${escapeHtml(m)}" ${logsMethodFilter === m ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
                 </select>
                 <select id="logs-repo-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
                     <option value="ALL">All Repos</option>
@@ -50,6 +57,7 @@ function renderGatekeeperSubTab(container) {
     `;
 
     bindGatekeeperLogsEvents();
+    _loadMethodOptions();
     loadSessions().then(() => loadLogsData());
 }
 
@@ -59,6 +67,15 @@ function bindGatekeeperLogsEvents() {
     if (filterEl) {
         filterEl.addEventListener('change', () => {
             logsFilter = filterEl.value;
+            gkPage = 0;
+            loadLogsData();
+        });
+    }
+
+    const methodFilterEl = document.getElementById('logs-method-filter');
+    if (methodFilterEl) {
+        methodFilterEl.addEventListener('change', () => {
+            logsMethodFilter = methodFilterEl.value;
             gkPage = 0;
             loadLogsData();
         });
@@ -173,6 +190,23 @@ function renderSessionCards(sessions, activeId) {
     `;
 }
 
+async function _loadMethodOptions() {
+    try {
+        const data = await api.get('/api/logs/gatekeeper/methods');
+        _methodOptions = data.methods || [];
+        const select = document.getElementById('logs-method-filter');
+        if (select) {
+            const options = ['<option value="ALL">All Methods</option>']
+                .concat(_methodOptions.map(m =>
+                    `<option value="${escapeHtml(m)}" ${logsMethodFilter === m ? 'selected' : ''}>${escapeHtml(m)}</option>`
+                ));
+            select.innerHTML = options.join('');
+        }
+    } catch (e) {
+        console.error('Failed to load method options:', e);
+    }
+}
+
 async function loadSessions() {
     try {
         logsSessions = await api.get('/api/logs/sessions');
@@ -260,6 +294,7 @@ async function loadLogsData() {
     try {
         let url = `/api/logs/gatekeeper?limit=${gkPageSize}&offset=${gkPage * gkPageSize}`;
         if (logsFilter !== 'ALL') url += `&decision=${logsFilter}`;
+        if (logsMethodFilter !== 'ALL') url += `&method=${encodeURIComponent(logsMethodFilter)}`;
         if (logsActiveSession !== 'ALL') url += `&session_id=${encodeURIComponent(logsActiveSession)}`;
         if (logsSearch) url += `&command_search=${encodeURIComponent(logsSearch)}`;
         if (logsActiveRepo !== 'ALL') url += `&repo_path=${encodeURIComponent(logsActiveRepo)}`;

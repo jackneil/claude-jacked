@@ -748,6 +748,18 @@ async def get_gatekeeper_logs(
     }
 
 
+@router.get("/logs/gatekeeper/methods")
+async def get_gatekeeper_methods(request: Request):
+    """Return distinct method values from gatekeeper decisions."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"error": {"message": "DB unavailable", "code": "DB_UNAVAILABLE"}},
+        )
+    return {"methods": db.list_gatekeeper_methods()}
+
+
 @router.delete("/logs/gatekeeper")
 async def purge_gatekeeper_logs(
     request: Request,
