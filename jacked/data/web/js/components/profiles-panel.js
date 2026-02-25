@@ -161,7 +161,7 @@ async function _handleExportProfile() {
 
     try {
         await api.post('/api/profiles/export', formValues);
-        _showProfilesToast(`Profile "${escapeHtml(formValues.name)}" exported successfully`);
+        _showProfilesToast(`Profile "${formValues.name}" exported successfully`);
         _loadProfilesTable();
     } catch (e) {
         Swal.fire('Export Failed', escapeHtml(e.message), 'error');
@@ -259,7 +259,7 @@ async function _handleDeleteProfile(name) {
 
     try {
         await api.delete(`/api/profiles/${encodeURIComponent(name)}`);
-        _showProfilesToast(`Profile "${escapeHtml(name)}" deleted`);
+        _showProfilesToast(`Profile "${name}" deleted`);
         _loadProfilesTable();
     } catch (e) {
         Swal.fire('Delete Failed', escapeHtml(e.message), 'error');
@@ -271,17 +271,17 @@ async function _handleDeleteProfile(name) {
 // Toasts
 // ---------------------------------------------------------------------------
 
-function _showProfilesToast(html, isError) {
+function _showProfilesToast(msg, isError) {
     if (typeof showLogsToast === 'function') {
-        showLogsToast(html, isError);
+        showLogsToast(msg, isError);
         return;
     }
-    // Fallback toast
+    // Fallback toast (uses textContent to match showLogsToast contract)
     const toast = document.createElement('div');
     toast.className = `fixed bottom-2 right-2 md:bottom-6 md:right-6 left-2 md:left-auto max-w-[calc(100vw-1rem)] md:max-w-sm px-4 py-2.5 rounded-lg text-sm font-medium shadow-lg z-50 transition-opacity duration-300 ${
         isError ? 'bg-red-800 text-red-100 border border-red-600' : 'bg-green-800 text-green-100 border border-green-600'
     }`;
-    toast.innerHTML = html;
+    toast.textContent = msg;
     document.body.appendChild(toast);
     setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 4000);
 }
@@ -310,7 +310,7 @@ function _showProfilesUndoToast(message, backupPath) {
             _showProfilesToast('Restored from backup');
             _loadProfilesTable();
         } catch (e) {
-            _showProfilesToast('Restore failed: ' + escapeHtml(e.message), true);
+            _showProfilesToast('Restore failed: ' + (e.message || 'Unknown error'), true);
         }
     });
 

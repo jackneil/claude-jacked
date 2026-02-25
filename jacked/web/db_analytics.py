@@ -255,7 +255,7 @@ def get_heatmap_raw(db, days: int = 7) -> list[dict]:
     with db._reader() as conn:
         rows = conn.execute(
             "SELECT timestamp FROM gatekeeper_decisions WHERE timestamp >= ? "
-            "ORDER BY timestamp",
+            "ORDER BY timestamp LIMIT 50000",
             (cutoff,),
         ).fetchall()
     return [{"timestamp": r["timestamp"]} for r in rows]

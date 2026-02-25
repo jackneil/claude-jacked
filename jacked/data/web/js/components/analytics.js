@@ -173,11 +173,6 @@ async function loadAnalyticsData() {
             }
             html += _section('heatmap', 'Activity Heatmap', false, heatmapContent);
 
-            // Tables
-            let tablesContent = _skeleton(150);
-            if (typeof renderAnalyticsTables === 'function') {
-                tablesContent = '<div id="analytics-tables-container"></div>';
-            }
             html += _section('sessions', 'Session Risk', false,
                 '<div id="analytics-sessions-container"></div>');
             html += _section('rules', 'Rule Intelligence', false,

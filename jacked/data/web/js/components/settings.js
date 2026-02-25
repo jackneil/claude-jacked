@@ -1,6 +1,6 @@
 /**
  * jacked web dashboard — settings component
- * Tabbed layout: Agents | Commands | Gatekeeper | Features | Plugins | Claude Code | Advanced
+ * Tabbed layout: Agents | Commands | Gatekeeper | Features | Plugins | Claude Code | Advanced | Profiles
  */
 
 const SETTINGS_TAB_KEY = 'jacked_settings_tab';

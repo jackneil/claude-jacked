@@ -472,6 +472,8 @@ def delete_profile(name: str, profiles_dir: Path) -> bool:
 
     Returns True if deleted, False if not found.
     """
+    if ".." in name or "/" in name or "\\" in name:
+        raise ValueError("Invalid profile name")
     filename = _name_to_filename(name)
     filepath = profiles_dir / filename
     if filepath.exists():
