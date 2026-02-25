@@ -30,6 +30,7 @@ dependencies = [
     "uvicorn[standard]>=0.20",
     "httpx>=0.24",
     "aiohttp>=3.9.0",
+    "packaging>=23.0",
 ]
 
 [project.optional-dependencies]
