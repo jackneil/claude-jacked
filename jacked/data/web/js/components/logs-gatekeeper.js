@@ -281,8 +281,39 @@ function renderGatekeeperSubTab(container) {
 
 // --- Event binding ---
 function bindGatekeeperLogsEvents() {
+    // Parse drill-down params from hash (e.g. #logs?decision=ALLOW&from=analytics)
+    const hashParts = window.location.hash.split('?');
+    const hashParams = new URLSearchParams(hashParts[1] || '');
+
+    if (hashParams.has('decision')) {
+        logsFilter = hashParams.get('decision');
+    }
+    if (hashParams.has('method')) {
+        logsMethodFilter = hashParams.get('method');
+    }
+    if (hashParams.has('session_id')) {
+        logsActiveSession = hashParams.get('session_id');
+    }
+
+    // Show "Back to Dashboard" link when coming from analytics
+    if (hashParams.get('from') === 'analytics') {
+        const backLink = document.createElement('a');
+        backLink.href = '#analytics';
+        backLink.className = 'inline-flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 mb-3 transition-colors';
+        backLink.innerHTML = '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg> Back to Dashboard';
+        backLink.addEventListener('click', () => {
+            // Clean hash params so they don't persist
+            window.location.hash = 'analytics';
+        });
+        const logsContent = document.getElementById('logs-subtab-content');
+        if (logsContent) {
+            logsContent.insertBefore(backLink, logsContent.firstChild);
+        }
+    }
+
     const filterEl = document.getElementById('logs-filter');
     if (filterEl) {
+        filterEl.value = logsFilter;
         filterEl.addEventListener('change', () => {
             logsFilter = filterEl.value;
             gkPage = 0;
@@ -503,10 +534,105 @@ function truncateCommand(cmd, maxLen) {
     return cmd.length <= maxLen ? cmd : cmd.substring(0, maxLen) + '...';
 }
 
+// --- Row HTML builder (reused by full render and incremental prepend) ---
+// Note: all dynamic values are escaped via escapeHtml() before interpolation.
+function buildRowHtml(r, showRepo) {
+    const colors = getDecisionColors(r.decision, r.method);
+    const cmd = escapeHtml(truncateCommand(r.command, 100));
+    const fullCmd = escapeHtml(r.command || '');
+    const method = escapeHtml(r.method || '-');
+    const reason = r.reason ? escapeHtml(r.reason) : '';
+    const elapsed = formatDuration(r.elapsed_ms);
+    const ts = formatLogTimestamp(r.timestamp);
+    const repo = getRepoName(r.repo_path);
+    const fullRepo = escapeHtml(r.repo_path || '');
+    const session = r.session_id ? r.session_id.substring(0, 8) : '';
+    const fullSession = escapeHtml(r.session_id || '');
+    const colSpan = showRepo ? 6 : 5;
+
+    return `
+        <tr class="${colors.bg} hover:bg-slate-700/50 transition-colors cursor-pointer log-row" data-id="${r.id}">
+            <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap font-mono">${ts}</td>
+            <td class="px-3 py-2">
+                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium ${colors.badge}">${escapeHtml(r.decision)}</span>
+            </td>
+            <td class="px-3 py-2 text-xs text-slate-300 whitespace-nowrap">${method}</td>
+            <td class="px-3 py-2 max-w-[200px] md:max-w-md">
+                <div class="text-sm font-mono text-slate-200 truncate">${cmd}</div>
+                ${reason ? `<div class="text-xs text-slate-400 italic truncate mt-0.5">${reason}</div>` : ''}
+            </td>
+            <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap text-right">${elapsed}</td>
+            ${showRepo
+                ? `<td class="px-3 py-2 text-xs text-slate-500 whitespace-nowrap font-mono">${escapeHtml(repo || session)}</td>`
+                : ''}
+        </tr>
+        <tr class="log-detail hidden" data-id="${r.id}">
+            <td colspan="${colSpan}" class="px-4 py-3 ${colors.bg} border-t border-slate-700/30">
+                <div class="space-y-2">
+                    <div>
+                        <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Full Command</div>
+                        <pre class="text-xs font-mono text-slate-200 whitespace-pre-wrap break-all bg-slate-900/50 rounded px-3 py-2 max-h-40 overflow-y-auto">${fullCmd}</pre>
+                    </div>
+                    ${reason ? `
+                    <div>
+                        <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Reason</div>
+                        <div class="text-xs text-slate-300 italic">${reason}</div>
+                    </div>` : ''}
+                    <div class="flex items-center gap-6 text-xs text-slate-400">
+                        <div><span class="text-slate-500">Session:</span> <span class="font-mono">${fullSession}</span></div>
+                        <div><span class="text-slate-500">Repo:</span> <span class="font-mono">${fullRepo}</span></div>
+                        <div><span class="text-slate-500">Elapsed:</span> ${elapsed}</div>
+                        ${r.decision === 'ASK_USER' ? `
+                        <button class="always-allow-btn ml-auto px-3 py-1 rounded-lg text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors"
+                            data-command="${fullCmd}"
+                            data-method="${method}"
+                            data-repo="${fullRepo}">
+                            ${r.method === 'PATH_SAFETY' || r.method === 'PATH_SAFETY_FLOOR' ? 'Add Allowed Path' : 'Always Allow'}
+                        </button>` : ''}
+                    </div>
+                </div>
+            </td>
+        </tr>
+    `;
+}
+
+// --- Bind row events (click-to-expand + always-allow) on a container element ---
+function _bindRowEvents(root) {
+    root.querySelectorAll('.log-row').forEach(row => {
+        row.addEventListener('click', () => {
+            const id = row.dataset.id;
+            const detail = row.parentElement
+                ? row.parentElement.querySelector(`.log-detail[data-id="${id}"]`)
+                : null;
+            if (detail) detail.classList.toggle('hidden');
+        });
+    });
+
+    root.querySelectorAll('.always-allow-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const command = btn.dataset.command;
+            const method = btn.dataset.method;
+            const repo = btn.dataset.repo;
+            const { pattern, type } = extractPattern(command, method);
+            showAlwaysAllowModal({ pattern, type, repoPath: repo, command });
+        });
+    });
+}
+
 // --- Gatekeeper decision table (server-side paginated) ---
-async function loadLogsData() {
+let _gkFetchGen = 0;
+
+async function loadLogsData(incremental = false) {
     const container = document.getElementById('logs-content');
     if (!container) return;
+
+    // Page-0 guard: incremental only works on the first page
+    if (incremental && gkPage !== 0) {
+        return loadLogsData(false);
+    }
+
+    const myGen = ++_gkFetchGen;
 
     window.jackedState.logsInFlight = true;
     try {
@@ -518,6 +644,10 @@ async function loadLogsData() {
         if (logsActiveRepo !== 'ALL') url += `&repo_path=${encodeURIComponent(logsActiveRepo)}`;
 
         const data = await api.get(url);
+
+        // Discard stale fetch (user changed filters/page while we were waiting)
+        if (myGen !== _gkFetchGen) return;
+
         const rows = data.rows || [];
         gkTotal = data.total || 0;
 
@@ -526,9 +656,48 @@ async function loadLogsData() {
         if (gkPage > maxPage) {
             gkPage = maxPage;
             window.jackedState.logsInFlight = false;
-            return loadLogsData();
+            return loadLogsData(false);
         }
 
+        // --- Incremental path: prepend only new rows ---
+        if (incremental) {
+            const tbody = container.querySelector('tbody');
+            if (tbody && rows.length > 0) {
+                const existingIds = new Set();
+                tbody.querySelectorAll('.log-row').forEach(el => existingIds.add(el.dataset.id));
+
+                const showRepo = logsActiveSession === 'ALL';
+                const newRows = rows.filter(r => !existingIds.has(String(r.id)));
+
+                if (newRows.length > 0) {
+                    // Build new rows in a temporary tbody to parse HTML into nodes
+                    const tempTable = document.createElement('table');
+                    const tempBody = document.createElement('tbody');
+                    tempTable.appendChild(tempBody);
+                    tempBody.insertAdjacentHTML('beforeend', newRows.map(r => buildRowHtml(r, showRepo)).join(''));
+
+                    // Bind events on new rows before inserting into the live DOM
+                    _bindRowEvents(tempBody);
+
+                    // Prepend new rows to the live tbody
+                    const fragment = document.createDocumentFragment();
+                    while (tempBody.firstChild) {
+                        fragment.appendChild(tempBody.firstChild);
+                    }
+                    tbody.insertBefore(fragment, tbody.firstChild);
+                }
+
+                // Re-render pagination (outside tbody, no user state to preserve)
+                const paginationEl = container.querySelector('.pagination-controls');
+                if (paginationEl) {
+                    paginationEl.outerHTML = renderPagination('gk', gkPage, gkPageSize, gkTotal);
+                }
+                return;
+            }
+            // tbody not found or empty rows — fall through to full render
+        }
+
+        // --- Full render path ---
         if (rows.length === 0) {
             container.innerHTML = `
                 <div class="bg-slate-900 border border-slate-700 rounded-lg px-6 py-12 text-center">
@@ -544,63 +713,7 @@ async function loadLogsData() {
         }
 
         const showRepo = logsActiveSession === 'ALL';
-
-        const rowsHtml = rows.map((r, idx) => {
-            const colors = getDecisionColors(r.decision, r.method);
-            const cmd = escapeHtml(truncateCommand(r.command, 100));
-            const fullCmd = escapeHtml(r.command || '');
-            const method = escapeHtml(r.method || '-');
-            const reason = r.reason ? escapeHtml(r.reason) : '';
-            const elapsed = formatDuration(r.elapsed_ms);
-            const ts = formatLogTimestamp(r.timestamp);
-            const repo = getRepoName(r.repo_path);
-            const fullRepo = escapeHtml(r.repo_path || '');
-            const session = r.session_id ? r.session_id.substring(0, 8) : '';
-            const fullSession = escapeHtml(r.session_id || '');
-            const colSpan = showRepo ? 6 : 5;
-
-            return `
-                <tr class="${colors.bg} hover:bg-slate-700/50 transition-colors cursor-pointer log-row" data-row="${idx}">
-                    <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap font-mono">${ts}</td>
-                    <td class="px-3 py-2">
-                        <span class="inline-block px-2 py-0.5 rounded text-xs font-medium ${colors.badge}">${escapeHtml(r.decision)}</span>
-                    </td>
-                    <td class="px-3 py-2 text-xs text-slate-300 whitespace-nowrap">${method}</td>
-                    <td class="px-3 py-2 text-sm font-mono text-slate-200 max-w-[200px] md:max-w-md truncate">${cmd}</td>
-                    <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap text-right">${elapsed}</td>
-                    ${showRepo
-                        ? `<td class="px-3 py-2 text-xs text-slate-500 whitespace-nowrap font-mono">${escapeHtml(repo || session)}</td>`
-                        : ''}
-                </tr>
-                <tr class="log-detail hidden" data-detail="${idx}">
-                    <td colspan="${colSpan}" class="px-4 py-3 ${colors.bg} border-t border-slate-700/30">
-                        <div class="space-y-2">
-                            <div>
-                                <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Full Command</div>
-                                <pre class="text-xs font-mono text-slate-200 whitespace-pre-wrap break-all bg-slate-900/50 rounded px-3 py-2 max-h-40 overflow-y-auto">${fullCmd}</pre>
-                            </div>
-                            ${reason ? `
-                            <div>
-                                <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Reason</div>
-                                <div class="text-xs text-slate-300 italic">${reason}</div>
-                            </div>` : ''}
-                            <div class="flex items-center gap-6 text-xs text-slate-400">
-                                <div><span class="text-slate-500">Session:</span> <span class="font-mono">${fullSession}</span></div>
-                                <div><span class="text-slate-500">Repo:</span> <span class="font-mono">${fullRepo}</span></div>
-                                <div><span class="text-slate-500">Elapsed:</span> ${elapsed}</div>
-                                ${r.decision === 'ASK_USER' ? `
-                                <button class="always-allow-btn ml-auto px-3 py-1 rounded-lg text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors"
-                                    data-command="${fullCmd}"
-                                    data-method="${method}"
-                                    data-repo="${fullRepo}">
-                                    ${r.method === 'PATH_SAFETY' || r.method === 'PATH_SAFETY_FLOOR' ? 'Add Allowed Path' : 'Always Allow'}
-                                </button>` : ''}
-                            </div>
-                        </div>
-                    </td>
-                </tr>
-            `;
-        }).join('');
+        const rowsHtml = rows.map(r => buildRowHtml(r, showRepo)).join('');
 
         container.innerHTML = `
             <div class="bg-slate-900 border border-slate-700 rounded-lg overflow-hidden overflow-x-auto">
@@ -623,23 +736,7 @@ async function loadLogsData() {
             ${renderPagination('gk', gkPage, gkPageSize, gkTotal)}
         `;
 
-        container.querySelectorAll('.log-row').forEach(row => {
-            row.addEventListener('click', () => {
-                const detail = container.querySelector(`.log-detail[data-detail="${row.dataset.row}"]`);
-                if (detail) detail.classList.toggle('hidden');
-            });
-        });
-
-        container.querySelectorAll('.always-allow-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const command = btn.dataset.command;
-                const method = btn.dataset.method;
-                const repo = btn.dataset.repo;
-                const { pattern, type } = extractPattern(command, method);
-                showAlwaysAllowModal({ pattern, type, repoPath: repo, command });
-            });
-        });
+        _bindRowEvents(container);
     } catch (e) {
         container.innerHTML = `
             <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
