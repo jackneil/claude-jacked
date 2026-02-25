@@ -1281,10 +1281,6 @@ def _remove_behavioral_rules(claude_md_path: Path) -> bool:
     return True
 
 
-def _security_hook_marker() -> str:
-    """Marker to identify jacked security gatekeeper hooks."""
-    return "# jacked-security"
-
 
 def _session_tracker_marker() -> str:
     """Marker to identify jacked session-account tracker hooks."""
@@ -1407,22 +1403,18 @@ def _verify_session_tracker_hooks(settings: dict):
             )
 
 
-GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"]
-
-
 def _install_security_hook(existing: dict, settings_path: Path):
-    """Install security gatekeeper hooks for Bash + file tool PreToolUse events.
+    """Install a single catch-all security gatekeeper PreToolUse hook.
 
-    Installs one PreToolUse hook entry per tool matcher (Bash, Read, Edit, Write, Grep, Glob, NotebookEdit).
-    Bash hook evaluates commands through the full 4-tier pipeline.
-    File tool hooks enforce path safety rules (sensitive files, outside-project access).
+    Uses an empty matcher to intercept ALL tool calls. The gatekeeper script
+    decides internally which tools to process vs pass-through based on the
+    DB/registry config. Migrates old per-tool entries to catch-all mode.
 
     Handles fresh install, version upgrades, and migration from PermissionRequest.
     """
     import json
     import shutil
 
-    marker = _security_hook_marker()
     script_path = _get_data_root() / "hooks" / "security_gatekeeper.py"
 
     if not script_path.exists():
@@ -1442,14 +1434,14 @@ def _install_security_hook(existing: dict, settings_path: Path):
     script_str = str(script_path).replace("\\", "/")
     command_str = f"{python_path} {script_str}"
 
-    # Migrate: remove old PermissionRequest hooks with our marker
+    # Migrate: remove old PermissionRequest hooks
     if "PermissionRequest" in existing.get("hooks", {}):
         old_hooks = existing["hooks"]["PermissionRequest"]
         before = len(old_hooks)
         existing["hooks"]["PermissionRequest"] = [
             h
             for h in old_hooks
-            if marker not in str(h) and "security_gatekeeper" not in str(h)
+            if "security_gatekeeper" not in str(h)
         ]
         if len(existing["hooks"]["PermissionRequest"]) < before:
             console.print(
@@ -1459,55 +1451,45 @@ def _install_security_hook(existing: dict, settings_path: Path):
     if "PreToolUse" not in existing["hooks"]:
         existing["hooks"]["PreToolUse"] = []
 
-    # Install/upgrade hooks for each tool matcher
-    modified = False
-    for tool in GATEKEEPER_TOOLS:
-        # Find existing hook for this tool matcher
-        hook_index = None
-        needs_upgrade = False
-        for i, hook_entry in enumerate(existing["hooks"]["PreToolUse"]):
-            hook_str = str(hook_entry)
-            entry_matcher = hook_entry.get("matcher", "")
-            if entry_matcher == tool and (
-                marker in hook_str or "security_gatekeeper" in hook_str
-            ):
-                hook_index = i
-                for h in hook_entry.get("hooks", []):
-                    if h.get("command", "") != command_str:
-                        needs_upgrade = True
-                break
-
-        if hook_index is not None and not needs_upgrade:
-            continue  # already up to date
-
-        hook_entry = {
-            "matcher": tool,
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command_str,
-                    "timeout": 30,
-                }
-            ],
-        }
-
-        if hook_index is not None and needs_upgrade:
-            existing["hooks"]["PreToolUse"][hook_index] = hook_entry
-            modified = True
-        else:
-            existing["hooks"]["PreToolUse"].append(hook_entry)
-            modified = True
-
-    if not modified:
-        console.print(
-            "[yellow][-][/yellow] Security gatekeeper hooks already configured"
+    # Migrate: remove old per-tool gatekeeper entries (non-empty matcher)
+    existing["hooks"]["PreToolUse"] = [
+        h for h in existing["hooks"]["PreToolUse"]
+        if not (
+            "security_gatekeeper" in str(h)
+            and h.get("matcher", "") != ""
         )
-        return
+    ]
+
+    # Check if catch-all already exists and is up to date
+    for entry in existing["hooks"]["PreToolUse"]:
+        if (
+            entry.get("matcher") == ""
+            and "security_gatekeeper" in str(entry)
+        ):
+            # Update command if python path changed
+            for h in entry.get("hooks", []):
+                if h.get("command", "") != command_str:
+                    h["command"] = command_str
+                    settings_path.parent.mkdir(parents=True, exist_ok=True)
+                    settings_path.write_text(json.dumps(existing, indent=2))
+                    console.print(
+                        "[green][OK][/green] Updated security gatekeeper hook (python path changed)"
+                    )
+                    return
+            console.print(
+                "[yellow][-][/yellow] Security gatekeeper hook already configured"
+            )
+            return
+
+    # Add catch-all entry
+    existing["hooks"]["PreToolUse"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
+    })
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(existing, indent=2))
-    tools_str = ", ".join(GATEKEEPER_TOOLS)
-    console.print(f"[green][OK][/green] Installed security gatekeeper for: {tools_str}")
+    console.print("[green][OK][/green] Installed security gatekeeper (catch-all hook)")
 
     # Clean up stale prompt file from older versions (v0.3.9 and earlier created
     # this automatically, but it goes stale on upgrades and triggers warnings).
@@ -1553,7 +1535,6 @@ def _remove_security_hook(settings_path: Path) -> bool:
         return False
 
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    marker = _security_hook_marker()
     modified = False
 
     for hook_type in ["PreToolUse", "PermissionRequest"]:
@@ -1563,7 +1544,7 @@ def _remove_security_hook(settings_path: Path) -> bool:
         settings["hooks"][hook_type] = [
             h
             for h in settings["hooks"][hook_type]
-            if marker not in str(h) and "security_gatekeeper" not in str(h)
+            if "security_gatekeeper" not in str(h)
         ]
         if len(settings["hooks"][hook_type]) < before:
             modified = True

@@ -24,8 +24,7 @@ SETTINGS_JSON = CLAUDE_DIR / "settings.json"
 CLAUDE_MD = CLAUDE_DIR / "CLAUDE.md"
 DATA_ROOT = Path(__file__).parent.parent.parent / "data"
 
-# Markers (match cli.py exactly)
-SECURITY_MARKER = "# jacked-security"
+# Markers
 SOUND_MARKER = "# jacked-sound: "
 RULES_START_PREFIX = "# jacked-behaviors-v"
 RULES_END_MARKER = "# end-jacked-behaviors"
@@ -534,7 +533,7 @@ async def _toggle_hook(name: str, enabled: bool, db=None):
             if db is not None:
                 import json
                 db.set_setting("gatekeeper.enabled", json.dumps(enabled))
-            # Ensure all 7 tool matchers are registered (idempotent repair).
+            # Ensure all known tool matchers are registered (idempotent repair).
             # Hook entries stay in settings.json permanently — the DB flag
             # controls whether the hook actually runs.
             _ensure_gatekeeper_hooks(settings)
@@ -647,14 +646,12 @@ async def _toggle_rules(enabled: bool):
 
 # --- Hook enable/disable helpers ---
 
-GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"]
-
-
 def _ensure_gatekeeper_hooks(settings: dict):
-    """Ensure all gatekeeper hook entries are registered for every tool.
+    """Ensure a single catch-all gatekeeper hook is registered.
 
-    Idempotent — only adds missing matchers without duplicating existing ones.
-    Used by both initial install and toggle repair.
+    Uses an empty matcher to intercept ALL tool calls. The gatekeeper decides
+    internally which tools to process vs pass-through based on DB/registry
+    config. Migrates old per-tool entries to catch-all mode. Idempotent.
     """
     python_exe = sys.executable
     if not python_exe or not Path(python_exe).exists():
@@ -668,16 +665,32 @@ def _ensure_gatekeeper_hooks(settings: dict):
     if "PreToolUse" not in settings["hooks"]:
         settings["hooks"]["PreToolUse"] = []
 
-    for tool in GATEKEEPER_TOOLS:
-        already = any(
-            entry.get("matcher") == tool and "security_gatekeeper" in str(entry)
-            for entry in settings["hooks"]["PreToolUse"]
+    # Migrate: remove old per-tool gatekeeper entries
+    settings["hooks"]["PreToolUse"] = [
+        h for h in settings["hooks"]["PreToolUse"]
+        if not (
+            "security_gatekeeper" in str(h)
+            and h.get("matcher", "") != ""
         )
-        if not already:
-            settings["hooks"]["PreToolUse"].append({
-                "matcher": tool,
-                "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
-            })
+    ]
+
+    # Check if catch-all already exists and is up to date
+    for entry in settings["hooks"]["PreToolUse"]:
+        if (
+            entry.get("matcher") == ""
+            and "security_gatekeeper" in str(entry)
+        ):
+            # Update command if needed (handles python path changes)
+            for h in entry.get("hooks", []):
+                if h.get("command", "") != command_str:
+                    h["command"] = command_str
+            return
+
+    # Add catch-all entry
+    settings["hooks"]["PreToolUse"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
+    })
 
 
 # Keep old name as alias for backwards compatibility with CLI installer
@@ -690,7 +703,7 @@ def _disable_security_hook(settings: dict):
         if hook_type in settings.get("hooks", {}):
             settings["hooks"][hook_type] = [
                 h for h in settings["hooks"][hook_type]
-                if SECURITY_MARKER not in str(h) and "security_gatekeeper" not in str(h)
+                if "security_gatekeeper" not in str(h)
             ]
 
 
