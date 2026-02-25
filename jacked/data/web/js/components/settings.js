@@ -26,6 +26,7 @@ function renderSettings(settings) {
                 <button class="settings-tab ${savedTab === 'plugins' ? 'active' : ''}" data-tab="plugins">Plugins</button>
                 <button class="settings-tab ${savedTab === 'claude-code' ? 'active' : ''}" data-tab="claude-code">Claude Code</button>
                 <button class="settings-tab ${savedTab === 'advanced' ? 'active' : ''}" data-tab="advanced">Advanced</button>
+                <button class="settings-tab ${savedTab === 'profiles' ? 'active' : ''}" data-tab="profiles">Profiles</button>
             </div>
 
             <!-- Tab Content -->
@@ -97,6 +98,9 @@ async function renderSettingsTab(tabName) {
             break;
         case 'advanced':
             renderAdvancedTab(container);
+            break;
+        case 'profiles':
+            renderProfilesTab(container);
             break;
         default:
             container.innerHTML = '<div class="text-slate-500">Unknown tab</div>';
@@ -2462,6 +2466,13 @@ async function _loadRawEditor() {
         textarea.value = `Error loading settings: ${e.message}`;
         textarea.disabled = true;
     }
+}
+
+// --- Tab: Profiles ---
+
+function renderProfilesTab(container) {
+    container.innerHTML = renderProfilesPanel();
+    bindProfilesPanelEvents();
 }
 
 // --- Tab: Advanced ---

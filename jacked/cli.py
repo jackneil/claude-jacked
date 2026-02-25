@@ -2222,6 +2222,196 @@ def gatekeeper_reset(yes: bool):
     console.print(f"[dim]{PROMPT_PATH}[/dim]")
 
 
+@main.group()
+def profiles():
+    """Manage security profiles -- export, import, list, delete."""
+    pass
+
+
+@profiles.command(name="list")
+def profiles_list():
+    """List saved security profiles."""
+    from jacked.profiles import PROFILE_DIR_NAME, list_profiles
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+    items = list_profiles(profiles_dir)
+
+    if not items:
+        console.print("[dim]No saved profiles.[/dim]")
+        return
+
+    table = Table(title="Security Profiles", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="white")
+    table.add_column("Description", style="dim")
+    table.add_column("Author", style="dim")
+    table.add_column("Version", style="dim")
+    table.add_column("Created", style="dim")
+
+    for p in items:
+        created = p.get("created_at", "")
+        if created:
+            try:
+                from datetime import datetime
+
+                dt = datetime.fromisoformat(created)
+                created = dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+        table.add_row(
+            p.get("name", "?"),
+            p.get("description", ""),
+            p.get("author", ""),
+            p.get("jacked_version", ""),
+            created,
+        )
+
+    console.print(table)
+
+
+@profiles.command(name="export")
+@click.argument("name")
+@click.option("-d", "--description", default="", help="Profile description")
+def profiles_export(name: str, description: str):
+    """Export current gatekeeper config + rules as a named profile."""
+    import json as _json
+
+    from jacked.profiles import PROFILE_DIR_NAME, export_profile
+    from jacked.web.database import Database
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+
+    # Read settings.json
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_json: dict = {}
+    if settings_path.exists():
+        try:
+            settings_json = _json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    try:
+        db = Database()
+    except Exception as e:
+        console.print(f"[red]Cannot open database: {e}[/red]")
+        raise SystemExit(1)
+
+    try:
+        filepath = export_profile(
+            name=name,
+            description=description,
+            author="",
+            db=db,
+            settings_json=settings_json,
+            profiles_dir=profiles_dir,
+        )
+        console.print(f"[green][OK][/green] Profile exported: {filepath}")
+    except Exception as e:
+        console.print(f"[red]Export failed: {e}[/red]")
+        raise SystemExit(1)
+    finally:
+        db.close()
+
+
+@profiles.command(name="import")
+@click.argument("path", type=click.Path(exists=True))
+def profiles_import(path: str):
+    """Import a profile from a JSON file."""
+    import json as _json
+
+    from jacked.profiles import (
+        BACKUP_DIR_NAME,
+        PROFILE_DIR_NAME,
+        import_profile,
+        validate_profile,
+    )
+    from jacked.web.database import Database
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+    backup_dir = profiles_dir / BACKUP_DIR_NAME
+
+    # Read profile file
+    try:
+        profile_data = _json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]Cannot read profile: {e}[/red]")
+        raise SystemExit(1)
+
+    # Validate
+    try:
+        warnings = validate_profile(profile_data)
+    except ValueError as e:
+        console.print(f"[red]Validation failed: {e}[/red]")
+        raise SystemExit(1)
+
+    if warnings:
+        console.print("[yellow]Warnings:[/yellow]")
+        for w in warnings:
+            console.print(f"  [yellow]- {w}[/yellow]")
+
+    if not click.confirm("Apply this profile?"):
+        console.print("Cancelled")
+        return
+
+    # Read settings.json
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_json: dict = {}
+    if settings_path.exists():
+        try:
+            settings_json = _json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    def _write_settings(data: dict):
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = settings_path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(settings_path)
+
+    try:
+        db = Database()
+    except Exception as e:
+        console.print(f"[red]Cannot open database: {e}[/red]")
+        raise SystemExit(1)
+
+    try:
+        backup_path, import_warnings = import_profile(
+            profile_data=profile_data,
+            db=db,
+            settings_json=settings_json,
+            write_settings_fn=_write_settings,
+            profiles_dir=profiles_dir,
+            backup_dir=backup_dir,
+        )
+        console.print(f"[green][OK][/green] Profile imported!")
+        console.print(f"[dim]Backup saved to: {backup_path}[/dim]")
+    except Exception as e:
+        console.print(f"[red]Import failed: {e}[/red]")
+        raise SystemExit(1)
+    finally:
+        db.close()
+
+
+@profiles.command(name="delete")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+def profiles_delete(name: str, yes: bool):
+    """Delete a saved profile."""
+    from jacked.profiles import PROFILE_DIR_NAME, delete_profile
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+
+    if not yes:
+        if not click.confirm(f'Delete profile "{name}"?'):
+            console.print("Cancelled")
+            return
+
+    deleted = delete_profile(name, profiles_dir)
+    if deleted:
+        console.print(f"[green][OK][/green] Profile '{name}' deleted")
+    else:
+        console.print(f"[yellow]Profile '{name}' not found[/yellow]")
+
+
 HIGH_RISK_PREFIXES = {
     "python": "arbitrary code execution via -c",
     "python3": "arbitrary code execution via -c",
