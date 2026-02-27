@@ -1482,6 +1482,106 @@ async def update_command_categories(body: CommandCategoriesRequest, request: Req
     return {"updated": True, "overrides": overrides}
 
 
+# --- Gatekeeper tool selection ---
+
+
+class GatedToolsRequest(BaseModel):
+    tools: dict[str, bool]
+
+
+@router.get("/settings/gatekeeper/tools")
+async def get_gated_tools(request: Request):
+    """Tool registry metadata + current enabled state."""
+    import json
+
+    from jacked.data.hooks.security_gatekeeper import get_gatekeeper_tools_metadata
+
+    db = getattr(request.app.state, "db", None)
+
+    metadata = get_gatekeeper_tools_metadata()
+
+    # Read current overrides from DB
+    overrides: dict = {}
+    if db is not None:
+        raw = db.get_setting("gatekeeper.tools")
+        if raw:
+            try:
+                overrides = json.loads(raw)
+                if not isinstance(overrides, dict):
+                    overrides = {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Merge: enabled = override if present, else default_enabled
+    tools = {}
+    for name, meta in metadata.items():
+        enabled = overrides.get(name, meta["default_enabled"])
+        # Locked tools are always enabled regardless of DB
+        if meta["locked"]:
+            enabled = True
+        tools[name] = {
+            **meta,
+            "enabled": enabled,
+        }
+
+    return {"tools": tools}
+
+
+@router.put("/settings/gatekeeper/tools")
+async def update_gated_tools(body: GatedToolsRequest, request: Request):
+    """Save tool enabled/disabled overrides."""
+    import json
+
+    from jacked.gatekeeper_registry import GATEKEEPER_TOOL_REGISTRY
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
+        )
+
+    # Validate: only known tools
+    invalid = [k for k in body.tools if k not in GATEKEEPER_TOOL_REGISTRY]
+    if invalid:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Unknown tool names: {', '.join(invalid)}",
+                    "code": "INVALID_TOOL_NAME",
+                }
+            },
+        )
+
+    # Reject disabling locked tools
+    for name, enabled in body.tools.items():
+        info = GATEKEEPER_TOOL_REGISTRY[name]
+        if info["locked"] and not enabled:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "error": {
+                        "message": f"Cannot disable locked tool: {name}",
+                        "code": "TOOL_LOCKED",
+                    }
+                },
+            )
+
+    # Only store overrides that differ from defaults
+    overrides = {}
+    for name, enabled in body.tools.items():
+        default = GATEKEEPER_TOOL_REGISTRY[name]["default_enabled"]
+        if enabled != default:
+            overrides[name] = enabled
+
+    db.set_setting("gatekeeper.tools", json.dumps(overrides))
+
+    return {"updated": True, "overrides": overrides}
+
+
 # --- Generic settings (parameterized routes AFTER static ones) ---
 
 

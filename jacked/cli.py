@@ -1611,6 +1611,100 @@ def _remove_session_tracker_hooks(settings_path: Path) -> bool:
     return False
 
 
+def _qa_hook_marker() -> str:
+    """Marker to identify jacked QA suggestion hook."""
+    return "# jacked-qa-suggest"
+
+
+def _install_qa_hook(existing: dict, settings_path: Path):
+    """Install QA suggestion Stop hook that detects UI file changes.
+
+    Registers a Stop hook that checks git diff for UI file changes
+    and suggests running /qa when changes are detected.
+
+    >>> # Smoke test — function exists and is callable
+    >>> callable(_install_qa_hook)
+    True
+    """
+    import json
+    import shutil
+
+    script_path = _get_data_root() / "hooks" / "qa_suggest.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] QA suggest script not found: {script_path}"
+        )
+        return
+
+    python_exe = sys.executable
+    if not python_exe or not Path(python_exe).exists():
+        python_exe = shutil.which("python3") or shutil.which("python") or "python"
+
+    python_path = str(Path(python_exe)).replace("\\", "/")
+    script_str = str(script_path).replace("\\", "/")
+    command_str = f"{python_path} {script_str}"
+
+    if "Stop" not in existing["hooks"]:
+        existing["hooks"]["Stop"] = []
+
+    # Check if already installed and up to date
+    for entry in existing["hooks"]["Stop"]:
+        if "qa_suggest" in str(entry):
+            for h in entry.get("hooks", []):
+                if h.get("command", "") != command_str:
+                    h["command"] = command_str
+                    settings_path.parent.mkdir(parents=True, exist_ok=True)
+                    settings_path.write_text(json.dumps(existing, indent=2))
+                    console.print(
+                        "[green][OK][/green] Updated QA suggest hook (python path changed)"
+                    )
+                    return
+            console.print(
+                "[yellow][-][/yellow] QA suggest hook already configured"
+            )
+            return
+
+    existing["hooks"]["Stop"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "async": True}],
+    })
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(existing, indent=2))
+    console.print("[green][OK][/green] Installed QA suggest hook (Stop event)")
+
+
+def _remove_qa_hook(settings_path: Path) -> bool:
+    """Remove jacked QA suggestion hook. Returns True if removed.
+
+    >>> # Smoke test — function exists and is callable
+    >>> callable(_remove_qa_hook)
+    True
+    """
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    if "Stop" not in settings.get("hooks", {}):
+        return False
+
+    before = len(settings["hooks"]["Stop"])
+    settings["hooks"]["Stop"] = [
+        h for h in settings["hooks"]["Stop"] if "qa_suggest" not in str(h)
+    ]
+
+    if len(settings["hooks"]["Stop"]) < before:
+        settings_path.write_text(json.dumps(settings, indent=2))
+        console.print("[green][OK][/green] Removed QA suggest hook")
+        return True
+
+    return False
+
+
 def _detect_project_env() -> str | None:
     """Detect the project's Python env root from the running interpreter.
 
@@ -1772,19 +1866,21 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             r"[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)"
         )
 
-    # Copy skill file with Python path templating
+    # Install skills — iterate all skills/*/SKILL.md in data root
     # Claude Code expects skills in subdirectories with SKILL.md
-    skill_dir = home / ".claude" / "skills" / "jacked"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
-    skill_src = pkg_root / "skills" / "jacked" / "SKILL.md"
-    skill_dst = skill_dir / "SKILL.md"
-
-    if skill_src.exists():
-        shutil.copy(skill_src, skill_dst)
-        console.print("[green][OK][/green] Installed skill: /jacked")
+    skills_src_dir = pkg_root / "skills"
+    skill_count = 0
+    if skills_src_dir.exists():
+        for skill_md in skills_src_dir.glob("*/SKILL.md"):
+            skill_name = skill_md.parent.name
+            skill_dir = home / ".claude" / "skills" / skill_name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy(skill_md, skill_dir / "SKILL.md")
+            skill_count += 1
+    if skill_count > 0:
+        console.print(f"[green][OK][/green] Installed {skill_count} skills")
     else:
-        console.print(f"[yellow][-][/yellow] Skill file not found at {skill_src}")
+        console.print("[yellow][-][/yellow] No skills found to install")
 
     # Copy jacked reference doc (comprehensive knowledge for Claude about jacked)
     ref_src = pkg_root / "rules" / "jacked-reference.md"
@@ -1919,6 +2015,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 
     # Install session-account tracker hooks (always — lightweight, no deps)
     _install_session_tracker_hook(existing, settings_path)
+
+    # Install QA suggestion hook (always — lightweight, no deps)
+    _install_qa_hook(existing, settings_path)
 
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
@@ -2066,6 +2165,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _remove_sound_hooks(settings_path)
     _remove_security_hook(settings_path)
     _remove_session_tracker_hooks(settings_path)
+    _remove_qa_hook(settings_path)
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):
         console.print("[green][OK][/green] Removed behavioral rules from CLAUDE.md")
@@ -2097,13 +2197,20 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     else:
         console.print("[yellow][-][/yellow] No settings.json found")
 
-    # Remove skill directory
-    skill_dir = home / ".claude" / "skills" / "jacked"
-    if skill_dir.exists():
-        shutil.rmtree(skill_dir)
-        console.print("[green][OK][/green] Removed skill: /jacked")
+    # Remove skill directories — iterate all skills/*/SKILL.md in data root
+    skills_src_dir = pkg_root / "skills"
+    skill_count = 0
+    if skills_src_dir.exists():
+        for skill_md in skills_src_dir.glob("*/SKILL.md"):
+            skill_name = skill_md.parent.name
+            skill_dir = home / ".claude" / "skills" / skill_name
+            if skill_dir.exists():
+                shutil.rmtree(skill_dir)
+                skill_count += 1
+    if skill_count > 0:
+        console.print(f"[green][OK][/green] Removed {skill_count} skills")
     else:
-        console.print("[yellow][-][/yellow] Skill not found")
+        console.print("[yellow][-][/yellow] No skills found")
 
     # Remove jacked reference doc
     ref_path = home / ".claude" / "jacked-reference.md"
@@ -2882,6 +2989,12 @@ def claude_cmd(account, claude_args):
         raise click.ClickException(
             "jacked database not found. Run 'jacked webux' first to initialize."
         )
+
+    # If account looks like a Claude CLI flag (e.g. --resume, -p),
+    # prepend it back to claude_args and resolve the active account instead.
+    if account is not None and account.startswith("-"):
+        claude_args = (account,) + tuple(claude_args)
+        account = None
 
     db = Database(str(db_path))
     try:

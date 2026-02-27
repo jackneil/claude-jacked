@@ -4,7 +4,10 @@ let logsMethodFilter = 'ALL';
 let _methodOptions = [];  // cached method values from API
 
 // --- Pattern extraction ---
-const _MULTI_WORD_COMMANDS = new Set([
+const _ENV_PREFIX_RE = /^(\w+=\S+\s+)+/;
+
+const _KNOWN_COMMAND_PREFIXES = new Set([
+    // 2-word prefixes
     'git push', 'git commit', 'git pull', 'git checkout', 'git merge', 'git rebase',
     'git clone', 'git fetch', 'git stash', 'git diff', 'git log', 'git add',
     'npm install', 'npm run', 'npm test', 'npm start', 'npm exec',
@@ -14,32 +17,112 @@ const _MULTI_WORD_COMMANDS = new Set([
     'cargo build', 'cargo test', 'cargo run',
     'go build', 'go test', 'go run', 'go get',
     'uv run', 'uv pip',
+    // 3-word prefixes
+    'python -m pytest', 'python -m pip', 'python -m venv',
+    'docker compose up', 'docker compose down', 'docker compose build', 'docker compose logs',
+    'npx create react', 'npx create next',
+    'uv run python', 'uv pip install',
 ]);
 
-function extractPattern(command, method) {
-    if (!command) return { pattern: '', type: 'permission' };
+// Commands whose broad allow rules bypass LLM safety evaluation
+const _SECURITY_SENSITIVE_BASES = new Set([
+    'curl', 'wget',
+    'pip install', 'npm install', 'npx', 'bunx',
+    'cargo install', 'gem install', 'go install',
+    'pipx install', 'yarn add', 'pnpx',
+    'uv pip install', 'uv tool install',
+]);
 
-    // PATH_SAFETY methods: extract file path
+function _isSensitive(prefix) {
+    for (const s of _SECURITY_SENSITIVE_BASES) {
+        if (prefix === s || prefix.startsWith(s + ' ') || s.startsWith(prefix + ' ')) return true;
+    }
+    return false;
+}
+
+function extractPatternLevels(command, method) {
+    if (!command) return [];
+
+    // PATH_SAFETY: single level
     if (method === 'PATH_SAFETY' || method === 'PATH_SAFETY_FLOOR') {
         const pathMatch = command.match(/^\[?\w+\]?\s+(\/\S+)/);
-        if (pathMatch) return { pattern: pathMatch[1], type: 'path' };
+        if (pathMatch) return [{
+            pattern: pathMatch[1], type: 'path',
+            label: pathMatch[1], description: 'Allow this path',
+            matchEnd: pathMatch[1].length, recommended: true, warning: null
+        }];
+        return [];
     }
 
-    // Strip env var prefixes (FOO=bar BAR=baz cmd ...)
-    let cmd = command.replace(/^(\w+=\S+\s+)+/, '');
+    // Strip env-var prefixes — use stripped for all pattern logic AND display
+    const stripped = command.replace(_ENV_PREFIX_RE, '');
+    const parts = stripped.split(/\s+/).filter(Boolean);
+    if (!parts.length) return [];
 
-    // Extract base command — check multi-word first
-    const parts = cmd.split(/\s+/);
-    const twoWord = parts.slice(0, 2).join(' ');
-    if (_MULTI_WORD_COMMANDS.has(twoWord)) {
-        return { pattern: `Bash(${twoWord}:*)`, type: 'permission' };
+    const base = parts[0];
+    const levels = [];
+    const seen = new Set();
+
+    function addLevel(prefix, isExact, recommended, desc) {
+        const pattern = isExact ? `Bash(${prefix})` : `Bash(${prefix}:*)`;
+        if (seen.has(pattern)) return;
+        seen.add(pattern);
+        const sensitive = !isExact && _isSensitive(prefix);
+        const effectiveRec = sensitive ? false : recommended;
+        const truncLabel = isExact && prefix.length > 80
+            ? prefix.substring(0, 77) + '\u2026' : prefix;
+        let warning = null;
+        if (sensitive) {
+            warning = (prefix === base)
+                ? 'Bypasses LLM safety checks for this command category'
+                : 'Broad \u2014 skips per-invocation safety review';
+        }
+        levels.push({
+            pattern, type: 'permission',
+            label: isExact ? truncLabel : `${prefix} *`,
+            description: desc,
+            matchEnd: prefix.length,
+            recommended: effectiveRec,
+            warning
+        });
     }
 
-    const base = parts[0] || '';
-    if (base) {
-        return { pattern: `Bash(${base}:*)`, type: 'permission' };
+    // Base (broadest)
+    addLevel(base, false, false, `Allow all ${base} commands`);
+
+    // Subcommand (from dictionary, check 3-word then 2-word)
+    let sub = base;
+    for (const len of [3, 2]) {
+        if (parts.length >= len) {
+            const candidate = parts.slice(0, len).join(' ');
+            if (_KNOWN_COMMAND_PREFIXES.has(candidate)) {
+                sub = candidate;
+                break;
+            }
+        }
     }
-    return { pattern: '', type: 'permission' };
+    if (sub !== base) {
+        addLevel(sub, false, true, `Allow ${sub} with any args`);
+    }
+
+    // Exact (narrowest)
+    addLevel(stripped, true, false, 'Allow only this exact command');
+
+    // If no subcommand level, recommend base (unless sensitive — then recommend exact)
+    if (sub === base) {
+        if (_isSensitive(base)) {
+            levels[levels.length - 1].recommended = true;
+        } else {
+            levels[0].recommended = true;
+        }
+    }
+
+    // Safety net: ensure exactly one level is recommended
+    if (!levels.some(l => l.recommended) && levels.length > 0) {
+        levels[levels.length - 1].recommended = true;
+    }
+
+    return levels;
 }
 
 // --- File-tool names (project-scope warning) ---
@@ -51,12 +134,11 @@ function _isFileToolPattern(pattern) {
 }
 
 // --- Always Allow modal ---
-function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
-    // Remove any existing modal
+function showAlwaysAllowModal({ levels, repoPath, strippedCommand }) {
     const existing = document.getElementById('always-allow-modal-overlay');
     if (existing) existing.remove();
 
-    const isPath = type === 'path';
+    const isPath = levels.length === 1 && levels[0].type === 'path';
     const repoName = repoPath ? repoPath.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
 
     const overlay = document.createElement('div');
@@ -64,7 +146,7 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
     overlay.className = 'fixed inset-0 bg-black/60 flex items-center justify-center z-50';
 
     const modal = document.createElement('div');
-    modal.className = 'bg-slate-800 border border-slate-600 rounded-xl shadow-2xl w-full max-w-md mx-4 p-6';
+    modal.className = 'bg-slate-800 border border-slate-600 rounded-xl shadow-2xl w-full max-w-lg mx-4 p-6';
 
     // Title
     const title = document.createElement('h3');
@@ -72,36 +154,179 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
     title.textContent = isPath ? 'Add Allowed Path' : 'Always Allow Rule';
     modal.appendChild(title);
 
-    // Command preview
-    if (command) {
+    // Command preview with dynamic highlighting
+    let cmdPreviewText = null;
+    if (strippedCommand) {
         const cmdPreview = document.createElement('div');
         cmdPreview.className = 'mb-4 bg-slate-900/50 rounded-lg px-3 py-2';
         const cmdLabel = document.createElement('div');
         cmdLabel.className = 'text-[10px] uppercase tracking-wider text-slate-500 mb-1';
         cmdLabel.textContent = 'Command';
-        const cmdText = document.createElement('pre');
-        cmdText.className = 'text-xs font-mono text-slate-300 whitespace-pre-wrap break-all max-h-20 overflow-y-auto';
-        cmdText.textContent = command.length > 200 ? command.substring(0, 200) + '...' : command;
+        cmdPreviewText = document.createElement('pre');
+        cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto';
         cmdPreview.appendChild(cmdLabel);
-        cmdPreview.appendChild(cmdText);
+        cmdPreview.appendChild(cmdPreviewText);
         modal.appendChild(cmdPreview);
     }
 
-    // Pattern input
-    const patternLabel = document.createElement('label');
-    patternLabel.className = 'block text-sm text-slate-300 mb-1';
-    patternLabel.textContent = isPath ? 'Path to allow:' : 'Permission pattern:';
-    modal.appendChild(patternLabel);
+    // Update command preview highlighting based on matchEnd
+    function updatePreview(matchEnd) {
+        if (!cmdPreviewText || !strippedCommand) return;
+        const display = strippedCommand.length > 200
+            ? strippedCommand.substring(0, 200) + '\u2026' : strippedCommand;
+        const cutAt = Math.min(matchEnd, display.length);
+        cmdPreviewText.innerHTML = '';
+        if (cutAt >= display.length) {
+            // Exact match — all bright
+            cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto text-slate-100';
+            cmdPreviewText.textContent = display;
+        } else {
+            cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto';
+            const bright = document.createElement('span');
+            bright.className = 'text-slate-100';
+            bright.textContent = display.substring(0, cutAt);
+            const dim = document.createElement('span');
+            dim.className = 'text-slate-500';
+            dim.textContent = display.substring(cutAt);
+            cmdPreviewText.appendChild(bright);
+            cmdPreviewText.appendChild(dim);
+        }
+    }
 
-    const patternInput = document.createElement('input');
-    patternInput.type = 'text';
-    patternInput.className = 'w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 mb-4';
-    patternInput.value = pattern;
-    modal.appendChild(patternInput);
+    // Track selected pattern for submission
+    let selectedPattern = '';
+    const recommendedLevel = levels.find(l => l.recommended) || levels[0];
 
-    // Scope selection (not for path type — paths always go to gatekeeper config)
-    let scopeGlobal = null;
-    let scopeProject = null;
+    if (isPath) {
+        // Path safety: simple input (unchanged from previous behavior)
+        selectedPattern = levels[0].pattern;
+        const pathInput = document.createElement('input');
+        pathInput.type = 'text';
+        pathInput.className = 'w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 mb-4';
+        pathInput.value = levels[0].pattern;
+        pathInput.addEventListener('input', () => { selectedPattern = pathInput.value.trim(); });
+        modal.appendChild(pathInput);
+    } else {
+        // Level radio cards
+        const levelLabel = document.createElement('div');
+        levelLabel.className = 'text-sm text-slate-300 mb-2';
+        levelLabel.textContent = 'Match level:';
+        modal.appendChild(levelLabel);
+
+        const radioGroup = document.createElement('div');
+        radioGroup.className = 'mb-4 rounded-lg border border-slate-700 overflow-hidden';
+
+        // Custom pattern input (hidden by default) + sensitivity warning
+        const customInput = document.createElement('input');
+        customInput.type = 'text';
+        customInput.className = 'w-full bg-slate-900 border-t border-slate-700 px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 hidden';
+        customInput.value = recommendedLevel.pattern;
+        const customWarn = document.createElement('div');
+        customWarn.className = 'text-[11px] text-amber-400 px-3 py-1 hidden';
+        customInput.addEventListener('input', () => {
+            selectedPattern = customInput.value.trim();
+            // Check if custom pattern bypasses LLM safety
+            const m = selectedPattern.match(/^Bash\((.+?)(?::?\*?)?\)$/);
+            if (m && _isSensitive(m[1])) {
+                customWarn.textContent = '\u26A0 This pattern bypasses LLM safety checks';
+                customWarn.classList.remove('hidden');
+            } else {
+                customWarn.classList.add('hidden');
+            }
+        });
+
+        levels.forEach((level, i) => {
+            const card = document.createElement('label');
+            card.className = 'flex items-start gap-3 px-3 py-2.5 cursor-pointer hover:bg-slate-700/30 transition-colors'
+                + (i > 0 ? ' border-t border-slate-700/50' : '');
+
+            const radio = document.createElement('input');
+            radio.type = 'radio';
+            radio.name = 'aa-level';
+            radio.value = level.pattern;
+            radio.className = 'accent-blue-500 mt-0.5 flex-shrink-0';
+            if (level.recommended) radio.checked = true;
+
+            const content = document.createElement('div');
+            content.className = 'flex-1 min-w-0';
+
+            const topRow = document.createElement('div');
+            topRow.className = 'flex items-center gap-2';
+            const patternSpan = document.createElement('span');
+            patternSpan.className = 'text-sm font-mono text-slate-200 truncate';
+            patternSpan.textContent = level.label;
+            topRow.appendChild(patternSpan);
+            if (level.recommended) {
+                const badge = document.createElement('span');
+                badge.className = 'flex-shrink-0 px-1.5 py-0 rounded text-[10px] font-medium bg-blue-800/60 text-blue-300';
+                badge.textContent = 'Recommended';
+                topRow.appendChild(badge);
+            }
+            content.appendChild(topRow);
+
+            const descSpan = document.createElement('div');
+            descSpan.className = 'text-xs text-slate-400 mt-0.5';
+            descSpan.textContent = level.description;
+            content.appendChild(descSpan);
+
+            if (level.warning) {
+                const warn = document.createElement('div');
+                warn.className = 'text-[11px] text-amber-400 mt-0.5';
+                warn.textContent = '\u26A0 ' + level.warning;
+                content.appendChild(warn);
+            }
+
+            card.appendChild(radio);
+            card.appendChild(content);
+            radioGroup.appendChild(card);
+
+            radio.addEventListener('change', () => {
+                selectedPattern = level.pattern;
+                customInput.classList.add('hidden');
+                updatePreview(level.matchEnd);
+            });
+        });
+
+        // Custom pattern option
+        const customCard = document.createElement('label');
+        customCard.className = 'flex items-start gap-3 px-3 py-2.5 cursor-pointer hover:bg-slate-700/30 transition-colors border-t border-slate-700/50';
+        const customRadio = document.createElement('input');
+        customRadio.type = 'radio';
+        customRadio.name = 'aa-level';
+        customRadio.value = '__custom__';
+        customRadio.className = 'accent-blue-500 mt-0.5 flex-shrink-0';
+        const customContent = document.createElement('div');
+        customContent.className = 'flex-1 min-w-0';
+        const customLabel = document.createElement('span');
+        customLabel.className = 'text-sm text-slate-400';
+        customLabel.textContent = 'Custom pattern\u2026';
+        customContent.appendChild(customLabel);
+        customCard.appendChild(customRadio);
+        customCard.appendChild(customContent);
+        radioGroup.appendChild(customCard);
+
+        customRadio.addEventListener('change', () => {
+            customInput.classList.remove('hidden');
+            customInput.focus();
+            selectedPattern = customInput.value.trim();
+            // Show full command bright for custom
+            if (cmdPreviewText && strippedCommand) {
+                cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto text-slate-100';
+                cmdPreviewText.textContent = strippedCommand.length > 200
+                    ? strippedCommand.substring(0, 200) + '\u2026' : strippedCommand;
+            }
+        });
+
+        radioGroup.appendChild(customInput);
+        radioGroup.appendChild(customWarn);
+        modal.appendChild(radioGroup);
+
+        // Set initial selection
+        selectedPattern = recommendedLevel.pattern;
+        updatePreview(recommendedLevel.matchEnd);
+    }
+
+    // Scope selection (not for path type)
     const scopeWarning = document.createElement('div');
     scopeWarning.className = 'text-xs text-yellow-400 mb-3 hidden';
 
@@ -114,7 +339,7 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
         const scopeRow = document.createElement('div');
         scopeRow.className = 'flex gap-3 mb-3';
 
-        scopeGlobal = document.createElement('label');
+        const scopeGlobal = document.createElement('label');
         scopeGlobal.className = 'flex items-center gap-2 text-sm text-slate-300 cursor-pointer';
         const radioGlobal = document.createElement('input');
         radioGlobal.type = 'radio';
@@ -127,7 +352,7 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
         scopeRow.appendChild(scopeGlobal);
 
         if (repoPath) {
-            scopeProject = document.createElement('label');
+            const scopeProject = document.createElement('label');
             scopeProject.className = 'flex items-center gap-2 text-sm text-slate-300 cursor-pointer';
             const radioProject = document.createElement('input');
             radioProject.type = 'radio';
@@ -135,27 +360,23 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
             radioProject.value = 'project';
             radioProject.className = 'accent-blue-500';
             scopeProject.appendChild(radioProject);
-            const projText = document.createTextNode(`Project: ${repoName}`);
-            scopeProject.appendChild(projText);
+            scopeProject.appendChild(document.createTextNode(`Project: ${repoName}`));
             scopeRow.appendChild(scopeProject);
         }
 
         modal.appendChild(scopeRow);
         modal.appendChild(scopeWarning);
 
-        // Update warning on scope change and pattern change
-        const updateWarning = () => {
-            const selectedScope = modal.querySelector('input[name="aa-scope"]:checked')?.value || 'global';
-            const curPattern = patternInput.value.trim();
-            if (selectedScope === 'project' && _isFileToolPattern(curPattern)) {
-                scopeWarning.textContent = 'Note: File-tool rules (Read, Edit, Write, Grep, Glob, NotebookEdit) only apply at global scope. Bash rules work at both scopes.';
+        const updateScopeWarning = () => {
+            const scope = modal.querySelector('input[name="aa-scope"]:checked')?.value || 'global';
+            if (scope === 'project' && _isFileToolPattern(selectedPattern)) {
+                scopeWarning.textContent = 'Note: File-tool rules (Read, Edit, Write, Grep, Glob, NotebookEdit) only apply at global scope.';
                 scopeWarning.classList.remove('hidden');
             } else {
                 scopeWarning.classList.add('hidden');
             }
         };
-        scopeRow.addEventListener('change', updateWarning);
-        patternInput.addEventListener('input', updateWarning);
+        modal.addEventListener('change', updateScopeWarning);
     }
 
     // Buttons
@@ -171,7 +392,7 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
     addBtn.className = 'px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors';
     addBtn.textContent = isPath ? 'Add Path' : 'Add Rule';
     addBtn.addEventListener('click', async () => {
-        const val = patternInput.value.trim();
+        const val = selectedPattern;
         if (!val) return;
 
         addBtn.disabled = true;
@@ -179,7 +400,6 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
 
         try {
             if (isPath) {
-                // Add allowed path via gatekeeper config API
                 const pathState = await api.get('/api/settings/gatekeeper/path-safety');
                 const allowed = pathState.allowed_paths || [];
                 if (!allowed.includes(val)) {
@@ -213,12 +433,15 @@ function showAlwaysAllowModal({ pattern, type, repoPath, command }) {
         if (e.target === overlay) overlay.remove();
     });
 
+    // Escape key
+    overlay.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') overlay.remove();
+    });
+
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
-
-    // Focus pattern input
-    patternInput.focus();
-    patternInput.select();
+    overlay.setAttribute('tabindex', '-1');
+    overlay.focus();
 }
 
 // --- Gatekeeper sub-tab renderer ---
@@ -614,8 +837,13 @@ function _bindRowEvents(root) {
             const command = btn.dataset.command;
             const method = btn.dataset.method;
             const repo = btn.dataset.repo;
-            const { pattern, type } = extractPattern(command, method);
-            showAlwaysAllowModal({ pattern, type, repoPath: repo, command });
+            const levels = extractPatternLevels(command, method);
+            if (!levels.length) {
+                showLogsToast('Could not extract pattern from this command', true);
+                return;
+            }
+            const stripped = command.replace(_ENV_PREFIX_RE, '');
+            showAlwaysAllowModal({ levels, repoPath: repo, strippedCommand: stripped });
         });
     });
 }

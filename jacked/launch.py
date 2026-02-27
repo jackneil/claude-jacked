@@ -24,6 +24,7 @@ import click
 from jacked.api.credential_helpers import (
     _safe_replace,
     build_oauth_data,
+    read_platform_credentials,
     write_platform_credentials,
 )
 from jacked.web.auth import should_refresh
@@ -173,6 +174,71 @@ def _seed_workspace_trust(config_dir: Path) -> None:
         logger.debug("Failed to write workspace trust to %s", claude_json)
 
 
+def _seed_oauth_account(config_dir: Path, account: dict) -> None:
+    """Seed oauthAccount identity into per-account .claude.json.
+
+    Seeds emailAddress when oauthAccount is absent.  When oauthAccount already
+    exists (Claude Code wrote the richer ~12-field version), preserves all
+    fields but ALWAYS corrects emailAddress to match the DB account.  This
+    prevents token contamination: if Claude Code re-authenticates as a
+    different Google account inside this per-account dir, the stale email
+    is overwritten on next launch so _sync_tokens_from_file() can detect
+    the mismatch and block the wrong token from polluting the DB.
+    """
+    email = account.get("email")
+    if not email:
+        return
+
+    claude_json = config_dir / ".claude.json"
+    if claude_json.is_symlink():
+        return
+
+    local = {}
+    try:
+        local = json.loads(claude_json.read_text(encoding="utf-8"))
+        if not isinstance(local, dict):
+            local = {}
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError):
+        return  # Don't clobber a file we can't parse
+
+    if "oauthAccount" in local and isinstance(local["oauthAccount"], dict):
+        # Claude Code wrote the full version — preserve all fields but
+        # ALWAYS update emailAddress to match the DB account.  This prevents
+        # stale emails from persisting after Claude Code re-authenticates
+        # as a different Google account inside a per-account directory.
+        if (local["oauthAccount"].get("emailAddress") or "").lower() != email.lower():
+            local["oauthAccount"]["emailAddress"] = email
+        else:
+            return  # Already correct — nothing to do
+    else:
+        oauth = {"emailAddress": email}
+        display_name = account.get("display_name")
+        if display_name:
+            oauth["displayName"] = display_name
+        local["oauthAccount"] = oauth
+
+    # Atomic write
+    fd, tmp = tempfile.mkstemp(
+        dir=str(config_dir), prefix=".claude_json_tmp_", suffix=".json"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(local, f, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        _safe_replace(tmp, str(claude_json))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        logger.debug("Failed to write oauthAccount to %s", claude_json)
+
+
 # Shared resources to symlink from global ~/.claude/ into per-account dirs.
 _SHARED_SYMLINKS_FILES = ("settings.json", "CLAUDE.md")
 _SHARED_SYMLINKS_DIRS = ("plugins", "agents", "commands", "skills", "projects")
@@ -266,6 +332,8 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     _seed_claude_config(config_dir)
     # Propagate workspace trust (runs every launch, not gated by onboarding)
     _seed_workspace_trust(config_dir)
+    # Seed oauthAccount identity so Claude Code doesn't open browser to verify
+    _seed_oauth_account(config_dir, account)
     # Symlink shared resources (settings, plugins, etc.) from global dir
     _ensure_shared_symlinks(config_dir)
 
@@ -311,7 +379,12 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
 
     # macOS: also write to Keychain so Claude Code finds creds on first run.
     # Claude Code reads Keychain before the config-dir file on macOS.
-    write_platform_credentials(existing)
+    if not write_platform_credentials(existing):
+        logger.warning(
+            "Keychain write failed for account %d — Claude Code may use "
+            "stale credentials from a previous session",
+            account_id,
+        )
 
     return config_dir
 
@@ -332,17 +405,52 @@ def resolve_account(account_ref, db: Database) -> dict:
     account = None
 
     if account_ref is None:
-        # No arg — read stamp from global credential file
-        cred_path = Path.home() / ".claude" / ".credentials.json"
         acct_id = None
+
+        # Layer 1: File stamp (fast, but Claude Code may delete the file)
+        cred_path = Path.home() / ".claude" / ".credentials.json"
         if cred_path.exists() and not cred_path.is_symlink():
             try:
                 data = json.loads(cred_path.read_text(encoding="utf-8"))
                 acct_id = data.get("_jackedAccountId")
             except (json.JSONDecodeError, OSError):
                 pass
+
+        # Layer 2: DB settings (immune to Claude Code credential management)
+        if acct_id is None:
+            try:
+                stored = db.get_setting("active_account_id")
+                if stored:
+                    acct_id = int(stored)
+            except (ValueError, TypeError, Exception):
+                pass
+
+        # Layer 3: Keychain stamp
+        if acct_id is None:
+            try:
+                kc_data = read_platform_credentials()
+                if kc_data:
+                    acct_id = kc_data.get("_jackedAccountId")
+            except Exception:
+                pass
+
         if acct_id is not None:
             account = db.get_account(acct_id)
+
+        # Layer 4: Keychain token → DB match (last resort)
+        if not account:
+            try:
+                kc_data = read_platform_credentials()
+                if kc_data:
+                    token = kc_data.get("claudeAiOauth", {}).get("accessToken")
+                    if token:
+                        for acct in db.list_accounts(include_inactive=False):
+                            if acct.get("access_token") == token:
+                                account = acct
+                                break
+            except Exception:
+                pass
+
         if not account:
             raise click.ClickException(
                 "No active account detected. Specify an account: jacked claude <id>"
@@ -395,6 +503,52 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
             account_id = int(config_dir.name)
         except (ValueError, TypeError):
             return
+
+        # Guard: verify the token still belongs to the expected account.
+        # If Claude Code re-authenticated as a different Google account
+        # inside this per-account dir, the .claude.json oauthAccount email
+        # will no longer match the DB account's email.  Refuse to sync
+        # the wrong token — it would contaminate the DB permanently.
+        claude_json = config_dir / ".claude.json"
+        if claude_json.exists() and not claude_json.is_symlink():
+            try:
+                cj = json.loads(claude_json.read_text(encoding="utf-8"))
+                oauth_block = cj.get("oauthAccount")
+                if isinstance(oauth_block, dict):
+                    file_email = oauth_block.get("emailAddress")
+                    if file_email:
+                        import sqlite3 as _sq
+
+                        _conn = _sq.connect(db_path, timeout=2.0)
+                        try:
+                            _conn.execute("PRAGMA busy_timeout = 5000")
+                            _row = _conn.execute(
+                                "SELECT email FROM accounts WHERE id = ?",
+                                (account_id,),
+                            ).fetchone()
+                            if _row and _row[0] and _row[0].lower() != file_email.lower():
+                                logger.warning(
+                                    "Token sync BLOCKED for account %d: "
+                                    "credential file has email %s but DB has %s "
+                                    "— Claude Code may have re-authenticated as "
+                                    "a different account",
+                                    account_id, file_email, _row[0],
+                                )
+                                return
+                        finally:
+                            _conn.close()
+                    elif oauth_block:
+                        # oauthAccount exists but emailAddress is missing —
+                        # suspicious (jacked always seeds emailAddress).
+                        # Block sync to prevent unverified token contamination.
+                        logger.warning(
+                            "Token sync BLOCKED for account %d: "
+                            "oauthAccount present but emailAddress missing",
+                            account_id,
+                        )
+                        return
+            except (json.JSONDecodeError, OSError, AttributeError):
+                pass  # Can't read — fall through to normal sync
 
         import sqlite3
 

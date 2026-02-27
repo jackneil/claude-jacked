@@ -75,8 +75,9 @@ class ApiError extends Error {
 const ROUTES = ['accounts', 'installations', 'settings', 'logs', 'analytics'];
 
 function getRoute() {
-    const hash = window.location.hash.replace('#', '') || 'accounts';
-    return ROUTES.includes(hash) ? hash : 'accounts';
+    const raw = window.location.hash.replace('#', '') || 'accounts';
+    const route = raw.split('?')[0];
+    return ROUTES.includes(route) ? route : 'accounts';
 }
 
 function navigateTo(route) {

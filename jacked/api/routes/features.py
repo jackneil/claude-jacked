@@ -965,10 +965,12 @@ async def toggle_claude_plugin(name: str, body: PluginToggleRequest):
         if "enabledPlugins" not in settings:
             settings["enabledPlugins"] = {}
 
-        if body.enabled:
-            settings["enabledPlugins"][name] = True
-        else:
-            settings["enabledPlugins"].pop(name, None)
+        # Explicit true/false — Claude Code treats absent keys as "enabled
+        # by default", so .pop() doesn't actually disable plugins.
+        # Note: upstream Claude Code bugs may ignore false for some plugins
+        # (see anthropics/claude-code#13344); may need installed_plugins.json
+        # manipulation as follow-up.
+        settings["enabledPlugins"][name] = body.enabled
 
         _write_settings_json(settings)
 

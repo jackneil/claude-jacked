@@ -299,6 +299,208 @@ class TestSeedWorkspaceTrust:
 
 
 # ---------------------------------------------------------------------------
+# _seed_oauth_account
+# ---------------------------------------------------------------------------
+
+
+class TestSeedOauthAccount:
+    def test_seeds_when_absent(self, tmp_path):
+        """Seeds oauthAccount with email when absent from .claude.json."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text('{"hasCompletedOnboarding": true}')
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "test@example.com", "display_name": "Test User"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result["oauthAccount"]["emailAddress"] == "test@example.com"
+        assert result["oauthAccount"]["displayName"] == "Test User"
+        # Preserves existing keys
+        assert result["hasCompletedOnboarding"] is True
+
+    def test_updates_email_but_preserves_other_fields(self, tmp_path):
+        """Updates emailAddress but preserves Claude Code's other oauthAccount fields."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        existing = {
+            "oauthAccount": {
+                "emailAddress": "existing@example.com",
+                "accountUuid": "uuid-123",
+                "billingType": "pro",
+            }
+        }
+        (config_dir / ".claude.json").write_text(json.dumps(existing))
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "different@example.com"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        # Email updated to match DB account
+        assert result["oauthAccount"]["emailAddress"] == "different@example.com"
+        # Other Claude Code fields preserved
+        assert result["oauthAccount"]["accountUuid"] == "uuid-123"
+        assert result["oauthAccount"]["billingType"] == "pro"
+
+    def test_handles_non_dict_oauth_account(self, tmp_path):
+        """Replaces non-dict oauthAccount with correct seed data."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": "garbage",
+            "hasCompletedOnboarding": True,
+        }))
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "test@example.com"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result["oauthAccount"]["emailAddress"] == "test@example.com"
+        assert result["hasCompletedOnboarding"] is True
+
+    def test_skips_when_email_already_matches(self, tmp_path):
+        """No-ops when oauthAccount email already matches — avoids unnecessary writes."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        existing = {
+            "oauthAccount": {
+                "emailAddress": "same@example.com",
+                "accountUuid": "uuid-123",
+            }
+        }
+        (config_dir / ".claude.json").write_text(json.dumps(existing))
+        mtime_before = (config_dir / ".claude.json").stat().st_mtime
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "same@example.com"})
+
+        # File should not be rewritten
+        mtime_after = (config_dir / ".claude.json").stat().st_mtime
+        assert mtime_before == mtime_after
+
+    def test_skips_when_email_matches_case_insensitively(self, tmp_path):
+        """No-ops when oauthAccount email differs only in case."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        existing = {
+            "oauthAccount": {
+                "emailAddress": "Same@Example.COM",
+                "accountUuid": "uuid-123",
+            }
+        }
+        (config_dir / ".claude.json").write_text(json.dumps(existing))
+        mtime_before = (config_dir / ".claude.json").stat().st_mtime
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "same@example.com"})
+
+        # File should not be rewritten — case-insensitive match
+        mtime_after = (config_dir / ".claude.json").stat().st_mtime
+        assert mtime_before == mtime_after
+
+    def test_handles_null_email_in_oauth_account(self, tmp_path):
+        """Handles emailAddress: null without crashing."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        existing = {"oauthAccount": {"emailAddress": None, "accountUuid": "uuid-123"}}
+        (config_dir / ".claude.json").write_text(json.dumps(existing))
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "correct@example.com"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result["oauthAccount"]["emailAddress"] == "correct@example.com"
+        # Should preserve other fields
+        assert result["oauthAccount"]["accountUuid"] == "uuid-123"
+
+    def test_skips_when_no_email(self, tmp_path):
+        """Returns immediately when account has no email."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text("{}")
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"display_name": "No Email"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert "oauthAccount" not in result
+
+    def test_skips_when_empty_email(self, tmp_path):
+        """Returns immediately when email is empty string."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text("{}")
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": ""})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert "oauthAccount" not in result
+
+    def test_skips_when_symlink(self, tmp_path):
+        """Refuses to write when .claude.json is a symlink."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        real_file = tmp_path / "real.json"
+        real_file.write_text("{}")
+        (config_dir / ".claude.json").symlink_to(real_file)
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "test@example.com"})
+
+        result = json.loads(real_file.read_text())
+        assert "oauthAccount" not in result
+
+    def test_skips_malformed_file(self, tmp_path):
+        """Returns without clobbering a malformed .claude.json."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        garbage = "not json {{{"
+        (config_dir / ".claude.json").write_text(garbage)
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "test@example.com"})
+
+        assert (config_dir / ".claude.json").read_text() == garbage
+
+    def test_creates_file_when_missing(self, tmp_path):
+        """Creates .claude.json with oauthAccount when file doesn't exist."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "test@example.com"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result["oauthAccount"]["emailAddress"] == "test@example.com"
+
+    def test_omits_display_name_when_absent(self, tmp_path):
+        """Only sets emailAddress when display_name is not provided."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text("{}")
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "test@example.com"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result["oauthAccount"] == {"emailAddress": "test@example.com"}
+        assert "displayName" not in result["oauthAccount"]
+
+
+# ---------------------------------------------------------------------------
 # prepare_account_dir
 # ---------------------------------------------------------------------------
 
@@ -393,6 +595,26 @@ class TestPrepareAccountDir:
 
                 with pytest.raises(click.ClickException, match="symlink"):
                     prepare_account_dir(account, db)
+
+    def test_warns_on_keychain_write_failure(self, tmp_path):
+        """Logs warning when macOS Keychain write fails."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+
+        with mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"):
+            with mock.patch("jacked.launch.should_refresh", return_value=False):
+                with mock.patch("jacked.launch.write_platform_credentials", return_value=False):
+                    with mock.patch("jacked.launch.logger") as mock_logger:
+                        from jacked.launch import prepare_account_dir
+
+                        result = prepare_account_dir(account, db)
+
+                        # Should still return successfully (non-fatal)
+                        assert result == tmp_path / "accounts" / "1"
+                        # But should log a warning
+                        mock_logger.warning.assert_any_call(
+                            mock.ANY, account["id"]
+                        )
 
     def test_preserves_existing_keys(self, tmp_path):
         """Preserves non-OAuth keys Claude Code may have added."""
@@ -495,6 +717,65 @@ class TestResolveAccount:
         with mock.patch("shutil.which", return_value=None):
             with pytest.raises(click.ClickException, match="claude not found"):
                 resolve_account(1, db)
+
+    def test_without_id_db_fallback(self, tmp_path):
+        """resolve_account(None) falls back to DB setting when file is missing."""
+        db = _make_db(tmp_path)
+        db.set_setting("active_account_id", "1")
+        from jacked.launch import resolve_account
+
+        # No credential file exists — should fall through to DB setting
+        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+            with mock.patch.object(Path, "home", return_value=tmp_path):
+                with mock.patch(
+                    "jacked.launch.read_platform_credentials", return_value=None
+                ):
+                    result = resolve_account(None, db)
+        assert result["email"] == "alice@test.com"
+
+    def test_without_id_keychain_stamp_fallback(self, tmp_path):
+        """resolve_account(None) falls back to Keychain stamp."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        kc_data = {"_jackedAccountId": 2, "claudeAiOauth": {"accessToken": "x"}}
+        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+            with mock.patch.object(Path, "home", return_value=tmp_path):
+                with mock.patch(
+                    "jacked.launch.read_platform_credentials", return_value=kc_data
+                ):
+                    result = resolve_account(None, db)
+        assert result["email"] == "bob@test.com"
+
+    def test_without_id_keychain_token_match(self, tmp_path):
+        """resolve_account(None) matches Keychain token against DB as last resort."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        # Keychain has token but no stamp
+        kc_data = {"claudeAiOauth": {"accessToken": "bob_access"}}
+        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+            with mock.patch.object(Path, "home", return_value=tmp_path):
+                with mock.patch(
+                    "jacked.launch.read_platform_credentials", return_value=kc_data
+                ):
+                    result = resolve_account(None, db)
+        assert result["email"] == "bob@test.com"
+
+    def test_without_id_all_layers_fail(self, tmp_path):
+        """resolve_account(None) raises when no file, no DB setting, no Keychain."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+            with mock.patch.object(Path, "home", return_value=tmp_path):
+                with mock.patch(
+                    "jacked.launch.read_platform_credentials", return_value=None
+                ):
+                    with pytest.raises(
+                        click.ClickException, match="No active account detected"
+                    ):
+                        resolve_account(None, db)
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +904,192 @@ class TestTokenSync:
 
         rows2 = db.get_session_accounts("sess-pid2")
         assert rows2[0]["ended_at"] is None  # different PID, not closed
+
+    def test_sync_rejects_mismatched_email(self, tmp_path):
+        """_sync_tokens_from_file refuses to sync when email doesn't match DB."""
+        db = _make_db(tmp_path)
+        original = db.get_account(1)
+        assert original["access_token"] == "alice_access"
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        # Claude Code re-authed as bob — wrong token in alice's dir
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "bobs_stolen_token",
+                "refreshToken": "bobs_refresh",
+                "expiresAt": 9999999999000,
+            }
+        }))
+        # Claude Code also wrote bob's email to alice's .claude.json
+        (config_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "bob@different.com"}
+        }))
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        # DB should NOT be contaminated — alice's original token preserved
+        account = db.get_account(1)
+        assert account["access_token"] == "alice_access"
+
+    def test_sync_allows_matching_email(self, tmp_path):
+        """_sync_tokens_from_file syncs normally when email matches DB."""
+        db = _make_db(tmp_path)
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "refreshed_alice_token",
+                "refreshToken": "new_refresh",
+                "expiresAt": 9999999999000,
+            }
+        }))
+        # Email matches DB — this is a legitimate token refresh
+        (config_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "alice@test.com"}
+        }))
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        account = db.get_account(1)
+        assert account["access_token"] == "refreshed_alice_token"
+
+    def test_sync_allows_case_insensitive_email_match(self, tmp_path):
+        """Email guard compares case-insensitively — same email, different case syncs."""
+        db = _make_db(tmp_path)
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "refreshed_token",
+                "refreshToken": "r",
+                "expiresAt": 9999999999000,
+            }
+        }))
+        # Same email, different case — should sync normally
+        (config_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "Alice@Test.Com"}
+        }))
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        account = db.get_account(1)
+        assert account["access_token"] == "refreshed_token"
+
+    def test_sync_blocks_when_email_missing_from_oauth(self, tmp_path):
+        """Blocks sync when oauthAccount exists but emailAddress is absent."""
+        db = _make_db(tmp_path)
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "suspicious_token",
+                "refreshToken": "r",
+                "expiresAt": 9999999999000,
+            }
+        }))
+        # oauthAccount exists but no emailAddress — suspicious
+        (config_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"accountUuid": "some-uuid"}
+        }))
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        account = db.get_account(1)
+        assert account["access_token"] == "alice_access"  # not contaminated
+
+    def test_sync_allows_when_no_claude_json(self, tmp_path):
+        """_sync_tokens_from_file syncs when .claude.json missing (backward compat)."""
+        db = _make_db(tmp_path)
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "new_access",
+                "refreshToken": "new_refresh",
+                "expiresAt": 9999999999000,
+            }
+        }))
+        # No .claude.json at all — can't validate, allow sync
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        account = db.get_account(1)
+        assert account["access_token"] == "new_access"
+
+
+# ---------------------------------------------------------------------------
+# _seed_oauth_account — email always updated
+# ---------------------------------------------------------------------------
+
+
+class TestSeedOauthAccountEmailUpdate:
+    def test_updates_email_even_when_oauth_account_exists(self, tmp_path):
+        """Always updates emailAddress to match DB, even when oauthAccount exists."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        # Claude Code wrote a rich oauthAccount with a STALE email
+        existing = {
+            "oauthAccount": {
+                "emailAddress": "stale@wrong.com",
+                "accountUuid": "uuid-123",
+                "billingType": "pro",
+                "displayName": "Stale Name",
+            }
+        }
+        (config_dir / ".claude.json").write_text(json.dumps(existing))
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "correct@test.com", "display_name": "Correct"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        # Email MUST be updated to match DB
+        assert result["oauthAccount"]["emailAddress"] == "correct@test.com"
+        # Other Claude Code fields preserved
+        assert result["oauthAccount"]["accountUuid"] == "uuid-123"
+        assert result["oauthAccount"]["billingType"] == "pro"
+
+    def test_preserves_other_oauth_fields(self, tmp_path):
+        """Updating email preserves all other oauthAccount fields from Claude Code."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        existing = {
+            "oauthAccount": {
+                "emailAddress": "old@test.com",
+                "accountUuid": "uuid-456",
+                "billingType": "max",
+                "organizationType": "claude_max",
+                "displayName": "Old Name",
+            },
+            "hasCompletedOnboarding": True,
+        }
+        (config_dir / ".claude.json").write_text(json.dumps(existing))
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(config_dir, {"email": "new@test.com"})
+
+        result = json.loads((config_dir / ".claude.json").read_text())
+        assert result["oauthAccount"]["emailAddress"] == "new@test.com"
+        assert result["oauthAccount"]["accountUuid"] == "uuid-456"
+        assert result["oauthAccount"]["billingType"] == "max"
+        assert result["oauthAccount"]["organizationType"] == "claude_max"
+        assert result["hasCompletedOnboarding"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -864,3 +1331,138 @@ class TestDeleteAccountCleanup:
         if real_dir.exists() and real_dir.is_dir() and not real_dir.is_symlink():
             shutil.rmtree(real_dir, ignore_errors=True)
         assert not real_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# claude_cmd — CLI flag passthrough (jacked claude --resume, -p, etc.)
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeCmdFlagPassthrough:
+    """Verify that Claude CLI flags aren't eaten as the account argument."""
+
+    @staticmethod
+    def _make_claude_db(tmp_path, active_account_id="1"):
+        """Create DB at the path claude_cmd expects (~/.claude/jacked.db)."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        db = Database(str(claude_dir / "jacked.db"))
+        with db._writer() as conn:
+            conn.execute(
+                """INSERT INTO accounts
+                   (id, email, access_token, refresh_token, expires_at,
+                    is_active, is_deleted, validation_status,
+                    consecutive_failures, subscription_type, rate_limit_tier)
+                   VALUES (1, 'alice@test.com', 'tok', 'ref', ?, 1, 0, 'valid', 0, 'max', 't1')""",
+                (int(time.time()) + 3600,),
+            )
+            conn.execute(
+                """INSERT INTO accounts
+                   (id, email, access_token, refresh_token, expires_at,
+                    is_active, is_deleted, validation_status,
+                    consecutive_failures, subscription_type, rate_limit_tier)
+                   VALUES (2, 'bob@test.com', 'tok2', 'ref2', ?, 1, 0, 'valid', 0, 'pro', 't2')""",
+                (int(time.time()) + 3600,),
+            )
+        if active_account_id:
+            db.set_setting("active_account_id", active_account_id)
+        db.close()
+
+    def test_resume_flag_passed_through(self, tmp_path):
+        """jacked claude --resume abc123 → resolves active account, passes --resume abc123."""
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+
+        self._make_claude_db(tmp_path)
+
+        with mock.patch.object(Path, "home", return_value=tmp_path), \
+             mock.patch("jacked.launch.resolve_account") as mock_resolve, \
+             mock.patch("jacked.launch.prepare_account_dir") as mock_prepare, \
+             mock.patch("jacked.launch.launch_claude") as mock_launch:
+            mock_resolve.return_value = {"id": 1, "email": "alice@test.com"}
+            mock_prepare.return_value = tmp_path / "accounts" / "1"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["claude", "--resume", "abc123"])
+
+            assert result.exit_code == 0, result.output
+            # account_ref should be None (active account), not "--resume"
+            mock_resolve.assert_called_once()
+            assert mock_resolve.call_args[0][0] is None
+            # --resume abc123 should be in claude_args passed to launch_claude
+            launch_args = mock_launch.call_args[0][1]
+            assert "--resume" in launch_args
+            assert "abc123" in launch_args
+
+    def test_short_flag_passed_through(self, tmp_path):
+        """jacked claude -p editor → resolves active account, passes -p editor."""
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+
+        self._make_claude_db(tmp_path)
+
+        with mock.patch.object(Path, "home", return_value=tmp_path), \
+             mock.patch("jacked.launch.resolve_account") as mock_resolve, \
+             mock.patch("jacked.launch.prepare_account_dir") as mock_prepare, \
+             mock.patch("jacked.launch.launch_claude") as mock_launch:
+            mock_resolve.return_value = {"id": 1, "email": "alice@test.com"}
+            mock_prepare.return_value = tmp_path / "accounts" / "1"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["claude", "-p", "editor"])
+
+            assert result.exit_code == 0, result.output
+            assert mock_resolve.call_args[0][0] is None
+            launch_args = mock_launch.call_args[0][1]
+            assert "-p" in launch_args
+            assert "editor" in launch_args
+
+    def test_account_with_flags_still_works(self, tmp_path):
+        """jacked claude 2 --resume abc123 → account=2, passes --resume abc123."""
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+
+        self._make_claude_db(tmp_path)
+
+        with mock.patch.object(Path, "home", return_value=tmp_path), \
+             mock.patch("jacked.launch.resolve_account") as mock_resolve, \
+             mock.patch("jacked.launch.prepare_account_dir") as mock_prepare, \
+             mock.patch("jacked.launch.launch_claude") as mock_launch:
+            mock_resolve.return_value = {"id": 2, "email": "bob@test.com"}
+            mock_prepare.return_value = tmp_path / "accounts" / "2"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["claude", "2", "--resume", "abc123"])
+
+            assert result.exit_code == 0, result.output
+            # account_ref should be 2 (integer)
+            assert mock_resolve.call_args[0][0] == 2
+            launch_args = mock_launch.call_args[0][1]
+            assert "--resume" in launch_args
+            assert "abc123" in launch_args
+
+    def test_bare_claude_no_args(self, tmp_path):
+        """jacked claude (no args) → resolves active account."""
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+
+        self._make_claude_db(tmp_path)
+
+        with mock.patch.object(Path, "home", return_value=tmp_path), \
+             mock.patch("jacked.launch.resolve_account") as mock_resolve, \
+             mock.patch("jacked.launch.prepare_account_dir") as mock_prepare, \
+             mock.patch("jacked.launch.launch_claude") as mock_launch:
+            mock_resolve.return_value = {"id": 1, "email": "alice@test.com"}
+            mock_prepare.return_value = tmp_path / "accounts" / "1"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["claude"])
+
+            assert result.exit_code == 0, result.output
+            assert mock_resolve.call_args[0][0] is None
+            launch_args = mock_launch.call_args[0][1]
+            assert len(launch_args) == 0

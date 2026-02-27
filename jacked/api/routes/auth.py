@@ -627,6 +627,9 @@ async def use_account(account_id: int, request: Request):
 
     sync_credential_to_all_stores(account_id, account)
 
+    # Persist in DB — immune to Claude Code overwriting credential files
+    db.set_setting("active_account_id", str(account_id))
+
     return UseAccountResponse(status="ok", email=account["email"])
 
 

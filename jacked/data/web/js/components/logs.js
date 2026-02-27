@@ -158,7 +158,7 @@ function refreshCurrentLogsSubTab(changedTables) {
     switch (logsSubTab) {
         case 'gatekeeper':
             if (!changedTables || changedTables.includes('gatekeeper_decisions')) {
-                loadSessions(); loadLogsData();
+                loadSessions(); loadLogsData(true);
             }
             break;
         case 'hooks':

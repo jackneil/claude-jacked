@@ -297,6 +297,9 @@ class OAuthFlow:
 
             sync_credential_to_all_stores(account["id"], account)
 
+            # Persist in DB — immune to Claude Code overwriting credential files
+            self.db.set_setting("active_account_id", str(account["id"]))
+
             return {
                 "account_id": account.get("id"),
                 "email": account.get("email"),

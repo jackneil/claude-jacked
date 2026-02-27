@@ -6,6 +6,7 @@ permission rule parsing, file path extraction, local_evaluate chain,
 and gatekeeper config reader.
 """
 
+import io
 import json
 import os
 import sqlite3
@@ -993,15 +994,16 @@ class TestParseLlmResponse:
         assert safe is True
         assert reason == "whatever"
 
-    # --- type confusion attacks (must NOT approve) ---
-    def test_string_true_not_approved(self):
-        """String "true" must not be treated as boolean True."""
+    # --- string-to-boolean coercion ---
+    def test_string_true_coerced_to_boolean(self):
+        """String "true" is coerced to boolean True (Haiku sometimes returns strings)."""
         safe, _ = gk.parse_llm_response('{"safe": "true"}')
-        assert safe is not True  # string "true", not bool True
+        assert safe is True
 
-    def test_string_false(self):
+    def test_string_false_coerced_to_boolean(self):
+        """String "false" is coerced to boolean False."""
         safe, _ = gk.parse_llm_response('{"safe": "false"}')
-        assert safe is not True
+        assert safe is False
 
     def test_int_1_not_approved(self):
         safe, _ = gk.parse_llm_response('{"safe": 1}')
@@ -1078,6 +1080,68 @@ class TestParseLlmResponse:
         """'not sure' starts with 'NO' after uppercasing — should be False, not approved."""
         safe, _ = gk.parse_llm_response("not sure about this")
         assert safe is not True
+
+    # --- pipe-delimited format ---
+    def test_pipe_pass_with_reason(self):
+        safe, reason = gk.parse_llm_response("PASS|safe read-only command")
+        assert safe is True
+        assert reason == "safe read-only command"
+
+    def test_pipe_block_with_reason(self):
+        safe, reason = gk.parse_llm_response("BLOCK|dangerous operation")
+        assert safe is False
+        assert reason == "dangerous operation"
+
+    def test_pipe_reason_contains_pipe(self):
+        """Reason with | in it should not break parsing (maxsplit=1)."""
+        safe, reason = gk.parse_llm_response("BLOCK|uses curl | bash which is dangerous")
+        assert safe is False
+        assert reason == "uses curl | bash which is dangerous"
+
+    def test_pipe_bare_pass(self):
+        """Bare PASS without pipe returns True with empty reason."""
+        safe, reason = gk.parse_llm_response("PASS")
+        assert safe is True
+        assert reason == ""
+
+    def test_pipe_bare_block(self):
+        """Bare BLOCK without pipe returns False with empty reason."""
+        safe, reason = gk.parse_llm_response("BLOCK")
+        assert safe is False
+        assert reason == ""
+
+    def test_pipe_pass_empty_reason(self):
+        """PASS| (pipe but empty reason) returns True with empty reason."""
+        safe, reason = gk.parse_llm_response("PASS|")
+        assert safe is True
+        assert reason == ""
+
+    def test_pipe_multiline_preamble(self):
+        """Haiku preamble text before PASS|reason is handled."""
+        safe, reason = gk.parse_llm_response("Let me evaluate this.\nPASS|safe command")
+        assert safe is True
+        assert reason == "safe command"
+
+    def test_pipe_multiline_bare_keyword(self):
+        """Haiku preamble text before bare BLOCK is handled."""
+        safe, reason = gk.parse_llm_response("Analysis done.\nBLOCK")
+        assert safe is False
+        assert reason == ""
+
+    def test_pipe_case_sensitive(self):
+        """Only uppercase PASS/BLOCK are recognized (not pass/block)."""
+        safe, _ = gk.parse_llm_response("pass|this should not match")
+        assert safe is None  # falls through to other parsers
+
+    def test_pipe_passing_not_matched(self):
+        """Words starting with PASS but not exact match or pipe-delimited are ignored."""
+        safe, _ = gk.parse_llm_response("PASSING all checks")
+        assert safe is None
+
+    def test_pipe_blocked_not_matched(self):
+        """Words starting with BLOCK but not exact match or pipe-delimited are ignored."""
+        safe, _ = gk.parse_llm_response("BLOCKED by firewall")
+        assert safe is None
 
 
 # ---------------------------------------------------------------------------
@@ -1236,6 +1300,16 @@ class TestLoadPrompt:
             result = gk._load_prompt()
         assert result == content
 
+    def test_prompt_includes_python_c_guidance(self):
+        """SECURITY_PROMPT must mention python -c as safe for simple expressions."""
+        assert "python" in gk.SECURITY_PROMPT.lower()
+        assert "-c" in gk.SECURITY_PROMPT
+
+    def test_prompt_includes_pipe_format(self):
+        """SECURITY_PROMPT must request PASS|/BLOCK| format."""
+        assert "PASS|" in gk.SECURITY_PROMPT
+        assert "BLOCK|" in gk.SECURITY_PROMPT
+
 
 # ---------------------------------------------------------------------------
 # _substitute_prompt — single-pass placeholder substitution
@@ -1292,7 +1366,7 @@ class TestSubstitutePrompt:
         )
         assert "python -c 'print(42)'" in result
         assert "/home/user" in result
-        assert '"safe": true' in result
+        assert "PASS|" in result
         assert "{command}" not in result
         assert "{cwd}" not in result
         assert "{file_context}" not in result
@@ -3898,6 +3972,95 @@ class TestCatchAllInstall:
         ]
         assert len(gk_hooks) == 1
         assert gk_hooks[0]["matcher"] == ""
+
+
+# ---------------------------------------------------------------------------
+# MCP tool handling
+# ---------------------------------------------------------------------------
+
+
+class TestMCPTools:
+    """Tests for MCP tool pattern matching and auto-approve handler."""
+
+    def test_handle_mcp_tool_emits_allow(self):
+        """_handle_mcp_tool calls emit_allow() and records decision."""
+        with (
+            patch.object(gk, "emit_allow") as mock_allow,
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.object(gk, "log"),
+        ):
+            gk._handle_mcp_tool(
+                "mcp__playwright__browser_click",
+                {"selector": "#btn"},
+                "sess123",
+                "/repo",
+            )
+            mock_allow.assert_called_once()
+            mock_record.assert_called_once()
+            args = mock_record.call_args[0]
+            assert args[0] == "ALLOW"
+            assert "mcp__playwright__browser_click" in args[1]
+            assert args[2] == "mcp_auto"
+
+    def test_handle_mcp_tool_exception_is_silent(self, capsys):
+        """On exception, _handle_mcp_tool produces no output (fail-open)."""
+        with patch.object(gk, "_record_decision", side_effect=RuntimeError("boom")), \
+             patch.object(gk, "log"):
+            gk._handle_mcp_tool(
+                "mcp__chrome__navigate",
+                {"url": "https://example.com"},
+                "sess123",
+                "/repo",
+            )
+        captured = capsys.readouterr()
+        assert captured.out == ""
+
+    def test_handle_mcp_tool_empty_input(self):
+        """_handle_mcp_tool handles tool_input=None gracefully."""
+        with (
+            patch.object(gk, "emit_allow") as mock_allow,
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "log"),
+        ):
+            gk._handle_mcp_tool("mcp__server__tool", None, "sess", "/repo")
+            mock_allow.assert_called_once()
+
+    def test_mcp_pattern_dispatches_when_enabled(self):
+        """main() dispatches MCP tool to _handle_mcp_tool when MCPTools enabled."""
+        hook_input = json.dumps({
+            "tool_name": "mcp__playwright__browser_snapshot",
+            "tool_input": {"selector": "body"},
+            "session_id": "test-sess",
+        })
+        with (
+            patch("sys.stdin", io.StringIO(hook_input)),
+            patch.object(gk, "_read_gatekeeper_config", return_value={"enabled": True}),
+            patch.object(gk, "_read_enabled_tools", return_value={"Bash", "MCPTools"}),
+            patch.object(gk, "_handle_mcp_tool") as mock_handler,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                gk.main()
+            assert exc_info.value.code == 0
+            mock_handler.assert_called_once()
+            assert mock_handler.call_args[0][0] == "mcp__playwright__browser_snapshot"
+
+    def test_mcp_pattern_exits_when_disabled(self):
+        """main() exits silently for MCP tool when MCPTools not in enabled set."""
+        hook_input = json.dumps({
+            "tool_name": "mcp__chrome__computer",
+            "tool_input": {},
+            "session_id": "test-sess",
+        })
+        with (
+            patch("sys.stdin", io.StringIO(hook_input)),
+            patch.object(gk, "_read_gatekeeper_config", return_value={"enabled": True}),
+            patch.object(gk, "_read_enabled_tools", return_value={"Bash", "Read"}),
+            patch.object(gk, "_handle_mcp_tool") as mock_handler,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                gk.main()
+            assert exc_info.value.code == 0
+            mock_handler.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
