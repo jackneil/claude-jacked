@@ -40,89 +40,50 @@ function _isSensitive(prefix) {
     return false;
 }
 
-function extractPatternLevels(command, method) {
-    if (!command) return [];
+function tokenizeForSelector(command, method) {
+    if (!command) return null;
 
-    // PATH_SAFETY: single level
+    // PATH_SAFETY: single input, no token selector
     if (method === 'PATH_SAFETY' || method === 'PATH_SAFETY_FLOOR') {
         const pathMatch = command.match(/^\[?\w+\]?\s+(\/\S+)/);
-        if (pathMatch) return [{
-            pattern: pathMatch[1], type: 'path',
-            label: pathMatch[1], description: 'Allow this path',
-            matchEnd: pathMatch[1].length, recommended: true, warning: null
-        }];
-        return [];
+        if (pathMatch) return { type: 'path', pattern: pathMatch[1] };
+        return null;
     }
 
-    // Strip env-var prefixes — use stripped for all pattern logic AND display
     const stripped = command.replace(_ENV_PREFIX_RE, '');
-    const parts = stripped.split(/\s+/).filter(Boolean);
-    if (!parts.length) return [];
+    const tokens = stripped.split(/\s+/).filter(Boolean);
+    if (!tokens.length) return null;
 
-    const base = parts[0];
-    const levels = [];
-    const seen = new Set();
-
-    function addLevel(prefix, isExact, recommended, desc) {
-        const pattern = isExact ? `Bash(${prefix})` : `Bash(${prefix}:*)`;
-        if (seen.has(pattern)) return;
-        seen.add(pattern);
-        const sensitive = !isExact && _isSensitive(prefix);
-        const effectiveRec = sensitive ? false : recommended;
-        const truncLabel = isExact && prefix.length > 80
-            ? prefix.substring(0, 77) + '\u2026' : prefix;
-        let warning = null;
-        if (sensitive) {
-            warning = (prefix === base)
-                ? 'Bypasses LLM safety checks for this command category'
-                : 'Broad \u2014 skips per-invocation safety review';
-        }
-        levels.push({
-            pattern, type: 'permission',
-            label: isExact ? truncLabel : `${prefix} *`,
-            description: desc,
-            matchEnd: prefix.length,
-            recommended: effectiveRec,
-            warning
-        });
-    }
-
-    // Base (broadest)
-    addLevel(base, false, false, `Allow all ${base} commands`);
-
-    // Subcommand (from dictionary, check 3-word then 2-word)
-    let sub = base;
+    // Find recommended boundary index (0-based, inclusive)
+    // Check 3-word then 2-word dictionary match
+    let recommendedIndex = tokens.length - 1; // default: exact match (safe)
     for (const len of [3, 2]) {
-        if (parts.length >= len) {
-            const candidate = parts.slice(0, len).join(' ');
+        if (tokens.length >= len) {
+            const candidate = tokens.slice(0, len).join(' ');
             if (_KNOWN_COMMAND_PREFIXES.has(candidate)) {
-                sub = candidate;
+                recommendedIndex = len - 1;
                 break;
             }
         }
     }
-    if (sub !== base) {
-        addLevel(sub, false, true, `Allow ${sub} with any args`);
+
+    return { type: 'tokens', tokens, stripped, recommendedIndex };
+}
+
+function _patternForBoundary(tokens, boundaryIndex) {
+    if (boundaryIndex >= tokens.length - 1) {
+        return `Bash(${tokens.join(' ')})`;
     }
+    const prefix = tokens.slice(0, boundaryIndex + 1).join(' ');
+    return `Bash(${prefix}:*)`;
+}
 
-    // Exact (narrowest)
-    addLevel(stripped, true, false, 'Allow only this exact command');
-
-    // If no subcommand level, recommend base (unless sensitive — then recommend exact)
-    if (sub === base) {
-        if (_isSensitive(base)) {
-            levels[levels.length - 1].recommended = true;
-        } else {
-            levels[0].recommended = true;
-        }
+function _descriptionForBoundary(tokens, boundaryIndex) {
+    if (boundaryIndex >= tokens.length - 1) {
+        return 'Allow only this exact command';
     }
-
-    // Safety net: ensure exactly one level is recommended
-    if (!levels.some(l => l.recommended) && levels.length > 0) {
-        levels[levels.length - 1].recommended = true;
-    }
-
-    return levels;
+    const prefix = tokens.slice(0, boundaryIndex + 1).join(' ');
+    return `Allow ${prefix} with any arguments`;
 }
 
 // --- File-tool names (project-scope warning) ---
@@ -134,11 +95,11 @@ function _isFileToolPattern(pattern) {
 }
 
 // --- Always Allow modal ---
-function showAlwaysAllowModal({ levels, repoPath, strippedCommand }) {
+function showAlwaysAllowModal({ tokenData, repoPath }) {
     const existing = document.getElementById('always-allow-modal-overlay');
     if (existing) existing.remove();
 
-    const isPath = levels.length === 1 && levels[0].type === 'path';
+    const isPath = tokenData.type === 'path';
     const repoName = repoPath ? repoPath.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
 
     const overlay = document.createElement('div');
@@ -154,78 +115,147 @@ function showAlwaysAllowModal({ levels, repoPath, strippedCommand }) {
     title.textContent = isPath ? 'Add Allowed Path' : 'Always Allow Rule';
     modal.appendChild(title);
 
-    // Command preview with dynamic highlighting
-    let cmdPreviewText = null;
-    if (strippedCommand) {
-        const cmdPreview = document.createElement('div');
-        cmdPreview.className = 'mb-4 bg-slate-900/50 rounded-lg px-3 py-2';
-        const cmdLabel = document.createElement('div');
-        cmdLabel.className = 'text-[10px] uppercase tracking-wider text-slate-500 mb-1';
-        cmdLabel.textContent = 'Command';
-        cmdPreviewText = document.createElement('pre');
-        cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto';
-        cmdPreview.appendChild(cmdLabel);
-        cmdPreview.appendChild(cmdPreviewText);
-        modal.appendChild(cmdPreview);
-    }
-
-    // Update command preview highlighting based on matchEnd
-    function updatePreview(matchEnd) {
-        if (!cmdPreviewText || !strippedCommand) return;
-        const display = strippedCommand.length > 200
-            ? strippedCommand.substring(0, 200) + '\u2026' : strippedCommand;
-        const cutAt = Math.min(matchEnd, display.length);
-        cmdPreviewText.innerHTML = '';
-        if (cutAt >= display.length) {
-            // Exact match — all bright
-            cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto text-slate-100';
-            cmdPreviewText.textContent = display;
-        } else {
-            cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto';
-            const bright = document.createElement('span');
-            bright.className = 'text-slate-100';
-            bright.textContent = display.substring(0, cutAt);
-            const dim = document.createElement('span');
-            dim.className = 'text-slate-500';
-            dim.textContent = display.substring(cutAt);
-            cmdPreviewText.appendChild(bright);
-            cmdPreviewText.appendChild(dim);
-        }
-    }
-
     // Track selected pattern for submission
     let selectedPattern = '';
-    const recommendedLevel = levels.find(l => l.recommended) || levels[0];
+    let useCustom = false;
 
     if (isPath) {
-        // Path safety: simple input (unchanged from previous behavior)
-        selectedPattern = levels[0].pattern;
+        // Path safety: simple input (unchanged)
+        selectedPattern = tokenData.pattern;
         const pathInput = document.createElement('input');
         pathInput.type = 'text';
         pathInput.className = 'w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 mb-4';
-        pathInput.value = levels[0].pattern;
+        pathInput.value = tokenData.pattern;
         pathInput.addEventListener('input', () => { selectedPattern = pathInput.value.trim(); });
         modal.appendChild(pathInput);
     } else {
-        // Level radio cards
-        const levelLabel = document.createElement('div');
-        levelLabel.className = 'text-sm text-slate-300 mb-2';
-        levelLabel.textContent = 'Match level:';
-        modal.appendChild(levelLabel);
+        const { tokens, recommendedIndex } = tokenData;
+        let boundaryIndex = recommendedIndex;
 
-        const radioGroup = document.createElement('div');
-        radioGroup.className = 'mb-4 rounded-lg border border-slate-700 overflow-hidden';
+        // Pattern display elements (created early, updated by renderTokens)
+        const patternRow = document.createElement('div');
+        patternRow.className = 'mb-1';
+        const patternCode = document.createElement('code');
+        patternCode.className = 'text-xs font-mono text-blue-300';
 
-        // Custom pattern input (hidden by default) + sensitivity warning
+        const descRow = document.createElement('div');
+        descRow.className = 'text-xs text-slate-400 mb-3';
+
+        const warningRow = document.createElement('div');
+        warningRow.className = 'text-[11px] text-amber-400 mb-3 hidden';
+
+        // Instruction label
+        const instrLabel = document.createElement('div');
+        instrLabel.className = 'text-sm text-slate-300 mb-2';
+        instrLabel.textContent = 'Click to set allow boundary:';
+        modal.appendChild(instrLabel);
+
+        // Token pill container
+        const tokenContainer = document.createElement('div');
+        tokenContainer.className = 'mb-4 bg-slate-900/50 rounded-lg px-3 py-3';
+
+        const tokenRow = document.createElement('div');
+        tokenRow.className = 'flex flex-wrap items-center gap-1.5';
+
+        function renderTokens() {
+            tokenRow.innerHTML = '';
+            tokens.forEach((tok, i) => {
+                const pill = document.createElement('span');
+                pill.className = 'cursor-pointer rounded px-2 py-0.5 text-sm font-mono transition-colors select-none';
+                if (i <= boundaryIndex) {
+                    pill.className += ' text-white bg-slate-700 hover:bg-slate-600';
+                } else {
+                    pill.className += ' text-slate-500 hover:bg-slate-700/40';
+                }
+                pill.textContent = tok;
+                pill.addEventListener('click', () => {
+                    boundaryIndex = i;
+                    useCustom = false;
+                    selectedPattern = _patternForBoundary(tokens, boundaryIndex);
+                    renderTokens();
+                    updateDisplay();
+                });
+                tokenRow.appendChild(pill);
+
+                // Insert wildcard indicator after boundary (if not exact match)
+                if (i === boundaryIndex && boundaryIndex < tokens.length - 1) {
+                    const star = document.createElement('span');
+                    star.className = 'text-blue-400 font-bold text-sm select-none';
+                    star.textContent = '*';
+                    tokenRow.appendChild(star);
+                }
+            });
+
+            // Recommended badge
+            const existingBadge = tokenContainer.querySelector('.rec-badge');
+            if (existingBadge) existingBadge.remove();
+            const badge = document.createElement('div');
+            badge.className = 'rec-badge text-[10px] text-blue-300 mt-1.5';
+            // Position the badge text to indicate which token is recommended
+            const recTok = tokens[recommendedIndex];
+            if (boundaryIndex === recommendedIndex) {
+                badge.innerHTML = '\u2191 Recommended';
+            } else {
+                badge.innerHTML = `Recommended: click <span class="font-mono text-blue-400">${recTok}</span>`;
+            }
+            tokenContainer.appendChild(badge);
+        }
+
+        function updateDisplay() {
+            if (useCustom) return;
+            patternCode.textContent = selectedPattern;
+            descRow.textContent = _descriptionForBoundary(tokens, boundaryIndex);
+            // Security warning
+            const prefix = tokens.slice(0, boundaryIndex + 1).join(' ');
+            if (boundaryIndex < tokens.length - 1 && _isSensitive(prefix)) {
+                warningRow.textContent = '\u26A0 Bypasses LLM safety checks for this command category';
+                warningRow.classList.remove('hidden');
+            } else {
+                warningRow.classList.add('hidden');
+            }
+        }
+
+        tokenContainer.appendChild(tokenRow);
+        modal.appendChild(tokenContainer);
+
+        // Pattern + description display
+        patternRow.appendChild(patternCode);
+        modal.appendChild(patternRow);
+        modal.appendChild(descRow);
+        modal.appendChild(warningRow);
+
+        // Custom pattern toggle
+        const customToggle = document.createElement('div');
+        customToggle.className = 'mb-4';
+        const customLink = document.createElement('button');
+        customLink.className = 'text-xs text-slate-500 hover:text-slate-300 transition-colors';
+        customLink.textContent = 'Custom pattern\u2026';
         const customInput = document.createElement('input');
         customInput.type = 'text';
-        customInput.className = 'w-full bg-slate-900 border-t border-slate-700 px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 hidden';
-        customInput.value = recommendedLevel.pattern;
+        customInput.className = 'w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 mt-2 hidden';
         const customWarn = document.createElement('div');
-        customWarn.className = 'text-[11px] text-amber-400 px-3 py-1 hidden';
+        customWarn.className = 'text-[11px] text-amber-400 mt-1 hidden';
+
+        customLink.addEventListener('click', () => {
+            useCustom = !useCustom;
+            if (useCustom) {
+                customInput.classList.remove('hidden');
+                customInput.value = selectedPattern;
+                customInput.focus();
+                customLink.textContent = 'Use token selector';
+            } else {
+                customInput.classList.add('hidden');
+                customWarn.classList.add('hidden');
+                customLink.textContent = 'Custom pattern\u2026';
+                selectedPattern = _patternForBoundary(tokens, boundaryIndex);
+                updateDisplay();
+            }
+        });
+
         customInput.addEventListener('input', () => {
             selectedPattern = customInput.value.trim();
-            // Check if custom pattern bypasses LLM safety
+            patternCode.textContent = selectedPattern;
+            descRow.textContent = 'Custom pattern';
             const m = selectedPattern.match(/^Bash\((.+?)(?::?\*?)?\)$/);
             if (m && _isSensitive(m[1])) {
                 customWarn.textContent = '\u26A0 This pattern bypasses LLM safety checks';
@@ -235,95 +265,15 @@ function showAlwaysAllowModal({ levels, repoPath, strippedCommand }) {
             }
         });
 
-        levels.forEach((level, i) => {
-            const card = document.createElement('label');
-            card.className = 'flex items-start gap-3 px-3 py-2.5 cursor-pointer hover:bg-slate-700/30 transition-colors'
-                + (i > 0 ? ' border-t border-slate-700/50' : '');
+        customToggle.appendChild(customLink);
+        customToggle.appendChild(customInput);
+        customToggle.appendChild(customWarn);
+        modal.appendChild(customToggle);
 
-            const radio = document.createElement('input');
-            radio.type = 'radio';
-            radio.name = 'aa-level';
-            radio.value = level.pattern;
-            radio.className = 'accent-blue-500 mt-0.5 flex-shrink-0';
-            if (level.recommended) radio.checked = true;
-
-            const content = document.createElement('div');
-            content.className = 'flex-1 min-w-0';
-
-            const topRow = document.createElement('div');
-            topRow.className = 'flex items-center gap-2';
-            const patternSpan = document.createElement('span');
-            patternSpan.className = 'text-sm font-mono text-slate-200 truncate';
-            patternSpan.textContent = level.label;
-            topRow.appendChild(patternSpan);
-            if (level.recommended) {
-                const badge = document.createElement('span');
-                badge.className = 'flex-shrink-0 px-1.5 py-0 rounded text-[10px] font-medium bg-blue-800/60 text-blue-300';
-                badge.textContent = 'Recommended';
-                topRow.appendChild(badge);
-            }
-            content.appendChild(topRow);
-
-            const descSpan = document.createElement('div');
-            descSpan.className = 'text-xs text-slate-400 mt-0.5';
-            descSpan.textContent = level.description;
-            content.appendChild(descSpan);
-
-            if (level.warning) {
-                const warn = document.createElement('div');
-                warn.className = 'text-[11px] text-amber-400 mt-0.5';
-                warn.textContent = '\u26A0 ' + level.warning;
-                content.appendChild(warn);
-            }
-
-            card.appendChild(radio);
-            card.appendChild(content);
-            radioGroup.appendChild(card);
-
-            radio.addEventListener('change', () => {
-                selectedPattern = level.pattern;
-                customInput.classList.add('hidden');
-                updatePreview(level.matchEnd);
-            });
-        });
-
-        // Custom pattern option
-        const customCard = document.createElement('label');
-        customCard.className = 'flex items-start gap-3 px-3 py-2.5 cursor-pointer hover:bg-slate-700/30 transition-colors border-t border-slate-700/50';
-        const customRadio = document.createElement('input');
-        customRadio.type = 'radio';
-        customRadio.name = 'aa-level';
-        customRadio.value = '__custom__';
-        customRadio.className = 'accent-blue-500 mt-0.5 flex-shrink-0';
-        const customContent = document.createElement('div');
-        customContent.className = 'flex-1 min-w-0';
-        const customLabel = document.createElement('span');
-        customLabel.className = 'text-sm text-slate-400';
-        customLabel.textContent = 'Custom pattern\u2026';
-        customContent.appendChild(customLabel);
-        customCard.appendChild(customRadio);
-        customCard.appendChild(customContent);
-        radioGroup.appendChild(customCard);
-
-        customRadio.addEventListener('change', () => {
-            customInput.classList.remove('hidden');
-            customInput.focus();
-            selectedPattern = customInput.value.trim();
-            // Show full command bright for custom
-            if (cmdPreviewText && strippedCommand) {
-                cmdPreviewText.className = 'text-xs font-mono whitespace-pre-wrap break-all max-h-20 overflow-y-auto text-slate-100';
-                cmdPreviewText.textContent = strippedCommand.length > 200
-                    ? strippedCommand.substring(0, 200) + '\u2026' : strippedCommand;
-            }
-        });
-
-        radioGroup.appendChild(customInput);
-        radioGroup.appendChild(customWarn);
-        modal.appendChild(radioGroup);
-
-        // Set initial selection
-        selectedPattern = recommendedLevel.pattern;
-        updatePreview(recommendedLevel.matchEnd);
+        // Set initial state
+        selectedPattern = _patternForBoundary(tokens, boundaryIndex);
+        renderTokens();
+        updateDisplay();
     }
 
     // Scope selection (not for path type)
@@ -837,13 +787,12 @@ function _bindRowEvents(root) {
             const command = btn.dataset.command;
             const method = btn.dataset.method;
             const repo = btn.dataset.repo;
-            const levels = extractPatternLevels(command, method);
-            if (!levels.length) {
+            const tokenData = tokenizeForSelector(command, method);
+            if (!tokenData) {
                 showLogsToast('Could not extract pattern from this command', true);
                 return;
             }
-            const stripped = command.replace(_ENV_PREFIX_RE, '');
-            showAlwaysAllowModal({ levels, repoPath: repo, strippedCommand: stripped });
+            showAlwaysAllowModal({ tokenData, repoPath: repo });
         });
     });
 }

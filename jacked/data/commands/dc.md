@@ -46,6 +46,21 @@ User asking for final verification
 **AMBIGUOUS/UNCLEAR indicators:**
 If conversation has signals from multiple phases or no clear signals at all, do NOT guess. Ask the user: "I can't tell what phase you're in. What would you like me to review?" and offer the options (planning, implementation, post-implementation, grill mode).
 
+## REVIEW LENSES (shared with /dcr)
+
+These 8 lenses define what gets reviewed. /dc checks all of them in a single pass. /dcr assigns subsets to parallel reviewers. Skip lenses that don't apply to the project type.
+
+| # | Lens | Focus Areas |
+|---|------|-------------|
+| 1 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
+| 2 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
+| 3 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
+| 4 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
+| 5 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
+| 6 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
+| 7 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
+| 8 | **Guardrails** | Project conventions (JACKED_GUARDRAILS.md if it exists), file sizes, naming, structure |
+
 ## SPAWNING INSTRUCTIONS
 
 Once you detect the phase, use the Task tool to spawn double-check-reviewer with these specific instructions:
@@ -53,31 +68,29 @@ Once you detect the phase, use the Task tool to spawn double-check-reviewer with
 ### FOR PLANNING PHASE:
 Review this plan with ultrathink depth. Ralph Wiggum style - appear simple but catch everything.
 
-Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
-- Security: Auth bypass, privilege escalation, injection, data exposure
-- RBAC: Role boundaries enforced? Multi-role edge cases? Permission checks on all paths?
-- Org isolation: Cross-tenant data leakage? Queries always scoped to org?
-- Logic: Edge cases, race conditions, error handling gaps, state corruption
-- UX: User flow coherence, error feedback, loading states, responsive/mobile
-- Performance: N+1 queries, unbounded loops, missing pagination, cache strategy
-- Testability: Is this design testable? What mocks needed? Integration test plan?
-- Guardrails compliance: Read JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md if one exists in the project root. Verify the design complies with its rules (file size limits, structure, naming, testing, security).
+Review ALL 8 lenses above (RANDOMIZE ORDER, skip lenses that don't apply). For each lens, apply it through the planning perspective:
+- Security/Access Control: Are auth and isolation designed correctly?
+- Logic & Edge Cases: What edge cases aren't addressed in the design?
+- UX & Flow: Does the user journey make sense? Error feedback planned?
+- Performance: Will this scale? N+1 risks? Cache strategy?
+- Testing: Is this design testable? What mocks/integration tests needed?
+- Maintainability: Is this the simplest solution? Implicit dependencies?
+- Guardrails: Does the design comply with project conventions?
 
 STOP CONDITION: ALL applicable lenses must pass clean. If ANY fix is made, reset and re-verify all lenses. Web search to validate assumptions as needed.
 
 ### FOR IMPLEMENTATION PHASE:
 Review recent code changes with ultrathink depth. Ralph Wiggum style - innocent questions that expose real issues.
 
-Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
-- Attacker mindset: Auth bypass? Privilege escalation? Injection? IDOR?
-- RBAC audit: Every endpoint checks permissions? Multi-role users handled?
-- Org isolation: All queries scoped? No cross-tenant leakage possible?
-- Edge case hunter: Empty states, nulls, timeouts, concurrent edits, max limits
-- User journey: Flow make sense? Error messages helpful? Mobile works?
-- Regression detector: Did fixing X break Y? Implicit dependencies changed?
-- Perf skeptic: N+1? Unbounded fetches? Missing indexes?
-- Test coverage: Unit tests cover new code? Edge cases tested?
-- Guardrails compliance: Read JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md if one exists in the project root. Verify changes comply with its rules (file size limits, structure, naming, testing, security).
+Review ALL 8 lenses above (RANDOMIZE ORDER, skip lenses that don't apply). For each lens, apply it through the implementation perspective:
+- Security: Auth bypass? Injection? IDOR? Input validation?
+- Access Control: Every endpoint checks permissions? Multi-role handled?
+- Logic & Edge Cases: Empty states, nulls, timeouts, concurrent edits, max limits?
+- UX & Flow: Flow make sense? Error messages helpful? Mobile works?
+- Performance: N+1? Unbounded fetches? Missing indexes?
+- Testing: Unit tests cover new code? Edge cases tested?
+- Maintainability: Did fixing X break Y? Implicit dependencies changed?
+- Guardrails: File sizes, naming, structure conventions followed?
 
 STOP CONDITION: ALL applicable lenses pass clean. Any fix resets pass tracker.
 
@@ -93,14 +106,14 @@ Checklist (ALL must pass):
 [ ] No perf regressions
 [ ] Tests added/updated
 
-Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
-- Requirements traceability: Does code match every requirement?
-- Defensive review: What assumptions might be wrong?
-- Fresh eyes: What would confuse someone seeing this first time?
-- Test skeptic: Would these tests catch a regression?
-- Security audit: Auth, RBAC, org isolation all solid?
-- Perf check: Queries efficient? Pagination where needed?
-- Guardrails compliance: Read JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md if one exists in the project root. Verify the implementation complies with its rules (file size limits, structure, naming, testing, security).
+Review ALL 8 lenses above (RANDOMIZE ORDER, skip lenses that don't apply). For each lens, apply it through the verification perspective:
+- Security/Access Control: Auth, RBAC, org isolation all solid?
+- Logic & Edge Cases: What assumptions might be wrong?
+- UX & Flow: What would confuse someone seeing this first time?
+- Performance: Queries efficient? Pagination where needed?
+- Testing: Would these tests catch a regression?
+- Maintainability: Does code match every requirement? Clean to read?
+- Guardrails: All project conventions followed?
 
 STOP CONDITION: Checklist 100% AND all lenses pass. Any fix resets tracker.
 
