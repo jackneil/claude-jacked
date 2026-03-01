@@ -269,9 +269,22 @@ def _ensure_shared_symlinks(config_dir: Path) -> None:
             # Wrong target — remove and recreate
             target.unlink()
 
-        # Non-symlink file/dir exists (Claude Code created it) — skip
+        # Non-symlink file/dir exists (Claude Code created it) — back up
+        # and replace with symlink so global resources are always used.
         if target.exists():
-            continue
+            backup = target.with_suffix(target.suffix + ".bak")
+            try:
+                if backup.exists():
+                    # Already backed up before — just remove the stale copy
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                else:
+                    target.rename(backup)
+            except OSError:
+                logger.warning("Failed to replace %s with symlink (non-fatal)", name)
+                continue
 
         is_dir = source.is_dir()
         try:

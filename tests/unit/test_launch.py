@@ -1286,6 +1286,92 @@ class TestSharedSymlinks:
         assert not (config_dir / "settings.json").exists()
         assert not (config_dir / "plugins").exists()
 
+    def test_replaces_real_file_with_symlink(self, tmp_path):
+        """Replaces a real settings.json (created by Claude Code) with a symlink."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        (claude_dir / "settings.json").write_text('{"hooks": {}}')
+
+        # Pre-create account dir with a REAL settings.json (as Claude Code would)
+        acct_dir = claude_dir / "accounts" / "1"
+        acct_dir.mkdir(parents=True)
+        (acct_dir / "settings.json").write_text('{"old": true}')
+        assert not (acct_dir / "settings.json").is_symlink()
+
+        with mock.patch("jacked.launch.ACCOUNTS_DIR", claude_dir / "accounts"):
+            with mock.patch("jacked.launch.should_refresh", return_value=False):
+                with mock.patch.object(Path, "home", return_value=tmp_path):
+                    from jacked.launch import prepare_account_dir
+
+                    config_dir = prepare_account_dir(account, db)
+
+        # Should now be a symlink to global
+        assert (config_dir / "settings.json").is_symlink()
+        assert (config_dir / "settings.json").resolve() == (claude_dir / "settings.json").resolve()
+        # Backup should exist
+        assert (config_dir / "settings.json.bak").exists()
+        assert json.loads((config_dir / "settings.json.bak").read_text()) == {"old": True}
+
+    def test_replaces_real_dir_with_symlink(self, tmp_path):
+        """Replaces a real plugins/ dir (created by Claude Code) with a symlink."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        (claude_dir / "plugins").mkdir()
+        (claude_dir / "plugins" / "installed_plugins.json").write_text("[]")
+
+        # Pre-create account dir with a REAL plugins dir
+        acct_dir = claude_dir / "accounts" / "1"
+        acct_dir.mkdir(parents=True)
+        (acct_dir / "plugins").mkdir()
+        (acct_dir / "plugins" / "blocklist.json").write_text("{}")
+        assert not (acct_dir / "plugins").is_symlink()
+
+        with mock.patch("jacked.launch.ACCOUNTS_DIR", claude_dir / "accounts"):
+            with mock.patch("jacked.launch.should_refresh", return_value=False):
+                with mock.patch.object(Path, "home", return_value=tmp_path):
+                    from jacked.launch import prepare_account_dir
+
+                    config_dir = prepare_account_dir(account, db)
+
+        # Should now be a symlink to global
+        assert (config_dir / "plugins").is_symlink()
+        assert (config_dir / "plugins").resolve() == (claude_dir / "plugins").resolve()
+        # Backup should exist with original content
+        assert (config_dir / "plugins.bak").is_dir()
+        assert (config_dir / "plugins.bak" / "blocklist.json").exists()
+
+    def test_backup_already_exists_removes_and_recreates(self, tmp_path):
+        """If .bak already exists, removes the real file and recreates symlink."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        (claude_dir / "settings.json").write_text('{"hooks": {}}')
+
+        acct_dir = claude_dir / "accounts" / "1"
+        acct_dir.mkdir(parents=True)
+        # Real file AND existing backup
+        (acct_dir / "settings.json").write_text('{"old": true}')
+        (acct_dir / "settings.json.bak").write_text('{"older": true}')
+
+        with mock.patch("jacked.launch.ACCOUNTS_DIR", claude_dir / "accounts"):
+            with mock.patch("jacked.launch.should_refresh", return_value=False):
+                with mock.patch.object(Path, "home", return_value=tmp_path):
+                    from jacked.launch import prepare_account_dir
+
+                    config_dir = prepare_account_dir(account, db)
+
+        assert (config_dir / "settings.json").is_symlink()
+        # Original backup preserved (not overwritten)
+        assert json.loads((config_dir / "settings.json.bak").read_text()) == {"older": True}
+
     def test_skips_existing_correct_symlink(self, tmp_path):
         """Doesn't recreate symlink if it already points to correct target."""
         db = _make_db(tmp_path)

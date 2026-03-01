@@ -63,7 +63,7 @@ function _skeleton(h) {
 
 // --- KPI cards ---
 
-function _renderKpis(kpi) {
+function _renderKpis(kpi, tokenCosts) {
     if (!kpi || kpi.total_decisions === 0) {
         return `
             <div class="flex flex-col items-center justify-center py-16 text-center">
@@ -78,8 +78,14 @@ function _renderKpis(kpi) {
     const rateColor = Number(rate) >= 90 ? 'text-green-400' : Number(rate) >= 70 ? 'text-yellow-400' : 'text-red-400';
     const cov = kpi.rule_coverage != null ? kpi.rule_coverage.toFixed(1) : '0.0';
 
+    // Cost card — only show if there's actual cost data
+    const cost = tokenCosts && tokenCosts.total_cost_usd > 0 ? tokenCosts.total_cost_usd : 0;
+    const totalTokens = tokenCosts ? (tokenCosts.total_input_tokens || 0) + (tokenCosts.total_output_tokens || 0) : 0;
+    const costDisplay = cost > 0 ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}` : '$0.00';
+    const tokenDisplay = totalTokens > 0 ? totalTokens.toLocaleString() : '0';
+
     return `
-        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
             <div class="stat-card">
                 <div class="text-2xl font-bold text-white">${(kpi.total_decisions || 0).toLocaleString()}</div>
                 <div class="text-xs text-slate-400 mt-1">Total Decisions</div>
@@ -99,6 +105,10 @@ function _renderKpis(kpi) {
             <div class="stat-card">
                 <div class="text-2xl font-bold text-amber-400">${(kpi.api_evaluations || 0).toLocaleString()}</div>
                 <div class="text-xs text-slate-400 mt-1">API Evaluations</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-2xl font-bold text-emerald-400">${costDisplay}</div>
+                <div class="text-xs text-slate-400 mt-1">API Cost <span class="text-slate-500">(${tokenDisplay} tok)</span></div>
             </div>
         </div>`;
 }
@@ -152,10 +162,11 @@ async function loadAnalyticsData() {
         ]);
 
         const kpi = dashboard ? dashboard.kpi : null;
+        const tokenCosts = dashboard ? dashboard.token_costs : null;
         const hasData = kpi && kpi.total_decisions > 0;
 
         // KPI cards (or empty state)
-        let html = _renderKpis(kpi);
+        let html = _renderKpis(kpi, tokenCosts);
 
         if (hasData) {
             // Charts section — needs Chart.js

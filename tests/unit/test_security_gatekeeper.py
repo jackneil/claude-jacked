@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -2479,6 +2480,75 @@ class TestCheckPathSafetyWatched:
 
 
 # ---------------------------------------------------------------------------
+# _project_dir — CLAUDE_PROJECT_DIR vs cwd fallback
+# ---------------------------------------------------------------------------
+
+
+class TestProjectDir:
+    """Tests for _project_dir helper used by outside-project checks."""
+
+    def test_returns_env_var_when_set(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/my/project")
+        assert gk._project_dir("/some/other/cwd") == "/my/project"
+
+    def test_falls_back_to_cwd_when_unset(self, monkeypatch):
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        assert gk._project_dir("/fallback/cwd") == "/fallback/cwd"
+
+    def test_empty_string_falls_back_to_cwd(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "")
+        assert gk._project_dir("/fallback/cwd") == "/fallback/cwd"
+
+
+class TestDriftedCwdOutsideProject:
+    """Regression: drifted cwd should not cause false 'outside project' alerts.
+
+    When cd commands shift cwd to a subdirectory, sibling paths within the
+    same project should not be flagged as outside the project.
+    """
+
+    def test_sibling_path_allowed_when_project_dir_set(self, tmp_path, monkeypatch):
+        """File in sibling dir of drifted cwd is inside project root."""
+        project = tmp_path / "project"
+        (project / "apps" / "desktop" / "src" / "api").mkdir(parents=True)
+        (project / "apps" / "desktop" / "src-tauri").mkdir(parents=True)
+
+        target = project / "apps" / "desktop" / "src" / "api" / "file.ts"
+        target.write_text("export {}")
+        drifted_cwd = str(project / "apps" / "desktop" / "src-tauri")
+
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+
+        config = {
+            "enabled": True,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+        result = gk._check_path_safety(str(target), drifted_cwd, config)
+        assert result is None, f"Expected None (allowed), got: {result}"
+
+    def test_outside_project_still_caught(self, tmp_path, monkeypatch):
+        """File truly outside project root is still flagged."""
+        project = tmp_path / "project"
+        project.mkdir()
+        outside = tmp_path / "other" / "secret.txt"
+        outside.parent.mkdir(parents=True)
+        outside.write_text("secret")
+
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+
+        config = {
+            "enabled": True,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+        result = gk._check_path_safety(str(outside), str(project), config)
+        assert result == "outside project directory"
+
+
+# ---------------------------------------------------------------------------
 # _check_bash_path_safety — watched paths in bash commands
 # ---------------------------------------------------------------------------
 
@@ -2991,10 +3061,10 @@ class TestHandleFileTool:
         output = json.loads(captured.out.strip())
         assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
 
-    def test_notebook_path_key_emits_allow(self, capsys, tmp_path):
-        """NotebookEdit uses 'notebook_path' key — still emits allow for safe paths.
+    def test_notebook_path_key_defers_write(self, capsys, tmp_path):
+        """NotebookEdit uses 'notebook_path' key — defers to Claude Code (write tool).
 
-        >>> # NotebookEdit uses tool_input["notebook_path"]
+        >>> # NotebookEdit is a write tool → DEFER_TO_CC
         """
         nb = tmp_path / "analysis.ipynb"
         nb.write_text("{}")
@@ -3013,8 +3083,7 @@ class TestHandleFileTool:
             )
 
         captured = capsys.readouterr()
-        output = json.loads(captured.out.strip())
-        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+        assert captured.out.strip() == ""  # silent return = defer to Claude Code
 
     def test_null_byte_in_path_denied(self, capsys, tmp_path):
         """Null byte in file path emits deny — prevents regex bypass.
@@ -3228,6 +3297,129 @@ class TestHandleFileTool:
         captured = capsys.readouterr()
         output = json.loads(captured.out.strip())
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # --- Write tool deferral tests ---
+
+    def test_edit_safe_file_defers_to_cc(self, capsys, tmp_path):
+        """Edit on a safe in-project file defers to Claude Code (no emit_allow).
+
+        >>> # Edit is a write tool → DEFER_TO_CC, not ALLOW
+        """
+        test_file = tmp_path / "main.py"
+        test_file.write_text("print('hi')")
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._safe_config()),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Edit", {"file_path": str(test_file)}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""  # silent return = defer to Claude Code
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
+
+    def test_write_safe_file_defers_to_cc(self, capsys, tmp_path):
+        """Write on a safe in-project file defers to Claude Code.
+
+        >>> # Write is a write tool → DEFER_TO_CC
+        """
+        test_file = tmp_path / "output.txt"
+        test_file.write_text("data")
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._safe_config()),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Write", {"file_path": str(test_file)}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
+
+    def test_read_safe_file_still_allows(self, capsys, tmp_path):
+        """Read on a safe in-project file still emits allow (not deferred).
+
+        >>> # Read is a read tool → ALLOW, not DEFER_TO_CC
+        """
+        test_file = tmp_path / "main.py"
+        test_file.write_text("print('hi')")
+        cwd = str(tmp_path)
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=self._safe_config()),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Read", {"file_path": str(test_file)}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "ALLOW"
+
+    def test_disabled_config_edit_defers_to_cc(self, capsys, tmp_path):
+        """config.enabled=False + Edit on safe file → defers to Claude Code.
+
+        >>> # Path safety disabled + write tool → DEFER_TO_CC
+        """
+        cwd = str(tmp_path)
+        disabled_config = {
+            "enabled": False,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=disabled_config),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Edit", {"file_path": "main.py"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""  # silent return = defer to Claude Code
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
+
+    def test_disabled_config_write_defers_to_cc(self, capsys, tmp_path):
+        """config.enabled=False + Write on safe file → defers to Claude Code.
+
+        >>> # Path safety disabled + write tool → DEFER_TO_CC
+        """
+        cwd = str(tmp_path)
+        disabled_config = {
+            "enabled": False,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+
+        with (
+            patch.object(gk, "_read_path_safety_config", return_value=disabled_config),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_is_path_sensitive", return_value=None),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": cwd}),
+        ):
+            gk._handle_file_tool("Write", {"file_path": "output.txt"}, cwd, "test-session")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
 
 
 # ---------------------------------------------------------------------------
@@ -4077,7 +4269,10 @@ class TestRecordDecisionRedaction:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS gatekeeper_decisions (
                 timestamp TEXT, command TEXT, decision TEXT, method TEXT,
-                reason TEXT, elapsed_ms REAL, session_id TEXT, repo_path TEXT
+                reason TEXT, elapsed_ms REAL, session_id TEXT, repo_path TEXT,
+                input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+                model TEXT, trajectory TEXT
             )"""
         )
         conn.execute(
@@ -4140,3 +4335,182 @@ class TestRecordDecisionRedaction:
         assert row is not None
         assert "secret123" not in row[0]
         assert "PGPASSWORD=***" in row[0]
+
+
+# ---------------------------------------------------------------------------
+# Trajectory: _Steps helper
+# ---------------------------------------------------------------------------
+
+
+class TestSteps:
+    """Verify _Steps helper collects trajectory steps with timing."""
+
+    def test_empty_returns_none(self):
+        steps = gk._Steps(time.time())
+        assert steps.to_json() is None
+
+    def test_single_step(self):
+        t = time.time()
+        steps = gk._Steps(t)
+        steps.record("deny_pattern", "pass")
+        result = steps.to_json()
+        assert len(result) == 1
+        assert result[0]["tier"] == "deny_pattern"
+        assert result[0]["result"] == "pass"
+        assert "ms" in result[0]
+        assert result[0]["ms"] >= 0
+        assert "detail" not in result[0]
+
+    def test_detail_included(self):
+        steps = gk._Steps(time.time())
+        steps.record("category", "ask", "rm,destructive")
+        result = steps.to_json()
+        assert result[0]["detail"] == "rm,destructive"
+
+    def test_detail_truncated_at_100(self):
+        steps = gk._Steps(time.time())
+        long_detail = "x" * 200
+        steps.record("llm", "allow", long_detail)
+        result = steps.to_json()
+        assert len(result[0]["detail"]) == 100
+
+    def test_per_step_timing(self):
+        """Each step measures delta from previous step, not from start."""
+        t = time.time()
+        steps = gk._Steps(t)
+        # Simulate small delays between steps
+        time.sleep(0.01)
+        steps.record("deny_pattern", "pass")
+        time.sleep(0.01)
+        steps.record("category", "pass")
+        result = steps.to_json()
+        assert len(result) == 2
+        # Both should have positive ms values
+        assert result[0]["ms"] > 0
+        assert result[1]["ms"] > 0
+
+    def test_result_values(self):
+        """Steps use pass/allow/ask — never match."""
+        steps = gk._Steps(time.time())
+        steps.record("deny_pattern", "pass")
+        steps.record("category", "pass")
+        steps.record("path_safety", "pass")
+        steps.record("perms", "allow", "npm *")
+        result = steps.to_json()
+        assert len(result) == 4
+        valid = {"pass", "allow", "ask"}
+        for step in result:
+            assert step["result"] in valid
+
+    def test_full_trajectory(self):
+        """All 6 tiers produce 6 steps."""
+        steps = gk._Steps(time.time())
+        steps.record("deny_pattern", "pass")
+        steps.record("category", "pass")
+        steps.record("path_safety", "pass")
+        steps.record("perms", "pass")
+        steps.record("local", "pass")
+        steps.record("llm", "allow", "API:haiku")
+        result = steps.to_json()
+        assert len(result) == 6
+        tiers = [s["tier"] for s in result]
+        assert tiers == ["deny_pattern", "category", "path_safety", "perms", "local", "llm"]
+
+
+# ---------------------------------------------------------------------------
+# Trajectory: DB recording
+# ---------------------------------------------------------------------------
+
+
+class TestTrajectoryRecording:
+    """Verify trajectory is serialized to JSON in gatekeeper_decisions."""
+
+    def _make_db(self, tmp_path):
+        db_path = tmp_path / "jacked.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS gatekeeper_decisions (
+                timestamp TEXT, command TEXT, decision TEXT, method TEXT,
+                reason TEXT, elapsed_ms REAL, session_id TEXT, repo_path TEXT,
+                input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+                model TEXT, trajectory TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS hook_executions (
+                timestamp TEXT, hook_type TEXT, hook_name TEXT,
+                session_id TEXT, success INTEGER, duration_ms REAL, repo_path TEXT
+            )"""
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_trajectory_written_to_db(self, tmp_path):
+        """Trajectory JSON array is stored in the trajectory column."""
+        db_path = self._make_db(tmp_path)
+        trajectory = [
+            {"tier": "deny_pattern", "result": "pass", "ms": 0.1},
+            {"tier": "category", "result": "pass", "ms": 0.2},
+            {"tier": "perms", "result": "allow", "ms": 0.3, "detail": "npm *"},
+        ]
+
+        with patch.object(gk, "DB_PATH", db_path):
+            gk._record_decision(
+                "ALLOW", "npm install", "perms", "matched pattern",
+                1.5, "test-sess", "/fake/repo", trajectory=trajectory,
+            )
+        time.sleep(0.2)
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT trajectory FROM gatekeeper_decisions").fetchone()
+        conn.close()
+
+        assert row is not None
+        parsed = json.loads(row[0])
+        assert len(parsed) == 3
+        assert parsed[0]["tier"] == "deny_pattern"
+        assert parsed[2]["detail"] == "npm *"
+
+    def test_none_trajectory_stored_as_null(self, tmp_path):
+        """Non-Bash tools pass trajectory=None — stored as SQL NULL."""
+        db_path = self._make_db(tmp_path)
+
+        with patch.object(gk, "DB_PATH", db_path):
+            gk._record_decision(
+                "ALLOW", "Read file.txt", "file", "safe",
+                0.5, "test-sess", "/fake/repo", trajectory=None,
+            )
+        time.sleep(0.2)
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT trajectory FROM gatekeeper_decisions").fetchone()
+        conn.close()
+
+        assert row is not None
+        assert row[0] is None
+
+    def test_trajectory_via_steps_helper(self, tmp_path):
+        """End-to-end: _Steps.to_json() output is recorded correctly."""
+        db_path = self._make_db(tmp_path)
+        steps = gk._Steps(time.time())
+        steps.record("deny_pattern", "pass")
+        steps.record("category", "ask", "rm,destructive")
+
+        with patch.object(gk, "DB_PATH", db_path):
+            gk._record_decision(
+                "ASK_USER", "rm -rf /", "category", "destructive pattern",
+                2.0, "test-sess", "/fake/repo", trajectory=steps.to_json(),
+            )
+        time.sleep(0.2)
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT trajectory FROM gatekeeper_decisions").fetchone()
+        conn.close()
+
+        parsed = json.loads(row[0])
+        assert len(parsed) == 2
+        assert parsed[0]["result"] == "pass"
+        assert parsed[1]["result"] == "ask"
+        assert parsed[1]["detail"] == "rm,destructive"

@@ -31,7 +31,7 @@ RULES_END_MARKER = "# end-jacked-behaviors"
 
 # Valid hook/knowledge names (allowlist)
 VALID_HOOKS = {"security_gatekeeper", "session_indexing", "sounds"}
-VALID_KNOWLEDGE = {"rules", "skill", "reference"}
+VALID_KNOWLEDGE = {"rules", "skill", "skill_optimizer", "reference"}
 
 # ---------------------------------------------------------------------------
 # Claude Code settings constants — these control Claude Code itself, not jacked
@@ -405,6 +405,13 @@ async def list_features():
             "source_available": (DATA_ROOT / "skills" / "jacked" / "SKILL.md").exists(),
         },
         {
+            "name": "skill_optimizer",
+            "display_name": "/claude-md-optimizer Skill",
+            "description": "Audit and optimize CLAUDE.md for quality and token efficiency",
+            "installed": (CLAUDE_DIR / "skills" / "claude-md-optimizer" / "SKILL.md").exists(),
+            "source_available": (DATA_ROOT / "skills" / "claude-md-optimizer" / "SKILL.md").exists(),
+        },
+        {
             "name": "reference",
             "display_name": "Reference Doc",
             "description": "Comprehensive knowledge document about jacked for Claude",
@@ -562,6 +569,10 @@ async def _toggle_knowledge(name: str, enabled: bool):
     if name == "skill":
         src = DATA_ROOT / "skills" / "jacked" / "SKILL.md"
         dst = CLAUDE_DIR / "skills" / "jacked" / "SKILL.md"
+        return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
+    if name == "skill_optimizer":
+        src = DATA_ROOT / "skills" / "claude-md-optimizer" / "SKILL.md"
+        dst = CLAUDE_DIR / "skills" / "claude-md-optimizer" / "SKILL.md"
         return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
     if name == "reference":
         src = DATA_ROOT / "rules" / "jacked-reference.md"

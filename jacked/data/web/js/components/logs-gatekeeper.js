@@ -407,6 +407,7 @@ function renderGatekeeperSubTab(container) {
                     <option value="ALL" ${logsFilter === 'ALL' ? 'selected' : ''}>All Decisions</option>
                     <option value="ALLOW" ${logsFilter === 'ALLOW' ? 'selected' : ''}>Allowed</option>
                     <option value="ASK_USER" ${logsFilter === 'ASK_USER' ? 'selected' : ''}>Asked User</option>
+                    <option value="DEFER_TO_CC" ${logsFilter === 'DEFER_TO_CC' ? 'selected' : ''}>Deferred</option>
                 </select>
                 <select id="logs-method-filter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500">
                     <option value="ALL">All Methods</option>
@@ -700,6 +701,9 @@ function getDecisionColors(decision, method) {
     if (method === 'DENY_PATTERN') {
         return { bg: 'bg-red-900/20', badge: 'bg-red-700 text-red-100' };
     }
+    if (decision === 'DEFER_TO_CC') {
+        return { bg: 'bg-slate-900/20', badge: 'bg-slate-600 text-slate-200' };
+    }
     return { bg: 'bg-yellow-900/20', badge: 'bg-yellow-700 text-yellow-100' };
 }
 function truncateCommand(cmd, maxLen) {
@@ -709,6 +713,43 @@ function truncateCommand(cmd, maxLen) {
 
 // --- Row HTML builder (reused by full render and incremental prepend) ---
 // Note: all dynamic values are escaped via escapeHtml() before interpolation.
+function _parseTrajectory(raw) {
+    if (raw == null) return null;
+    try {
+        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+    } catch (e) {
+        console.warn('Failed to parse trajectory:', e);
+        return null;
+    }
+}
+
+function _renderTrajectory(traj) {
+    if (!Array.isArray(traj) || !traj.length) return '';
+    const TIER_LABELS = {
+        deny_pattern: 'Deny', category: 'Category',
+        path_safety: 'Path', path_safety_floor: 'Path Floor',
+        perms: 'Perms', local: 'Local', llm: 'LLM'
+    };
+    const pills = traj.map(step => {
+        const label = TIER_LABELS[step.tier] || escapeHtml(step.tier || '');
+        const detail = step.detail ? ` \u00b7 ${escapeHtml(String(step.detail).substring(0, 40))}` : '';
+        const msVal = Number(step.ms);
+        const ms = !isNaN(msVal) ? ` ${msVal < 1 ? '<1' : Math.round(msVal)}ms` : '';
+        if (step.result === 'pass') {
+            return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-transparent text-[10px] bg-slate-700/50 text-slate-400"><span class="text-green-500">\u2713</span>${label}<span class="text-slate-500">${ms}</span></span>`;
+        }
+        const isAllow = step.result === 'allow';
+        const color = isAllow
+            ? 'bg-green-900/40 text-green-300 border border-green-700/50'
+            : 'bg-amber-900/40 text-amber-300 border border-amber-700/50';
+        return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] ${color}">${label}${detail}<span class="opacity-60">${ms}</span></span>`;
+    });
+    return `<div>
+        <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Decision Path</div>
+        <div class="flex items-center gap-1 flex-wrap">${pills.join('<span class="text-slate-600 text-[10px]">\u2192</span>')}</div>
+    </div>`;
+}
+
 function buildRowHtml(r, showRepo) {
     const colors = getDecisionColors(r.decision, r.method);
     const cmd = escapeHtml(truncateCommand(r.command, 100));
@@ -751,6 +792,7 @@ function buildRowHtml(r, showRepo) {
                         <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Reason</div>
                         <div class="text-xs text-slate-300 italic">${reason}</div>
                     </div>` : ''}
+                    ${_renderTrajectory(_parseTrajectory(r.trajectory))}
                     <div class="flex items-center gap-6 text-xs text-slate-400">
                         <div><span class="text-slate-500">Session:</span> <span class="font-mono">${fullSession}</span></div>
                         <div><span class="text-slate-500">Repo:</span> <span class="font-mono">${fullRepo}</span></div>

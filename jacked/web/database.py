@@ -248,7 +248,13 @@ CREATE TABLE IF NOT EXISTS gatekeeper_decisions (
     reason TEXT,
     elapsed_ms REAL,
     session_id TEXT,
-    repo_path TEXT
+    repo_path TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    model TEXT,
+    trajectory TEXT
 );
 
 CREATE TABLE IF NOT EXISTS command_usage (
@@ -453,6 +459,31 @@ class Database:
                         )
                     except sqlite3.OperationalError:
                         pass
+            # Migration: add token tracking + model to gatekeeper_decisions
+            cursor = conn.execute("PRAGMA table_info(gatekeeper_decisions)")
+            cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_def in [
+                ("input_tokens", "INTEGER DEFAULT 0"),
+                ("output_tokens", "INTEGER DEFAULT 0"),
+                ("cache_read_tokens", "INTEGER DEFAULT 0"),
+                ("cache_write_tokens", "INTEGER DEFAULT 0"),
+                ("model", "TEXT"),
+            ]:
+                if col_name not in cols:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE gatekeeper_decisions ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+            # Migration: add trajectory to gatekeeper_decisions
+            if "trajectory" not in cols:
+                try:
+                    conn.execute(
+                        "ALTER TABLE gatekeeper_decisions ADD COLUMN trajectory TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass
             # Indexes (after migrations so new columns exist)
             conn.executescript(INDEXES_SQL)
             # Migration: rebuild idx_sa_active to cover last_activity_at
@@ -1061,6 +1092,11 @@ class Database:
         elapsed_ms: Optional[float] = None,
         session_id: Optional[str] = None,
         repo_path: Optional[str] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        model: Optional[str] = None,
     ) -> int:
         """Record a gatekeeper decision.
 
@@ -1077,8 +1113,10 @@ class Database:
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO gatekeeper_decisions
-                   (timestamp, command, decision, method, reason, elapsed_ms, session_id, repo_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (timestamp, command, decision, method, reason, elapsed_ms,
+                    session_id, repo_path, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ts,
                     command,
@@ -1088,6 +1126,11 @@ class Database:
                     elapsed_ms,
                     session_id,
                     repo_path,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    model,
                 ),
             )
             return cursor.lastrowid or 0

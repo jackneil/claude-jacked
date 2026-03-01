@@ -146,7 +146,7 @@ async function renderRoute(route) {
 // ---------------------------------------------------------------------------
 async function loadAccounts() {
     try {
-        const data = await api.get('/api/auth/accounts');
+        const data = await api.get('/api/auth/accounts?include_inactive=true');
         window.jackedState.accounts = data.accounts || data || [];
     } catch (e) {
         console.error('Failed to load accounts:', e);

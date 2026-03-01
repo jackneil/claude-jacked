@@ -233,4 +233,11 @@ When NOT given lens assignments (spawned by /dc or directly), review all applica
 - **Fresh Perspective**: Your value is being the "fresh eyes" - don't assume anything is correct just because it exists
 
 ## PROJECT CONTEXT
-Re-read claude.md and follow any instructions in the repo for knowledge you need or rules you must follow before performing the double check review
+
+If the dispatcher included a `## PROJECT CONTEXT` section in your prompt, use it as your primary reference for the Guardrails lens. Cite specific rules when flagging violations.
+
+If NO project context was provided (e.g., spawned directly via /dc without context discovery), discover it yourself:
+- Read `CLAUDE.md`, `AGENTS.md` in the project root
+- Glob for `*GUARDRAILS*`, `*guardrails*`, `CONTRIBUTING.md`, `STYLE_GUIDE.md`
+- Check `docs/`, `design/`, `adr/`, `decisions/` for design docs and ADRs
+- Read any relevant files found — these inform all review angles, not just Guardrails

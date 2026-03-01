@@ -18,6 +18,7 @@ from jacked.api.watchers import (
     process_alive_sweeper_loop,
     session_accounts_watch_loop,
 )
+from jacked.api.log_capture import server_log_buffer
 from jacked.api.websocket import WebSocketRegistry
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,18 @@ async def lifespan(app: FastAPI):
     app.state.port = port
     app.state.allowed_origins = _build_allowed_origins(host, port)
 
+    # Wire server log capture (buffer-only until loop/registry set)
+    _log_handler = server_log_buffer.handler
+    server_log_buffer.set_loop(asyncio.get_running_loop())
+    server_log_buffer.set_registry(app.state.ws_registry)
+    logging.getLogger().addHandler(_log_handler)
+
+    # Lower jacked namespace to INFO so messages reach the capture handler.
+    # basicConfig() in cli.py sets root to WARNING which would suppress them.
+    _jacked_logger = logging.getLogger("jacked")
+    if _jacked_logger.getEffectiveLevel() > logging.INFO:
+        _jacked_logger.setLevel(logging.INFO)
+
     if host == "0.0.0.0":
         logger.warning(
             "Dashboard exposed to network — consider using a VPN or tunnel for security"
@@ -120,6 +133,10 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+
+    # Detach server log capture
+    logging.getLogger().removeHandler(_log_handler)
+    server_log_buffer.detach()
 
     db = getattr(app.state, "db", None)
     if db is not None:
@@ -229,11 +246,12 @@ async def websocket_endpoint(ws: WebSocket):
 
 # --- Include route modules ---
 
-from jacked.api.routes import system, analytics, features, permissions, profiles  # noqa: E402
+from jacked.api.routes import system, analytics, features, logs, permissions, profiles  # noqa: E402
 
 app.include_router(system.router, prefix="/api", tags=["system"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(features.router, prefix="/api", tags=["features"])
+app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(permissions.router, prefix="/api", tags=["permissions"])
 app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
 

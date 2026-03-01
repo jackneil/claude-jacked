@@ -58,6 +58,8 @@ const jackedWS = {
 
         this.ws.onclose = () => {
             console.log('[WS] Disconnected — reconnecting in', this.reconnectDelay + 'ms');
+            // Insert disconnect marker in server logs tab
+            if (typeof _srvInsertDisconnectMarker === 'function') _srvInsertDisconnectMarker();
             // Reset polling to fast interval since WS is no longer providing updates
             if (typeof _wsPollingAdjusted !== 'undefined') _wsPollingAdjusted = false;
             if (typeof stopPolling === 'function' && typeof startPolling === 'function') {
@@ -160,6 +162,12 @@ jackedWS.on('credentials_changed', async (msg) => {
 jackedWS.on('logs_changed', (msg) => {
     if (typeof refreshCurrentLogsSubTab === 'function') {
         refreshCurrentLogsSubTab(msg.payload?.tables);
+    }
+});
+
+jackedWS.on('server_logs_changed', (msg) => {
+    if (typeof _srvHandleWsEntries === 'function') {
+        _srvHandleWsEntries(msg.payload?.entries);
     }
 });
 

@@ -68,7 +68,7 @@ Language-specific coding standards enforced through templates and git hooks.
 - Projects without our pre-push hook show "No Lint Hook" badge
 - One-click setup from dashboard creates guardrails and/or installs hooks
 
-## Security Gatekeeper (requires [security] extra)
+## Security Gatekeeper
 
 4-tier evaluation chain for every Bash command Claude runs:
 

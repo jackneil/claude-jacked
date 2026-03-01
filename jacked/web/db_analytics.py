@@ -6,6 +6,32 @@ Pure-function layer over a Database instance. All queries are parameterized
 
 from datetime import datetime, timedelta, timezone
 
+# ---------------------------------------------------------------------------
+# Anthropic API pricing per million tokens (USD)
+# Verify at: https://platform.claude.com/docs/en/about-claude/pricing
+# Last verified: 2026-02-28
+# ---------------------------------------------------------------------------
+
+# Price tiers — single source of truth, mapped by full ID and short alias below.
+_TIER_HAIKU  = {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25}
+_TIER_SONNET = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75}
+_TIER_OPUS   = {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25}
+
+# Keep in sync with MODEL_MAP in security_gatekeeper.py when adding models.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    # Full model IDs (stored in DB model column)
+    "claude-haiku-4-5-20251001": _TIER_HAIKU,
+    "claude-sonnet-4-5-20250929": _TIER_SONNET,
+    "claude-sonnet-4-6": _TIER_SONNET,
+    "claude-opus-4-6": _TIER_OPUS,
+    # Short aliases (fallback for legacy rows without model column)
+    "haiku": _TIER_HAIKU,
+    "sonnet": _TIER_SONNET,
+    "opus": _TIER_OPUS,
+}
+
+_ZERO_PRICES: dict[str, float] = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -385,3 +411,136 @@ def get_hot_rules(db, days: int = 7, limit: int = 10) -> list[dict]:
             (cutoff, limit),
         ).fetchall()
     return [{"method": r["method"], "count": r["cnt"]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Token cost analytics
+# ---------------------------------------------------------------------------
+
+def _resolve_model(row: dict) -> str:
+    """Extract model identifier from a gatekeeper_decisions row.
+
+    Prefers the `model` column (full ID). Falls back to parsing the short
+    name from the `method` column (e.g. 'API:haiku' -> 'haiku').
+
+    >>> _resolve_model({"model": "claude-opus-4-6", "method": "API:opus"})
+    'claude-opus-4-6'
+    >>> _resolve_model({"model": None, "method": "API:haiku"})
+    'haiku'
+    >>> _resolve_model({"model": None, "method": None})
+    'unknown'
+    """
+    model = row.get("model")
+    if model:
+        return model
+    method = row.get("method") or ""
+    if ":" in method:
+        return method.split(":", 1)[1]
+    return "unknown"
+
+
+def _row_cost(row: dict) -> float:
+    """Calculate USD cost for a single gatekeeper decision row.
+
+    >>> _row_cost({"model": "claude-haiku-4-5-20251001", "method": "API:haiku",
+    ...            "input_tokens": 1000, "output_tokens": 100,
+    ...            "cache_read_tokens": 0, "cache_write_tokens": 0})
+    1.5e-03
+    """
+    model_key = _resolve_model(row)
+    prices = MODEL_PRICING.get(model_key, _ZERO_PRICES)
+    return (
+        (row.get("input_tokens", 0) or 0) / 1_000_000 * prices["input"]
+        + (row.get("output_tokens", 0) or 0) / 1_000_000 * prices["output"]
+        + (row.get("cache_read_tokens", 0) or 0) / 1_000_000 * prices["cache_read"]
+        + (row.get("cache_write_tokens", 0) or 0) / 1_000_000 * prices["cache_write"]
+    )
+
+
+def get_token_cost_summary(db, days: int = 7) -> dict:
+    """Aggregate token usage and estimated cost over the given window.
+
+    Only includes rows where input_tokens > 0 (i.e. API calls, not CLI/local).
+
+    >>> from jacked.web.database import Database
+    >>> db = Database(":memory:")
+    >>> summary = get_token_cost_summary(db, days=7)
+    >>> summary["total_cost_usd"]
+    0.0
+    >>> summary["total_input_tokens"]
+    0
+    """
+    cutoff = _cutoff_iso(days)
+    with db._reader() as conn:
+        rows = conn.execute(
+            "SELECT timestamp, method, model, input_tokens, output_tokens, "
+            "       cache_read_tokens, cache_write_tokens "
+            "FROM gatekeeper_decisions "
+            "WHERE timestamp >= ? AND input_tokens > 0 "
+            "ORDER BY timestamp DESC LIMIT 10000",
+            (cutoff,),
+        ).fetchall()
+
+    if not rows:
+        return {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cache_read_tokens": 0,
+            "total_cache_write_tokens": 0,
+            "total_cost_usd": 0.0,
+            "by_model": {},
+            "daily_costs": [],
+        }
+
+    total_in = total_out = total_cr = total_cw = 0
+    total_cost = 0.0
+    by_model: dict[str, dict] = {}
+    daily: dict[str, dict] = {}
+
+    for row in rows:
+        r = dict(row)
+        model_key = _resolve_model(r)
+        cost = _row_cost(r)
+        in_tok = r.get("input_tokens", 0) or 0
+        out_tok = r.get("output_tokens", 0) or 0
+        cr_tok = r.get("cache_read_tokens", 0) or 0
+        cw_tok = r.get("cache_write_tokens", 0) or 0
+
+        total_in += in_tok
+        total_out += out_tok
+        total_cr += cr_tok
+        total_cw += cw_tok
+        total_cost += cost
+
+        # By model
+        if model_key not in by_model:
+            by_model[model_key] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
+        by_model[model_key]["input_tokens"] += in_tok
+        by_model[model_key]["output_tokens"] += out_tok
+        by_model[model_key]["cost_usd"] += cost
+        by_model[model_key]["calls"] += 1
+
+        # Daily
+        ts = r.get("timestamp", "")
+        date_key = ts[:10] if len(ts) >= 10 else "unknown"
+        if date_key not in daily:
+            daily[date_key] = {"date": date_key, "cost_usd": 0.0, "calls": 0}
+        daily[date_key]["cost_usd"] += cost
+        daily[date_key]["calls"] += 1
+
+    # Round costs for display
+    for entry in by_model.values():
+        entry["cost_usd"] = round(entry["cost_usd"], 6)
+    daily_costs = sorted(daily.values(), key=lambda d: d["date"])
+    for entry in daily_costs:
+        entry["cost_usd"] = round(entry["cost_usd"], 6)
+
+    return {
+        "total_input_tokens": total_in,
+        "total_output_tokens": total_out,
+        "total_cache_read_tokens": total_cr,
+        "total_cache_write_tokens": total_cw,
+        "total_cost_usd": round(total_cost, 6),
+        "by_model": by_model,
+        "daily_costs": daily_costs,
+    }

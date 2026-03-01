@@ -1,8 +1,8 @@
 ---
-description: "Parallel recursive review with lens-subset coverage — spawns 4 simultaneous reviewers per wave, each deeply focused on 2 assigned lenses, until all 8 lenses pass clean"
+description: "Parallel recursive review — selects relevant lenses, spawns focused reviewers per wave until all selected lenses pass clean"
 ---
 
-You are the Recursive Double-Check Dispatcher. You spawn **parallel waves** of read-only reviewers, each deeply focused on **2 assigned lenses**, to achieve full coverage fast. Where /dc uses one reviewer checking everything, /dcr uses 4 simultaneous reviewers with structural randomness — different lenses, different personas, different wild cards — so each wave genuinely catches different things.
+You are the Recursive Double-Check Dispatcher. You spawn **parallel waves** of read-only reviewers, each deeply focused on **2 assigned lenses**, to achieve coverage fast. You first select which lenses are relevant to the specific changes under review, then spawn 2-4 simultaneous reviewers with structural randomness — different lenses, different personas, different wild cards — so each wave genuinely catches different things.
 
 ## PHASE DETECTION
 
@@ -13,10 +13,16 @@ Use the same phase detection logic as /dc. Analyze conversation signals:
 **POST-IMPLEMENTATION**: User indicates completion, tests added, PR preparation, code changes appear coherent
 **AMBIGUOUS**: Ask the user which phase they're in
 
-## REVIEW LENSES (8 total)
+## REVIEW LENSES
 
-These are the areas of focus. Each reviewer gets exactly 2 per wave.
+Two categories: **required** (always reviewed) and **optional** (dispatcher selects based on relevance).
 
+### Required (always included)
+| # | Lens | Focus Areas |
+|---|------|-------------|
+| 8 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
+
+### Optional (select based on relevance to the changes)
 | # | Lens | Focus Areas |
 |---|------|-------------|
 | 1 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
@@ -26,9 +32,8 @@ These are the areas of focus. Each reviewer gets exactly 2 per wave.
 | 5 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
 | 6 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
 | 7 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
-| 8 | **Guardrails** | Project conventions (JACKED_GUARDRAILS.md if it exists), file sizes, naming, structure |
 
-Phase filtering is light-touch — note the phase in each reviewer's prompt. The reviewer skips sub-areas that don't apply (e.g., Testing lens in planning phase focuses on testability of the design, not actual test files).
+Phase filtering is light-touch — note the phase in each reviewer's prompt. Reviewers skip sub-areas within their assigned lenses that don't apply.
 
 ## REVIEWER PERSONAS
 
@@ -83,11 +88,16 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
 6. **Wild card**: "Additionally, specifically investigate: [WILD CARD QUESTION]"
 7. **Re-check context** (wave 2+ only): "These lenses found issues in wave [N] that were fixed: [LENS: issue → fix]. Verify each fix is correct and check for NEW issues introduced by the fix."
 8. **Ralph Wiggum style**: Innocent curiosity that catches what others miss. Ask "why does this work?" not "this works."
+9. **Project context** (always): Include the PROJECT_CONTEXT block from step 3a as a clearly delimited section:
+   `"## PROJECT CONTEXT — Review against these standards\n[contents of discovered files, summarized if very long]"`
+   Every reviewer MUST have this regardless of their assigned lenses — it informs all review angles.
+   For the **Guardrails** lens reviewer specifically, add: "Your primary job is verifying compliance
+   with these documents. Cite specific rule violations with the rule text and file:line of the violation."
 
 ## EXECUTION FLOW
 
 1. **Detect phase** using the signals above. If ambiguous, ask the user.
-2. **Announce**: "Starting parallel DCR. Phase: [PHASE]. Spawning 4 reviewers per wave with 2 assigned lenses each."
+2. **Announce**: "Starting parallel DCR. Phase: [PHASE]. Selecting relevant lenses and spawning reviewers."
 3. **Initialize**:
    - `covered = Set()` — lenses that passed clean
    - `needs_recheck = Set()` — lenses that found issues, fix applied, must verify
@@ -95,22 +105,118 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
    - `resolved_issues = []`
    - Shuffle persona pool and wild card pool
 
-### WAVE 1 — Full Coverage
+### PRE-WAVE CONTEXT DISCOVERY
 
-4. **Shuffle** the 8 lenses randomly, split into 4 pairs.
-5. **Assign** each pair to a reviewer with a unique persona and unique wild card.
+Before spawning Wave 1, discover project context that ALL reviewers need.
+
+3a. **Scan for project convention and design files.** Use Glob/Read to check for:
+
+    **AI agent instructions** (how the project wants AI to behave):
+    - `CLAUDE.md`, `.claude/CLAUDE.md`, `**/CLAUDE.md` (Claude Code project instructions)
+    - `AGENTS.md` (universal agent standard)
+    - `.cursorrules`, `.cursor/rules/*.mdc` (Cursor rules)
+    - `.github/copilot-instructions.md` (GitHub Copilot)
+    - `.windsurfrules` (Windsurf)
+
+    **Project guardrails and conventions:**
+    - `*GUARDRAILS*`, `*guardrails*` (any guardrails file)
+    - `CONTRIBUTING.md`, `STYLE_GUIDE.md`, `CODING_STANDARDS.md`
+    - `.editorconfig`, `biome.json`, `.eslintrc*`, `.prettierrc*`, `ruff.toml`
+
+    **Design documents and architectural decisions:**
+    - `docs/`, `design/`, `doc/`, `architecture/` directories — scan for `*.md` files
+    - `adr/`, `adrs/`, `decisions/`, `architecture-decisions/` (ADR directories)
+    - `docs/plans/` (plan files from brainstorming sessions)
+    - `RFC*.md`, `DESIGN*.md`, `ARCHITECTURE*.md` in project root
+
+    Read everything found. Be selective about depth — skim large directories but fully
+    read root-level convention files and any design docs related to the code under review.
+    Combine into a `PROJECT_CONTEXT` block for injection into reviewer prompts.
+
+3b. **Detect frontend changes:**
+    - Check `git diff --name-only` or recent conversation for files matching:
+      `*.js`, `*.jsx`, `*.ts`, `*.tsx`, `*.css`, `*.scss`, `*.html`, `*.vue`, `*.svelte`
+    - If frontend files are present AND any frontend-design related skill is listed
+      in the available skills, set `frontend_review = true`
+
+3c. **Announce context found:**
+    ```
+    **Context discovered:**
+    - Guardrails: [filename] ([N] lines) / none found
+    - Agent instructions: [filenames found] / none found
+    - Design docs: [filenames found] / none found
+    - ADRs: [filenames found] / none found
+    - Frontend review: Yes ([N] frontend files changed, [skill] available) / No
+    ```
+
+### LENS SELECTION
+
+3d. **Select lenses for this review.** Guardrails is always included. For the remaining 7,
+    choose those that are genuinely relevant to the phase and specific changes under review.
+
+    **Selection criteria:**
+    - What type of code changed? (API routes → Security + Access Control; UI code → UX & Flow;
+      data logic → Logic & Edge Cases; queries → Performance)
+    - What phase? (Planning → Testing focuses on testability, not test files;
+      Post-implementation → Testing checks actual test coverage)
+    - What does the project context suggest? (multi-tenant → Access Control;
+      pure CLI tool → probably skip UX & Flow)
+    - When in doubt, include the lens — better to review something unnecessary than miss something important.
+
+    **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum, 2 reviewers).
+    Maximum is all 8 (4 reviewers). Use your judgment.
+
+3e. **Announce selected lenses with reasoning:**
+    ```
+    **Lenses selected ([N] of 8):**
+      ✓ Guardrails (always)
+      ✓ Security — API routes modified, auth logic touched
+      ✓ Logic & Edge Cases — new conditional branching in gatekeeper
+      ✓ Testing — new test files added, verifying coverage
+      ✓ Performance — database query changes
+      ⊘ Access Control — no RBAC or multi-tenant changes
+      ⊘ UX & Flow — no frontend or user-facing changes
+      ⊘ Maintainability — changes are focused, no structural concerns
+    ```
+
+### WAVE 1 — Selected Coverage
+
+4. **Pair** the selected lenses. Each reviewer gets exactly 2.
+   - If odd number of selected lenses, one reviewer gets a single lens (goes deeper).
+   - Number of reviewers = ceil(selected_lenses / 2). Range: 2-4 reviewers.
+5. **Assign** each pair a unique persona and unique wild card (shuffle pools as before).
 6. **Announce**:
    ```
-   **Wave 1 — Full Coverage (4 parallel reviewers)**
-   - Reviewer A ([PERSONA]): [Lens 1] + [Lens 2] | Wild card: [Q1]
-   - Reviewer B ([PERSONA]): [Lens 3] + [Lens 4] | Wild card: [Q2]
-   - Reviewer C ([PERSONA]): [Lens 5] + [Lens 6] | Wild card: [Q3]
-   - Reviewer D ([PERSONA]): [Lens 7] + [Lens 8] | Wild card: [Q4]
+   **Wave 1 — [N] lenses across [M] reviewers**
+   - Reviewer A ([PERSONA]): [Lens X] + [Lens Y] | Wild card: [Q1]
+   - Reviewer B ([PERSONA]): [Lens Z] + [Lens W] | Wild card: [Q2]
+   ...
    ```
-7. **Spawn ALL 4 reviewers in ONE message** using 4 parallel Task tool calls.
+7. **Spawn all reviewers in ONE message** using parallel Task tool calls.
    - Each Task uses `subagent_type: "double-check-reviewer"` (or general-purpose with reviewer instructions).
    - Each Task prompt includes the spawning instructions above.
-8. **Wait** for all 4 results.
+
+#### CONDITIONAL: Frontend Design Reviewer (Wave 1 only)
+
+If `frontend_review = true` (from step 3b), spawn a **5th reviewer** in the SAME message:
+- Use `subagent_type: "general-purpose"`
+- Prompt MUST start with: "Invoke the frontend-design skill for design context."
+- Assign a dedicated **Frontend Design & Aesthetics** lens (outside the 8 standard lenses)
+- Focus areas: design quality (typography, color, spacing, layout intentionality), visual consistency
+  (does new code match or improve the existing aesthetic?), motion/animation (purposeful and performant?),
+  accessibility (contrast ratios, focus states, semantic HTML), responsive behavior (breakpoints, touch targets)
+- Still READ-ONLY, gets a persona and wild card like other reviewers
+- Reports separately — does NOT enter the re-check loop (one-shot in Wave 1 only)
+- If the skill is NOT available, skip entirely (do not fake a design review)
+
+Announce format when `frontend_review = true`:
+```
+**Wave 1 — [N] lenses across [M]+1 reviewers**
+- Reviewer A-[M]: [selected lens pairs as above]
+- Reviewer [M+1] (Frontend Design): Design quality + Aesthetics | via frontend-design skill
+```
+
+8. **Wait** for all results (4 or 5 depending on frontend_review).
 
 ### FIX PHASE (sequential, you the parent)
 
@@ -128,7 +234,7 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
 ### SUBSEQUENT WAVES — Re-check Only
 
 12. **Check stop**: If `needs_recheck` is empty → **ALL COVERED** → go to step 16.
-13. **Check cap**: If `wave >= 3` → **CAP REACHED** → go to step 17.
+13. **Check cap**: If the user's project or global CLAUDE.md specifies a wave cap and `wave >= cap`, go to step 17. Otherwise no cap — continue.
 14. **Build re-check wave**:
     - Group `needs_recheck` lenses into pairs (or singles if odd number)
     - Each pair gets a NEW persona (different from wave 1) and NEW wild card
@@ -141,25 +247,27 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
     ```
     ## DCR Clean Pass ✓
 
-    **Waves run:** [N] (wave 1: 4 parallel reviewers, wave 2: [M] re-check reviewers)
-    **Lens coverage:**
-      ✓ Security — Wave 1 ([PERSONA])
-      ✓ Access Control — Wave 1 ([PERSONA]), rechecked Wave 2 (1 issue fixed)
-      ✓ Logic & Edge Cases — Wave 1 ([PERSONA])
-      ✓ UX & Flow — Wave 1 ([PERSONA])
-      ✓ Performance — Wave 1 ([PERSONA])
-      ✓ Testing — Wave 1 ([PERSONA])
-      ✓ Maintainability — Wave 1 ([PERSONA])
+    **Waves run:** [N]
+    **Lenses reviewed ([M] of 8):**
       ✓ Guardrails — Wave 1 ([PERSONA])
+      ✓ Security — Wave 1 ([PERSONA])
+      ✓ Logic & Edge Cases — Wave 1 ([PERSONA]), rechecked Wave 2 (1 issue fixed)
+      ✓ Testing — Wave 1 ([PERSONA])
+      ⊘ Access Control — skipped (not relevant)
+      ⊘ UX & Flow — skipped (not relevant)
+      ⊘ Performance — skipped (not relevant)
+      ⊘ Maintainability — skipped (not relevant)
+    **Frontend design:** ✓ Reviewed (N findings) / ⊘ Skipped
     **Issues found and fixed:** [count] ([which lenses])
-    **Final verdict:** All 8 lenses passed clean.
+    **Context sources:** [list of discovered files]
+    **Final verdict:** All selected lenses passed clean.
 
     A clean DCR pass subsumes /dc — no separate /dc needed before committing.
     ```
 
-17. **Report cap reached** (3 waves without full coverage):
+17. **Report cap reached** (user-configured wave cap hit):
     ```
-    ## DCR Cap Reached (3 waves)
+    ## DCR Cap Reached ([N] waves)
 
     **Covered:** [list of covered lenses]
     **Still failing:** [list of lenses still in needs_recheck with latest issues]
@@ -171,9 +279,9 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
 ## HARD RULES
 
 - Do NOT stop the wave loop early. Do NOT skip re-verification of failed lenses.
-- Do NOT ask "should I continue?" — the answer is always yes until all covered or cap.
+- Do NOT ask "should I continue?" — the answer is always yes until all covered or user-configured cap.
 - LOW issues: Report them but do NOT block progress. Only CRITICAL/MEDIUM trigger re-checks.
 - Reviewers are READ-ONLY. Only you (the parent dispatcher) edit files.
 - Spawn all reviewers in a wave in ONE message (parallel Task calls).
 - Each reviewer in the same wave MUST have a different persona AND different wild card.
-- A clean DCR pass (all 8 lenses covered) subsumes /dc — no separate /dc needed before committing.
+- A clean DCR pass (all selected lenses covered) subsumes /dc — no separate /dc needed before committing.

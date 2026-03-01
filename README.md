@@ -33,7 +33,7 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
 3. Install based on my choice:
    - BASE: uv tool install claude-jacked && jacked install --force
    - SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
-   - SECURITY: uv tool install "claude-jacked[security]" && jacked install --force --security
+   - SECURITY: uv tool install claude-jacked && jacked install --force --security
    - ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
 4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
 5. Verify with: jacked --help
@@ -58,10 +58,10 @@ jacked webux              # opens your dashboard at localhost:8321
 # Add session search (needs Qdrant Cloud ~$30/mo)
 uv tool install "claude-jacked[search]" --force && jacked install --force
 
-# Add security gatekeeper (auto-approves safe bash commands)
-uv tool install "claude-jacked[security]" --force && jacked install --force --security
+# Add security gatekeeper (auto-approves safe bash commands, included in base install)
+jacked install --force --security
 
-# Everything
+# Everything (base + search)
 uv tool install "claude-jacked[all]" --force && jacked install --force --security
 ```
 
@@ -154,7 +154,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
 | **Team Sharing** | Search your teammates' sessions (with their permission) |
 
-### Security Extra (`uv tool install "claude-jacked[security]"`)
+### Security Gatekeeper (activate with `jacked install --security`)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -222,7 +222,6 @@ Approve commands directly from the **Logs** page. Click "Always Allow" on any lo
 ### Install / Uninstall
 
 ```bash
-uv tool install "claude-jacked[security]"
 jacked install --force --security
 ```
 
@@ -649,7 +648,7 @@ PHASE 3 - INSTALL:
 Based on user choice:
 - BASE: uv tool install claude-jacked && jacked install --force
 - SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
-- SECURITY: uv tool install "claude-jacked[security]" && jacked install --force --security
+- SECURITY: uv tool install claude-jacked && jacked install --force --security
 - ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
 
 PHASE 4 - POST-INSTALL:

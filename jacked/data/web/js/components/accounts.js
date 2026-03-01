@@ -250,8 +250,9 @@ function renderAccountCard(acct, idx, total) {
     const detailsHtml = renderExpandableDetails(acct);
     const actionsHtml = renderActionButtons(acct);
 
+    const disabledClass = status === 'disabled' ? ' opacity-60' : '';
     return `
-        <div class="bg-slate-800 border border-slate-700 rounded-lg p-4 card-hover" data-account-id="${acct.id}">
+        <div class="bg-slate-800 border border-slate-700 rounded-lg p-4 card-hover${disabledClass}" data-account-id="${acct.id}">
             <div class="flex items-start">
                 ${priorityButtons}
                 <div class="flex-1 min-w-0">

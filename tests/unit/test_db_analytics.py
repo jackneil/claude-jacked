@@ -12,6 +12,8 @@ from jacked.web.db_analytics import (
     _cutoff_iso,
     _granularity,
     _bucket_format,
+    _resolve_model,
+    _row_cost,
     get_kpi_totals,
     get_time_series,
     get_method_breakdown,
@@ -19,6 +21,8 @@ from jacked.web.db_analytics import (
     get_session_risk,
     get_suggested_rules,
     get_hot_rules,
+    get_token_cost_summary,
+    MODEL_PRICING,
 )
 
 
@@ -34,7 +38,8 @@ def _ts_ago(days=0, hours=0):
 
 def _insert(db, decision="ALLOW", method="LOCAL", command="ls",
             session_id="s1", repo_path="/repo", timestamp=None,
-            reason="ok", elapsed_ms=1.0):
+            reason="ok", elapsed_ms=1.0, input_tokens=0, output_tokens=0,
+            cache_read_tokens=0, cache_write_tokens=0, model=None):
     return db.record_gatekeeper_decision(
         decision,
         timestamp=timestamp or _ts_ago(0),
@@ -44,6 +49,11 @@ def _insert(db, decision="ALLOW", method="LOCAL", command="ls",
         elapsed_ms=elapsed_ms,
         session_id=session_id,
         repo_path=repo_path,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        model=model,
     )
 
 
@@ -356,3 +366,174 @@ class TestGetHotRules:
             _insert(db, method=m)
         hot = get_hot_rules(db, days=1, limit=3)
         assert len(hot) == 3
+
+
+# ------------------------------------------------------------------
+# Token cost helpers
+# ------------------------------------------------------------------
+
+class TestResolveModel:
+    def test_prefers_model_column(self):
+        assert _resolve_model({"model": "claude-opus-4-6", "method": "API:opus"}) == "claude-opus-4-6"
+
+    def test_falls_back_to_method(self):
+        assert _resolve_model({"model": None, "method": "API:haiku"}) == "haiku"
+
+    def test_unknown_when_no_info(self):
+        assert _resolve_model({"model": None, "method": None}) == "unknown"
+
+    def test_method_without_colon(self):
+        assert _resolve_model({"model": None, "method": "LOCAL"}) == "unknown"
+
+
+class TestRowCost:
+    def test_haiku_cost(self):
+        row = {
+            "model": "claude-haiku-4-5-20251001", "method": "API:haiku",
+            "input_tokens": 1_000_000, "output_tokens": 1_000_000,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        }
+        # 1M input * $1/MTok + 1M output * $5/MTok = $6.00
+        assert _row_cost(row) == 6.00
+
+    def test_opus_cost(self):
+        row = {
+            "model": "claude-opus-4-6", "method": "API:opus",
+            "input_tokens": 1000, "output_tokens": 200,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        }
+        # 1000/1M * $5 + 200/1M * $25 = 0.005 + 0.005 = 0.01
+        assert abs(_row_cost(row) - 0.01) < 1e-9
+
+    def test_unknown_model_zero_cost(self):
+        row = {
+            "model": "unknown-model-xyz", "method": "API:unknown",
+            "input_tokens": 999999, "output_tokens": 999999,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        }
+        assert _row_cost(row) == 0.0
+
+    def test_cache_tokens_priced(self):
+        row = {
+            "model": "claude-haiku-4-5-20251001", "method": "API:haiku",
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 1_000_000, "cache_write_tokens": 1_000_000,
+        }
+        # 1M cache_read * $0.10/MTok + 1M cache_write * $1.25/MTok = $1.35
+        assert abs(_row_cost(row) - 1.35) < 1e-9
+
+    def test_zero_tokens_zero_cost(self):
+        row = {
+            "model": "claude-opus-4-6", "method": "API:opus",
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        }
+        assert _row_cost(row) == 0.0
+
+    def test_none_tokens_treated_as_zero(self):
+        row = {
+            "model": "claude-haiku-4-5-20251001", "method": "API:haiku",
+            "input_tokens": None, "output_tokens": None,
+            "cache_read_tokens": None, "cache_write_tokens": None,
+        }
+        assert _row_cost(row) == 0.0
+
+    def test_empty_string_model(self):
+        row = {
+            "model": "", "method": "API:haiku",
+            "input_tokens": 1000, "output_tokens": 100,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        }
+        # Empty string model -> falls back to method -> haiku
+        cost = _row_cost(row)
+        assert cost > 0
+
+
+class TestResolveModelEdgeCases:
+    def test_empty_string_model_falls_back(self):
+        assert _resolve_model({"model": "", "method": "API:haiku"}) == "haiku"
+
+    def test_missing_keys(self):
+        assert _resolve_model({}) == "unknown"
+
+
+# ------------------------------------------------------------------
+# Token cost summary
+# ------------------------------------------------------------------
+
+class TestGetTokenCostSummary:
+    def test_empty_db(self):
+        db = _make_db()
+        summary = get_token_cost_summary(db, days=7)
+        assert summary["total_cost_usd"] == 0.0
+        assert summary["total_input_tokens"] == 0
+        assert summary["total_output_tokens"] == 0
+        assert summary["by_model"] == {}
+        assert summary["daily_costs"] == []
+
+    def test_single_api_call(self):
+        db = _make_db()
+        _insert(db, method="API:haiku", model="claude-haiku-4-5-20251001",
+                input_tokens=500, output_tokens=50)
+        summary = get_token_cost_summary(db, days=1)
+        assert summary["total_input_tokens"] == 500
+        assert summary["total_output_tokens"] == 50
+        assert summary["total_cost_usd"] > 0
+        assert "claude-haiku-4-5-20251001" in summary["by_model"]
+        assert summary["by_model"]["claude-haiku-4-5-20251001"]["calls"] == 1
+
+    def test_ignores_cli_calls(self):
+        """CLI calls have 0 input_tokens — should not appear."""
+        db = _make_db()
+        _insert(db, method="CLI:haiku", input_tokens=0, output_tokens=0)
+        summary = get_token_cost_summary(db, days=1)
+        assert summary["total_cost_usd"] == 0.0
+        assert summary["by_model"] == {}
+
+    def test_ignores_local_rules(self):
+        """LOCAL decisions have 0 tokens — should not appear."""
+        db = _make_db()
+        _insert(db, method="LOCAL", input_tokens=0, output_tokens=0)
+        summary = get_token_cost_summary(db, days=1)
+        assert summary["total_cost_usd"] == 0.0
+
+    def test_multiple_models(self):
+        db = _make_db()
+        _insert(db, method="API:haiku", model="claude-haiku-4-5-20251001",
+                input_tokens=1000, output_tokens=100)
+        _insert(db, method="API:opus", model="claude-opus-4-6",
+                input_tokens=1000, output_tokens=100)
+        summary = get_token_cost_summary(db, days=1)
+        assert len(summary["by_model"]) == 2
+        # Opus costs more than haiku for same token counts
+        opus_cost = summary["by_model"]["claude-opus-4-6"]["cost_usd"]
+        haiku_cost = summary["by_model"]["claude-haiku-4-5-20251001"]["cost_usd"]
+        assert opus_cost > haiku_cost
+
+    def test_daily_costs_sorted(self):
+        db = _make_db()
+        _insert(db, method="API:haiku", model="claude-haiku-4-5-20251001",
+                input_tokens=500, output_tokens=50, timestamp=_ts_ago(1))
+        _insert(db, method="API:haiku", model="claude-haiku-4-5-20251001",
+                input_tokens=500, output_tokens=50, timestamp=_ts_ago(0))
+        summary = get_token_cost_summary(db, days=7)
+        dates = [d["date"] for d in summary["daily_costs"]]
+        assert dates == sorted(dates)
+
+    def test_date_range_filtering(self):
+        db = _make_db()
+        _insert(db, method="API:haiku", model="claude-haiku-4-5-20251001",
+                input_tokens=500, output_tokens=50, timestamp=_ts_ago(0))
+        _insert(db, method="API:haiku", model="claude-haiku-4-5-20251001",
+                input_tokens=500, output_tokens=50, timestamp=_ts_ago(10))
+        summary = get_token_cost_summary(db, days=7)
+        assert summary["by_model"]["claude-haiku-4-5-20251001"]["calls"] == 1
+
+    def test_legacy_rows_without_model(self):
+        """Old rows have model=None, should fall back to method parsing."""
+        db = _make_db()
+        _insert(db, method="API:haiku", model=None,
+                input_tokens=1000, output_tokens=100)
+        summary = get_token_cost_summary(db, days=1)
+        assert "haiku" in summary["by_model"]
+        assert summary["total_cost_usd"] > 0

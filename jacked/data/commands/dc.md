@@ -48,8 +48,14 @@ If conversation has signals from multiple phases or no clear signals at all, do 
 
 ## REVIEW LENSES (shared with /dcr)
 
-These 8 lenses define what gets reviewed. /dc checks all of them in a single pass. /dcr assigns subsets to parallel reviewers. Skip lenses that don't apply to the project type.
+Two categories: **required** (always reviewed) and **optional** (select based on relevance to the changes).
 
+### Required (always included)
+| # | Lens | Focus Areas |
+|---|------|-------------|
+| 8 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
+
+### Optional (select based on relevance)
 | # | Lens | Focus Areas |
 |---|------|-------------|
 | 1 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
@@ -59,7 +65,25 @@ These 8 lenses define what gets reviewed. /dc checks all of them in a single pas
 | 5 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
 | 6 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
 | 7 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
-| 8 | **Guardrails** | Project conventions (JACKED_GUARDRAILS.md if it exists), file sizes, naming, structure |
+
+## PRE-REVIEW CONTEXT DISCOVERY
+
+Before spawning any reviewer, discover and read project convention files. Use Glob/Read to check for:
+
+**AI agent instructions:**
+- `CLAUDE.md`, `.claude/CLAUDE.md`, `**/CLAUDE.md`, `AGENTS.md`
+- `.cursorrules`, `.cursor/rules/*.mdc`, `.github/copilot-instructions.md`, `.windsurfrules`
+
+**Guardrails and conventions:**
+- `*GUARDRAILS*`, `*guardrails*`, `CONTRIBUTING.md`, `STYLE_GUIDE.md`, `CODING_STANDARDS.md`
+- `.editorconfig`, `biome.json`, `.eslintrc*`, `.prettierrc*`, `ruff.toml`
+
+**Design docs and ADRs:**
+- `docs/`, `design/`, `doc/`, `architecture/` directories — scan for `*.md` files
+- `adr/`, `adrs/`, `decisions/`, `architecture-decisions/` directories
+- `docs/plans/`, `RFC*.md`, `DESIGN*.md`, `ARCHITECTURE*.md`
+
+Read everything found. Include the contents as a `## PROJECT CONTEXT` section in every reviewer prompt. For the Guardrails lens, the reviewer must cite specific rule violations with the rule text and file:line of the violation.
 
 ## SPAWNING INSTRUCTIONS
 
@@ -68,7 +92,7 @@ Once you detect the phase, use the Task tool to spawn double-check-reviewer with
 ### FOR PLANNING PHASE:
 Review this plan with ultrathink depth. Ralph Wiggum style - appear simple but catch everything.
 
-Review ALL 8 lenses above (RANDOMIZE ORDER, skip lenses that don't apply). For each lens, apply it through the planning perspective:
+Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the planning perspective:
 - Security/Access Control: Are auth and isolation designed correctly?
 - Logic & Edge Cases: What edge cases aren't addressed in the design?
 - UX & Flow: Does the user journey make sense? Error feedback planned?
@@ -82,7 +106,7 @@ STOP CONDITION: ALL applicable lenses must pass clean. If ANY fix is made, reset
 ### FOR IMPLEMENTATION PHASE:
 Review recent code changes with ultrathink depth. Ralph Wiggum style - innocent questions that expose real issues.
 
-Review ALL 8 lenses above (RANDOMIZE ORDER, skip lenses that don't apply). For each lens, apply it through the implementation perspective:
+Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the implementation perspective:
 - Security: Auth bypass? Injection? IDOR? Input validation?
 - Access Control: Every endpoint checks permissions? Multi-role handled?
 - Logic & Edge Cases: Empty states, nulls, timeouts, concurrent edits, max limits?
@@ -106,7 +130,7 @@ Checklist (ALL must pass):
 [ ] No perf regressions
 [ ] Tests added/updated
 
-Review ALL 8 lenses above (RANDOMIZE ORDER, skip lenses that don't apply). For each lens, apply it through the verification perspective:
+Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the verification perspective:
 - Security/Access Control: Auth, RBAC, org isolation all solid?
 - Logic & Edge Cases: What assumptions might be wrong?
 - UX & Flow: What would confuse someone seeing this first time?
@@ -163,18 +187,19 @@ The innocent observation that breaks the whole design
 ## EXECUTION FLOW
 
 1. Announce detected phase and reasoning
-2. Identify if multiple threads are needed
-3. Spawn double-check-reviewer with appropriate instructions
-4. If multiple threads, spawn them with distinct focus areas
-5. When reviewer results come back, evaluate findings:
+2. **Discover project context** using PRE-REVIEW CONTEXT DISCOVERY above. Announce what was found.
+3. Identify if multiple threads are needed
+4. Spawn double-check-reviewer with appropriate instructions + discovered context
+5. If multiple threads, spawn them with distinct focus areas
+6. When reviewer results come back, evaluate findings:
    - If **no CRITICAL or MEDIUM issues** → report clean pass. Done.
-   - If **CRITICAL or MEDIUM issues found** → proceed to step 6
-6. **Fix the issues yourself** based on phase:
+   - If **CRITICAL or MEDIUM issues found** → proceed to step 7
+7. **Fix the issues yourself** based on phase:
    - **Planning phase**: Edit the plan file to address each CRITICAL/MEDIUM finding. Summarize what you changed.
    - **Implementation/Post-implementation phase**: Edit the code to fix each CRITICAL/MEDIUM finding. Run tests to verify fixes don't break anything. Summarize what you changed.
    - LOW issues: Report them but do NOT block the loop for LOWs.
-7. **Re-spawn the double-check-reviewer** with the same phase instructions. Include a note: "Previous review found these issues which have been fixed: [list]. Verify fixes are correct and check for any NEW issues introduced by the fixes."
-8. **Repeat from step 5** until the reviewer returns clean (no CRITICAL/MEDIUM).
-9. Report final clean pass with a summary of all cycles.
+8. **Re-spawn the double-check-reviewer** with the same phase instructions + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Verify fixes are correct and check for any NEW issues introduced by the fixes."
+9. **Repeat from step 6** until the reviewer returns clean (no CRITICAL/MEDIUM).
+10. Report final clean pass with a summary of all cycles.
 
-HARD RULE: Do NOT stop the loop early. Do NOT skip re-verification. Do NOT ask the user "should I continue?" — the answer is always yes. The loop runs until clean pass or until 5 cycles (safety cap to prevent infinite loops). If still not clean after 5 cycles, report remaining issues and stop.
+HARD RULE: Do NOT stop the loop early. Do NOT skip re-verification. Do NOT ask the user "should I continue?" — the answer is always yes. The loop runs until clean pass. If the user's project or global CLAUDE.md specifies a wave/cycle cap, respect it. Otherwise there is no cap — keep going until all issues are resolved.

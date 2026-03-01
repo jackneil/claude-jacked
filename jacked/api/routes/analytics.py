@@ -95,7 +95,7 @@ async def gatekeeper_stats(request: Request, days: int = Query(default=7, ge=1, 
         method = r.get("method", "UNKNOWN")
         decision_counts[decision] = decision_counts.get(decision, 0) + 1
         method_counts[method] = method_counts.get(method, 0) + 1
-        if decision == "DENY":
+        if decision in ("DENY", "DENY_PATTERN"):
             denials.append({
                 "timestamp": r.get("timestamp"),
                 "command": (r.get("command") or "")[:100],
@@ -278,11 +278,13 @@ async def gatekeeper_dashboard(request: Request, days: int = Query(default=7, ge
     kpi = db_analytics.get_kpi_totals(db, days=days)
     time_series = db_analytics.get_time_series(db, days=days)
     method_breakdown = db_analytics.get_method_breakdown(db, days=days)
+    token_costs = db_analytics.get_token_cost_summary(db, days=days)
 
     return {
         "kpi": kpi,
         "time_series": time_series,
         "method_breakdown": method_breakdown,
+        "token_costs": token_costs,
     }
 
 

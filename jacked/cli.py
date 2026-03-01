@@ -1776,7 +1776,7 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
 @click.option(
     "--security",
     is_flag=True,
-    help="Install security gatekeeper hook (requires [security] extra)",
+    help="Install security gatekeeper hook",
 )
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
 @click.option(
@@ -2106,7 +2106,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             r'  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
         )
         console.print(
-            r'  uv tool install "claude-jacked\[security]" --force  # Auto-approve safe Bash commands'
+            r'  jacked install --force --security                   # Auto-approve safe Bash commands'
         )
         console.print(r'  uv tool install "claude-jacked\[all]" --force       # Everything')
 
@@ -2815,7 +2815,7 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
                 "[red]anthropic SDK not installed — cannot run LLM audit[/red]"
             )
             console.print(
-                '[dim]Install it: uv tool install "claude-jacked[security]" --force[/dim]'
+                '[dim]Activate it: jacked install --force --security[/dim]'
             )
         except json.JSONDecodeError:
             console.print(

@@ -234,6 +234,7 @@ name = "claude-jacked"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "anthropic" },
     { name = "click" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -245,19 +246,14 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
-    { name = "anthropic" },
     { name = "qdrant-client" },
 ]
 search = [
     { name = "qdrant-client" },
 ]
-security = [
-    { name = "anthropic" },
-]
 
 [package.dev-dependencies]
 dev = [
-    { name = "anthropic" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "qdrant-client" },
@@ -267,8 +263,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "anthropic", marker = "extra == 'all'", specifier = ">=0.40.0" },
-    { name = "anthropic", marker = "extra == 'security'", specifier = ">=0.40.0" },
+    { name = "anthropic", specifier = ">=0.40.0" },
     { name = "click", specifier = ">=8.0.0" },
     { name = "fastapi", specifier = ">=0.100" },
     { name = "httpx", specifier = ">=0.24" },
@@ -283,7 +278,6 @@ provides-extras = ["all", "search", "security", "web"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "anthropic", specifier = ">=0.40.0" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-cov", specifier = ">=4.0.0" },
     { name = "qdrant-client", specifier = ">=1.7.0" },

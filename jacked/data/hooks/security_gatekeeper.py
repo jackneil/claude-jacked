@@ -27,6 +27,7 @@ LOG_PATH = Path.home() / ".claude" / "hooks-debug.log"
 STATE_PATH = Path.home() / ".claude" / "gatekeeper-state.json"
 DEBUG = os.environ.get("JACKED_HOOK_DEBUG", "") == "1"
 MODEL = "claude-haiku-4-5-20251001"
+# Keep in sync with MODEL_PRICING in jacked/web/db_analytics.py when adding models.
 MODEL_MAP = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-5-20250929",
@@ -36,6 +37,9 @@ CLI_MODEL_MAP = {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus"}
 DB_PATH = Path.home() / ".claude" / "jacked.db"
 MAX_FILE_READ = 30_000
 AUDIT_NUDGE_INTERVAL = 100
+
+# File tools that are non-destructive reads — safe to auto-approve on non-sensitive paths.
+_READ_TOOLS = frozenset({"Read", "Grep", "Glob", "Search", "LS", "NotebookRead"})
 
 # --- Log redaction patterns ---
 
@@ -1364,6 +1368,11 @@ def _is_path_sensitive(path_str: str, disabled_patterns: list[str]) -> str | Non
     return None
 
 
+def _project_dir(cwd: str) -> str:
+    """Return the project root — CLAUDE_PROJECT_DIR if set, else cwd."""
+    return os.environ.get("CLAUDE_PROJECT_DIR") or cwd
+
+
 def _is_outside_project(
     file_path: str, cwd: str, allowed_paths: list[str]
 ) -> str | None:
@@ -1475,7 +1484,7 @@ def _check_path_safety(file_path: str, cwd: str, config: dict) -> str | None:
     reason = _is_watched_path(file_path, cwd, config.get("watched_paths", []))
     if reason:
         return reason
-    reason = _is_outside_project(file_path, cwd, config.get("allowed_paths", []))
+    reason = _is_outside_project(file_path, _project_dir(cwd), config.get("allowed_paths", []))
     if reason:
         return reason
     return _is_path_sensitive(file_path, config.get("disabled_patterns", []))
@@ -1740,10 +1749,11 @@ def _handle_file_tool_inner(
             return
 
         # 3. Outside project — configurable via outside_reads / outside_writes
-        reason = _is_outside_project(file_path, cwd, config.get("allowed_paths", []))
+        # Use project root (CLAUDE_PROJECT_DIR) not drifted cwd — cd commands
+        # shift cwd to subdirs, causing false positives on sibling paths.
+        reason = _is_outside_project(file_path, _project_dir(cwd), config.get("allowed_paths", []))
         if reason:
-            read_tools = {"Read", "Grep", "Glob", "Search", "LS", "NotebookRead"}
-            setting_key = "outside_reads" if tool_name in read_tools else "outside_writes"
+            setting_key = "outside_reads" if tool_name in _READ_TOOLS else "outside_writes"
             behavior = config.get(setting_key, "ask")
 
             if behavior == "defer" and not headless:
@@ -1751,7 +1761,6 @@ def _handle_file_tool_inner(
                 elapsed = time.time() - start
                 log(f"PATH SAFETY [{tool_name}]: DEFER_TO_CC {file_path[:100]} — {reason} ({elapsed:.3f}s)")
                 _record_decision("DEFER_TO_CC", f"[{tool_name}] {file_path[:200]}", "PATH_SAFETY", reason, elapsed * 1000, session_id, repo_path)
-                _record_hook_execution(elapsed * 1000, session_id, repo_path)
                 return  # no output = Claude Code decides
             else:
                 elapsed = time.time() - start
@@ -1784,8 +1793,7 @@ def _handle_file_tool_inner(
         emit_allow()
         return
 
-    # Step 3: Safe — emit allow so Claude Code auto-approves
-    # Floor check: even with path safety disabled, never auto-approve sensitive files.
+    # Step 3: Floor check — even with path safety disabled, never auto-approve sensitive files.
     # Uses empty disabled_patterns [] deliberately — the floor is the full sensitive
     # ruleset regardless of user overrides, because disabled=False means "I turned off
     # path safety" not "I want .env auto-approved".
@@ -1795,18 +1803,35 @@ def _handle_file_tool_inner(
             _record_hook_execution((time.time() - start) * 1000, session_id, repo_path)
             return  # silent exit — let Claude Code's own protection handle it
 
+    # Step 4: Non-sensitive path — auto-allow reads, defer writes to Claude Code.
+    # Read tools are non-destructive so safe to auto-approve. Write tools (Edit, Write,
+    # NotebookEdit) defer to Claude Code's permission mode so the user's autoApprove
+    # settings are respected.
     elapsed = time.time() - start
-    log_debug(f"PATH SAFETY [{tool_name}]: ALLOW {file_path[:100]} ({elapsed:.3f}s)")
-    emit_allow()
-    _record_decision(
-        "ALLOW",
-        f"[{tool_name}] {file_path[:200]}",
-        "PATH_SAFETY",
-        "path not sensitive",
-        elapsed * 1000,
-        session_id,
-        repo_path,
-    )
+    if tool_name in _READ_TOOLS:
+        log_debug(f"PATH SAFETY [{tool_name}]: ALLOW {file_path[:100]} ({elapsed:.3f}s)")
+        emit_allow()
+        _record_decision(
+            "ALLOW",
+            f"[{tool_name}] {file_path[:200]}",
+            "PATH_SAFETY",
+            "path not sensitive",
+            elapsed * 1000,
+            session_id,
+            repo_path,
+        )
+    else:
+        log_debug(f"PATH SAFETY [{tool_name}]: DEFER_TO_CC {file_path[:100]} ({elapsed:.3f}s)")
+        _record_decision(
+            "DEFER_TO_CC",
+            f"[{tool_name}] {file_path[:200]}",
+            "PATH_SAFETY",
+            "write tool — deferred to Claude Code",
+            elapsed * 1000,
+            session_id,
+            repo_path,
+        )
+        return  # no output = Claude Code decides
 
 
 # --- Path safety metadata export ---
@@ -1884,17 +1909,18 @@ def get_gatekeeper_tools_metadata() -> dict:
 # --- API / CLI evaluation ---
 
 
-def evaluate_via_api(prompt: str, model: str = MODEL, api_key: str = "") -> str | None:
+def evaluate_via_api(prompt: str, model: str = MODEL, api_key: str = "") -> dict | None:
+    """Call Anthropic API. Returns dict with text + token usage, or None on failure."""
     try:
         import anthropic
     except ImportError:
-        log_debug("anthropic SDK not installed, skipping API path")
+        log("API SKIP: anthropic SDK not installed")
         return None
 
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        log_debug("No ANTHROPIC_API_KEY, skipping API path")
+        log("API SKIP: no API key (check settings or ANTHROPIC_API_KEY env)")
         return None
 
     try:
@@ -1904,9 +1930,19 @@ def evaluate_via_api(prompt: str, model: str = MODEL, api_key: str = "") -> str 
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.content[0].text.strip()
+        if not response.content:
+            log_debug("API returned empty content array")
+            return None
+        usage = response.usage
+        return {
+            "text": response.content[0].text.strip(),
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        }
     except Exception as e:
-        log_debug(f"API ERROR: {e}")
+        log(f"API ERROR: {e}")
         return None
 
 
@@ -2069,8 +2105,8 @@ def _record_hook_execution(elapsed_ms, session_id, repo_path):
             )
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_debug(f"_record_hook_execution write failed: {exc}")
 
     try:
         t = threading.Thread(target=_do_write, daemon=True)
@@ -2080,8 +2116,29 @@ def _record_hook_execution(elapsed_ms, session_id, repo_path):
         pass
 
 
+class _Steps:
+    """Collect trajectory steps with per-step timing."""
+
+    def __init__(self, start):
+        self._last = start
+        self.steps = []
+
+    def record(self, tier, result, detail=None):
+        now = time.time()
+        step = {"tier": tier, "result": result, "ms": round((now - self._last) * 1000, 1)}
+        if detail is not None:
+            step["detail"] = str(detail)[:100]
+        self.steps.append(step)
+        self._last = now
+
+    def to_json(self):
+        return self.steps if self.steps else None
+
+
 def _record_decision(
-    decision, command, method, reason, elapsed_ms, session_id, repo_path
+    decision, command, method, reason, elapsed_ms, session_id, repo_path,
+    *, input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0,
+    model=None, trajectory=None
 ):
     """Fire-and-forget DB write in a daemon thread. Never blocks, never crashes."""
     import threading
@@ -2097,10 +2154,14 @@ def _record_decision(
             conn = _sqlite3.connect(str(target), timeout=0.5)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout = 5000")
+            import json as _json
+
             conn.execute(
                 """INSERT INTO gatekeeper_decisions
-                   (timestamp, command, decision, method, reason, elapsed_ms, session_id, repo_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (timestamp, command, decision, method, reason, elapsed_ms,
+                    session_id, repo_path, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, model, trajectory)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     _dt.now(_tz.utc).isoformat(),
                     _redact((command or "")[:1000]),
@@ -2110,12 +2171,18 @@ def _record_decision(
                     elapsed_ms,
                     session_id,
                     repo_path,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    model,
+                    _json.dumps(trajectory) if trajectory else None,
                 ),
             )
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_debug(f"_record_decision write failed: {exc}")
 
     try:
         t = threading.Thread(target=_do_write, daemon=True)
@@ -2193,12 +2260,14 @@ def main():
         sys.exit(0)
 
     log(f"EVALUATING: {command[:200]}")
+    steps = _Steps(start)
 
     # Tier 0: Deny check FIRST — security always wins over permissions
     cmd_stripped = command.strip()
     cmd_core = _strip_env_prefix(cmd_stripped)
     for pattern, label in DENY_PATTERNS:
         if pattern.search(cmd_stripped) or pattern.search(cmd_core):
+            steps.record("deny_pattern", "ask", label)
             elapsed = time.time() - start
             log(f"DENY MATCH ({elapsed:.3f}s)")
             log(f"DECISION: ASK USER ({elapsed:.3f}s)")
@@ -2210,8 +2279,11 @@ def main():
                 elapsed * 1000,
                 sid,
                 repo_path,
+                trajectory=steps.to_json(),
             )
             sys.exit(0)
+
+    steps.record("deny_pattern", "pass")
 
     # Tier 0.5: Command categories — configurable per-category behavior
     cat_config = _read_command_categories_config()
@@ -2221,6 +2293,7 @@ def main():
 
     # "ask" categories short-circuit (same as deny — always ask user)
     if cat_mode == "ask":
+        steps.record("category", "ask", ",".join(cat_keys))
         elapsed = time.time() - start
         log(f"CATEGORY ASK ({','.join(cat_keys)}) ({elapsed:.3f}s)")
         log(f"DECISION: ASK USER ({elapsed:.3f}s)")
@@ -2232,6 +2305,7 @@ def main():
             elapsed * 1000,
             sid,
             repo_path,
+            trajectory=steps.to_json(),
         )
         sys.exit(0)
 
@@ -2245,6 +2319,7 @@ def main():
 
     # "evaluate" categories — store context for injection at Tier 4+5
     # (does NOT skip Tiers 1-3; commands matching SAFE_PREFIXES still auto-approve)
+    steps.record("category", "pass")
 
     # Tier 1: Path safety — deterministic check for sensitive files
     # and out-of-project paths. Runs BEFORE permission rules so broad
@@ -2253,6 +2328,7 @@ def main():
     ps_config = _read_path_safety_config()
     bash_path_reason = _check_bash_path_safety(command, cwd, ps_config)
     if bash_path_reason:
+        steps.record("path_safety", "ask", bash_path_reason)
         elapsed = time.time() - start
         log(f"PATH SAFETY [Bash]: {bash_path_reason} ({elapsed:.3f}s)")
         log(f"DECISION: ASK USER ({elapsed:.3f}s)")
@@ -2264,6 +2340,7 @@ def main():
             elapsed * 1000,
             sid,
             repo_path,
+            trajectory=steps.to_json(),
         )
         sys.exit(0)  # silent exit → Claude Code asks user
 
@@ -2273,6 +2350,7 @@ def main():
     if not ps_config.get("enabled", True):
         for rule in SENSITIVE_FILE_RULES.values():
             if rule["pattern"].search(command):
+                steps.record("path_safety_floor", "ask", rule["label"])
                 elapsed = time.time() - start
                 log(
                     f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)"
@@ -2285,10 +2363,12 @@ def main():
                     elapsed * 1000,
                     sid,
                     repo_path,
+                    trajectory=steps.to_json(),
                 )
                 sys.exit(0)
         for rule in SENSITIVE_DIR_RULES.values():
             if rule["pattern"].search(command):
+                steps.record("path_safety_floor", "ask", rule["label"])
                 elapsed = time.time() - start
                 log(
                     f"PATH SAFETY [Bash]: FLOOR CHECK — {rule['label']} ({elapsed:.3f}s)"
@@ -2301,42 +2381,55 @@ def main():
                     elapsed * 1000,
                     sid,
                     repo_path,
+                    trajectory=steps.to_json(),
                 )
                 sys.exit(0)
+
+    steps.record("path_safety", "pass")
 
     # Tier 2: Check Claude's own permission rules
     perm_match, perm_pattern = check_permissions(command, cwd)
     if perm_match:
+        steps.record("perms", "allow", perm_pattern)
         elapsed = time.time() - start
         log(f"PERMS MATCH ({elapsed:.3f}s)")
         log(f"DECISION: ALLOW ({elapsed:.3f}s)")
         _increment_perms_counter()
         emit_allow()
         _record_decision(
-            "ALLOW", command, "PERMS", perm_pattern, elapsed * 1000, sid, repo_path
+            "ALLOW", command, "PERMS", perm_pattern, elapsed * 1000, sid, repo_path,
+            trajectory=steps.to_json(),
         )
         sys.exit(0)
+
+    steps.record("perms", "pass")
 
     # Tier 3: Local allowlist matching (deny already checked above)
     local_result, local_reason = local_evaluate(command)
     if local_result == "YES":
+        steps.record("local", "allow", local_reason)
         elapsed = time.time() - start
         log(f"LOCAL SAID: YES ({elapsed:.3f}s)")
         log(f"DECISION: ALLOW ({elapsed:.3f}s)")
         emit_allow()
         _record_decision(
-            "ALLOW", command, "LOCAL", local_reason, elapsed * 1000, sid, repo_path
+            "ALLOW", command, "LOCAL", local_reason, elapsed * 1000, sid, repo_path,
+            trajectory=steps.to_json(),
         )
         sys.exit(0)
     elif local_result == "NO":
         # Shouldn't hit this since deny checked above, but just in case
+        steps.record("local", "ask", local_reason)
         elapsed = time.time() - start
         log(f"LOCAL SAID: NO ({elapsed:.3f}s)")
         log(f"DECISION: ASK USER ({elapsed:.3f}s)")
         _record_decision(
-            "ASK_USER", command, "LOCAL", local_reason, elapsed * 1000, sid, repo_path
+            "ASK_USER", command, "LOCAL", local_reason, elapsed * 1000, sid, repo_path,
+            trajectory=steps.to_json(),
         )
         sys.exit(0)
+
+    steps.record("local", "pass")
 
     # Tier 4+5: LLM evaluation for ambiguous commands (with 1 retry)
     # Reuse gk_config from early exit check to avoid duplicate DB read
@@ -2387,18 +2480,35 @@ def main():
 
     response = None
     method = f"API:{model_short}"
+    input_tokens = output_tokens = cache_read_tokens = cache_write_tokens = 0
+    used_model = None
+
+    def _unpack_api(result):
+        """Extract text and capture token usage from evaluate_via_api result."""
+        nonlocal input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, used_model
+        if result is None:
+            return None
+        input_tokens = result.get("input_tokens", 0) or 0
+        output_tokens = result.get("output_tokens", 0) or 0
+        cache_read_tokens = result.get("cache_read_tokens", 0) or 0
+        cache_write_tokens = result.get("cache_write_tokens", 0) or 0
+        used_model = model
+        return result.get("text")
+
     for attempt in range(2):
         if eval_method in ("api_first", "api_only"):
-            response = evaluate_via_api(prompt, model=model, api_key=api_key)
+            response = _unpack_api(evaluate_via_api(prompt, model=model, api_key=api_key))
             method = f"API:{model_short}"
             if response is None and eval_method == "api_first":
+                log("API failed — falling back to CLI")
                 response = evaluate_via_cli(prompt, model_short=model_short)
                 method = f"CLI:{model_short}"
         elif eval_method in ("cli_first", "cli_only"):
             response = evaluate_via_cli(prompt, model_short=model_short)
             method = f"CLI:{model_short}"
             if response is None and eval_method == "cli_first":
-                response = evaluate_via_api(prompt, model=model, api_key=api_key)
+                log("CLI failed — falling back to API")
+                response = _unpack_api(evaluate_via_api(prompt, model=model, api_key=api_key))
                 method = f"API:{model_short}"
 
         if response is not None:
@@ -2408,8 +2518,14 @@ def main():
             time.sleep(0.5)
 
     elapsed = time.time() - start
+    token_kwargs = dict(
+        input_tokens=input_tokens, output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens,
+        model=used_model,
+    )
 
     if response is None:
+        steps.record("llm", "ask", "no response after retry")
         log(f"DECISION: ASK USER (no response after retry, {elapsed:.1f}s)")
         _record_decision(
             "ASK_USER",
@@ -2419,6 +2535,8 @@ def main():
             elapsed * 1000,
             sid,
             repo_path,
+            **token_kwargs,
+            trajectory=steps.to_json(),
         )
         sys.exit(0)
 
@@ -2428,15 +2546,21 @@ def main():
     reason = reason or "LLM provided no reason"
 
     if safe is True:
+        steps.record("llm", "allow", method)
         log(f"DECISION: ALLOW [{method}] - {reason} ({elapsed:.1f}s)")
         emit_allow()
         _record_decision(
-            "ALLOW", command, method, reason, elapsed * 1000, sid, repo_path
+            "ALLOW", command, method, reason, elapsed * 1000, sid, repo_path,
+            **token_kwargs,
+            trajectory=steps.to_json(),
         )
     else:
+        steps.record("llm", "ask", method)
         log(f"DECISION: ASK USER [{method}] - {reason} ({elapsed:.1f}s)")
         _record_decision(
-            "ASK_USER", command, method, reason, elapsed * 1000, sid, repo_path
+            "ASK_USER", command, method, reason, elapsed * 1000, sid, repo_path,
+            **token_kwargs,
+            trajectory=steps.to_json(),
         )
 
     sys.exit(0)

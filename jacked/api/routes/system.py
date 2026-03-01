@@ -1008,7 +1008,7 @@ async def test_gatekeeper_api_key(body: TestApiKeyRequest, request: Request):
         return {
             "success": False,
             "source": source,
-            "error": "anthropic SDK not installed (uv tool install \"claude-jacked[security]\")",
+            "error": "anthropic SDK not available — try reinstalling claude-jacked",
         }
     except Exception as e:
         return {"success": False, "source": source, "error": str(e)[:200]}
