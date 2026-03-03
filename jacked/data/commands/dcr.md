@@ -65,6 +65,25 @@ Each reviewer in a wave gets a different wild card. Shuffle the pool; no repeats
 - "What if this is the user's very first time using the feature?"
 - "What if a feature flag is disabled?"
 
+## PRE-MORTEM FAILURE SCENARIOS
+
+The pre-mortem agent gets 2-3 scenarios from this pool (shuffled; no repeats until exhausted, then reset).
+
+**Operational:**
+- "6 months in production, this feature is being rolled back. What went wrong?"
+- "A user filed a P0 bug at 3am. The on-call couldn't figure out what happened from the logs. Why?"
+- "Load increased 10x and this was the first thing to break. Trace the failure path."
+- "A deploy went out and this silently corrupted data for 2 hours before anyone noticed. How?"
+
+**Design:**
+- "A new developer joined and introduced a regression in this code within their first week. What was unclear?"
+- "This feature shipped but adoption is near zero — users can't figure it out. What's confusing?"
+- "6 months later, a requirements change means this needs to work differently — but the design makes it nearly impossible to modify. What's coupled too tightly?"
+
+**Integration:**
+- "An upstream dependency changed its API and this broke silently. Where are the implicit contracts?"
+- "Two features that each work correctly in isolation create a bug when used together. What's the interaction?"
+
 ## CONCURRENCY MODEL
 
 **Reviewers are READ-ONLY.** They find issues and report findings but NEVER edit files. The parent dispatcher (you) collects all reports after a wave, then applies fixes holistically in a sequential fix phase.
@@ -86,13 +105,25 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
 4. **Phase context**: "Phase: [PHASE]. Skip sub-areas within your lenses that don't apply."
 5. **Persona bias**: "You are reviewing as the [PERSONA NAME]. Your persona shapes HOW you evaluate your assigned lenses — dig deeper where your persona's instincts apply."
 6. **Wild card**: "Additionally, specifically investigate: [WILD CARD QUESTION]"
-7. **Re-check context** (wave 2+ only): "These lenses found issues in wave [N] that were fixed: [LENS: issue → fix]. Verify each fix is correct and check for NEW issues introduced by the fix."
+7. **Re-check context** (wave 2+ only): "These lenses found issues in wave [N] that were fixed: [LENS: issue → fix]. Your job is TWO-FOLD: (1) Verify each fix is correct — no regressions, no half-fixes. (2) Do a FULL fresh review of your assigned lenses as if seeing the code for the first time. Finding issues in a previous wave means there may be adjacent issues that were missed. Do NOT limit your review to verifying prior fixes."
 8. **Ralph Wiggum style**: Innocent curiosity that catches what others miss. Ask "why does this work?" not "this works."
 9. **Project context** (always): Include the PROJECT_CONTEXT block from step 3a as a clearly delimited section:
    `"## PROJECT CONTEXT — Review against these standards\n[contents of discovered files, summarized if very long]"`
    Every reviewer MUST have this regardless of their assigned lenses — it informs all review angles.
    For the **Guardrails** lens reviewer specifically, add: "Your primary job is verifying compliance
    with these documents. Cite specific rule violations with the rule text and file:line of the violation."
+10. **Pre-mortem agent** (Wave 1 only): Spawn an additional reviewer with these instructions:
+    "You are the PRE-MORTEM ANALYST. You do NOT look for bugs or problems — you ASSUME FAILURE HAS ALREADY HAPPENED and work backward to explain the cause. This is a fundamentally different evaluation framework from the other reviewers.
+
+    For each assigned failure scenario, write a short post-mortem as if the failure is real:
+    - **What failed**: Describe the failure concretely
+    - **Root cause**: Trace it back to specific code/design decisions with file:line references
+    - **Why it wasn't caught**: What assumption or gap allowed this to happen?
+    - **Severity**: CRITICAL / MEDIUM / LOW using the same scale as other reviewers
+
+    Your failure scenarios: [SCENARIO 1], [SCENARIO 2], [SCENARIO 3]
+
+    You are READ-ONLY. Report findings but do NOT edit files. Include file paths and line numbers."
 
 ## EXECUTION FLOW
 
@@ -216,11 +247,28 @@ Announce format when `frontend_review = true`:
 - Reviewer [M+1] (Frontend Design): Design quality + Aesthetics | via frontend-design skill
 ```
 
-8. **Wait** for all results (4 or 5 depending on frontend_review).
+#### PRE-MORTEM ANALYST (Wave 1 only, always spawned)
+
+Spawn an additional reviewer as the pre-mortem agent in the SAME message as all other Wave 1 reviewers:
+- Use `subagent_type: "double-check-reviewer"` (or general-purpose with pre-mortem instructions)
+- Assign 2-3 shuffled failure scenarios from the PRE-MORTEM FAILURE SCENARIOS pool
+- Include the pre-mortem spawning instructions from item 10 above
+- Include PROJECT_CONTEXT block and phase context
+- Reports in standard CRITICAL/MEDIUM/LOW format — findings enter the normal fix loop
+- Does NOT re-spawn in subsequent waves (one-shot reframing — its value is the initial perspective shift, not iterative verification)
+
+Announce format (always):
+```
+**Wave 1 — [N] lenses across [M] reviewers + Pre-Mortem Analyst**
+- Reviewer A-[M]: [selected lens pairs as above]
+- Pre-Mortem Analyst: [2-3 failure scenarios from pool]
+```
+
+8. **Wait** for all results.
 
 ### FIX PHASE (sequential, you the parent)
 
-9. **Read** all 4 reports. For each lens across all reports:
+9. **Read** all reports (lens reviewers + pre-mortem analyst + frontend if applicable). For each lens across all reports:
    - **Clean** (no CRITICAL/MEDIUM) → move lens to `covered`
    - **CRITICAL/MEDIUM found** → add findings to list
    - **LOW issues** → report them but do NOT block progress
@@ -231,14 +279,14 @@ Announce format when `frontend_review = true`:
     - Add to `resolved_issues` with description of what was found and how it was fixed
 11. `wave++`
 
-### SUBSEQUENT WAVES — Re-check Only
+### SUBSEQUENT WAVES — Re-check + Fresh Review
 
 12. **Check stop**: If `needs_recheck` is empty → **ALL COVERED** → go to step 16.
 13. **Check cap**: If the user's project or global CLAUDE.md specifies a wave cap and `wave >= cap`, go to step 17. Otherwise no cap — continue.
 14. **Build re-check wave**:
     - Group `needs_recheck` lenses into pairs (or singles if odd number)
     - Each pair gets a NEW persona (different from wave 1) and NEW wild card
-    - Include re-check context in spawn prompt
+    - Include re-check context in spawn prompt. Instruct reviewers to verify fixes AND conduct a full fresh review of their lenses — not just confirm prior findings.
 15. **Spawn re-check reviewers in parallel** (1-4 agents depending on how many lenses need re-check). Wait for results. → Go to FIX PHASE (step 9).
 
 ### REPORTING
@@ -258,7 +306,8 @@ Announce format when `frontend_review = true`:
       ⊘ Performance — skipped (not relevant)
       ⊘ Maintainability — skipped (not relevant)
     **Frontend design:** ✓ Reviewed (N findings) / ⊘ Skipped
-    **Issues found and fixed:** [count] ([which lenses])
+    **Pre-mortem analysis:** ✓ [N] scenarios analyzed ([N] findings)
+    **Issues found and fixed:** [count] ([which lenses/pre-mortem])
     **Context sources:** [list of discovered files]
     **Final verdict:** All selected lenses passed clean.
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, Request, status
@@ -114,6 +115,38 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"error": {"message": "Invalid repo_path"}},
         )
+    # Validate all patterns against the same rules as add_permission_rule —
+    # dangerous-patterns blocklist + file-tool depth check. Prevents bypass via bulk PUT.
+    for list_name, patterns in [("allow", body.allow), ("deny", body.deny), ("ask", body.ask)]:
+        if patterns is None:
+            continue
+        for pat in patterns:
+            stripped = pat.strip()
+            if stripped.lower() in _DANGEROUS_PATTERNS_LOWER:
+                return JSONResponse(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    content={
+                        "error": {
+                            "message": f"Pattern '{pat}' in {list_name} list is too broad and would bypass gatekeeper security"
+                        }
+                    },
+                )
+            ft_match = _FILE_TOOL_PREFIX_RE.match(stripped)
+            if ft_match and ft_match.group(1) in _FILE_TOOLS:
+                segments = [s for s in ft_match.group(2).split("/") if s]
+                if len(segments) < 3:
+                    return JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        content={
+                            "error": {
+                                "message": (
+                                    f"Pattern '{pat}' in {list_name} list is too broad — "
+                                    "path must have at least 3 directory segments"
+                                )
+                            }
+                        },
+                    )
+
     async with _project_settings_lock:
         settings = _read_project_settings(str(resolved))
         if "permissions" not in settings:
@@ -139,7 +172,26 @@ _DANGEROUS_PATTERNS = {
     "Bash(rm -rf:*)",
     "Bash(sh:*)",
     "Bash(bash:*)",
+    # File-tool root patterns — would allow access to every file on the system
+    "Read(/:*)",
+    "Edit(/:*)",
+    "Write(/:*)",
+    "Grep(/:*)",
+    "Glob(/:*)",
+    "NotebookEdit(/:*)",
+    # Empty-prefix patterns — bypass all path matching
+    "Read(:*)",
+    "Edit(:*)",
+    "Write(:*)",
+    "Grep(:*)",
+    "Glob(:*)",
+    "NotebookEdit(:*)",
+    "Bash(:*)",
 }
+_DANGEROUS_PATTERNS_LOWER = {p.lower() for p in _DANGEROUS_PATTERNS}
+
+_FILE_TOOLS = {"Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"}
+_FILE_TOOL_PREFIX_RE = re.compile(r"^(\w+)\((.+):\*\)$")
 
 
 class AddRuleRequest(BaseModel):
@@ -163,7 +215,9 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"error": {"message": "Pattern required"}},
         )
-    if pattern in _DANGEROUS_PATTERNS:
+    # Case-insensitive check: tool names are case-sensitive in Claude Code
+    # (Read, Bash, etc.) but we normalize to catch bypass attempts like "bash(*:*)".
+    if pattern.lower() in _DANGEROUS_PATTERNS_LOWER:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={
@@ -172,6 +226,24 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
                 }
             },
         )
+
+    # Block overly-broad file-tool prefix patterns (< 3 directory segments)
+    ft_match = _FILE_TOOL_PREFIX_RE.match(pattern)
+    if ft_match and ft_match.group(1) in _FILE_TOOLS:
+        path_prefix = ft_match.group(2)
+        segments = [s for s in path_prefix.split("/") if s]
+        if len(segments) < 3:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "error": {
+                        "message": (
+                            f"Pattern '{pattern}' is too broad — "
+                            "path must have at least 3 directory segments"
+                        )
+                    }
+                },
+            )
 
     if body.scope == "project":
         db = getattr(request.app.state, "db", None)

@@ -16,18 +16,21 @@ You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each
 
 ## Step 1: Detect Browser Tools
 
-Check which browser automation tools are available. **Prefer Playwright MCP** — it supports headless operation (no visible browser window).
+Check which browser automation tools are available, in this order:
 
-**Option A — Playwright MCP (preferred)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, set `browser = "playwright"`.
+**Option A — agent-browser CLI (preferred)**: Run `npx agent-browser --version` via Bash. If it succeeds, set `browser = "agent-browser"`. This reuses your existing browser session — no new windows.
 
-**Option B — Claude-in-Chrome (fallback)**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, set `browser = "chrome"`. Note to user:
-> Using Claude-in-Chrome, which requires a visible browser window. For headless operation, configure Playwright MCP with `--headless` in `.mcp.json`.
+**Option B — Claude-in-Chrome (fallback)**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, set `browser = "chrome"`.
 
-**If neither is available**: Tell the user:
+**Option C — Playwright MCP (fallback)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, set `browser = "playwright"`. Note to user:
+> Using Playwright MCP, which opens separate browser windows. Install agent-browser (`npm i -g agent-browser`) or Claude-in-Chrome for in-browser operation.
+
+**If none are available**: Tell the user:
 ```
 No browser tools detected. Install one:
-- Playwright MCP (recommended): Add to .mcp.json with --headless flag for non-interactive mode
+- agent-browser (recommended): npm i -g agent-browser
 - Claude-in-Chrome: Install the Chrome extension from https://chromewebstore.google.com
+- Playwright MCP: Add to .mcp.json with --headless flag
 ```
 Then stop.
 
@@ -215,19 +218,21 @@ Include ALL of the following in each agent's Task prompt:
 ```
 You are a UX tester performing focused browser-based checks.
 
-## BROWSER TOOL: [playwright / chrome]
+## BROWSER TOOL: [agent-browser / chrome / playwright]
 
-[If Playwright]:
-Use tools prefixed with `mcp__plugin_playwright_playwright__browser_*`:
-- `browser_tabs` action "new" — create your own tab FIRST
-- `browser_navigate` — go to a URL
-- `browser_snapshot` — accessibility tree (preferred for element detection)
-- `browser_take_screenshot` — visual screenshot
-- `browser_click` — click element by ref
-- `browser_type` — type text
-- `browser_console_messages` — read console output
-- `browser_network_requests` — inspect network
-- `browser_resize` — change viewport size
+[If agent-browser]:
+Use the Bash tool with `npx agent-browser` commands:
+- `npx agent-browser open <url>` — navigate to a URL
+- `npx agent-browser snapshot` — accessibility tree with refs (preferred for element detection)
+- `npx agent-browser screenshot <path>` — save screenshot to file
+- `npx agent-browser click <ref>` — click element by @ref from snapshot
+- `npx agent-browser type <ref> <text>` — type text into element
+- `npx agent-browser fill <ref> <text>` — clear and fill element
+- `npx agent-browser eval <js>` — run JavaScript on page
+- `npx agent-browser scroll <dir> [px]` — scroll up/down/left/right
+- `npx agent-browser wait <sel|ms>` — wait for element or time
+
+Note: agent-browser reuses your existing browser — no tab isolation needed.
 
 [If Chrome]:
 Use tools prefixed with `mcp__claude-in-chrome__*`:
@@ -241,11 +246,23 @@ Use tools prefixed with `mcp__claude-in-chrome__*`:
 - `read_network_requests` — network activity
 - `resize_window` — change viewport size
 
-## CRITICAL: TAB ISOLATION
+[If Playwright]:
+Use tools prefixed with `mcp__plugin_playwright_playwright__browser_*`:
+- `browser_tabs` action "new" — create your own tab FIRST
+- `browser_navigate` — go to a URL
+- `browser_snapshot` — accessibility tree (preferred for element detection)
+- `browser_take_screenshot` — visual screenshot
+- `browser_click` — click element by ref
+- `browser_type` — type text
+- `browser_console_messages` — read console output
+- `browser_network_requests` — inspect network
+- `browser_resize` — change viewport size
+
+## CRITICAL: TAB ISOLATION (Chrome/Playwright only — not needed for agent-browser)
 
 Before ANY browser action, create your own tab:
-- [Playwright]: `browser_tabs` action "new", then navigate in the new tab
 - [Chrome]: `tabs_create_mcp`, then use ONLY the returned tab ID for ALL subsequent calls
+- [Playwright]: `browser_tabs` action "new", then navigate in the new tab
 
 NEVER interact with other tabs. Work exclusively in your own tab.
 

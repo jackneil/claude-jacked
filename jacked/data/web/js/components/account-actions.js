@@ -1,11 +1,5 @@
-/**
- * jacked web dashboard — account actions
- * Event handlers, OAuth flows, delete/reorder, and credential switching.
- * Split from accounts.js for guardrails compliance.
- */
-
-// Flag to suppress polling re-renders during in-flight actions
-let _accountActionInFlight = false;
+// jacked web dashboard — account actions
+// Event handlers, OAuth flows, delete/reorder, and credential switching.
 
 // ---------------------------------------------------------------------------
 // Auto-refresh usage state
@@ -16,20 +10,145 @@ const AUTO_REFRESH_PERIOD = 60;
 const _refreshSvg = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>';
 
 // ---------------------------------------------------------------------------
-// Event binding (called after renderAccounts)
+// SweetAlert confirmation helpers for auth flows
 // ---------------------------------------------------------------------------
+async function _confirmAddAccount() {
+    return Swal.fire({
+        title: 'Add Account',
+        html: `Add a new Google account?<br><br>
+               This opens browser tabs for authorization:<br>
+               1. Usage token (for jacked dashboard)<br>
+               2. Claude Code token (refresh-capable, for CC sessions)<br><br>
+               Complete both to fully authorize the new account.`,
+        icon: 'info',
+        showCancelButton: true,
+        confirmButtonText: 'Add Account',
+        cancelButtonText: 'Cancel',
+        focusCancel: true,
+    });
+}
+
+async function _confirmReauth(email) {
+    return Swal.fire({
+        title: 'Re-authenticate Account?',
+        html: `Re-authenticate <strong>${escapeHtml(email)}</strong>?<br><br>
+               This opens browser tabs for authorization:<br>
+               1. Usage token (for jacked dashboard)<br>
+               2. Claude Code token (refresh-capable, for CC sessions)<br><br>
+               Complete both to fully authorize this account.<br>
+               Sign in with the same Google account.`,
+        icon: 'info',
+        showCancelButton: true,
+        confirmButtonText: 'Authorize',
+        cancelButtonText: 'Cancel',
+        focusCancel: true,
+    });
+}
+
+async function _confirmCcAuth(email) {
+    return Swal.fire({
+        title: 'Authorize Claude Code Token?',
+        html: `Authorize a separate token for <strong>${escapeHtml(email)}</strong>?<br><br>
+               This opens a browser tab. Sign in with the same Google account.<br><br>
+               Claude Code uses its own refresh-capable token, independent from the usage token.
+               This lets CC sessions refresh without re-authenticating.`,
+        icon: 'info',
+        showCancelButton: true,
+        confirmButtonText: 'Authorize',
+        cancelButtonText: 'Cancel',
+        focusCancel: true,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Pill click handler — re-attaches on every render (safe: old element is GC'd)
+// ---------------------------------------------------------------------------
+function initPillHandlers() {
+    const list = document.getElementById('accounts-list');
+    if (!list) return;
+    list.addEventListener('click', async (e) => {
+        const pill = e.target.closest('button.token-pill.actionable');
+        if (!pill) return;
+        if (window.jackedState._accountActionInFlight) {
+            showToast('Another action is in progress', 'warning', 2000);
+            return;
+        }
+        const action = pill.dataset.action;
+        const id = pill.dataset.accountId;
+        const email = pill.dataset.email;
+        try {
+            if (action === 'reauth-primary') {
+                const result = await _confirmReauth(email);
+                if (!result.isConfirmed) return;
+                if (window.jackedState._accountActionInFlight) {
+                    showToast('Another action started — please try again', 'warning', 2000);
+                    return;
+                }
+                // No account ID needed — server matches by Google login during OAuth
+                startAddAccountFlow();
+            } else if (action === 'auth-cc') {
+                const result = await _confirmCcAuth(email);
+                if (!result.isConfirmed) return;
+                if (window.jackedState._accountActionInFlight) {
+                    showToast('Another action started — please try again', 'warning', 2000);
+                    return;
+                }
+                startCcAuthFlow(id, email);
+            }
+        } catch (err) {
+            console.error('Auth confirmation error:', err);
+            showToast('Something went wrong — please try again', 'error');
+        }
+    });
+}
+
 function bindAccountEvents() {
-    // Session display controls (defined in sessions.js)
+    initPillHandlers();
     if (typeof bindSessionControlEvents === 'function') bindSessionControlEvents();
 
     // Add Account button
     document.querySelectorAll('#btn-add-account').forEach(btn => {
-        btn.addEventListener('click', startAddAccountFlow);
+        btn.addEventListener('click', async () => {
+            if (window.jackedState._accountActionInFlight) {
+                showToast('Another action is in progress', 'warning', 2000);
+                return;
+            }
+            try {
+                const result = await _confirmAddAccount();
+                if (!result.isConfirmed) return;
+                if (window.jackedState._accountActionInFlight) {
+                    showToast('Another action started — please try again', 'warning', 2000);
+                    return;
+                }
+                startAddAccountFlow();
+            } catch (err) {
+                console.error('Add account confirmation error:', err);
+                showToast('Something went wrong — please try again', 'error');
+            }
+        });
     });
 
     // Re-auth buttons
     document.querySelectorAll('.btn-reauth').forEach(btn => {
-        btn.addEventListener('click', () => startAddAccountFlow());
+        btn.addEventListener('click', async () => {
+            if (window.jackedState._accountActionInFlight) {
+                showToast('Another action is in progress', 'warning', 2000);
+                return;
+            }
+            const email = btn.dataset.email || '';
+            try {
+                const result = await _confirmReauth(email);
+                if (!result.isConfirmed) return;
+                if (window.jackedState._accountActionInFlight) {
+                    showToast('Another action started — please try again', 'warning', 2000);
+                    return;
+                }
+                startAddAccountFlow();
+            } catch (err) {
+                console.error('Reauth confirmation error:', err);
+                showToast('Something went wrong — please try again', 'error');
+            }
+        });
     });
 
     // Toggle active/disabled
@@ -40,6 +159,35 @@ function bindAccountEvents() {
             try {
                 await api.patch(`/api/auth/accounts/${id}`, { is_active: !isActive });
                 showToast(isActive ? 'Account disabled' : 'Account enabled', 'success');
+                await refreshAndRender();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        });
+    });
+
+    // Edit label buttons
+    document.querySelectorAll('.btn-edit-label').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (window.jackedState._accountActionInFlight) return;
+            const id = btn.dataset.id;
+            const current = btn.dataset.label || '';
+            const result = await Swal.fire({
+                title: 'Account Label',
+                input: 'text',
+                inputValue: current,
+                inputPlaceholder: 'e.g., Work Max, Personal Pro',
+                showCancelButton: true,
+                confirmButtonText: 'Save',
+                cancelButtonText: 'Cancel',
+                inputAttributes: { maxlength: 50, autocomplete: 'off' },
+            });
+            if (!result.isConfirmed) return;
+            const value = (result.value || '').trim();
+            try {
+                await api.patch(`/api/auth/accounts/${id}`, { display_name: value });
+                showToast(value ? `Label set to "${value}"` : 'Label cleared', 'success');
                 await refreshAndRender();
             } catch (e) {
                 showToast(e.message, 'error');
@@ -58,11 +206,15 @@ function bindAccountEvents() {
     // Set Active buttons
     document.querySelectorAll('.btn-set-active').forEach(btn => {
         btn.addEventListener('click', async () => {
+            if (window.jackedState._accountActionInFlight) {
+                showToast('Another action is in progress', 'warning', 2000);
+                return;
+            }
             const id = btn.dataset.id;
             const email = btn.dataset.email || 'this account';
             const result = await Swal.fire({
                 title: 'Switch Active Account?',
-                html: `Set <strong>${email}</strong> as Claude Code's active account?<br><br><span style="color:#94a3b8">You'll need to restart Claude Code for this to take effect.</span>`,
+                html: `Set <strong>${escapeHtml(email)}</strong> as Claude Code's active account?<br><br>You'll need to restart Claude Code for this to take effect.`,
                 icon: 'question',
                 showCancelButton: true,
                 confirmButtonText: 'Switch Account',
@@ -74,7 +226,7 @@ function bindAccountEvents() {
             btn.disabled = true;
             const originalHtml = btn.innerHTML;
             btn.innerHTML = '<div class="spinner" style="width:12px;height:12px;border-width:2px"></div>';
-            _accountActionInFlight = true;
+            window.jackedState._accountActionInFlight = true;
 
             try {
                 await api.post(`/api/auth/accounts/${id}/use`);
@@ -85,7 +237,7 @@ function bindAccountEvents() {
                 btn.disabled = false;
                 btn.innerHTML = originalHtml;
             } finally {
-                _accountActionInFlight = false;
+                window.jackedState._accountActionInFlight = false;
             }
         });
     });
@@ -225,11 +377,12 @@ function showDeleteConfirm(accountId) {
     if (!container) return;
 
     container.classList.remove('hidden');
+    const safeId = escapeHtml(String(accountId));
     container.innerHTML = `
         <div class="delete-confirm flex items-center gap-3 mt-3 pt-3 border-t border-red-800/50 text-sm">
             <span class="text-red-300">Remove this account?</span>
-            <button class="btn-confirm-yes px-3 py-1 bg-red-600 hover:bg-red-500 text-white text-xs rounded transition-colors" data-id="${accountId}">Yes, Remove</button>
-            <button class="btn-confirm-cancel px-3 py-1 text-slate-400 hover:text-white text-xs rounded transition-colors" data-id="${accountId}">Cancel</button>
+            <button class="btn-confirm-yes px-3 py-1 bg-red-600 hover:bg-red-500 text-white text-xs rounded transition-colors" data-id="${safeId}">Yes, Remove</button>
+            <button class="btn-confirm-cancel px-3 py-1 text-slate-400 hover:text-white text-xs rounded transition-colors" data-id="${safeId}">Cancel</button>
         </div>
     `;
 
@@ -262,96 +415,7 @@ function hideDeleteConfirm(accountId) {
     container.innerHTML = '';
 }
 
-// ---------------------------------------------------------------------------
-// OAuth add-account flow
-// ---------------------------------------------------------------------------
-async function startAddAccountFlow() {
-    const statusEl = document.getElementById('oauth-flow-status');
-    if (!statusEl) return;
-
-    statusEl.innerHTML = `
-        <div class="bg-blue-900/30 border border-blue-700 rounded-lg px-4 py-3 text-sm text-blue-200 flex items-center gap-3">
-            <div class="spinner"></div>
-            <div>
-                <div class="font-medium">Waiting for authorization...</div>
-                <div class="text-xs text-blue-300 mt-1">A browser window should open. Complete the authorization there.</div>
-            </div>
-        </div>
-    `;
-
-    let flowId;
-    try {
-        const result = await api.post('/api/auth/accounts/add');
-        flowId = result.flow_id;
-    } catch (e) {
-        statusEl.innerHTML = `
-            <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
-                Failed to start auth flow: ${escapeHtml(e.message)}
-            </div>
-        `;
-        return;
-    }
-
-    if (!flowId) {
-        statusEl.innerHTML = `
-            <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
-                No flow ID returned from server
-            </div>
-        `;
-        return;
-    }
-
-    // Poll every 1s, timeout at 2 minutes
-    let elapsed = 0;
-    const maxWait = 120;
-    const pollInterval = setInterval(async () => {
-        elapsed++;
-        if (elapsed > maxWait) {
-            clearInterval(pollInterval);
-            statusEl.innerHTML = `
-                <div class="bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-200">
-                    Authorization timed out after 2 minutes. Please try again.
-                </div>
-            `;
-            return;
-        }
-
-        try {
-            const poll = await api.get(`/api/auth/flow/${flowId}`);
-
-            if (poll.status === 'completed') {
-                clearInterval(pollInterval);
-                statusEl.innerHTML = `
-                    <div class="bg-green-900/30 border border-green-700 rounded-lg px-4 py-3 text-sm text-green-200">
-                        Account connected successfully!
-                    </div>
-                `;
-                setTimeout(() => { statusEl.innerHTML = ''; }, 3000);
-                await refreshAndRender();
-            } else if (poll.status === 'error') {
-                clearInterval(pollInterval);
-                statusEl.innerHTML = `
-                    <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
-                        Authorization failed: ${escapeHtml(poll.error || 'Unknown error')}
-                    </div>
-                `;
-            }
-            // status === 'pending' — keep polling
-        } catch (e) {
-            // not_found means flow expired
-            if (e.status === 404) {
-                clearInterval(pollInterval);
-                statusEl.innerHTML = `
-                    <div class="bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-200">
-                        Authorization flow expired. Please try again.
-                    </div>
-                `;
-            }
-        }
-    }, 1000);
-
-    window.jackedState.flowPolling = pollInterval;
-}
+// startAddAccountFlow() and startCcAuthFlow() moved to oauth-flows.js
 
 // ---------------------------------------------------------------------------
 // Auto-refresh usage
@@ -376,7 +440,7 @@ function _stopAutoRefresh() {
 async function _autoRefreshTick() {
     const btn = document.getElementById('btn-refresh-all-usage');
     if (!btn) return;
-    if (_accountActionInFlight) return;
+    if (window.jackedState._accountActionInFlight) return;
 
     _autoRefreshCountdown--;
     if (_autoRefreshCountdown > 0) {
@@ -384,7 +448,7 @@ async function _autoRefreshTick() {
         return;
     }
 
-    _accountActionInFlight = true;
+    window.jackedState._accountActionInFlight = true;
     btn.disabled = true;
     btn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Refreshing...';
     try {
@@ -398,7 +462,7 @@ async function _autoRefreshTick() {
         if (chk) chk.checked = false;
         _stopAutoRefresh();
     } finally {
-        _accountActionInFlight = false;
+        window.jackedState._accountActionInFlight = false;
         if (btn) btn.disabled = false;
     }
 }

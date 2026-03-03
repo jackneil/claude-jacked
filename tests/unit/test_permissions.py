@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from jacked.api.routes.permissions import (
+    _DANGEROUS_PATTERNS,
+    _FILE_TOOL_PREFIX_RE,
+    _FILE_TOOLS,
     _read_project_settings,
     _validate_repo_path,
     _write_project_settings,
@@ -86,3 +91,68 @@ class TestProjectSettings:
         """No .json.tmp left behind after write."""
         _write_project_settings(str(tmp_path), {"test": True})
         assert not (tmp_path / ".claude" / "settings.local.json.tmp").exists()
+
+
+class TestDangerousPatterns:
+    """Tests for the _DANGEROUS_PATTERNS blocklist and file-tool validation."""
+
+    def test_bash_root_blocked(self):
+        assert "Bash(*:*)" in _DANGEROUS_PATTERNS
+
+    def test_bash_rm_blocked(self):
+        assert "Bash(rm:*)" in _DANGEROUS_PATTERNS
+
+    @pytest.mark.parametrize("tool", ["Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"])
+    def test_file_tool_root_patterns_blocked(self, tool):
+        """Root file-tool patterns like Read(/:*) are in the blocklist."""
+        assert f"{tool}(/:*)" in _DANGEROUS_PATTERNS
+
+    def test_file_tools_set_complete(self):
+        """_FILE_TOOLS includes all 6 file tools."""
+        assert _FILE_TOOLS == {"Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"}
+
+
+class TestFileToolPrefixValidation:
+    """Tests for the dynamic shallow-path validation regex."""
+
+    def test_regex_matches_prefix_pattern(self):
+        m = _FILE_TOOL_PREFIX_RE.match("Read(/Users/jack/project:*)")
+        assert m is not None
+        assert m.group(1) == "Read"
+        assert m.group(2) == "/Users/jack/project"
+
+    def test_regex_matches_single_segment(self):
+        m = _FILE_TOOL_PREFIX_RE.match("Edit(/Users:*)")
+        assert m is not None
+        assert m.group(2) == "/Users"
+
+    def test_regex_no_match_exact(self):
+        """Exact path patterns (no :*) don't match the prefix regex."""
+        m = _FILE_TOOL_PREFIX_RE.match("Read(/Users/jack/project/file.py)")
+        assert m is None
+
+    def test_regex_no_match_bash(self):
+        m = _FILE_TOOL_PREFIX_RE.match("Bash(git push:*)")
+        # Matches the regex shape but tool won't be in _FILE_TOOLS
+        if m:
+            assert m.group(1) not in _FILE_TOOLS
+
+    @pytest.mark.parametrize(
+        "pattern,should_reject",
+        [
+            ("Read(/:*)", True),           # root — 0 segments
+            ("Read(/Users:*)", True),      # 1 segment
+            ("Edit(/Users/jack:*)", True), # 2 segments
+            ("Read(/Users/jack/project:*)", False),  # 3 segments — OK
+            ("Write(/a/b/c/d:*)", False),  # 4 segments — OK
+        ],
+    )
+    def test_segment_count_validation(self, pattern, should_reject):
+        """Prefix patterns with < 3 path segments should be rejected."""
+        m = _FILE_TOOL_PREFIX_RE.match(pattern)
+        assert m is not None
+        tool = m.group(1)
+        path_prefix = m.group(2)
+        segments = [s for s in path_prefix.split("/") if s]
+        too_broad = tool in _FILE_TOOLS and len(segments) < 3
+        assert too_broad == should_reject

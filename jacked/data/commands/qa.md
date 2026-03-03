@@ -6,18 +6,21 @@ You are a QA engineer testing UI changes from the current coding session. Follow
 
 ## Step 1: Detect Browser Tools
 
-Check which browser automation tools are available. **Prefer Playwright MCP** — it supports headless operation (no visible browser window).
+Check which browser automation tools are available, in this order:
 
-**Option A — Playwright MCP (preferred)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, use Playwright tools for all browser interaction.
+**Option A — agent-browser CLI (preferred)**: Run `npx agent-browser --version` via Bash. If it succeeds, use agent-browser for all browser interaction via Bash tool calls (e.g., `npx agent-browser open <url>`, `npx agent-browser snapshot`, `npx agent-browser screenshot <path>`, `npx agent-browser click <ref>`, `npx agent-browser type <ref> <text>`, `npx agent-browser eval <js>`). This reuses your existing browser session — no new windows.
 
-**Option B — Claude-in-Chrome (fallback)**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, use Claude-in-Chrome tools. Note to user:
-> Using Claude-in-Chrome, which requires a visible browser window. For headless operation, configure Playwright MCP with `--headless` in `.mcp.json`.
+**Option B — Claude-in-Chrome (fallback)**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, use Claude-in-Chrome tools for all browser interaction.
 
-**If neither is available**: Tell the user:
+**Option C — Playwright MCP (fallback)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, use Playwright tools. Note to user:
+> Using Playwright MCP, which opens separate browser windows. Install agent-browser (`npm i -g agent-browser`) or Claude-in-Chrome for in-browser operation.
+
+**If none are available**: Tell the user:
 ```
 No browser tools detected. Install one:
-- Playwright MCP (recommended): Add to .mcp.json with --headless flag for non-interactive mode
+- agent-browser (recommended): npm i -g agent-browser
 - Claude-in-Chrome: Install the Chrome extension from https://chromewebstore.google.com
+- Playwright MCP: Add to .mcp.json with --headless flag
 ```
 Then stop.
 

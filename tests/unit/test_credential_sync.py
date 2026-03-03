@@ -84,7 +84,9 @@ def test_build_oauth_data_basic():
     }
     result = build_oauth_data(account)
     assert result["accessToken"] == "at"
-    assert result["refreshToken"] == "rt"
+    # Primary fallback: refreshToken is always None to prevent Claude Code
+    # from consuming the primary refresh token (dual-token safety invariant)
+    assert result["refreshToken"] is None
     assert result["expiresAt"] == 100000  # * 1000
     assert result["scopes"] is None
     assert result["subscriptionType"] == "max"
@@ -129,6 +131,9 @@ def test_sync_writes_global_credential_file():
             "access_token": "new_access",
             "refresh_token": "new_refresh",
             "expires_at": 1800000000,
+            "cc_access_token": "cc_new_access",
+            "cc_refresh_token": "cc_new_refresh",
+            "cc_expires_at": 1800000000,
             "scopes": None,
             "subscription_type": "max",
             "rate_limit_tier": "t1",
@@ -147,8 +152,9 @@ def test_sync_writes_global_credential_file():
         assert cred_path.exists()
         data = json.loads(cred_path.read_text(encoding="utf-8"))
         assert data["_jackedAccountId"] == 1
-        assert data["claudeAiOauth"]["accessToken"] == "new_access"
-        assert data["claudeAiOauth"]["refreshToken"] == "new_refresh"
+        # build_oauth_data prefers CC tokens for credential files
+        assert data["claudeAiOauth"]["accessToken"] == "cc_new_access"
+        assert data["claudeAiOauth"]["refreshToken"] == "cc_new_refresh"
         assert data["claudeAiOauth"]["expiresAt"] == 1800000000000
 
 

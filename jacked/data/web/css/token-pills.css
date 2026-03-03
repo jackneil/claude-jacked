@@ -1,0 +1,204 @@
+/* Token pill styles — inline auth status indicators on account cards */
+
+:root {
+    --pill-blue: #3b82f6;
+    --pill-orange: #f97316;
+    --pill-red: #ef4444;
+}
+
+/* ---------------------------------------------------------------------------
+   Base pill
+   --------------------------------------------------------------------------- */
+.token-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: #94a3b8;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: border-color 200ms, background-color 200ms;
+}
+
+/* ---------------------------------------------------------------------------
+   Actionable pill (button reset)
+   --------------------------------------------------------------------------- */
+.token-pill.actionable {
+    cursor: pointer;
+    min-height: 36px;
+    min-width: 44px;
+    font: inherit;
+    font-size: 0.75rem;
+}
+
+.token-pill.actionable:hover {
+    border-color: var(--pill-blue);
+    background: rgba(59, 130, 246, 0.08);
+}
+
+.token-pill.actionable:focus-visible {
+    outline: 2px solid var(--pill-blue);
+    outline-offset: 2px;
+}
+
+.token-pill.actionable:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+/* ---------------------------------------------------------------------------
+   Actionable pill modifiers — dashed borders by severity
+   --------------------------------------------------------------------------- */
+
+/* Missing: CC token not set up (blue — inviting) */
+.token-pill.actionable.pill-missing {
+    border: 1px dashed rgba(59, 130, 246, 0.45);
+    background: rgba(59, 130, 246, 0.06);
+}
+.token-pill.actionable.pill-missing:hover {
+    border-color: var(--pill-blue);
+    background: rgba(59, 130, 246, 0.12);
+}
+.token-pill.actionable.pill-missing .pill-status { color: #93c5fd; }
+.token-pill.actionable.pill-missing:focus-visible {
+    outline-color: var(--pill-blue);
+    outline-offset: 4px;
+}
+
+/* Warning: needs re-auth (orange) */
+.token-pill.actionable.pill-warn {
+    border: 1px dashed rgba(249, 115, 22, 0.45);
+    background: rgba(249, 115, 22, 0.06);
+}
+.token-pill.actionable.pill-warn:hover {
+    border-color: var(--pill-orange);
+    background: rgba(249, 115, 22, 0.12);
+}
+.token-pill.actionable.pill-warn .pill-status { color: #fdba74; }
+.token-pill.actionable.pill-warn:focus-visible { outline-color: var(--pill-orange); }
+
+/* Error: expired or revoked (red) */
+.token-pill.actionable.pill-error {
+    border: 1px dashed rgba(239, 68, 68, 0.45);
+    background: rgba(239, 68, 68, 0.06);
+}
+.token-pill.actionable.pill-error:hover {
+    border-color: var(--pill-red);
+    background: rgba(239, 68, 68, 0.12);
+}
+.token-pill.actionable.pill-error .pill-status { color: #fca5a5; }
+.token-pill.actionable.pill-error:focus-visible { outline-color: var(--pill-red); }
+
+/* ---------------------------------------------------------------------------
+   Pill label and status text
+   --------------------------------------------------------------------------- */
+.pill-label {
+    font-weight: 500;
+    color: #cbd5e1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pill-status {
+    color: #94a3b8;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------------------------
+   Pill chevron — actionable indicator (sibling span, not ::after)
+   --------------------------------------------------------------------------- */
+.pill-chevron {
+    flex-shrink: 0;
+    opacity: 0.6;
+    font-weight: 700;
+    transition: opacity 200ms;
+}
+.token-pill.actionable:hover .pill-chevron { opacity: 1; }
+
+/* ---------------------------------------------------------------------------
+   Pill dot — subordinate 8px indicator
+   --------------------------------------------------------------------------- */
+.pill-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    flex-shrink: 0;
+}
+
+/* Filled circle (healthy / warning) */
+.pill-dot.filled {
+    border-radius: 50%;
+}
+
+.pill-dot.green {
+    background-color: #22c55e;
+}
+
+.pill-dot.yellow {
+    background-color: #eab308;
+}
+
+.pill-dot.orange {
+    background-color: #f97316;
+}
+
+/* Triangle (error/expired) */
+.pill-dot.triangle {
+    width: 8px;
+    height: 8px;
+    border-radius: 0;
+    background: none;
+    clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
+    background-color: var(--pill-red);
+}
+
+/* Ring (missing) */
+.pill-dot.ring {
+    border-radius: 50%;
+    border: 2px solid #94a3b8;
+    background: transparent;
+    box-sizing: border-box;
+}
+
+/* Pulse animation (checking/refreshing) */
+.pill-dot.pulse {
+    border-radius: 50%;
+    background-color: var(--pill-blue);
+    animation: pill-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pill-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+/* ---------------------------------------------------------------------------
+   Overall status-dot variants (worst-of-two derived)
+   --------------------------------------------------------------------------- */
+.status-dot.warning {
+    background-color: #eab308;
+}
+
+.status-dot.cc-missing {
+    background-color: #64748b;
+}
+
+/* ---------------------------------------------------------------------------
+   Pill container — flex wrap for header row
+   --------------------------------------------------------------------------- */
+.token-pills-container {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+}

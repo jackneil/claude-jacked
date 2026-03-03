@@ -21,26 +21,35 @@ _WIN = os.name == "nt"
 
 
 def _make_db(tmp_path: Path) -> Database:
-    """Create a test DB with sample accounts."""
+    """Create a test DB with sample accounts.
+
+    Accounts have both primary and CC tokens (dual-token architecture).
+    CC tokens are what credential files receive; primary tokens are jacked-only.
+    """
     db = Database(str(tmp_path / "test.db"))
+    future = int(time.time()) + 3600
     with db._writer() as conn:
         conn.execute(
             """INSERT INTO accounts
                (id, email, access_token, refresh_token, expires_at,
+                cc_access_token, cc_refresh_token, cc_expires_at,
                 is_active, is_deleted, validation_status,
                 consecutive_failures, subscription_type, rate_limit_tier)
                VALUES (1, 'alice@test.com', 'alice_access', 'alice_refresh',
-                       ?, 1, 0, 'valid', 0, 'max', 't1')""",
-            (int(time.time()) + 3600,),
+                       ?, 'alice_cc_access', 'alice_cc_refresh', ?,
+                       1, 0, 'valid', 0, 'max', 't1')""",
+            (future, future),
         )
         conn.execute(
             """INSERT INTO accounts
                (id, email, access_token, refresh_token, expires_at,
+                cc_access_token, cc_refresh_token, cc_expires_at,
                 is_active, is_deleted, validation_status,
                 consecutive_failures, subscription_type, rate_limit_tier)
                VALUES (2, 'bob@test.com', 'bob_access', 'bob_refresh',
-                       ?, 1, 0, 'valid', 0, 'pro', 't2')""",
-            (int(time.time()) + 3600,),
+                       ?, 'bob_cc_access', 'bob_cc_refresh', ?,
+                       1, 0, 'valid', 0, 'pro', 't2')""",
+            (future, future),
         )
         conn.execute(
             """INSERT INTO accounts
@@ -523,8 +532,9 @@ class TestPrepareAccountDir:
 
         data = json.loads(cred_file.read_text())
         oauth = data["claudeAiOauth"]
-        assert oauth["accessToken"] == "alice_access"
-        assert oauth["refreshToken"] == "alice_refresh"
+        # build_oauth_data prefers CC tokens for credential files
+        assert oauth["accessToken"] == "alice_cc_access"
+        assert oauth["refreshToken"] == "alice_cc_refresh"
         assert oauth["subscriptionType"] == "max"
         assert oauth["rateLimitTier"] == "t1"
 
@@ -840,15 +850,15 @@ class TestLaunchClaude:
 
 class TestTokenSync:
     def test_sync_tokens_from_file_updates_db(self, tmp_path):
-        """_sync_tokens_from_file writes changed tokens to DB."""
+        """_sync_tokens_from_file writes changed tokens to cc_* columns."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
         config_dir.mkdir(parents=True)
         (config_dir / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {
-                "accessToken": "new_access",
-                "refreshToken": "new_refresh",
+                "accessToken": "new_cc_access",
+                "refreshToken": "new_cc_refresh",
                 "expiresAt": 9999999999000,
             }
         }))
@@ -858,12 +868,15 @@ class TestTokenSync:
         _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
         account = db.get_account(1)
-        assert account["access_token"] == "new_access"
-        assert account["refresh_token"] == "new_refresh"
+        # Writes to cc_* columns, not primary
+        assert account["cc_access_token"] == "new_cc_access"
+        assert account["cc_refresh_token"] == "new_cc_refresh"
         assert account["validation_status"] == "valid"
+        # Primary tokens unchanged
+        assert account["access_token"] == "alice_access"
 
     def test_sync_tokens_noop_when_unchanged(self, tmp_path):
-        """_sync_tokens_from_file skips write when token hasn't changed."""
+        """_sync_tokens_from_file skips write when CC token hasn't changed."""
         db = _make_db(tmp_path)
         original = db.get_account(1)
 
@@ -871,8 +884,8 @@ class TestTokenSync:
         config_dir.mkdir(parents=True)
         (config_dir / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {
-                "accessToken": "alice_access",  # same as DB
-                "refreshToken": "alice_refresh",
+                "accessToken": "alice_cc_access",  # same as DB cc_access_token
+                "refreshToken": "alice_cc_refresh",
                 "expiresAt": 9999999999000,
             }
         }))
@@ -883,7 +896,7 @@ class TestTokenSync:
 
         # Should not have changed anything
         account = db.get_account(1)
-        assert account["access_token"] == original["access_token"]
+        assert account["cc_access_token"] == original["cc_access_token"]
 
     def test_close_sessions_by_pid(self, tmp_path):
         """_close_sessions_by_pid marks matching open sessions as ended."""
@@ -930,12 +943,13 @@ class TestTokenSync:
 
         _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
-        # DB should NOT be contaminated — alice's original token preserved
+        # DB should NOT be contaminated — alice's original tokens preserved
         account = db.get_account(1)
         assert account["access_token"] == "alice_access"
+        assert account["cc_access_token"] == "alice_cc_access"
 
     def test_sync_allows_matching_email(self, tmp_path):
-        """_sync_tokens_from_file syncs normally when email matches DB."""
+        """_sync_tokens_from_file syncs CC tokens when email matches DB."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
@@ -957,7 +971,9 @@ class TestTokenSync:
         _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
         account = db.get_account(1)
-        assert account["access_token"] == "refreshed_alice_token"
+        # Writes to cc_* columns
+        assert account["cc_access_token"] == "refreshed_alice_token"
+        assert account["cc_refresh_token"] == "new_refresh"
 
     def test_sync_allows_case_insensitive_email_match(self, tmp_path):
         """Email guard compares case-insensitively — same email, different case syncs."""
@@ -982,7 +998,7 @@ class TestTokenSync:
         _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
         account = db.get_account(1)
-        assert account["access_token"] == "refreshed_token"
+        assert account["cc_access_token"] == "refreshed_token"
 
     def test_sync_blocks_when_email_missing_from_oauth(self, tmp_path):
         """Blocks sync when oauthAccount exists but emailAddress is absent."""
@@ -1008,17 +1024,18 @@ class TestTokenSync:
 
         account = db.get_account(1)
         assert account["access_token"] == "alice_access"  # not contaminated
+        assert account["cc_access_token"] == "alice_cc_access"  # CC not contaminated
 
     def test_sync_allows_when_no_claude_json(self, tmp_path):
-        """_sync_tokens_from_file syncs when .claude.json missing (backward compat)."""
+        """_sync_tokens_from_file syncs CC tokens when .claude.json missing."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
         config_dir.mkdir(parents=True)
         (config_dir / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {
-                "accessToken": "new_access",
-                "refreshToken": "new_refresh",
+                "accessToken": "new_cc_access",
+                "refreshToken": "new_cc_refresh",
                 "expiresAt": 9999999999000,
             }
         }))
@@ -1029,7 +1046,33 @@ class TestTokenSync:
         _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
         account = db.get_account(1)
-        assert account["access_token"] == "new_access"
+        assert account["cc_access_token"] == "new_cc_access"
+        assert account["cc_refresh_token"] == "new_cc_refresh"
+
+    def test_sync_skips_when_claude_json_corrupted(self, tmp_path):
+        """Corrupted .claude.json → fail closed, skip sync without identity check."""
+        db = _make_db(tmp_path)
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        # Write valid credential file with new tokens
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "new_cc_access",
+                "refreshToken": "new_cc_refresh",
+                "expiresAt": 9999999999000,
+            }
+        }))
+        # Write CORRUPTED .claude.json
+        (config_dir / ".claude.json").write_text("not valid json{{{")
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        account = db.get_account(1)
+        # Sync should NOT have happened — fail closed
+        assert account["cc_access_token"] == "alice_cc_access"  # unchanged
 
 
 # ---------------------------------------------------------------------------

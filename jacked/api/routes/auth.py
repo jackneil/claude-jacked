@@ -14,7 +14,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from jacked.web.auth import (
     fetch_usage,
@@ -64,6 +64,8 @@ class AccountResponse(BaseModel):
 
     id: int
     email: str
+    organization_uuid: Optional[str] = None
+    organization_name: Optional[str] = None
     display_name: Optional[str] = None
     expires_at: int
     scopes: Optional[str] = None
@@ -86,6 +88,10 @@ class AccountResponse(BaseModel):
     validation_status: str = "unknown"
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    # CC (Claude Code) token status (computed, not stored in DB)
+    cc_expires_at: Optional[int] = None
+    has_cc_token: bool = False
+    cc_needs_auth: bool = False
     # Computed / enriched fields
     is_default: bool = False
     is_expired: bool = False
@@ -94,7 +100,7 @@ class AccountResponse(BaseModel):
 
 
 class AccountPatchRequest(BaseModel):
-    display_name: Optional[str] = None
+    display_name: Optional[str] = Field(None, max_length=50)
     is_active: Optional[bool] = None
 
 
@@ -108,6 +114,7 @@ class FlowStatusResponse(BaseModel):
     account_id: Optional[int] = None
     email: Optional[str] = None
     error: Optional[str] = None
+    cc_flow_id: Optional[str] = None
 
 
 class RefreshResponse(BaseModel):
@@ -257,6 +264,8 @@ def _account_to_response(row: dict) -> AccountResponse:
     return AccountResponse(
         id=row["id"],
         email=row["email"],
+        organization_uuid=row.get("organization_uuid") or None,
+        organization_name=row.get("organization_name"),
         display_name=row.get("display_name"),
         expires_at=row["expires_at"],
         scopes=row.get("scopes"),
@@ -279,6 +288,14 @@ def _account_to_response(row: dict) -> AccountResponse:
         validation_status=row.get("validation_status", "unknown"),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
+        # CC token status (computed from DB columns, not stored)
+        cc_expires_at=row.get("cc_expires_at"),
+        has_cc_token=bool(row.get("cc_access_token")),
+        cc_needs_auth=(
+            row.get("cc_access_token") is not None
+            and row.get("cc_refresh_token") is None
+            and now >= (row.get("cc_expires_at") or 0)
+        ),
         # Computed fields per design doc
         is_default=row.get("priority", 0) == 0,
         is_expired=now >= row["expires_at"],
@@ -325,6 +342,7 @@ async def get_flow_status(flow_id: str):
         account_id=status_data.get("account_id"),
         email=status_data.get("email"),
         error=status_data.get("error"),
+        cc_flow_id=status_data.get("cc_flow_id"),
     )
 
 
@@ -351,8 +369,10 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
         return _not_found(f"No account with id={account_id}")
 
     updates: dict = {}
-    if body.display_name is not None:
-        updates["display_name"] = body.display_name
+    if "display_name" in body.model_fields_set:
+        # Explicit null or empty string clears the label; strip whitespace
+        raw = body.display_name.strip() if body.display_name else None
+        updates["display_name"] = raw if raw else None
     if body.is_active is not None:
         updates["is_active"] = body.is_active
 
@@ -364,9 +384,12 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
             },
         )
 
-    db.update_account(account_id, **updates)
+    if not db.update_account(account_id, **updates):
+        return _not_found(f"Account {account_id} was deleted during update")
 
     updated = db.get_account(account_id)
+    if not updated:
+        return _not_found(f"Account {account_id} no longer exists")
     return _account_to_response(updated)
 
 
@@ -562,6 +585,34 @@ async def validate_token(account_id: int, request: Request):
     )
 
 
+@router.post("/accounts/{account_id}/authorize-cc")
+async def start_cc_auth(account_id: int, request: Request):
+    """Start OAuth flow for independent Claude Code tokens on existing account.
+
+    Allows upgrading an existing account with separate CC tokens without
+    re-authenticating the primary pair.
+    """
+    db = _get_db(request)
+    if db is None:
+        return _db_unavailable()
+
+    account = db.get_account(account_id)
+    if not account:
+        return _not_found(f"No account with id={account_id}")
+
+    from jacked.web.oauth import OAuthFlow, _active_flows
+
+    # Dedup: if a CC flow for this account is already active, return it
+    # Snapshot with list() — _active_flows may be mutated by concurrent coroutines
+    for fid, existing in list(_active_flows.items()):
+        if existing.purpose == "claude_code" and existing._target_account_id == account_id:
+            return {"flow_id": fid, "auth_url": "", "status": "pending"}
+
+    flow = OAuthFlow(db, purpose="claude_code", target_account_id=account_id)
+    result = await flow.start()
+    return result
+
+
 # --- Credential switching ---
 
 
@@ -672,12 +723,18 @@ async def get_active_credential(request: Request):
                 account_id=account["id"], email=account["email"]
             )
 
-    # Layer 2: Exact access_token match
+    # Layer 2: Exact token match (CC token takes precedence over primary)
     access_token = cred_data.get("claudeAiOauth", {}).get("accessToken")
     if access_token:
         accounts = db.list_accounts(include_inactive=True)
         for acct in accounts:
-            if acct.get("access_token") == access_token and not acct.get("is_deleted"):
+            if acct.get("is_deleted"):
+                continue
+            if acct.get("cc_access_token") == access_token:
+                return ActiveCredentialResponse(
+                    account_id=acct["id"], email=acct["email"]
+                )
+            if acct.get("access_token") == access_token:
                 return ActiveCredentialResponse(
                     account_id=acct["id"], email=acct["email"]
                 )

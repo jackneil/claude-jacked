@@ -63,11 +63,16 @@ def _write_credential_file(cred_path: Path, data: dict) -> float:
     return cred_path.stat().st_mtime
 
 
-def update_claude_config_email(email: str, display_name: str = None):
-    """Update or create ~/.claude.json with the active account's email.
+def update_claude_config_email(
+    email: str,
+    display_name: str = None,
+    organization_uuid: str = None,
+    organization_name: str = None,
+):
+    """Update or create ~/.claude.json with the active account's identity.
 
-    If the file exists, only changes oauthAccount.emailAddress (preserves all
-    other keys).  If the file doesn't exist, creates it with oauthAccount data.
+    Writes emailAddress, organizationUuid, and organizationName to the
+    oauthAccount block.  If the file exists, preserves all other keys.
     Refuses to write through symlinks.  Logs on failure instead of raising.
 
     >>> update_claude_config_email("test@example.com")  # noqa: no side-effects in test env
@@ -93,6 +98,16 @@ def update_claude_config_email(email: str, display_name: str = None):
     config["oauthAccount"]["emailAddress"] = email
     if display_name and "displayName" not in config["oauthAccount"]:
         config["oauthAccount"]["displayName"] = display_name
+
+    # Write organization identity to oauthAccount block
+    if organization_uuid:
+        config["oauthAccount"]["organizationUuid"] = organization_uuid
+    elif "organizationUuid" in config["oauthAccount"]:
+        del config["oauthAccount"]["organizationUuid"]
+    if organization_name:
+        config["oauthAccount"]["organizationName"] = organization_name
+    elif "organizationName" in config["oauthAccount"]:
+        del config["oauthAccount"]["organizationName"]
 
     try:
         fd, tmp = tempfile.mkstemp(
@@ -192,8 +207,17 @@ def write_platform_credentials(data: dict) -> bool:
 def build_oauth_data(account: dict) -> dict:
     """Build Claude Code credential format from account dict.
 
+    Prefers CC (Claude Code) tokens when present and usable.
+    Falls back to primary tokens when CC tokens don't exist yet.
+    CRITICAL: The fallback path sets refreshToken to None to prevent
+    Claude Code from consuming the primary refresh token.
+
     >>> build_oauth_data({"access_token": "at", "refresh_token": "rt", "expires_at": 100, "scopes": None, "subscription_type": "max", "rate_limit_tier": "t1"})["accessToken"]
     'at'
+    >>> build_oauth_data({"access_token": "at", "refresh_token": "rt", "expires_at": 100, "scopes": None, "subscription_type": "max", "rate_limit_tier": "t1"})["refreshToken"] is None
+    True
+    >>> build_oauth_data({"access_token": "at", "refresh_token": "rt", "expires_at": 100, "scopes": None, "subscription_type": "max", "rate_limit_tier": "t1", "cc_access_token": "cc_at", "cc_refresh_token": "cc_rt", "cc_expires_at": 200})["accessToken"]
+    'cc_at'
     """
     scopes = None
     raw_scopes = account.get("scopes")
@@ -205,13 +229,37 @@ def build_oauth_data(account: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             pass
 
+    # Prefer CC tokens when present AND usable
+    cc_at = account.get("cc_access_token")
+    cc_rt = account.get("cc_refresh_token")
+    cc_exp = account.get("cc_expires_at")
+
+    if cc_at:
+        # If CC token is expired AND no refresh token, fall through to primary
+        if cc_exp is not None and cc_exp < time.time() and not cc_rt:
+            pass  # Fall through — expired CC with no refresh is unusable
+        else:
+            return {
+                "accessToken": cc_at,
+                "refreshToken": cc_rt,  # may be None pre-CC-auth
+                "expiresAt": (cc_exp or 0) * 1000,
+                "scopes": scopes,
+                "subscriptionType": account.get("subscription_type"),
+                "rateLimitTier": account.get("rate_limit_tier"),
+                "organizationUuid": account.get("organization_uuid") or None,
+            }
+
+    # Fallback: primary tokens, but NEVER expose primary refresh_token.
+    # If Claude Code consumed this refresh token, it would break jacked's
+    # background refresh — the exact bug dual-token architecture prevents.
     return {
         "accessToken": account.get("access_token", ""),
-        "refreshToken": account.get("refresh_token"),
+        "refreshToken": None,  # NEVER expose primary refresh_token
         "expiresAt": account.get("expires_at", 0) * 1000,
         "scopes": scopes,
         "subscriptionType": account.get("subscription_type"),
         "rateLimitTier": account.get("rate_limit_tier"),
+        "organizationUuid": account.get("organization_uuid") or None,
     }
 
 
@@ -274,9 +322,14 @@ def sync_credential_to_all_stores(
     except Exception as exc:
         logger.warning("Failed to write keychain credentials: %s", exc)
 
-    # 3. Update ~/.claude.json with email
+    # 3. Update ~/.claude.json with email + org identity
     try:
-        update_claude_config_email(email, display_name)
+        update_claude_config_email(
+            email,
+            display_name,
+            organization_uuid=account.get("organization_uuid") or None,
+            organization_name=account.get("organization_name"),
+        )
     except Exception as exc:
         logger.warning("Failed to update ~/.claude.json email: %s", exc)
 

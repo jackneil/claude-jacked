@@ -1400,7 +1400,7 @@ def _is_outside_project(
         norm_target = str(target).replace("\\", "/")
         for ap in allowed_paths:
             norm_ap = ap.replace("\\", "/").rstrip("/")
-            if norm_target.startswith(norm_ap):
+            if norm_target == norm_ap or norm_target.startswith(norm_ap + "/"):
                 return None  # explicitly allowed
 
         # Windows: different drive letter
@@ -1628,14 +1628,18 @@ def _check_file_tool_permissions(tool_name: str, file_path: str) -> tuple[bool, 
     >>> _check_file_tool_permissions("Read", "/home/user/test.py")
     (False, None)
     """
+    # Normalize to collapse .. traversal and redundant separators
+    file_path = os.path.normpath(file_path)
     patterns = _load_tool_permissions(tool_name)
     for pat in patterns:
         inner = pat[len(tool_name) + 1 :]  # strip 'Read('
         if inner.endswith(")"):
             inner = inner[:-1]
         if inner.endswith(":*"):
-            pfx = inner[:-2]
-            if file_path.startswith(pfx):
+            pfx = os.path.normpath(inner[:-2])
+            if not pfx:
+                continue  # reject empty prefix (e.g. "Read(:*)")
+            if file_path == pfx or file_path.startswith(pfx + "/"):
                 return (True, pat)
         elif inner == file_path:
             return (True, pat)
@@ -1748,6 +1752,18 @@ def _handle_file_tool_inner(
                 _emit_ask(msg)
             return
 
+        # 2b. Permission rules — checked AFTER sensitive/watched but BEFORE
+        # outside-project. User-configured allow patterns like Edit(/path:*)
+        # should override the outside-project scope guard, but must never
+        # bypass watched-path or sensitive-file security checks above.
+        perm_match, perm_pattern = _check_file_tool_permissions(tool_name, file_path)
+        if perm_match:
+            elapsed = time.time() - start
+            log(f"PATH SAFETY [{tool_name}]: PERMS ALLOW {file_path[:100]} ({elapsed:.3f}s)")
+            _record_decision("ALLOW", f"[{tool_name}] {file_path[:200]}", "PERMS", perm_pattern, elapsed * 1000, session_id, repo_path)
+            emit_allow()
+            return
+
         # 3. Outside project — configurable via outside_reads / outside_writes
         # Use project root (CLAUDE_PROJECT_DIR) not drifted cwd — cd commands
         # shift cwd to subdirs, causing false positives on sibling paths.
@@ -1774,8 +1790,13 @@ def _handle_file_tool_inner(
                     _emit_ask(msg)
                 return
 
-    # Step 2: Check if already approved via permission rules
-    perm_match, perm_pattern = _check_file_tool_permissions(tool_name, file_path)
+    # Step 2: Check if already approved via permission rules (fallback for
+    # when path_safety is disabled — the primary check is 2b inside the
+    # path_safety block above already covers the enabled case)
+    if not config.get("enabled", True):
+        perm_match, perm_pattern = _check_file_tool_permissions(tool_name, file_path)
+    else:
+        perm_match, perm_pattern = False, None
     if perm_match:
         elapsed = time.time() - start
         log(

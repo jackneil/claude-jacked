@@ -43,11 +43,20 @@ function _isSensitive(prefix) {
 function tokenizeForSelector(command, method) {
     if (!command) return null;
 
-    // PATH_SAFETY: single input, no token selector
-    if (method === 'PATH_SAFETY' || method === 'PATH_SAFETY_FLOOR') {
-        const pathMatch = command.match(/^\[?\w+\]?\s+(\/\S+)/);
-        if (pathMatch) return { type: 'path', pattern: pathMatch[1] };
-        return null;
+    // PATH_SAFETY with [ToolName] /path format → path segment selector.
+    // If the command is a raw Bash string (e.g., grep ... /path/.env), fall
+    // through to the standard Bash tokenizer below.
+    if (method === 'PATH_SAFETY') {
+        const pathMatch = command.match(/^\[?(\w+)\]?\s+(\/.+)/);
+        if (pathMatch) {
+            const toolName = pathMatch[1];
+            const pattern = pathMatch[2].trim();
+            const segments = pattern.slice(1).split('/').filter(Boolean); // drop leading /
+            if (!segments.length) return { type: 'path', pattern, toolName, segments: [], recommendedIndex: 0 };
+            const recommendedIndex = Math.max(0, segments.length - 2);
+            return { type: 'path', pattern, toolName, segments, recommendedIndex };
+        }
+        // Not in [Tool] /path format — fall through to Bash tokenizer
     }
 
     const stripped = command.replace(_ENV_PREFIX_RE, '');
@@ -86,6 +95,26 @@ function _descriptionForBoundary(tokens, boundaryIndex) {
     return `Allow ${prefix} with any arguments`;
 }
 
+function _pathPatternForBoundary(toolName, segments, boundaryIndex) {
+    // Escape chars that are special in the pattern syntax (:, *, (, ))
+    const safeSegments = segments.slice(0, boundaryIndex + 1).map(
+        s => s.replace(/[:\*\(\)]/g, '_')
+    );
+    const path = '/' + safeSegments.join('/');
+    if (boundaryIndex >= segments.length - 1) {
+        return `${toolName}(${path})`;
+    }
+    return `${toolName}(${path}:*)`;
+}
+
+function _pathDescriptionForBoundary(toolName, segments, boundaryIndex) {
+    const path = '/' + segments.slice(0, boundaryIndex + 1).join('/');
+    if (boundaryIndex >= segments.length - 1) {
+        return `Allow ${toolName} only for this exact path`;
+    }
+    return `Allow ${toolName} for all files under ${path}/`;
+}
+
 // --- File-tool names (project-scope warning) ---
 const _FILE_TOOL_NAMES = new Set(['Read', 'Edit', 'Write', 'Grep', 'Glob', 'NotebookEdit']);
 
@@ -112,7 +141,7 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
     // Title
     const title = document.createElement('h3');
     title.className = 'text-lg font-semibold text-white mb-4';
-    title.textContent = isPath ? 'Add Allowed Path' : 'Always Allow Rule';
+    title.textContent = isPath ? 'Add Path Rule' : 'Always Allow Rule';
     modal.appendChild(title);
 
     // Track selected pattern for submission
@@ -120,14 +149,122 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
     let useCustom = false;
 
     if (isPath) {
-        // Path safety: simple input (unchanged)
-        selectedPattern = tokenData.pattern;
-        const pathInput = document.createElement('input');
-        pathInput.type = 'text';
-        pathInput.className = 'w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 font-mono focus:outline-none focus:border-blue-500 mb-4';
-        pathInput.value = tokenData.pattern;
-        pathInput.addEventListener('input', () => { selectedPattern = pathInput.value.trim(); });
-        modal.appendChild(pathInput);
+        // Path safety: token pill selector for path segments
+        const { segments, toolName, recommendedIndex: pathRecIdx } = tokenData;
+        // Clamp initial boundary: at least 3 segments (index 2) for prefix patterns,
+        // or fall back to exact match (last segment) if path is too short.
+        const minBoundary = segments.length <= 2 ? segments.length - 1 : 2;
+        let pathBoundary = Math.max(pathRecIdx, minBoundary);
+
+        const pathPatternRow = document.createElement('div');
+        pathPatternRow.className = 'mb-1';
+        const pathPatternCode = document.createElement('code');
+        pathPatternCode.className = 'text-xs font-mono text-blue-300';
+
+        const pathDescRow = document.createElement('div');
+        pathDescRow.className = 'text-xs text-slate-400 mb-3';
+
+        // Instruction label
+        const pathInstrLabel = document.createElement('div');
+        pathInstrLabel.className = 'text-sm text-slate-300 mb-2';
+        pathInstrLabel.textContent = 'Click to set allow boundary:';
+        modal.appendChild(pathInstrLabel);
+
+        // Token pill container for path segments
+        const pathTokenContainer = document.createElement('div');
+        pathTokenContainer.className = 'mb-4 bg-slate-900/50 rounded-lg px-3 py-3';
+
+        const pathTokenRow = document.createElement('div');
+        pathTokenRow.className = 'flex flex-wrap items-center gap-0.5';
+
+        function renderPathTokens() {
+            while (pathTokenRow.firstChild) pathTokenRow.removeChild(pathTokenRow.firstChild);
+            // Leading /
+            const slash0 = document.createElement('span');
+            slash0.className = 'text-slate-500 font-mono text-sm select-none';
+            slash0.textContent = '/';
+            pathTokenRow.appendChild(slash0);
+
+            // Minimum boundary index for 3 directory segments (API rejects < 3).
+            // Last segment (exact file match) is always allowed regardless.
+            const minPrefixBoundary = 2;
+
+            segments.forEach((seg, i) => {
+                const pill = document.createElement('span');
+                const isExactMatch = (i === segments.length - 1);
+                const isTooShallow = (i < minPrefixBoundary && !isExactMatch);
+                pill.className = 'rounded px-2 py-0.5 text-sm font-mono transition-colors select-none';
+                if (isTooShallow) {
+                    pill.className += ' text-slate-600 cursor-not-allowed';
+                } else if (i <= pathBoundary) {
+                    pill.className += ' cursor-pointer text-white bg-slate-700 hover:bg-slate-600';
+                } else {
+                    pill.className += ' cursor-pointer text-slate-500 hover:bg-slate-700/40';
+                }
+                pill.textContent = seg;
+                if (!isTooShallow) {
+                    pill.addEventListener('click', () => {
+                        pathBoundary = i;
+                        selectedPattern = _pathPatternForBoundary(toolName, segments, pathBoundary);
+                        renderPathTokens();
+                        updatePathDisplay();
+                    });
+                }
+                pathTokenRow.appendChild(pill);
+
+                // Wildcard indicator after boundary (if not exact match)
+                if (i === pathBoundary && pathBoundary < segments.length - 1) {
+                    const star = document.createElement('span');
+                    star.className = 'text-blue-400 font-bold text-sm select-none mx-0.5';
+                    star.textContent = '/*';
+                    pathTokenRow.appendChild(star);
+                }
+
+                // Slash separator between segments (after non-last segments beyond boundary)
+                if (i < segments.length - 1 && i !== pathBoundary) {
+                    const sep = document.createElement('span');
+                    sep.className = 'text-slate-500 font-mono text-sm select-none';
+                    sep.textContent = '/';
+                    pathTokenRow.appendChild(sep);
+                }
+            });
+
+            // Recommended badge
+            const existingBadge = pathTokenContainer.querySelector('.rec-badge');
+            if (existingBadge) existingBadge.remove();
+            const badge = document.createElement('div');
+            badge.className = 'rec-badge text-[10px] text-blue-300 mt-1.5';
+            // Show "Recommended" arrow if at the recommended boundary, or if the
+            // recommended index points to a disabled (too-shallow) pill.
+            const recIsDisabled = pathRecIdx < minPrefixBoundary && pathRecIdx !== segments.length - 1;
+            if (pathBoundary === pathRecIdx || recIsDisabled) {
+                badge.textContent = '\u2191 Recommended';
+            } else {
+                badge.textContent = 'Recommended: click ';
+                const recSpan = document.createElement('span');
+                recSpan.className = 'font-mono text-blue-400';
+                recSpan.textContent = segments[pathRecIdx];
+                badge.appendChild(recSpan);
+            }
+            pathTokenContainer.appendChild(badge);
+        }
+
+        function updatePathDisplay() {
+            pathPatternCode.textContent = selectedPattern;
+            pathDescRow.textContent = _pathDescriptionForBoundary(toolName, segments, pathBoundary);
+        }
+
+        pathTokenContainer.appendChild(pathTokenRow);
+        modal.appendChild(pathTokenContainer);
+
+        pathPatternRow.appendChild(pathPatternCode);
+        modal.appendChild(pathPatternRow);
+        modal.appendChild(pathDescRow);
+
+        // Set initial state
+        selectedPattern = _pathPatternForBoundary(toolName, segments, pathBoundary);
+        renderPathTokens();
+        updatePathDisplay();
     } else {
         const { tokens, recommendedIndex } = tokenData;
         let boundaryIndex = recommendedIndex;
@@ -276,11 +413,11 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
         updateDisplay();
     }
 
-    // Scope selection (not for path type)
+    // Scope selection
     const scopeWarning = document.createElement('div');
     scopeWarning.className = 'text-xs text-yellow-400 mb-3 hidden';
 
-    if (!isPath) {
+    {
         const scopeLabel = document.createElement('div');
         scopeLabel.className = 'text-sm text-slate-300 mb-2';
         scopeLabel.textContent = 'Scope:';
@@ -303,18 +440,33 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
 
         if (repoPath) {
             const scopeProject = document.createElement('label');
-            scopeProject.className = 'flex items-center gap-2 text-sm text-slate-300 cursor-pointer';
             const radioProject = document.createElement('input');
             radioProject.type = 'radio';
             radioProject.name = 'aa-scope';
             radioProject.value = 'project';
             radioProject.className = 'accent-blue-500';
+            if (isPath) {
+                // Path rules only work at global scope — disable project radio
+                radioProject.disabled = true;
+                scopeProject.className = 'flex items-center gap-2 text-sm text-slate-500 cursor-not-allowed';
+            } else {
+                scopeProject.className = 'flex items-center gap-2 text-sm text-slate-300 cursor-pointer';
+            }
             scopeProject.appendChild(radioProject);
             scopeProject.appendChild(document.createTextNode(`Project: ${repoName}`));
             scopeRow.appendChild(scopeProject);
         }
 
         modal.appendChild(scopeRow);
+
+        if (isPath) {
+            // Static note for path rules
+            const pathScopeNote = document.createElement('div');
+            pathScopeNote.className = 'text-xs text-slate-500 mb-3';
+            pathScopeNote.textContent = 'Path rules are always global \u2014 they apply across all projects';
+            modal.appendChild(pathScopeNote);
+        }
+
         modal.appendChild(scopeWarning);
 
         const updateScopeWarning = () => {
@@ -340,7 +492,7 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
 
     const addBtn = document.createElement('button');
     addBtn.className = 'px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors';
-    addBtn.textContent = isPath ? 'Add Path' : 'Add Rule';
+    addBtn.textContent = 'Add Rule';
     addBtn.addEventListener('click', async () => {
         const val = selectedPattern;
         if (!val) return;
@@ -349,28 +501,18 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
         addBtn.textContent = 'Adding...';
 
         try {
-            if (isPath) {
-                const pathState = await api.get('/api/settings/gatekeeper/path-safety');
-                const allowed = pathState.allowed_paths || [];
-                if (!allowed.includes(val)) {
-                    allowed.push(val);
-                    pathState.allowed_paths = allowed;
-                    await api.put('/api/settings/gatekeeper/path-safety', pathState);
-                }
-            } else {
-                const scope = modal.querySelector('input[name="aa-scope"]:checked')?.value || 'global';
-                const payload = { pattern: val, list_name: 'allow', scope };
-                if (scope === 'project' && repoPath) {
-                    payload.repo_path = repoPath;
-                }
-                await api.post('/api/claude-settings/permissions/rule', payload);
+            const scope = modal.querySelector('input[name="aa-scope"]:checked')?.value || 'global';
+            const payload = { pattern: val, list_name: 'allow', scope };
+            if (scope === 'project' && repoPath) {
+                payload.repo_path = repoPath;
             }
+            await api.post('/api/claude-settings/permissions/rule', payload);
             overlay.remove();
-            showLogsToast(isPath ? `Added allowed path: ${val}` : `Added rule: ${val}`);
+            showLogsToast(`Added rule: ${val}`);
         } catch (e) {
             showLogsToast('Failed: ' + e.message, true);
             addBtn.disabled = false;
-            addBtn.textContent = isPath ? 'Add Path' : 'Add Rule';
+            addBtn.textContent = 'Add Rule';
         }
     });
 
@@ -797,12 +939,12 @@ function buildRowHtml(r, showRepo) {
                         <div><span class="text-slate-500">Session:</span> <span class="font-mono">${fullSession}</span></div>
                         <div><span class="text-slate-500">Repo:</span> <span class="font-mono">${fullRepo}</span></div>
                         <div><span class="text-slate-500">Elapsed:</span> ${elapsed}</div>
-                        ${r.decision === 'ASK_USER' ? `
+                        ${r.decision === 'ASK_USER' && r.method !== 'PATH_SAFETY_FLOOR' ? `
                         <button class="always-allow-btn ml-auto px-3 py-1 rounded-lg text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors"
                             data-command="${fullCmd}"
                             data-method="${method}"
                             data-repo="${fullRepo}">
-                            ${r.method === 'PATH_SAFETY' || r.method === 'PATH_SAFETY_FLOOR' ? 'Add Allowed Path' : 'Always Allow'}
+                            ${r.method === 'PATH_SAFETY' ? 'Add Allowed Path' : 'Always Allow'}
                         </button>` : ''}
                     </div>
                 </div>

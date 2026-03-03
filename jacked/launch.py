@@ -27,7 +27,7 @@ from jacked.api.credential_helpers import (
     read_platform_credentials,
     write_platform_credentials,
 )
-from jacked.web.auth import should_refresh
+from jacked.web.auth import should_refresh, should_refresh_cc
 from jacked.web.database import Database
 
 logger = logging.getLogger(__name__)
@@ -90,11 +90,24 @@ def _seed_claude_config(config_dir: Path) -> None:
         if key in source:
             local[key] = source[key]
 
+    # Atomic write (matches _seed_workspace_trust / _seed_oauth_account pattern)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(config_dir), prefix=".claude_json_tmp_", suffix=".json"
+    )
     try:
-        claude_json.write_text(json.dumps(local, indent=2), encoding="utf-8")
-        os.chmod(str(claude_json), 0o600)
-    except OSError as exc:
-        logger.debug("Failed to write per-account .claude.json: %s", exc)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(local, f, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        _safe_replace(tmp, str(claude_json))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        logger.debug("Failed to write per-account .claude.json")
 
 
 def _seed_workspace_trust(config_dir: Path) -> None:
@@ -203,20 +216,45 @@ def _seed_oauth_account(config_dir: Path, account: dict) -> None:
     except (json.JSONDecodeError, OSError):
         return  # Don't clobber a file we can't parse
 
+    org_uuid = account.get("organization_uuid") or None
+    org_name = account.get("organization_name")
+
     if "oauthAccount" in local and isinstance(local["oauthAccount"], dict):
         # Claude Code wrote the full version — preserve all fields but
-        # ALWAYS update emailAddress to match the DB account.  This prevents
-        # stale emails from persisting after Claude Code re-authenticates
-        # as a different Google account inside a per-account directory.
+        # ALWAYS update emailAddress + org identity to match the DB account.
+        # This prevents stale emails/orgs from persisting after Claude Code
+        # re-authenticates inside a per-account directory.
+        changed = False
         if (local["oauthAccount"].get("emailAddress") or "").lower() != email.lower():
             local["oauthAccount"]["emailAddress"] = email
+            changed = True
+        # Always sync org identity
+        if org_uuid:
+            if local["oauthAccount"].get("organizationUuid") != org_uuid:
+                local["oauthAccount"]["organizationUuid"] = org_uuid
+                changed = True
+            if org_name and local["oauthAccount"].get("organizationName") != org_name:
+                local["oauthAccount"]["organizationName"] = org_name
+                changed = True
         else:
+            # Personal account — clear any stale org fields
+            if "organizationUuid" in local["oauthAccount"]:
+                del local["oauthAccount"]["organizationUuid"]
+                changed = True
+            if "organizationName" in local["oauthAccount"]:
+                del local["oauthAccount"]["organizationName"]
+                changed = True
+        if not changed:
             return  # Already correct — nothing to do
     else:
         oauth = {"emailAddress": email}
         display_name = account.get("display_name")
         if display_name:
             oauth["displayName"] = display_name
+        if org_uuid:
+            oauth["organizationUuid"] = org_uuid
+        if org_name:
+            oauth["organizationName"] = org_name
         local["oauthAccount"] = oauth
 
     # Atomic write
@@ -313,7 +351,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     if account_id <= 0:
         raise click.ClickException(f"Invalid account ID: {account_id}")
 
-    # Refresh token if near-expiry (refresh_account_token is async)
+    # Refresh primary token if near-expiry (refresh_account_token is async)
     if should_refresh(account):
         from jacked.web.auth import refresh_account_token
 
@@ -325,6 +363,35 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         account = db.get_account(account_id)
         if not account:
             raise click.ClickException(f"Account {account_id} disappeared after refresh")
+
+    # Refresh CC token if near-expiry (independent from primary)
+    if should_refresh_cc(account):
+        from jacked.web.auth import refresh_cc_token
+
+        try:
+            asyncio.run(refresh_cc_token(account_id, db))
+        except Exception as exc:
+            logger.warning("Pre-launch CC token refresh failed: %s", exc)
+        account = db.get_account(account_id)
+        if not account:
+            raise click.ClickException(f"Account {account_id} disappeared after CC refresh")
+
+    # Pre-launch CC token warnings
+    cc_at = account.get("cc_access_token")
+    cc_rt = account.get("cc_refresh_token")
+    cc_exp = account.get("cc_expires_at")
+    if not cc_at:
+        logger.warning(
+            "Account %d: No CC token — using primary token (non-refreshable). "
+            "Authorize CC via dashboard for stable sessions.",
+            account_id,
+        )
+    elif cc_exp and cc_exp < _time.time() and not cc_rt:
+        logger.warning(
+            "Account %d: CC token expired and no refresh token — Claude Code "
+            "session may fail. Re-authorize CC via dashboard.",
+            account_id,
+        )
 
     config_dir = ACCOUNTS_DIR / str(account_id)
 
@@ -451,16 +518,24 @@ def resolve_account(account_ref, db: Database) -> dict:
             account = db.get_account(acct_id)
 
         # Layer 4: Keychain token → DB match (last resort)
+        # Credential files/Keychain contain CC tokens, so check cc_access_token
+        # first (preferred), then fall back to primary access_token.
         if not account:
             try:
                 kc_data = read_platform_credentials()
                 if kc_data:
                     token = kc_data.get("claudeAiOauth", {}).get("accessToken")
                     if token:
-                        for acct in db.list_accounts(include_inactive=False):
-                            if acct.get("access_token") == token:
+                        accounts_list = db.list_accounts(include_inactive=False)
+                        for acct in accounts_list:
+                            if acct.get("cc_access_token") == token:
                                 account = acct
                                 break
+                        if not account:
+                            for acct in accounts_list:
+                                if acct.get("access_token") == token:
+                                    account = acct
+                                    break
             except Exception:
                 pass
 
@@ -469,7 +544,11 @@ def resolve_account(account_ref, db: Database) -> dict:
                 "No active account detected. Specify an account: jacked claude <id>"
             )
     elif isinstance(account_ref, str) and "@" in account_ref:
-        account = db.get_account_by_email(account_ref)
+        try:
+            account = db.get_account_by_email(account_ref)
+        except ValueError as exc:
+            # Ambiguous: multiple orgs for the same email
+            raise click.ClickException(str(exc))
         if not account:
             raise click.ClickException(f"No account found for email: {account_ref}")
     else:
@@ -527,41 +606,83 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
             try:
                 cj = json.loads(claude_json.read_text(encoding="utf-8"))
                 oauth_block = cj.get("oauthAccount")
-                if isinstance(oauth_block, dict):
-                    file_email = oauth_block.get("emailAddress")
-                    if file_email:
-                        import sqlite3 as _sq
+                if not isinstance(oauth_block, dict):
+                    # oauthAccount key is missing or non-dict — suspicious since
+                    # jacked always seeds this block via _seed_oauth_account().
+                    # Fail closed to prevent unverified token sync.
+                    logger.warning(
+                        "Token sync BLOCKED for account %d: "
+                        "oauthAccount block missing or invalid in .claude.json",
+                        account_id,
+                    )
+                    return
+                file_email = oauth_block.get("emailAddress")
+                if file_email:
+                    import sqlite3 as _sq
 
-                        _conn = _sq.connect(db_path, timeout=2.0)
-                        try:
-                            _conn.execute("PRAGMA busy_timeout = 5000")
-                            _row = _conn.execute(
-                                "SELECT email FROM accounts WHERE id = ?",
-                                (account_id,),
-                            ).fetchone()
-                            if _row and _row[0] and _row[0].lower() != file_email.lower():
+                    _conn = _sq.connect(db_path, timeout=2.0)
+                    try:
+                        _conn.execute("PRAGMA busy_timeout = 5000")
+                        _conn.row_factory = _sq.Row
+                        _row = _conn.execute(
+                            "SELECT email, organization_uuid FROM accounts WHERE id = ?",
+                            (account_id,),
+                        ).fetchone()
+                        if _row and _row["email"] and _row["email"].lower() != file_email.lower():
+                            logger.warning(
+                                "Token sync BLOCKED for account %d: "
+                                "credential file has email %s but DB has %s "
+                                "— Claude Code may have re-authenticated as "
+                                "a different account",
+                                account_id, file_email, _row["email"],
+                            )
+                            return
+
+                        # Org identity check — fail closed for org-scoped accounts
+                        db_org = _row["organization_uuid"] if _row else ""
+                        if db_org:  # non-empty sentinel = real org
+                            file_org = oauth_block.get("organizationUuid")
+                            if not file_org:
                                 logger.warning(
                                     "Token sync BLOCKED for account %d: "
-                                    "credential file has email %s but DB has %s "
-                                    "— Claude Code may have re-authenticated as "
-                                    "a different account",
-                                    account_id, file_email, _row[0],
+                                    "file missing org for org-scoped account",
+                                    account_id,
                                 )
                                 return
-                        finally:
-                            _conn.close()
-                    elif oauth_block:
-                        # oauthAccount exists but emailAddress is missing —
-                        # suspicious (jacked always seeds emailAddress).
-                        # Block sync to prevent unverified token contamination.
-                        logger.warning(
-                            "Token sync BLOCKED for account %d: "
-                            "oauthAccount present but emailAddress missing",
-                            account_id,
+                            if file_org != db_org:
+                                logger.warning(
+                                    "Token sync BLOCKED for account %d: "
+                                    "org mismatch %s != %s",
+                                    account_id, file_org, db_org,
+                                )
+                                return
+                    except _sq.OperationalError as exc:
+                        logger.debug(
+                            "Token sync identity check failed for account %d: %s",
+                            account_id, exc,
                         )
                         return
+                    finally:
+                        _conn.close()
+                else:
+                    # oauthAccount exists but emailAddress is missing —
+                    # suspicious (jacked always seeds emailAddress).
+                    # Block sync to prevent unverified token contamination.
+                    logger.warning(
+                        "Token sync BLOCKED for account %d: "
+                        "oauthAccount present but emailAddress missing",
+                        account_id,
+                    )
+                    return
             except (json.JSONDecodeError, OSError, AttributeError):
-                pass  # Can't read — fall through to normal sync
+                # Corrupted/unreadable file — fail closed to avoid
+                # syncing tokens without identity verification.
+                logger.debug(
+                    "Token sync skipped for account %d: "
+                    "cannot parse credential file for identity check",
+                    account_id,
+                )
+                return
 
         import sqlite3
 
@@ -570,39 +691,119 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout = 5000")
 
-            row = conn.execute(
-                "SELECT access_token FROM accounts WHERE id = ?", (account_id,)
-            ).fetchone()
-            if row and row[0] == access_token:
-                return  # unchanged
+            # Check if cc_* columns exist (handles pre-migration edge case)
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            cols = {row[1] for row in cursor.fetchall()}
+            has_cc_cols = "cc_access_token" in cols
 
             refresh_token = oauth.get("refreshToken")
             expires_at_ms = oauth.get("expiresAt", 0)
             expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
 
-            now = datetime.now(timezone.utc).isoformat()
-            updates = [
-                "access_token = ?",
-                "validation_status = 'valid'",
-                "consecutive_failures = 0",
-                "last_error = NULL",
-                "updated_at = ?",
-            ]
-            params: list = [access_token, now]
-            if refresh_token:
-                updates.append("refresh_token = ?")
-                params.append(refresh_token)
-            if expires_at is not None:
-                updates.append("expires_at = ?")
-                params.append(expires_at)
-            params.append(account_id)
+            if has_cc_cols:
+                # Credential files contain CC tokens — sync to cc_* columns.
+                # CAS: only write if DB value hasn't changed under us.
+                row = conn.execute(
+                    "SELECT cc_access_token FROM accounts WHERE id = ?",
+                    (account_id,),
+                ).fetchone()
+                old_cc_access_token = row[0] if row else None
+                if old_cc_access_token == access_token:
+                    return  # Token unchanged
 
-            conn.execute(
-                f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?",
-                params,
-            )
-            conn.commit()
-            logger.debug("Synced refreshed tokens for account %d", account_id)
+                # If cc_access_token is NULL in DB, skip sync. NULL means either:
+                # (a) CC tokens were cleared by invalid_grant — writing stale
+                #     file tokens back would resurrect dead tokens, or
+                # (b) CC auth was never done — file contains primary fallback
+                #     tokens that shouldn't be stored in cc_* columns.
+                # In both cases, only the OAuth flow or async refresh should
+                # populate cc_* columns from NULL.
+                if old_cc_access_token is None:
+                    logger.debug(
+                        "Skipping CC sync for account %d — cc_access_token "
+                        "is NULL (awaiting CC auth or post-invalidation)",
+                        account_id,
+                    )
+                    return
+
+                now = int(_time.time())
+                # Column names are hardcoded below, not from user input
+                set_clauses = ["cc_access_token = ?"]
+                params: list = [access_token]
+
+                # Only overwrite cc_expires_at if we have a real value
+                if expires_at:
+                    set_clauses.append("cc_expires_at = ?")
+                    params.append(expires_at)
+
+                # Write cc_refresh_token as-is (including NULL).
+                # Do NOT use COALESCE — if Claude Code consumed the refresh
+                # token and wrote null to the file, we must propagate that
+                # null so should_refresh_cc() knows the token is gone.
+                set_clauses.append("cc_refresh_token = ?")
+                params.append(refresh_token)
+
+                set_clauses.extend([
+                    "validation_status = 'valid'",
+                    "last_validated_at = ?",
+                ])
+                params.append(now)
+                params.extend([account_id, old_cc_access_token])
+
+                # CAS WHERE clause: only update if cc_access_token hasn't
+                # changed since we read it (prevents stale overwrites from
+                # concurrent refresh_cc_token in the async event loop).
+                # Uses IS instead of = for correct NULL comparison in SQL.
+                result = conn.execute(
+                    f"UPDATE accounts SET {', '.join(set_clauses)} "
+                    f"WHERE id = ? AND cc_access_token IS ?",
+                    params,
+                )
+                if result.rowcount > 0:
+                    conn.commit()
+                    logger.debug(
+                        "Synced CC tokens for account %d", account_id
+                    )
+                else:
+                    logger.debug(
+                        "CAS skip for account %d — another writer updated first",
+                        account_id,
+                    )
+            else:
+                # Pre-migration fallback: write to primary columns
+                row = conn.execute(
+                    "SELECT access_token FROM accounts WHERE id = ?",
+                    (account_id,),
+                ).fetchone()
+                if row and row[0] == access_token:
+                    return  # unchanged
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                updates = [
+                    "access_token = ?",
+                    "validation_status = 'valid'",
+                    "consecutive_failures = 0",
+                    "last_error = NULL",
+                    "updated_at = ?",
+                ]
+                params_legacy: list = [access_token, now_iso]
+                if refresh_token:
+                    updates.append("refresh_token = ?")
+                    params_legacy.append(refresh_token)
+                if expires_at is not None:
+                    updates.append("expires_at = ?")
+                    params_legacy.append(expires_at)
+                params_legacy.append(account_id)
+
+                conn.execute(
+                    f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?",
+                    params_legacy,
+                )
+                conn.commit()
+                logger.debug(
+                    "Synced refreshed tokens for account %d (pre-migration)",
+                    account_id,
+                )
         finally:
             conn.close()
     except Exception as exc:

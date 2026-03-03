@@ -37,6 +37,8 @@ class Account(BaseModel):
 
     id: int
     email: str
+    organization_uuid: str = ""
+    organization_name: Optional[str] = None
     display_name: Optional[str] = None
     access_token: str
     refresh_token: Optional[str] = None
@@ -60,6 +62,9 @@ class Account(BaseModel):
     consecutive_failures: int = 0
     last_validated_at: Optional[int] = None
     validation_status: str = "unknown"
+    cc_access_token: Optional[str] = None
+    cc_refresh_token: Optional[str] = None
+    cc_expires_at: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -190,7 +195,9 @@ SCHEMA_SQL = """
 -- Account Management Tables
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
+    organization_uuid TEXT DEFAULT '',  -- Sentinel: "" = personal/legacy, non-empty = real org UUID
+    organization_name TEXT,
     display_name TEXT,
     access_token TEXT NOT NULL,
     refresh_token TEXT,
@@ -214,8 +221,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     consecutive_failures INTEGER DEFAULT 0,
     last_validated_at INTEGER,
     validation_status TEXT DEFAULT 'unknown',
+    cc_access_token TEXT,
+    cc_refresh_token TEXT,
+    cc_expires_at INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(email, organization_uuid)
 );
 
 CREATE TABLE IF NOT EXISTS installations (
@@ -335,7 +346,6 @@ CREATE TABLE IF NOT EXISTS session_accounts (
 
 INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active, is_deleted);
-CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
 CREATE INDEX IF NOT EXISTS idx_accounts_priority ON accounts(priority);
 CREATE INDEX IF NOT EXISTS idx_installations_repo ON installations(repo_path);
 CREATE INDEX IF NOT EXISTS idx_gatekeeper_timestamp ON gatekeeper_decisions(timestamp);
@@ -413,6 +423,18 @@ class Database:
 
     def _init_schema(self) -> None:
         with self._writer() as conn:
+            # Pre-schema crash recovery: if accounts_new exists but accounts doesn't,
+            # a prior migration crashed between DROP TABLE and ALTER TABLE RENAME.
+            # Rename before SCHEMA_SQL runs (which would CREATE TABLE accounts empty).
+            _has_new = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts_new'"
+            ).fetchone() is not None
+            _has_old = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'"
+            ).fetchone() is not None
+            if _has_new and not _has_old:
+                conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
+                conn.execute("DROP INDEX IF EXISTS idx_accounts_email")
             conn.executescript(SCHEMA_SQL)
             # Migrations run BEFORE indexes (indexes may reference new columns)
             # Migration: add cached_usage_raw if missing (existing DBs)
@@ -484,6 +506,108 @@ class Database:
                     )
                 except sqlite3.OperationalError:
                     pass
+            # Migration: add CC (Claude Code) token columns for dual-token architecture.
+            # Primary tokens are jacked-only; CC tokens are written to credential files
+            # for Claude Code. This prevents token rotation conflicts.
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols = {row[1] for row in cursor.fetchall()}
+            cc_cols_added = False
+            for col_name, col_def in [
+                ("cc_access_token", "TEXT"),
+                ("cc_refresh_token", "TEXT"),
+                ("cc_expires_at", "INTEGER"),
+            ]:
+                if col_name not in acct_cols:
+                    cc_cols_added = True
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE accounts ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+            # Seed cc_access_token from primary for existing accounts (one-time only).
+            # Only runs when columns were JUST added — not on every startup.
+            # Re-running would defeat invalid_grant cleanup (which sets cc_* to NULL).
+            # cc_refresh_token is intentionally NOT seeded — seeding it would recreate
+            # the shared-refresh-token bug. Users must do CC OAuth to get independent
+            # CC refresh tokens.
+            if cc_cols_added:
+                conn.execute(
+                    """UPDATE accounts SET cc_access_token = access_token,
+                    cc_expires_at = expires_at
+                    WHERE cc_access_token IS NULL AND access_token IS NOT NULL
+                    AND is_deleted = 0
+                    AND (expires_at IS NULL OR expires_at > strftime('%s','now'))"""
+                )
+            # Migration: add organization columns + composite uniqueness.
+            # Requires table recreation because SQLite can't ALTER UNIQUE constraints.
+            # Uses individual conn.execute() (NOT executescript) for transactional safety.
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_org = {row[1] for row in cursor.fetchall()}
+            if "organization_uuid" not in acct_cols_org:
+                # Note: scenario where accounts was dropped but accounts_new wasn't
+                # yet renamed is handled by pre-schema recovery above (line ~430).
+                # Here we only need to handle partial accounts_new from early-stage crash.
+                conn.execute("DROP TABLE IF EXISTS accounts_new")
+                conn.execute("""CREATE TABLE accounts_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL,
+                    organization_uuid TEXT DEFAULT '',
+                    organization_name TEXT,
+                    display_name TEXT,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    expires_at INTEGER NOT NULL,
+                    scopes TEXT,
+                    subscription_type TEXT,
+                    rate_limit_tier TEXT,
+                    has_extra_usage BOOLEAN DEFAULT FALSE,
+                    priority INTEGER DEFAULT 0,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    last_used_at TIMESTAMP,
+                    cached_usage_5h REAL,
+                    cached_usage_7d REAL,
+                    cached_5h_resets_at TEXT,
+                    cached_7d_resets_at TEXT,
+                    usage_cached_at INTEGER,
+                    cached_usage_raw TEXT,
+                    last_error TEXT,
+                    last_error_at TIMESTAMP,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    last_validated_at INTEGER,
+                    validation_status TEXT DEFAULT 'unknown',
+                    cc_access_token TEXT,
+                    cc_refresh_token TEXT,
+                    cc_expires_at INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(email, organization_uuid)
+                )""")
+                conn.execute("""INSERT INTO accounts_new (
+                    id, email, organization_uuid, organization_name,
+                    display_name, access_token, refresh_token, expires_at,
+                    scopes, subscription_type, rate_limit_tier, has_extra_usage,
+                    priority, is_active, is_deleted, last_used_at,
+                    cached_usage_5h, cached_usage_7d, cached_5h_resets_at, cached_7d_resets_at,
+                    usage_cached_at, cached_usage_raw, last_error, last_error_at,
+                    consecutive_failures, last_validated_at, validation_status,
+                    cc_access_token, cc_refresh_token, cc_expires_at,
+                    created_at, updated_at
+                ) SELECT
+                    id, email, '', NULL,
+                    display_name, access_token, refresh_token, expires_at,
+                    scopes, subscription_type, rate_limit_tier, has_extra_usage,
+                    priority, is_active, is_deleted, last_used_at,
+                    cached_usage_5h, cached_usage_7d, cached_5h_resets_at, cached_7d_resets_at,
+                    usage_cached_at, cached_usage_raw, last_error, last_error_at,
+                    consecutive_failures, last_validated_at, validation_status,
+                    cc_access_token, cc_refresh_token, cc_expires_at,
+                    created_at, updated_at
+                FROM accounts""")
+                conn.execute("DROP TABLE accounts")
+                conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
+                conn.execute("DROP INDEX IF EXISTS idx_accounts_email")
             # Indexes (after migrations so new columns exist)
             conn.executescript(INDEXES_SQL)
             # Migration: rebuild idx_sa_active to cover last_activity_at
@@ -535,18 +659,30 @@ class Database:
         subscription_type: Optional[str] = None,
         rate_limit_tier: Optional[str] = None,
         has_extra_usage: bool = False,
+        organization_uuid: str = "",  # Sentinel: "" = personal/legacy, non-empty = real org UUID
+        organization_name: Optional[str] = None,
     ) -> dict:
-        """Create a new account or update if email already exists.
+        """Create a new account or update if (email, organization_uuid) already exists.
 
-        Handles the design doc edge cases:
-        - Existing deleted account with same email: undelete and update
-        - Existing active account with same email: update tokens in place
+        organization_uuid uses "" (empty string) as sentinel for personal/legacy accounts
+        instead of NULL, because SQLite treats NULL != NULL in UNIQUE constraints.
+        This makes UNIQUE(email, organization_uuid) and ON CONFLICT work atomically.
+
+        Handles edge cases:
+        - Existing deleted account with same email+org: undelete and update
+        - Existing active account with same email+org: update tokens in place
+        - Same email, different org: creates a new separate account
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("test@example.com", "sk-ant-test", 9999999999)
         >>> acct["email"]
         'test@example.com'
+        >>> acct["organization_uuid"]
+        ''
         """
+        # Normalize None → sentinel to prevent SQLite NULL uniqueness issues
+        if organization_uuid is None:
+            organization_uuid = ""
         now = datetime.now(timezone.utc).isoformat()
 
         with self._writer() as conn:
@@ -564,16 +700,18 @@ class Database:
 
             cursor = conn.execute(
                 """INSERT INTO accounts (
-                    email, access_token, refresh_token, expires_at, display_name,
+                    email, organization_uuid, organization_name,
+                    access_token, refresh_token, expires_at, display_name,
                     scopes, subscription_type, rate_limit_tier, has_extra_usage,
                     priority, is_active, is_deleted, consecutive_failures,
                     validation_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?)
-                ON CONFLICT(email) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?)
+                ON CONFLICT(email, organization_uuid) DO UPDATE SET
                     access_token = excluded.access_token,
                     refresh_token = excluded.refresh_token,
                     expires_at = excluded.expires_at,
                     scopes = excluded.scopes,
+                    organization_name = COALESCE(excluded.organization_name, organization_name),
                     subscription_type = COALESCE(excluded.subscription_type, subscription_type),
                     rate_limit_tier = COALESCE(excluded.rate_limit_tier, rate_limit_tier),
                     has_extra_usage = excluded.has_extra_usage,
@@ -585,6 +723,8 @@ class Database:
                 """,
                 (
                     email,
+                    organization_uuid,
+                    organization_name,
                     access_token,
                     refresh_token,
                     expires_at,
@@ -599,7 +739,11 @@ class Database:
                 ),
             )
 
-            cursor = conn.execute("SELECT * FROM accounts WHERE email = ?", (email,))
+            # Use compound key for retrieval — safe since UNIQUE(email, organization_uuid)
+            cursor = conn.execute(
+                "SELECT * FROM accounts WHERE email = ? AND organization_uuid = ?",
+                (email, organization_uuid),
+            )
             row = cursor.fetchone()
             return dict(row) if row else {}
 
@@ -618,20 +762,40 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_account_by_email(self, email: str) -> Optional[dict]:
-        """Get an account by email, case-insensitive (excludes soft-deleted).
+    def get_account_by_email(
+        self, email: str, organization_uuid: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Get an account by email (+ optional org), case-insensitive.
+
+        When organization_uuid is provided, returns exact match.
+        When omitted, returns the single match or raises ValueError
+        if multiple accounts share the same email (different orgs).
 
         >>> db = Database(":memory:")
         >>> db.get_account_by_email("nobody@nowhere.com") is None
         True
         """
         with self._reader() as conn:
+            if organization_uuid is not None:
+                cursor = conn.execute(
+                    "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) "
+                    "AND organization_uuid = ? AND is_deleted = 0",
+                    (email, organization_uuid),
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+
             cursor = conn.execute(
-                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) AND is_deleted = 0",
+                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) "
+                "AND is_deleted = 0 ORDER BY priority ASC, id ASC",
                 (email,),
             )
-            row = cursor.fetchone()
-            return dict(row) if row else None
+            rows = cursor.fetchall()
+            if len(rows) > 1:
+                raise ValueError(
+                    f"Ambiguous: {len(rows)} accounts for {email} — specify by ID or org"
+                )
+            return dict(rows[0]) if rows else None
 
     def list_accounts(
         self,
@@ -661,6 +825,7 @@ class Database:
     # Whitelist of columns allowed in update_account
     _ACCOUNT_UPDATE_COLS = frozenset(
         {
+            "organization_name",
             "display_name",
             "access_token",
             "refresh_token",
@@ -683,6 +848,9 @@ class Database:
             "consecutive_failures",
             "last_validated_at",
             "validation_status",
+            "cc_access_token",
+            "cc_refresh_token",
+            "cc_expires_at",
         }
     )
 

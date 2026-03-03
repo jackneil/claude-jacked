@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -29,6 +31,8 @@ WEB_DIR = Path(__file__).parent.parent / "data" / "web"
 TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes
 WS_KEEPALIVE_INTERVAL = 30  # seconds between WebSocket pings
 HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
+LOG_FILE_MAX_BYTES = 5_000_000  # 5 MB
+LOG_FILE_BACKUP_COUNT = 3
 
 
 def _build_allowed_origins(host: str, port: int) -> list[str]:
@@ -101,6 +105,25 @@ async def lifespan(app: FastAPI):
     server_log_buffer.set_registry(app.state.ws_registry)
     logging.getLogger().addHandler(_log_handler)
 
+    # Persistent file logging with rotation
+    _file_handler = None
+    log_path = Path.home() / ".claude" / "jacked-server.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _fh = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=LOG_FILE_MAX_BYTES, backupCount=LOG_FILE_BACKUP_COUNT,
+        )
+        _fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        _fmt.converter = time.gmtime
+        _fh.setFormatter(_fmt)
+        os.chmod(str(log_path), 0o600)
+        # Attach only after chmod succeeds — prevents handler leak if chmod fails
+        logging.getLogger().addHandler(_fh)
+        _file_handler = _fh
+    except Exception as e:
+        logger.warning("File logging unavailable: %s", e)
+        _file_handler = None
+
     # Lower jacked namespace to INFO so messages reach the capture handler.
     # basicConfig() in cli.py sets root to WARNING which would suppress them.
     _jacked_logger = logging.getLogger("jacked")
@@ -137,6 +160,10 @@ async def lifespan(app: FastAPI):
     # Detach server log capture
     logging.getLogger().removeHandler(_log_handler)
     server_log_buffer.detach()
+
+    if _file_handler:
+        logging.getLogger().removeHandler(_file_handler)
+        _file_handler.close()
 
     db = getattr(app.state, "db", None)
     if db is not None:

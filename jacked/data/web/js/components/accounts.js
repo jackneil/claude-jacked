@@ -13,17 +13,33 @@ const MODEL_DISPLAY_NAMES = {
 };
 
 /**
- * Determine visual status for an account.
+ * Determine visual status for an account (worst-of-two: primary + CC).
+ * Uses server-computed fields: acct.is_expired, acct.expires_in_seconds.
+ * Priority: disabled > expired/invalid > warning > cc-missing > checking > valid > unknown
  */
 function getAccountStatus(acct) {
     if (!acct.is_active) return 'disabled';
-    if (acct.validation_status === 'checking') return 'checking';
+    if (acct.is_expired) return 'expired';
     if (acct.validation_status === 'invalid') return 'invalid';
 
-    // Check expiry — computed, not stored
-    const now = Math.floor(Date.now() / 1000);
-    if (acct.expires_at && now >= acct.expires_at) return 'expired';
+    // Near-expiry warning (primary < 1h)
+    if (acct.expires_in_seconds != null && acct.expires_in_seconds < TOKEN_EXPIRY_WARN_SECS) {
+        return 'warning';
+    }
 
+    // CC worst-of-two (only if CC fields present — backward compat)
+    if (acct.has_cc_token !== undefined) {
+        if (!acct.has_cc_token) return 'cc-missing';
+        if (acct.cc_needs_auth) return 'warning';
+        // CC expiry check
+        if (acct.cc_expires_at) {
+            const ccRemaining = acct.cc_expires_at - Math.floor(Date.now() / 1000);
+            if (ccRemaining <= 0) return 'expired';
+            if (ccRemaining < TOKEN_EXPIRY_WARN_SECS) return 'warning';
+        }
+    }
+
+    if (acct.validation_status === 'checking') return 'checking';
     if (acct.validation_status === 'valid') return 'valid';
     return 'unknown';
 }
@@ -157,7 +173,7 @@ function renderActionButtons(acct) {
     let setActiveHtml = '';
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
-    } else if (status === 'valid' || status === 'unknown') {
+    } else if (status === 'valid' || status === 'warning' || status === 'cc-missing' || status === 'unknown') {
         setActiveHtml = `<button class="btn-set-active text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Set Active</button>`;
     }
 
@@ -168,12 +184,14 @@ function renderActionButtons(acct) {
         ${escapeHtml(copyCmd)}
     </button>`;
 
-    // Re-auth button (if invalid/expired)
+    // Re-auth button (if invalid/expired) — pills also handle this, keep for backward compat
     const showReauth = status === 'invalid' || status === 'expired';
     let reauthHtml = '';
     if (showReauth) {
-        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}">Re-auth</button>`;
+        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
     }
+
+    // CC auth now handled by pill click handler — no standalone button
 
     // Toggle active/disabled
     const toggleLabel = acct.is_active ? 'Disable' : 'Enable';
@@ -199,19 +217,24 @@ function renderActionButtons(acct) {
 function renderAccountCard(acct, idx, total) {
     const status = getAccountStatus(acct);
     const email = escapeHtml(acct.email || 'Unknown');
+    // Show display_name as custom label only when it differs from email
+    const hasCustomLabel = acct.display_name && acct.display_name !== acct.email;
+    const label = hasCustomLabel ? escapeHtml(acct.display_name) : '';
+    const orgLabel = acct.organization_name
+        ? escapeHtml(acct.organization_name)
+        : acct.organization_uuid
+            ? escapeHtml(acct.organization_uuid.slice(0, 8) + '…')
+            : '';
     const subDisplay = getSubDisplay(acct);
     const priorityBadge = getPriorityBadge(acct.priority || 0);
 
-    // Status badge for non-valid states
-    let statusBadge = '';
-    if (status === 'checking') {
-        statusBadge = '<span class="badge badge-info">Checking...</span>';
-    } else if (status === 'invalid') {
-        statusBadge = '<span class="badge badge-warning">Token Invalid</span>';
-    } else if (status === 'expired') {
-        statusBadge = '<span class="badge badge-warning">Expired</span>';
-    } else if (status === 'disabled') {
-        statusBadge = '<span class="badge badge-muted">Disabled</span>';
+    // Token pills replace status/CC badges
+    const pillsHtml = renderTokenPills(acct);
+
+    // Disabled badge (pills don't cover disabled state)
+    let disabledBadge = '';
+    if (status === 'disabled') {
+        disabledBadge = '<span class="badge badge-muted">Disabled</span>';
     }
 
     // Usage bars
@@ -256,14 +279,23 @@ function renderAccountCard(acct, idx, total) {
             <div class="flex items-start">
                 ${priorityButtons}
                 <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2 mb-1">
+                    <div class="flex items-center gap-2 mb-1 flex-wrap">
                         <span class="status-dot ${status}"></span>
-                        <span class="font-medium text-white truncate">${email}</span>
+                        ${label
+                            ? `<span class="font-medium text-white truncate max-w-[240px]" title="${label}">${label}</span>`
+                            : `<span class="font-medium text-white truncate">${email}</span>`
+                        }
+                        <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors" data-id="${acct.id}" data-label="${label}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
+                        </button>
+                        ${orgLabel ? `<span class="text-xs text-slate-400 truncate max-w-[150px] inline-block align-bottom" title="${escapeHtml(acct.organization_name || acct.organization_uuid || '')}">(${orgLabel})</span>` : ''}
                         ${priorityBadge}
-                        ${statusBadge}
+                        ${disabledBadge}
+                        ${pillsHtml}
                         ${extraUsageHtml}
                     </div>
                     <div class="flex items-center gap-3 mb-3 ml-5">
+                        ${label ? `<span class="text-xs text-slate-400">${email}${orgLabel ? ` (${orgLabel})` : ''}</span><span class="text-slate-600">|</span>` : ''}
                         <span class="text-xs text-slate-400">${escapeHtml(subDisplay)}</span>
                         <span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
@@ -371,7 +403,7 @@ function renderEmptyState() {
             <p class="text-sm text-slate-400 mb-6">Connect your Claude account to get started</p>
             <button id="btn-add-account" class="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
-                Connect Account
+                Add Account
             </button>
             <div id="oauth-flow-status" class="mt-4"></div>
         </div>

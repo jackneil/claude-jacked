@@ -4514,3 +4514,96 @@ class TestTrajectoryRecording:
         assert parsed[0]["result"] == "pass"
         assert parsed[1]["result"] == "ask"
         assert parsed[1]["detail"] == "rm,destructive"
+
+
+# ── _check_file_tool_permissions direct tests ─────────────────────────
+
+
+class TestCheckFileToolPermissions:
+    """Direct tests for _check_file_tool_permissions prefix/exact matching."""
+
+    def test_exact_match(self):
+        """Exact path pattern matches the exact file."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/file.py)"]):
+            matched, pat = gk._check_file_tool_permissions("Read", "/home/user/file.py")
+        assert matched is True
+        assert pat == "Read(/home/user/file.py)"
+
+    def test_exact_no_match(self):
+        """Exact path pattern does not match a different file."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/file.py)"]):
+            matched, _ = gk._check_file_tool_permissions("Read", "/home/user/other.py")
+        assert matched is False
+
+    def test_prefix_match_subdir(self):
+        """Prefix pattern matches files in subdirectories."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/project:*)"]):
+            matched, pat = gk._check_file_tool_permissions("Read", "/home/user/project/src/main.py")
+        assert matched is True
+        assert pat == "Read(/home/user/project:*)"
+
+    def test_prefix_match_direct_child(self):
+        """Prefix pattern matches direct children."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/project:*)"]):
+            matched, _ = gk._check_file_tool_permissions("Read", "/home/user/project/file.py")
+        assert matched is True
+
+    def test_prefix_no_sibling_escape(self):
+        """Prefix pattern must NOT match sibling directories with shared prefix."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/project:*)"]):
+            matched, _ = gk._check_file_tool_permissions("Read", "/home/user/project-secrets/key.pem")
+        assert matched is False
+
+    def test_prefix_no_sibling_escape_hyphen(self):
+        """Another sibling directory escape variant."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/Users/jack/myapp:*)"]):
+            matched, _ = gk._check_file_tool_permissions("Read", "/Users/jack/myapp2/secrets.json")
+        assert matched is False
+
+    def test_prefix_matches_exact_dir(self):
+        """Prefix pattern matches the directory path itself."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/project:*)"]):
+            matched, _ = gk._check_file_tool_permissions("Read", "/home/user/project")
+        assert matched is True
+
+    def test_no_patterns(self):
+        """No patterns loaded returns no match."""
+        with patch.object(gk, "_load_tool_permissions", return_value=[]):
+            matched, pat = gk._check_file_tool_permissions("Read", "/any/path")
+        assert matched is False
+        assert pat is None
+
+    def test_bare_tool_name_pattern(self):
+        """Bare tool name (e.g., 'Read') matches any file."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read"]):
+            matched, pat = gk._check_file_tool_permissions("Read", "/any/path/at/all")
+        assert matched is True
+        assert pat == "Read"
+
+    def test_wrong_tool(self):
+        """Patterns for a different tool don't match even if returned by loader."""
+        # Simulate Read patterns being returned for a Write query —
+        # inner parsing strips "Write(" prefix, leaving malformed inner string
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/file.py)"]):
+            matched, _ = gk._check_file_tool_permissions("Write", "/home/user/file.py")
+        assert matched is False
+
+    def test_empty_prefix_rejected(self):
+        """Empty prefix patterns like 'Read(:*)' are skipped (match nothing)."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(:*)"]):
+            matched, _ = gk._check_file_tool_permissions("Read", "/any/path")
+        assert matched is False
+
+    def test_path_traversal_blocked(self):
+        """Path traversal via .. is normalized before prefix matching."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/project:*)"]):
+            # ../secrets should normalize to /home/user/secrets, not match /home/user/project
+            matched, _ = gk._check_file_tool_permissions("Read", "/home/user/project/../secrets/key.pem")
+        assert matched is False
+
+    def test_path_traversal_within_project_allowed(self):
+        """Normalized traversal within the allowed prefix still matches."""
+        with patch.object(gk, "_load_tool_permissions", return_value=["Read(/home/user/project:*)"]):
+            # project/src/../lib normalizes to project/lib — still under project
+            matched, _ = gk._check_file_tool_permissions("Read", "/home/user/project/src/../lib/util.py")
+        assert matched is True

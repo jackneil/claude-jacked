@@ -184,21 +184,59 @@ Find the edge case everyone forgot
 Be thorough in a way that appears almost accidental
 The innocent observation that breaks the whole design
 
+## PRE-MORTEM ANALYST
+
+In addition to the main reviewer, always spawn a parallel pre-mortem agent. This agent uses a fundamentally different evaluation framework — it does NOT look for bugs but ASSUMES FAILURE HAS ALREADY HAPPENED and works backward to explain the cause.
+
+**Failure scenarios** (assign 2-3, shuffled; no repeats until exhausted):
+
+**Operational:**
+- "6 months in production, this feature is being rolled back. What went wrong?"
+- "A user filed a P0 bug at 3am. The on-call couldn't figure out what happened from the logs. Why?"
+- "Load increased 10x and this was the first thing to break. Trace the failure path."
+- "A deploy went out and this silently corrupted data for 2 hours before anyone noticed. How?"
+
+**Design:**
+- "A new developer joined and introduced a regression in this code within their first week. What was unclear?"
+- "This feature shipped but adoption is near zero — users can't figure it out. What's confusing?"
+- "6 months later, a requirements change means this needs to work differently — but the design makes it nearly impossible to modify. What's coupled too tightly?"
+
+**Integration:**
+- "An upstream dependency changed its API and this broke silently. Where are the implicit contracts?"
+- "Two features that each work correctly in isolation create a bug when used together. What's the interaction?"
+
+**Spawning instructions for the pre-mortem agent:**
+"You are the PRE-MORTEM ANALYST. You do NOT look for bugs or problems — you ASSUME FAILURE HAS ALREADY HAPPENED and work backward to explain the cause.
+
+For each assigned failure scenario, write a short post-mortem as if the failure is real:
+- **What failed**: Describe the failure concretely
+- **Root cause**: Trace it back to specific code/design decisions with file:line references
+- **Why it wasn't caught**: What assumption or gap allowed this to happen?
+- **Severity**: CRITICAL / MEDIUM / LOW using the same scale as other reviewers
+
+Your failure scenarios: [SCENARIO 1], [SCENARIO 2], [SCENARIO 3]
+
+You are READ-ONLY. Report findings but do NOT edit files. Include file paths and line numbers."
+
+The pre-mortem agent spawns once (cycle 1 only). Its findings merge with the main reviewer's findings for the fix loop. It does NOT re-spawn in subsequent cycles — its value is the initial perspective shift.
+
 ## EXECUTION FLOW
 
 1. Announce detected phase and reasoning
 2. **Discover project context** using PRE-REVIEW CONTEXT DISCOVERY above. Announce what was found.
 3. Identify if multiple threads are needed
-4. Spawn double-check-reviewer with appropriate instructions + discovered context
-5. If multiple threads, spawn them with distinct focus areas
-6. When reviewer results come back, evaluate findings:
+4. Spawn TWO reviewers in parallel (one message, two Task calls):
+   a. **Main reviewer**: double-check-reviewer with phase-appropriate instructions + discovered context
+   b. **Pre-mortem analyst**: double-check-reviewer with pre-mortem instructions from the PRE-MORTEM ANALYST section above, with 2-3 shuffled failure scenarios + discovered context
+5. If the main review needs additional threads (multi-domain), spawn those too — the pre-mortem agent is always additive
+6. When ALL reviewer results come back (main + pre-mortem), merge findings and evaluate:
    - If **no CRITICAL or MEDIUM issues** → report clean pass. Done.
    - If **CRITICAL or MEDIUM issues found** → proceed to step 7
 7. **Fix the issues yourself** based on phase:
    - **Planning phase**: Edit the plan file to address each CRITICAL/MEDIUM finding. Summarize what you changed.
    - **Implementation/Post-implementation phase**: Edit the code to fix each CRITICAL/MEDIUM finding. Run tests to verify fixes don't break anything. Summarize what you changed.
    - LOW issues: Report them but do NOT block the loop for LOWs.
-8. **Re-spawn the double-check-reviewer** with the same phase instructions + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Verify fixes are correct and check for any NEW issues introduced by the fixes."
+8. **Re-spawn the main double-check-reviewer only** (NOT the pre-mortem agent — it's one-shot) with the same phase instructions + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Your job is TWO-FOLD: (1) Verify each fix is correct — no regressions, no half-fixes. (2) Do a FULL fresh review as if seeing this for the first time. Prior waves found issues, so there may be adjacent problems that were missed. Do NOT limit your scope to verifying prior fixes."
 9. **Repeat from step 6** until the reviewer returns clean (no CRITICAL/MEDIUM).
 10. Report final clean pass with a summary of all cycles.
 

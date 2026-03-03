@@ -23,6 +23,7 @@ import httpx
 from jacked.web.database import Database
 from jacked.web.oauth import (
     CLIENT_ID,
+    DEFAULT_TOKEN_TTL_SECONDS,
     OAUTH_BETA_HEADER,
     ORG_TYPE_MAP,
     PROFILE_URL,
@@ -33,12 +34,16 @@ from jacked.web.oauth import (
 logger = logging.getLogger("jacked.auth")
 
 
+# Shared constant for refresh buffer (used by should_refresh and should_refresh_cc)
+REFRESH_BUFFER_SECONDS = 300
+
+
 def should_refresh(account: dict) -> bool:
     """Check if an account's token needs refreshing.
 
     Rules:
     - API key accounts (refresh_token is None) cannot be refreshed
-    - Refresh when now > expires_at - 300 (5-minute buffer)
+    - Refresh when now > expires_at - REFRESH_BUFFER_SECONDS (5-minute buffer)
 
     >>> should_refresh({"refresh_token": None, "expires_at": 9999999999})
     False
@@ -49,7 +54,124 @@ def should_refresh(account: dict) -> bool:
     """
     if not account.get("refresh_token"):
         return False
-    return time.time() > account["expires_at"] - 300
+    return account["expires_at"] < time.time() + REFRESH_BUFFER_SECONDS
+
+
+def should_refresh_cc(account: dict) -> bool:
+    """Check if CC (Claude Code) tokens need refresh.
+
+    Returns False if cc_refresh_token is NULL — can't refresh without one.
+
+    >>> should_refresh_cc({"cc_refresh_token": None, "cc_expires_at": 9999999999})
+    False
+    >>> should_refresh_cc({"cc_refresh_token": "rt", "cc_expires_at": 0})
+    True
+    >>> should_refresh_cc({"cc_refresh_token": "rt", "cc_expires_at": 9999999999})
+    False
+    >>> should_refresh_cc({"cc_refresh_token": "rt", "cc_expires_at": None})
+    True
+    """
+    if not account.get("cc_refresh_token"):
+        return False
+    cc_expires_at = account.get("cc_expires_at")
+    if not cc_expires_at:
+        return True
+    return cc_expires_at < time.time() + REFRESH_BUFFER_SECONDS
+
+
+async def refresh_cc_token(account_id: int, db: Database) -> bool:
+    """Refresh CC token pair independently. Updates cc_* columns only.
+
+    On invalid_grant: clear both cc_access_token and cc_refresh_token so
+    build_oauth_data() falls back to primary with refreshToken: None.
+    Does NOT mark account as invalid — primary token health determines
+    account validity.
+
+    Uses a per-account lock to prevent concurrent CC refresh collisions
+    between the background refresh loop and pre-launch refresh.
+    """
+    account = db.get_account(account_id)
+    if not account:
+        return False
+
+    if not should_refresh_cc(account):
+        return True
+
+    if not account.get("cc_refresh_token"):
+        return True
+
+    lock = _get_cc_refresh_lock(account_id)
+    if lock.locked():
+        return True  # Another refresh in progress — skip
+
+    async with lock:
+        # Re-read account under lock — another refresh may have completed
+        account = db.get_account(account_id)
+        if not account or not should_refresh_cc(account):
+            return True
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    TOKEN_URL,
+                    json={
+                        "grant_type": "refresh_token",
+                        "refresh_token": account["cc_refresh_token"],
+                        "client_id": CLIENT_ID,
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-beta": OAUTH_BETA_HEADER,
+                    },
+                )
+
+                if resp.status_code == 200:
+                    tokens = resp.json()
+                    new_refresh = tokens.get(
+                        "refresh_token", account["cc_refresh_token"]
+                    )
+                    new_expires_at = int(time.time()) + tokens.get(
+                        "expires_in", DEFAULT_TOKEN_TTL_SECONDS
+                    )
+
+                    db.update_account(
+                        account_id,
+                        cc_access_token=tokens["access_token"],
+                        cc_refresh_token=new_refresh,
+                        cc_expires_at=new_expires_at,
+                    )
+                    logger.info(f"CC token refreshed for account {account_id}")
+                    return True
+
+                if resp.status_code == 400:
+                    try:
+                        error_data = resp.json()
+                        if error_data.get("error") == "invalid_grant":
+                            # CC refresh token consumed (likely by Claude Code).
+                            # Clear both CC tokens so build_oauth_data() falls
+                            # back to primary with refreshToken: None.
+                            logger.warning(
+                                "Account %d: CC invalid_grant — clearing CC tokens",
+                                account_id,
+                            )
+                            db.update_account(
+                                account_id,
+                                cc_access_token=None,
+                                cc_refresh_token=None,
+                                cc_expires_at=None,
+                            )
+                            return False
+                    except Exception:
+                        pass
+
+                logger.warning(
+                    "Account %d: CC refresh HTTP %d", account_id, resp.status_code
+                )
+                return False
+
+        except Exception as e:
+            logger.warning(f"Account {account_id}: CC refresh error: {e}")
+            return False
 
 
 async def refresh_account_token(
@@ -96,7 +218,7 @@ async def refresh_account_token(
 
                 # Token rotation: save new refresh_token if provided
                 new_refresh = tokens.get("refresh_token", account["refresh_token"])
-                new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
+                new_expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
 
                 # Update DB with new tokens (retry with backoff)
                 db_updated = False
@@ -345,6 +467,10 @@ async def fetch_profile(
                     updates["has_extra_usage"] = org["has_extra_usage_enabled"]
                 if acct_info.get("display_name"):
                     updates["display_name"] = acct_info["display_name"]
+                # Keep org name fresh (names can change), but NEVER change
+                # organization_uuid via profile refresh — that's set at auth time
+                if org.get("name"):
+                    updates["organization_name"] = org["name"]
 
                 if updates:
                     db.update_account(account_id, **updates)
@@ -414,6 +540,8 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     updates["has_extra_usage"] = org["has_extra_usage_enabled"]
                 if acct_info.get("display_name"):
                     updates["display_name"] = acct_info["display_name"]
+                if org.get("name"):
+                    updates["organization_name"] = org["name"]
                 if updates:
                     db.update_account(account_id, **updates)
 
@@ -470,6 +598,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
 # Per-account refresh locks to prevent concurrent refresh collisions
 # between the background loop and manual API calls.
 _refresh_locks: dict[int, asyncio.Lock] = {}
+_cc_refresh_locks: dict[int, asyncio.Lock] = {}
 
 
 def _get_refresh_lock(account_id: int) -> asyncio.Lock:
@@ -486,6 +615,13 @@ def _get_refresh_lock(account_id: int) -> asyncio.Lock:
     return _refresh_locks[account_id]
 
 
+def _get_cc_refresh_lock(account_id: int) -> asyncio.Lock:
+    """Get or create a per-account CC refresh lock."""
+    if account_id not in _cc_refresh_locks:
+        _cc_refresh_locks[account_id] = asyncio.Lock()
+    return _cc_refresh_locks[account_id]
+
+
 async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     """Refresh all account tokens expiring within buffer_seconds.
 
@@ -497,43 +633,53 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
         buffer_seconds: Refresh tokens expiring within this many seconds (default 4 hours)
 
     Returns:
-        dict with counts: {"checked": N, "refreshed": N, "skipped": N, "failed": N}
+        dict with counts: {"checked": N, "refreshed": N, "skipped": N, "failed": N,
+                           "cc_refreshed": N, "cc_failed": N}
 
     >>> import asyncio
     >>> result = asyncio.get_event_loop().run_until_complete(refresh_all_expiring_tokens())
-    >>> sorted(result.keys()) == ['checked', 'failed', 'refreshed', 'skipped']
+    >>> all(k in result for k in ['checked', 'failed', 'refreshed', 'skipped', 'cc_refreshed', 'cc_failed'])
     True
     """
     db = Database()
     now = int(time.time())
-    result = {"checked": 0, "refreshed": 0, "skipped": 0, "failed": 0}
+    result = {
+        "checked": 0, "refreshed": 0, "skipped": 0, "failed": 0,
+        "cc_refreshed": 0, "cc_failed": 0,
+    }
 
     accounts = db.list_accounts(include_inactive=False)
     for account in accounts:
         result["checked"] += 1
+        account_id = account["id"]
 
-        # Skip API key accounts (no refresh_token)
-        if not account.get("refresh_token"):
-            result["skipped"] += 1
-            continue
+        # --- Primary token refresh ---
+        primary_needs_refresh = (
+            account.get("refresh_token")
+            and now >= (account.get("expires_at") or 0) - buffer_seconds
+        )
 
-        # Skip if not expiring within buffer
-        if now < (account.get("expires_at") or 0) - buffer_seconds:
-            result["skipped"] += 1
-            continue
-
-        # Non-blocking lock: skip if another refresh is in progress
-        lock = _get_refresh_lock(account["id"])
-        if lock.locked():
-            result["skipped"] += 1
-            continue
-
-        async with lock:
-            success = await refresh_account_token(account["id"], db)
-            if success:
-                result["refreshed"] += 1
+        if primary_needs_refresh:
+            lock = _get_refresh_lock(account_id)
+            if lock.locked():
+                result["skipped"] += 1
             else:
-                result["failed"] += 1
+                async with lock:
+                    success = await refresh_account_token(account_id, db)
+                    if success:
+                        result["refreshed"] += 1
+                    else:
+                        result["failed"] += 1
+        else:
+            result["skipped"] += 1
+
+        # --- CC token refresh (independent from primary) ---
+        if should_refresh_cc(account):
+            cc_success = await refresh_cc_token(account_id, db)
+            if cc_success:
+                result["cc_refreshed"] += 1
+            else:
+                result["cc_failed"] += 1
 
     return result
 
@@ -564,19 +710,28 @@ async def heal_invalid_accounts() -> dict:
         account_id = account["id"]
 
         # Try refresh first if token is near/past expiry and has RT
+        healed = False
         if account.get("refresh_token") and should_refresh(account):
             lock = _get_refresh_lock(account_id)
             if not lock.locked():
                 async with lock:
                     success = await refresh_account_token(account_id, db)
                     if success:
-                        result["healed"] += 1
-                        continue
+                        healed = True
 
-        # Otherwise validate via profile fetch
-        validation = await validate_account(account_id, db)
-        if validation.get("valid"):
+        if not healed:
+            # Validate via profile fetch
+            validation = await validate_account(account_id, db)
+            healed = validation.get("valid", False)
+
+        if healed:
             result["healed"] += 1
+            # Check if CC tokens need re-auth after primary heals
+            if not account.get("cc_refresh_token") and account.get("cc_access_token"):
+                logger.info(
+                    "Account %d healed but CC token needs re-authorization",
+                    account_id,
+                )
         else:
             result["confirmed_invalid"] += 1
 
