@@ -465,8 +465,8 @@ async def fetch_profile(
                     updates["rate_limit_tier"] = org["rate_limit_tier"]
                 if "has_extra_usage_enabled" in org:
                     updates["has_extra_usage"] = org["has_extra_usage_enabled"]
-                if acct_info.get("display_name"):
-                    updates["display_name"] = acct_info["display_name"]
+                # NOTE: display_name intentionally NOT updated here — user sets
+                # custom labels via PATCH; profile refresh must not overwrite them.
                 # Keep org name fresh (names can change), but NEVER change
                 # organization_uuid via profile refresh — that's set at auth time
                 if org.get("name"):
