@@ -198,7 +198,7 @@ function renderActionButtons(acct) {
     const toggleClass = acct.is_active ? 'text-yellow-400 hover:text-yellow-300' : 'text-green-400 hover:text-green-300';
 
     return `
-        <div class="flex items-center flex-wrap gap-2 mt-3 pt-3 border-t border-slate-700/50">
+        <div class="flex items-center flex-wrap gap-2 mt-2 pt-2 border-t border-slate-700/50">
             ${setActiveHtml}
             ${copyHtml}
             <div class="flex-1"></div>
@@ -274,28 +274,26 @@ function renderAccountCard(acct, idx, total) {
     const actionsHtml = renderActionButtons(acct);
 
     const disabledClass = status === 'disabled' ? ' opacity-60' : '';
+    const primaryName = label || email;
     return `
-        <div class="bg-slate-800 border border-slate-700 rounded-lg p-4 card-hover${disabledClass}" data-account-id="${acct.id}">
+        <div class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 card-hover${disabledClass}" data-account-id="${acct.id}">
             <div class="flex items-start">
                 ${priorityButtons}
                 <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2 mb-1 flex-wrap">
+                    <div class="flex items-center gap-2 flex-wrap">
                         <span class="status-dot ${status}"></span>
-                        ${label
-                            ? `<span class="font-medium text-white truncate max-w-[240px]" title="${label}">${label}</span>`
-                            : `<span class="font-medium text-white truncate">${email}</span>`
-                        }
+                        <span class="font-medium text-white truncate max-w-[300px]" title="${escapeHtml(primaryName)}">${escapeHtml(primaryName)}</span>
                         <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors" data-id="${acct.id}" data-label="${label}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
                         </button>
-                        ${orgLabel ? `<span class="text-xs text-slate-400 truncate max-w-[150px] inline-block align-bottom" title="${escapeHtml(acct.organization_name || acct.organization_uuid || '')}">(${orgLabel})</span>` : ''}
                         ${priorityBadge}
                         ${disabledBadge}
                         ${pillsHtml}
                         ${extraUsageHtml}
                     </div>
-                    <div class="flex items-center gap-3 mb-3 ml-5">
-                        ${label ? `<span class="text-xs text-slate-400">${email}${orgLabel ? ` (${orgLabel})` : ''}</span><span class="text-slate-600">|</span>` : ''}
+                    <div class="flex items-center gap-3 mb-2 ml-5">
+                        <span class="text-xs text-slate-400">${email}${orgLabel ? ` (${orgLabel})` : ''}</span>
+                        <span class="text-slate-600">|</span>
                         <span class="text-xs text-slate-400">${escapeHtml(subDisplay)}</span>
                         <span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
@@ -357,7 +355,7 @@ function renderAccounts(accounts) {
     const cardsHtml = sorted.map((acct, idx) => renderAccountCard(acct, idx, sorted.length)).join('');
 
     return `
-        <div class="max-w-3xl">
+        <div class="max-w-5xl">
             <div class="flex items-center justify-between mb-5">
                 <h2 class="text-xl font-semibold text-white">Accounts</h2>
                 <div class="flex items-center gap-2">
