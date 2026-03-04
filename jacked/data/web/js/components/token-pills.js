@@ -13,7 +13,7 @@ const CC_LABEL = 'CC Token';
  */
 function _renderSinglePill(cfg) {
     const { label, isPrimary, expiresInSecs, hasToken, needsAuth,
-            validationStatus, isExpired, accountId, email } = cfg;
+            validationStatus, isExpired, accountId, email, hasRefreshToken } = cfg;
 
     let dotClass, statusText, isActionable = false, cssModifier = '', action = '', ariaLabel = '';
 
@@ -48,8 +48,12 @@ function _renderSinglePill(cfg) {
         cssModifier = 'pill-error';
         action = 'reauth-primary';
         ariaLabel = `Re-auth ${label} for ${escapeHtml(email)}`;
+    } else if (hasRefreshToken) {
+        // Auto-refreshable token — just show green, no countdown noise
+        dotClass = 'filled green';
+        statusText = 'valid';
     } else {
-        // Valid — show time remaining
+        // Non-refreshable (e.g. API key) — show time remaining
         const timeStr = formatTimeRemaining(expiresInSecs);
         if (!timeStr) {
             return `<span class="token-pill"><span class="pill-dot filled green"></span><span class="pill-label">${label}</span></span>`;
@@ -84,6 +88,7 @@ function renderTokenPills(acct) {
         isExpired: acct.is_expired,
         accountId: acct.id,
         email: acct.email || '',
+        hasRefreshToken: !!acct.has_refresh_token,
     });
 
     if (acct.has_cc_token === undefined) {
@@ -107,6 +112,7 @@ function renderTokenPills(acct) {
         isExpired: ccIsExpired,
         accountId: acct.id,
         email: acct.email || '',
+        hasRefreshToken: !!acct.has_cc_refresh_token,
     });
 
     return `<span class="token-pills-container">${primaryPill}${ccPill}</span>`;

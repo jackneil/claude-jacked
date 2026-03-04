@@ -92,6 +92,9 @@ class AccountResponse(BaseModel):
     cc_expires_at: Optional[int] = None
     has_cc_token: bool = False
     cc_needs_auth: bool = False
+    # Refresh capability — UI hides countdown when token auto-refreshes
+    has_refresh_token: bool = False
+    has_cc_refresh_token: bool = False
     # Computed / enriched fields
     is_default: bool = False
     is_expired: bool = False
@@ -296,6 +299,8 @@ def _account_to_response(row: dict) -> AccountResponse:
             and row.get("cc_refresh_token") is None
             and now >= (row.get("cc_expires_at") or 0)
         ),
+        has_refresh_token=bool(row.get("refresh_token")),
+        has_cc_refresh_token=bool(row.get("cc_refresh_token")),
         # Computed fields per design doc
         is_default=row.get("priority", 0) == 0,
         is_expired=now >= row["expires_at"],
