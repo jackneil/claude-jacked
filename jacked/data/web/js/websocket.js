@@ -68,6 +68,10 @@ const jackedWS = {
             }
             // Start logs fallback polling while WS is down
             if (typeof startLogsFallbackPolling === 'function') startLogsFallbackPolling();
+            // Clean up stuck usage-checking cards (no completion message will arrive)
+            document.querySelectorAll('[data-account-id].usage-checking').forEach(
+                el => el.classList.remove('usage-checking')
+            );
             this._scheduleReconnect();
         };
 
@@ -154,9 +158,46 @@ function showPersistentCredentialToast(timestamp) {
 jackedWS.on('credentials_changed', async (msg) => {
     if (typeof loadActiveCredential === 'function') await loadActiveCredential();
     if (window.jackedState && window.jackedState.activeRoute === 'accounts') {
+        // Suppress re-renders during bulk usage refresh — the refresh handler
+        // calls refreshAndRender() itself when it finishes.
+        if (window.jackedState && window.jackedState._usageRefreshInProgress) {
+            showPersistentCredentialToast(msg.timestamp);
+            return;
+        }
         if (typeof refreshAndRender === 'function') await refreshAndRender();
     }
     showPersistentCredentialToast(msg.timestamp);
+});
+
+// ---------------------------------------------------------------------------
+// Usage refresh progress — per-account card animations during bulk refresh
+// ---------------------------------------------------------------------------
+jackedWS.on('usage_refresh_progress', (msg) => {
+    const d = msg.payload || msg;
+    // Validate payload fields before using them in selectors / class names
+    if (!Number.isInteger(d.account_id)) return;
+    const validStatuses = ['checking', 'done', 'failed'];
+    if (!validStatuses.includes(d.status)) return;
+
+    const card = document.querySelector('[data-account-id="' + d.account_id + '"]');
+    if (card) {
+        card.classList.remove('usage-checking', 'usage-done', 'usage-failed');
+        card.classList.add('usage-' + d.status);
+        // Remove done/failed highlight after 3s so it doesn't stick forever
+        if (d.status !== 'checking') {
+            setTimeout(() => card.classList.remove('usage-' + d.status), 3000);
+        }
+    }
+    // Update button progress text
+    const btn = document.getElementById('btn-refresh-all-usage');
+    if (btn && Number.isInteger(d.progress) && Number.isInteger(d.total) && d.total > 0) {
+        btn.textContent = '';
+        const spinner = typeof _createInlineSpinner === 'function'
+            ? _createInlineSpinner()
+            : document.createTextNode('');
+        btn.appendChild(spinner);
+        btn.appendChild(document.createTextNode(' Refreshing ' + d.progress + '/' + d.total + '...'));
+    }
 });
 
 jackedWS.on('logs_changed', (msg) => {

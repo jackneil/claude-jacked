@@ -36,6 +36,7 @@ logger = logging.getLogger("jacked.auth")
 
 # Shared constant for refresh buffer (used by should_refresh and should_refresh_cc)
 REFRESH_BUFFER_SECONDS = 300
+USAGE_CACHE_FRESHNESS_SECONDS = 30
 
 
 def should_refresh(account: dict) -> bool:
@@ -359,6 +360,19 @@ async def fetch_usage(
     if not account:
         return None
 
+    # Cache freshness guard — skip API call if data is < USAGE_CACHE_FRESHNESS_SECONDS old.
+    # Prevents multi-tab and double-click storms.
+    # usage_cached_at is stored as an integer (Unix epoch seconds) in the DB.
+    cached_at = account.get("usage_cached_at")
+    if cached_at and not access_token:
+        try:
+            age = int(time.time()) - int(cached_at)
+            if age < USAGE_CACHE_FRESHNESS_SECONDS:
+                logger.debug(f"Usage cache fresh for account {account_id} ({age}s old), skipping")
+                return {"_cached": True}
+        except (ValueError, TypeError):
+            pass  # Malformed timestamp — proceed with fetch
+
     token = access_token or account["access_token"]
 
     try:
@@ -403,8 +417,19 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                db.record_account_error(account_id, "Usage fetch rate limited (429)")
-                logger.warning(f"Usage fetch rate limited for account {account_id}")
+                retry_after = resp.headers.get("retry-after", "unknown")
+                # Do NOT increment consecutive_failures — 429 is a rate limit,
+                # not an account health issue.  Incrementing would sideline
+                # accounts from credential rotation after 3 dashboard refreshes.
+                db.record_account_error(
+                    account_id,
+                    f"Usage fetch rate limited (429) — retry after {retry_after}s",
+                    increment_failures=False,
+                )
+                logger.warning(
+                    f"Usage fetch rate limited for account {account_id}, "
+                    f"retry-after: {retry_after}"
+                )
                 return None
 
             db.record_account_error(
@@ -538,8 +563,8 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     updates["rate_limit_tier"] = org["rate_limit_tier"]
                 if "has_extra_usage_enabled" in org:
                     updates["has_extra_usage"] = org["has_extra_usage_enabled"]
-                if acct_info.get("display_name"):
-                    updates["display_name"] = acct_info["display_name"]
+                # NOTE: display_name intentionally NOT updated — user sets
+                # custom labels via PATCH; validation must not overwrite them.
                 if org.get("name"):
                     updates["organization_name"] = org["name"]
                 if updates:

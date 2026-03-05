@@ -30,6 +30,14 @@
     animation: pulse 1.5s ease-in-out infinite;
 }
 
+.status-dot.warning {
+    background-color: #eab308;
+}
+
+.status-dot.cc-missing {
+    background-color: #f97316;
+}
+
 .status-dot.unknown {
     background-color: #6b7280;
 }
@@ -486,5 +494,38 @@
 @keyframes cardHighlight {
     0% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.5); }
     100% { box-shadow: none; }
+}
+
+/* Usage refresh card animations */
+[data-account-id].usage-checking {
+    position: relative;
+    opacity: 0.85;
+}
+[data-account-id].usage-checking .btn-refresh-single {
+    pointer-events: none;
+    opacity: 0.3;
+}
+[data-account-id].usage-checking::after {
+    content: '';
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 18px;
+    height: 18px;
+    border: 2px solid #475569;
+    border-top-color: #3b82f6;
+    border-radius: 50%;
+    animation: spin 600ms linear infinite;
+}
+[data-account-id].usage-done {
+    border-color: rgb(34 197 94 / 0.6);
+    transition: border-color 0.5s;
+}
+[data-account-id].usage-failed {
+    border-color: rgb(239 68 68 / 0.6);
+    transition: border-color 0.5s;
+}
+@media (prefers-reduced-motion: reduce) {
+    [data-account-id].usage-checking::after { animation: none; }
 }
 

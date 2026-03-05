@@ -515,22 +515,77 @@ class OAuthFlow:
         has_extra_usage = org.get("has_extra_usage_enabled", False)
         display_name = acct_info.get("display_name")
 
-        # Create/update account (ON CONFLICT intentionally excludes cc_* columns)
         final_org_uuid = tokens.get("organization_uuid", "")
         final_org_name = tokens.get("organization_name")
-        account = self.db.create_account(
-            email=email,
-            access_token=tokens["access_token"],
-            refresh_token=tokens.get("refresh_token"),
-            expires_at=expires_at,
-            display_name=display_name,
-            scopes=scopes_json,
-            subscription_type=subscription_type,
-            rate_limit_tier=rate_limit_tier,
-            has_extra_usage=has_extra_usage,
-            organization_uuid=final_org_uuid,
-            organization_name=final_org_name,
-        )
+
+        if self._target_account_id:
+            # RE-AUTH: Update existing account by ID.
+            # Don't use create_account()'s email+org_uuid upsert — org_uuid
+            # can change between OAuth sessions, creating duplicates.
+            target = self.db.get_account(self._target_account_id)
+            if not target:
+                raise ValueError(
+                    f"Re-auth target account {self._target_account_id} not found"
+                )
+
+            # Identity check: ensure the user logged in with the same Google account
+            if email.lower() != target["email"].lower():
+                raise ValueError(
+                    f"Re-auth email ({email}) does not match "
+                    f"target account ({target['email']})"
+                )
+
+            # If org_uuid changed, remove any soft-deleted duplicate that would
+            # collide with UNIQUE(email, organization_uuid). This cleans up ghosts
+            # left by the old bug where re-auth created duplicate accounts.
+            old_org_uuid = target.get("organization_uuid", "")
+            if final_org_uuid != old_org_uuid:
+                self.db.hard_delete_duplicate(email, final_org_uuid)
+
+            self.db.update_account(
+                self._target_account_id,
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                expires_at=expires_at,
+                scopes=scopes_json,
+                organization_uuid=final_org_uuid,
+                organization_name=final_org_name,
+                subscription_type=subscription_type,
+                rate_limit_tier=rate_limit_tier,
+                has_extra_usage=has_extra_usage,
+                is_active=True,
+                consecutive_failures=0,
+                validation_status="valid",
+                last_validated_at=int(time.time()),
+                last_error=None,
+            )
+            account = self.db.get_account(self._target_account_id)
+        else:
+            # ADD: Normal create_account with email+org upsert
+            account = self.db.create_account(
+                email=email,
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                expires_at=expires_at,
+                display_name=display_name,
+                scopes=scopes_json,
+                subscription_type=subscription_type,
+                rate_limit_tier=rate_limit_tier,
+                has_extra_usage=has_extra_usage,
+                organization_uuid=final_org_uuid,
+                organization_name=final_org_name,
+            )
+
+            # Non-fatal: account already persisted by create_account above
+            updated = self.db.update_account(
+                account["id"],
+                validation_status="valid",
+                last_validated_at=int(time.time()),
+            )
+            if not updated:
+                logger.warning(
+                    f"Validation status update failed for account {account['id']}"
+                )
 
         # Update usage cache if we got usage data
         five_hour = usage.get("five_hour", {})
@@ -544,15 +599,6 @@ class OAuthFlow:
                 seven_day_resets_at=seven_day.get("resets_at"),
                 raw=usage,
             )
-
-        # Non-fatal: account already persisted by create_account above
-        updated = self.db.update_account(
-            account["id"],
-            validation_status="valid",
-            last_validated_at=int(time.time()),
-        )
-        if not updated:
-            logger.warning(f"Validation status update failed for account {account['id']}")
 
         logger.info(f"Account stored: {email} (id={account['id']})")
         return account

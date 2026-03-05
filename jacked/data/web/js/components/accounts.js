@@ -260,7 +260,7 @@ function renderAccountCard(acct, idx, total) {
 
     // Error display
     let errorHtml = '';
-    if (acct.last_error) {
+    if (acct.last_error && (acct.validation_status === 'invalid' || acct.consecutive_failures > 0)) {
         errorHtml = `<div class="text-xs text-red-400 mt-2">${escapeHtml(acct.last_error)}</div>`;
     }
 
@@ -297,6 +297,9 @@ function renderAccountCard(acct, idx, total) {
                         <span class="text-xs text-slate-400">${escapeHtml(subDisplay)}</span>
                         <span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
+                        <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        </button>
                     </div>
                     <div class="ml-5">
                         ${usage5h}
@@ -363,13 +366,12 @@ function renderAccounts(accounts) {
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                         Refresh All Usage
                     </button>
-                    <div class="flex items-center gap-1.5" title="Auto-refresh usage every 60s">
-                        <span class="text-xs text-slate-400">Auto</span>
-                        <label class="toggle-switch toggle-sm">
-                            <input type="checkbox" id="chk-auto-refresh">
-                            <span class="toggle-slider"></span>
-                        </label>
-                    </div>
+                    <select id="sel-auto-refresh" class="bg-slate-700 border border-slate-600 text-slate-300 text-sm rounded-lg px-3 py-2 cursor-pointer hover:border-slate-500 transition-colors" title="Auto-refresh interval" aria-label="Auto-refresh interval">
+                        <option value="0">Auto: Off</option>
+                        <option value="120">Auto: 2 min</option>
+                        <option value="300">Auto: 5 min</option>
+                        <option value="600">Auto: 10 min</option>
+                    </select>
                     <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                         Add Account

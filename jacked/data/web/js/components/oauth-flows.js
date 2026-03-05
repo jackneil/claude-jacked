@@ -138,6 +138,148 @@ async function startAddAccountFlow() {
 }
 
 // ---------------------------------------------------------------------------
+// OAuth re-auth flow (targets existing account by ID)
+// ---------------------------------------------------------------------------
+async function startReauthFlow(accountId, email) {
+    if (window.jackedState._accountActionInFlight) return;
+    window.jackedState._accountActionInFlight = true;
+
+    const statusEl = document.getElementById('oauth-flow-status');
+    if (!statusEl) {
+        window.jackedState._accountActionInFlight = false;
+        return;
+    }
+
+    // Build status banner safely
+    statusEl.textContent = '';
+    const banner = document.createElement('div');
+    banner.className = 'bg-blue-900/30 border border-blue-700 rounded-lg px-4 py-3 text-sm text-blue-200 flex items-center gap-3';
+    const spinner = document.createElement('div');
+    spinner.className = 'spinner';
+    banner.appendChild(spinner);
+    const textDiv = document.createElement('div');
+    const title = document.createElement('div');
+    title.className = 'font-medium';
+    title.textContent = 'Re-authenticating ' + email + '...';
+    textDiv.appendChild(title);
+    const subtitle = document.createElement('div');
+    subtitle.className = 'text-xs text-blue-300 mt-1';
+    subtitle.textContent = 'A browser window should open. Sign in with the same Google account.';
+    textDiv.appendChild(subtitle);
+    banner.appendChild(textDiv);
+    statusEl.appendChild(banner);
+
+    let flowId;
+    try {
+        const result = await api.post('/api/auth/accounts/' + accountId + '/reauth');
+        flowId = result.flow_id;
+    } catch (e) {
+        statusEl.textContent = '';
+        const errDiv = document.createElement('div');
+        errDiv.className = 'bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200';
+        errDiv.textContent = 'Failed to start re-auth flow: ' + e.message;
+        statusEl.appendChild(errDiv);
+        window.jackedState._accountActionInFlight = false;
+        return;
+    }
+
+    if (!flowId) {
+        statusEl.textContent = '';
+        const errDiv = document.createElement('div');
+        errDiv.className = 'bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200';
+        errDiv.textContent = 'No flow ID returned from server';
+        statusEl.appendChild(errDiv);
+        window.jackedState._accountActionInFlight = false;
+        return;
+    }
+
+    // Poll every 1s, timeout at 2 minutes (same as add-account)
+    let elapsed = 0;
+    let consecutiveErrors = 0;
+    const maxWait = 120;
+    const maxErrors = 5;
+    const pollInterval = setInterval(async () => {
+        elapsed++;
+        if (elapsed > maxWait) {
+            clearInterval(pollInterval);
+            window.jackedState.flowPolling = null;
+            statusEl.textContent = '';
+            const warnDiv = document.createElement('div');
+            warnDiv.className = 'bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-200';
+            warnDiv.textContent = 'Re-authentication timed out after 2 minutes. Please try again.';
+            statusEl.appendChild(warnDiv);
+            window.jackedState._accountActionInFlight = false;
+            return;
+        }
+
+        try {
+            const poll = await api.get('/api/auth/flow/' + flowId);
+            consecutiveErrors = 0;
+
+            if (poll.status === 'completed') {
+                clearInterval(pollInterval);
+                window.jackedState.flowPolling = null;
+                statusEl.textContent = '';
+                const okDiv = document.createElement('div');
+                okDiv.className = 'bg-green-900/30 border border-green-700 rounded-lg px-4 py-3 text-sm text-green-200';
+                okDiv.textContent = 'Account re-authenticated successfully!';
+                statusEl.appendChild(okDiv);
+                setTimeout(() => { statusEl.textContent = ''; }, 3000);
+                try {
+                    await refreshAndRender();
+                } finally {
+                    window.jackedState._accountActionInFlight = false;
+                }
+            } else if (poll.status === 'error') {
+                clearInterval(pollInterval);
+                window.jackedState.flowPolling = null;
+                statusEl.textContent = '';
+                const errDiv = document.createElement('div');
+                errDiv.className = 'bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200';
+                errDiv.textContent = 'Re-authentication failed: ' + (poll.error || 'Unknown error');
+                statusEl.appendChild(errDiv);
+                window.jackedState._accountActionInFlight = false;
+            } else if (poll.status === 'not_found') {
+                clearInterval(pollInterval);
+                window.jackedState.flowPolling = null;
+                statusEl.textContent = '';
+                const warnDiv = document.createElement('div');
+                warnDiv.className = 'bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-200';
+                warnDiv.textContent = 'Re-auth flow not found — it may have expired. Please try again.';
+                statusEl.appendChild(warnDiv);
+                window.jackedState._accountActionInFlight = false;
+            }
+            // status === 'pending' — keep polling
+        } catch (e) {
+            if (e.status === 404) {
+                clearInterval(pollInterval);
+                window.jackedState.flowPolling = null;
+                statusEl.textContent = '';
+                const warnDiv = document.createElement('div');
+                warnDiv.className = 'bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-200';
+                warnDiv.textContent = 'Re-auth flow expired. Please try again.';
+                statusEl.appendChild(warnDiv);
+                window.jackedState._accountActionInFlight = false;
+            } else {
+                consecutiveErrors++;
+                if (consecutiveErrors >= maxErrors) {
+                    clearInterval(pollInterval);
+                    window.jackedState.flowPolling = null;
+                    statusEl.textContent = '';
+                    const errDiv = document.createElement('div');
+                    errDiv.className = 'bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200';
+                    errDiv.textContent = 'Re-auth check failed repeatedly. Please try again.';
+                    statusEl.appendChild(errDiv);
+                    window.jackedState._accountActionInFlight = false;
+                }
+            }
+        }
+    }, 1000);
+
+    window.jackedState.flowPolling = pollInterval;
+}
+
+// ---------------------------------------------------------------------------
 // CC token authorization flow
 // ---------------------------------------------------------------------------
 async function startCcAuthFlow(accountId, email) {

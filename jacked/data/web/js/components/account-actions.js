@@ -5,9 +5,32 @@
 // Auto-refresh usage state
 // ---------------------------------------------------------------------------
 let _autoRefreshInterval = null;
-let _autoRefreshCountdown = 60;
-const AUTO_REFRESH_PERIOD = 60;
+let _autoRefreshCountdown = 0;
+const _singleRefreshInFlight = new Set(); // tracks accountIds with pending single-refresh
+// Shared via window.jackedState so websocket.js can check it without cross-file globals
+if (window.jackedState) window.jackedState._usageRefreshInProgress = false;
 const _refreshSvg = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>';
+
+// Migrate old auto-refresh localStorage key (checkbox '0'/'1') to new interval key
+if (localStorage.getItem('jacked_auto_refresh') === '1' && !localStorage.getItem('jacked_auto_refresh_interval')) {
+    localStorage.setItem('jacked_auto_refresh_interval', '120');
+}
+localStorage.removeItem('jacked_auto_refresh');
+
+// Get user's configured auto-refresh interval (seconds), 0 = off
+function _getAutoRefreshSeconds() {
+    return parseInt(localStorage.getItem('jacked_auto_refresh_interval') || '0', 10) || 0;
+}
+
+// Format countdown: "2:05" for >= 60s, "45s" for < 60s
+function _formatCountdown(seconds) {
+    if (seconds >= 60) {
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
+        return m + ':' + String(s).padStart(2, '0');
+    }
+    return seconds + 's';
+}
 
 // ---------------------------------------------------------------------------
 // SweetAlert confirmation helpers for auth flows
@@ -84,8 +107,7 @@ function initPillHandlers() {
                     showToast('Another action started — please try again', 'warning', 2000);
                     return;
                 }
-                // No account ID needed — server matches by Google login during OAuth
-                startAddAccountFlow();
+                startReauthFlow(id, email);
             } else if (action === 'auth-cc') {
                 const result = await _confirmCcAuth(email);
                 if (!result.isConfirmed) return;
@@ -245,35 +267,16 @@ function bindAccountEvents() {
     // Refresh All Usage button
     const refreshAllBtn = document.getElementById('btn-refresh-all-usage');
     if (refreshAllBtn) {
-        refreshAllBtn.addEventListener('click', async () => {
-            refreshAllBtn.disabled = true;
-            refreshAllBtn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Refreshing...';
-            try {
-                const result = await api.post('/api/auth/accounts/refresh-all-usage');
-                if (result.refreshed === 0 && result.failed === 0) {
-                    showToast('No active accounts to refresh', 'warning');
-                } else if (result.failed > 0) {
-                    const failedAccounts = (result.results || [])
-                        .filter(r => !r.success)
-                        .map(r => r.email)
-                        .join(', ');
-                    showToast(`Usage refreshed (${result.refreshed} ok, ${result.failed} failed: ${failedAccounts})`, 'warning');
-                } else {
-                    showToast(`Usage refreshed for ${result.refreshed} account${result.refreshed !== 1 ? 's' : ''}`, 'success');
-                }
-                if (_autoRefreshInterval) _autoRefreshCountdown = AUTO_REFRESH_PERIOD;
-                await refreshAndRender();
-            } catch (e) {
-                showToast(e.message, 'error');
-            }
-            refreshAllBtn.disabled = false;
-            if (_autoRefreshInterval) {
-                refreshAllBtn.innerHTML = `${_refreshSvg} Refresh now \u00b7 ${_autoRefreshCountdown}s`;
-            } else {
-                refreshAllBtn.innerHTML = `${_refreshSvg} Refresh All Usage`;
-            }
-        });
+        refreshAllBtn.addEventListener('click', () => _triggerUsageRefresh().catch(() => {}));
     }
+
+    // Per-card refresh usage buttons
+    document.querySelectorAll('.btn-refresh-single').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            _triggerSingleUsageRefresh(btn.dataset.id);
+        });
+    });
 
     // Priority up/down
     document.querySelectorAll('.btn-priority-up').forEach(btn => {
@@ -418,14 +421,129 @@ function hideDeleteConfirm(accountId) {
 // startAddAccountFlow() and startCcAuthFlow() moved to oauth-flows.js
 
 // ---------------------------------------------------------------------------
+// Usage refresh — shared by button click and auto-refresh
+// ---------------------------------------------------------------------------
+async function _triggerUsageRefresh() {
+    if (window.jackedState._usageRefreshInProgress) {
+        showToast('Usage refresh already in progress', 'warning', 2000);
+        return;
+    }
+    const btn = document.getElementById('btn-refresh-all-usage');
+    window.jackedState._usageRefreshInProgress = true;
+    if (btn) {
+        btn.disabled = true;
+        _setRefreshBtnText(btn, 'Refreshing...');
+    }
+    try {
+        const result = await api.post('/api/auth/accounts/refresh-all-usage');
+        if (result.refreshed === 0 && result.failed === 0) {
+            showToast('No active accounts to refresh', 'warning');
+        } else if (result.failed > 0) {
+            const failedAccounts = (result.results || [])
+                .filter(r => !r.success)
+                .map(r => r.email)
+                .join(', ');
+            showToast('Usage refreshed (' + result.refreshed + ' ok, ' + result.failed + ' failed: ' + failedAccounts + ')', 'warning');
+        } else {
+            showToast('Usage refreshed for ' + result.refreshed + ' account' + (result.refreshed !== 1 ? 's' : ''), 'success');
+        }
+        if (_autoRefreshInterval) _autoRefreshCountdown = _getAutoRefreshSeconds();
+        // Only re-render if still on accounts tab (user may have navigated away)
+        if (window.jackedState.activeRoute === 'accounts') {
+            await refreshAndRender();
+        }
+    } catch (e) {
+        showToast(e.message, 'error');
+        throw e; // re-throw so callers (e.g., _autoRefreshTick) can react
+    } finally {
+        window.jackedState._usageRefreshInProgress = false;
+        if (btn) {
+            btn.disabled = false;
+            _updateRefreshBtnLabel();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-account usage refresh
+// ---------------------------------------------------------------------------
+async function _triggerSingleUsageRefresh(accountId) {
+    if (window.jackedState._usageRefreshInProgress) {
+        showToast('Bulk refresh in progress — please wait', 'warning', 2000);
+        return;
+    }
+    if (_singleRefreshInFlight.has(accountId)) return;
+
+    const card = document.querySelector('[data-account-id="' + accountId + '"]');
+    if (!card) return;
+
+    _singleRefreshInFlight.add(accountId);
+    card.classList.remove('usage-done', 'usage-failed');
+    card.classList.add('usage-checking');
+
+    try {
+        await api.post('/api/auth/accounts/' + accountId + '/refresh-usage');
+        if (window.jackedState.activeRoute === 'accounts') {
+            await refreshAndRender();
+            // Apply success class to the newly-rendered card (old DOM node was replaced)
+            const fresh = document.querySelector('[data-account-id="' + accountId + '"]');
+            if (fresh) {
+                fresh.classList.add('usage-done');
+                setTimeout(() => fresh.classList.remove('usage-done'), 3000);
+            }
+        }
+    } catch (e) {
+        // Re-lookup card in case DOM was replaced by another concurrent render
+        const current = document.querySelector('[data-account-id="' + accountId + '"]');
+        if (current) {
+            current.classList.remove('usage-checking');
+            current.classList.add('usage-failed');
+            setTimeout(() => current.classList.remove('usage-failed'), 3000);
+        }
+        showToast('Refresh failed: ' + e.message, 'error');
+    } finally {
+        _singleRefreshInFlight.delete(accountId);
+    }
+}
+
+// Create a small inline spinner element (shared by refresh button + WS handler)
+function _createInlineSpinner() {
+    const spinner = document.createElement('div');
+    spinner.className = 'spinner';
+    spinner.style.cssText = 'width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle';
+    return spinner;
+}
+
+// Set button text safely (no innerHTML with untrusted data)
+function _setRefreshBtnText(btn, text) {
+    btn.textContent = '';
+    const spinner = _createInlineSpinner();
+    btn.appendChild(spinner);
+    btn.appendChild(document.createTextNode(' ' + text));
+}
+
+function _updateRefreshBtnLabel() {
+    const btn = document.getElementById('btn-refresh-all-usage');
+    if (!btn) return;
+    if (_autoRefreshInterval) {
+        btn.textContent = '';
+        btn.insertAdjacentHTML('afterbegin', _refreshSvg);
+        btn.appendChild(document.createTextNode(' Refresh now \u00b7 ' + _formatCountdown(_autoRefreshCountdown)));
+    } else {
+        btn.textContent = '';
+        btn.insertAdjacentHTML('afterbegin', _refreshSvg);
+        btn.appendChild(document.createTextNode(' Refresh All Usage'));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Auto-refresh usage
 // ---------------------------------------------------------------------------
 function _startAutoRefresh() {
     if (_autoRefreshInterval) clearInterval(_autoRefreshInterval);
-    _autoRefreshCountdown = AUTO_REFRESH_PERIOD;
+    _autoRefreshCountdown = _getAutoRefreshSeconds();
     _autoRefreshInterval = setInterval(_autoRefreshTick, 1000);
-    const btn = document.getElementById('btn-refresh-all-usage');
-    if (btn) btn.innerHTML = `${_refreshSvg} Refresh now \u00b7 ${_autoRefreshCountdown}s`;
+    _updateRefreshBtnLabel();
 }
 
 function _stopAutoRefresh() {
@@ -433,55 +551,51 @@ function _stopAutoRefresh() {
         clearInterval(_autoRefreshInterval);
         _autoRefreshInterval = null;
     }
-    const btn = document.getElementById('btn-refresh-all-usage');
-    if (btn) btn.innerHTML = `${_refreshSvg} Refresh All Usage`;
+    _updateRefreshBtnLabel();
 }
 
 async function _autoRefreshTick() {
     const btn = document.getElementById('btn-refresh-all-usage');
     if (!btn) return;
-    if (window.jackedState._accountActionInFlight) return;
+    if (window.jackedState._usageRefreshInProgress || window.jackedState._accountActionInFlight) return;
 
     _autoRefreshCountdown--;
     if (_autoRefreshCountdown > 0) {
-        btn.innerHTML = `${_refreshSvg} Refresh now \u00b7 ${_autoRefreshCountdown}s`;
+        _updateRefreshBtnLabel();
         return;
     }
 
-    window.jackedState._accountActionInFlight = true;
-    btn.disabled = true;
-    btn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Refreshing...';
     try {
-        await api.post('/api/auth/accounts/refresh-all-usage');
-        _autoRefreshCountdown = AUTO_REFRESH_PERIOD;
-        await refreshAndRender();
+        await _triggerUsageRefresh();
     } catch (e) {
-        showToast(`Auto-refresh failed: ${e.message}`, 'error');
-        localStorage.setItem('jacked_auto_refresh', '0');
-        const chk = document.getElementById('chk-auto-refresh');
-        if (chk) chk.checked = false;
+        showToast('Auto-refresh failed: ' + e.message, 'error');
+        localStorage.setItem('jacked_auto_refresh_interval', '0');
+        const sel = document.getElementById('sel-auto-refresh');
+        if (sel) sel.value = '0';
         _stopAutoRefresh();
-    } finally {
-        window.jackedState._accountActionInFlight = false;
-        if (btn) btn.disabled = false;
     }
 }
 
 function bindAutoRefreshToggle() {
-    const chk = document.getElementById('chk-auto-refresh');
-    if (!chk) return;
+    const sel = document.getElementById('sel-auto-refresh');
+    if (!sel) return;
 
-    const isOn = localStorage.getItem('jacked_auto_refresh') === '1';
-    chk.checked = isOn;
-    if (isOn && !_autoRefreshInterval) _startAutoRefresh();
+    const stored = String(_getAutoRefreshSeconds());
+    sel.value = stored;
+    // If stored value isn't a valid option, reset to off
+    if (sel.value !== stored) {
+        sel.value = '0';
+        localStorage.setItem('jacked_auto_refresh_interval', '0');
+    }
+    if (_getAutoRefreshSeconds() > 0 && !_autoRefreshInterval) _startAutoRefresh();
 
-    chk.addEventListener('change', () => {
-        if (chk.checked) {
-            localStorage.setItem('jacked_auto_refresh', '1');
-            _startAutoRefresh();
-        } else {
-            localStorage.setItem('jacked_auto_refresh', '0');
+    sel.addEventListener('change', () => {
+        const val = sel.value;
+        localStorage.setItem('jacked_auto_refresh_interval', val);
+        if (val === '0') {
             _stopAutoRefresh();
+        } else {
+            _startAutoRefresh();
         }
     });
 }

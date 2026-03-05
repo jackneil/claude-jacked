@@ -851,6 +851,7 @@ class Database:
             "cc_access_token",
             "cc_refresh_token",
             "cc_expires_at",
+            "organization_uuid",
         }
     )
 
@@ -895,6 +896,25 @@ class Database:
             cursor = conn.execute(
                 "UPDATE accounts SET is_deleted = 1, updated_at = ? WHERE id = ? AND is_deleted = 0",
                 (now, account_id),
+            )
+            return cursor.rowcount > 0
+
+    def hard_delete_duplicate(self, email: str, organization_uuid: str) -> bool:
+        """Hard-delete a soft-deleted account that would collide on UNIQUE(email, org_uuid).
+
+        Used during re-auth when org_uuid changes: a prior buggy re-auth may have
+        created a duplicate row that was later soft-deleted. The UNIQUE constraint
+        includes soft-deleted rows, so we must remove the ghost before updating.
+        Only deletes rows where is_deleted=1 — never touches active accounts.
+
+        >>> db = Database(":memory:")
+        >>> db.hard_delete_duplicate("x@test.com", "")
+        False
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "DELETE FROM accounts WHERE email = ? AND organization_uuid = ? AND is_deleted = 1",
+                (email, organization_uuid),
             )
             return cursor.rowcount > 0
 

@@ -5,6 +5,7 @@ usage cache refresh, account validation, credential switching, and
 session-account queries.
 """
 
+import asyncio
 import json
 import logging
 import shutil
@@ -28,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Server-side guard: only one bulk usage refresh at a time.
+_bulk_refresh_lock = asyncio.Lock()
 
 # --- Pydantic v2 request/response models ---
 
@@ -333,6 +336,39 @@ async def start_add_account(request: Request):
     return result
 
 
+@router.post("/accounts/{account_id}/reauth")
+async def start_reauth(account_id: int, request: Request):
+    """Start OAuth re-auth flow for an existing account.
+
+    Unlike /accounts/add, this targets a specific account by ID so the
+    OAuth callback updates the existing row instead of creating a duplicate
+    (which can happen when organization_uuid changes between OAuth sessions).
+    """
+    db = _get_db(request)
+    if db is None:
+        return _db_unavailable()
+
+    account = db.get_account(account_id)
+    if not account:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error": {"message": "Account not found", "code": "NOT_FOUND"}},
+        )
+
+    flow = OAuthFlow(db, purpose="primary", target_account_id=account_id)
+    result = await flow.start()
+
+    if "error" in result:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": {"message": result["error"], "code": "OAUTH_START_FAILED"}
+            },
+        )
+
+    return result
+
+
 @router.get("/flow/{flow_id}", response_model=FlowStatusResponse)
 async def get_flow_status(flow_id: str):
     """Poll OAuth flow status. Returns pending/completed/error/not_found."""
@@ -528,48 +564,102 @@ async def refresh_usage(account_id: int, request: Request):
 
 @router.post("/accounts/refresh-all-usage", response_model=BulkUsageRefreshResponse)
 async def refresh_all_usage(request: Request):
-    """Refresh usage cache for all active accounts."""
+    """Refresh usage cache for all active accounts.
+
+    Paces requests with a 2-second delay between accounts to avoid
+    Anthropic API rate limits (429).  Sends per-account progress via
+    WebSocket so the frontend can animate individual cards.
+    """
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
 
-    accounts = db.list_accounts(include_inactive=False)
-    refreshed = 0
-    failed = 0
-    results = []
+    # Only one bulk refresh at a time (across tabs / auto-refresh overlap)
+    if _bulk_refresh_lock.locked():
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Usage refresh already in progress"},
+        )
 
-    for acct in accounts:
-        usage_data = await fetch_usage(acct["id"], db)
-        if usage_data is not None:
-            refreshed += 1
-            five_hour = usage_data.get("five_hour", {})
-            seven_day = usage_data.get("seven_day", {})
-            results.append(
-                {
-                    "account_id": acct["id"],
-                    "email": acct["email"],
-                    "success": True,
-                    "cached_usage_5h": five_hour.get("utilization"),
-                    "cached_usage_7d": seven_day.get("utilization"),
-                }
-            )
-        else:
-            failed += 1
-            updated_acct = db.get_account(acct["id"])
-            results.append(
-                {
-                    "account_id": acct["id"],
-                    "email": acct["email"],
-                    "success": False,
-                    "error": updated_acct.get("last_error") if updated_acct else None,
-                }
-            )
+    async with _bulk_refresh_lock:
+        accounts = db.list_accounts(include_inactive=False)
+        refreshed = 0
+        failed = 0
+        results = []
+        ws_registry = getattr(request.app.state, "ws_registry", None)
+        total = len(accounts)
 
-    return BulkUsageRefreshResponse(
-        refreshed=refreshed,
-        failed=failed,
-        results=results,
-    )
+        for i, acct in enumerate(accounts):
+            if i > 0:
+                await asyncio.sleep(2.0)  # Rate-limit pacing
+
+            # Notify frontend: this account is being checked
+            if ws_registry:
+                await ws_registry.broadcast(
+                    "usage_refresh_progress",
+                    {"account_id": acct["id"], "status": "checking",
+                     "progress": i + 1, "total": total},
+                )
+
+            usage_data = await fetch_usage(acct["id"], db)
+
+            # Cache hits return {"_cached": True} — read stored values from DB
+            is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
+            if is_cached:
+                usage_data = None  # Treat as skip — use DB values below
+
+            if usage_data is not None:
+                refreshed += 1
+                five_hour = usage_data.get("five_hour", {})
+                seven_day = usage_data.get("seven_day", {})
+                results.append(
+                    {
+                        "account_id": acct["id"],
+                        "email": acct["email"],
+                        "success": True,
+                        "cached_usage_5h": five_hour.get("utilization"),
+                        "cached_usage_7d": seven_day.get("utilization"),
+                    }
+                )
+            elif is_cached:
+                # Cache hit — report existing DB values, count as success
+                refreshed += 1
+                results.append(
+                    {
+                        "account_id": acct["id"],
+                        "email": acct["email"],
+                        "success": True,
+                        "cached_usage_5h": acct.get("cached_usage_5h"),
+                        "cached_usage_7d": acct.get("cached_usage_7d"),
+                    }
+                )
+            else:
+                failed += 1
+                updated_acct = db.get_account(acct["id"])
+                results.append(
+                    {
+                        "account_id": acct["id"],
+                        "email": acct["email"],
+                        "success": False,
+                        "error": updated_acct.get("last_error") if updated_acct else None,
+                    }
+                )
+
+            # Notify frontend: done or failed
+            progress_status = "failed" if (not is_cached and usage_data is None) else "done"
+            if ws_registry:
+                await ws_registry.broadcast(
+                    "usage_refresh_progress",
+                    {"account_id": acct["id"],
+                     "status": progress_status,
+                     "progress": i + 1, "total": total},
+                )
+
+        return BulkUsageRefreshResponse(
+            refreshed=refreshed,
+            failed=failed,
+            results=results,
+        )
 
 
 @router.post("/accounts/{account_id}/validate", response_model=ValidateResponse)
