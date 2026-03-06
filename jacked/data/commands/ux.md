@@ -6,7 +6,7 @@ You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each
 
 > **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.
 
-## UX CHECK ASPECTS (5 total)
+## UX CHECK ASPECTS (6 total)
 
 | # | Aspect | What to Check |
 |---|--------|---------------|
@@ -15,6 +15,7 @@ You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each
 | 3 | **Interactions** | Buttons, forms, navigation, modals, dropdowns, toggles, hover states, loading states, error feedback |
 | 4 | **Console & Network** | JS errors, unhandled rejections, 404s, failed API calls, slow requests, deprecation warnings |
 | 5 | **Accessibility** | Semantic HTML, focus order, keyboard navigation, color contrast, ARIA labels, screen reader landmarks |
+| 6 | **Discoverability** | New features only: entry points from related pages, navigation depth to reach feature, first-use clarity, return navigation back to origin |
 
 ## Step 1: Detect Browser Tools
 
@@ -47,6 +48,34 @@ Run `git diff --name-only HEAD` to find UI-relevant files:
 Map changed files to affected pages/flows using file paths and conversation context.
 
 If no UI files changed, tell the user and ask if they still want to proceed.
+
+### Detect New Features (Discoverability trigger)
+
+Also run both commands — the first catches staged new files, the second catches untracked (created but not yet staged) new files:
+```bash
+git diff --name-status HEAD | grep "^A" | grep -iE '\.(js|jsx|ts|tsx|css|scss|html|vue|svelte)$'
+git ls-files --others --exclude-standard 2>/dev/null | grep -iE '\.(js|jsx|ts|tsx|css|scss|html|vue|svelte)$'
+```
+
+**Filter out utility/infrastructure files** before concluding a new feature exists. Files where the path contains `utils/`, `helpers/`, `hooks/`, `lib/`, `shared/`, `services/`, or where the filename matches `*.util.*`, `*.helper.*`, `*.service.*`, `*.store.*` are likely support code — not new navigable features. These do NOT trigger `new_feature_detected`.
+
+If any remaining UI files appear (pages, views, components in feature directories) → set `new_feature_detected = true`.
+
+When true, use the file paths and conversation context to:
+- Describe what the new feature IS (e.g., "new Account Details page at `/accounts/:id`")
+- Identify which **existing pages** a user would logically navigate FROM to reach it (e.g., Accounts list, Dashboard, any page that references accounts)
+- Store these as **entry point pages** — the Discoverability agent will check them
+
+**If entry points cannot be identified** from file paths or conversation context, default to checking the app's root/home page and any top-level navigation section most semantically related to the new feature (e.g., for an "Account Details" page, default entry points = Accounts list + Dashboard).
+
+**$ARGUMENTS override:** If `$ARGUMENTS` contains `discoverability` or `disc`, force `new_feature_detected = true` even if git detection found no new files. Useful when testing a feature added in a previous session.
+
+Announce:
+```
+**New feature detected:** [description]
+**Expected entry points:** [list of existing pages that should link to the new feature]
+**Discoverability check:** ENABLED
+```
 
 ## Step 3: Detect Cross-Page Impact
 
@@ -102,7 +131,7 @@ If cross-page impact detected:
 
 ## Step 4: Select UX Personas
 
-Select 2-3 personas that match the project's target users. These personas shape HOW agents evaluate their assigned aspects — they don't replace the 5 aspects, they add evaluative bias.
+Select 2-3 personas that match the project's target users. These personas shape HOW agents evaluate their assigned aspects — they don't replace the 6 aspects, they add evaluative bias.
 
 ### Persona Pool
 
@@ -218,22 +247,34 @@ Select which aspects are relevant based on what changed:
 - CSS/styling changes → weight **Visual & Layout** + **Responsive**
 - JS logic/component changes → weight **Interactions** + **Console & Network**
 - HTML structure changes → weight **Accessibility** + **Visual & Layout**
+- New UI files added (`new_feature_detected = true`) → include **Discoverability** — assign the entry point pages list to the agent handling this aspect
 - When in doubt, include the aspect.
 
 Build a matrix of (aspect, page) and assign to 2-4 agents:
 
-**1 page:**
+**1 page (modified only):**
 - Agent A: Visual & Layout + Responsive
 - Agent B: Interactions + Console & Network
 - Agent C: Accessibility
 
-**2 pages:**
+**1 page (new feature — new_feature_detected = true):**
+- Agent A: Visual & Layout + Responsive
+- Agent B: Interactions + Console & Network
+- Agent C: Accessibility + Discoverability
+
+**2 pages (modified only):**
 - Agent A: Page 1 — Visual & Layout + Responsive
 - Agent B: Page 1 — Interactions + Console & Network + Accessibility
 - Agent C: Page 2 — Visual & Layout + Responsive
 - Agent D: Page 2 — Interactions + Console & Network + Accessibility
 
-**3+ pages:** Group intelligently, cap at 4 agents. Prioritize pages most affected by changes.
+**2 pages (new feature — new_feature_detected = true):**
+- Agent A: Page 1 — Visual & Layout + Responsive
+- Agent B: Page 1 — Interactions + Console & Network
+- Agent C: Page 2 — Visual & Layout + Accessibility
+- Agent D: Page 2 — Interactions + Discoverability (receives the entry point pages list)
+
+**3+ pages:** Group intelligently, cap at 4 agents. Prioritize pages most affected by changes. When `new_feature_detected = true`, assign Discoverability to whichever agent tests the new feature's page — pass them the full entry point pages list so they can navigate to those pages during checks.
 
 Use your judgment — adjust grouping based on what changed. Skip aspects that clearly don't apply (e.g., skip Responsive for a purely server-rendered admin page that's never used on mobile).
 
@@ -382,6 +423,39 @@ For every check, ask: would this pass for EACH persona? A button that works for 
 - [ ] Check color contrast (text should be legible)
 - [ ] Verify focus indicators are visible on all interactive elements
 
+### Discoverability (include ONLY if new_feature_detected = true)
+
+**New feature:** [description — e.g., "Account Details page at /accounts/:id"]
+**Expected entry points:** [list from Step 2 analysis — existing pages where users would look for this]
+
+#### Entry Point Checks
+For each expected entry point page:
+- [ ] Navigate to the entry point page. If the page returns a 404, requires auth you don't have, or fails to load — flag as **[MEDIUM] Entry point unreachable during test** and skip to the next entry point. Do not abort the entire Discoverability check.
+- [ ] Look for a link, button, menu item, card, or nav entry pointing to the new feature
+- [ ] If present: is it visible without scrolling? Is the label clear and self-explanatory?
+- [ ] If absent: flag severity based on the entry point's importance:
+  - **[HIGH]** if this is the primary or only natural navigation path to the feature
+  - **[MEDIUM]** if other entry points exist and this is a secondary path
+  - No flag if the missing link is genuinely optional (e.g., a "related" shortcut)
+
+#### Navigation Flow In
+- [ ] Follow the most natural path from the primary entry point to the new feature
+- [ ] Count the steps/clicks required — 1-2 clicks = good, 3+ for a primary feature = **[MEDIUM]**
+- [ ] Is each step's next action obvious? (clear labels, visible affordances, no dead ends)
+- [ ] Are there breadcrumbs or "you are here" indicators along the path?
+
+#### First-Use Experience
+- [ ] Does the new feature page make its purpose immediately clear without reading docs?
+- [ ] Empty state (no data yet): is there a helpful message with a clear call to action?
+- [ ] Are controls, buttons, and form fields labeled clearly for a first-time user?
+- [ ] Is there any tooltip, hint text, or contextual help to guide initial use?
+
+#### Return Navigation
+- [ ] Is there a visible Back button, breadcrumb, or close affordance?
+- [ ] Does the browser Back button work correctly (no broken history stack)?
+- [ ] After completing the primary action, where does the user land? Is it the right place?
+- [ ] Are there cross-links to related features that naturally follow from using this one?
+
 ## REPORT FORMAT
 
 Structure your findings like this:
@@ -405,7 +479,7 @@ Wait for all agents to complete. Aggregate findings into a single report:
 ```
 ## UX Check Report
 
-**Pages tested:** [N] | **Aspects covered:** [N] of 5 | **Agents used:** [N]
+**Pages tested:** [N] | **Aspects covered:** [N] of 6 | **Agents used:** [N]
 **Browser:** Playwright MCP / Claude-in-Chrome
 **Personas applied:** [list of selected personas]
 **Mobile deep dive:** Yes / No
@@ -418,6 +492,7 @@ Wait for all agents to complete. Aggregate findings into a single report:
   ✓ Interactions — PASS (Agent B)
   ✓ Console & Network — PASS (Agent B)
   ✓ Accessibility — PASS (Agent C)
+  ✓ Discoverability — PASS / N/A (Agent C)
 
 ### Issues ([N] total)
 
