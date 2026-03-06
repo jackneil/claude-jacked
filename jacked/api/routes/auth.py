@@ -409,15 +409,10 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    updates: dict = {}
-    if "display_name" in body.model_fields_set:
-        # Explicit null or empty string clears the label; strip whitespace
-        raw = body.display_name.strip() if body.display_name else None
-        updates["display_name"] = raw if raw else None
-    if body.is_active is not None:
-        updates["is_active"] = body.is_active
+    has_label = "display_name" in body.model_fields_set
+    has_active = body.is_active is not None
 
-    if not updates:
+    if not has_label and not has_active:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
@@ -425,8 +420,16 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
             },
         )
 
-    if not db.update_account(account_id, **updates):
-        return _not_found(f"Account {account_id} was deleted during update")
+    # Label changes go through dedicated set_account_label() — the ONLY
+    # code path that can modify display_name (whitelist excludes it).
+    if has_label:
+        raw = body.display_name.strip() if body.display_name else None
+        label = raw if raw else None
+        db.set_account_label(account_id, label)
+
+    if has_active:
+        if not db.update_account(account_id, is_active=body.is_active):
+            return _not_found(f"Account {account_id} was deleted during update")
 
     updated = db.get_account(account_id)
     if not updated:
@@ -589,6 +592,13 @@ async def refresh_all_usage(request: Request):
         ws_registry = getattr(request.app.state, "ws_registry", None)
         total = len(accounts)
 
+        # Notify frontend: full queue so cards can show "Waiting..." immediately
+        if ws_registry:
+            await ws_registry.broadcast(
+                "usage_refresh_started",
+                {"account_ids": [a["id"] for a in accounts], "total": total},
+            )
+
         for i, acct in enumerate(accounts):
             if i > 0:
                 await asyncio.sleep(2.0)  # Rate-limit pacing
@@ -645,14 +655,20 @@ async def refresh_all_usage(request: Request):
                     }
                 )
 
-            # Notify frontend: done or failed
+            # Notify frontend: done or failed (include account data for immediate UI update)
             progress_status = "failed" if (not is_cached and usage_data is None) else "done"
             if ws_registry:
+                updated_row = db.get_account(acct["id"])
+                acct_payload = (
+                    _account_to_response(updated_row).model_dump()
+                    if updated_row else None
+                )
                 await ws_registry.broadcast(
                     "usage_refresh_progress",
                     {"account_id": acct["id"],
                      "status": progress_status,
-                     "progress": i + 1, "total": total},
+                     "progress": i + 1, "total": total,
+                     "account_data": acct_payload},
                 )
 
         return BulkUsageRefreshResponse(
@@ -891,3 +907,14 @@ async def get_active_sessions(request: Request, staleness: int = 60):
         )
 
     return {"sessions": grouped}
+
+
+@router.get("/display-name-audit")
+async def get_display_name_audit(request: Request, limit: int = 50):
+    """Return recent display_name change audit log entries."""
+    db = _get_db(request)
+    if db is None:
+        return _db_unavailable()
+
+    entries = db.get_label_audit_log(limit=min(max(limit, 1), 200))
+    return {"entries": entries}

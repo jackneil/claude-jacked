@@ -579,6 +579,7 @@ COMMAND_CATEGORIES = {
             re.compile(r"\bpnpx\s"),
         ],
         "default_mode": "ask",
+        "perm_override": True,  # User may explicitly allow specific npx tools via allowlist
         "llm_context": (
             "Running well-known tools (prettier, eslint, tsc, create-react-app, vite) is OK. "
             "If you don't recognize the package, treat as NOT safe — npx downloads and "
@@ -593,6 +594,7 @@ COMMAND_CATEGORIES = {
             re.compile(r"\bgit\s+push\b"),
         ],
         "default_mode": "ask",
+        "perm_override": False,  # Never bypass via allowlist — force/amend must always prompt
         "llm_context": (
             "Current branch: {branch}. Commits and pushes to feature branches are OK. "
             "Pushes to main/master/develop, pushes with no explicit remote/branch "
@@ -2314,21 +2316,37 @@ def main():
 
     # "ask" categories short-circuit (same as deny — always ask user)
     if cat_mode == "ask":
-        steps.record("category", "ask", ",".join(cat_keys))
-        elapsed = time.time() - start
-        log(f"CATEGORY ASK ({','.join(cat_keys)}) ({elapsed:.3f}s)")
-        log(f"DECISION: ASK USER ({elapsed:.3f}s)")
-        _record_decision(
-            "ASK_USER",
-            command,
-            "CATEGORY",
-            f"ask:{','.join(cat_keys)}",
-            elapsed * 1000,
-            sid,
-            repo_path,
-            trajectory=steps.to_json(),
+        # Respect explicit user allow-rules for categories that permit override (perm_override=True).
+        # git_write is excluded — force/amend pushes must not be auto-approved even if the user
+        # has a broad Bash(git push:*) rule. check_permissions() runs again at Tier 2 for the
+        # final ALLOW decision; path safety (Tier 1) still runs in between.
+        all_overridable = all(
+            COMMAND_CATEGORIES.get(k, {}).get("perm_override", False)
+            for k in cat_keys
         )
-        sys.exit(0)
+        perm_match, perm_pattern = (
+            check_permissions(command, cwd) if all_overridable else (False, None)
+        )
+        if perm_match:
+            log(f"CATEGORY ASK ({','.join(cat_keys)}) overridden by permission rule: {perm_pattern}")
+            steps.record("category", "pass", f"ask_overridden:{perm_pattern}")
+            # Fall through — Tier 1 (path safety) may still ASK_USER; Tier 2 re-checks perms → ALLOW
+        else:
+            steps.record("category", "ask", ",".join(cat_keys))
+            elapsed = time.time() - start
+            log(f"CATEGORY ASK ({','.join(cat_keys)}) ({elapsed:.3f}s)")
+            log(f"DECISION: ASK USER ({elapsed:.3f}s)")
+            _record_decision(
+                "ASK_USER",
+                command,
+                "CATEGORY",
+                f"ask:{','.join(cat_keys)}",
+                elapsed * 1000,
+                sid,
+                repo_path,
+                trajectory=steps.to_json(),
+            )
+            sys.exit(0)
 
     # "allow" categories — add patterns to runtime safe set for Tier 3
     # (does NOT short-circuit; pipe safety and compound splitting still apply)

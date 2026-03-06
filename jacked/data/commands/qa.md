@@ -2,25 +2,28 @@
 description: "Browser-based QA testing of UI changes from the current session. Pass a URL as argument, or let it auto-detect."
 ---
 
+> **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.
+
 You are a QA engineer testing UI changes from the current coding session. Follow these steps systematically.
 
 ## Step 1: Detect Browser Tools
 
-Check which browser automation tools are available, in this order:
+Check which browser automation tools are available. Prefer MCP tools first — they require no bash permissions and work without gatekeeper prompts.
 
-**Option A — agent-browser CLI (preferred)**: Run `npx agent-browser --version` via Bash. If it succeeds, use agent-browser for all browser interaction via Bash tool calls (e.g., `npx agent-browser open <url>`, `npx agent-browser snapshot`, `npx agent-browser screenshot <path>`, `npx agent-browser click <ref>`, `npx agent-browser type <ref> <text>`, `npx agent-browser eval <js>`). This reuses your existing browser session — no new windows.
-
-**Option B — Claude-in-Chrome (fallback)**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, use Claude-in-Chrome tools for all browser interaction.
-
-**Option C — Playwright MCP (fallback)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, use Playwright tools. Note to user:
+**Option A — Playwright MCP (preferred)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, use Playwright tools for all browser interaction. Note to user:
 > Using Playwright MCP, which opens separate browser windows. Install agent-browser (`npm i -g agent-browser`) or Claude-in-Chrome for in-browser operation.
+
+**Option B — Claude-in-Chrome**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, use Claude-in-Chrome tools for all browser interaction.
+
+**Option C — agent-browser CLI**: Run `npx agent-browser --version` via Bash. If it succeeds, use agent-browser for all browser interaction via Bash tool calls (e.g., `npx agent-browser open <url>`, `npx agent-browser snapshot`, `npx agent-browser screenshot <path>`, `npx agent-browser click <ref>`, `npx agent-browser type <ref> <text>`, `npx agent-browser eval <js>`). This reuses your existing browser session — no new windows.
+> Note: `npx` requires a gatekeeper approval prompt unless pre-approved. Add `Bash(npx agent-browser:*)` via the jacked "Always Allow" button to avoid repeated prompts.
 
 **If none are available**: Tell the user:
 ```
 No browser tools detected. Install one:
-- agent-browser (recommended): npm i -g agent-browser
+- Playwright MCP: Add to .mcp.json with --headless flag (no gatekeeper prompts)
 - Claude-in-Chrome: Install the Chrome extension from https://chromewebstore.google.com
-- Playwright MCP: Add to .mcp.json with --headless flag
+- agent-browser: npm i -g agent-browser (requires npx pre-approval)
 ```
 Then stop.
 
@@ -60,7 +63,42 @@ If no shared files changed, skip the spot-check entirely.
 
 If a server is found, use it. If multiple are found, ask the user which one. If none found, ask the user for the URL.
 
-## Step 5: Run QA Pass
+## Step 5: Check for Login Credentials
+
+If the app requires authentication to access the areas being tested, search for credentials in `.env` files before asking the user.
+
+**Find the repo root** (`git rev-parse` is auto-approved by the gatekeeper):
+```bash
+git rev-parse --show-toplevel 2>/dev/null || pwd
+```
+
+**Scan env files** in priority order — run each grep separately (all are auto-approved, stop at first file with results):
+```bash
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env.local
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env.development
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env.test
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env
+```
+Run from the repo root. **Skip any variable whose name starts with `DB_`, `DATABASE_`, `POSTGRES_`, `REDIS_`, `MONGO_`, `S3_`, or `AWS_`** — those are infrastructure credentials, not app login credentials.
+
+**Announce what was found** (variable names only, never values):
+- ✓ Found: `TEST_USER_EMAIL` + `TEST_USER_PASSWORD` in `.env.local` — "Using these for login."
+- ✗ Not found: "No login credentials found in env files." → Ask the user for credentials.
+
+**If login with found credentials fails:** Warn the user ("Credentials from `.env.local` were rejected") and ask for correct credentials. Do not retry silently.
+
+**Security note:** If credentials were found in `.env.local`, `.env.development`, or `.env.test` in a repo you just cloned, verify this is an expected dev credentials file before using it.
+
+## Step 6: Run QA Pass
+
+**Screenshot setup** (agent-browser and Playwright only — Chrome does not support file-based screenshots):
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+rm -rf "$REPO_ROOT/tmp/qa_screenshots"
+mkdir -p "$REPO_ROOT/tmp/qa_screenshots"
+```
+Save all screenshots to `$REPO_ROOT/tmp/qa_screenshots/<descriptive-name>.png`.
+*Add `tmp/` to your project's `.gitignore` if it isn't already there.*
 
 Navigate to the app URL. For each UI area affected by the changes:
 
@@ -91,7 +129,7 @@ Navigate to the app URL. For each UI area affected by the changes:
 - Resize the browser to mobile width (375px) and check layout
 - Resize to tablet width (768px) and check layout
 
-## Step 6: Report Findings
+## Step 7: Report Findings
 
 Present a structured report:
 
@@ -117,3 +155,10 @@ Present a structured report:
 ```
 
 If everything passes, say so clearly. If issues are found, prioritize them by severity.
+
+## Step 8: Cleanup
+
+Remove the screenshot directory after presenting the report:
+```bash
+rm -rf "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/tmp/qa_screenshots"
+```

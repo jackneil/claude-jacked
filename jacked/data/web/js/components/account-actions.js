@@ -434,6 +434,21 @@ async function _triggerUsageRefresh() {
         btn.disabled = true;
         _setRefreshBtnText(btn, 'Refreshing...');
     }
+
+    // Immediately mark all active accounts as queued (frontend-side, before server responds)
+    // Provides instant visual feedback even if WebSocket usage_refresh_started is slightly delayed
+    if (typeof _usageInjectOverlay === 'function') {
+        const activeAccounts = (window.jackedState.accounts || []).filter(a => !a.is_deleted && a.is_active);
+        for (const acct of activeAccounts) {
+            const card = document.querySelector('[data-account-id="' + acct.id + '"]');
+            if (card) {
+                card.classList.remove('usage-checking', 'usage-done', 'usage-failed');
+                card.classList.add('usage-queued');
+                _usageInjectOverlay(card, 'queued', 'Waiting\u2026');
+            }
+        }
+    }
+
     try {
         const result = await api.post('/api/auth/accounts/refresh-all-usage');
         if (result.refreshed === 0 && result.failed === 0) {
@@ -448,11 +463,21 @@ async function _triggerUsageRefresh() {
             showToast('Usage refreshed for ' + result.refreshed + ' account' + (result.refreshed !== 1 ? 's' : ''), 'success');
         }
         if (_autoRefreshInterval) _autoRefreshCountdown = _getAutoRefreshSeconds();
+        // Clean up any remaining overlays (e.g., if WS events were missed)
+        document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
+        document.querySelectorAll('[data-account-id].usage-queued, [data-account-id].usage-checking').forEach(
+            el => el.classList.remove('usage-queued', 'usage-checking')
+        );
         // Only re-render if still on accounts tab (user may have navigated away)
         if (window.jackedState.activeRoute === 'accounts') {
             await refreshAndRender();
         }
     } catch (e) {
+        // Clean up overlays on error too
+        document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
+        document.querySelectorAll('[data-account-id].usage-queued, [data-account-id].usage-checking').forEach(
+            el => el.classList.remove('usage-queued', 'usage-checking')
+        );
         showToast(e.message, 'error');
         throw e; // re-throw so callers (e.g., _autoRefreshTick) can react
     } finally {
@@ -480,25 +505,43 @@ async function _triggerSingleUsageRefresh(accountId) {
     _singleRefreshInFlight.add(accountId);
     card.classList.remove('usage-done', 'usage-failed');
     card.classList.add('usage-checking');
+    if (typeof _usageInjectOverlay === 'function') {
+        _usageInjectOverlay(card, 'checking', 'Checking usage\u2026');
+    }
 
     try {
         await api.post('/api/auth/accounts/' + accountId + '/refresh-usage');
         if (window.jackedState.activeRoute === 'accounts') {
             await refreshAndRender();
-            // Apply success class to the newly-rendered card (old DOM node was replaced)
+            // Apply success overlay to the newly-rendered card (old DOM node was replaced)
             const fresh = document.querySelector('[data-account-id="' + accountId + '"]');
             if (fresh) {
                 fresh.classList.add('usage-done');
-                setTimeout(() => fresh.classList.remove('usage-done'), 3000);
+                if (typeof _usageInjectOverlay === 'function') {
+                    _usageInjectOverlay(fresh, 'done', 'Updated!');
+                    setTimeout(() => {
+                        if (typeof _usageRemoveOverlay === 'function') _usageRemoveOverlay(fresh);
+                        fresh.classList.remove('usage-done');
+                    }, _OVERLAY_DONE_MS);
+                } else {
+                    setTimeout(() => fresh.classList.remove('usage-done'), _OVERLAY_DONE_MS);
+                }
             }
         }
     } catch (e) {
-        // Re-lookup card in case DOM was replaced by another concurrent render
         const current = document.querySelector('[data-account-id="' + accountId + '"]');
         if (current) {
             current.classList.remove('usage-checking');
             current.classList.add('usage-failed');
-            setTimeout(() => current.classList.remove('usage-failed'), 3000);
+            if (typeof _usageInjectOverlay === 'function') {
+                _usageInjectOverlay(current, 'failed', 'Failed');
+                setTimeout(() => {
+                    if (typeof _usageRemoveOverlay === 'function') _usageRemoveOverlay(current);
+                    current.classList.remove('usage-failed');
+                }, _OVERLAY_FAILED_MS);
+            } else {
+                setTimeout(() => current.classList.remove('usage-failed'), _OVERLAY_FAILED_MS);
+            }
         }
         showToast('Refresh failed: ' + e.message, 'error');
     } finally {

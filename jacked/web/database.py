@@ -10,6 +10,7 @@ WAL mode for concurrent reads, single writer lock for atomic writes.
 """
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, computed_field
+
+logger = logging.getLogger(__name__)
 
 # Sessions without a heartbeat within this window are considered stale
 SESSION_STALENESS_MINUTES = 60
@@ -638,6 +641,33 @@ class Database:
                 )
             except sqlite3.OperationalError:
                 pass
+            # Audit trail: catch ALL display_name changes regardless of code path.
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS display_name_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    changed_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TRIGGER IF NOT EXISTS trg_display_name_audit
+                AFTER UPDATE OF display_name ON accounts
+                WHEN OLD.display_name IS NOT NEW.display_name
+                BEGIN
+                    INSERT INTO display_name_audit (account_id, old_value, new_value)
+                    VALUES (OLD.id, OLD.display_name, NEW.display_name);
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_display_name_audit_insert
+                AFTER INSERT ON accounts
+                WHEN NEW.display_name IS NOT NULL
+                BEGIN
+                    INSERT INTO display_name_audit (account_id, old_value, new_value)
+                    VALUES (NEW.id, NULL, NEW.display_name);
+                END;
+            """)
+            logger.info(
+                "display_name protected: only set_account_label() can modify labels"
+            )
 
     def close(self) -> None:
         if hasattr(self._local, "connection") and self._local.connection:
@@ -826,7 +856,6 @@ class Database:
     _ACCOUNT_UPDATE_COLS = frozenset(
         {
             "organization_name",
-            "display_name",
             "access_token",
             "refresh_token",
             "expires_at",
@@ -858,9 +887,11 @@ class Database:
     def update_account(self, account_id: int, **kwargs: Any) -> bool:
         """Update an account by ID.
 
+        display_name is NOT in the whitelist — use set_account_label() instead.
+
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@test.com", "tok", 9999999999)
-        >>> db.update_account(acct["id"], display_name="Test User")
+        >>> db.update_account(acct["id"], is_active=False)
         True
         """
         if not kwargs:
@@ -880,6 +911,56 @@ class Database:
                 values,
             )
             return cursor.rowcount > 0
+
+    def set_account_label(self, account_id: int, label: Optional[str]) -> bool:
+        """Set display_name for an account — the ONLY way to change labels.
+
+        Logs old→new for audit trail. The SQLite trigger on display_name
+        also writes to display_name_audit for belt-and-suspenders tracking.
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("u@test.com", "tok", 9999999999)
+        >>> db.set_account_label(acct["id"], "Work")
+        True
+        >>> db.get_account(acct["id"])["display_name"]
+        'Work'
+        """
+        with self._writer() as conn:
+            old_row = conn.execute(
+                "SELECT display_name FROM accounts WHERE id = ? AND is_deleted = 0",
+                (account_id,),
+            ).fetchone()
+            if old_row is None:
+                return False
+            old = old_row[0]
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE accounts SET display_name = ?, updated_at = ? "
+                "WHERE id = ? AND is_deleted = 0",
+                (label, now, account_id),
+            )
+            logger.info(
+                "Label changed for account %d: %r -> %r", account_id, old, label,
+            )
+            return True
+
+    def get_label_audit_log(self, limit: int = 50) -> list[dict]:
+        """Return recent display_name audit entries.
+
+        >>> db = Database(":memory:")
+        >>> isinstance(db.get_label_audit_log(), list)
+        True
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT a.id, a.account_id, a.old_value, a.new_value, "
+                "a.changed_at, acct.email "
+                "FROM display_name_audit a "
+                "LEFT JOIN accounts acct ON acct.id = a.account_id "
+                "ORDER BY a.id DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def delete_account(self, account_id: int) -> bool:
         """Soft-delete an account.

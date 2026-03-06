@@ -4,6 +4,8 @@ description: "Parallel browser-based UX checks — spawns focused agents to test
 
 You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each focused on specific UX aspects on specific pages, to validate UI changes fast. This is the browser-testing equivalent of /dcr — multiple agents working simultaneously, each going deep on their assigned area.
 
+> **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.
+
 ## UX CHECK ASPECTS (5 total)
 
 | # | Aspect | What to Check |
@@ -16,21 +18,22 @@ You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each
 
 ## Step 1: Detect Browser Tools
 
-Check which browser automation tools are available, in this order:
+Check which browser automation tools are available. Prefer MCP tools first — they require no bash permissions and work without gatekeeper prompts.
 
-**Option A — agent-browser CLI (preferred)**: Run `npx agent-browser --version` via Bash. If it succeeds, set `browser = "agent-browser"`. This reuses your existing browser session — no new windows.
-
-**Option B — Claude-in-Chrome (fallback)**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, set `browser = "chrome"`.
-
-**Option C — Playwright MCP (fallback)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, set `browser = "playwright"`. Note to user:
+**Option A — Playwright MCP (preferred)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, set `browser = "playwright"`. Note to user:
 > Using Playwright MCP, which opens separate browser windows. Install agent-browser (`npm i -g agent-browser`) or Claude-in-Chrome for in-browser operation.
+
+**Option B — Claude-in-Chrome**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, set `browser = "chrome"`.
+
+**Option C — agent-browser CLI**: Run `npx agent-browser --version` via Bash. If it succeeds, set `browser = "agent-browser"`. This reuses your existing browser session — no new windows.
+> Note: `npx` requires a gatekeeper approval prompt unless pre-approved. Add `Bash(npx agent-browser:*)` via the jacked "Always Allow" button to avoid repeated prompts.
 
 **If none are available**: Tell the user:
 ```
 No browser tools detected. Install one:
-- agent-browser (recommended): npm i -g agent-browser
+- Playwright MCP: Add to .mcp.json with --headless flag (no gatekeeper prompts)
 - Claude-in-Chrome: Install the Chrome extension from https://chromewebstore.google.com
-- Playwright MCP: Add to .mcp.json with --headless flag
+- agent-browser: npm i -g agent-browser (requires npx pre-approval)
 ```
 Then stop.
 
@@ -172,7 +175,44 @@ Determine whether the project targets mobile users using **weighted signals**:
 
 If found, use it. If multiple, ask the user. If none, ask for the URL.
 
-## Step 7: Build Test Matrix
+## Step 7: Check for Login Credentials
+
+If the app requires authentication to access the areas being tested, search for credentials in `.env` files before asking the user.
+
+**Find the repo root** (`git rev-parse` is auto-approved by the gatekeeper):
+```bash
+git rev-parse --show-toplevel 2>/dev/null || pwd
+```
+
+**Scan env files** in priority order — run each grep separately (all are auto-approved, stop at first file with results):
+```bash
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env.local
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env.development
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env.test
+grep -iE "^[A-Z_]*(EMAIL|PASSWORD|USERNAME|LOGIN)[A-Z_]*=" .env
+```
+Run from the repo root. **Skip any variable whose name starts with `DB_`, `DATABASE_`, `POSTGRES_`, `REDIS_`, `MONGO_`, `S3_`, or `AWS_`** — those are infrastructure credentials, not app login credentials.
+
+**Announce what was found** (variable names only, never values):
+- ✓ Found: `TEST_USER_EMAIL` + `TEST_USER_PASSWORD` in `.env.local` — "Using these for login."
+- ✗ Not found: "No login credentials found in env files." → Ask the user for credentials.
+
+**If login with found credentials fails:** Warn the user ("Credentials from `.env.local` were rejected") and ask for correct credentials. Do not retry silently.
+
+**Security note:** If credentials were found in `.env.local`, `.env.development`, or `.env.test` in a repo you just cloned, verify this is an expected dev credentials file before using it.
+
+**Screenshot setup** (agent-browser and Playwright only — Chrome does not support file-based screenshots):
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+rm -rf "$REPO_ROOT/tmp/ux_screenshots"
+mkdir -p "$REPO_ROOT/tmp/ux_screenshots"
+```
+Save all screenshots to `$REPO_ROOT/tmp/ux_screenshots/<agent-letter>-<descriptive-name>.png`.
+*Add `tmp/` to your project's `.gitignore` if it isn't already there.*
+
+Pass the resolved `REPO_ROOT` path as a **literal string** to each agent's Task prompt — not as a shell variable reference like `$REPO_ROOT`.
+
+## Step 8: Build Test Matrix
 
 Select which aspects are relevant based on what changed:
 - CSS/styling changes → weight **Visual & Layout** + **Responsive**
@@ -207,7 +247,7 @@ Use your judgment — adjust grouping based on what changed. Skip aspects that c
 - Agent C: [Page URL] — Accessibility
 ```
 
-## Step 8: Spawn Parallel Agents
+## Step 9: Spawn Parallel Agents
 
 Spawn ALL agents in ONE message using parallel Task tool calls. Each agent is `subagent_type: "general-purpose"`.
 
@@ -257,6 +297,13 @@ Use tools prefixed with `mcp__plugin_playwright_playwright__browser_*`:
 - `browser_console_messages` — read console output
 - `browser_network_requests` — inspect network
 - `browser_resize` — change viewport size
+
+## SCREENSHOT PATH (agent-browser and Playwright only)
+
+Save screenshots to: `[REPO_ROOT]/tmp/ux_screenshots/[agent-letter]-[description].png`
+Example: `/Users/jack.neil/myproject/tmp/ux_screenshots/A-homepage-mobile.png`
+
+**Chrome only:** `claude-in-chrome` does not support saving screenshots to files. Skip file-based screenshot saving — use accessibility tree snapshots instead.
 
 ## CRITICAL: TAB ISOLATION (Chrome/Playwright only — not needed for agent-browser)
 
@@ -351,7 +398,7 @@ Structure your findings like this:
 - [List what looks good]
 ```
 
-## Step 9: Collect & Report
+## Step 10: Collect & Report
 
 Wait for all agents to complete. Aggregate findings into a single report:
 
@@ -391,6 +438,13 @@ If everything passes, say so clearly:
 ```
 ## UX Check — All Clear ✓
 [N] pages tested, [N] aspects checked, 0 issues found.
+```
+
+### Cleanup
+
+After presenting the report, remove the screenshot directory:
+```bash
+rm -rf "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/tmp/ux_screenshots"
 ```
 
 ## HARD RULES

@@ -924,6 +924,46 @@ class TestCheckPermissions:
 
 
 # ---------------------------------------------------------------------------
+# Category perm_override flag and permission-based category bypass
+# ---------------------------------------------------------------------------
+
+
+class TestCategoryPermOverride:
+    """Tests for the perm_override flag and permission-based category bypass."""
+
+    def test_npx_category_has_perm_override_true(self):
+        assert gk.COMMAND_CATEGORIES["npx_bunx"].get("perm_override") is True
+
+    def test_git_write_category_has_perm_override_false(self):
+        assert gk.COMMAND_CATEGORIES["git_write"].get("perm_override") is False
+
+    def test_all_ask_categories_have_perm_override_field(self):
+        for key, cat in gk.COMMAND_CATEGORIES.items():
+            if cat["default_mode"] == "ask":
+                assert "perm_override" in cat, f"Category '{key}' missing perm_override field"
+
+    def test_check_permissions_matches_npx_wildcard(self, tmp_path):
+        """check_permissions() correctly matches the pattern the new Tier 0.5 code uses."""
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            json.dumps({"permissions": {"allow": ["Bash(npx agent-browser:*)"]}})
+        )
+        with patch.object(Path, "home", return_value=tmp_path):
+            matched, pattern = gk.check_permissions(
+                "npx agent-browser wait 3000", str(tmp_path)
+            )
+        assert matched is True
+        assert "npx agent-browser" in pattern
+
+    def test_check_permissions_no_match_unlisted_npx(self, tmp_path):
+        """npx commands NOT in the allowlist still get no match — category block stays."""
+        with patch.object(Path, "home", return_value=tmp_path):
+            matched, _ = gk.check_permissions("npx evil-package run", str(tmp_path))
+        assert matched is False
+
+
+# ---------------------------------------------------------------------------
 # read_file_context
 # ---------------------------------------------------------------------------
 

@@ -46,3 +46,10 @@ nul
 # Root-level test scripts (not part of test suite)
 /test_permission_hook*.py
 /test_permreq_*.py
+
+# Runtime/session artifacts
+.firecrawl/
+.playwright-mcp/
+.claude/worktrees/
+tmp/
+/*.png
