@@ -156,9 +156,47 @@ Present a structured report:
 
 If everything passes, say so clearly. If issues are found, prioritize them by severity.
 
-## Step 8: Cleanup
+## Step 8: Investigate & Plan Fixes
 
-Remove the screenshot directory after presenting the report:
+If the report found 0 issues, announce:
+**"All clear — 0 issues found. Skipping fix plan and /dcr verification."**
+Go to Step 11 (Cleanup).
+
+Otherwise, announce: **"[N] issues found. Writing implementation plan for fixes..."**
+
+Use the `superpowers:writing-plans` skill to create a proper fix plan. Feed it the full issue list from the QA report as requirements. The writing-plans skill will:
+- Investigate root causes by reading source files
+- Produce bite-sized tasks with exact file paths, line numbers, and complete code changes
+- Include verification steps and test commands for each fix
+- Order by severity: CRITICAL > HIGH > MEDIUM > LOW
+
+The plan should be scoped to fixing the QA-reported issues — not a general feature plan.
+
+## Step 9: Execute Fix Plan
+
+After the plan is written, execute it using the `superpowers:executing-plans` skill (or `superpowers:subagent-driven-development` for parallel execution). This ensures each fix is:
+1. Verified against the current file state before applying
+2. Tested after applying
+3. Tracked to completion
+
+**On failure**: If a fix introduces a test failure or error, STOP immediately. Do not attempt remaining fixes. Announce the failure with error details. The user decides how to proceed. Do NOT continue to /dcr with broken state.
+
+After all items succeed, announce:
+**"Fix plan complete — all [N] items resolved. Running /dcr for verification."**
+
+## Step 10: Run /dcr
+
+Invoke the /dcr skill for parallel recursive review of all changes. /dcr handles its own wave loop — it will review, fix, and re-verify until all selected lenses pass clean.
+
+/dcr does NOT re-trigger /qa or /ux — it reviews code, not browser behavior.
+
+After /dcr reports clean, proceed to Cleanup.
+
+> **Note:** The investigate → plan → execute → /dcr pattern mirrors the same flow in `/ux`. Keep both in sync when updating.
+
+## Step 11: Cleanup
+
+Remove the screenshot directory after the full workflow completes:
 ```bash
 rm -rf "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/tmp/qa_screenshots"
 ```

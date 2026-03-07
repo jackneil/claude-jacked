@@ -1,11 +1,15 @@
 ---
 name: qa
-description: Browser-based QA testing of UI changes from the current session. Pass a URL as argument, or let it auto-detect.
+description: Browser-based QA testing of UI changes — detects issues, fixes them, and verifies with /dcr until clean.
 ---
 
 Two commands are available — read the appropriate one and follow it:
 
-- `~/.claude/commands/qa.md` — Focused QA checklist for specific changes (visual, interactive, console, edge cases). Use when testing a targeted fix or feature.
-- `~/.claude/commands/ux.md` — Parallel UX checks spawning focused agents per aspect. Use when testing broader UX impact across a page or flow.
+- `~/.claude/commands/qa.md` — Quick, focused QA pass (single agent). Visual, interactive, console, and edge case checks on specific changes. Best for targeted fixes or single-feature verification.
+- `~/.claude/commands/ux.md` — Thorough parallel UX review (multiple agents). Tests 6 UX aspects across multiple pages simultaneously. Best when changes touch layout, navigation, or multiple components.
 
-Default to `/qa` for single-feature verification. Use `/ux` when changes touch layout, navigation, or multiple components.
+Both follow the same end-to-end pattern: detect issues → compile fix plan → execute fixes → /dcr verification until clean pass.
+
+Decision guide:
+- Changed button styling or a single component? → `/qa`
+- Changed layout, interactions, AND multiple pages? → `/ux`

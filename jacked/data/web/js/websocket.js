@@ -381,6 +381,8 @@ jackedWS.on('server_logs_changed', (msg) => {
 jackedWS.on('sessions_changed', async () => {
     if (typeof loadActiveSessions === 'function') await loadActiveSessions();
     if (typeof loadAccounts === 'function') await loadAccounts();
+    // Suppress re-render during bulk usage refresh — refresh handler calls refreshAndRender() itself
+    if (window.jackedState && window.jackedState._usageRefreshInProgress) return;
     if (typeof rerenderAccountsView === 'function') rerenderAccountsView();
 });
 
@@ -412,6 +414,8 @@ document.addEventListener('visibilitychange', () => {
         if (now - _lastVisibilityRefresh < 5000) return;
         _lastVisibilityRefresh = now;
 
+        // Skip full re-render if bulk usage refresh is in progress — it will call refreshAndRender() itself
+        if (window.jackedState && window.jackedState._usageRefreshInProgress) return;
         if (typeof loadAllData === 'function') {
             loadAllData().then(() => {
                 if (typeof renderRoute === 'function' && typeof getRoute === 'function') {

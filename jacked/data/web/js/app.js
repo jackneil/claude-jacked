@@ -309,6 +309,7 @@ function startPolling() {
     stopPolling();
     window.jackedState.polling = setInterval(async () => {
         if (window.jackedState._accountActionInFlight) return;
+        if (window.jackedState._usageRefreshInProgress) return;
         await loadAccounts();
         await loadActiveSessions();
         rerenderAccountsView();

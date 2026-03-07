@@ -71,6 +71,8 @@ function getPriorityBadge(priority) {
 
 /**
  * Render cache age display.
+ * NOTE: data-cache-age is a DOM contract — queried by _usageUpdateCardDOM (websocket.js)
+ * for surgical updates during usage refresh. Do not rename without updating consumers.
  */
 function renderCacheAge(usageCachedAt) {
     if (usageCachedAt === null || usageCachedAt === undefined) {

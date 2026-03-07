@@ -542,6 +542,17 @@
     transition: opacity 300ms ease;
 }
 
+/* Pulse the cache-age span while queued or checking — signals stale data without changing text */
+[data-account-id].usage-queued [data-cache-age],
+[data-account-id].usage-checking [data-cache-age] {
+    animation: cacheAgePulse 1.5s ease-in-out infinite;
+}
+
+@keyframes cacheAgePulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 0.65; }
+}
+
 .usage-status-overlay.status-queued .status-icon {
     animation: queuePulse 2s ease-in-out infinite;
 }
@@ -553,9 +564,9 @@
 
 /* --- Checking --- */
 .usage-status-overlay.status-checking {
-    background: rgba(59, 130, 246, 0.12);
+    background: rgba(59, 130, 246, 0.18);
     color: #93c5fd;
-    border-bottom: 1px solid rgba(59, 130, 246, 0.2);
+    border-bottom: 1px solid rgba(59, 130, 246, 0.25);
 }
 
 [data-account-id].usage-checking {
@@ -625,6 +636,8 @@
     .usage-status-overlay.status-queued .status-icon,
     .usage-status-overlay.status-done .status-icon { animation: none; }
     [data-account-id].usage-checking { animation: none; }
+    [data-account-id].usage-queued [data-cache-age],
+    [data-account-id].usage-checking [data-cache-age] { animation: none; opacity: 0.4; }
     .usage-status-overlay { animation: none; }
     /* Instant removal — the JS fallback setTimeout handles actual .remove() */
     .usage-status-overlay.removing { animation: none; opacity: 0; }
