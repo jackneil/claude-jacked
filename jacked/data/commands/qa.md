@@ -6,6 +6,19 @@ description: "Browser-based QA testing of UI changes from the current session. P
 
 You are a QA engineer testing UI changes from the current coding session. Follow these steps systematically.
 
+## Config Override
+
+If this command was invoked via a local config wrapper (you see a `## Repo Config` section earlier in the prompt), use that config to skip detection:
+- **Browser Tool** specified? → Skip Step 1, use the declared tool directly (fall back to detection if it's unavailable)
+- **Stack** declared? → Skip tech stack inference in Step 2
+- **Dev Server Port** specified? → Use it in Step 4 URL detection (still check `lsof` as fallback)
+- **Credential Hints** listed? → Use those variable names in Step 5 credential search
+- **Framework-Specific Checks** listed? → Add them to Step 6 QA pass (in addition to standard checks)
+
+If the config overlay date is more than 90 days old, mention: "Your `/qa` config is over 90 days old — consider running `/jacked-setup qa` to refresh it."
+
+If no `## Repo Config` section is present, run all detection steps normally.
+
 ## Step 1: Detect Browser Tools
 
 Check which browser automation tools are available. Prefer MCP tools first — they require no bash permissions and work without gatekeeper prompts.
@@ -164,3 +177,5 @@ rm -rf "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/tmp/qa_screenshots"
 ```
 
 This command is **read-only** — it detects and reports issues but does NOT fix them. The detailed issue list is returned to the parent caller (Claude Code), which should then use `superpowers:writing-plans` to build a fix plan from the findings, let the user iterate on it, and execute with `/dcr` verification.
+
+> **Tip:** Run `/jacked-setup qa` to generate a repo-specific config that skips browser detection, bakes in your tech stack, and adds framework-specific QA checks.

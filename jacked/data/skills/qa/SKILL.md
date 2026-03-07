@@ -13,3 +13,4 @@ Both are **read-only detection tools** — they return a detailed issue list but
 Decision guide:
 - Changed button styling or a single component? → `/qa`
 - Changed layout, interactions, AND multiple pages? → `/ux`
+- Want faster repeat QA runs? → `/jacked-setup qa` to pre-configure browser tool and framework checks

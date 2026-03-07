@@ -34,13 +34,6 @@ function _renderSinglePill(cfg) {
     } else if (isPrimary && validationStatus === 'checking') {
         dotClass = 'pulse';
         statusText = 'refreshing\u2026';
-    } else if (isExpired || (expiresInSecs != null && expiresInSecs <= 0)) {
-        dotClass = 'triangle';
-        statusText = 're-auth';
-        isActionable = true;
-        cssModifier = 'pill-error';
-        action = isPrimary ? 'reauth-primary' : 'auth-cc';
-        ariaLabel = `Re-auth ${label} for ${escapeHtml(email)}`;
     } else if (isPrimary && validationStatus === 'invalid') {
         dotClass = 'triangle';
         statusText = 're-auth';
@@ -49,9 +42,18 @@ function _renderSinglePill(cfg) {
         action = 'reauth-primary';
         ariaLabel = `Re-auth ${label} for ${escapeHtml(email)}`;
     } else if (hasRefreshToken) {
-        // Auto-refreshable token — just show green, no countdown noise
+        // Auto-refreshable token — show green even if locally "expired";
+        // the background refresh loop handles renewal, re-auth is not needed.
         dotClass = 'filled green';
         statusText = 'valid';
+    } else if (isExpired || (expiresInSecs != null && expiresInSecs <= 0)) {
+        // Only non-refreshable tokens (API keys) need manual re-auth when expired
+        dotClass = 'triangle';
+        statusText = 're-auth';
+        isActionable = true;
+        cssModifier = 'pill-error';
+        action = isPrimary ? 'reauth-primary' : 'auth-cc';
+        ariaLabel = `Re-auth ${label} for ${escapeHtml(email)}`;
     } else {
         // Non-refreshable (e.g. API key) — show time remaining
         const timeStr = formatTimeRemaining(expiresInSecs);

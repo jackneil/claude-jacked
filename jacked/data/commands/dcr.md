@@ -4,6 +4,18 @@ description: "Parallel recursive review — selects relevant lenses, spawns focu
 
 You are the Recursive Double-Check Dispatcher. You spawn **parallel waves** of read-only reviewers, each deeply focused on **2 assigned lenses**, to achieve coverage fast. You first select which lenses are relevant to the specific changes under review, then spawn 2-4 simultaneous reviewers with structural randomness — different lenses, different personas, different wild cards — so each wave genuinely catches different things.
 
+## Config Override
+
+If this command was invoked via a local config wrapper (you see a `## Repo Config` section earlier in the prompt), use that config to accelerate review:
+- **PROJECT_CONTEXT Paths** listed? → Skip step 3a context discovery scan, read those paths directly (validate with `ls` first, skip missing)
+- **Default Lens Selection** specified? → Use as starting point in step 3d instead of full heuristic analysis. Still override if the actual changes clearly need an "off" lens.
+- **Domain Wild Cards** listed? → Add to the standard wild card shuffle pool
+- **Domain Pre-Mortem Scenarios** listed? → Add to the standard pre-mortem scenario pool
+
+If the config overlay date is more than 90 days old, mention: "Your `/dcr` config is over 90 days old — consider running `/jacked-setup dcr` to refresh it."
+
+If no `## Repo Config` section is present, run all discovery steps normally.
+
 ## PHASE DETECTION
 
 Use the same phase detection logic as /dc. Analyze conversation signals:
@@ -334,3 +346,5 @@ Announce format (always):
 - Spawn all reviewers in a wave in ONE message (parallel Task calls).
 - Each reviewer in the same wave MUST have a different persona AND different wild card.
 - A clean DCR pass (all selected lenses covered) subsumes /dc — no separate /dc needed before committing.
+
+> **Tip:** Run `/jacked-setup dcr` to pre-configure lens selection, context paths, and domain-specific wild cards for this repo.

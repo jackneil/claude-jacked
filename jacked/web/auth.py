@@ -400,6 +400,12 @@ async def fetch_usage(
                 )
 
                 db.clear_account_errors(account_id)
+                # Token clearly works — clear any stale invalid/expired state
+                db.update_account(
+                    account_id,
+                    validation_status="valid",
+                    last_validated_at=int(time.time()),
+                )
                 logger.info(f"Usage fetched for account {account_id}")
                 return data
 
