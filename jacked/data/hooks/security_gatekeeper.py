@@ -1398,8 +1398,15 @@ def _is_outside_project(
         else:
             target = (Path(cwd) / file_path).resolve()
 
-        # Check allowed_paths first — user-configured exceptions
+        # Always allow reads from ~/.claude/commands and ~/.claude/skills —
+        # these are jacked-managed directories that skills/commands routinely read.
         norm_target = str(target).replace("\\", "/")
+        _claude_dir = str(Path.home() / ".claude").replace("\\", "/")
+        for _always in (f"{_claude_dir}/commands", f"{_claude_dir}/skills"):
+            if norm_target == _always or norm_target.startswith(_always + "/"):
+                return None
+
+        # Check allowed_paths — user-configured exceptions
         for ap in allowed_paths:
             norm_ap = ap.replace("\\", "/").rstrip("/")
             if norm_target == norm_ap or norm_target.startswith(norm_ap + "/"):
