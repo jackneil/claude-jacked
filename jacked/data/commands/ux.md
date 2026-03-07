@@ -515,50 +515,14 @@ If everything passes, say so clearly:
 [N] pages tested, [N] aspects checked, 0 issues found.
 ```
 
-## Step 11: Investigate & Plan Fixes
+### Cleanup
 
-If the report found 0 issues, announce:
-**"All clear — 0 issues found. Skipping fix plan and /dcr verification."**
-Go to Step 14 (Cleanup).
-
-Otherwise, announce: **"[N] issues found. Writing implementation plan for fixes..."**
-
-Use the `superpowers:writing-plans` skill to create a proper fix plan. Feed it the full issue list from the UX report as requirements. The writing-plans skill will:
-- Investigate root causes by reading source files
-- Produce bite-sized tasks with exact file paths, line numbers, and complete code changes
-- Include verification steps and test commands for each fix
-- Order by severity: CRITICAL > HIGH > MEDIUM > LOW
-
-The plan should be scoped to fixing the UX-reported issues — not a general feature plan.
-
-## Step 12: Execute Fix Plan
-
-After the plan is written, execute it using the `superpowers:executing-plans` skill (or `superpowers:subagent-driven-development` for parallel execution). This ensures each fix is:
-1. Verified against the current file state before applying
-2. Tested after applying
-3. Tracked to completion
-
-**On failure**: If a fix introduces a test failure or error, STOP immediately. Do not attempt remaining fixes. Announce the failure with error details. The user decides how to proceed. Do NOT continue to /dcr with broken state.
-
-After all items succeed, announce:
-**"Fix plan complete — all [N] items resolved. Running /dcr for verification."**
-
-## Step 13: Run /dcr
-
-Invoke the /dcr skill for parallel recursive review of all changes. /dcr handles its own wave loop — it will review, fix, and re-verify until all selected lenses pass clean.
-
-/dcr does NOT re-trigger /qa or /ux — it reviews code, not browser behavior.
-
-After /dcr reports clean, proceed to Cleanup.
-
-> **Note:** The investigate → plan → execute → /dcr pattern mirrors the same flow in `/qa`. Keep both in sync when updating.
-
-## Step 14: Cleanup
-
-Remove the screenshot directory after the full workflow completes:
+After presenting the report, remove the screenshot directory:
 ```bash
 rm -rf "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/tmp/ux_screenshots"
 ```
+
+This command is **read-only** — it detects and reports issues but does NOT fix them. The detailed issue list is returned to the parent caller (Claude Code), which should then use `superpowers:writing-plans` to build a fix plan from the findings, let the user iterate on it, and execute with `/dcr` verification.
 
 ## HARD RULES
 
@@ -568,10 +532,5 @@ rm -rf "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/tmp/ux_screenshots"
 - Cap at 4 agents maximum to avoid browser contention.
 - Minimum 2 agents — if only 1-2 aspects are relevant, combine into 2 agents anyway for depth.
 - Do NOT ask "should I continue?" after spawning — always collect and report.
-- If issues are found, ALWAYS investigate root causes and write a fix plan before touching code — do NOT guess fixes from symptoms.
-- The fix plan MUST have exact file paths, line numbers, and concrete code changes — not vague descriptions.
-- After executing fixes, ALWAYS run /dcr — do NOT skip verification.
-- If zero issues found, skip the fix plan and go straight to cleanup.
-- If a fix fails (test failure or error), STOP. Do NOT proceed to /dcr with broken state.
-- /dcr does NOT re-trigger /qa or /ux. It is a code review tool.
+- This command is READ-ONLY — detect and report only. Do NOT fix code or invoke /dcr.
 - Each /ux invocation is independent — do not reference previous runs.
