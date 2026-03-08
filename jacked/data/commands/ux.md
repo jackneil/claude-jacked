@@ -2,6 +2,20 @@
 description: "Parallel browser-based UX checks — spawns focused agents to test different UX aspects on affected pages simultaneously"
 ---
 
+## Config Override
+
+If this command was invoked via a local config wrapper (you see a `## Repo Config` section earlier in the prompt), use that config to skip detection:
+- **Browser Tool** specified? → Skip Step 1, use the declared tool directly (fall back to detection if unavailable)
+- **Stack** declared? → Skip tech stack inference in Step 2
+- **Dev Server Port** specified? → Use it in Step 3 URL construction (still check `lsof` as fallback)
+- **Component Paths** listed? → Use as focus hints for which pages to prioritize in Step 3
+- **Credential Hints** listed? → Use those variable names in Step 4 credential search
+- **UX Focus Areas** listed? → Emphasize those aspects in your test plan across all agents
+
+If the config overlay date is more than 90 days old, mention: "Your `/ux` config is over 90 days old — consider running `/jacked-setup ux` to refresh it."
+
+If no `## Repo Config` section is present, run all detection steps normally.
+
 You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each focused on specific UX aspects on specific pages, to validate UI changes fast. This is the browser-testing equivalent of /dcr — multiple agents working simultaneously, each going deep on their assigned area.
 
 > **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.

@@ -1,5 +1,5 @@
 ---
-description: "Analyze this repo and generate faster, customized versions of jacked commands (/whats-next, /qa, /dcr)"
+description: "Analyze this repo and generate faster, customized versions of jacked commands (/whats-next, /qa, /ux, /dcr)"
 ---
 
 You are a repo analyzer. Your job is to examine the current repo's structure, tech stack, and conventions, then generate fully standalone command files that embed the engine logic with repo-specific config pre-filled.
@@ -15,28 +15,29 @@ Check `$ARGUMENTS` for a target:
 | Argument | Action |
 |----------|--------|
 | `whats-next` | Generate config for `/whats-next` |
-| `qa` | Generate config for `/qa` |
+| `qa` | Generate config for `/qa` and `/ux` (always paired — they share one analysis pass) |
+| `ux` | Generate config for `/ux` and `/qa` (always paired — they share one analysis pass) |
 | `dcr` | Generate config for `/dcr` |
-| `all` | Generate all three sequentially |
+| `all` | Generate all four sequentially (qa and ux share one analysis pass) |
 | *(empty)* | Show the explanation below and ask which to generate |
 
 **If no argument provided**, show this:
 ```
-/jacked-setup generates repo-specific config files that make jacked commands faster.
-It analyzes your repo's tech stack, planning docs, and structure once, then saves the
-results so future command runs skip discovery.
+/jacked-setup generates repo-specific config files that make jacked commands faster and
+work for repo cloners without jacked installed.
 
 Available targets:
   whats-next  — Pre-configure lifecycle, planning doc paths, tier weights
-  qa          — Pre-configure browser tool, framework checks, component paths
+  qa          — Pre-configure browser tool, framework checks, component paths (also generates /ux)
+  ux          — Pre-configure parallel UX checks (also generates /qa)
   dcr         — Pre-configure lens selection, context paths, domain-specific checks
-  all         — Generate all three
+  all         — Generate all four
 
 Usage: /jacked-setup <target>
 ```
 Then ask which target to generate.
 
-If the argument doesn't match any of the above, say: "Unknown target. Valid options: `whats-next`, `qa`, `dcr`, `all`."
+If the argument doesn't match any of the above, say: "Unknown target. Valid options: `whats-next`, `qa`, `ux`, `dcr`, `all`."
 
 ## Step 2: Common Repo Analysis
 
@@ -151,6 +152,8 @@ Also check which browser tools are available:
 - Try `mcp__claude-in-chrome__tabs_context_mcp` → Claude-in-Chrome
 - Try `npx agent-browser --version` → agent-browser CLI
 
+> **Note:** This analysis also covers the `ux` target — `qa` and `ux` are always generated together since the qa skill routes to both. When both `qa` and `ux` are targets in the same run, execute this analysis once and reuse the results for both.
+
 ### For `dcr`:
 
 ```bash
@@ -196,22 +199,24 @@ From these results, determine default lens weights:
 - Test directory exists → **Testing** always on
 - Guardrails docs found → **Guardrails** gets extra context paths
 
-## Step 4: Check for Existing Local File
+## Step 4: Check for Existing Local Files
 
 ```bash
-ls .claude/commands/whats-next.md .claude/commands/qa.md .claude/commands/dcr.md 2>/dev/null
+ls .claude/commands/whats-next.md .claude/commands/qa.md .claude/commands/ux.md .claude/commands/dcr.md 2>/dev/null
+ls .claude/skills/whats-next/SKILL.md .claude/skills/qa/SKILL.md .claude/skills/ux/SKILL.md .claude/skills/dcr/SKILL.md 2>/dev/null
 ```
 
-If the target file already exists, ask the user conversationally: "A customized `/<target>` already exists at `.claude/commands/<target>.md`. Replace it with a fresh version?"
+If the target command **or** skill file already exists, ask the user conversationally: "A customized `/<target>` already exists at `.claude/commands/<target>.md` (and/or `.claude/skills/<target>/SKILL.md`). Replace with a fresh version?"
 
-- If yes → proceed to generation
+- If yes → proceed to generation (overwrites both command and skill files)
 - If no → skip that target, move to next (if doing `all`)
 
-## Step 5: Generate Standalone Command File
+## Step 5: Generate Standalone Command and Skill Files
 
-Create the directory if needed:
+Create the directories if needed:
 ```bash
 mkdir -p .claude/commands
+mkdir -p .claude/skills/<target>
 ```
 
 **Before writing, get the jacked version:**
@@ -250,6 +255,8 @@ description: "<standalone description — see per-target templates below>"
 
 **Critical:** Use the Read tool output verbatim for the engine body. Do NOT reproduce it from memory. The engine body is injected as-is after the `<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->` marker.
 
+**Also write a local skill file** after the command file. Use `mkdir -p .claude/skills/<target>` first. Local skills use RELATIVE paths — do NOT use `~/.claude/commands/`. Do NOT add Glob fallback checks to local skills (those are only for global skills). See per-target skill bodies below.
+
 ### whats-next standalone template:
 
 ```markdown
@@ -282,6 +289,15 @@ Emphasize: <tier guidance based on lifecycle>
 [Engine body from `~/.claude/commands/whats-next.md` embedded here — front matter and delegation Note stripped]
 ```
 
+**whats-next local skill** (write to `.claude/skills/whats-next/SKILL.md`):
+```markdown
+---
+name: whats-next
+description: "Roadmap advisor — analyzes plans, issues, commits, and lifecycle to recommend highest-yield next work items. (repo)"
+---
+Read `.claude/commands/whats-next.md` and follow it.
+```
+
 ### qa standalone template:
 
 ```markdown
@@ -311,6 +327,60 @@ description: "Browser QA — standalone (generated <date>; upgrade jacked + re-r
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
 [Engine body from `~/.claude/commands/qa.md` embedded here — front matter and delegation Note stripped]
+```
+
+**qa local skill** (write to `.claude/skills/qa/SKILL.md`):
+```markdown
+---
+name: qa
+description: "Browser-based QA testing — targeted single-component check (/qa) or parallel multi-aspect review (/ux). (repo)"
+---
+Two commands are available — read the appropriate one and follow it:
+- `.claude/commands/qa.md` — Quick, focused QA pass (single agent). Best for targeted fixes or single-feature verification.
+- `.claude/commands/ux.md` — Thorough parallel UX review (multiple agents). Best when changes touch layout, navigation, or multiple components.
+
+Both are read-only detection tools — they return a detailed issue list but do NOT fix code.
+
+Decision guide:
+- Changed button styling or a single component? → `/qa`
+- Changed layout, interactions, AND multiple pages? → `/ux`
+```
+
+### ux standalone template:
+
+```markdown
+---
+description: "Parallel UX checks — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+---
+# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup ux
+
+## Repo Config
+
+- **Project**: <name>
+- **Stack**: <frontend framework, CSS framework>
+- **Browser Tool**: <Playwright MCP|Claude-in-Chrome|agent-browser|none detected>
+- **Dev Server Port**: <port if detected, or "auto-detect">
+- **Component Paths**: <paths if found>
+
+## Credential Hints
+<variable names from env files, or "none found — ask user if login required">
+
+## UX Focus Areas
+<emphasis based on stack — e.g. "Tailwind: verify responsive breakpoints (375px, 768px, 1280px)" or "Next.js: test hydration boundaries, client/server component interactions" or "Nav changes: emphasize Discoverability aspect across all agents">
+
+<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
+---
+[Engine body from `~/.claude/commands/ux.md` embedded here — front matter stripped]
+```
+
+**ux local skill** (write to `.claude/skills/ux/SKILL.md`):
+```markdown
+---
+name: ux
+description: "Parallel browser-based UX checks — spawns focused agents to test different UX aspects simultaneously. (repo)"
+---
+Read `.claude/commands/ux.md` and follow it.
 ```
 
 ### dcr standalone template:
@@ -350,17 +420,34 @@ In addition to the standard pool, include:
 [Engine body from `~/.claude/commands/dcr.md` embedded here — front matter and delegation Note stripped]
 ```
 
+**dcr local skill** (write to `.claude/skills/dcr/SKILL.md`):
+```markdown
+---
+name: dcr
+description: "Parallel recursive review — selects relevant lenses, spawns focused reviewers per wave until all selected lenses pass clean. (repo)"
+---
+Read `.claude/commands/dcr.md` and follow it.
+```
+
 ## Step 6: Announce Results
 
-For each generated file, announce:
+For each generated target, announce:
 
 ```
 Saved standalone `/<target>` at `.claude/commands/<target>.md` (Engine: jacked v<VERSION>).
-**Commit this file** — it works for anyone who clones your repo, no jacked required.
+Also saved local skill at `.claude/skills/<target>/SKILL.md`.
+**Commit both `.claude/commands/` and `.claude/skills/`** — repo cloners get slash commands AND auto-triggering without jacked installed.
 To pick up future engine improvements: `uv tool install --upgrade claude-jacked && jacked install` then re-run `/jacked-setup <target>`.
 ```
 
-If generating `all`, list all three results together.
+If generating `all`, list all four results together.
+
+**After generation, run a .gitignore check:**
+```bash
+git check-ignore -q .claude 2>/dev/null && echo "GITIGNORED" || echo "OK"
+```
+If the result is `GITIGNORED`, warn the user:
+> ⚠️ `.claude/` appears to be gitignored. Your teammates and repo cloners won't get these files unless you commit them explicitly. Add a `.gitignore` exception: `!.claude/` (or commit the files directly with `git add -f .claude/`).
 
 If the repo is greenfield (<10 commits), add: "This is a young repo — re-run `/jacked-setup <target>` as your project matures to capture new planning docs and lifecycle changes."
 
@@ -372,4 +459,7 @@ If the repo is greenfield (<10 commits), add: "This is a young repo — re-run `
 - Never log credential values — only variable names from env files.
 - All `find` and `grep` commands must use `-maxdepth` or `--exclude-dir` to prevent hanging on large repos.
 - If the repo passes the floor check but has minimal context, write a config with defaults. If it fails the floor check (zero manifests, zero source files, zero commits), do NOT generate — tell the user to add code first.
-- Do NOT silently overwrite existing local files — always ask first.
+- Do NOT silently overwrite existing local files — always ask first (check both command and skill files).
+- Each target generates TWO files: `.claude/commands/<target>.md` (standalone command) AND `.claude/skills/<target>/SKILL.md` (local skill). Both must be committed for cloners to get full functionality.
+- Local skill files MUST use relative paths (`.claude/commands/<target>.md`). Do NOT use `~/.claude/commands/`. Do NOT add Glob fallback checks to local skills — that pattern belongs only in global skills.
+- `qa` and `ux` are always paired — generating either one generates both (they share one analysis pass and the qa skill routes to both commands).
