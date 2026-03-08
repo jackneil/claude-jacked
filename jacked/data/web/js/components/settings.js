@@ -163,7 +163,8 @@ function bindToggleEvents(container) {
 
             try {
                 await api.put(`/api/features/${encodeURIComponent(category)}/${encodeURIComponent(name)}`, { enabled });
-                showToast(`${name} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+                const displayName = toggle.closest('[data-feature-row]')?.dataset.displayName || name;
+                showToast(`${displayName} ${enabled ? 'enabled' : 'disabled'}`, 'success');
                 await refreshFeatures();
                 // Re-render the current tab to reflect changes
                 const activeTab = localStorage.getItem(SETTINGS_TAB_KEY) || DEFAULT_TAB;
@@ -204,7 +205,7 @@ async function renderAgentsTab(container) {
                 ? `<span class="badge badge-info ml-2">${escapeHtml(a.model)}</span>`
                 : '';
             return `
-                <div class="feature-card ${a.installed ? '' : 'disabled'}">
+                <div class="feature-card ${a.installed ? '' : 'disabled'}" data-feature-row data-display-name="${escapeHtml(a.display_name || a.name)}">
                     <div class="flex items-start justify-between gap-3">
                         <div class="min-w-0 flex-1">
                             <div class="flex items-center">
@@ -257,7 +258,7 @@ async function renderCommandsTab(container) {
         }
 
         const cardsHtml = commands.map(c => `
-            <div class="feature-card ${c.installed ? '' : 'disabled'}">
+            <div class="feature-card ${c.installed ? '' : 'disabled'}" data-feature-row data-display-name="${escapeHtml(c.display_name || c.name)}">
                 <div class="flex items-start justify-between gap-3">
                     <div class="min-w-0 flex-1">
                         <span class="text-sm font-medium text-white font-mono">${escapeHtml(c.display_name || c.name)}</span>
@@ -1731,7 +1732,7 @@ async function renderFeaturesTab(container) {
         const knowledge = features.knowledge || [];
 
         const hookRows = hooks.map(h => `
-            <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50">
+            <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(h.display_name)}">
                 <div class="min-w-0 flex-1">
                     <div class="text-sm text-white">${escapeHtml(h.display_name)}</div>
                     <div class="text-xs text-slate-400">${escapeHtml(h.description || '')}</div>
@@ -1746,7 +1747,7 @@ async function renderFeaturesTab(container) {
                 note = '<span class="text-xs text-red-400 ml-2">Corrupt markers detected</span>';
             }
             return `
-                <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50">
+                <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(k.display_name)}">
                     <div class="min-w-0 flex-1">
                         <div class="text-sm text-white">${escapeHtml(k.display_name)}${note}</div>
                         <div class="text-xs text-slate-400">${escapeHtml(k.description || '')}</div>

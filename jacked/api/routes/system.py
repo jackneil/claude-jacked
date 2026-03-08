@@ -1,10 +1,13 @@
 """System routes — health, version, installations, settings, gatekeeper config."""
 
+import logging
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -109,6 +112,7 @@ class GlobalInstallation(BaseModel):
     commands: list[InstalledComponent]
     hooks: list[InstalledComponent]
     knowledge: list[InstalledComponent]
+    skills: list[InstalledComponent] = []
 
 
 class InstallationsOverview(BaseModel):
@@ -556,10 +560,12 @@ async def installations_overview(request: Request):
     from jacked import __version__
     from jacked.api.routes.features import (
         CLAUDE_DIR,
+        DATA_ROOT,
         _detect_hook_installed,
         _detect_rules_status,
         _get_valid_agent_names,
         _get_valid_command_names,
+        _get_valid_skill_names,
         _name_to_display,
         _read_settings_json,
     )
@@ -611,7 +617,6 @@ async def installations_overview(request: Request):
 
     # Knowledge
     rules_status = _detect_rules_status()
-    skill_installed = (CLAUDE_DIR / "skills" / "jacked" / "SKILL.md").exists()
     ref_installed = (CLAUDE_DIR / "jacked-reference.md").exists()
     knowledge = [
         InstalledComponent(
@@ -620,11 +625,18 @@ async def installations_overview(request: Request):
             installed=rules_status.get("installed", False),
         ),
         InstalledComponent(
-            name="skill", display_name="Skill", installed=skill_installed
-        ),
-        InstalledComponent(
             name="reference", display_name="Reference", installed=ref_installed
         ),
+    ]
+
+    # Skills (dynamic — one per SKILL.md in package)
+    skills = [
+        InstalledComponent(
+            name=f"skill_{skill_name}",
+            display_name=f"/{skill_name}",
+            installed=(CLAUDE_DIR / "skills" / skill_name / "SKILL.md").exists(),
+        )
+        for skill_name in _get_valid_skill_names()
     ]
 
     global_install = GlobalInstallation(
@@ -633,6 +645,7 @@ async def installations_overview(request: Request):
         commands=commands,
         hooks=hooks,
         knowledge=knowledge,
+        skills=skills,
     )
 
     # Project activity from DB
@@ -669,7 +682,7 @@ async def installations_overview(request: Request):
                     )
                 )
         except Exception:
-            pass
+            logger.exception("Failed to load project activity")
 
     return InstallationsOverview(
         global_install=global_install,

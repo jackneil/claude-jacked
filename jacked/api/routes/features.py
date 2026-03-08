@@ -31,7 +31,24 @@ RULES_END_MARKER = "# end-jacked-behaviors"
 
 # Valid hook/knowledge names (allowlist)
 VALID_HOOKS = {"security_gatekeeper", "session_indexing", "sounds"}
-VALID_KNOWLEDGE = {"rules", "skill", "skill_optimizer", "reference"}
+
+
+def _get_valid_skill_names() -> list[str]:
+    """List skill names from package source."""
+    skills_dir = DATA_ROOT / "skills"
+    if not skills_dir.exists():
+        return []
+    return [d.name for d in sorted(skills_dir.iterdir())
+            if d.is_dir() and (d / "SKILL.md").exists()]
+
+
+def _get_valid_knowledge_names() -> set[str]:
+    """Dynamic allowlist of knowledge feature names."""
+    base = {"rules", "reference"}
+    for name in _get_valid_skill_names():
+        base.add(f"skill_{name}")
+    return base
+
 
 # ---------------------------------------------------------------------------
 # Claude Code settings constants — these control Claude Code itself, not jacked
@@ -397,28 +414,24 @@ async def list_features():
             "source_available": (DATA_ROOT / "rules" / "jacked_behaviors.md").exists(),
             "corrupt": rules_status.get("corrupt", False),
         },
-        {
-            "name": "skill",
-            "display_name": "/jacked Skill",
-            "description": "Search and load context from past Claude sessions",
-            "installed": (CLAUDE_DIR / "skills" / "jacked" / "SKILL.md").exists(),
-            "source_available": (DATA_ROOT / "skills" / "jacked" / "SKILL.md").exists(),
-        },
-        {
-            "name": "skill_optimizer",
-            "display_name": "/claude-md-optimizer Skill",
-            "description": "Audit and optimize CLAUDE.md for quality and token efficiency",
-            "installed": (CLAUDE_DIR / "skills" / "claude-md-optimizer" / "SKILL.md").exists(),
-            "source_available": (DATA_ROOT / "skills" / "claude-md-optimizer" / "SKILL.md").exists(),
-        },
-        {
-            "name": "reference",
-            "display_name": "Reference Doc",
-            "description": "Comprehensive knowledge document about jacked for Claude",
-            "installed": (CLAUDE_DIR / "jacked-reference.md").exists(),
-            "source_available": (DATA_ROOT / "rules" / "jacked-reference.md").exists(),
-        },
     ]
+    for skill_name in _get_valid_skill_names():
+        src = DATA_ROOT / "skills" / skill_name / "SKILL.md"
+        fm = _parse_frontmatter(src)
+        knowledge.append({
+            "name": f"skill_{skill_name}",
+            "display_name": fm.get("name", f"/{skill_name} Skill"),
+            "description": fm.get("description", ""),
+            "installed": (CLAUDE_DIR / "skills" / skill_name / "SKILL.md").exists(),
+            "source_available": src.exists(),
+        })
+    knowledge.append({
+        "name": "reference",
+        "display_name": "Reference Doc",
+        "description": "Comprehensive knowledge document about jacked for Claude",
+        "installed": (CLAUDE_DIR / "jacked-reference.md").exists(),
+        "source_available": (DATA_ROOT / "rules" / "jacked-reference.md").exists(),
+    })
 
     return {
         "agents": agents, "commands": commands, "hooks": hooks,
@@ -482,7 +495,7 @@ async def toggle_feature(
         return await _toggle_hook(name, body.enabled, db=db)
 
     if category == "knowledge":
-        if name not in VALID_KNOWLEDGE:
+        if name not in _get_valid_knowledge_names():
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 content={"error": {"message": f"Unknown knowledge item: {name}", "code": "INVALID_FEATURE"}},
@@ -566,14 +579,17 @@ async def _toggle_knowledge(name: str, enabled: bool):
     """Enable/disable a knowledge feature."""
     if name == "rules":
         return await _toggle_rules(enabled)
-    if name == "skill":
-        src = DATA_ROOT / "skills" / "jacked" / "SKILL.md"
-        dst = CLAUDE_DIR / "skills" / "jacked" / "SKILL.md"
-        return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
-    if name == "skill_optimizer":
-        src = DATA_ROOT / "skills" / "claude-md-optimizer" / "SKILL.md"
-        dst = CLAUDE_DIR / "skills" / "claude-md-optimizer" / "SKILL.md"
-        return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
+    if name.startswith("skill_"):
+        skill_name = name[len("skill_"):]
+        if _validate_name(skill_name):
+            src = DATA_ROOT / "skills" / skill_name / "SKILL.md"
+            dst = CLAUDE_DIR / "skills" / skill_name / "SKILL.md"
+            if src.exists():
+                return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": f"Unknown skill: {skill_name}", "code": "INVALID_FEATURE"}},
+        )
     if name == "reference":
         src = DATA_ROOT / "rules" / "jacked-reference.md"
         dst = CLAUDE_DIR / "jacked-reference.md"

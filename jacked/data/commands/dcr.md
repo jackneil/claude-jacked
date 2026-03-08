@@ -44,6 +44,7 @@ Two categories: **required** (always reviewed) and **optional** (dispatcher sele
 | 5 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
 | 6 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
 | 7 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
+| 8 | **Simplicity & Reuse** | Redundant logic (same thing written twice), reinvented utilities (search for existing helpers before concluding new code is needed), over-engineering (simpler structure would work equally well), premature abstraction (interface/generics for a single concrete use), dead weight (params never varied, single-use abstractions, configs for hypothetical scenarios). Do NOT flag complexity that is genuinely necessary — the question is always "can this be equally correct with less code or indirection?" |
 
 Phase filtering is light-touch — note the phase in each reviewer's prompt. Reviewers skip sub-areas within their assigned lenses that don't apply.
 
@@ -197,7 +198,7 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
 
 ### LENS SELECTION
 
-3d. **Select lenses for this review.** Guardrails is always included. For the remaining 7,
+3d. **Select lenses for this review.** Guardrails is always included. For the remaining 8,
     choose those that are genuinely relevant to the phase and specific changes under review.
 
     **Selection criteria:**
@@ -209,14 +210,16 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
       pure CLI tool → probably skip UX & Flow)
     - Any UI element added, moved, renamed, or hidden → include UX & Flow (with discoverability emphasis)
     - Any behavior change visible to the user (status change, label change, action removed) → UX & Flow
+    - New code added or substantial refactoring → Simplicity & Reuse (look for existing utilities,
+      over-engineered solutions, redundant logic). Naturally pairs with Maintainability.
     - When in doubt, include the lens — better to review something unnecessary than miss something important.
 
     **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum, 2 reviewers).
-    Maximum is all 8 (4 reviewers). Use your judgment.
+    Maximum is all 9 (5 reviewers). Use your judgment.
 
 3e. **Announce selected lenses with reasoning:**
     ```
-    **Lenses selected ([N] of 8):**
+    **Lenses selected ([N] of 9):**
       ✓ Guardrails (always)
       ✓ Security — API routes modified, auth logic touched
       ✓ Logic & Edge Cases — new conditional branching in gatekeeper
@@ -225,13 +228,14 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
       ⊘ Access Control — no RBAC or multi-tenant changes
       ⊘ UX & Flow — no frontend or user-facing changes
       ⊘ Maintainability — changes are focused, no structural concerns
+      ⊘ Simplicity & Reuse — no new logic added, pure config change
     ```
 
 ### WAVE 1 — Selected Coverage
 
 4. **Pair** the selected lenses. Each reviewer gets exactly 2.
    - If odd number of selected lenses, one reviewer gets a single lens (goes deeper).
-   - Number of reviewers = ceil(selected_lenses / 2). Range: 2-4 reviewers.
+   - Number of reviewers = ceil(selected_lenses / 2). Range: 2-5 reviewers.
 5. **Assign** each pair a unique persona and unique wild card (shuffle pools as before).
 6. **Announce**:
    ```

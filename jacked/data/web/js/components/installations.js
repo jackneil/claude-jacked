@@ -77,6 +77,12 @@ function renderGlobalInstallationCard(gi) {
         return `<span class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border ${color}">${icon} ${escapeHtml(k.display_name)}</span>`;
     }).join(' ');
 
+    const skillChips = (gi.skills || []).map(s => {
+        const color = s.installed ? 'bg-violet-900/50 text-violet-300 border-violet-700' : 'bg-slate-800 text-slate-500 border-slate-700';
+        const icon = s.installed ? '&#10003;' : '&#10005;';
+        return `<span class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border ${color}">${icon} ${escapeHtml(s.display_name)}</span>`;
+    }).join(' ');
+
     return `
         <div class="bg-gradient-to-r from-indigo-900/40 to-purple-900/40 border border-indigo-700/50 rounded-lg p-5 mb-6">
             <div class="flex items-center justify-between mb-3">
@@ -109,6 +115,11 @@ function renderGlobalInstallationCard(gi) {
                     <div class="mt-1 flex flex-wrap gap-1">${knowledgeChips}</div>
                 </div>
             </div>
+            ${skillChips ? `
+            <div class="mt-3 pt-3 border-t border-indigo-700/30">
+                <div class="text-xs text-slate-400 mb-1">Skills</div>
+                <div class="flex flex-wrap gap-1">${skillChips}</div>
+            </div>` : ''}
         </div>
     `;
 }
