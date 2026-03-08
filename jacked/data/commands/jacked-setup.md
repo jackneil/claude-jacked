@@ -206,10 +206,22 @@ ls .claude/commands/whats-next.md .claude/commands/qa.md .claude/commands/ux.md 
 ls .claude/skills/whats-next/SKILL.md .claude/skills/qa/SKILL.md .claude/skills/ux/SKILL.md .claude/skills/dcr/SKILL.md 2>/dev/null
 ```
 
-If the target command **or** skill file already exists, ask the user conversationally: "A customized `/<target>` already exists at `.claude/commands/<target>.md` (and/or `.claude/skills/<target>/SKILL.md`). Replace with a fresh version?"
+Only check the **target(s) being generated** (not all files found by the `ls`). For any command file that exists, determine its format using a positive signal:
+```bash
+# New standalone files always have ## Repo Config; old overlays do not
+grep -q '## Repo Config' .claude/commands/<target>.md 2>/dev/null && echo "STANDALONE" || echo "OLD_FORMAT"
+```
 
-- If yes → proceed to generation (overwrites both command and skill files)
-- If no → skip that target, move to next (if doing `all`)
+**qa and ux are always a pair — handle their consent as one decision:**
+- Run the format check for whichever of `qa.md` and `ux.md` exist
+- If EITHER is `OLD_FORMAT` (old overlay, missing, or hand-crafted without `## Repo Config`): show ONE combined warning — "⚠️ Your existing `/qa` and/or `/ux` command files depend on jacked being installed on every developer's machine. Regenerating makes them fully standalone — repo cloners can use them without jacked." Ask: "Regenerate both?"
+- If BOTH are `STANDALONE`: ask conversationally: "Both `/qa` and `/ux` already exist. Replace with fresh versions?"
+- If yes → generate both; if no → skip both. Never generate one without the other.
+
+**For non-paired targets (`whats-next`, `dcr`):** if the command **or** skill file already exists:
+- **If command file exists and is `OLD_FORMAT`**: Warn — "⚠️ Your existing `/<target>` depends on jacked being installed on every developer's machine. Regenerating makes it fully standalone." Ask: "Regenerate now?"
+- **If `STANDALONE` (or only skill file exists, no command file to check)**: Ask conversationally: "A `/<target>` already exists. Replace with a fresh version?"
+- If yes → proceed; if no → skip that target, move to next (if doing `all`)
 
 ## Step 5: Generate Standalone Command and Skill Files
 
@@ -371,7 +383,7 @@ description: "Parallel UX checks — standalone (generated <date>; upgrade jacke
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-[Engine body from `~/.claude/commands/ux.md` embedded here — front matter stripped]
+[Engine body from `~/.claude/commands/ux.md` embedded here — front matter and delegation Note stripped]
 ```
 
 **ux local skill** (write to `.claude/skills/ux/SKILL.md`):
