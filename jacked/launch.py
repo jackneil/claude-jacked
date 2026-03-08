@@ -711,11 +711,9 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                 if old_cc_access_token == access_token:
                     return  # Token unchanged
 
-                # If cc_access_token is NULL in DB, skip sync. NULL means either:
-                # (a) CC tokens were cleared by invalid_grant — writing stale
-                #     file tokens back would resurrect dead tokens, or
-                # (b) CC auth was never done — file contains primary fallback
-                #     tokens that shouldn't be stored in cc_* columns.
+                # If cc_access_token is NULL in DB, skip sync. NULL means
+                # CC auth was never done — file contains primary fallback
+                # tokens that shouldn't be stored in cc_* columns.
                 # In both cases, only the OAuth flow or async refresh should
                 # populate cc_* columns from NULL.
                 if old_cc_access_token is None:

@@ -425,6 +425,12 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
     if has_label:
         raw = body.display_name.strip() if body.display_name else None
         label = raw if raw else None
+        logger.info(
+            "PATCH label for account %d: %r (User-Agent: %s, Origin: %s)",
+            account_id, label,
+            request.headers.get("user-agent", "unknown"),
+            request.headers.get("origin", "unknown"),
+        )
         db.set_account_label(account_id, label)
 
     if has_active:

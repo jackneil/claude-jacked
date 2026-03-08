@@ -120,6 +120,8 @@ SAFE_PREFIXES = [
     "git remote show",
     "git remote get-url",
     "git rev-parse",
+    # git rev-list: read-only plumbing (lists commit objects); no state-mutating flags
+    "git rev-list",
     "git describe",
     "git shortlog",
     # git cherry-pick removed — creates commits, inconsistent with git commit in "ask" category
@@ -1400,11 +1402,27 @@ def _is_outside_project(
 
         # Always allow reads from ~/.claude/commands and ~/.claude/skills —
         # these are jacked-managed directories that skills/commands routinely read.
+        #
+        # Check BOTH the unresolved and resolved forms of the file path:
+        # - Unresolved: jacked install symlinks commands into the project directory,
+        #   so Path.resolve() follows the symlink and returns a project path — we must
+        #   check the original path before following symlinks.
+        # - Resolved: handles macOS /Users → /private/Users expansion and dotfile symlinks.
+        if Path(file_path).is_absolute():
+            norm_unresolved = str(file_path).replace("\\", "/")
+        else:
+            norm_unresolved = str(Path(cwd) / file_path).replace("\\", "/")
         norm_target = str(target).replace("\\", "/")
-        _claude_dir = str(Path.home() / ".claude").replace("\\", "/")
-        for _always in (f"{_claude_dir}/commands", f"{_claude_dir}/skills"):
-            if norm_target == _always or norm_target.startswith(_always + "/"):
-                return None
+        _claude_raw = str(Path.home() / ".claude").replace("\\", "/")
+        try:
+            _claude_res = str((Path.home() / ".claude").resolve()).replace("\\", "/")
+        except Exception:
+            _claude_res = _claude_raw
+        for check_path in (norm_unresolved, norm_target):
+            for _claude_dir in (_claude_raw, _claude_res):
+                for _always in (f"{_claude_dir}/commands", f"{_claude_dir}/skills"):
+                    if check_path == _always or check_path.startswith(_always + "/"):
+                        return None
 
         # Check allowed_paths — user-configured exceptions
         for ap in allowed_paths:

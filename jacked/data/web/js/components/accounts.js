@@ -19,11 +19,14 @@ const MODEL_DISPLAY_NAMES = {
  */
 function getAccountStatus(acct) {
     if (!acct.is_active) return 'disabled';
-    if (acct.is_expired) return 'expired';
+    // Only flag expired for non-refreshable accounts (API keys); OAuth tokens
+    // renew automatically so the card should not show an expired state.
+    if (acct.is_expired && !acct.has_refresh_token) return 'expired';
     if (acct.validation_status === 'invalid') return 'invalid';
 
-    // Near-expiry warning (primary < 1h)
-    if (acct.expires_in_seconds != null && acct.expires_in_seconds < TOKEN_EXPIRY_WARN_SECS) {
+    // Near-expiry warning (primary < 1h) — only for non-refreshable (API key) accounts.
+    // OAuth tokens renew automatically; showing a warning would contradict the pill's "valid".
+    if (!acct.has_refresh_token && acct.expires_in_seconds != null && acct.expires_in_seconds < TOKEN_EXPIRY_WARN_SECS) {
         return 'warning';
     }
 
@@ -31,8 +34,8 @@ function getAccountStatus(acct) {
     if (acct.has_cc_token !== undefined) {
         if (!acct.has_cc_token) return 'cc-missing';
         if (acct.cc_needs_auth) return 'warning';
-        // CC expiry check
-        if (acct.cc_expires_at) {
+        // CC expiry check — only flag for non-refreshable CC tokens
+        if (acct.cc_expires_at && !acct.has_cc_refresh_token) {
             const ccRemaining = acct.cc_expires_at - Math.floor(Date.now() / 1000);
             if (ccRemaining <= 0) return 'expired';
             if (ccRemaining < TOKEN_EXPIRY_WARN_SECS) return 'warning';

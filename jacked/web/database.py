@@ -530,7 +530,7 @@ class Database:
                         pass
             # Seed cc_access_token from primary for existing accounts (one-time only).
             # Only runs when columns were JUST added — not on every startup.
-            # Re-running would defeat invalid_grant cleanup (which sets cc_* to NULL).
+            # Re-running would defeat invalid_grant handling (which clears cc_refresh_token).
             # cc_refresh_token is intentionally NOT seeded — seeding it would recreate
             # the shared-refresh-token bug. Users must do CC OAuth to get independent
             # CC refresh tokens.

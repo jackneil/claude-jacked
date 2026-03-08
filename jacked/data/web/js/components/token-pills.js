@@ -35,6 +35,8 @@ function _renderSinglePill(cfg) {
         dotClass = 'pulse';
         statusText = 'refreshing\u2026';
     } else if (isPrimary && validationStatus === 'invalid') {
+        // Token confirmed invalid (heal loop has tried and failed) — user must re-auth.
+        // Note: fetch_usage success clears this state quickly via clear_account_errors().
         dotClass = 'triangle';
         statusText = 're-auth';
         isActionable = true;
@@ -42,12 +44,12 @@ function _renderSinglePill(cfg) {
         action = 'reauth-primary';
         ariaLabel = `Re-auth ${label} for ${escapeHtml(email)}`;
     } else if (hasRefreshToken) {
-        // Auto-refreshable token — show green even if locally "expired";
-        // the background refresh loop handles renewal, re-auth is not needed.
+        // OAuth account — background loop handles refresh automatically.
+        // Show "valid" even if locally expired; the loop will renew before it matters.
         dotClass = 'filled green';
         statusText = 'valid';
     } else if (isExpired || (expiresInSecs != null && expiresInSecs <= 0)) {
-        // Only non-refreshable tokens (API keys) need manual re-auth when expired
+        // Non-refreshable (API key) expired — user must re-auth
         dotClass = 'triangle';
         statusText = 're-auth';
         isActionable = true;

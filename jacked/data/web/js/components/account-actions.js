@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 let _autoRefreshInterval = null;
 let _autoRefreshCountdown = 0;
+let _lastAutoRefreshAt = null; // Date.now() of last COMPLETED auto-refresh; null = no prior refresh or stopped
 const _singleRefreshInFlight = new Set(); // tracks accountIds with pending single-refresh
 // Shared via window.jackedState so websocket.js can check it without cross-file globals
 if (window.jackedState) window.jackedState._usageRefreshInProgress = false;
@@ -462,7 +463,15 @@ async function _triggerUsageRefresh() {
         } else {
             showToast('Usage refreshed for ' + result.refreshed + ' account' + (result.refreshed !== 1 ? 's' : ''), 'success');
         }
-        if (_autoRefreshInterval) _autoRefreshCountdown = _getAutoRefreshSeconds();
+        if (_autoRefreshInterval) {
+            // Reset countdown and anchor only when auto-refresh is running.
+            // This applies to both auto-tick fires and manual "Refresh All" clicks while auto-refresh is on —
+            // both reset the countdown, which is correct (a manual refresh acts like an early tick).
+            // When auto-refresh is OFF (_autoRefreshInterval is null), we skip this so a manual click
+            // doesn't silently start tracking _lastAutoRefreshAt without a timer running.
+            _autoRefreshCountdown = _getAutoRefreshSeconds();
+            _lastAutoRefreshAt = Date.now();
+        }
         // Clean up any remaining overlays (e.g., if WS events were missed)
         document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
         document.querySelectorAll('[data-account-id].usage-queued, [data-account-id].usage-checking').forEach(
@@ -583,10 +592,9 @@ function _updateRefreshBtnLabel() {
 // Auto-refresh usage
 // ---------------------------------------------------------------------------
 function _startAutoRefresh() {
-    if (_autoRefreshInterval) clearInterval(_autoRefreshInterval);
-    _autoRefreshCountdown = _getAutoRefreshSeconds();
-    _autoRefreshInterval = setInterval(_autoRefreshTick, 1000);
-    _updateRefreshBtnLabel();
+    // Cold start — clear timestamp so _changeAutoRefreshInterval takes the "fresh start" path
+    _lastAutoRefreshAt = null;
+    _changeAutoRefreshInterval(_getAutoRefreshSeconds());
 }
 
 function _stopAutoRefresh() {
@@ -594,7 +602,52 @@ function _stopAutoRefresh() {
         clearInterval(_autoRefreshInterval);
         _autoRefreshInterval = null;
     }
+    // Clearing _lastAutoRefreshAt ensures re-enable takes the "fresh start" path in
+    // _changeAutoRefreshInterval (null timestamp = no elapsed time to carry over).
+    // This applies to both: user selecting "Off" (manual stop) and the error circuit-breaker
+    // in _autoRefreshTick calling _stopAutoRefresh() after a failure.
+    _lastAutoRefreshAt = null;
     _updateRefreshBtnLabel();
+}
+
+function _changeAutoRefreshInterval(newSecs) {
+    if (_autoRefreshInterval) clearInterval(_autoRefreshInterval);
+    _autoRefreshInterval = null;
+
+    if (!_lastAutoRefreshAt) {
+        // Coming from OFF state or cold start — always start fresh, no immediate fire
+        _autoRefreshCountdown = newSecs;
+        _lastAutoRefreshAt = Date.now();
+        _autoRefreshInterval = setInterval(_autoRefreshTick, 1000);
+        _updateRefreshBtnLabel();
+        return;
+    }
+
+    const elapsedSecs = Math.floor((Date.now() - _lastAutoRefreshAt) / 1000);
+    const remaining = newSecs - elapsedSecs;
+
+    if (remaining <= 0) {
+        // Overdue at new interval — fire immediately if not already refreshing.
+        // Note: .catch(() => {}) is intentional — unlike _autoRefreshTick's circuit-breaker catch,
+        // this is a one-shot user-triggered fire; transient errors should not stop the timer.
+        _autoRefreshCountdown = newSecs;
+        // IMPORTANT: _autoRefreshInterval MUST be assigned before _triggerUsageRefresh() is called.
+        // The success block in _triggerUsageRefresh checks _autoRefreshInterval to decide whether
+        // to update _lastAutoRefreshAt. Swapping this order would silently skip that update.
+        _autoRefreshInterval = setInterval(_autoRefreshTick, 1000);
+        _updateRefreshBtnLabel();
+        // Do NOT set _lastAutoRefreshAt here — let _triggerUsageRefresh success block do it on
+        // completion. If the fire is skipped (in-flight guard), _lastAutoRefreshAt stays at the
+        // previous completed-refresh time, which is the correct anchor for elapsed-time calculations.
+        if (!window.jackedState._usageRefreshInProgress) {
+            _triggerUsageRefresh().catch(() => {});
+        }
+    } else {
+        // Carry over elapsed time — next tick is sooner than a full new interval
+        _autoRefreshCountdown = remaining;
+        _autoRefreshInterval = setInterval(_autoRefreshTick, 1000);
+        _updateRefreshBtnLabel();
+    }
 }
 
 async function _autoRefreshTick() {
@@ -630,7 +683,25 @@ function bindAutoRefreshToggle() {
         sel.value = '0';
         localStorage.setItem('jacked_auto_refresh_interval', '0');
     }
-    if (_getAutoRefreshSeconds() > 0 && !_autoRefreshInterval) _startAutoRefresh();
+    const storedSecs = _getAutoRefreshSeconds();
+    if (storedSecs > 0) {
+        if (!_autoRefreshInterval) {
+            _startAutoRefresh();
+        } else if (_lastAutoRefreshAt) {
+            // Timer was running while on another tab — _autoRefreshTick pauses when btn is absent.
+            // Check elapsed time and correct the frozen countdown regardless of whether we're overdue.
+            const elapsed = Math.floor((Date.now() - _lastAutoRefreshAt) / 1000);
+            if (elapsed >= storedSecs) {
+                // Overdue — fire immediately and restart the interval.
+                _changeAutoRefreshInterval(storedSecs);
+            } else {
+                // Not yet overdue — correct the frozen countdown to reflect actual elapsed time.
+                // (Countdown froze while off-tab because _autoRefreshTick bails when btn is absent.)
+                _autoRefreshCountdown = storedSecs - elapsed;
+                _updateRefreshBtnLabel();
+            }
+        }
+    }
 
     sel.addEventListener('change', () => {
         const val = sel.value;
@@ -638,7 +709,7 @@ function bindAutoRefreshToggle() {
         if (val === '0') {
             _stopAutoRefresh();
         } else {
-            _startAutoRefresh();
+            _changeAutoRefreshInterval(parseInt(val, 10));
         }
     });
 }

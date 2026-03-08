@@ -40,7 +40,7 @@ Two categories: **required** (always reviewed) and **optional** (dispatcher sele
 | 1 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
 | 2 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
 | 3 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
-| 4 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
+| 4 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior; **discoverability** (are entry points present from related pages? is the path natural?); **workflow correctness** (does the change fit the user's mental model and expected flow?) |
 | 5 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
 | 6 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
 | 7 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
@@ -76,6 +76,8 @@ Each reviewer in a wave gets a different wild card. Shuffle the pool; no repeats
 - "What if the input contains unicode/emoji?"
 - "What if this is the user's very first time using the feature?"
 - "What if a feature flag is disabled?"
+- "Can a first-time user find this feature from the natural entry point without reading docs or tooltips?"
+- "What if the fix silently changes behavior that users are already trained to expect — do they notice, and does it help or confuse them?"
 
 ## PRE-MORTEM FAILURE SCENARIOS
 
@@ -91,6 +93,7 @@ The pre-mortem agent gets 2-3 scenarios from this pool (shuffled; no repeats unt
 - "A new developer joined and introduced a regression in this code within their first week. What was unclear?"
 - "This feature shipped but adoption is near zero — users can't figure it out. What's confusing?"
 - "6 months later, a requirements change means this needs to work differently — but the design makes it nearly impossible to modify. What's coupled too tightly?"
+- "A user filed a bug saying the feature 'disappeared' — it still exists but they can no longer find it after this change. What moved or changed that broke their muscle memory?"
 
 **Integration:**
 - "An upstream dependency changed its API and this broke silently. Where are the implicit contracts?"
@@ -204,6 +207,8 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
       Post-implementation → Testing checks actual test coverage)
     - What does the project context suggest? (multi-tenant → Access Control;
       pure CLI tool → probably skip UX & Flow)
+    - Any UI element added, moved, renamed, or hidden → include UX & Flow (with discoverability emphasis)
+    - Any behavior change visible to the user (status change, label change, action removed) → UX & Flow
     - When in doubt, include the lens — better to review something unnecessary than miss something important.
 
     **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum, 2 reviewers).
@@ -275,6 +280,24 @@ Announce format (always):
 - Reviewer A-[M]: [selected lens pairs as above]
 - Pre-Mortem Analyst: [2-3 failure scenarios from pool]
 ```
+
+#### CONDITIONAL: UX & Flow Discoverability Sub-checklist
+
+If any reviewer in this wave is assigned the **UX & Flow** lens, append the following block
+to their Lens details (item 3) in the spawn prompt:
+
+> #### Discoverability & Workflow Correctness
+> - **Entry points:** From pages that naturally precede this feature/fix, is there a visible path in
+>   (link, button, nav item, card)? If something was added/moved/renamed, do the old entry points
+>   still work or now lead nowhere?
+> - **Navigation depth:** How many steps/clicks to reach the changed behavior? 1-2 = fine;
+>   3+ for a primary action = flag MEDIUM.
+> - **First-use clarity:** If a user encounters this for the first time, is the purpose and action
+>   immediately obvious without reading documentation?
+> - **Workflow correctness:** Does the change fit the user's expected mental model? Could a user
+>   accidentally trigger an unintended action, or miss that the behavior has changed?
+> - **Return / recovery:** After the user takes the action, do they land in the right place?
+>   Is there a clear way to undo or go back?
 
 8. **Wait** for all results.
 

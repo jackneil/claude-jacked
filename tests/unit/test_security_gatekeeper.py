@@ -4647,3 +4647,71 @@ class TestCheckFileToolPermissions:
             # project/src/../lib normalizes to project/lib — still under project
             matched, _ = gk._check_file_tool_permissions("Read", "/home/user/project/src/../lib/util.py")
         assert matched is True
+
+
+# ---------------------------------------------------------------------------
+# _is_outside_project: ~/.claude/commands and ~/.claude/skills allowlist
+# (fixes macOS /Users → /private/Users symlink expansion)
+# ---------------------------------------------------------------------------
+
+class TestClaudeCommandsAllowlist:
+    """_is_outside_project allows ~/.claude/commands and ~/.claude/skills
+    even when Path.resolve() expands symlinks (macOS /Users → /private/Users)."""
+
+    def test_claude_commands_unresolved_path(self, tmp_path):
+        """Normal (unresolved) path to ~/.claude/commands is allowed."""
+        normal_path = str(Path.home() / ".claude" / "commands" / "whats-next.md")
+        result = gk._is_outside_project(normal_path, str(tmp_path), [])
+        assert result is None, f"Expected None (allowed), got: {result}"
+
+    def test_claude_skills_unresolved_path(self, tmp_path):
+        """Normal (unresolved) path to ~/.claude/skills is allowed."""
+        normal_path = str(Path.home() / ".claude" / "skills" / "dcr" / "SKILL.md")
+        result = gk._is_outside_project(normal_path, str(tmp_path), [])
+        assert result is None, f"Expected None (allowed), got: {result}"
+
+    def test_claude_commands_resolved_path(self, tmp_path, monkeypatch):
+        """~/.claude/commands is allowed even when Path.resolve() expands symlinks.
+
+        Simulates macOS where /Users is a symlink to /private/Users:
+        the resolved path starts with /private/Users but the allowlist
+        check should still return None (allowed).
+        """
+        real_home = Path.home()
+        # Simulate resolved path (e.g., /private/Users/... on macOS)
+        resolved_home = Path("/private") / str(real_home).lstrip("/")
+        resolved_path = str(resolved_home / ".claude" / "commands" / "test.md")
+        # Patch Path.home() so _is_outside_project builds the allowlist from the same base
+        # (we want to test the resolve() branch, not fake a different home)
+        # Instead, patch (Path.home() / ".claude").resolve() to return the resolved form
+        resolved_claude = resolved_home / ".claude"
+        with patch.object(
+            Path,
+            "resolve",
+            lambda self: resolved_claude if ".claude" in str(self) else self,
+        ):
+            result = gk._is_outside_project(resolved_path, str(tmp_path), [])
+        assert result is None, f"Expected None (allowed), got: {result}"
+
+
+# ---------------------------------------------------------------------------
+# local_evaluate: git rev-list
+# ---------------------------------------------------------------------------
+
+class TestGitRevList:
+    """git rev-list is in SAFE_PREFIXES and evaluates as YES."""
+
+    def test_git_rev_list_count_head(self):
+        result, reason = gk.local_evaluate("git rev-list --count HEAD")
+        assert result == "YES", f"Expected YES, got {result!r} ({reason})"
+
+    def test_compound_git_rev_list_is_safe(self):
+        """Compound command containing git rev-list evaluates as YES (all parts safe)."""
+        cmd = (
+            "git rev-parse --show-toplevel 2>/dev/null && "
+            "git rev-list --count HEAD 2>/dev/null && "
+            "git log --oneline -5"
+        )
+        result, reason = gk.local_evaluate(cmd)
+        assert result == "YES", f"Expected YES, got {result!r} ({reason})"
+        assert "compound" in reason.lower(), f"Expected 'compound' in reason, got: {reason}"

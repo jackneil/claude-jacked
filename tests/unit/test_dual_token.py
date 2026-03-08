@@ -4,7 +4,7 @@ Covers:
 - Migration seeding (cc_access_token seeded, cc_refresh_token NOT seeded)
 - build_oauth_data preference logic
 - should_refresh_cc / refresh_cc_token
-- CC invalid_grant clearing
+- CC invalid_grant handling
 - CC OAuth identity validation
 - CAS pattern in _sync_tokens_from_file
 - resolve_account Layer 4 CC match
@@ -519,7 +519,7 @@ class TestUpdateAccountWhitelist:
 
 
 # ---------------------------------------------------------------------------
-# CC invalid_grant clearing
+# CC invalid_grant handling
 # ---------------------------------------------------------------------------
 
 
@@ -593,18 +593,19 @@ class TestRefreshCCTokenSuccess:
         assert acct["cc_refresh_token"] == "existing_rt"  # Preserved
 
 
-class TestCCInvalidGrantClearing:
-    """Verify that CC invalid_grant clears both cc_access_token and cc_refresh_token."""
+class TestCCInvalidGrantHandling:
+    """Verify that CC invalid_grant clears refresh token but preserves access token."""
 
     @patch("jacked.web.auth.httpx.AsyncClient")
-    def test_invalid_grant_clears_all_cc_tokens(self, mock_client_cls, tmp_path):
-        """invalid_grant response clears cc_access_token, cc_refresh_token, cc_expires_at."""
+    def test_invalid_grant_clears_refresh_preserves_access(self, mock_client_cls, tmp_path):
+        """invalid_grant clears cc_refresh_token, preserves cc_access_token + cc_expires_at."""
         db = _make_db(tmp_path)
+        expires = int(time.time()) - 100
         db.update_account(
             1,
             cc_access_token="old_cc_at",
             cc_refresh_token="old_cc_rt",
-            cc_expires_at=int(time.time()) - 100,  # expired
+            cc_expires_at=expires,
         )
 
         # Mock HTTP response: 400 invalid_grant
@@ -621,9 +622,9 @@ class TestCCInvalidGrantClearing:
 
         assert result is False
         acct = db.get_account(1)
-        assert acct["cc_access_token"] is None
-        assert acct["cc_refresh_token"] is None
-        assert acct["cc_expires_at"] is None
+        assert acct["cc_access_token"] == "old_cc_at"      # preserved
+        assert acct["cc_refresh_token"] is None              # cleared
+        assert acct["cc_expires_at"] == expires               # preserved
 
     @patch("jacked.web.auth.httpx.AsyncClient")
     def test_invalid_grant_does_not_mark_account_invalid(
@@ -1031,7 +1032,7 @@ class TestRefreshCCTokenNon400Errors:
         acct = db.get_account(1)
         # Account NOT marked invalid — CC doesn't control account validity
         assert acct["validation_status"] != "invalid"
-        # CC tokens NOT cleared (only invalid_grant clears them)
+        # CC tokens NOT cleared (invalid_grant only clears cc_refresh_token)
         assert acct["cc_access_token"] == "old_cc_at"
         assert acct["cc_refresh_token"] == "old_cc_rt"
 

@@ -83,8 +83,8 @@ def should_refresh_cc(account: dict) -> bool:
 async def refresh_cc_token(account_id: int, db: Database) -> bool:
     """Refresh CC token pair independently. Updates cc_* columns only.
 
-    On invalid_grant: clear both cc_access_token and cc_refresh_token so
-    build_oauth_data() falls back to primary with refreshToken: None.
+    On invalid_grant: clear only cc_refresh_token (consumed by Claude Code).
+    Keep cc_access_token — it may still be valid until cc_expires_at.
     Does NOT mark account as invalid — primary token health determines
     account validity.
 
@@ -148,21 +148,17 @@ async def refresh_cc_token(account_id: int, db: Database) -> bool:
                     try:
                         error_data = resp.json()
                         if error_data.get("error") == "invalid_grant":
-                            # CC refresh token consumed (likely by Claude Code).
-                            # Clear both CC tokens so build_oauth_data() falls
-                            # back to primary with refreshToken: None.
                             logger.warning(
-                                "Account %d: CC invalid_grant — clearing CC tokens",
+                                "Account %d: CC invalid_grant — clearing refresh token "
+                                "(access token preserved until expiry)",
                                 account_id,
                             )
                             db.update_account(
                                 account_id,
-                                cc_access_token=None,
                                 cc_refresh_token=None,
-                                cc_expires_at=None,
                             )
                             return False
-                    except Exception:
+                    except (ValueError, AttributeError):
                         pass
 
                 logger.warning(
@@ -399,13 +395,8 @@ async def fetch_usage(
                     raw=data,
                 )
 
+                # clear_account_errors marks valid, clears last_error, consecutive_failures
                 db.clear_account_errors(account_id)
-                # Token clearly works — clear any stale invalid/expired state
-                db.update_account(
-                    account_id,
-                    validation_status="valid",
-                    last_validated_at=int(time.time()),
-                )
                 logger.info(f"Usage fetched for account {account_id}")
                 return data
 
