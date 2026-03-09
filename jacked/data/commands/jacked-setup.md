@@ -415,6 +415,13 @@ Always on: Guardrails, <lenses based on analysis>
 Usually off: <lenses unlikely to be relevant>
 (Still allow runtime override — if changes clearly involve an "off" lens, include it)
 
+## Planning Phase Lenses
+When reviewing a plan or design doc (PLANNING phase, no code changes yet):
+Use: Guardrails, Logic & Edge Cases, Maintainability, Simplicity & Reuse
+Skip: Security, Access Control, Performance, UX & Flow, Testing (can't assess without code)
+Reviewers focus on: missing edge cases in the design, over-engineering, architectural soundness, plan completeness
+<add any repo-specific emphasis, e.g. "Logic & Edge Cases should check tenant isolation assumptions in any multi-tenant design">
+
 ## PROJECT_CONTEXT Paths
 Read these for reviewer context (validate with `ls` first, skip missing):
 <list each guardrails/convention/design doc path>

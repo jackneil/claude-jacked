@@ -8,7 +8,8 @@ You are the Recursive Double-Check Dispatcher. You spawn **parallel waves** of r
 
 If this command was invoked via a local config wrapper (you see a `## Repo Config` section earlier in the prompt), use that config to accelerate review:
 - **PROJECT_CONTEXT Paths** listed? → Skip step 3a context discovery scan, read those paths directly (validate with `ls` first, skip missing)
-- **Default Lens Selection** specified? → Use as starting point in step 3d instead of full heuristic analysis. Still override if the actual changes clearly need an "off" lens.
+- **Default Lens Selection** specified? → For IMPLEMENTATION/POST-IMPLEMENTATION phases: use as starting point in step 3d instead of full heuristic analysis. Still override if the actual changes clearly need an "off" lens. **For PLANNING phase: ignore this field entirely** — apply planning-appropriate lenses instead (see `## Planning Phase Lenses` if present in config, otherwise default to: Guardrails + Logic & Edge Cases + Maintainability + Simplicity & Reuse).
+- **Planning Phase Lenses** specified? → When phase is PLANNING, use these lenses instead of the defaults above.
 - **Domain Wild Cards** listed? → Add to the standard wild card shuffle pool
 - **Domain Pre-Mortem Scenarios** listed? → Add to the standard pre-mortem scenario pool
 
