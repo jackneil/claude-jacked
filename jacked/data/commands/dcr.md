@@ -144,6 +144,13 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
 
 ## EXECUTION FLOW
 
+0. **Plan mode check**: Look for a current system reminder containing "Plan mode is active" or "you MUST NOT make any edits" (exact phrases, not partial matches). If found:
+   - Set `phase = PLANNING`. Skip step 1.
+   - Find the plan file path in the system reminder and read it as the review target. If no path is found, ask: "What plan doc should I review?"
+   - **Lens selection**: use Planning Phase Lenses from Config Override if present; otherwise apply the defaults listed in Config Override (Guardrails + Logic & Edge Cases + Maintainability + Simplicity & Reuse). Config Override takes precedence over step 0 defaults.
+   - Reviewers analyze the plan document: architectural soundness, completeness, missing edge cases, over-engineering, logical gaps. Reviewers remain READ-ONLY as always.
+   - **Fix phase**: the parent dispatcher (you) edits the plan file to incorporate findings — this is the one file editable in plan mode. Do not edit any other files.
+
 1. **Detect phase** using the signals above. If ambiguous, ask the user.
 2. **Announce**: "Starting parallel DCR. Phase: [PHASE]. Selecting relevant lenses and spawning reviewers."
 3. **Initialize**:
