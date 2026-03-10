@@ -73,6 +73,10 @@ const jackedWS = {
                 el => el.classList.remove('usage-checking', 'usage-queued')
             );
             document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
+            // If upgrade modal is open and WS drops, server is likely restarting — begin health poll
+            if (document.getElementById('upgrade-modal') && typeof _startHealthPolling === 'function') {
+                _startHealthPolling();
+            }
             this._scheduleReconnect();
         };
 
@@ -376,6 +380,25 @@ jackedWS.on('server_logs_changed', (msg) => {
     if (typeof _srvHandleWsEntries === 'function') {
         _srvHandleWsEntries(msg.payload?.entries);
     }
+});
+
+/** Upgrade progress events */
+jackedWS.on('upgrade_started', () => {
+    if (typeof _showUpgradeModal === 'function') _showUpgradeModal('Upgrading claude-jacked\u2026');
+});
+
+jackedWS.on('upgrade_progress', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof _updateUpgradeModal === 'function') _updateUpgradeModal(d.message || 'Working\u2026');
+});
+
+jackedWS.on('upgrade_complete', () => {
+    if (typeof _startHealthPolling === 'function') _startHealthPolling();
+});
+
+jackedWS.on('upgrade_failed', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof _showUpgradeError === 'function') _showUpgradeError(d.error || 'Upgrade failed');
 });
 
 jackedWS.on('sessions_changed', async () => {

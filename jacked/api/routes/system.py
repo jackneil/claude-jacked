@@ -1,6 +1,10 @@
 """System routes — health, version, installations, settings, gatekeeper config."""
 
+import asyncio
 import logging
+import os
+import shutil
+import sys
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Request, status
@@ -689,6 +693,74 @@ async def installations_overview(request: Request):
         projects=projects,
         total_projects=total_projects,
     )
+
+
+# --- Self-upgrade ---
+
+_upgrade_lock = asyncio.Lock()
+
+
+async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
+    if ws_registry:
+        try:
+            await ws_registry.broadcast(event, payload)
+        except Exception:
+            logger.exception("Failed to broadcast %s", event)
+
+
+async def _upgrade_run_cmd(cmd: list[str]) -> None:
+    """Run a subprocess command list, raising RuntimeError on failure or timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"{cmd[0]} timed out after 120s")
+    if proc.returncode != 0:
+        raise RuntimeError((stdout or b"").decode()[-500:] or "Unknown error")
+
+
+async def _do_upgrade(ws_registry) -> None:
+    async with _upgrade_lock:
+        try:
+            await _upgrade_broadcast(ws_registry, "upgrade_started", {})
+
+            uv_bin = shutil.which("uv")
+            if not uv_bin:
+                raise RuntimeError("uv not found on PATH \u2014 cannot upgrade")
+            await _upgrade_broadcast(ws_registry, "upgrade_progress",
+                                     {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
+            await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
+
+            jacked_bin = shutil.which("jacked")
+            if not jacked_bin:
+                raise RuntimeError("jacked not found on PATH \u2014 cannot reinstall")
+            await _upgrade_broadcast(ws_registry, "upgrade_progress",
+                                     {"step": "reinstall", "message": "Reinstalling files\u2026"})
+            await _upgrade_run_cmd([jacked_bin, "install", "--force"])
+
+            await _upgrade_broadcast(ws_registry, "upgrade_complete",
+                                     {"message": "Restarting server\u2026"})
+            await asyncio.sleep(1.5)  # let WS message flush
+            # Replace the running process with a fresh start — entry point shebang picks up new venv
+            os.execv(sys.argv[0], sys.argv)
+
+        except Exception as exc:
+            await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": str(exc)})
+
+
+@router.post("/upgrade")
+async def system_upgrade(request: Request):
+    """Upgrade claude-jacked, reinstall files, and restart the server."""
+    if _upgrade_lock.locked():
+        return JSONResponse(status_code=409, content={"detail": "Upgrade already in progress"})
+    ws_registry = getattr(request.app.state, "ws_registry", None)
+    asyncio.create_task(_do_upgrade(ws_registry))
+    return {"status": "started"}
 
 
 # --- Gatekeeper logs ---
