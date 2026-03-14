@@ -1968,6 +1968,45 @@ async function renderClaudeCodeTab(container) {
         // --- Permissions ---
         html += _renderPermissionsSection(permissions);
 
+        // --- Chrome DevTools MCP ---
+        html += `
+            <div class="mb-6 border-t border-slate-700 pt-5">
+                <div class="flex items-center gap-2 mb-1">
+                    <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
+                    <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider">Browser Tools</h3>
+                </div>
+                <p class="text-xs text-slate-500 mb-3">Chrome DevTools MCP powers <code class="text-slate-300">/qa</code> and <code class="text-slate-300">/ux</code> browser testing. Requires <span class="text-emerald-400">Chrome 144+</span> with remote debugging enabled.</p>
+                <div id="cdp-mcp-status" class="p-3 bg-slate-900/50 rounded border border-slate-700/50">
+                    <div class="flex items-center justify-between">
+                        <div class="min-w-0 flex-1">
+                            <div class="text-sm text-white">Chrome DevTools MCP</div>
+                            <div id="cdp-mcp-status-text" class="text-xs text-slate-400">Checking...</div>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <select id="cdp-mcp-mode" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500" disabled>
+                                <option value="autoConnect">Auto-connect (Chrome 144+)</option>
+                                <option value="browserUrl">Browser URL (:9222)</option>
+                                <option value="launch">Launch new Chrome</option>
+                                <option value="headless">Headless (no UI)</option>
+                            </select>
+                            <label class="toggle-switch" id="cdp-mcp-toggle">
+                                <input type="checkbox" disabled>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div id="cdp-mcp-help" class="hidden mt-3 p-2 bg-slate-800/50 rounded border border-slate-700/30">
+                        <p class="text-xs text-slate-400 mb-1 font-semibold">Setup instructions:</p>
+                        <ol class="text-xs text-slate-500 list-decimal ml-4 space-y-1">
+                            <li>Install Chrome 144 or newer — check at <code class="text-slate-300">chrome://version</code></li>
+                            <li>Enable remote debugging at <code class="text-slate-300">chrome://inspect/#remote-debugging</code></li>
+                            <li>Restart Claude Code after enabling</li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+        `;
+
         // --- Raw JSON Editor ---
         html += `
             <div class="mb-6 border-t border-slate-700 pt-5">
@@ -2391,6 +2430,9 @@ function _bindClaudeCodeEvents(container) {
         });
     });
 
+    // Chrome DevTools MCP — load status then bind events (once only)
+    _initChromeDevToolsMCP(container);
+
     // Raw JSON editor — collapsible
     const rawHeader = document.getElementById('raw-editor-header');
     const rawContent = document.getElementById('raw-editor-content');
@@ -2406,6 +2448,82 @@ function _bindClaudeCodeEvents(container) {
             }
         });
     }
+}
+
+async function _refreshChromeDevToolsStatus() {
+    const statusText = document.getElementById('cdp-mcp-status-text');
+    const modeSelect = document.getElementById('cdp-mcp-mode');
+    const toggleInput = document.getElementById('cdp-mcp-toggle')?.querySelector('input');
+    const helpDiv = document.getElementById('cdp-mcp-help');
+    if (!statusText || !modeSelect || !toggleInput) return;
+
+    try {
+        const data = await api.get('/api/chrome-devtools-mcp');
+        if (data.installed) {
+            statusText.textContent = `Configured (${data.mode || 'default'})`;
+            statusText.className = 'text-xs text-emerald-400';
+            modeSelect.value = data.mode || 'autoConnect';
+            modeSelect.disabled = false;
+            toggleInput.checked = true;
+            toggleInput.disabled = false;
+            if (helpDiv) helpDiv.classList.add('hidden');
+        } else {
+            statusText.textContent = 'Not configured';
+            statusText.className = 'text-xs text-amber-400';
+            modeSelect.disabled = true;
+            toggleInput.checked = false;
+            toggleInput.disabled = false;
+            if (helpDiv) helpDiv.classList.remove('hidden');
+        }
+    } catch (e) {
+        statusText.textContent = 'Error loading status';
+        statusText.className = 'text-xs text-red-400';
+        if (helpDiv) helpDiv.classList.remove('hidden');
+    }
+}
+
+function _initChromeDevToolsMCP(container) {
+    const toggleInput = document.getElementById('cdp-mcp-toggle')?.querySelector('input');
+    const modeSelect = document.getElementById('cdp-mcp-mode');
+    if (!toggleInput || !modeSelect) return;
+
+    // Load initial status
+    _refreshChromeDevToolsStatus();
+
+    // Bind events once only
+    toggleInput.addEventListener('change', async () => {
+        toggleInput.disabled = true;
+        try {
+            if (toggleInput.checked) {
+                const mode = modeSelect.value || 'autoConnect';
+                await api.put('/api/chrome-devtools-mcp', { mode });
+                showToast(`Chrome DevTools MCP enabled (${mode}). Restart Claude Code.`, 'warning');
+            } else {
+                await api.delete('/api/chrome-devtools-mcp');
+                showToast('Chrome DevTools MCP removed. Restart Claude Code.', 'warning');
+            }
+            await _refreshChromeDevToolsStatus();
+        } catch (e) {
+            toggleInput.checked = !toggleInput.checked;
+            showToast(e.message || 'Failed to update Chrome DevTools MCP', 'error');
+        } finally {
+            toggleInput.disabled = false;
+        }
+    });
+
+    modeSelect.addEventListener('change', async () => {
+        if (!toggleInput.checked) return;
+        modeSelect.disabled = true;
+        try {
+            await api.put('/api/chrome-devtools-mcp', { mode: modeSelect.value });
+            showToast(`Mode changed to ${modeSelect.value}. Restart Claude Code.`, 'warning');
+            await _refreshChromeDevToolsStatus();
+        } catch (e) {
+            showToast(e.message || 'Failed to change mode', 'error');
+        } finally {
+            modeSelect.disabled = false;
+        }
+    });
 }
 
 async function _loadRawEditor() {

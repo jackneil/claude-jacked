@@ -1061,3 +1061,51 @@ async def set_raw_settings(body: RawSettingsRequest):
     async with _settings_lock:
         _write_settings_json(body.content)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Chrome DevTools MCP endpoints — manage browser tool configuration
+# ---------------------------------------------------------------------------
+
+@router.get("/chrome-devtools-mcp")
+async def get_chrome_devtools_mcp():
+    """Get Chrome DevTools MCP configuration status."""
+    from jacked.cli import _get_chrome_devtools_mcp_status
+
+    result = await asyncio.to_thread(_get_chrome_devtools_mcp_status)
+    return result
+
+
+class ChromeDevToolsMCPRequest(BaseModel):
+    mode: Literal["autoConnect", "browserUrl", "launch", "headless"]
+    # Keep in sync with CHROME_DEVTOOLS_MODES in jacked/cli.py
+
+
+@router.put("/chrome-devtools-mcp")
+async def set_chrome_devtools_mcp(body: ChromeDevToolsMCPRequest):
+    """Update Chrome DevTools MCP connection mode."""
+    from jacked.cli import _set_chrome_devtools_mcp_mode
+
+    success, message = await asyncio.to_thread(
+        _set_chrome_devtools_mcp_mode, body.mode
+    )
+    if not success:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": {"message": message}},
+        )
+    return {"ok": True, "mode": body.mode, "message": message}
+
+
+@router.delete("/chrome-devtools-mcp")
+async def remove_chrome_devtools_mcp():
+    """Remove Chrome DevTools MCP configuration."""
+    from jacked.cli import _remove_chrome_devtools_mcp
+
+    removed = await asyncio.to_thread(_remove_chrome_devtools_mcp)
+    if not removed:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": {"message": "Failed to remove Chrome DevTools MCP"}},
+        )
+    return {"ok": True}

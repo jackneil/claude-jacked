@@ -1705,6 +1705,143 @@ def _remove_qa_hook(settings_path: Path) -> bool:
     return False
 
 
+CHROME_DEVTOOLS_MODES: dict[str, list[str]] = {
+    "autoConnect": ["--autoConnect"],
+    "browserUrl": ["--browserUrl", "http://127.0.0.1:9222"],
+    "launch": [],
+    "headless": ["--headless"],
+}
+
+
+def _run_claude_mcp(
+    *args: str, timeout: int = 10
+) -> "subprocess.CompletedProcess[str] | None":
+    """Run a ``claude mcp`` subcommand, returning the result or None on error."""
+    import shutil
+    import subprocess
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        return None
+
+    try:
+        return subprocess.run(
+            [claude_bin, "mcp", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _install_chrome_devtools_mcp(force: bool = False) -> None:
+    """Install Chrome DevTools MCP server (user-scoped via ``claude mcp add``)."""
+    result = _run_claude_mcp("get", "chrome-devtools")
+    already_installed = result is not None and result.returncode == 0
+
+    if already_installed and not force:
+        console.print("[yellow][-][/yellow] Chrome DevTools MCP already configured")
+        return
+
+    if already_installed and force:
+        rm = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
+        if rm is None or rm.returncode != 0:
+            console.print("[yellow][WARN][/yellow] Could not remove existing Chrome DevTools MCP — attempting overwrite")
+
+    add = _run_claude_mcp(
+        "add", "-s", "user", "chrome-devtools", "--",
+        "npx", "chrome-devtools-mcp@latest", "--autoConnect",
+        timeout=30,
+    )
+    if add is None:
+        console.print("[red][FAIL][/red] Chrome DevTools MCP setup failed (claude CLI not found or timed out)")
+    elif add.returncode == 0:
+        console.print("[green][OK][/green] Chrome DevTools MCP configured (autoConnect)")
+        console.print("[dim]     Requires Chrome 144+ with remote debugging enabled[/dim]")
+        console.print("[dim]     Enable at: chrome://inspect/#remote-debugging[/dim]")
+    else:
+        console.print(f"[red][FAIL][/red] Chrome DevTools MCP setup failed: {add.stderr.strip()}")
+
+
+def _remove_chrome_devtools_mcp() -> bool:
+    """Remove Chrome DevTools MCP server. Returns True if removed."""
+    result = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
+    if result is not None and result.returncode == 0:
+        console.print("[green][OK][/green] Removed Chrome DevTools MCP")
+        return True
+    return False
+
+
+def _get_chrome_devtools_mcp_status() -> dict:
+    """Get Chrome DevTools MCP configuration status.
+
+    Returns dict with keys: installed (bool), mode (str | None), details (str).
+    """
+    result = _run_claude_mcp("get", "chrome-devtools")
+    if result is None:
+        return {"installed": False, "mode": None, "details": "claude CLI not found or timed out"}
+    if result.returncode != 0:
+        return {"installed": False, "mode": None, "details": "Not configured"}
+
+    output = result.stdout.strip()
+    # Parse mode from the args line
+    if "--autoConnect" in output:
+        mode = "autoConnect"
+    elif "--browserUrl" in output:
+        mode = "browserUrl"
+    elif "--headless" in output:
+        mode = "headless"
+    else:
+        mode = "launch"
+    return {"installed": True, "mode": mode, "details": output}
+
+
+def _set_chrome_devtools_mcp_mode(mode: str) -> tuple[bool, str]:
+    """Reconfigure Chrome DevTools MCP connection mode.
+
+    Returns (success, message). Captures existing config before removal
+    so it can be restored if the re-add fails.
+    """
+    if mode not in CHROME_DEVTOOLS_MODES:
+        return False, f"Unknown mode: {mode}. Valid: {', '.join(CHROME_DEVTOOLS_MODES)}"
+
+    # Capture current mode for rollback
+    current = _run_claude_mcp("get", "chrome-devtools")
+    had_existing = current is not None and current.returncode == 0
+    prev_mode_args: list[str] = []
+    if had_existing:
+        output = current.stdout
+        for m, args in CHROME_DEVTOOLS_MODES.items():
+            if args and args[0] in output:
+                prev_mode_args = args
+                break
+
+    # Remove existing
+    if had_existing:
+        rm = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
+        if rm is None or rm.returncode != 0:
+            return False, "Failed to remove existing configuration"
+
+    # Re-add with new mode
+    add_args = ["add", "-s", "user", "chrome-devtools", "--",
+                "npx", "chrome-devtools-mcp@latest"] + CHROME_DEVTOOLS_MODES[mode]
+    add = _run_claude_mcp(*add_args, timeout=30)
+
+    if add is not None and add.returncode == 0:
+        return True, f"Chrome DevTools MCP set to {mode}"
+
+    # Rollback: restore previous config if add failed
+    if had_existing:
+        _run_claude_mcp(
+            "add", "-s", "user", "chrome-devtools", "--",
+            "npx", "chrome-devtools-mcp@latest", *prev_mode_args,
+            timeout=30,
+        )
+    error = add.stderr.strip() if add else "timed out or claude CLI not found"
+    return False, f"Failed to set mode: {error}"
+
+
 def _detect_project_env() -> str | None:
     """Detect the project's Python env root from the running interpreter.
 
@@ -2041,6 +2178,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             f"[dim][-][/dim] Skipped {g_skip + h_skip} existing templates (use --force to overwrite)"
         )
 
+    # Install Chrome DevTools MCP server (user-scoped)
+    _install_chrome_devtools_mcp(force=force)
+
     # Ensure analytics DB exists
     try:
         from jacked.web.database import Database
@@ -2091,6 +2231,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print("  - Security gatekeeper (auto-approves safe Bash commands)")
     if not no_rules:
         console.print("  - Behavioral rules in CLAUDE.md")
+    console.print("  - Chrome DevTools MCP (browser testing via /qa and /ux)")
     console.print("  - Guardrails templates (run 'jacked init' in a project to set up)")
 
     # Show next steps based on what's installed
@@ -2166,6 +2307,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _remove_security_hook(settings_path)
     _remove_session_tracker_hooks(settings_path)
     _remove_qa_hook(settings_path)
+    _remove_chrome_devtools_mcp()
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):
         console.print("[green][OK][/green] Removed behavioral rules from CLAUDE.md")

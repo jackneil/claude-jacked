@@ -23,18 +23,55 @@ If no `## Repo Config` section is present, run all detection steps normally.
 
 Check which browser automation tools are available. Prefer MCP tools first — they require no bash permissions and work without gatekeeper prompts.
 
-**Option A — Playwright MCP (preferred)**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, use Playwright tools for all browser interaction. Note to user:
-> Using Playwright MCP, which opens separate browser windows. Install agent-browser (`npm i -g agent-browser`) or Claude-in-Chrome for in-browser operation.
+**Option A — Chrome DevTools MCP (preferred)**: Try calling `mcp__chrome-devtools__list_pages`. If it works, use Chrome DevTools MCP tools for all browser interaction:
+- `mcp__chrome-devtools__navigate_page` → open pages
+- `mcp__chrome-devtools__take_snapshot` → accessibility tree (preferred for element detection)
+- `mcp__chrome-devtools__take_screenshot` → visual screenshot
+- `mcp__chrome-devtools__click` → click element by ref from snapshot
+- `mcp__chrome-devtools__fill` → fill input fields
+- `mcp__chrome-devtools__evaluate_script` → run JavaScript on page
+- `mcp__chrome-devtools__emulate` → change viewport size (mobile/tablet testing)
+- `mcp__chrome-devtools__list_console_messages` → check for JS errors
+- `mcp__chrome-devtools__list_network_requests` → check for failed requests
 
-**Option B — Claude-in-Chrome**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, use Claude-in-Chrome tools for all browser interaction.
+**If Chrome DevTools MCP fails** (tool call errors, connection refused, or no pages returned): Tell the user:
+```
+Chrome DevTools MCP is not responding. To fix:
 
-**Option C — agent-browser CLI**: Run `npx agent-browser --version` via Bash. If it succeeds, use agent-browser for all browser interaction via Bash tool calls (e.g., `npx agent-browser open <url>`, `npx agent-browser snapshot`, `npx agent-browser screenshot <path>`, `npx agent-browser click <ref>`, `npx agent-browser type <ref> <text>`, `npx agent-browser eval <js>`). This reuses your existing browser session — no new windows.
+1. Chrome version: You need Chrome 144 or newer.
+   Check yours at chrome://version — update if needed.
+
+2. Enable remote debugging (pick one):
+   a) In Chrome: go to chrome://inspect/#remote-debugging and enable it
+   b) Or launch Chrome with: --remote-debugging-port=9222
+      macOS:  /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+      Linux:  google-chrome --remote-debugging-port=9222
+
+3. If not installed: run `jacked install` (includes Chrome DevTools MCP setup)
+   or manually: claude mcp add -s user chrome-devtools -- npx chrome-devtools-mcp@latest --autoConnect
+```
+Then continue to Option B as fallback.
+
+**Option B — Playwright MCP**: Try using `mcp__plugin_playwright_playwright__browser_snapshot`. If it works, use Playwright tools for all browser interaction. Note to user:
+> Using Playwright MCP (Chrome DevTools MCP is preferred — see above). Playwright opens separate browser windows.
+
+**Option C — Claude-in-Chrome**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, use Claude-in-Chrome tools for all browser interaction.
+
+**Option D — agent-browser CLI**: Run `npx agent-browser --version` via Bash. If it succeeds, use agent-browser for all browser interaction via Bash tool calls (e.g., `npx agent-browser open <url>`, `npx agent-browser snapshot`, `npx agent-browser screenshot <path>`, `npx agent-browser click <ref>`, `npx agent-browser type <ref> <text>`, `npx agent-browser eval <js>`). This reuses your existing browser session — no new windows.
 > Note: `npx` requires a gatekeeper approval prompt unless pre-approved. Add `Bash(npx agent-browser:*)` via the jacked "Always Allow" button to avoid repeated prompts.
 
 **If none are available**: Tell the user:
 ```
-No browser tools detected. Install one:
-- Playwright MCP: Add to .mcp.json with --headless flag (no gatekeeper prompts)
+No browser tools detected. Recommended setup:
+
+  jacked install    (configures Chrome DevTools MCP automatically)
+
+Or install manually:
+  claude mcp add -s user chrome-devtools -- npx chrome-devtools-mcp@latest --autoConnect
+  (requires Chrome 144+ with remote debugging enabled — see chrome://inspect/#remote-debugging)
+
+Alternatives:
+- Playwright MCP: Add to .mcp.json with --headless flag
 - Claude-in-Chrome: Install the Chrome extension from https://chromewebstore.google.com
 - agent-browser: npm i -g agent-browser (requires npx pre-approval)
 ```
