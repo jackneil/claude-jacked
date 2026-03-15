@@ -53,18 +53,21 @@ Two categories: **required** (always reviewed) and **optional** (select based on
 ### Required (always included)
 | # | Lens | Focus Areas |
 |---|------|-------------|
-| 8 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
+| 1 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
 
 ### Optional (select based on relevance)
 | # | Lens | Focus Areas |
 |---|------|-------------|
-| 1 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
-| 2 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
-| 3 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
-| 4 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
-| 5 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
-| 6 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
-| 7 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
+| 2 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
+| 3 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
+| 4 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
+| 5 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
+| 6 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
+| 7 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
+| 8 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
+| 9 | **Simplicity & Reuse** | Redundant logic, reinvented utilities, over-engineering, premature abstraction |
+| 10 | **Observability & Debuggability** | Error context preservation, silent failure detection, structured logging adequacy, correlation/tracing, alertability |
+| 11 | **Data Integrity & Schema Safety** | Transaction boundaries, migration rollback safety, schema-code coupling, cache invalidation, idempotency, partial write recovery |
 
 ## PRE-REVIEW CONTEXT DISCOVERY
 
@@ -204,6 +207,9 @@ In addition to the main reviewer, always spawn a parallel pre-mortem agent. This
 **Integration:**
 - "An upstream dependency changed its API and this broke silently. Where are the implicit contracts?"
 - "Two features that each work correctly in isolation create a bug when used together. What's the interaction?"
+- "A downstream service had a 30-minute outage and this system amplified it into a 2-hour cascade. Trace the amplification path."
+- "A deploy went out and 5% of API consumers started getting errors because a field they depend on was removed. How did this slip through?"
+- "A background job failed silently for 3 days. Nobody noticed until a user reported missing data. Why was there no alert?"
 
 **Spawning instructions for the pre-mortem agent:**
 "You are the PRE-MORTEM ANALYST. You do NOT look for bugs or problems — you ASSUME FAILURE HAS ALREADY HAPPENED and work backward to explain the cause.

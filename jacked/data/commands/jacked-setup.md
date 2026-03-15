@@ -198,6 +198,9 @@ From these results, determine default lens weights:
 - Pure library/CLI (no routes, no components) → **UX & Flow** usually off
 - Test directory exists → **Testing** always on
 - Guardrails docs found → **Guardrails** gets extra context paths
+- Database/ORM/migration tool detected (alembic, django migrations, prisma, knex, etc.) → **Data Integrity & Schema Safety** always on
+- Service/API project with external integrations → **Observability & Debuggability** always on
+- Pure library with no I/O or persistence → **Data Integrity & Schema Safety** and **Observability & Debuggability** usually off
 
 ## Step 4: Check for Existing Local Files
 
@@ -418,7 +421,7 @@ Usually off: <lenses unlikely to be relevant>
 ## Planning Phase Lenses
 When reviewing a plan or design doc (PLANNING phase, no code changes yet):
 Use: Guardrails, Logic & Edge Cases, Maintainability, Simplicity & Reuse
-Skip: Security, Access Control, Performance, UX & Flow, Testing (can't assess without code)
+Skip: Security, Access Control, Performance, UX & Flow, Testing, Observability & Debuggability, Data Integrity & Schema Safety (can't assess without code)
 Reviewers focus on: missing edge cases in the design, over-engineering, architectural soundness, plan completeness
 <add any repo-specific emphasis, e.g. "Logic & Edge Cases should check tenant isolation assumptions in any multi-tenant design">
 

@@ -33,19 +33,21 @@ Two categories: **required** (always reviewed) and **optional** (dispatcher sele
 ### Required (always included)
 | # | Lens | Focus Areas |
 |---|------|-------------|
-| 8 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
+| 1 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
 
 ### Optional (select based on relevance to the changes)
 | # | Lens | Focus Areas |
 |---|------|-------------|
-| 1 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
-| 2 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
-| 3 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
-| 4 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior; **discoverability** (are entry points present from related pages? is the path natural?); **workflow correctness** (does the change fit the user's mental model and expected flow?) |
-| 5 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
-| 6 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
-| 7 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
-| 8 | **Simplicity & Reuse** | Redundant logic (same thing written twice), reinvented utilities (search for existing helpers before concluding new code is needed), over-engineering (simpler structure would work equally well), premature abstraction (interface/generics for a single concrete use), dead weight (params never varied, single-use abstractions, configs for hypothetical scenarios). Do NOT flag complexity that is genuinely necessary — the question is always "can this be equally correct with less code or indirection?" |
+| 2 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
+| 3 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
+| 4 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
+| 5 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior; **discoverability** (are entry points present from related pages? is the path natural?); **workflow correctness** (does the change fit the user's mental model and expected flow?) |
+| 6 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
+| 7 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
+| 8 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
+| 9 | **Simplicity & Reuse** | Redundant logic (same thing written twice), reinvented utilities (search for existing helpers before concluding new code is needed), over-engineering (simpler structure would work equally well), premature abstraction (interface/generics for a single concrete use), dead weight (params never varied, single-use abstractions, configs for hypothetical scenarios). Do NOT flag complexity that is genuinely necessary — the question is always "can this be equally correct with less code or indirection?" |
+| 10 | **Observability & Debuggability** | Error context preservation (catch blocks that destroy stack traces), silent failure detection (swallowed exceptions, missing log entries), structured logging adequacy, correlation/tracing across operations, alertability (can you set a threshold that fires before users notice?) |
+| 11 | **Data Integrity & Schema Safety** | Transaction boundaries (are multi-step writes atomic?), migration rollback safety, schema-code coupling (does code assume schema state that may not exist in all environments?), cache invalidation on format changes, idempotency (safe to retry?), partial write recovery |
 
 Phase filtering is light-touch — note the phase in each reviewer's prompt. Reviewers skip sub-areas within their assigned lenses that don't apply.
 
@@ -60,6 +62,8 @@ Each reviewer in a wave gets a different persona. Shuffle the pool; no repeats u
 5. **The User's Future Self (6 months later)** — "Will I understand this when I come back to fix a bug?"
 6. **Chaos Monkey** — "What if this crashes halfway through?"
 7. **Compliance Auditor** — "Does this follow the rules?"
+8. **On-Call SRE at 3am** — "Can I figure out what happened from the logs?"
+9. **Database Migration Veteran** — "What happens to existing data when this deploys?"
 
 ## WILD CARD CHECKS
 
@@ -72,6 +76,9 @@ Each reviewer in a wave gets a different wild card. Shuffle the pool; no repeats
 - "What if a dependency is unavailable or slow?"
 - "What if this runs on a machine with different locale/timezone?"
 - "What if the user cancels mid-operation?"
+- "What if this external call times out? Is the timeout configured? What's the retry strategy?"
+- "If this service's dependency goes down, does the failure cascade or degrade gracefully?"
+- "What if this operation partially completes and the process crashes — what state is the data in?"
 
 **Business logic:**
 - "What if the user has zero permissions?"
@@ -80,6 +87,10 @@ Each reviewer in a wave gets a different wild card. Shuffle the pool; no repeats
 - "What if a feature flag is disabled?"
 - "Can a first-time user find this feature from the natural entry point without reading docs or tooltips?"
 - "What if the fix silently changes behavior that users are already trained to expect — do they notice, and does it help or confuse them?"
+
+**Observability & data:**
+- "Something broke in production at 3am — can the on-call diagnose it from logs alone, without reading source code?"
+- "If this write fails halfway, what state is the data in? Can you tell from the logs what succeeded and what didn't?"
 
 ## PRE-MORTEM FAILURE SCENARIOS
 
@@ -100,6 +111,9 @@ The pre-mortem agent gets 2-3 scenarios from this pool (shuffled; no repeats unt
 **Integration:**
 - "An upstream dependency changed its API and this broke silently. Where are the implicit contracts?"
 - "Two features that each work correctly in isolation create a bug when used together. What's the interaction?"
+- "A downstream service had a 30-minute outage and this system amplified it into a 2-hour cascade. Trace the amplification path."
+- "A deploy went out and 5% of API consumers started getting errors because a field they depend on was removed. How did this slip through?"
+- "A background job failed silently for 3 days. Nobody noticed until a user reported missing data. Why was there no alert?"
 
 ## CONCURRENCY MODEL
 
@@ -206,7 +220,7 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
 
 ### LENS SELECTION
 
-3d. **Select lenses for this review.** Guardrails is always included. For the remaining 8,
+3d. **Select lenses for this review.** Guardrails is always included. For the remaining 10,
     choose those that are genuinely relevant to the phase and specific changes under review.
 
     **Selection criteria:**
@@ -220,14 +234,18 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
     - Any behavior change visible to the user (status change, label change, action removed) → UX & Flow
     - New code added or substantial refactoring → Simplicity & Reuse (look for existing utilities,
       over-engineered solutions, redundant logic). Naturally pairs with Maintainability.
+    - Error handling, async/background processing, external service calls, multi-step workflows
+      → Observability & Debuggability (can you diagnose failures from logs alone?)
+    - Database migrations, multi-table writes, cache read/write, serialization/deserialization,
+      enum/type changes → Data Integrity & Schema Safety (can data get into an inconsistent state?)
     - When in doubt, include the lens — better to review something unnecessary than miss something important.
 
     **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum, 2 reviewers).
-    Maximum is all 9 (5 reviewers). Use your judgment.
+    Maximum is all 11 (6 reviewers). Use your judgment.
 
 3e. **Announce selected lenses with reasoning:**
     ```
-    **Lenses selected ([N] of 9):**
+    **Lenses selected ([N] of 11):**
       ✓ Guardrails (always)
       ✓ Security — API routes modified, auth logic touched
       ✓ Logic & Edge Cases — new conditional branching in gatekeeper
@@ -237,13 +255,15 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
       ⊘ UX & Flow — no frontend or user-facing changes
       ⊘ Maintainability — changes are focused, no structural concerns
       ⊘ Simplicity & Reuse — no new logic added, pure config change
+      ⊘ Observability & Debuggability — no error handling or async changes
+      ⊘ Data Integrity & Schema Safety — no database or schema changes
     ```
 
 ### WAVE 1 — Selected Coverage
 
 4. **Pair** the selected lenses. Each reviewer gets exactly 2.
    - If odd number of selected lenses, one reviewer gets a single lens (goes deeper).
-   - Number of reviewers = ceil(selected_lenses / 2). Range: 2-5 reviewers.
+   - Number of reviewers = ceil(selected_lenses / 2). Range: 2-6 reviewers.
 5. **Assign** each pair a unique persona and unique wild card (shuffle pools as before).
 6. **Announce**:
    ```
@@ -261,7 +281,7 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
 If `frontend_review = true` (from step 3b), spawn a **5th reviewer** in the SAME message:
 - Use `subagent_type: "general-purpose"`
 - Prompt MUST start with: "Invoke the frontend-design skill for design context."
-- Assign a dedicated **Frontend Design & Aesthetics** lens (outside the 8 standard lenses)
+- Assign a dedicated **Frontend Design & Aesthetics** lens (outside the 11 standard lenses)
 - Focus areas: design quality (typography, color, spacing, layout intentionality), visual consistency
   (does new code match or improve the existing aesthetic?), motion/animation (purposeful and performant?),
   accessibility (contrast ratios, focus states, semantic HTML), responsive behavior (breakpoints, touch targets)
@@ -343,7 +363,7 @@ to their Lens details (item 3) in the spawn prompt:
     ## DCR Clean Pass ✓
 
     **Waves run:** [N]
-    **Lenses reviewed ([M] of 8):**
+    **Lenses reviewed ([M] of 11):**
       ✓ Guardrails — Wave 1 ([PERSONA])
       ✓ Security — Wave 1 ([PERSONA])
       ✓ Logic & Edge Cases — Wave 1 ([PERSONA]), rechecked Wave 2 (1 issue fixed)
@@ -352,6 +372,8 @@ to their Lens details (item 3) in the spawn prompt:
       ⊘ UX & Flow — skipped (not relevant)
       ⊘ Performance — skipped (not relevant)
       ⊘ Maintainability — skipped (not relevant)
+      ⊘ Observability & Debuggability — skipped (not relevant)
+      ⊘ Data Integrity & Schema Safety — skipped (not relevant)
     **Frontend design:** ✓ Reviewed (N findings) / ⊘ Skipped
     **Pre-mortem analysis:** ✓ [N] scenarios analyzed ([N] findings)
     **Issues found and fixed:** [count] ([which lenses/pre-mortem])
