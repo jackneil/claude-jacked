@@ -1,0 +1,27 @@
+{
+  "name": "jacked-marketplace",
+  "owner": {
+    "name": "Jack Neil",
+    "email": "jack@jackneil.com"
+  },
+  "metadata": {
+    "description": "Smart reviewers, parallel agents, and developer workflow commands for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "jacked",
+      "source": "./jacked/data",
+      "description": "Smart reviewers, commands, and agents for Claude Code — parallel code review (DCR), browser QA, swarm implementation, divergent research, tech debt scanning, and more",
+      "version": "0.23.1",
+      "author": {
+        "name": "Jack Neil"
+      },
+      "homepage": "https://github.com/jackneil/claude-jacked",
+      "repository": "https://github.com/jackneil/claude-jacked",
+      "license": "MIT",
+      "category": "productivity",
+      "tags": ["code-review", "testing", "workflow", "agents", "planning"]
+    }
+  ]
+}
