@@ -13,7 +13,7 @@
       "name": "jacked",
       "source": "./jacked/data",
       "description": "Smart reviewers, commands, and agents for Claude Code — parallel code review (DCR), browser QA, swarm implementation, divergent research, tech debt scanning, and more",
-      "version": "0.23.1",
+      "version": "0.24.0",
       "author": {
         "name": "Jack Neil"
       },
