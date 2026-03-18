@@ -9,7 +9,7 @@
 ## What You Get
 
 - **Stop clicking "approve" on every terminal command** — Claude Code asks permission for every bash command it runs. The security gatekeeper handles the safe ones automatically, so you only get interrupted when something is actually risky.
-- **Catch bugs before they ship** — Automatic code quality checks review your work for security holes, complexity, missing error handling, and test gaps. 10 built-in reviewers, always watching.
+- **Catch bugs before they ship** — `/dcr` spawns parallel reviewers across 11 lenses (security, performance, logic, observability, data integrity, and more) in recursive waves until everything passes clean. 10 built-in agents, always available.
 - **Find any past conversation** — Search your Claude history by describing what you were working on. Works across machines, works across teammates. *(requires [search] extra)*
 - **Manage everything from a web dashboard** — Toggle features on and off, configure the security system, monitor decisions, track usage — all from your browser. No config files, no terminal commands.
 
@@ -51,6 +51,17 @@ jacked webux              # opens your dashboard at localhost:8321
 ```
 
 > **Don't have uv?** Install it first: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Mac/Linux) or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
+
+### Option 3: Install as a Plugin (Teams)
+
+Add to your team's Claude Code environment — no Python install needed:
+
+```bash
+/plugin marketplace add jackneil/claude-jacked
+/plugin install jacked@jacked-marketplace
+```
+
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 14 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
 
 **Want more?** Add optional extras:
 
@@ -100,7 +111,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable slash commands (`/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`).
+**Commands** — Enable or disable any of the 14 slash commands.
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
 
@@ -136,7 +147,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **7 Slash Commands** | `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa` |
+| **14 Slash Commands** | `/dc`, `/dcr`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -327,12 +338,19 @@ Type these directly in Claude Code:
 | Command | What It Does |
 |---------|--------------|
 | `/dc` | **Double-check** — Reviews your recent work for bugs, security issues, and problems |
+| `/dcr` | **Recursive Review** — Spawns parallel reviewers across 11 lenses (security, performance, logic, UX, observability, data integrity, etc.) in waves until all pass clean |
+| `/swarm` | **Swarm** — Parallel implementation across 3-8 coordinated agents with file-level isolation |
+| `/swarm-research` | **Divergent Research** — Spawns 2-5 independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate |
+| `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
+| `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
+| `/whats-next` | **Roadmap Advisor** — Analyzes plans, issues, commits, and lifecycle stage to recommend highest-yield next work |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
+| `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
 | `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
 | `/redo` | **Redo** — Scraps the current approach and re-implements cleanly with full hindsight |
 | `/techdebt` | **Tech Debt** — Scans for TODOs, oversized files, missing tests, dead code |
 | `/audit-rules` | **Audit Rules** — Checks CLAUDE.md for duplicates, contradictions, stale rules |
-| `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome |
+| `/jacked-setup` | **Repo Setup** — Generates repo-specific configs for `/whats-next`, `/qa`, `/ux`, `/dcr` — faster repeat runs |
 
 ### Smart Reviewers
 
@@ -428,6 +446,16 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.24.0** | **Plugin marketplace** — repo doubles as a Claude Code plugin marketplace for team distribution. Zero file duplication. |
+| **0.23.x** | **`/swarm-research`** — divergent research skill (2-5 parallel agents from different angles, synthesis, devil's advocate). **Observability & Data Integrity lenses** added to DCR (11 lenses total). New wild cards, pre-mortem scenarios, and reviewer personas. |
+| **0.22.0** | **Chrome DevTools MCP** integration for `/qa` and `/ux` browser testing. |
+| **0.21.0** | **One-click upgrade** from the dashboard (upgrade + reinstall + restart). |
+| **0.20.x** | **DCR plan-mode support** — review plan docs while in plan mode. Dynamic skills dashboard. Simplicity & Reuse lens. |
+| **0.19.x** | **`/ux` parallel browser testing** — spawns 2-4 agents testing different UX aspects simultaneously. `/jacked-setup` standalone generation for `/qa`, `/ux`, `/dcr`, `/whats-next`. |
+| **0.18.x** | **`/dcr` recursive review** — parallel waves of focused reviewers with lens pairing, personas, wild cards, and pre-mortem analysis. |
+| **0.17.x** | **`/release` workflow** — bump version, push, CI, GitHub Release, PyPI publish. |
+| **0.16.x** | **`/swarm`** — coordinated parallel implementation across 3-8 agent teammates. |
+| **0.15.x** | **`/whats-next`** — roadmap advisor with lifecycle detection, tier-based prioritization. |
 | **0.9.1** | **Catch-all PreToolUse hook** — intercepts all tools (file tools get path-safety checks, web/MCP tools get auto-approve with logging, Bash keeps full eval chain). Tool registry with per-tool enable/disable. Labeled deny patterns for clearer audit logs. `/qa` command + Stop hook for browser QA. oauthAccount seeding, plugin toggle fix. |
 | **0.9.0** | **Analytics dashboard** with charts, heatmap, and drill-down. **Security profiles** — export, import, and backup gatekeeper configurations. Profile API endpoints + Settings UI panel. |
 | **0.8.0** | **Permissions panel** — manage allowed commands with project-level vs global scope. "Always Allow" from log rows. Method filter on log viewer. |
@@ -497,7 +525,8 @@ jacked webux --port 9000           # Custom port
 jacked webux --no-browser          # Server only, no auto-open
 
 # Slash Commands
-# /dc /pr /learn /redo /techdebt /audit-rules /qa
+# /dc /dcr /pr /learn /redo /techdebt /audit-rules /qa /ux
+# /swarm /swarm-research /release /whats-next /jacked-setup
 ```
 
 </details>
