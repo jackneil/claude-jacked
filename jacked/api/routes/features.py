@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -24,15 +24,31 @@ SETTINGS_JSON = CLAUDE_DIR / "settings.json"
 CLAUDE_MD = CLAUDE_DIR / "CLAUDE.md"
 DATA_ROOT = Path(__file__).parent.parent.parent / "data"
 
-# Markers (match cli.py exactly)
-SECURITY_MARKER = "# jacked-security"
+# Markers
 SOUND_MARKER = "# jacked-sound: "
 RULES_START_PREFIX = "# jacked-behaviors-v"
 RULES_END_MARKER = "# end-jacked-behaviors"
 
 # Valid hook/knowledge names (allowlist)
 VALID_HOOKS = {"security_gatekeeper", "session_indexing", "sounds"}
-VALID_KNOWLEDGE = {"rules", "skill", "reference"}
+
+
+def _get_valid_skill_names() -> list[str]:
+    """List skill names from package source."""
+    skills_dir = DATA_ROOT / "skills"
+    if not skills_dir.exists():
+        return []
+    return [d.name for d in sorted(skills_dir.iterdir())
+            if d.is_dir() and (d / "SKILL.md").exists()]
+
+
+def _get_valid_knowledge_names() -> set[str]:
+    """Dynamic allowlist of knowledge feature names."""
+    base = {"rules", "reference"}
+    for name in _get_valid_skill_names():
+        base.add(f"skill_{name}")
+    return base
+
 
 # ---------------------------------------------------------------------------
 # Claude Code settings constants — these control Claude Code itself, not jacked
@@ -253,14 +269,35 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
     hooks = settings.get("hooks", {})
 
     if hook_name == "security_gatekeeper":
-        for entry in hooks.get("PreToolUse", []):
-            if SECURITY_MARKER in str(entry) or "security_gatekeeper" in str(entry):
-                return True
-        # Check legacy PermissionRequest too
-        for entry in hooks.get("PermissionRequest", []):
-            if SECURITY_MARKER in str(entry) or "security_gatekeeper" in str(entry):
-                return True
-        return False
+        # Check if hook entries are registered in settings.json
+        registered = any(
+            "security_gatekeeper" in str(entry)
+            for entry in hooks.get("PreToolUse", [])
+        ) or any(
+            "security_gatekeeper" in str(entry)
+            for entry in hooks.get("PermissionRequest", [])
+        )
+        if not registered:
+            return False
+        # Check DB flag for runtime enabled state.
+        # Direct sqlite3 read to avoid needing Request/db param propagation.
+        import json as _json
+        import sqlite3 as _sqlite3
+        db_path = Path.home() / ".claude" / "jacked.db"
+        if not db_path.exists():
+            return True  # No DB = default enabled
+        try:
+            with _sqlite3.connect(str(db_path), timeout=2.0) as conn:
+                cursor = conn.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    ("gatekeeper.enabled",),
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return _json.loads(row[0]) is not False
+            return True  # No flag = default enabled
+        except Exception:
+            return True  # Fail-open
 
     if hook_name == "session_indexing":
         for entry in hooks.get("Stop", []):
@@ -377,21 +414,24 @@ async def list_features():
             "source_available": (DATA_ROOT / "rules" / "jacked_behaviors.md").exists(),
             "corrupt": rules_status.get("corrupt", False),
         },
-        {
-            "name": "skill",
-            "display_name": "/jacked Skill",
-            "description": "Search and load context from past Claude sessions",
-            "installed": (CLAUDE_DIR / "skills" / "jacked" / "SKILL.md").exists(),
-            "source_available": (DATA_ROOT / "skills" / "jacked" / "SKILL.md").exists(),
-        },
-        {
-            "name": "reference",
-            "display_name": "Reference Doc",
-            "description": "Comprehensive knowledge document about jacked for Claude",
-            "installed": (CLAUDE_DIR / "jacked-reference.md").exists(),
-            "source_available": (DATA_ROOT / "rules" / "jacked-reference.md").exists(),
-        },
     ]
+    for skill_name in _get_valid_skill_names():
+        src = DATA_ROOT / "skills" / skill_name / "SKILL.md"
+        fm = _parse_frontmatter(src)
+        knowledge.append({
+            "name": f"skill_{skill_name}",
+            "display_name": fm.get("name", f"/{skill_name} Skill"),
+            "description": fm.get("description", ""),
+            "installed": (CLAUDE_DIR / "skills" / skill_name / "SKILL.md").exists(),
+            "source_available": src.exists(),
+        })
+    knowledge.append({
+        "name": "reference",
+        "display_name": "Reference Doc",
+        "description": "Comprehensive knowledge document about jacked for Claude",
+        "installed": (CLAUDE_DIR / "jacked-reference.md").exists(),
+        "source_available": (DATA_ROOT / "rules" / "jacked-reference.md").exists(),
+    })
 
     return {
         "agents": agents, "commands": commands, "hooks": hooks,
@@ -406,6 +446,7 @@ async def toggle_feature(
     category: Literal["agents", "commands", "hooks", "knowledge"],
     name: str,
     body: FeatureToggleRequest,
+    request: Request,
 ):
     """Enable or disable a feature."""
     # Validate name
@@ -450,10 +491,11 @@ async def toggle_feature(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 content={"error": {"message": f"Unknown hook: {name}", "code": "INVALID_FEATURE"}},
             )
-        return await _toggle_hook(name, body.enabled)
+        db = getattr(request.app.state, "db", None)
+        return await _toggle_hook(name, body.enabled, db=db)
 
     if category == "knowledge":
-        if name not in VALID_KNOWLEDGE:
+        if name not in _get_valid_knowledge_names():
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 content={"error": {"message": f"Unknown knowledge item: {name}", "code": "INVALID_FEATURE"}},
@@ -493,18 +535,28 @@ async def _toggle_file_feature(src: Path, dst: Path, enabled: bool, name: str, c
     return {"name": name, "category": category, "enabled": enabled}
 
 
-async def _toggle_hook(name: str, enabled: bool):
-    """Enable/disable a hook in settings.json."""
+async def _toggle_hook(name: str, enabled: bool, db=None):
+    """Enable/disable a hook.
+
+    For security_gatekeeper: writes DB flag (takes effect immediately)
+    and ensures all tool matchers are registered in settings.json.
+    For other hooks: adds/removes entries from settings.json.
+    """
     async with _settings_lock:
         settings = _read_settings_json()
         if "hooks" not in settings:
             settings["hooks"] = {}
 
         if name == "security_gatekeeper":
-            if enabled:
-                _enable_security_hook(settings)
-            else:
-                _disable_security_hook(settings)
+            # Write DB flag — gatekeeper checks this on every invocation,
+            # so toggle takes effect immediately without restarting Claude Code.
+            if db is not None:
+                import json
+                db.set_setting("gatekeeper.enabled", json.dumps(enabled))
+            # Ensure all known tool matchers are registered (idempotent repair).
+            # Hook entries stay in settings.json permanently — the DB flag
+            # controls whether the hook actually runs.
+            _ensure_gatekeeper_hooks(settings)
 
         elif name == "session_indexing":
             if enabled:
@@ -527,10 +579,17 @@ async def _toggle_knowledge(name: str, enabled: bool):
     """Enable/disable a knowledge feature."""
     if name == "rules":
         return await _toggle_rules(enabled)
-    if name == "skill":
-        src = DATA_ROOT / "skills" / "jacked" / "SKILL.md"
-        dst = CLAUDE_DIR / "skills" / "jacked" / "SKILL.md"
-        return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
+    if name.startswith("skill_"):
+        skill_name = name[len("skill_"):]
+        if _validate_name(skill_name):
+            src = DATA_ROOT / "skills" / skill_name / "SKILL.md"
+            dst = CLAUDE_DIR / "skills" / skill_name / "SKILL.md"
+            if src.exists():
+                return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"message": f"Unknown skill: {skill_name}", "code": "INVALID_FEATURE"}},
+        )
     if name == "reference":
         src = DATA_ROOT / "rules" / "jacked-reference.md"
         dst = CLAUDE_DIR / "jacked-reference.md"
@@ -614,8 +673,13 @@ async def _toggle_rules(enabled: bool):
 
 # --- Hook enable/disable helpers ---
 
-def _enable_security_hook(settings: dict):
-    """Add security gatekeeper hook to settings."""
+def _ensure_gatekeeper_hooks(settings: dict):
+    """Ensure a single catch-all gatekeeper hook is registered.
+
+    Uses an empty matcher to intercept ALL tool calls. The gatekeeper decides
+    internally which tools to process vs pass-through based on DB/registry
+    config. Migrates old per-tool entries to catch-all mode. Idempotent.
+    """
     python_exe = sys.executable
     if not python_exe or not Path(python_exe).exists():
         python_exe = shutil.which("python3") or shutil.which("python") or "python"
@@ -628,20 +692,36 @@ def _enable_security_hook(settings: dict):
     if "PreToolUse" not in settings["hooks"]:
         settings["hooks"]["PreToolUse"] = []
 
-    # Check if already installed
+    # Migrate: remove old per-tool gatekeeper entries
+    settings["hooks"]["PreToolUse"] = [
+        h for h in settings["hooks"]["PreToolUse"]
+        if not (
+            "security_gatekeeper" in str(h)
+            and h.get("matcher", "") != ""
+        )
+    ]
+
+    # Check if catch-all already exists and is up to date
     for entry in settings["hooks"]["PreToolUse"]:
-        if SECURITY_MARKER in str(entry) or "security_gatekeeper" in str(entry):
+        if (
+            entry.get("matcher") == ""
+            and "security_gatekeeper" in str(entry)
+        ):
+            # Update command if needed (handles python path changes)
+            for h in entry.get("hooks", []):
+                if h.get("command", "") != command_str:
+                    h["command"] = command_str
             return
 
-    hook_entry = {
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": command_str,
-            "timeout": 30,
-        }]
-    }
-    settings["hooks"]["PreToolUse"].append(hook_entry)
+    # Add catch-all entry
+    settings["hooks"]["PreToolUse"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
+    })
+
+
+# Keep old name as alias for backwards compatibility with CLI installer
+_enable_security_hook = _ensure_gatekeeper_hooks
 
 
 def _disable_security_hook(settings: dict):
@@ -650,7 +730,7 @@ def _disable_security_hook(settings: dict):
         if hook_type in settings.get("hooks", {}):
             settings["hooks"][hook_type] = [
                 h for h in settings["hooks"][hook_type]
-                if SECURITY_MARKER not in str(h) and "security_gatekeeper" not in str(h)
+                if "security_gatekeeper" not in str(h)
             ]
 
 
@@ -912,10 +992,12 @@ async def toggle_claude_plugin(name: str, body: PluginToggleRequest):
         if "enabledPlugins" not in settings:
             settings["enabledPlugins"] = {}
 
-        if body.enabled:
-            settings["enabledPlugins"][name] = True
-        else:
-            settings["enabledPlugins"].pop(name, None)
+        # Explicit true/false — Claude Code treats absent keys as "enabled
+        # by default", so .pop() doesn't actually disable plugins.
+        # Note: upstream Claude Code bugs may ignore false for some plugins
+        # (see anthropics/claude-code#13344); may need installed_plugins.json
+        # manipulation as follow-up.
+        settings["enabledPlugins"][name] = body.enabled
 
         _write_settings_json(settings)
 
@@ -978,4 +1060,52 @@ async def set_raw_settings(body: RawSettingsRequest):
         )
     async with _settings_lock:
         _write_settings_json(body.content)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Chrome DevTools MCP endpoints — manage browser tool configuration
+# ---------------------------------------------------------------------------
+
+@router.get("/chrome-devtools-mcp")
+async def get_chrome_devtools_mcp():
+    """Get Chrome DevTools MCP configuration status."""
+    from jacked.cli import _get_chrome_devtools_mcp_status
+
+    result = await asyncio.to_thread(_get_chrome_devtools_mcp_status)
+    return result
+
+
+class ChromeDevToolsMCPRequest(BaseModel):
+    mode: Literal["autoConnect", "browserUrl", "launch", "headless"]
+    # Keep in sync with CHROME_DEVTOOLS_MODES in jacked/cli.py
+
+
+@router.put("/chrome-devtools-mcp")
+async def set_chrome_devtools_mcp(body: ChromeDevToolsMCPRequest):
+    """Update Chrome DevTools MCP connection mode."""
+    from jacked.cli import _set_chrome_devtools_mcp_mode
+
+    success, message = await asyncio.to_thread(
+        _set_chrome_devtools_mcp_mode, body.mode
+    )
+    if not success:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": {"message": message}},
+        )
+    return {"ok": True, "mode": body.mode, "message": message}
+
+
+@router.delete("/chrome-devtools-mcp")
+async def remove_chrome_devtools_mcp():
+    """Remove Chrome DevTools MCP configuration."""
+    from jacked.cli import _remove_chrome_devtools_mcp
+
+    removed = await asyncio.to_thread(_remove_chrome_devtools_mcp)
+    if not removed:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": {"message": "Failed to remove Chrome DevTools MCP"}},
+        )
     return {"ok": True}

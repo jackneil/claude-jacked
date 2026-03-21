@@ -1,8 +1,8 @@
 /**
  * jacked web dashboard — log viewer (shell + shared helpers)
- * Sub-tabbed view: Gatekeeper | Hooks | Version Checks
+ * Sub-tabbed view: Gatekeeper | Hooks | Version Checks | Server
  *
- * Sub-tab implementations in logs-gatekeeper.js, logs-hooks.js, logs-version-checks.js
+ * Sub-tab implementations in logs-gatekeeper.js, logs-hooks.js, logs-version-checks.js, logs-server.js
  */
 
 // ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ function refreshCurrentLogsSubTab(changedTables) {
     switch (logsSubTab) {
         case 'gatekeeper':
             if (!changedTables || changedTables.includes('gatekeeper_decisions')) {
-                loadSessions(); loadLogsData();
+                loadSessions(); loadLogsData(true);
             }
             break;
         case 'hooks':
@@ -170,6 +170,10 @@ function refreshCurrentLogsSubTab(changedTables) {
             if (!changedTables || changedTables.includes('version_checks')) {
                 loadVersionCheckLogsData();
             }
+            break;
+        case 'server':
+            // Server logs are push-based; refreshServerLogs is a no-op
+            if (typeof refreshServerLogs === 'function') refreshServerLogs();
             break;
     }
 }
@@ -202,6 +206,7 @@ function renderLogs() {
         { id: 'gatekeeper', label: 'Gatekeeper' },
         { id: 'hooks', label: 'Hooks' },
         { id: 'version-checks', label: 'Version Checks' },
+        { id: 'server', label: 'Server' },
     ];
 
     const tabBar = tabs.map(t => `
@@ -260,6 +265,7 @@ function renderSubTab() {
         case 'gatekeeper': renderGatekeeperSubTab(container); break;
         case 'hooks':      renderHookLogs(container); break;
         case 'version-checks': renderVersionCheckLogs(container); break;
-        default: container.innerHTML = '<div class="text-slate-500 p-4">Unknown log type</div>';
+        case 'server': if (typeof renderServerLogs === 'function') renderServerLogs(container); break;
+        default: container.textContent = 'Unknown log type';
     }
 }

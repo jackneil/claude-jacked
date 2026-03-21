@@ -7,22 +7,21 @@ set -e
 echo "Installing claude-jacked..."
 echo ""
 
-# Check for pipx
-if ! command -v pipx &> /dev/null; then
-    echo "pipx not found. Installing pipx first..."
-    python3 -m pip install --user pipx
-    python3 -m pipx ensurepath
+# Check for uv
+if ! command -v uv &> /dev/null; then
+    echo "uv not found. Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
     echo ""
-    echo "pipx installed. You may need to restart your shell or run:"
+    echo "uv installed. You may need to restart your shell or run:"
     echo "  source ~/.bashrc  (or ~/.zshrc)"
     echo ""
     echo "Then re-run this installer."
     exit 1
 fi
 
-# Install claude-jacked via pipx
-echo "Installing claude-jacked via pipx..."
-pipx install claude-jacked --force
+# Install claude-jacked via uv
+echo "Installing claude-jacked via uv..."
+uv tool install claude-jacked --force
 
 echo ""
 

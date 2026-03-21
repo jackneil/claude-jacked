@@ -42,6 +42,12 @@
     background: #475569 !important;
 }
 
+.swal2-confirm:focus-visible,
+.swal2-cancel:focus-visible {
+    outline: 2px solid #3b82f6;
+    outline-offset: 2px;
+}
+
 .swal2-actions {
     gap: 0.5rem !important;
 }
@@ -49,6 +55,21 @@
 .swal2-icon {
     border-color: #334155 !important;
     color: #94a3b8 !important;
+}
+
+.swal2-input,
+.swal2-textarea {
+    background: #0f172a !important;
+    color: #e2e8f0 !important;
+    border: 1px solid #334155 !important;
+    border-radius: 0.375rem !important;
+    font-size: 0.85rem !important;
+}
+
+.swal2-input:focus,
+.swal2-textarea:focus {
+    border-color: #3b82f6 !important;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25) !important;
 }
 
 .swal2-popup code {

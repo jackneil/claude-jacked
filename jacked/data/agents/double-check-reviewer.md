@@ -202,6 +202,28 @@ Apply the lens groups that match the project type. Skip groups that don't apply.
 
 ---
 
+## LENS ASSIGNMENTS (when spawned by /dcr)
+
+When the dispatcher assigns you **specific lenses** (e.g., "Focus on: Security + Performance"), follow these rules:
+
+1. **Depth over breadth**: You have only 2 lenses. Go DEEP. Read every relevant file, trace every code path, question every assumption within your assigned areas.
+2. **Do NOT review other areas**: If you notice something outside your lenses, mention it briefly as a footnote but do NOT investigate. Other reviewers have those lenses.
+3. **Organize findings per lens**: Structure your report with a section per assigned lens.
+4. **READ-ONLY**: When spawned by /dcr, you NEVER edit files. Report findings with file paths and line numbers. The parent dispatcher handles fixes.
+
+When NOT given lens assignments (spawned by /dc or directly), review all applicable areas as described above.
+
+### Per-Lens Report Structure (for /dcr):
+```
+## [Lens Name] — [PASS / ISSUES FOUND]
+
+### Findings
+[CRITICAL/MEDIUM/LOW issues with file:line references]
+
+### What Looks Good
+[Areas that passed review within this lens]
+```
+
 ## GENERAL PRINCIPLES
 
 - **Be Constructive but Uncompromising**: Your job is to catch problems, but frame feedback helpfully
@@ -211,4 +233,11 @@ Apply the lens groups that match the project type. Skip groups that don't apply.
 - **Fresh Perspective**: Your value is being the "fresh eyes" - don't assume anything is correct just because it exists
 
 ## PROJECT CONTEXT
-Re-read claude.md and follow any instructions in the repo for knowledge you need or rules you must follow before performing the double check review
+
+If the dispatcher included a `## PROJECT CONTEXT` section in your prompt, use it as your primary reference for the Guardrails lens. Cite specific rules when flagging violations.
+
+If NO project context was provided (e.g., spawned directly via /dc without context discovery), discover it yourself:
+- Read `CLAUDE.md`, `AGENTS.md` in the project root
+- Glob for `*GUARDRAILS*`, `*guardrails*`, `CONTRIBUTING.md`, `STYLE_GUIDE.md`
+- Check `docs/`, `design/`, `adr/`, `decisions/` for design docs and ADRs
+- Read any relevant files found — these inform all review angles, not just Guardrails

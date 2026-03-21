@@ -1,13 +1,14 @@
 """Background watcher loops for the jacked dashboard.
 
 These async loops poll SQLite tables for changes and broadcast
-notifications through the WebSocket registry.  Extracted from
-main.py to stay under the 500-line guardrail.
+notifications through the WebSocket registry.
 """
 
 import asyncio
 import logging
+import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from jacked.api.websocket import WebSocketRegistry
@@ -24,10 +25,7 @@ async def session_accounts_watch_loop(app, interval: int = 3):
     differ from cached values.
 
     Also forces a periodic broadcast every ~60s (20 cycles) to handle
-    time-based session expiry.  Heartbeat writes change data_version but
-    the secondary MAX(detected_at)/MAX(ended_at) check filters them out
-    (heartbeats only touch last_activity_at).  The periodic broadcast
-    ensures the dashboard re-evaluates the 60-minute read-side filter.
+    time-based session expiry.
 
     >>> # Verified via integration test
     """
@@ -196,3 +194,117 @@ async def logs_watch_loop(app, interval: int = 3):
             conn.close()
         except Exception:
             pass
+
+
+def _any_claude_process_alive() -> bool:
+    """Check if any Claude Code process is running.
+
+    Uses ``pgrep -x claude`` for exact process name matching.
+    Returns False on any error (fail-safe — never incorrectly closes sessions).
+
+    >>> # Can't reliably doctest process detection
+    """
+    # macOS/Linux only — returns False (fail-safe) on Windows
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "claude"],
+            capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is alive.
+
+    >>> _is_pid_alive(1)  # init/launchd is always alive
+    True
+    >>> _is_pid_alive(999999999)
+    False
+    """
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0 = check existence, don't kill
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists but we can't signal it
+    except OSError:
+        return False
+
+
+async def process_alive_sweeper_loop(app, interval: int = 60):
+    """Close sessions whose Claude process has exited.
+
+    For sessions with a PID: check that specific PID.
+    For sessions without a PID: fall back to old "any claude running?" heuristic.
+
+    >>> # Verified via integration test
+    """
+    db_obj = getattr(app.state, "db", None)
+    if db_obj is None:
+        return
+
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                stale = await asyncio.to_thread(db_obj.get_stale_open_sessions)
+                if not stale:
+                    continue
+
+                changed = False
+
+                # Split into PID-tracked and non-PID sessions
+                pid_sessions = [s for s in stale if s.get("pid")]
+                no_pid_sessions = [s for s in stale if not s.get("pid")]
+
+                # PID-tracked: check each individually
+                for sess in pid_sessions:
+                    pid = sess["pid"]
+                    alive = await asyncio.to_thread(_is_pid_alive, pid)
+                    if alive:
+                        await asyncio.to_thread(
+                            db_obj.heartbeat_session, sess["session_id"]
+                        )
+                        changed = True
+                    else:
+                        await asyncio.to_thread(
+                            db_obj.end_session_account, sess["session_id"]
+                        )
+                        changed = True
+                        logger.info(
+                            "Sweeper: closed session %s (PID %d dead)",
+                            sess["session_id"][-8:],
+                            pid,
+                        )
+
+                # Non-PID: old heuristic fallback
+                if no_pid_sessions:
+                    alive = await asyncio.to_thread(_any_claude_process_alive)
+                    if alive:
+                        count = await asyncio.to_thread(
+                            db_obj.bump_all_stale_sessions
+                        )
+                        if count > 0:
+                            changed = True
+                    else:
+                        count = await asyncio.to_thread(db_obj.close_dead_sessions)
+                        if count > 0:
+                            changed = True
+
+                if changed:
+                    registry = getattr(app.state, "ws_registry", None)
+                    if registry and registry.client_count > 0:
+                        await registry.broadcast(
+                            "sessions_changed", source="process_sweeper"
+                        )
+
+            except Exception as e:
+                logger.warning("Process sweeper error: %s", e)
+                continue
+    except asyncio.CancelledError:
+        pass

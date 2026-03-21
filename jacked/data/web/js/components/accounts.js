@@ -13,17 +13,36 @@ const MODEL_DISPLAY_NAMES = {
 };
 
 /**
- * Determine visual status for an account.
+ * Determine visual status for an account (worst-of-two: primary + CC).
+ * Uses server-computed fields: acct.is_expired, acct.expires_in_seconds.
+ * Priority: disabled > expired/invalid > warning > cc-missing > checking > valid > unknown
  */
 function getAccountStatus(acct) {
     if (!acct.is_active) return 'disabled';
-    if (acct.validation_status === 'checking') return 'checking';
+    // Only flag expired for non-refreshable accounts (API keys); OAuth tokens
+    // renew automatically so the card should not show an expired state.
+    if (acct.is_expired && !acct.has_refresh_token) return 'expired';
     if (acct.validation_status === 'invalid') return 'invalid';
 
-    // Check expiry — computed, not stored
-    const now = Math.floor(Date.now() / 1000);
-    if (acct.expires_at && now >= acct.expires_at) return 'expired';
+    // Near-expiry warning (primary < 1h) — only for non-refreshable (API key) accounts.
+    // OAuth tokens renew automatically; showing a warning would contradict the pill's "valid".
+    if (!acct.has_refresh_token && acct.expires_in_seconds != null && acct.expires_in_seconds < TOKEN_EXPIRY_WARN_SECS) {
+        return 'warning';
+    }
 
+    // CC worst-of-two (only if CC fields present — backward compat)
+    if (acct.has_cc_token !== undefined) {
+        if (!acct.has_cc_token) return 'cc-missing';
+        if (acct.cc_needs_auth) return 'warning';
+        // CC expiry check — only flag for non-refreshable CC tokens
+        if (acct.cc_expires_at && !acct.has_cc_refresh_token) {
+            const ccRemaining = acct.cc_expires_at - Math.floor(Date.now() / 1000);
+            if (ccRemaining <= 0) return 'expired';
+            if (ccRemaining < TOKEN_EXPIRY_WARN_SECS) return 'warning';
+        }
+    }
+
+    if (acct.validation_status === 'checking') return 'checking';
     if (acct.validation_status === 'valid') return 'valid';
     return 'unknown';
 }
@@ -55,13 +74,15 @@ function getPriorityBadge(priority) {
 
 /**
  * Render cache age display.
+ * NOTE: data-cache-age is a DOM contract — queried by _usageUpdateCardDOM (websocket.js)
+ * for surgical updates during usage refresh. Do not rename without updating consumers.
  */
 function renderCacheAge(usageCachedAt) {
     if (usageCachedAt === null || usageCachedAt === undefined) {
-        return '<span class="text-xs text-slate-500">Usage: never fetched</span>';
+        return '<span class="text-xs text-slate-500" data-cache-age>Usage: never fetched</span>';
     }
     const ago = timeAgoFromUnix(usageCachedAt);
-    return `<span class="text-xs text-slate-500">Usage updated ${escapeHtml(ago)}</span>`;
+    return `<span class="text-xs text-slate-500" data-cache-age>Usage updated ${escapeHtml(ago)}</span>`;
 }
 
 /**
@@ -157,24 +178,34 @@ function renderActionButtons(acct) {
     let setActiveHtml = '';
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
-    } else if (status === 'valid' || status === 'unknown') {
+    } else if (status === 'valid' || status === 'warning' || status === 'cc-missing' || status === 'unknown') {
         setActiveHtml = `<button class="btn-set-active text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Set Active</button>`;
     }
 
-    // Re-auth button (if invalid/expired)
+    // Copy launch command button
+    const copyCmd = `jacked claude ${acct.id}`;
+    const copyHtml = `<button class="btn-copy-cmd text-xs px-3 py-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded transition-colors" data-cmd="${escapeHtml(copyCmd)}" title="Copy launch command">
+        <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
+        ${escapeHtml(copyCmd)}
+    </button>`;
+
+    // Re-auth button (if invalid/expired) — pills also handle this, keep for backward compat
     const showReauth = status === 'invalid' || status === 'expired';
     let reauthHtml = '';
     if (showReauth) {
-        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}">Re-auth</button>`;
+        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
     }
+
+    // CC auth now handled by pill click handler — no standalone button
 
     // Toggle active/disabled
     const toggleLabel = acct.is_active ? 'Disable' : 'Enable';
     const toggleClass = acct.is_active ? 'text-yellow-400 hover:text-yellow-300' : 'text-green-400 hover:text-green-300';
 
     return `
-        <div class="flex items-center gap-2 mt-3 pt-3 border-t border-slate-700/50">
+        <div class="flex items-center flex-wrap gap-2 mt-2 pt-2 border-t border-slate-700/50">
             ${setActiveHtml}
+            ${copyHtml}
             <div class="flex-1"></div>
             ${reauthHtml}
             <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition-colors" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
@@ -190,20 +221,25 @@ function renderActionButtons(acct) {
  */
 function renderAccountCard(acct, idx, total) {
     const status = getAccountStatus(acct);
-    const email = escapeHtml(acct.email || 'Unknown');
+    const email = acct.email || 'Unknown';
+    // Show display_name as custom label only when it differs from email
+    const hasCustomLabel = acct.display_name && acct.display_name !== acct.email;
+    const label = hasCustomLabel ? acct.display_name : '';
+    const orgLabel = acct.organization_name
+        ? acct.organization_name
+        : acct.organization_uuid
+            ? acct.organization_uuid.slice(0, 8) + '…'
+            : '';
     const subDisplay = getSubDisplay(acct);
     const priorityBadge = getPriorityBadge(acct.priority || 0);
 
-    // Status badge for non-valid states
-    let statusBadge = '';
-    if (status === 'checking') {
-        statusBadge = '<span class="badge badge-info">Checking...</span>';
-    } else if (status === 'invalid') {
-        statusBadge = '<span class="badge badge-warning">Token Invalid</span>';
-    } else if (status === 'expired') {
-        statusBadge = '<span class="badge badge-warning">Expired</span>';
-    } else if (status === 'disabled') {
-        statusBadge = '<span class="badge badge-muted">Disabled</span>';
+    // Token pills replace status/CC badges
+    const pillsHtml = renderTokenPills(acct);
+
+    // Disabled badge (pills don't cover disabled state)
+    let disabledBadge = '';
+    if (status === 'disabled') {
+        disabledBadge = '<span class="badge badge-muted">Disabled</span>';
     }
 
     // Usage bars
@@ -229,7 +265,7 @@ function renderAccountCard(acct, idx, total) {
 
     // Error display
     let errorHtml = '';
-    if (acct.last_error) {
+    if (acct.last_error && (acct.validation_status === 'invalid' || acct.consecutive_failures > 0)) {
         errorHtml = `<div class="text-xs text-red-400 mt-2">${escapeHtml(acct.last_error)}</div>`;
     }
 
@@ -242,24 +278,36 @@ function renderAccountCard(acct, idx, total) {
     const detailsHtml = renderExpandableDetails(acct);
     const actionsHtml = renderActionButtons(acct);
 
+    const disabledClass = status === 'disabled' ? ' opacity-60' : '';
+    const primaryName = label || email;
     return `
-        <div class="bg-slate-800 border border-slate-700 rounded-lg p-4 card-hover" data-account-id="${acct.id}">
+        <div class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 card-hover${disabledClass}" data-account-id="${acct.id}">
             <div class="flex items-start">
                 ${priorityButtons}
                 <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2 mb-1">
+                    <div class="flex items-center gap-2 flex-wrap">
                         <span class="status-dot ${status}"></span>
-                        <span class="font-medium text-white truncate">${email}</span>
+                        <span class="font-medium text-white truncate max-w-[300px]" title="${escapeHtml(primaryName)}">${escapeHtml(primaryName)}</span>
+                        <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors" data-id="${acct.id}" data-label="${escapeHtml(label)}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
+                        </button>
                         ${priorityBadge}
-                        ${statusBadge}
+                        ${disabledBadge}
+                        ${pillsHtml}
                         ${extraUsageHtml}
                     </div>
-                    <div class="flex items-center gap-3 mb-3 ml-5">
+                    <div class="flex items-center gap-3 mb-2 ml-5">
+                        <span class="text-xs text-slate-400">${escapeHtml(email)}${orgLabel ? ` (${escapeHtml(orgLabel)})` : ''}</span>
+                        <span class="text-slate-600">|</span>
                         <span class="text-xs text-slate-400">${escapeHtml(subDisplay)}</span>
                         <span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
+                        <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        </button>
                     </div>
-                    <div class="ml-5">
+                    <!-- data-usage-container: queried by _usageUpdateCardDOM (websocket.js) for surgical bar updates -->
+                    <div class="ml-5" data-usage-container>
                         ${usage5h}
                         ${usage7d}
                         ${renderActiveSessions(acct)}
@@ -295,11 +343,28 @@ function renderAccounts(accounts) {
         `;
     }
 
+    // Session isolation tip banner (dismissible via localStorage)
+    let tipHtml = '';
+    if (!localStorage.getItem('jacked_tip_dismissed')) {
+        tipHtml = `
+            <div id="session-tip-banner" class="bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 mb-4 text-sm text-slate-300">
+                <div class="flex items-start justify-between">
+                    <div>
+                        <strong class="text-slate-200">Per-account sessions</strong> &mdash;
+                        Use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch Claude Code with isolated credentials per account.
+                        Supports pass-through args: <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude 2 --resume</code>
+                    </div>
+                    <button id="btn-dismiss-tip" class="text-slate-500 hover:text-slate-300 ml-3 shrink-0 text-lg leading-none" title="Dismiss">&times;</button>
+                </div>
+            </div>
+        `;
+    }
+
     const sorted = [...visible].sort((a, b) => (a.priority || 0) - (b.priority || 0));
     const cardsHtml = sorted.map((acct, idx) => renderAccountCard(acct, idx, sorted.length)).join('');
 
     return `
-        <div class="max-w-3xl">
+        <div class="max-w-5xl">
             <div class="flex items-center justify-between mb-5">
                 <h2 class="text-xl font-semibold text-white">Accounts</h2>
                 <div class="flex items-center gap-2">
@@ -307,19 +372,19 @@ function renderAccounts(accounts) {
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                         Refresh All Usage
                     </button>
-                    <div class="flex items-center gap-1.5" title="Auto-refresh usage every 60s">
-                        <span class="text-xs text-slate-400">Auto</span>
-                        <label class="toggle-switch toggle-sm">
-                            <input type="checkbox" id="chk-auto-refresh">
-                            <span class="toggle-slider"></span>
-                        </label>
-                    </div>
+                    <select id="sel-auto-refresh" class="bg-slate-700 border border-slate-600 text-slate-300 text-sm rounded-lg px-3 py-2 cursor-pointer hover:border-slate-500 transition-colors" title="Auto-refresh interval" aria-label="Auto-refresh interval">
+                        <option value="0">Auto: Off</option>
+                        <option value="120">Auto: 2 min</option>
+                        <option value="300">Auto: 5 min</option>
+                        <option value="600">Auto: 10 min</option>
+                    </select>
                     <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                         Add Account
                     </button>
                 </div>
             </div>
+            ${tipHtml}
             ${bannerHtml}
             <div id="oauth-flow-status"></div>
             ${typeof renderSessionControls === 'function' ? renderSessionControls() : ''}
@@ -344,7 +409,7 @@ function renderEmptyState() {
             <p class="text-sm text-slate-400 mb-6">Connect your Claude account to get started</p>
             <button id="btn-add-account" class="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
-                Connect Account
+                Add Account
             </button>
             <div id="oauth-flow-status" class="mt-4"></div>
         </div>

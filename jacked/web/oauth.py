@@ -16,6 +16,7 @@ Adapted from ralphx — same CLIENT_ID, same Anthropic endpoints.
 import asyncio
 import base64
 import hashlib
+import html
 import json
 import logging
 import secrets
@@ -44,6 +45,7 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 CALLBACK_PORT_RANGE = range(45100, 45200)
+DEFAULT_TOKEN_TTL_SECONDS = 28800  # 8 hours — default token lifetime from Anthropic
 
 # organization_type → subscription_type mapping (design doc section 4e)
 ORG_TYPE_MAP = {
@@ -124,8 +126,15 @@ class OAuthFlow:
     4. Frontend sees status='completed' and reloads account list
     """
 
-    def __init__(self, db: Database):
+    def __init__(
+        self,
+        db: Database,
+        purpose: str = "primary",
+        target_account_id: Optional[int] = None,
+    ):
         self.db = db
+        self.purpose = purpose  # "primary" | "claude_code"
+        self._target_account_id = target_account_id
         self.flow_id = secrets.token_urlsafe(16)
         self._verifier: Optional[str] = None
         self._state: Optional[str] = None
@@ -133,6 +142,7 @@ class OAuthFlow:
         self._status = "pending"  # pending | completed | error
         self._result: Optional[dict] = None
         self._error: Optional[str] = None
+        self._cc_flow_id: Optional[str] = None
         self._event = asyncio.Event()
         self._created_at = time.time()
 
@@ -154,6 +164,8 @@ class OAuthFlow:
             result["email"] = self._result.get("email")
         if self._error:
             result["error"] = self._error
+        if self._cc_flow_id:
+            result["cc_flow_id"] = self._cc_flow_id
         return result
 
     async def start(self) -> dict:
@@ -243,7 +255,8 @@ class OAuthFlow:
                 content_type="text/html",
             )
 
-        # CSRF check
+        # CSRF check — state validation also prevents cross-flow purpose confusion
+        # (each flow has a unique state token, so a CC callback can't hit a primary flow)
         if state != self._state:
             self._status = "error"
             self._error = "Invalid state parameter (possible CSRF attack)"
@@ -259,13 +272,28 @@ class OAuthFlow:
                 self._result = result
                 self._status = "completed"
             except Exception as e:
-                logger.error(f"OAuth completion failed: {e}")
+                logger.error(
+                    f"OAuth completion failed for flow {self.flow_id} "
+                    f"(purpose={self.purpose}): {e}"
+                )
                 self._status = "error"
                 self._error = str(e)
+        else:
+            self._status = "error"
+            self._error = "No authorization code received"
 
         self._event.set()
+
+        if self._status == "error":
+            safe_error = html.escape(self._error or "Unknown error")
+            return web.Response(
+                text=f"<h1>Authorization Failed</h1><p>{safe_error}</p>"
+                     "<p>Return to the jacked dashboard to try again.</p>",
+                content_type="text/html",
+            )
         return web.Response(
-            text="<h1>Success!</h1><p>You can close this window.</p><script>window.close()</script>",
+            text="<h1>Success!</h1><p>You can close this window.</p>"
+                 "<script>window.close()</script>",
             content_type="text/html",
         )
 
@@ -278,19 +306,49 @@ class OAuthFlow:
             access_token = tokens["access_token"]
 
             # Step 2: Optionally create API key (changes token lifecycle)
-            if "org:create_api_key" in tokens.get("scope", ""):
+            # Only for primary flows — CC tokens need refresh capability
+            if self.purpose == "primary" and "org:create_api_key" in tokens.get("scope", ""):
                 access_token, tokens = await self._create_api_key(
                     client, access_token, tokens
                 )
 
-            # Step 3: Fetch profile
-            profile = await self._fetch_profile(client, access_token)
+            # Step 3 & 4: Fetch profile & usage (skip for CC — raw OAuth
+            # token isn't accepted by these endpoints, causing 401s + misleading logs)
+            if self.purpose == "primary":
+                profile = await self._fetch_profile(client, access_token)
+                usage = await self._fetch_usage(client, access_token)
+            else:
+                profile = {}
+                usage = {}
 
-            # Step 4: Fetch usage
-            usage = await self._fetch_usage(client, access_token)
-
-            # Step 5: Store in database
+            # Step 5: Store in database (branches on purpose)
             account = self._store_account(tokens, profile, usage)
+
+            # Step 6: Write to all credential stores (file, keychain, config)
+            from jacked.api.credential_helpers import sync_credential_to_all_stores
+
+            sync_credential_to_all_stores(account["id"], account)
+
+            # Step 7: For primary flows, persist active account + auto-start CC flow
+            if self.purpose == "primary":
+                self.db.set_setting("active_account_id", str(account["id"]))
+
+                # Auto-start CC flow so the account gets independent CC tokens.
+                # Wrapped in try/except: CC failure is non-fatal — primary account
+                # is already saved. Without this guard, a CC failure (e.g., no
+                # available port) would propagate up to _handle_callback() and
+                # mark the PRIMARY flow as errored.
+                try:
+                    cc_flow = OAuthFlow(
+                        self.db,
+                        purpose="claude_code",
+                        target_account_id=account["id"],
+                    )
+                    cc_result = await cc_flow.start()
+                    self._cc_flow_id = cc_result.get("flow_id")
+                except Exception as e:
+                    logger.warning(f"CC auto-flow failed (non-fatal): {e}")
+                    self._cc_flow_id = None
 
             return {
                 "account_id": account.get("id"),
@@ -315,12 +373,15 @@ class OAuthFlow:
             },
         )
         if resp.status_code != 200:
-            logger.error(f"Token exchange HTTP {resp.status_code}: {resp.text}")
+            # Truncate response body to avoid logging sensitive data
+            body_preview = (resp.text or "")[:200]
+            logger.error(f"Token exchange HTTP {resp.status_code}: {body_preview}")
             resp.raise_for_status()
 
         tokens = resp.json()
         logger.info(
-            f"Token exchange successful: expires_in={tokens.get('expires_in')}"
+            f"Token exchange successful: expires_in={tokens.get('expires_in')}, "
+            f"has_refresh={bool(tokens.get('refresh_token'))}"
         )
 
         # Extract account metadata from response (design doc section 4b)
@@ -331,6 +392,12 @@ class OAuthFlow:
             tokens["subscription_type"] = account_data["subscriptionType"]
         if account_data.get("rateLimitTier"):
             tokens["rate_limit_tier"] = account_data["rateLimitTier"]
+
+        # Extract organization data from token response.
+        # Normalize: None/"" → sentinel "" for DB storage.
+        org_data = tokens.get("organization", {})
+        tokens["organization_uuid"] = org_data.get("uuid") or ""
+        tokens["organization_name"] = org_data.get("name") or None
 
         # Store scopes as JSON array
         if tokens.get("scope"):
@@ -364,8 +431,9 @@ class OAuthFlow:
                     logger.info("Created long-lived API key (1 year)")
                     return api_key_data["api_key"], tokens
             else:
+                body_preview = (resp.text or "")[:200]
                 logger.warning(
-                    f"API key creation HTTP {resp.status_code}: {resp.text}"
+                    f"API key creation HTTP {resp.status_code}: {body_preview}"
                 )
         except Exception as e:
             logger.warning(f"API key creation failed: {e} — using short-lived token")
@@ -411,9 +479,23 @@ class OAuthFlow:
         return {}
 
     def _store_account(self, tokens: dict, profile: dict, usage: dict) -> dict:
-        """Store account data in the database."""
+        """Store account data in the database.
+
+        Branches on self.purpose:
+        - "primary": create/update account with primary tokens (existing behavior)
+        - "claude_code": validate identity, update cc_* columns on existing account
+        """
+        if self.purpose == "claude_code":
+            return self._store_cc_tokens(tokens, profile)
+
+        return self._store_primary_account(tokens, profile, usage)
+
+    def _store_primary_account(
+        self, tokens: dict, profile: dict, usage: dict
+    ) -> dict:
+        """Store primary account tokens (original behavior)."""
         email = tokens.get("email", "unknown")
-        expires_at = int(time.time()) + tokens.get("expires_in", 28800)
+        expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
 
         # Build scopes JSON
         scopes_json = None
@@ -433,18 +515,77 @@ class OAuthFlow:
         has_extra_usage = org.get("has_extra_usage_enabled", False)
         display_name = acct_info.get("display_name")
 
-        # Create/update account
-        account = self.db.create_account(
-            email=email,
-            access_token=tokens["access_token"],
-            refresh_token=tokens.get("refresh_token"),
-            expires_at=expires_at,
-            display_name=display_name,
-            scopes=scopes_json,
-            subscription_type=subscription_type,
-            rate_limit_tier=rate_limit_tier,
-            has_extra_usage=has_extra_usage,
-        )
+        final_org_uuid = tokens.get("organization_uuid", "")
+        final_org_name = tokens.get("organization_name")
+
+        if self._target_account_id:
+            # RE-AUTH: Update existing account by ID.
+            # Don't use create_account()'s email+org_uuid upsert — org_uuid
+            # can change between OAuth sessions, creating duplicates.
+            target = self.db.get_account(self._target_account_id)
+            if not target:
+                raise ValueError(
+                    f"Re-auth target account {self._target_account_id} not found"
+                )
+
+            # Identity check: ensure the user logged in with the same Google account
+            if email.lower() != target["email"].lower():
+                raise ValueError(
+                    f"Re-auth email ({email}) does not match "
+                    f"target account ({target['email']})"
+                )
+
+            # If org_uuid changed, remove any soft-deleted duplicate that would
+            # collide with UNIQUE(email, organization_uuid). This cleans up ghosts
+            # left by the old bug where re-auth created duplicate accounts.
+            old_org_uuid = target.get("organization_uuid", "")
+            if final_org_uuid != old_org_uuid:
+                self.db.hard_delete_duplicate(email, final_org_uuid)
+
+            self.db.update_account(
+                self._target_account_id,
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                expires_at=expires_at,
+                scopes=scopes_json,
+                organization_uuid=final_org_uuid,
+                organization_name=final_org_name,
+                subscription_type=subscription_type,
+                rate_limit_tier=rate_limit_tier,
+                has_extra_usage=has_extra_usage,
+                is_active=True,
+                consecutive_failures=0,
+                validation_status="valid",
+                last_validated_at=int(time.time()),
+                last_error=None,
+            )
+            account = self.db.get_account(self._target_account_id)
+        else:
+            # ADD: Normal create_account with email+org upsert
+            account = self.db.create_account(
+                email=email,
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                expires_at=expires_at,
+                display_name=display_name,
+                scopes=scopes_json,
+                subscription_type=subscription_type,
+                rate_limit_tier=rate_limit_tier,
+                has_extra_usage=has_extra_usage,
+                organization_uuid=final_org_uuid,
+                organization_name=final_org_name,
+            )
+
+            # Non-fatal: account already persisted by create_account above
+            updated = self.db.update_account(
+                account["id"],
+                validation_status="valid",
+                last_validated_at=int(time.time()),
+            )
+            if not updated:
+                logger.warning(
+                    f"Validation status update failed for account {account['id']}"
+                )
 
         # Update usage cache if we got usage data
         five_hour = usage.get("five_hour", {})
@@ -459,12 +600,69 @@ class OAuthFlow:
                 raw=usage,
             )
 
-        # Mark as valid
-        self.db.update_account(
-            account["id"],
+        logger.info(f"Account stored: {email} (id={account['id']})")
+        return account
+
+    def _store_cc_tokens(self, tokens: dict, profile: dict) -> dict:
+        """Store CC (Claude Code) tokens on an existing account.
+
+        Identity validation: the CC OAuth flow may authenticate a different
+        Google/email account than the target. We verify the email matches.
+        """
+        account_id = self._target_account_id
+        target = self.db.get_account(account_id)
+        if not target:
+            raise ValueError(f"Target account {account_id} not found")
+
+        # Identity validation — try token response first, fall back to profile.
+        # CC flows skip API key creation, so _fetch_profile may fail with
+        # the raw OAuth access token (returns {}). The token exchange response
+        # already contains the email in tokens["email"] from the account field.
+        cc_email = (
+            tokens.get("email")
+            or profile.get("account", {}).get("email_address")
+        )
+        if not cc_email:
+            raise RuntimeError(
+                "Cannot verify CC token identity — no email in token response or profile"
+            )
+        if cc_email.lower() != target["email"].lower():
+            raise ValueError(
+                f"CC auth email ({cc_email}) does not match "
+                f"target account ({target['email']})"
+            )
+
+        # Org validation — fail closed: if target has a real org, CC must match it
+        target_org = target.get("organization_uuid", "")
+        cc_org = tokens.get("organization_uuid", "")
+        if target_org:  # non-empty sentinel = real org
+            if not cc_org:
+                raise ValueError(
+                    "CC auth missing org — cannot verify against org-scoped account "
+                    f"(target org: {target_org})"
+                )
+            if cc_org != target_org:
+                raise ValueError(
+                    f"CC auth org ({cc_org}) does not match "
+                    f"target account org ({target_org})"
+                )
+
+        expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
+
+        # Fatal: CC tokens are the sole deliverable of this flow
+        updated = self.db.update_account(
+            account_id,
+            cc_access_token=tokens["access_token"],
+            cc_refresh_token=tokens.get("refresh_token"),
+            cc_expires_at=expires_at,
             validation_status="valid",
             last_validated_at=int(time.time()),
         )
+        if not updated:
+            raise RuntimeError(
+                f"CC token update failed: account {account_id} — 0 rows affected"
+            )
 
-        logger.info(f"Account stored: {email} (id={account['id']})")
-        return account
+        logger.info(f"CC tokens stored for account {account_id} ({cc_email})")
+        # Return the full account row so credential sync works
+        return self.db.get_account(account_id)

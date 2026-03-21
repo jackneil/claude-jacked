@@ -24,7 +24,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label) {
     const resetDisplay = resetTime ? formatResetTime(resetTime) : '';
 
     return `
-        <div class="flex items-center gap-3 mb-1.5">
+        <div class="flex items-center gap-3 mb-1">
             <span class="text-xs text-slate-400 w-14 shrink-0">${escapeHtml(label || '')}</span>
             <div class="usage-bar flex-1">
                 <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>

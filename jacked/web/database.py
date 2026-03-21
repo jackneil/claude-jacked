@@ -1,14 +1,16 @@
 """SQLite database layer for jacked web dashboard.
 
-9 tables across three concerns:
+10 tables across three concerns:
 - Account management: accounts, installations, settings
 - Analytics: gatekeeper_decisions, command_usage, agent_invocations,
              hook_executions, lessons, version_checks
+- Session tracking: session_accounts
 
 WAL mode for concurrent reads, single writer lock for atomic writes.
 """
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -19,8 +21,13 @@ from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, computed_field
 
+logger = logging.getLogger(__name__)
+
 # Sessions without a heartbeat within this window are considered stale
 SESSION_STALENESS_MINUTES = 60
+
+# Sessions with no Claude process alive for this long are auto-closed
+DEAD_SESSION_HOURS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +40,8 @@ class Account(BaseModel):
 
     id: int
     email: str
+    organization_uuid: str = ""
+    organization_name: Optional[str] = None
     display_name: Optional[str] = None
     access_token: str
     refresh_token: Optional[str] = None
@@ -56,6 +65,9 @@ class Account(BaseModel):
     consecutive_failures: int = 0
     last_validated_at: Optional[int] = None
     validation_status: str = "unknown"
+    cc_access_token: Optional[str] = None
+    cc_refresh_token: Optional[str] = None
+    cc_expires_at: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -186,7 +198,9 @@ SCHEMA_SQL = """
 -- Account Management Tables
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
+    organization_uuid TEXT DEFAULT '',  -- Sentinel: "" = personal/legacy, non-empty = real org UUID
+    organization_name TEXT,
     display_name TEXT,
     access_token TEXT NOT NULL,
     refresh_token TEXT,
@@ -210,8 +224,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     consecutive_failures INTEGER DEFAULT 0,
     last_validated_at INTEGER,
     validation_status TEXT DEFAULT 'unknown',
+    cc_access_token TEXT,
+    cc_refresh_token TEXT,
+    cc_expires_at INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(email, organization_uuid)
 );
 
 CREATE TABLE IF NOT EXISTS installations (
@@ -244,7 +262,13 @@ CREATE TABLE IF NOT EXISTS gatekeeper_decisions (
     reason TEXT,
     elapsed_ms REAL,
     session_id TEXT,
-    repo_path TEXT
+    repo_path TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    model TEXT,
+    trajectory TEXT
 );
 
 CREATE TABLE IF NOT EXISTS command_usage (
@@ -317,13 +341,14 @@ CREATE TABLE IF NOT EXISTS session_accounts (
     is_subagent BOOLEAN DEFAULT 0,
     parent_session_id TEXT,
     agent_type TEXT,
+    pid INTEGER,
     UNIQUE(session_id, detected_at)
 );
+
 """
 
 INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active, is_deleted);
-CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
 CREATE INDEX IF NOT EXISTS idx_accounts_priority ON accounts(priority);
 CREATE INDEX IF NOT EXISTS idx_installations_repo ON installations(repo_path);
 CREATE INDEX IF NOT EXISTS idx_gatekeeper_timestamp ON gatekeeper_decisions(timestamp);
@@ -401,6 +426,18 @@ class Database:
 
     def _init_schema(self) -> None:
         with self._writer() as conn:
+            # Pre-schema crash recovery: if accounts_new exists but accounts doesn't,
+            # a prior migration crashed between DROP TABLE and ALTER TABLE RENAME.
+            # Rename before SCHEMA_SQL runs (which would CREATE TABLE accounts empty).
+            _has_new = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts_new'"
+            ).fetchone() is not None
+            _has_old = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'"
+            ).fetchone() is not None
+            if _has_new and not _has_old:
+                conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
+                conn.execute("DROP INDEX IF EXISTS idx_accounts_email")
             conn.executescript(SCHEMA_SQL)
             # Migrations run BEFORE indexes (indexes may reference new columns)
             # Migration: add cached_usage_raw if missing (existing DBs)
@@ -438,6 +475,7 @@ class Database:
                 ("is_subagent", "BOOLEAN DEFAULT 0"),
                 ("parent_session_id", "TEXT"),
                 ("agent_type", "TEXT"),
+                ("pid", "INTEGER"),
             ]:
                 if col_name not in cols:
                     try:
@@ -446,6 +484,133 @@ class Database:
                         )
                     except sqlite3.OperationalError:
                         pass
+            # Migration: add token tracking + model to gatekeeper_decisions
+            cursor = conn.execute("PRAGMA table_info(gatekeeper_decisions)")
+            cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_def in [
+                ("input_tokens", "INTEGER DEFAULT 0"),
+                ("output_tokens", "INTEGER DEFAULT 0"),
+                ("cache_read_tokens", "INTEGER DEFAULT 0"),
+                ("cache_write_tokens", "INTEGER DEFAULT 0"),
+                ("model", "TEXT"),
+            ]:
+                if col_name not in cols:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE gatekeeper_decisions ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+            # Migration: add trajectory to gatekeeper_decisions
+            if "trajectory" not in cols:
+                try:
+                    conn.execute(
+                        "ALTER TABLE gatekeeper_decisions ADD COLUMN trajectory TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            # Migration: add CC (Claude Code) token columns for dual-token architecture.
+            # Primary tokens are jacked-only; CC tokens are written to credential files
+            # for Claude Code. This prevents token rotation conflicts.
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols = {row[1] for row in cursor.fetchall()}
+            cc_cols_added = False
+            for col_name, col_def in [
+                ("cc_access_token", "TEXT"),
+                ("cc_refresh_token", "TEXT"),
+                ("cc_expires_at", "INTEGER"),
+            ]:
+                if col_name not in acct_cols:
+                    cc_cols_added = True
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE accounts ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+            # Seed cc_access_token from primary for existing accounts (one-time only).
+            # Only runs when columns were JUST added — not on every startup.
+            # Re-running would defeat invalid_grant handling (which clears cc_refresh_token).
+            # cc_refresh_token is intentionally NOT seeded — seeding it would recreate
+            # the shared-refresh-token bug. Users must do CC OAuth to get independent
+            # CC refresh tokens.
+            if cc_cols_added:
+                conn.execute(
+                    """UPDATE accounts SET cc_access_token = access_token,
+                    cc_expires_at = expires_at
+                    WHERE cc_access_token IS NULL AND access_token IS NOT NULL
+                    AND is_deleted = 0
+                    AND (expires_at IS NULL OR expires_at > strftime('%s','now'))"""
+                )
+            # Migration: add organization columns + composite uniqueness.
+            # Requires table recreation because SQLite can't ALTER UNIQUE constraints.
+            # Uses individual conn.execute() (NOT executescript) for transactional safety.
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_org = {row[1] for row in cursor.fetchall()}
+            if "organization_uuid" not in acct_cols_org:
+                # Note: scenario where accounts was dropped but accounts_new wasn't
+                # yet renamed is handled by pre-schema recovery above (line ~430).
+                # Here we only need to handle partial accounts_new from early-stage crash.
+                conn.execute("DROP TABLE IF EXISTS accounts_new")
+                conn.execute("""CREATE TABLE accounts_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL,
+                    organization_uuid TEXT DEFAULT '',
+                    organization_name TEXT,
+                    display_name TEXT,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    expires_at INTEGER NOT NULL,
+                    scopes TEXT,
+                    subscription_type TEXT,
+                    rate_limit_tier TEXT,
+                    has_extra_usage BOOLEAN DEFAULT FALSE,
+                    priority INTEGER DEFAULT 0,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    last_used_at TIMESTAMP,
+                    cached_usage_5h REAL,
+                    cached_usage_7d REAL,
+                    cached_5h_resets_at TEXT,
+                    cached_7d_resets_at TEXT,
+                    usage_cached_at INTEGER,
+                    cached_usage_raw TEXT,
+                    last_error TEXT,
+                    last_error_at TIMESTAMP,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    last_validated_at INTEGER,
+                    validation_status TEXT DEFAULT 'unknown',
+                    cc_access_token TEXT,
+                    cc_refresh_token TEXT,
+                    cc_expires_at INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(email, organization_uuid)
+                )""")
+                conn.execute("""INSERT INTO accounts_new (
+                    id, email, organization_uuid, organization_name,
+                    display_name, access_token, refresh_token, expires_at,
+                    scopes, subscription_type, rate_limit_tier, has_extra_usage,
+                    priority, is_active, is_deleted, last_used_at,
+                    cached_usage_5h, cached_usage_7d, cached_5h_resets_at, cached_7d_resets_at,
+                    usage_cached_at, cached_usage_raw, last_error, last_error_at,
+                    consecutive_failures, last_validated_at, validation_status,
+                    cc_access_token, cc_refresh_token, cc_expires_at,
+                    created_at, updated_at
+                ) SELECT
+                    id, email, '', NULL,
+                    display_name, access_token, refresh_token, expires_at,
+                    scopes, subscription_type, rate_limit_tier, has_extra_usage,
+                    priority, is_active, is_deleted, last_used_at,
+                    cached_usage_5h, cached_usage_7d, cached_5h_resets_at, cached_7d_resets_at,
+                    usage_cached_at, cached_usage_raw, last_error, last_error_at,
+                    consecutive_failures, last_validated_at, validation_status,
+                    cc_access_token, cc_refresh_token, cc_expires_at,
+                    created_at, updated_at
+                FROM accounts""")
+                conn.execute("DROP TABLE accounts")
+                conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
+                conn.execute("DROP INDEX IF EXISTS idx_accounts_email")
             # Indexes (after migrations so new columns exist)
             conn.executescript(INDEXES_SQL)
             # Migration: rebuild idx_sa_active to cover last_activity_at
@@ -455,6 +620,11 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_sa_active "
                     "ON session_accounts(ended_at, last_activity_at, detected_at)"
                 )
+            except sqlite3.OperationalError:
+                pass
+            # Migration: drop known_refresh_tokens (no longer needed)
+            try:
+                conn.execute("DROP TABLE IF EXISTS known_refresh_tokens")
             except sqlite3.OperationalError:
                 pass
             # Cleanup: end duplicate open session-account records.
@@ -471,6 +641,33 @@ class Database:
                 )
             except sqlite3.OperationalError:
                 pass
+            # Audit trail: catch ALL display_name changes regardless of code path.
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS display_name_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    changed_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TRIGGER IF NOT EXISTS trg_display_name_audit
+                AFTER UPDATE OF display_name ON accounts
+                WHEN OLD.display_name IS NOT NEW.display_name
+                BEGIN
+                    INSERT INTO display_name_audit (account_id, old_value, new_value)
+                    VALUES (OLD.id, OLD.display_name, NEW.display_name);
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_display_name_audit_insert
+                AFTER INSERT ON accounts
+                WHEN NEW.display_name IS NOT NULL
+                BEGIN
+                    INSERT INTO display_name_audit (account_id, old_value, new_value)
+                    VALUES (NEW.id, NULL, NEW.display_name);
+                END;
+            """)
+            logger.info(
+                "display_name protected: only set_account_label() can modify labels"
+            )
 
     def close(self) -> None:
         if hasattr(self._local, "connection") and self._local.connection:
@@ -492,18 +689,30 @@ class Database:
         subscription_type: Optional[str] = None,
         rate_limit_tier: Optional[str] = None,
         has_extra_usage: bool = False,
+        organization_uuid: str = "",  # Sentinel: "" = personal/legacy, non-empty = real org UUID
+        organization_name: Optional[str] = None,
     ) -> dict:
-        """Create a new account or update if email already exists.
+        """Create a new account or update if (email, organization_uuid) already exists.
 
-        Handles the design doc edge cases:
-        - Existing deleted account with same email: undelete and update
-        - Existing active account with same email: update tokens in place
+        organization_uuid uses "" (empty string) as sentinel for personal/legacy accounts
+        instead of NULL, because SQLite treats NULL != NULL in UNIQUE constraints.
+        This makes UNIQUE(email, organization_uuid) and ON CONFLICT work atomically.
+
+        Handles edge cases:
+        - Existing deleted account with same email+org: undelete and update
+        - Existing active account with same email+org: update tokens in place
+        - Same email, different org: creates a new separate account
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("test@example.com", "sk-ant-test", 9999999999)
         >>> acct["email"]
         'test@example.com'
+        >>> acct["organization_uuid"]
+        ''
         """
+        # Normalize None → sentinel to prevent SQLite NULL uniqueness issues
+        if organization_uuid is None:
+            organization_uuid = ""
         now = datetime.now(timezone.utc).isoformat()
 
         with self._writer() as conn:
@@ -521,16 +730,18 @@ class Database:
 
             cursor = conn.execute(
                 """INSERT INTO accounts (
-                    email, access_token, refresh_token, expires_at, display_name,
+                    email, organization_uuid, organization_name,
+                    access_token, refresh_token, expires_at, display_name,
                     scopes, subscription_type, rate_limit_tier, has_extra_usage,
                     priority, is_active, is_deleted, consecutive_failures,
                     validation_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?)
-                ON CONFLICT(email) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?)
+                ON CONFLICT(email, organization_uuid) DO UPDATE SET
                     access_token = excluded.access_token,
                     refresh_token = excluded.refresh_token,
                     expires_at = excluded.expires_at,
                     scopes = excluded.scopes,
+                    organization_name = COALESCE(excluded.organization_name, organization_name),
                     subscription_type = COALESCE(excluded.subscription_type, subscription_type),
                     rate_limit_tier = COALESCE(excluded.rate_limit_tier, rate_limit_tier),
                     has_extra_usage = excluded.has_extra_usage,
@@ -542,6 +753,8 @@ class Database:
                 """,
                 (
                     email,
+                    organization_uuid,
+                    organization_name,
                     access_token,
                     refresh_token,
                     expires_at,
@@ -556,7 +769,11 @@ class Database:
                 ),
             )
 
-            cursor = conn.execute("SELECT * FROM accounts WHERE email = ?", (email,))
+            # Use compound key for retrieval — safe since UNIQUE(email, organization_uuid)
+            cursor = conn.execute(
+                "SELECT * FROM accounts WHERE email = ? AND organization_uuid = ?",
+                (email, organization_uuid),
+            )
             row = cursor.fetchone()
             return dict(row) if row else {}
 
@@ -575,20 +792,40 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_account_by_email(self, email: str) -> Optional[dict]:
-        """Get an account by email, case-insensitive (excludes soft-deleted).
+    def get_account_by_email(
+        self, email: str, organization_uuid: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Get an account by email (+ optional org), case-insensitive.
+
+        When organization_uuid is provided, returns exact match.
+        When omitted, returns the single match or raises ValueError
+        if multiple accounts share the same email (different orgs).
 
         >>> db = Database(":memory:")
         >>> db.get_account_by_email("nobody@nowhere.com") is None
         True
         """
         with self._reader() as conn:
+            if organization_uuid is not None:
+                cursor = conn.execute(
+                    "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) "
+                    "AND organization_uuid = ? AND is_deleted = 0",
+                    (email, organization_uuid),
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+
             cursor = conn.execute(
-                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) AND is_deleted = 0",
+                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) "
+                "AND is_deleted = 0 ORDER BY priority ASC, id ASC",
                 (email,),
             )
-            row = cursor.fetchone()
-            return dict(row) if row else None
+            rows = cursor.fetchall()
+            if len(rows) > 1:
+                raise ValueError(
+                    f"Ambiguous: {len(rows)} accounts for {email} — specify by ID or org"
+                )
+            return dict(rows[0]) if rows else None
 
     def list_accounts(
         self,
@@ -618,7 +855,7 @@ class Database:
     # Whitelist of columns allowed in update_account
     _ACCOUNT_UPDATE_COLS = frozenset(
         {
-            "display_name",
+            "organization_name",
             "access_token",
             "refresh_token",
             "expires_at",
@@ -640,15 +877,21 @@ class Database:
             "consecutive_failures",
             "last_validated_at",
             "validation_status",
+            "cc_access_token",
+            "cc_refresh_token",
+            "cc_expires_at",
+            "organization_uuid",
         }
     )
 
     def update_account(self, account_id: int, **kwargs: Any) -> bool:
         """Update an account by ID.
 
+        display_name is NOT in the whitelist — use set_account_label() instead.
+
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@test.com", "tok", 9999999999)
-        >>> db.update_account(acct["id"], display_name="Test User")
+        >>> db.update_account(acct["id"], is_active=False)
         True
         """
         if not kwargs:
@@ -669,6 +912,56 @@ class Database:
             )
             return cursor.rowcount > 0
 
+    def set_account_label(self, account_id: int, label: Optional[str]) -> bool:
+        """Set display_name for an account — the ONLY way to change labels.
+
+        Logs old→new for audit trail. The SQLite trigger on display_name
+        also writes to display_name_audit for belt-and-suspenders tracking.
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("u@test.com", "tok", 9999999999)
+        >>> db.set_account_label(acct["id"], "Work")
+        True
+        >>> db.get_account(acct["id"])["display_name"]
+        'Work'
+        """
+        with self._writer() as conn:
+            old_row = conn.execute(
+                "SELECT display_name FROM accounts WHERE id = ? AND is_deleted = 0",
+                (account_id,),
+            ).fetchone()
+            if old_row is None:
+                return False
+            old = old_row[0]
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE accounts SET display_name = ?, updated_at = ? "
+                "WHERE id = ? AND is_deleted = 0",
+                (label, now, account_id),
+            )
+            logger.info(
+                "Label changed for account %d: %r -> %r", account_id, old, label,
+            )
+            return True
+
+    def get_label_audit_log(self, limit: int = 50) -> list[dict]:
+        """Return recent display_name audit entries.
+
+        >>> db = Database(":memory:")
+        >>> isinstance(db.get_label_audit_log(), list)
+        True
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT a.id, a.account_id, a.old_value, a.new_value, "
+                "a.changed_at, acct.email "
+                "FROM display_name_audit a "
+                "LEFT JOIN accounts acct ON acct.id = a.account_id "
+                "ORDER BY a.id DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def delete_account(self, account_id: int) -> bool:
         """Soft-delete an account.
 
@@ -684,6 +977,25 @@ class Database:
             cursor = conn.execute(
                 "UPDATE accounts SET is_deleted = 1, updated_at = ? WHERE id = ? AND is_deleted = 0",
                 (now, account_id),
+            )
+            return cursor.rowcount > 0
+
+    def hard_delete_duplicate(self, email: str, organization_uuid: str) -> bool:
+        """Hard-delete a soft-deleted account that would collide on UNIQUE(email, org_uuid).
+
+        Used during re-auth when org_uuid changes: a prior buggy re-auth may have
+        created a duplicate row that was later soft-deleted. The UNIQUE constraint
+        includes soft-deleted rows, so we must remove the ghost before updating.
+        Only deletes rows where is_deleted=1 — never touches active accounts.
+
+        >>> db = Database(":memory:")
+        >>> db.hard_delete_duplicate("x@test.com", "")
+        False
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "DELETE FROM accounts WHERE email = ? AND organization_uuid = ? AND is_deleted = 1",
+                (email, organization_uuid),
             )
             return cursor.rowcount > 0
 
@@ -1049,6 +1361,11 @@ class Database:
         elapsed_ms: Optional[float] = None,
         session_id: Optional[str] = None,
         repo_path: Optional[str] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        model: Optional[str] = None,
     ) -> int:
         """Record a gatekeeper decision.
 
@@ -1065,8 +1382,10 @@ class Database:
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO gatekeeper_decisions
-                   (timestamp, command, decision, method, reason, elapsed_ms, session_id, repo_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (timestamp, command, decision, method, reason, elapsed_ms,
+                    session_id, repo_path, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ts,
                     command,
@@ -1076,9 +1395,27 @@ class Database:
                     elapsed_ms,
                     session_id,
                     repo_path,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    model,
                 ),
             )
             return cursor.lastrowid or 0
+
+    def list_gatekeeper_methods(self) -> list[str]:
+        """Return distinct method values from gatekeeper_decisions.
+
+        >>> db = Database(":memory:")
+        >>> db.list_gatekeeper_methods()
+        []
+        """
+        with self._reader() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT method FROM gatekeeper_decisions WHERE method IS NOT NULL ORDER BY method"
+            ).fetchall()
+            return [r[0] for r in rows]
 
     def list_gatekeeper_decisions(
         self,
@@ -1467,6 +1804,7 @@ class Database:
         email: Optional[str] = None,
         detection_method: Optional[str] = None,
         repo_path: Optional[str] = None,
+        pid: Optional[int] = None,
     ) -> int:
         """Record which account a session is using.
 
@@ -1523,9 +1861,9 @@ class Database:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO session_accounts
                    (session_id, account_id, email, detected_at, last_activity_at,
-                    detection_method, repo_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (session_id, account_id, email, ts, ts, detection_method, repo_path),
+                    detection_method, repo_path, pid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, account_id, email, ts, ts, detection_method, repo_path, pid),
             )
             return cursor.lastrowid or 0
 
@@ -1588,7 +1926,7 @@ class Database:
         with self._reader() as conn:
             cursor = conn.execute(
                 """SELECT id, session_id, account_id, email, detected_at,
-                          ended_at, detection_method, repo_path
+                          ended_at, detection_method, repo_path, pid
                    FROM session_accounts
                    WHERE session_id = ?
                    ORDER BY detected_at DESC""",
@@ -1654,6 +1992,126 @@ class Database:
                 (cutoff,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_stale_open_sessions(
+        self, staleness_minutes: int = SESSION_STALENESS_MINUTES
+    ) -> list:
+        """Get sessions that are stale (past staleness window) but not ended.
+
+        Inverse of get_active_sessions — returns sessions that have gone
+        silent but were never closed. Used by the process-alive sweeper.
+
+        >>> db = Database(":memory:")
+        >>> db.get_stale_open_sessions()
+        []
+        """
+        clamped = max(5, min(120, staleness_minutes))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT s.session_id,
+                          s.last_activity_at,
+                          s.detected_at,
+                          s.pid
+                   FROM session_accounts s
+                   INNER JOIN (
+                       SELECT session_id,
+                              MAX(COALESCE(last_activity_at, detected_at)) AS last_activity_at,
+                              MAX(detected_at) AS max_detected_at
+                       FROM session_accounts
+                       WHERE ended_at IS NULL
+                         AND COALESCE(last_activity_at, detected_at) <= ?
+                       GROUP BY session_id
+                   ) g ON s.session_id = g.session_id
+                      AND s.detected_at = g.max_detected_at
+                   WHERE s.ended_at IS NULL
+                   ORDER BY s.last_activity_at ASC""",
+                (cutoff,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def bump_all_stale_sessions(
+        self, staleness_minutes: int = SESSION_STALENESS_MINUTES
+    ) -> int:
+        """Bump last_activity_at on all stale-but-open sessions.
+
+        Used by the process-alive sweeper when Claude processes are still
+        running. Returns the number of rows updated.
+
+        >>> db = Database(":memory:")
+        >>> db.bump_all_stale_sessions()
+        0
+        """
+        clamped = max(5, min(120, staleness_minutes))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts SET last_activity_at = ?
+                   WHERE ended_at IS NULL
+                     AND COALESCE(last_activity_at, detected_at) <= ?""",
+                (now, cutoff),
+            )
+            return cursor.rowcount
+
+    def close_dead_sessions(self, hours: int = DEAD_SESSION_HOURS) -> int:
+        """Close sessions that have been stale for more than `hours`.
+
+        Used by the process-alive sweeper when no Claude processes are
+        running. Returns the number of rows updated.
+
+        >>> db = Database(":memory:")
+        >>> db.close_dead_sessions()
+        0
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts SET ended_at = ?
+                   WHERE ended_at IS NULL
+                     AND COALESCE(last_activity_at, detected_at) <= ?""",
+                (now, cutoff),
+            )
+            return cursor.rowcount
+
+    def reassign_sessions(
+        self, from_account_id: int, to_account_id: int, since_iso: str
+    ) -> int:
+        """Reassign sessions from one account to another.
+
+        Batch-fixes wrongly-tagged sessions. Updates both account_id and email.
+        Both account IDs must exist and the target must not be deleted.
+
+        Args:
+            from_account_id: Source account (wrongly tagged)
+            to_account_id: Target account (correct)
+            since_iso: ISO timestamp cutoff — only sessions after this are reassigned
+
+        Returns:
+            Count of sessions reassigned
+
+        >>> db = Database(":memory:")
+        >>> db.reassign_sessions(1, 2, "2025-01-01T00:00:00Z")
+        0
+        """
+        from_acct = self.get_account(from_account_id)
+        to_acct = self.get_account(to_account_id)
+        if not from_acct:
+            raise ValueError(f"Source account {from_account_id} not found")
+        if not to_acct:
+            raise ValueError(f"Target account {to_account_id} not found")
+        if to_acct.get("is_deleted"):
+            raise ValueError(f"Target account {to_account_id} is deleted")
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts
+                   SET account_id = ?, email = ?
+                   WHERE account_id = ? AND detected_at > ?""",
+                (to_account_id, to_acct["email"], from_account_id, since_iso),
+            )
+            return cursor.rowcount
 
     def lookup_session_by_suffix(self, suffix: str, limit: int = 10) -> list:
         """Find session-account records by session_id suffix.

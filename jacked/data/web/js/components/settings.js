@@ -1,6 +1,6 @@
 /**
  * jacked web dashboard — settings component
- * Tabbed layout: Agents | Commands | Gatekeeper | Features | Plugins | Claude Code | Advanced
+ * Tabbed layout: Agents | Commands | Gatekeeper | Features | Plugins | Claude Code | Advanced | Profiles
  */
 
 const SETTINGS_TAB_KEY = 'jacked_settings_tab';
@@ -26,6 +26,7 @@ function renderSettings(settings) {
                 <button class="settings-tab ${savedTab === 'plugins' ? 'active' : ''}" data-tab="plugins">Plugins</button>
                 <button class="settings-tab ${savedTab === 'claude-code' ? 'active' : ''}" data-tab="claude-code">Claude Code</button>
                 <button class="settings-tab ${savedTab === 'advanced' ? 'active' : ''}" data-tab="advanced">Advanced</button>
+                <button class="settings-tab ${savedTab === 'profiles' ? 'active' : ''}" data-tab="profiles">Profiles</button>
             </div>
 
             <!-- Tab Content -->
@@ -98,6 +99,9 @@ async function renderSettingsTab(tabName) {
         case 'advanced':
             renderAdvancedTab(container);
             break;
+        case 'profiles':
+            renderProfilesTab(container);
+            break;
         default:
             container.innerHTML = '<div class="text-slate-500">Unknown tab</div>';
     }
@@ -159,7 +163,8 @@ function bindToggleEvents(container) {
 
             try {
                 await api.put(`/api/features/${encodeURIComponent(category)}/${encodeURIComponent(name)}`, { enabled });
-                showToast(`${name} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+                const displayName = toggle.closest('[data-feature-row]')?.dataset.displayName || name;
+                showToast(`${displayName} ${enabled ? 'enabled' : 'disabled'}`, 'success');
                 await refreshFeatures();
                 // Re-render the current tab to reflect changes
                 const activeTab = localStorage.getItem(SETTINGS_TAB_KEY) || DEFAULT_TAB;
@@ -200,7 +205,7 @@ async function renderAgentsTab(container) {
                 ? `<span class="badge badge-info ml-2">${escapeHtml(a.model)}</span>`
                 : '';
             return `
-                <div class="feature-card ${a.installed ? '' : 'disabled'}">
+                <div class="feature-card ${a.installed ? '' : 'disabled'}" data-feature-row data-display-name="${escapeHtml(a.display_name || a.name)}">
                     <div class="flex items-start justify-between gap-3">
                         <div class="min-w-0 flex-1">
                             <div class="flex items-center">
@@ -253,7 +258,7 @@ async function renderCommandsTab(container) {
         }
 
         const cardsHtml = commands.map(c => `
-            <div class="feature-card ${c.installed ? '' : 'disabled'}">
+            <div class="feature-card ${c.installed ? '' : 'disabled'}" data-feature-row data-display-name="${escapeHtml(c.display_name || c.name)}">
                 <div class="flex items-start justify-between gap-3">
                     <div class="min-w-0 flex-1">
                         <span class="text-sm font-medium text-white font-mono">${escapeHtml(c.display_name || c.name)}</span>
@@ -293,17 +298,25 @@ async function renderGatekeeperTab(container) {
     `;
 
     try {
-        const [config, features, pathSafety] = await Promise.all([
+        const results = await Promise.allSettled([
             api.get('/api/settings/gatekeeper'),
             loadFeatures(),
             api.get('/api/settings/gatekeeper/path-safety'),
+            api.get('/api/settings/gatekeeper/command-categories'),
         ]);
+
+        // Core config (index 0) is required; others degrade gracefully
+        if (results[0].status === 'rejected') throw results[0].reason;
+        const config = results[0].value;
+        const features = results[1].status === 'fulfilled' ? results[1].value : { hooks: [] };
+        const pathSafety = results[2].status === 'fulfilled' ? results[2].value : null;
+        const commandCategories = results[3].status === 'fulfilled' ? results[3].value : null;
 
         const gkHook = (features.hooks || []).find(h => h.name === 'security_gatekeeper');
         const hookInstalled = gkHook ? gkHook.installed : false;
 
-        container.innerHTML = renderGatekeeperContent(config, hookInstalled, pathSafety);
-        bindGatekeeperEvents(config, hookInstalled, pathSafety);
+        container.innerHTML = renderGatekeeperContent(config, hookInstalled, pathSafety, commandCategories);
+        bindGatekeeperEvents(config, hookInstalled, pathSafety, commandCategories);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -314,7 +327,7 @@ async function renderGatekeeperTab(container) {
     }
 }
 
-function renderGatekeeperContent(config, hookInstalled, pathSafety) {
+function renderGatekeeperContent(config, hookInstalled, pathSafety, commandCategories) {
     // On/off banner
     const bannerClass = hookInstalled ? 'bg-green-900/30 border-green-700/40' : 'bg-yellow-900/20 border-yellow-700/40';
     const bannerIcon = hookInstalled
@@ -435,6 +448,11 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety) {
                     ${renderPathSafetySection(pathSafety)}
                 </div>
 
+                <!-- Command Categories Config (collapsible) -->
+                <div class="border-t border-slate-700 pt-4 mt-2">
+                    ${renderCommandCategoriesSection(commandCategories)}
+                </div>
+
                 <!-- LLM Model Selection -->
                 <div>
                     <label class="block text-sm font-medium text-slate-300 mb-2">LLM Model</label>
@@ -461,7 +479,7 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety) {
                 <div>
                     <label class="block text-sm font-medium text-slate-300 mb-2">API Key Override</label>
                     <div class="flex items-center gap-2">
-                        <input id="gk-api-key" type="password" placeholder="Leave empty to use ANTHROPIC_API_KEY env var"
+                        <input id="gk-api-key" type="password" placeholder="${config.api_key_set && config.api_key_source === 'db' ? 'API key saved \u2014 enter new value to replace' : 'Leave empty to use ANTHROPIC_API_KEY env var'}"
                                class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
                         <button id="btn-gk-toggle-key" class="px-3 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors" title="Show/hide">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
@@ -502,6 +520,7 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety) {
 }
 
 function renderPathSafetySection(pathSafety) {
+    if (!pathSafety) return '<div class="text-xs text-slate-500 italic">Path safety config unavailable. <button onclick="renderSettingsTab(\'gatekeeper\')" class="text-blue-400 hover:text-blue-300">Retry</button></div>';
     const enabled = pathSafety.enabled !== false;
     const disabledPatterns = pathSafety.disabled_patterns || [];
     const allowedPaths = pathSafety.allowed_paths || [];
@@ -511,6 +530,8 @@ function renderPathSafetySection(pathSafety) {
 
     const watchedPaths = pathSafety.watched_paths || [];
     const watchedExistence = pathSafety.watched_existence || {};
+    const outsideReads = pathSafety.outside_reads || 'ask';
+    const outsideWrites = pathSafety.outside_writes || 'ask';
 
     const sectionOpacity = enabled ? '' : 'opacity-40 pointer-events-none';
 
@@ -587,6 +608,41 @@ function renderPathSafetySection(pathSafety) {
                 </div>
             </div>
 
+            <!-- Outside Project Behavior -->
+            <div class="mb-4">
+                <div id="ps-outside-header" class="flex items-center justify-between cursor-pointer select-none mb-2">
+                    <span class="text-xs font-medium text-slate-400 uppercase tracking-wider">Outside Project Behavior</span>
+                    <svg id="ps-outside-chevron" class="w-4 h-4 text-slate-500 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                </div>
+                <div id="ps-outside-content" class="hidden">
+                    <p class="text-[10px] text-slate-500 mb-3">Controls what happens when Claude accesses files outside your project directory. "Defer to Claude Code" stays silent and lets Claude Code's session permissions handle repeat approvals. Sensitive files and watched paths always require permission regardless.</p>
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <div class="text-sm text-white">Outside-project reads</div>
+                                <div class="text-[10px] text-slate-500">Read, Grep, Glob</div>
+                            </div>
+                            <select id="ps-outside-reads" class="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-orange-500">
+                                <option value="ask" ${outsideReads === 'ask' ? 'selected' : ''}>Always ask</option>
+                                <option value="defer" ${outsideReads === 'defer' ? 'selected' : ''}>Defer to Claude Code</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <div class="text-sm text-white">Outside-project writes</div>
+                                <div class="text-[10px] text-slate-500">Edit, Write, NotebookEdit</div>
+                            </div>
+                            <select id="ps-outside-writes" class="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-orange-500">
+                                <option value="ask" ${outsideWrites === 'ask' ? 'selected' : ''}>Always ask</option>
+                                <option value="defer" ${outsideWrites === 'defer' ? 'selected' : ''}>Defer to Claude Code</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Watched Paths -->
             <div class="mb-4">
                 <div id="ps-watched-header" class="flex items-center justify-between cursor-pointer select-none mb-2">
@@ -655,6 +711,165 @@ function renderPathSafetySection(pathSafety) {
 }
 
 
+function renderCommandCategoriesSection(commandCategories) {
+    const cats = commandCategories?.categories || {};
+    const modeColors = {
+        allow: { bg: 'bg-green-900/40', border: 'border-green-700/50', text: 'text-green-400', dot: 'bg-green-400' },
+        evaluate: { bg: 'bg-orange-900/30', border: 'border-orange-700/40', text: 'text-orange-400', dot: 'bg-orange-400' },
+        ask: { bg: 'bg-red-900/30', border: 'border-red-700/40', text: 'text-red-400', dot: 'bg-red-400' },
+    };
+    const modeLabels = { allow: 'Allow', evaluate: 'Evaluate', ask: 'Ask User' };
+
+    const rows = Object.entries(cats).map(([key, cat]) => {
+        const mode = cat.current_mode || cat.default_mode;
+        const isDefault = mode === cat.default_mode;
+        const colors = modeColors[mode] || modeColors.evaluate;
+
+        const options = ['allow', 'evaluate', 'ask'].map(m => {
+            const selected = m === mode ? 'selected' : '';
+            const label = modeLabels[m] + (m === cat.default_mode ? ' (default)' : '');
+            return `<option value="${m}" ${selected}>${label}</option>`;
+        }).join('');
+
+        return `
+            <div class="flex items-center gap-3 p-3 rounded ${colors.bg} border ${colors.border} transition-all" data-cat-key="${escapeHtml(key)}">
+                <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full ${colors.dot} flex-shrink-0"></span>
+                        <span class="text-sm text-white font-medium">${escapeHtml(cat.label)}</span>
+                        ${!isDefault ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-300">modified</span>' : ''}
+                    </div>
+                    <div class="text-xs text-slate-400 mt-0.5 ml-4">${escapeHtml(cat.desc)}</div>
+                </div>
+                <select class="cc-mode-select bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500 flex-shrink-0"
+                        data-cat-key="${escapeHtml(key)}">
+                    ${options}
+                </select>
+            </div>
+        `;
+    }).join('');
+
+    return `
+        <div id="cc-section-header" class="flex items-center justify-between cursor-pointer select-none mb-3">
+            <div class="flex items-center gap-3">
+                <span class="text-sm font-medium text-slate-300">Command Categories</span>
+                <span class="text-xs px-2 py-0.5 rounded-full bg-blue-900/50 text-blue-300">${Object.keys(cats).length} categories</span>
+            </div>
+            <svg id="cc-chevron" class="w-5 h-5 text-slate-400 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+            </svg>
+        </div>
+        <div id="cc-section-content" class="hidden">
+            <p class="text-xs text-slate-500 mb-3">Configure how the gatekeeper handles specific command types. <span class="text-green-400">Allow</span> auto-approves, <span class="text-orange-400">Evaluate</span> sends to the LLM with category-specific guidance, <span class="text-red-400">Ask User</span> always prompts you.</p>
+            <div class="space-y-2 mb-4">
+                ${rows}
+            </div>
+            <div class="flex items-center justify-end">
+                <button id="btn-cc-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors">Save Categories</button>
+            </div>
+        </div>
+    `;
+}
+
+
+function bindCommandCategoriesEvents(commandCategories) {
+    // Collapsible toggle
+    const header = document.getElementById('cc-section-header');
+    const content = document.getElementById('cc-section-content');
+    const chevron = document.getElementById('cc-chevron');
+    if (header && content) {
+        header.addEventListener('click', () => {
+            const isHidden = content.classList.toggle('hidden');
+            if (chevron) chevron.style.transform = isHidden ? '' : 'rotate(180deg)';
+        });
+    }
+
+    // Mode change — update row colors live
+    const selects = document.querySelectorAll('.cc-mode-select');
+    const modeColors = {
+        allow: { bg: 'bg-green-900/40', border: 'border-green-700/50', dot: 'bg-green-400' },
+        evaluate: { bg: 'bg-orange-900/30', border: 'border-orange-700/40', dot: 'bg-orange-400' },
+        ask: { bg: 'bg-red-900/30', border: 'border-red-700/40', dot: 'bg-red-400' },
+    };
+    const allBgs = Object.values(modeColors).flatMap(c => [c.bg, c.border, c.dot]);
+
+    selects.forEach(select => {
+        select.addEventListener('change', async () => {
+            const key = select.dataset.catKey;
+            const mode = select.value;
+
+            // Warning for git_write → allow
+            if (key === 'git_write' && mode === 'allow') {
+                const result = await Swal.fire({
+                    title: 'Auto-approve git commits & pushes?',
+                    html: 'This will auto-approve all <code>git commit</code> and <code>git push</code> commands.<br><br><span class="text-green-400">Force push, branch deletion, and amend are still blocked by hardcoded rules.</span>',
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: 'Yes, allow',
+                    cancelButtonText: 'Cancel',
+                    focusCancel: true,
+                });
+                if (!result.isConfirmed) {
+                    // Revert select to previous value
+                    const cats = commandCategories?.categories || {};
+                    select.value = cats[key]?.current_mode || cats[key]?.default_mode || 'ask';
+                    return;
+                }
+            }
+
+            // Update row styling
+            const row = select.closest('[data-cat-key]');
+            if (row) {
+                const dot = row.querySelector('.rounded-full');
+                row.classList.remove(...allBgs);
+                const c = modeColors[mode] || modeColors.evaluate;
+                row.classList.add(c.bg, c.border);
+                if (dot) {
+                    dot.classList.remove(...allBgs);
+                    dot.classList.add(c.dot);
+                }
+                // Toggle "modified" badge
+                const cats = commandCategories?.categories || {};
+                const isDefault = mode === (cats[key]?.default_mode);
+                let badge = row.querySelector('.text-blue-300');
+                if (!isDefault && !badge) {
+                    const nameSpan = row.querySelector('.text-white.font-medium');
+                    if (nameSpan) {
+                        nameSpan.insertAdjacentHTML('afterend', ' <span class="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-300">modified</span>');
+                    }
+                } else if (isDefault && badge) {
+                    badge.remove();
+                }
+            }
+        });
+    });
+
+    // Save button
+    const saveBtn = document.getElementById('btn-cc-save');
+    if (saveBtn) {
+        saveBtn.addEventListener('click', async () => {
+            const categories = {};
+            selects.forEach(s => {
+                categories[s.dataset.catKey] = s.value;
+            });
+
+            try {
+                saveBtn.disabled = true;
+                saveBtn.textContent = 'Saving...';
+                await api.put('/api/settings/gatekeeper/command-categories', { categories });
+                showToast('Command categories saved', 'success');
+                await renderSettingsTab('gatekeeper');
+            } catch (e) {
+                showToast(e.message || 'Save failed', 'error');
+            } finally {
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Save Categories';
+            }
+        });
+    }
+}
+
+
 function bindPathSafetyEvents(pathSafety) {
     // Store initial state for dirty tracking
     window._psInitialState = {
@@ -662,6 +877,8 @@ function bindPathSafetyEvents(pathSafety) {
         disabled_patterns: [...(pathSafety.disabled_patterns || [])],
         allowed_paths: [...(pathSafety.allowed_paths || [])],
         watched_paths: [...(pathSafety.watched_paths || [])],
+        outside_reads: pathSafety.outside_reads || 'ask',
+        outside_writes: pathSafety.outside_writes || 'ask',
     };
     window._settingsDirty = false;
 
@@ -692,6 +909,8 @@ function bindPathSafetyEvents(pathSafety) {
                         disabled_patterns: window._psInitialState.disabled_patterns,
                         allowed_paths: window._psInitialState.allowed_paths,
                         watched_paths: window._psInitialState.watched_paths,
+                        outside_reads: window._psInitialState.outside_reads || 'ask',
+                        outside_writes: window._psInitialState.outside_writes || 'ask',
                     };
                     await api.put('/api/settings/gatekeeper/path-safety', saved);
                     window._psInitialState.enabled = enabled;
@@ -718,6 +937,7 @@ function bindPathSafetyEvents(pathSafety) {
     // Collapsible sections
     _bindCollapsible('ps-files-header', 'ps-files-content', 'ps-files-chevron');
     _bindCollapsible('ps-dirs-header', 'ps-dirs-content', 'ps-dirs-chevron');
+    _bindCollapsible('ps-outside-header', 'ps-outside-content', 'ps-outside-chevron');
     _bindCollapsible('ps-watched-header', 'ps-watched-content', 'ps-watched-chevron');
     _bindCollapsible('ps-paths-header', 'ps-paths-content', 'ps-paths-chevron');
 
@@ -725,6 +945,12 @@ function bindPathSafetyEvents(pathSafety) {
     document.querySelectorAll('.ps-pattern-toggle').forEach(cb => {
         cb.addEventListener('change', () => _updatePathSafetyDirtyState());
     });
+
+    // Track dirty state on outside-project selects
+    const outsideReadsSelect = document.getElementById('ps-outside-reads');
+    const outsideWritesSelect = document.getElementById('ps-outside-writes');
+    if (outsideReadsSelect) outsideReadsSelect.addEventListener('change', () => _updatePathSafetyDirtyState());
+    if (outsideWritesSelect) outsideWritesSelect.addEventListener('change', () => _updatePathSafetyDirtyState());
 
     // Add path
     const addBtn = document.getElementById('ps-add-path');
@@ -855,6 +1081,8 @@ function bindPathSafetyEvents(pathSafety) {
                     disabled_patterns: init.disabled_patterns || [],
                     allowed_paths: init.allowed_paths || [],
                     watched_paths: freshWatched,
+                    outside_reads: init.outside_reads || 'ask',
+                    outside_writes: init.outside_writes || 'ask',
                 };
                 await api.put('/api/settings/gatekeeper/path-safety', saveState);
                 window._psInitialState.watched_paths = [...freshWatched];
@@ -922,6 +1150,8 @@ function bindPathSafetyEvents(pathSafety) {
                     disabled_patterns: [...state.disabled_patterns],
                     allowed_paths: [...state.allowed_paths],
                     watched_paths: [...state.watched_paths],
+                    outside_reads: state.outside_reads || 'ask',
+                    outside_writes: state.outside_writes || 'ask',
                 };
                 _updatePathSafetyDirtyState();
                 showToast('Path safety rules saved', 'success');
@@ -1022,6 +1252,8 @@ function _rebindRemoveWatchedButtons() {
                     disabled_patterns: init.disabled_patterns || [],
                     allowed_paths: init.allowed_paths || [],
                     watched_paths: freshWatched,
+                    outside_reads: init.outside_reads || 'ask',
+                    outside_writes: init.outside_writes || 'ask',
                 };
                 await api.put('/api/settings/gatekeeper/path-safety', saveState);
                 window._psInitialState.watched_paths = [...freshWatched];
@@ -1117,7 +1349,8 @@ function _updatePathSafetyDirtyState() {
     const patternsChanged = JSON.stringify([...current.disabled_patterns].sort()) !== JSON.stringify([...initial.disabled_patterns].sort());
     const pathsChanged = JSON.stringify(current.allowed_paths) !== JSON.stringify(initial.allowed_paths);
     const watchedChanged = JSON.stringify(current.watched_paths) !== JSON.stringify(initial.watched_paths || []);
-    const isDirty = patternsChanged || pathsChanged || watchedChanged;
+    const outsideChanged = current.outside_reads !== (initial.outside_reads || 'ask') || current.outside_writes !== (initial.outside_writes || 'ask');
+    const isDirty = patternsChanged || pathsChanged || watchedChanged || outsideChanged;
 
     // Global flag for beforeunload and tab switch guards
     window._settingsDirty = isDirty;
@@ -1163,11 +1396,17 @@ function _collectPathSafetyState() {
         if (path) watchedPaths.push(path);
     });
 
-    return { enabled, disabled_patterns: disabledPatterns, allowed_paths: allowedPaths, watched_paths: watchedPaths };
+    // Collect outside-project settings
+    const outsideReadsEl = document.getElementById('ps-outside-reads');
+    const outsideWritesEl = document.getElementById('ps-outside-writes');
+    const outside_reads = outsideReadsEl ? outsideReadsEl.value : 'ask';
+    const outside_writes = outsideWritesEl ? outsideWritesEl.value : 'ask';
+
+    return { enabled, disabled_patterns: disabledPatterns, allowed_paths: allowedPaths, watched_paths: watchedPaths, outside_reads, outside_writes };
 }
 
 
-function bindGatekeeperEvents(config, hookInstalled, pathSafety) {
+function bindGatekeeperEvents(config, hookInstalled, pathSafety, commandCategories) {
     // Hook toggle in banner
     const bannerToggle = document.querySelector('.toggle-switch[data-name="security_gatekeeper"][data-category="hooks"]');
     if (bannerToggle) {
@@ -1276,13 +1515,17 @@ function bindGatekeeperEvents(config, hookInstalled, pathSafety) {
     if (testBtn) {
         testBtn.addEventListener('click', async () => {
             const resultEl = document.getElementById('gk-key-test-result');
+            const apiKeyInput = document.getElementById('gk-api-key');
             testBtn.disabled = true;
             testBtn.textContent = 'Testing...';
             resultEl.innerHTML = '';
             try {
-                const result = await api.post('/api/settings/gatekeeper/test-api-key');
+                const payload = apiKeyInput?.value?.trim() ? { api_key: apiKeyInput.value.trim() } : {};
+                const result = await api.post('/api/settings/gatekeeper/test-api-key', payload);
+                const sourceLabel = { input: 'from input', db: 'from saved config', env: 'from env var' };
+                const sourceText = result.source ? ` (${sourceLabel[result.source] || result.source})` : '';
                 resultEl.innerHTML = result.success
-                    ? '<span class="text-green-400">API key works</span>'
+                    ? `<span class="text-green-400">API key works${escapeHtml(sourceText)}</span>`
                     : `<span class="text-red-400">${escapeHtml(result.error)}</span>`;
             } catch (e) {
                 resultEl.innerHTML = `<span class="text-red-400">${escapeHtml(e.message)}</span>`;
@@ -1296,6 +1539,11 @@ function bindGatekeeperEvents(config, hookInstalled, pathSafety) {
     // Path safety events
     if (pathSafety) {
         bindPathSafetyEvents(pathSafety);
+    }
+
+    // Command categories events
+    if (commandCategories) {
+        bindCommandCategoriesEvents(commandCategories);
     }
 
     // Prompt editor collapsible
@@ -1484,7 +1732,7 @@ async function renderFeaturesTab(container) {
         const knowledge = features.knowledge || [];
 
         const hookRows = hooks.map(h => `
-            <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50">
+            <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(h.display_name)}">
                 <div class="min-w-0 flex-1">
                     <div class="text-sm text-white">${escapeHtml(h.display_name)}</div>
                     <div class="text-xs text-slate-400">${escapeHtml(h.description || '')}</div>
@@ -1499,7 +1747,7 @@ async function renderFeaturesTab(container) {
                 note = '<span class="text-xs text-red-400 ml-2">Corrupt markers detected</span>';
             }
             return `
-                <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50">
+                <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(k.display_name)}">
                     <div class="min-w-0 flex-1">
                         <div class="text-sm text-white">${escapeHtml(k.display_name)}${note}</div>
                         <div class="text-xs text-slate-400">${escapeHtml(k.description || '')}</div>
@@ -1720,6 +1968,45 @@ async function renderClaudeCodeTab(container) {
         // --- Permissions ---
         html += _renderPermissionsSection(permissions);
 
+        // --- Chrome DevTools MCP ---
+        html += `
+            <div class="mb-6 border-t border-slate-700 pt-5">
+                <div class="flex items-center gap-2 mb-1">
+                    <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
+                    <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider">Browser Tools</h3>
+                </div>
+                <p class="text-xs text-slate-500 mb-3">Chrome DevTools MCP powers <code class="text-slate-300">/qa</code> and <code class="text-slate-300">/ux</code> browser testing. Requires <span class="text-emerald-400">Chrome 144+</span> with remote debugging enabled.</p>
+                <div id="cdp-mcp-status" class="p-3 bg-slate-900/50 rounded border border-slate-700/50">
+                    <div class="flex items-center justify-between">
+                        <div class="min-w-0 flex-1">
+                            <div class="text-sm text-white">Chrome DevTools MCP</div>
+                            <div id="cdp-mcp-status-text" class="text-xs text-slate-400">Checking...</div>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <select id="cdp-mcp-mode" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500" disabled>
+                                <option value="autoConnect">Auto-connect (Chrome 144+)</option>
+                                <option value="browserUrl">Browser URL (:9222)</option>
+                                <option value="launch">Launch new Chrome</option>
+                                <option value="headless">Headless (no UI)</option>
+                            </select>
+                            <label class="toggle-switch" id="cdp-mcp-toggle">
+                                <input type="checkbox" disabled>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div id="cdp-mcp-help" class="hidden mt-3 p-2 bg-slate-800/50 rounded border border-slate-700/30">
+                        <p class="text-xs text-slate-400 mb-1 font-semibold">Setup instructions:</p>
+                        <ol class="text-xs text-slate-500 list-decimal ml-4 space-y-1">
+                            <li>Install Chrome 144 or newer — check at <code class="text-slate-300">chrome://version</code></li>
+                            <li>Enable remote debugging at <code class="text-slate-300">chrome://inspect/#remote-debugging</code></li>
+                            <li>Restart Claude Code after enabling</li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+        `;
+
         // --- Raw JSON Editor ---
         html += `
             <div class="mb-6 border-t border-slate-700 pt-5">
@@ -1801,6 +2088,25 @@ function _renderNumericSection(title, items) {
     `;
 }
 
+// --- Permissions scope state ---
+let _permScope = 'global';
+let _permProjectRepo = '';
+let _permProjectRepos = [];
+let _permProjectData = null;  // cached project permissions
+
+const _PERM_TEMPLATES = [
+    { label: 'WebFetch', pattern: 'WebFetch' },
+    { label: 'WebSearch', pattern: 'WebSearch' },
+    { label: 'curl', pattern: 'Bash(curl:*)' },
+    { label: 'wget', pattern: 'Bash(wget:*)' },
+    { label: 'git push', pattern: 'Bash(git push:*)' },
+    { label: 'git commit', pattern: 'Bash(git commit:*)' },
+    { label: 'npm install', pattern: 'Bash(npm install:*)' },
+    { label: 'pip install', pattern: 'Bash(pip install:*)' },
+    { label: 'docker', pattern: 'Bash(docker:*)' },
+    { label: 'make', pattern: 'Bash(make:*)' },
+];
+
 function _renderPermissionsSection(permissions) {
     const modeOptions = ['default', 'plan', 'bypassPermissions', 'acceptEdits'].map(m =>
         `<option value="${m}" ${permissions.defaultMode === m ? 'selected' : ''}>${m}</option>`
@@ -1835,23 +2141,61 @@ function _renderPermissionsSection(permissions) {
         `;
     }
 
+    // Templates row (only for allow list)
+    const templatesHtml = _PERM_TEMPLATES.map(t =>
+        `<button class="perm-template-btn px-2 py-0.5 text-[11px] bg-slate-700/60 hover:bg-blue-700/60 text-slate-300 hover:text-white rounded transition-colors font-mono" data-pattern="${escapeHtml(t.pattern)}">${escapeHtml(t.label)}</button>`
+    ).join('');
+
+    // Scope tabs
+    const globalActive = _permScope === 'global';
+    const projectActive = _permScope === 'project';
+
+    // Project repo dropdown
+    const repoOptions = _permProjectRepos.map(r => {
+        const name = r.replace(/\\/g, '/').split('/').filter(Boolean).pop() || r;
+        return `<option value="${escapeHtml(r)}" ${_permProjectRepo === r ? 'selected' : ''}>${escapeHtml(name)}</option>`;
+    }).join('');
+
+    // Decide which permissions to display
+    const displayPerms = projectActive && _permProjectData ? _permProjectData : permissions;
+
     return `
         <div class="mb-6">
             <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Permissions</h3>
-            <div class="p-3 bg-slate-900/50 rounded border border-slate-700/50 mb-3">
-                <div class="flex items-center justify-between">
-                    <div>
-                        <div class="text-sm text-white">Default Mode</div>
-                        <div class="text-xs text-slate-400">Permission mode Claude Code starts in</div>
-                    </div>
-                    <select id="perm-default-mode" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500">
-                        ${modeOptions}
-                    </select>
-                </div>
+
+            <div class="flex items-center gap-2 mb-3">
+                <button class="perm-scope-btn px-3 py-1 rounded-lg text-xs font-medium transition-colors ${globalActive ? 'bg-blue-700 text-white' : 'bg-slate-700 text-slate-400 hover:text-white'}" data-scope="global">Global</button>
+                <button class="perm-scope-btn px-3 py-1 rounded-lg text-xs font-medium transition-colors ${projectActive ? 'bg-blue-700 text-white' : 'bg-slate-700 text-slate-400 hover:text-white'}" data-scope="project">Project</button>
+                ${projectActive ? `
+                    <select id="perm-project-repo" class="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-blue-500">
+                        <option value="">Select project...</option>
+                        ${repoOptions}
+                    </select>` : ''}
+                ${projectActive ? '<div class="text-[10px] text-slate-500">settings.local.json</div>' : '<div class="text-[10px] text-slate-500">~/.claude/settings.json</div>'}
             </div>
-            ${renderList('Allow', permissions.allow, 'allow')}
-            ${renderList('Deny', permissions.deny, 'deny')}
-            ${renderList('Ask', permissions.ask, 'ask')}
+
+            ${projectActive && !_permProjectRepo ? `
+                <div class="text-xs text-slate-500 italic py-4 text-center">Select a project to view its permissions</div>
+            ` : `
+                <div class="p-3 bg-slate-900/50 rounded border border-slate-700/50 mb-3">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <div class="text-sm text-white">Default Mode</div>
+                            <div class="text-xs text-slate-400">Permission mode Claude Code starts in</div>
+                        </div>
+                        <select id="perm-default-mode" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500">
+                            ${modeOptions}
+                        </select>
+                    </div>
+                </div>
+                ${renderList('Allow', displayPerms.allow || [], 'allow')}
+                <div class="mb-3">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5">Quick-add templates</div>
+                    <div class="flex flex-wrap gap-1">${templatesHtml}</div>
+                </div>
+                ${renderList('Deny', displayPerms.deny || [], 'deny')}
+                ${renderList('Ask', displayPerms.ask || [], 'ask')}
+            `}
         </div>
     `;
 }
@@ -1935,12 +2279,60 @@ function _bindClaudeCodeEvents(container) {
         });
     });
 
+    // Permissions — scope tabs
+    container.querySelectorAll('.perm-scope-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            _permScope = btn.dataset.scope;
+            _permProjectData = null;
+            if (_permScope === 'project' && _permProjectRepos.length === 0) {
+                try {
+                    const sessions = await api.get('/api/logs/sessions');
+                    const seen = new Map();
+                    for (const s of sessions) {
+                        if (s.repo_path) {
+                            const key = s.repo_path.toLowerCase();
+                            if (!seen.has(key)) seen.set(key, s.repo_path);
+                        }
+                    }
+                    _permProjectRepos = [...seen.values()].sort();
+                } catch (e) { _permProjectRepos = []; }
+            }
+            await renderClaudeCodeTab(container);
+        });
+    });
+
+    // Permissions — project repo dropdown
+    const repoSelect = document.getElementById('perm-project-repo');
+    if (repoSelect) {
+        repoSelect.addEventListener('change', async () => {
+            _permProjectRepo = repoSelect.value;
+            if (_permProjectRepo) {
+                try {
+                    _permProjectData = await api.get(`/api/claude-settings/project-permissions?repo_path=${encodeURIComponent(_permProjectRepo)}`);
+                } catch (e) {
+                    _permProjectData = null;
+                    showToast(e.message || 'Failed to load project permissions', 'error');
+                }
+            } else {
+                _permProjectData = null;
+            }
+            await renderClaudeCodeTab(container);
+        });
+    }
+
     // Permissions — default mode dropdown
     const modeSelect = document.getElementById('perm-default-mode');
     if (modeSelect) {
         modeSelect.addEventListener('change', async () => {
             try {
-                await api.put('/api/claude-settings/permissions', { defaultMode: modeSelect.value });
+                if (_permScope === 'project' && _permProjectRepo) {
+                    await api.put('/api/claude-settings/project-permissions', {
+                        repo_path: _permProjectRepo,
+                        defaultMode: modeSelect.value,
+                    });
+                } else {
+                    await api.put('/api/claude-settings/permissions', { defaultMode: modeSelect.value });
+                }
                 showToast(`Default mode set to "${modeSelect.value}". Restart Claude Code.`, 'warning');
                 await refreshClaudeSettings();
             } catch (e) {
@@ -1949,20 +2341,29 @@ function _bindClaudeCodeEvents(container) {
         });
     }
 
-    // Permissions — remove rule
+    // Permissions — remove rule (scope-aware)
     container.querySelectorAll('.perm-remove-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const listName = btn.dataset.list;
             const index = parseInt(btn.dataset.index);
             try {
-                const current = await loadClaudeSettings();
-                const perms = { ...current.permissions };
-                const arr = [...(perms[listName] || [])];
-                arr.splice(index, 1);
-                perms[listName] = arr;
-                await api.put('/api/claude-settings/permissions', perms);
+                if (_permScope === 'project' && _permProjectRepo && _permProjectData) {
+                    const arr = [...(_permProjectData[listName] || [])];
+                    arr.splice(index, 1);
+                    const payload = { repo_path: _permProjectRepo };
+                    payload[listName] = arr;
+                    await api.put('/api/claude-settings/project-permissions', payload);
+                    _permProjectData[listName] = arr;
+                } else {
+                    const current = await loadClaudeSettings();
+                    const perms = { ...current.permissions };
+                    const arr = [...(perms[listName] || [])];
+                    arr.splice(index, 1);
+                    perms[listName] = arr;
+                    await api.put('/api/claude-settings/permissions', perms);
+                    await refreshClaudeSettings();
+                }
                 showToast(`Rule removed. Restart Claude Code.`, 'warning');
-                await refreshClaudeSettings();
                 await renderClaudeCodeTab(container);
             } catch (e) {
                 showToast(e.message || 'Remove failed', 'error');
@@ -1970,7 +2371,7 @@ function _bindClaudeCodeEvents(container) {
         });
     });
 
-    // Permissions — add rule
+    // Permissions — add rule (scope-aware)
     container.querySelectorAll('.perm-add-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const listName = btn.dataset.list;
@@ -1978,14 +2379,17 @@ function _bindClaudeCodeEvents(container) {
             const rule = input ? input.value.trim() : '';
             if (!rule) return;
             try {
-                const current = await loadClaudeSettings();
-                const perms = { ...current.permissions };
-                const arr = [...(perms[listName] || [])];
-                arr.push(rule);
-                perms[listName] = arr;
-                await api.put('/api/claude-settings/permissions', perms);
+                const payload = { pattern: rule, list_name: listName, scope: _permScope };
+                if (_permScope === 'project' && _permProjectRepo) {
+                    payload.repo_path = _permProjectRepo;
+                }
+                await api.post('/api/claude-settings/permissions/rule', payload);
                 showToast(`Rule added. Restart Claude Code.`, 'warning');
-                await refreshClaudeSettings();
+                if (_permScope === 'project' && _permProjectRepo) {
+                    _permProjectData = await api.get(`/api/claude-settings/project-permissions?repo_path=${encodeURIComponent(_permProjectRepo)}`);
+                } else {
+                    await refreshClaudeSettings();
+                }
                 await renderClaudeCodeTab(container);
             } catch (e) {
                 showToast(e.message || 'Add failed', 'error');
@@ -2003,6 +2407,32 @@ function _bindClaudeCodeEvents(container) {
         });
     });
 
+    // Permissions — template buttons
+    container.querySelectorAll('.perm-template-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const pattern = btn.dataset.pattern;
+            try {
+                const payload = { pattern, list_name: 'allow', scope: _permScope };
+                if (_permScope === 'project' && _permProjectRepo) {
+                    payload.repo_path = _permProjectRepo;
+                }
+                await api.post('/api/claude-settings/permissions/rule', payload);
+                showToast(`Added ${pattern}. Restart Claude Code.`, 'warning');
+                if (_permScope === 'project' && _permProjectRepo) {
+                    _permProjectData = await api.get(`/api/claude-settings/project-permissions?repo_path=${encodeURIComponent(_permProjectRepo)}`);
+                } else {
+                    await refreshClaudeSettings();
+                }
+                await renderClaudeCodeTab(container);
+            } catch (e) {
+                showToast(e.message || 'Add failed', 'error');
+            }
+        });
+    });
+
+    // Chrome DevTools MCP — load status then bind events (once only)
+    _initChromeDevToolsMCP(container);
+
     // Raw JSON editor — collapsible
     const rawHeader = document.getElementById('raw-editor-header');
     const rawContent = document.getElementById('raw-editor-content');
@@ -2018,6 +2448,82 @@ function _bindClaudeCodeEvents(container) {
             }
         });
     }
+}
+
+async function _refreshChromeDevToolsStatus() {
+    const statusText = document.getElementById('cdp-mcp-status-text');
+    const modeSelect = document.getElementById('cdp-mcp-mode');
+    const toggleInput = document.getElementById('cdp-mcp-toggle')?.querySelector('input');
+    const helpDiv = document.getElementById('cdp-mcp-help');
+    if (!statusText || !modeSelect || !toggleInput) return;
+
+    try {
+        const data = await api.get('/api/chrome-devtools-mcp');
+        if (data.installed) {
+            statusText.textContent = `Configured (${data.mode || 'default'})`;
+            statusText.className = 'text-xs text-emerald-400';
+            modeSelect.value = data.mode || 'autoConnect';
+            modeSelect.disabled = false;
+            toggleInput.checked = true;
+            toggleInput.disabled = false;
+            if (helpDiv) helpDiv.classList.add('hidden');
+        } else {
+            statusText.textContent = 'Not configured';
+            statusText.className = 'text-xs text-amber-400';
+            modeSelect.disabled = true;
+            toggleInput.checked = false;
+            toggleInput.disabled = false;
+            if (helpDiv) helpDiv.classList.remove('hidden');
+        }
+    } catch (e) {
+        statusText.textContent = 'Error loading status';
+        statusText.className = 'text-xs text-red-400';
+        if (helpDiv) helpDiv.classList.remove('hidden');
+    }
+}
+
+function _initChromeDevToolsMCP(container) {
+    const toggleInput = document.getElementById('cdp-mcp-toggle')?.querySelector('input');
+    const modeSelect = document.getElementById('cdp-mcp-mode');
+    if (!toggleInput || !modeSelect) return;
+
+    // Load initial status
+    _refreshChromeDevToolsStatus();
+
+    // Bind events once only
+    toggleInput.addEventListener('change', async () => {
+        toggleInput.disabled = true;
+        try {
+            if (toggleInput.checked) {
+                const mode = modeSelect.value || 'autoConnect';
+                await api.put('/api/chrome-devtools-mcp', { mode });
+                showToast(`Chrome DevTools MCP enabled (${mode}). Restart Claude Code.`, 'warning');
+            } else {
+                await api.delete('/api/chrome-devtools-mcp');
+                showToast('Chrome DevTools MCP removed. Restart Claude Code.', 'warning');
+            }
+            await _refreshChromeDevToolsStatus();
+        } catch (e) {
+            toggleInput.checked = !toggleInput.checked;
+            showToast(e.message || 'Failed to update Chrome DevTools MCP', 'error');
+        } finally {
+            toggleInput.disabled = false;
+        }
+    });
+
+    modeSelect.addEventListener('change', async () => {
+        if (!toggleInput.checked) return;
+        modeSelect.disabled = true;
+        try {
+            await api.put('/api/chrome-devtools-mcp', { mode: modeSelect.value });
+            showToast(`Mode changed to ${modeSelect.value}. Restart Claude Code.`, 'warning');
+            await _refreshChromeDevToolsStatus();
+        } catch (e) {
+            showToast(e.message || 'Failed to change mode', 'error');
+        } finally {
+            modeSelect.disabled = false;
+        }
+    });
 }
 
 async function _loadRawEditor() {
@@ -2079,6 +2585,13 @@ async function _loadRawEditor() {
         textarea.value = `Error loading settings: ${e.message}`;
         textarea.disabled = true;
     }
+}
+
+// --- Tab: Profiles ---
+
+function renderProfilesTab(container) {
+    container.innerHTML = renderProfilesPanel();
+    bindProfilesPanelEvents();
 }
 
 // --- Tab: Advanced ---

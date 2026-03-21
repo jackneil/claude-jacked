@@ -976,3 +976,302 @@ def test_heartbeat_scopes_to_newest_record():
         # If close-stale already cleaned up, only one row should exist
         assert len(rows) == 1
         assert rows[0][0] == 2  # account_id of the newer record
+
+
+# ------------------------------------------------------------------
+# get_stale_open_sessions, bump_all_stale_sessions, close_dead_sessions
+# ------------------------------------------------------------------
+
+
+def test_get_stale_open_sessions():
+    """Returns sessions that are open but past the staleness window.
+
+    >>> db = _make_db()
+    >>> db.get_stale_open_sessions()
+    []
+    """
+    db = _make_db()
+    # Insert a session with old last_activity_at
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("stale-1", 1, "a@b.com", old_ts, old_ts, "test", "/repo"),
+        )
+
+    # Also insert a fresh session (should NOT be returned)
+    db.record_session_account("fresh-1", account_id=2, email="b@c.com")
+
+    stale = db.get_stale_open_sessions()
+    assert len(stale) == 1
+    assert stale[0]["session_id"] == "stale-1"
+
+
+def test_get_stale_open_sessions_excludes_ended():
+    """Ended sessions are never returned even if old.
+
+    >>> db = _make_db()
+    >>> db.get_stale_open_sessions()
+    []
+    """
+    db = _make_db()
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    now_ts = datetime.now(timezone.utc).isoformat()
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path, ended_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("ended-1", 1, "a@b.com", old_ts, old_ts, "test", "/repo", now_ts),
+        )
+
+    assert db.get_stale_open_sessions() == []
+
+
+def test_bump_all_stale_sessions():
+    """Bumps last_activity_at on all stale-but-open sessions.
+
+    >>> db = _make_db()
+    >>> db.bump_all_stale_sessions()
+    0
+    """
+    db = _make_db()
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("stale-1", 1, "a@b.com", old_ts, old_ts, "test", "/repo"),
+        )
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("stale-2", 2, "b@c.com", old_ts, old_ts, "test", "/repo"),
+        )
+
+    # Fresh session should not be bumped
+    db.record_session_account("fresh-1", account_id=3, email="c@d.com")
+
+    count = db.bump_all_stale_sessions()
+    assert count == 2
+
+    # After bump, they should no longer appear as stale
+    assert db.get_stale_open_sessions() == []
+
+    # And they should appear in active sessions
+    active = db.get_active_sessions()
+    active_ids = {s["session_id"] for s in active}
+    assert "stale-1" in active_ids
+    assert "stale-2" in active_ids
+
+
+def test_close_dead_sessions():
+    """Closes sessions stale beyond DEAD_SESSION_HOURS.
+
+    >>> db = _make_db()
+    >>> db.close_dead_sessions()
+    0
+    """
+    db = _make_db()
+    # Session stale for 5 hours (> 4h threshold)
+    dead_ts = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    # Session stale for 2 hours (< 4h threshold)
+    recent_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("dead-1", 1, "a@b.com", dead_ts, dead_ts, "test", "/repo"),
+        )
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("recent-1", 2, "b@c.com", recent_ts, recent_ts, "test", "/repo"),
+        )
+
+    count = db.close_dead_sessions()
+    assert count == 1
+
+    # dead-1 should be closed
+    with db._reader() as conn:
+        row = conn.execute(
+            "SELECT ended_at FROM session_accounts WHERE session_id = 'dead-1'"
+        ).fetchone()
+        assert row[0] is not None
+
+    # recent-1 should still be open
+    with db._reader() as conn:
+        row = conn.execute(
+            "SELECT ended_at FROM session_accounts WHERE session_id = 'recent-1'"
+        ).fetchone()
+        assert row[0] is None
+
+
+# ------------------------------------------------------------------
+# process_alive_sweeper tests
+# ------------------------------------------------------------------
+
+from unittest import mock  # noqa: E402
+from jacked.api.watchers import _any_claude_process_alive, process_alive_sweeper_loop  # noqa: E402
+
+
+def test_any_claude_process_alive_true():
+    """Returns True when pgrep finds claude processes.
+
+    >>> # Can't doctest process detection
+    """
+    mock_result = mock.MagicMock()
+    mock_result.returncode = 0
+    with mock.patch("jacked.api.watchers.subprocess.run", return_value=mock_result):
+        assert _any_claude_process_alive() is True
+
+
+def test_any_claude_process_alive_false():
+    """Returns False when pgrep finds no claude processes.
+
+    >>> # Can't doctest process detection
+    """
+    mock_result = mock.MagicMock()
+    mock_result.returncode = 1
+    with mock.patch("jacked.api.watchers.subprocess.run", return_value=mock_result):
+        assert _any_claude_process_alive() is False
+
+
+def test_any_claude_process_alive_exception():
+    """Returns False when pgrep raises an exception (fail-safe).
+
+    >>> # Can't doctest process detection
+    """
+    import subprocess
+    with mock.patch(
+        "jacked.api.watchers.subprocess.run",
+        side_effect=OSError("pgrep not found"),
+    ):
+        assert _any_claude_process_alive() is False
+
+
+def test_sweeper_logic_bumps_all_when_claude_alive():
+    """Sweeper logic: Claude alive + stale sessions → bump all.
+
+    Tests the same sequence of operations the sweeper loop performs,
+    without the async machinery.
+
+    >>> # Verified via unit test
+    """
+    db = _make_db()
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("stale-1", 1, "a@b.com", old_ts, old_ts, "test", "/repo"),
+        )
+
+    # Step 1: stale sessions exist
+    stale = db.get_stale_open_sessions()
+    assert len(stale) == 1
+
+    # Step 2: simulate "Claude alive" (pgrep returns 0)
+    # Step 3: bump all stale sessions
+    count = db.bump_all_stale_sessions()
+    assert count == 1
+
+    # Result: session should now be active
+    active = db.get_active_sessions()
+    assert any(s["session_id"] == "stale-1" for s in active)
+    assert db.get_stale_open_sessions() == []
+
+
+def test_sweeper_logic_closes_dead_when_no_claude():
+    """Sweeper logic: no Claude processes + stale >4h → close.
+
+    >>> # Verified via unit test
+    """
+    db = _make_db()
+    dead_ts = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("dead-1", 1, "a@b.com", dead_ts, dead_ts, "test", "/repo"),
+        )
+
+    # Step 1: stale sessions exist
+    stale = db.get_stale_open_sessions()
+    assert len(stale) == 1
+
+    # Step 2: simulate "no Claude processes" (pgrep returns 1)
+    # Step 3: close dead sessions (stale > 4h)
+    count = db.close_dead_sessions()
+    assert count == 1
+
+    # Result: session should be closed
+    with db._reader() as conn:
+        row = conn.execute(
+            "SELECT ended_at FROM session_accounts WHERE session_id = 'dead-1'"
+        ).fetchone()
+        assert row[0] is not None
+
+
+def test_sweeper_logic_leaves_recently_stale():
+    """Sweeper logic: no Claude processes + stale <4h → leave open.
+
+    >>> # Verified via unit test
+    """
+    db = _make_db()
+    recent_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO session_accounts
+               (session_id, account_id, email, detected_at, last_activity_at,
+                detection_method, repo_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("recent-1", 1, "a@b.com", recent_ts, recent_ts, "test", "/repo"),
+        )
+
+    # Step 1: stale sessions exist (past 60-min window)
+    stale = db.get_stale_open_sessions()
+    assert len(stale) == 1
+
+    # Step 2: simulate "no Claude processes"
+    # Step 3: try to close dead sessions — but recent-1 is only 2h old (< 4h)
+    count = db.close_dead_sessions()
+    assert count == 0
+
+    # Result: session should still be open
+    with db._reader() as conn:
+        row = conn.execute(
+            "SELECT ended_at FROM session_accounts WHERE session_id = 'recent-1'"
+        ).fetchone()
+        assert row[0] is None
+
+
+def test_sweeper_skips_when_no_stale_sessions():
+    """When no stale sessions, get_stale_open_sessions returns empty.
+
+    >>> db = _make_db()
+    >>> db.record_session_account("fresh-1", account_id=1, email="a@b.com") > 0
+    True
+    >>> db.get_stale_open_sessions()
+    []
+    """
+    db = _make_db()
+    db.record_session_account("fresh-1", account_id=1, email="a@b.com")
+    assert db.get_stale_open_sessions() == []

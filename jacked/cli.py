@@ -60,8 +60,7 @@ def _require_search(command_name: str) -> bool:
     except ImportError:
         console.print(f"[red]Error:[/red] '{command_name}' requires the search extra.")
         console.print("\nInstall it with:")
-        console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
-        console.print('  [bold]pipx install "claude-jacked\[search]"[/bold]')
+        console.print(r'  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
         return False
 
 
@@ -124,7 +123,7 @@ def index(session: Optional[str], repo: Optional[str]):
     Index a Claude session to Qdrant.
 
     If SESSION is not provided, indexes the current session (from CLAUDE_SESSION_ID).
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     import os
     import time
@@ -142,7 +141,7 @@ def index(session: Optional[str], repo: Optional[str]):
         else:
             console.print("[red]Error:[/red] 'index' requires the search extra.")
             console.print("\nInstall it with:")
-            console.print('  [bold]pip install "claude-jacked\[search]"[/bold]')
+            console.print(r'  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
             sys.exit(1)
 
     from jacked.indexer import SessionIndexer
@@ -253,7 +252,7 @@ def index(session: Optional[str], repo: Optional[str]):
 @click.option("--repo", "-r", help="Filter by repository name pattern")
 @click.option("--force", "-f", is_flag=True, help="Re-index all sessions")
 def backfill(repo: Optional[str], force: bool):
-    """Index all existing Claude sessions. Requires: pip install "claude-jacked[search]" """
+    """Index all existing Claude sessions. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("backfill"):
         sys.exit(1)
 
@@ -309,7 +308,7 @@ def search(
 ):
     """Search for sessions by semantic similarity with multi-factor ranking.
 
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     if not _require_search("search"):
         sys.exit(1)
@@ -454,7 +453,7 @@ def retrieve(
 ):
     """Retrieve a session's context with smart mode support.
 
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     if not _require_search("retrieve"):
         sys.exit(1)
@@ -540,7 +539,7 @@ def retrieve(
 @click.option("--repo", "-r", help="Filter by repository path")
 @click.option("--limit", "-n", default=20, help="Maximum results")
 def list_sessions(repo: Optional[str], limit: int):
-    """List indexed sessions. Requires: pip install "claude-jacked[search]" """
+    """List indexed sessions. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("sessions"):
         sys.exit(1)
 
@@ -581,7 +580,7 @@ def list_sessions(repo: Optional[str], limit: int):
 @click.argument("session_id")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 def delete(session_id: str, yes: bool):
-    """Delete a session from the index. Requires: pip install "claude-jacked[search]" """
+    """Delete a session from the index. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("delete"):
         sys.exit(1)
 
@@ -604,7 +603,7 @@ def cleardb():
     """
     Delete ALL your indexed data from Qdrant.
 
-    Requires: pip install "claude-jacked[search]"
+    Requires: uv tool install "claude-jacked[search]"
     """
     if not _require_search("cleardb"):
         sys.exit(1)
@@ -651,7 +650,7 @@ def cleardb():
 
 @main.command()
 def status():
-    """Show indexing health and Qdrant connectivity. Requires: pip install "claude-jacked[search]" """
+    """Show indexing health and Qdrant connectivity. Requires: uv tool install "claude-jacked[search]" """
     if not _require_search("status"):
         sys.exit(1)
 
@@ -715,7 +714,7 @@ def webux(host: str, port: int, no_browser: bool, reload: bool):
     except ImportError:
         console.print("[red]Error:[/red] webux requires the web extra.")
         console.print("Install it with:")
-        console.print('  [bold]pip install "claude-jacked[web]"[/bold]')
+        console.print(r'  [bold]uv tool install "claude-jacked\[web]" --force[/bold]')
         sys.exit(1)
 
     # Propagate host/port to app via env vars (used for dynamic CORS + WebSocket origin checks)
@@ -766,7 +765,7 @@ def check_version():
             f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}"
         )
         console.print(
-            "Run: [bold]pipx upgrade claude-jacked[/bold]  or  [bold]pip install -U claude-jacked[/bold]"
+            "Run: [bold]uv tool upgrade claude-jacked[/bold]"
         )
     else:
         console.print(f"[green]Up to date:[/green] {__version__}")
@@ -1282,10 +1281,6 @@ def _remove_behavioral_rules(claude_md_path: Path) -> bool:
     return True
 
 
-def _security_hook_marker() -> str:
-    """Marker to identify jacked security gatekeeper hooks."""
-    return "# jacked-security"
-
 
 def _session_tracker_marker() -> str:
     """Marker to identify jacked session-account tracker hooks."""
@@ -1297,6 +1292,7 @@ SESSION_TRACKER_EVENTS = [
     ("Notification", "auth_success"),
     ("SessionEnd", ""),
     ("Stop", ""),
+    ("UserPromptSubmit", ""),
 ]
 
 
@@ -1407,22 +1403,18 @@ def _verify_session_tracker_hooks(settings: dict):
             )
 
 
-GATEKEEPER_TOOLS = ["Bash", "Read", "Edit", "Write", "Grep"]
-
-
 def _install_security_hook(existing: dict, settings_path: Path):
-    """Install security gatekeeper hooks for Bash + file tool PreToolUse events.
+    """Install a single catch-all security gatekeeper PreToolUse hook.
 
-    Installs one PreToolUse hook entry per tool matcher (Bash, Read, Edit, Write, Grep).
-    Bash hook evaluates commands through the full 4-tier pipeline.
-    File tool hooks enforce path safety rules (sensitive files, outside-project access).
+    Uses an empty matcher to intercept ALL tool calls. The gatekeeper script
+    decides internally which tools to process vs pass-through based on the
+    DB/registry config. Migrates old per-tool entries to catch-all mode.
 
     Handles fresh install, version upgrades, and migration from PermissionRequest.
     """
     import json
     import shutil
 
-    marker = _security_hook_marker()
     script_path = _get_data_root() / "hooks" / "security_gatekeeper.py"
 
     if not script_path.exists():
@@ -1442,14 +1434,14 @@ def _install_security_hook(existing: dict, settings_path: Path):
     script_str = str(script_path).replace("\\", "/")
     command_str = f"{python_path} {script_str}"
 
-    # Migrate: remove old PermissionRequest hooks with our marker
+    # Migrate: remove old PermissionRequest hooks
     if "PermissionRequest" in existing.get("hooks", {}):
         old_hooks = existing["hooks"]["PermissionRequest"]
         before = len(old_hooks)
         existing["hooks"]["PermissionRequest"] = [
             h
             for h in old_hooks
-            if marker not in str(h) and "security_gatekeeper" not in str(h)
+            if "security_gatekeeper" not in str(h)
         ]
         if len(existing["hooks"]["PermissionRequest"]) < before:
             console.print(
@@ -1459,55 +1451,45 @@ def _install_security_hook(existing: dict, settings_path: Path):
     if "PreToolUse" not in existing["hooks"]:
         existing["hooks"]["PreToolUse"] = []
 
-    # Install/upgrade hooks for each tool matcher
-    modified = False
-    for tool in GATEKEEPER_TOOLS:
-        # Find existing hook for this tool matcher
-        hook_index = None
-        needs_upgrade = False
-        for i, hook_entry in enumerate(existing["hooks"]["PreToolUse"]):
-            hook_str = str(hook_entry)
-            entry_matcher = hook_entry.get("matcher", "")
-            if entry_matcher == tool and (
-                marker in hook_str or "security_gatekeeper" in hook_str
-            ):
-                hook_index = i
-                for h in hook_entry.get("hooks", []):
-                    if h.get("command", "") != command_str:
-                        needs_upgrade = True
-                break
-
-        if hook_index is not None and not needs_upgrade:
-            continue  # already up to date
-
-        hook_entry = {
-            "matcher": tool,
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command_str,
-                    "timeout": 30,
-                }
-            ],
-        }
-
-        if hook_index is not None and needs_upgrade:
-            existing["hooks"]["PreToolUse"][hook_index] = hook_entry
-            modified = True
-        else:
-            existing["hooks"]["PreToolUse"].append(hook_entry)
-            modified = True
-
-    if not modified:
-        console.print(
-            "[yellow][-][/yellow] Security gatekeeper hooks already configured"
+    # Migrate: remove old per-tool gatekeeper entries (non-empty matcher)
+    existing["hooks"]["PreToolUse"] = [
+        h for h in existing["hooks"]["PreToolUse"]
+        if not (
+            "security_gatekeeper" in str(h)
+            and h.get("matcher", "") != ""
         )
-        return
+    ]
+
+    # Check if catch-all already exists and is up to date
+    for entry in existing["hooks"]["PreToolUse"]:
+        if (
+            entry.get("matcher") == ""
+            and "security_gatekeeper" in str(entry)
+        ):
+            # Update command if python path changed
+            for h in entry.get("hooks", []):
+                if h.get("command", "") != command_str:
+                    h["command"] = command_str
+                    settings_path.parent.mkdir(parents=True, exist_ok=True)
+                    settings_path.write_text(json.dumps(existing, indent=2))
+                    console.print(
+                        "[green][OK][/green] Updated security gatekeeper hook (python path changed)"
+                    )
+                    return
+            console.print(
+                "[yellow][-][/yellow] Security gatekeeper hook already configured"
+            )
+            return
+
+    # Add catch-all entry
+    existing["hooks"]["PreToolUse"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
+    })
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(existing, indent=2))
-    tools_str = ", ".join(GATEKEEPER_TOOLS)
-    console.print(f"[green][OK][/green] Installed security gatekeeper for: {tools_str}")
+    console.print("[green][OK][/green] Installed security gatekeeper (catch-all hook)")
 
     # Clean up stale prompt file from older versions (v0.3.9 and earlier created
     # this automatically, but it goes stale on upgrades and triggers warnings).
@@ -1553,7 +1535,6 @@ def _remove_security_hook(settings_path: Path) -> bool:
         return False
 
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    marker = _security_hook_marker()
     modified = False
 
     for hook_type in ["PreToolUse", "PermissionRequest"]:
@@ -1563,7 +1544,7 @@ def _remove_security_hook(settings_path: Path) -> bool:
         settings["hooks"][hook_type] = [
             h
             for h in settings["hooks"][hook_type]
-            if marker not in str(h) and "security_gatekeeper" not in str(h)
+            if "security_gatekeeper" not in str(h)
         ]
         if len(settings["hooks"][hook_type]) < before:
             modified = True
@@ -1628,6 +1609,237 @@ def _remove_session_tracker_hooks(settings_path: Path) -> bool:
         return True
 
     return False
+
+
+def _qa_hook_marker() -> str:
+    """Marker to identify jacked QA suggestion hook."""
+    return "# jacked-qa-suggest"
+
+
+def _install_qa_hook(existing: dict, settings_path: Path):
+    """Install QA suggestion Stop hook that detects UI file changes.
+
+    Registers a Stop hook that checks git diff for UI file changes
+    and suggests running /qa when changes are detected.
+
+    >>> # Smoke test — function exists and is callable
+    >>> callable(_install_qa_hook)
+    True
+    """
+    import json
+    import shutil
+
+    script_path = _get_data_root() / "hooks" / "qa_suggest.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] QA suggest script not found: {script_path}"
+        )
+        return
+
+    python_exe = sys.executable
+    if not python_exe or not Path(python_exe).exists():
+        python_exe = shutil.which("python3") or shutil.which("python") or "python"
+
+    python_path = str(Path(python_exe)).replace("\\", "/")
+    script_str = str(script_path).replace("\\", "/")
+    command_str = f"{python_path} {script_str}"
+
+    if "Stop" not in existing["hooks"]:
+        existing["hooks"]["Stop"] = []
+
+    # Check if already installed and up to date
+    for entry in existing["hooks"]["Stop"]:
+        if "qa_suggest" in str(entry):
+            for h in entry.get("hooks", []):
+                if h.get("command", "") != command_str:
+                    h["command"] = command_str
+                    settings_path.parent.mkdir(parents=True, exist_ok=True)
+                    settings_path.write_text(json.dumps(existing, indent=2))
+                    console.print(
+                        "[green][OK][/green] Updated QA suggest hook (python path changed)"
+                    )
+                    return
+            console.print(
+                "[yellow][-][/yellow] QA suggest hook already configured"
+            )
+            return
+
+    existing["hooks"]["Stop"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "async": True}],
+    })
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(existing, indent=2))
+    console.print("[green][OK][/green] Installed QA suggest hook (Stop event)")
+
+
+def _remove_qa_hook(settings_path: Path) -> bool:
+    """Remove jacked QA suggestion hook. Returns True if removed.
+
+    >>> # Smoke test — function exists and is callable
+    >>> callable(_remove_qa_hook)
+    True
+    """
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    if "Stop" not in settings.get("hooks", {}):
+        return False
+
+    before = len(settings["hooks"]["Stop"])
+    settings["hooks"]["Stop"] = [
+        h for h in settings["hooks"]["Stop"] if "qa_suggest" not in str(h)
+    ]
+
+    if len(settings["hooks"]["Stop"]) < before:
+        settings_path.write_text(json.dumps(settings, indent=2))
+        console.print("[green][OK][/green] Removed QA suggest hook")
+        return True
+
+    return False
+
+
+CHROME_DEVTOOLS_MODES: dict[str, list[str]] = {
+    "autoConnect": ["--autoConnect"],
+    "browserUrl": ["--browserUrl", "http://127.0.0.1:9222"],
+    "launch": [],
+    "headless": ["--headless"],
+}
+
+
+def _run_claude_mcp(
+    *args: str, timeout: int = 10
+) -> "subprocess.CompletedProcess[str] | None":
+    """Run a ``claude mcp`` subcommand, returning the result or None on error."""
+    import shutil
+    import subprocess
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        return None
+
+    try:
+        return subprocess.run(
+            [claude_bin, "mcp", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _install_chrome_devtools_mcp(force: bool = False) -> None:
+    """Install Chrome DevTools MCP server (user-scoped via ``claude mcp add``)."""
+    result = _run_claude_mcp("get", "chrome-devtools")
+    already_installed = result is not None and result.returncode == 0
+
+    if already_installed and not force:
+        console.print("[yellow][-][/yellow] Chrome DevTools MCP already configured")
+        return
+
+    if already_installed and force:
+        rm = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
+        if rm is None or rm.returncode != 0:
+            console.print("[yellow][WARN][/yellow] Could not remove existing Chrome DevTools MCP — attempting overwrite")
+
+    add = _run_claude_mcp(
+        "add", "-s", "user", "chrome-devtools", "--",
+        "npx", "chrome-devtools-mcp@latest", "--autoConnect",
+        timeout=30,
+    )
+    if add is None:
+        console.print("[red][FAIL][/red] Chrome DevTools MCP setup failed (claude CLI not found or timed out)")
+    elif add.returncode == 0:
+        console.print("[green][OK][/green] Chrome DevTools MCP configured (autoConnect)")
+        console.print("[dim]     Requires Chrome 144+ with remote debugging enabled[/dim]")
+        console.print("[dim]     Enable at: chrome://inspect/#remote-debugging[/dim]")
+    else:
+        console.print(f"[red][FAIL][/red] Chrome DevTools MCP setup failed: {add.stderr.strip()}")
+
+
+def _remove_chrome_devtools_mcp() -> bool:
+    """Remove Chrome DevTools MCP server. Returns True if removed."""
+    result = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
+    if result is not None and result.returncode == 0:
+        console.print("[green][OK][/green] Removed Chrome DevTools MCP")
+        return True
+    return False
+
+
+def _get_chrome_devtools_mcp_status() -> dict:
+    """Get Chrome DevTools MCP configuration status.
+
+    Returns dict with keys: installed (bool), mode (str | None), details (str).
+    """
+    result = _run_claude_mcp("get", "chrome-devtools")
+    if result is None:
+        return {"installed": False, "mode": None, "details": "claude CLI not found or timed out"}
+    if result.returncode != 0:
+        return {"installed": False, "mode": None, "details": "Not configured"}
+
+    output = result.stdout.strip()
+    # Parse mode from the args line
+    if "--autoConnect" in output:
+        mode = "autoConnect"
+    elif "--browserUrl" in output:
+        mode = "browserUrl"
+    elif "--headless" in output:
+        mode = "headless"
+    else:
+        mode = "launch"
+    return {"installed": True, "mode": mode, "details": output}
+
+
+def _set_chrome_devtools_mcp_mode(mode: str) -> tuple[bool, str]:
+    """Reconfigure Chrome DevTools MCP connection mode.
+
+    Returns (success, message). Captures existing config before removal
+    so it can be restored if the re-add fails.
+    """
+    if mode not in CHROME_DEVTOOLS_MODES:
+        return False, f"Unknown mode: {mode}. Valid: {', '.join(CHROME_DEVTOOLS_MODES)}"
+
+    # Capture current mode for rollback
+    current = _run_claude_mcp("get", "chrome-devtools")
+    had_existing = current is not None and current.returncode == 0
+    prev_mode_args: list[str] = []
+    if had_existing:
+        output = current.stdout
+        for m, args in CHROME_DEVTOOLS_MODES.items():
+            if args and args[0] in output:
+                prev_mode_args = args
+                break
+
+    # Remove existing
+    if had_existing:
+        rm = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
+        if rm is None or rm.returncode != 0:
+            return False, "Failed to remove existing configuration"
+
+    # Re-add with new mode
+    add_args = ["add", "-s", "user", "chrome-devtools", "--",
+                "npx", "chrome-devtools-mcp@latest"] + CHROME_DEVTOOLS_MODES[mode]
+    add = _run_claude_mcp(*add_args, timeout=30)
+
+    if add is not None and add.returncode == 0:
+        return True, f"Chrome DevTools MCP set to {mode}"
+
+    # Rollback: restore previous config if add failed
+    if had_existing:
+        _run_claude_mcp(
+            "add", "-s", "user", "chrome-devtools", "--",
+            "npx", "chrome-devtools-mcp@latest", *prev_mode_args,
+            timeout=30,
+        )
+    error = add.stderr.strip() if add else "timed out or claude CLI not found"
+    return False, f"Failed to set mode: {error}"
 
 
 def _detect_project_env() -> str | None:
@@ -1701,7 +1913,7 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
 @click.option(
     "--security",
     is_flag=True,
-    help="Install security gatekeeper hook (requires [security] extra)",
+    help="Install security gatekeeper hook",
 )
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
 @click.option(
@@ -1788,22 +2000,24 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             console.print("[yellow][-][/yellow] Stop hook already configured")
     else:
         console.print(
-            "[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)"
+            r"[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)"
         )
 
-    # Copy skill file with Python path templating
+    # Install skills — iterate all skills/*/SKILL.md in data root
     # Claude Code expects skills in subdirectories with SKILL.md
-    skill_dir = home / ".claude" / "skills" / "jacked"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
-    skill_src = pkg_root / "skills" / "jacked" / "SKILL.md"
-    skill_dst = skill_dir / "SKILL.md"
-
-    if skill_src.exists():
-        shutil.copy(skill_src, skill_dst)
-        console.print("[green][OK][/green] Installed skill: /jacked")
+    skills_src_dir = pkg_root / "skills"
+    skill_count = 0
+    if skills_src_dir.exists():
+        for skill_md in skills_src_dir.glob("*/SKILL.md"):
+            skill_name = skill_md.parent.name
+            skill_dir = home / ".claude" / "skills" / skill_name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy(skill_md, skill_dir / "SKILL.md")
+            skill_count += 1
+    if skill_count > 0:
+        console.print(f"[green][OK][/green] Installed {skill_count} skills")
     else:
-        console.print(f"[yellow][-][/yellow] Skill file not found at {skill_src}")
+        console.print("[yellow][-][/yellow] No skills found to install")
 
     # Copy jacked reference doc (comprehensive knowledge for Claude about jacked)
     ref_src = pkg_root / "rules" / "jacked-reference.md"
@@ -1939,6 +2153,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     # Install session-account tracker hooks (always — lightweight, no deps)
     _install_session_tracker_hook(existing, settings_path)
 
+    # Install QA suggestion hook (always — lightweight, no deps)
+    _install_qa_hook(existing, settings_path)
+
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
         claude_md_path = home / ".claude" / "CLAUDE.md"
@@ -1960,6 +2177,9 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print(
             f"[dim][-][/dim] Skipped {g_skip + h_skip} existing templates (use --force to overwrite)"
         )
+
+    # Install Chrome DevTools MCP server (user-scoped)
+    _install_chrome_devtools_mcp(force=force)
 
     # Ensure analytics DB exists
     try:
@@ -2011,6 +2231,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         console.print("  - Security gatekeeper (auto-approves safe Bash commands)")
     if not no_rules:
         console.print("  - Behavioral rules in CLAUDE.md")
+    console.print("  - Chrome DevTools MCP (browser testing via /qa and /ux)")
     console.print("  - Guardrails templates (run 'jacked init' in a project to set up)")
 
     # Show next steps based on what's installed
@@ -2023,12 +2244,12 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     else:
         console.print("\nOptional extras:")
         console.print(
-            '  pip install "claude-jacked\[search]"    # Session search via Qdrant'
+            r'  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
         )
         console.print(
-            '  pip install "claude-jacked\[security]"  # Auto-approve safe Bash commands'
+            r'  jacked install --force --security                   # Auto-approve safe Bash commands'
         )
-        console.print('  pip install "claude-jacked\[all]"       # Everything')
+        console.print(r'  uv tool install "claude-jacked\[all]" --force       # Everything')
 
 
 @main.command()
@@ -2085,6 +2306,8 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _remove_sound_hooks(settings_path)
     _remove_security_hook(settings_path)
     _remove_session_tracker_hooks(settings_path)
+    _remove_qa_hook(settings_path)
+    _remove_chrome_devtools_mcp()
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):
         console.print("[green][OK][/green] Removed behavioral rules from CLAUDE.md")
@@ -2116,13 +2339,20 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     else:
         console.print("[yellow][-][/yellow] No settings.json found")
 
-    # Remove skill directory
-    skill_dir = home / ".claude" / "skills" / "jacked"
-    if skill_dir.exists():
-        shutil.rmtree(skill_dir)
-        console.print("[green][OK][/green] Removed skill: /jacked")
+    # Remove skill directories — iterate all skills/*/SKILL.md in data root
+    skills_src_dir = pkg_root / "skills"
+    skill_count = 0
+    if skills_src_dir.exists():
+        for skill_md in skills_src_dir.glob("*/SKILL.md"):
+            skill_name = skill_md.parent.name
+            skill_dir = home / ".claude" / "skills" / skill_name
+            if skill_dir.exists():
+                shutil.rmtree(skill_dir)
+                skill_count += 1
+    if skill_count > 0:
+        console.print(f"[green][OK][/green] Removed {skill_count} skills")
     else:
-        console.print("[yellow][-][/yellow] Skill not found")
+        console.print("[yellow][-][/yellow] No skills found")
 
     # Remove jacked reference doc
     ref_path = home / ".claude" / "jacked-reference.md"
@@ -2166,7 +2396,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(
-        "\n[dim]Note: Your Qdrant index is still intact. Run 'pipx uninstall claude-jacked' to fully remove.[/dim]"
+        "\n[dim]Note: Your Qdrant index is still intact. Run 'uv tool uninstall claude-jacked' to fully remove.[/dim]"
     )
 
 
@@ -2222,6 +2452,196 @@ def gatekeeper_reset(yes: bool):
     console.print(f"[dim]{PROMPT_PATH}[/dim]")
 
 
+@main.group()
+def profiles():
+    """Manage security profiles -- export, import, list, delete."""
+    pass
+
+
+@profiles.command(name="list")
+def profiles_list():
+    """List saved security profiles."""
+    from jacked.profiles import PROFILE_DIR_NAME, list_profiles
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+    items = list_profiles(profiles_dir)
+
+    if not items:
+        console.print("[dim]No saved profiles.[/dim]")
+        return
+
+    table = Table(title="Security Profiles", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="white")
+    table.add_column("Description", style="dim")
+    table.add_column("Author", style="dim")
+    table.add_column("Version", style="dim")
+    table.add_column("Created", style="dim")
+
+    for p in items:
+        created = p.get("created_at", "")
+        if created:
+            try:
+                from datetime import datetime
+
+                dt = datetime.fromisoformat(created)
+                created = dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+        table.add_row(
+            p.get("name", "?"),
+            p.get("description", ""),
+            p.get("author", ""),
+            p.get("jacked_version", ""),
+            created,
+        )
+
+    console.print(table)
+
+
+@profiles.command(name="export")
+@click.argument("name")
+@click.option("-d", "--description", default="", help="Profile description")
+def profiles_export(name: str, description: str):
+    """Export current gatekeeper config + rules as a named profile."""
+    import json as _json
+
+    from jacked.profiles import PROFILE_DIR_NAME, export_profile
+    from jacked.web.database import Database
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+
+    # Read settings.json
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_json: dict = {}
+    if settings_path.exists():
+        try:
+            settings_json = _json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    try:
+        db = Database()
+    except Exception as e:
+        console.print(f"[red]Cannot open database: {e}[/red]")
+        raise SystemExit(1)
+
+    try:
+        filepath = export_profile(
+            name=name,
+            description=description,
+            author="",
+            db=db,
+            settings_json=settings_json,
+            profiles_dir=profiles_dir,
+        )
+        console.print(f"[green][OK][/green] Profile exported: {filepath}")
+    except Exception as e:
+        console.print(f"[red]Export failed: {e}[/red]")
+        raise SystemExit(1)
+    finally:
+        db.close()
+
+
+@profiles.command(name="import")
+@click.argument("path", type=click.Path(exists=True))
+def profiles_import(path: str):
+    """Import a profile from a JSON file."""
+    import json as _json
+
+    from jacked.profiles import (
+        BACKUP_DIR_NAME,
+        PROFILE_DIR_NAME,
+        import_profile,
+        validate_profile,
+    )
+    from jacked.web.database import Database
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+    backup_dir = profiles_dir / BACKUP_DIR_NAME
+
+    # Read profile file
+    try:
+        profile_data = _json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]Cannot read profile: {e}[/red]")
+        raise SystemExit(1)
+
+    # Validate
+    try:
+        warnings = validate_profile(profile_data)
+    except ValueError as e:
+        console.print(f"[red]Validation failed: {e}[/red]")
+        raise SystemExit(1)
+
+    if warnings:
+        console.print("[yellow]Warnings:[/yellow]")
+        for w in warnings:
+            console.print(f"  [yellow]- {w}[/yellow]")
+
+    if not click.confirm("Apply this profile?"):
+        console.print("Cancelled")
+        return
+
+    # Read settings.json
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_json: dict = {}
+    if settings_path.exists():
+        try:
+            settings_json = _json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    def _write_settings(data: dict):
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = settings_path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(settings_path)
+
+    try:
+        db = Database()
+    except Exception as e:
+        console.print(f"[red]Cannot open database: {e}[/red]")
+        raise SystemExit(1)
+
+    try:
+        backup_path, import_warnings = import_profile(
+            profile_data=profile_data,
+            db=db,
+            settings_json=settings_json,
+            write_settings_fn=_write_settings,
+            profiles_dir=profiles_dir,
+            backup_dir=backup_dir,
+        )
+        console.print(f"[green][OK][/green] Profile imported!")
+        console.print(f"[dim]Backup saved to: {backup_path}[/dim]")
+    except Exception as e:
+        console.print(f"[red]Import failed: {e}[/red]")
+        raise SystemExit(1)
+    finally:
+        db.close()
+
+
+@profiles.command(name="delete")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+def profiles_delete(name: str, yes: bool):
+    """Delete a saved profile."""
+    from jacked.profiles import PROFILE_DIR_NAME, delete_profile
+
+    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
+
+    if not yes:
+        if not click.confirm(f'Delete profile "{name}"?'):
+            console.print("Cancelled")
+            return
+
+    deleted = delete_profile(name, profiles_dir)
+    if deleted:
+        console.print(f"[green][OK][/green] Profile '{name}' deleted")
+    else:
+        console.print(f"[yellow]Profile '{name}' not found[/yellow]")
+
+
 HIGH_RISK_PREFIXES = {
     "python": "arbitrary code execution via -c",
     "python3": "arbitrary code execution via -c",
@@ -2239,6 +2659,7 @@ HIGH_RISK_PREFIXES = {
     "ssh": "remote command execution",
     "scp": "file transfer to remote",
     "rsync": "file transfer to remote",
+    "uv": "uv run executes arbitrary code, uv tool install runs arbitrary packages",
     "nc": "raw network connections",
     "ncat": "raw network connections",
     "netcat": "raw network connections",
@@ -2536,7 +2957,7 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
                 "[red]anthropic SDK not installed — cannot run LLM audit[/red]"
             )
             console.print(
-                '[dim]Install it: pip install "claude-jacked[security]"[/dim]'
+                '[dim]Activate it: jacked install --force --security[/dim]'
             )
         except json.JSONDecodeError:
             console.print(
@@ -2679,6 +3100,67 @@ def lint_hook_init(repo: str, language: str, force: bool):
                 console.print(f"[green][OK][/green] Project env: {env_path}")
     else:
         console.print(f"[yellow][-][/yellow] {result['reason']}")
+
+
+# ── Launch Claude Code with per-account isolation ────────────────────
+
+
+@main.command(name="claude", context_settings={"ignore_unknown_options": True})
+@click.argument("account", required=False)
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def claude_cmd(account, claude_args):
+    """Launch Claude Code with per-account credential isolation.
+
+    ACCOUNT can be an integer ID or email address. If omitted, uses
+    the currently active account (set via dashboard "Use" button).
+
+    All additional arguments are passed through to claude.
+
+    Examples:
+        jacked claude 2
+        jacked claude alice@test.com
+        jacked claude 2 -p editor
+
+    >>> # CLI command: jacked claude [ACCOUNT] [CLAUDE_ARGS...]
+    """
+    from jacked.launch import launch_claude, prepare_account_dir, resolve_account
+    from jacked.web.database import Database
+
+    db_path = Path.home() / ".claude" / "jacked.db"
+    if not db_path.exists():
+        raise click.ClickException(
+            "jacked database not found. Run 'jacked webux' first to initialize."
+        )
+
+    # If account looks like a Claude CLI flag (e.g. --resume, -p),
+    # prepend it back to claude_args and resolve the active account instead.
+    if account is not None and account.startswith("-"):
+        claude_args = (account,) + tuple(claude_args)
+        account = None
+
+    db = Database(str(db_path))
+    try:
+        # Parse account ref: try int first, else string (email or None)
+        account_ref = None
+        if account is not None:
+            try:
+                account_ref = int(account)
+            except ValueError:
+                account_ref = account
+
+        acct = resolve_account(account_ref, db)
+        config_dir = prepare_account_dir(acct, db)
+        console.print(
+            f"Launching Claude Code as [bold]{acct['email']}[/bold] (account {acct['id']})..."
+        )
+    finally:
+        db.close()
+
+    # Strip leading "claude" if user pasted full `claude --resume ...` after the command
+    if claude_args and claude_args[0] == "claude":
+        claude_args = claude_args[1:]
+
+    launch_claude(config_dir, claude_args, db_path=str(db_path))
 
 
 # ── Convenience init command ─────────────────────────────────────────

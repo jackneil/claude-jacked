@@ -46,6 +46,48 @@ User asking for final verification
 **AMBIGUOUS/UNCLEAR indicators:**
 If conversation has signals from multiple phases or no clear signals at all, do NOT guess. Ask the user: "I can't tell what phase you're in. What would you like me to review?" and offer the options (planning, implementation, post-implementation, grill mode).
 
+## REVIEW LENSES (shared with /dcr)
+
+Two categories: **required** (always reviewed) and **optional** (select based on relevance to the changes).
+
+### Required (always included)
+| # | Lens | Focus Areas |
+|---|------|-------------|
+| 1 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
+
+### Optional (select based on relevance)
+| # | Lens | Focus Areas |
+|---|------|-------------|
+| 2 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
+| 3 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
+| 4 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
+| 5 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
+| 6 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
+| 7 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
+| 8 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
+| 9 | **Simplicity & Reuse** | Redundant logic, reinvented utilities, over-engineering, premature abstraction |
+| 10 | **Observability & Debuggability** | Error context preservation, silent failure detection, structured logging adequacy, correlation/tracing, alertability |
+| 11 | **Data Integrity & Schema Safety** | Transaction boundaries, migration rollback safety, schema-code coupling, cache invalidation, idempotency, partial write recovery |
+
+## PRE-REVIEW CONTEXT DISCOVERY
+
+Before spawning any reviewer, discover and read project convention files. Use Glob/Read to check for:
+
+**AI agent instructions:**
+- `CLAUDE.md`, `.claude/CLAUDE.md`, `**/CLAUDE.md`, `AGENTS.md`
+- `.cursorrules`, `.cursor/rules/*.mdc`, `.github/copilot-instructions.md`, `.windsurfrules`
+
+**Guardrails and conventions:**
+- `*GUARDRAILS*`, `*guardrails*`, `CONTRIBUTING.md`, `STYLE_GUIDE.md`, `CODING_STANDARDS.md`
+- `.editorconfig`, `biome.json`, `.eslintrc*`, `.prettierrc*`, `ruff.toml`
+
+**Design docs and ADRs:**
+- `docs/`, `design/`, `doc/`, `architecture/` directories — scan for `*.md` files
+- `adr/`, `adrs/`, `decisions/`, `architecture-decisions/` directories
+- `docs/plans/`, `RFC*.md`, `DESIGN*.md`, `ARCHITECTURE*.md`
+
+Read everything found. Include the contents as a `## PROJECT CONTEXT` section in every reviewer prompt. For the Guardrails lens, the reviewer must cite specific rule violations with the rule text and file:line of the violation.
+
 ## SPAWNING INSTRUCTIONS
 
 Once you detect the phase, use the Task tool to spawn double-check-reviewer with these specific instructions:
@@ -53,31 +95,29 @@ Once you detect the phase, use the Task tool to spawn double-check-reviewer with
 ### FOR PLANNING PHASE:
 Review this plan with ultrathink depth. Ralph Wiggum style - appear simple but catch everything.
 
-Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
-- Security: Auth bypass, privilege escalation, injection, data exposure
-- RBAC: Role boundaries enforced? Multi-role edge cases? Permission checks on all paths?
-- Org isolation: Cross-tenant data leakage? Queries always scoped to org?
-- Logic: Edge cases, race conditions, error handling gaps, state corruption
-- UX: User flow coherence, error feedback, loading states, responsive/mobile
-- Performance: N+1 queries, unbounded loops, missing pagination, cache strategy
-- Testability: Is this design testable? What mocks needed? Integration test plan?
-- Guardrails compliance: Read JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md if one exists in the project root. Verify the design complies with its rules (file size limits, structure, naming, testing, security).
+Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the planning perspective:
+- Security/Access Control: Are auth and isolation designed correctly?
+- Logic & Edge Cases: What edge cases aren't addressed in the design?
+- UX & Flow: Does the user journey make sense? Error feedback planned?
+- Performance: Will this scale? N+1 risks? Cache strategy?
+- Testing: Is this design testable? What mocks/integration tests needed?
+- Maintainability: Is this the simplest solution? Implicit dependencies?
+- Guardrails: Does the design comply with project conventions?
 
 STOP CONDITION: ALL applicable lenses must pass clean. If ANY fix is made, reset and re-verify all lenses. Web search to validate assumptions as needed.
 
 ### FOR IMPLEMENTATION PHASE:
 Review recent code changes with ultrathink depth. Ralph Wiggum style - innocent questions that expose real issues.
 
-Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
-- Attacker mindset: Auth bypass? Privilege escalation? Injection? IDOR?
-- RBAC audit: Every endpoint checks permissions? Multi-role users handled?
-- Org isolation: All queries scoped? No cross-tenant leakage possible?
-- Edge case hunter: Empty states, nulls, timeouts, concurrent edits, max limits
-- User journey: Flow make sense? Error messages helpful? Mobile works?
-- Regression detector: Did fixing X break Y? Implicit dependencies changed?
-- Perf skeptic: N+1? Unbounded fetches? Missing indexes?
-- Test coverage: Unit tests cover new code? Edge cases tested?
-- Guardrails compliance: Read JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md if one exists in the project root. Verify changes comply with its rules (file size limits, structure, naming, testing, security).
+Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the implementation perspective:
+- Security: Auth bypass? Injection? IDOR? Input validation?
+- Access Control: Every endpoint checks permissions? Multi-role handled?
+- Logic & Edge Cases: Empty states, nulls, timeouts, concurrent edits, max limits?
+- UX & Flow: Flow make sense? Error messages helpful? Mobile works?
+- Performance: N+1? Unbounded fetches? Missing indexes?
+- Testing: Unit tests cover new code? Edge cases tested?
+- Maintainability: Did fixing X break Y? Implicit dependencies changed?
+- Guardrails: File sizes, naming, structure conventions followed?
 
 STOP CONDITION: ALL applicable lenses pass clean. Any fix resets pass tracker.
 
@@ -93,14 +133,14 @@ Checklist (ALL must pass):
 [ ] No perf regressions
 [ ] Tests added/updated
 
-Review lenses (RANDOMIZE ORDER, skip lenses that don't apply to this type of project):
-- Requirements traceability: Does code match every requirement?
-- Defensive review: What assumptions might be wrong?
-- Fresh eyes: What would confuse someone seeing this first time?
-- Test skeptic: Would these tests catch a regression?
-- Security audit: Auth, RBAC, org isolation all solid?
-- Perf check: Queries efficient? Pagination where needed?
-- Guardrails compliance: Read JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md if one exists in the project root. Verify the implementation complies with its rules (file size limits, structure, naming, testing, security).
+Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the verification perspective:
+- Security/Access Control: Auth, RBAC, org isolation all solid?
+- Logic & Edge Cases: What assumptions might be wrong?
+- UX & Flow: What would confuse someone seeing this first time?
+- Performance: Queries efficient? Pagination where needed?
+- Testing: Would these tests catch a regression?
+- Maintainability: Does code match every requirement? Clean to read?
+- Guardrails: All project conventions followed?
 
 STOP CONDITION: Checklist 100% AND all lenses pass. Any fix resets tracker.
 
@@ -147,21 +187,63 @@ Find the edge case everyone forgot
 Be thorough in a way that appears almost accidental
 The innocent observation that breaks the whole design
 
+## PRE-MORTEM ANALYST
+
+In addition to the main reviewer, always spawn a parallel pre-mortem agent. This agent uses a fundamentally different evaluation framework — it does NOT look for bugs but ASSUMES FAILURE HAS ALREADY HAPPENED and works backward to explain the cause.
+
+**Failure scenarios** (assign 2-3, shuffled; no repeats until exhausted):
+
+**Operational:**
+- "6 months in production, this feature is being rolled back. What went wrong?"
+- "A user filed a P0 bug at 3am. The on-call couldn't figure out what happened from the logs. Why?"
+- "Load increased 10x and this was the first thing to break. Trace the failure path."
+- "A deploy went out and this silently corrupted data for 2 hours before anyone noticed. How?"
+
+**Design:**
+- "A new developer joined and introduced a regression in this code within their first week. What was unclear?"
+- "This feature shipped but adoption is near zero — users can't figure it out. What's confusing?"
+- "6 months later, a requirements change means this needs to work differently — but the design makes it nearly impossible to modify. What's coupled too tightly?"
+
+**Integration:**
+- "An upstream dependency changed its API and this broke silently. Where are the implicit contracts?"
+- "Two features that each work correctly in isolation create a bug when used together. What's the interaction?"
+- "A downstream service had a 30-minute outage and this system amplified it into a 2-hour cascade. Trace the amplification path."
+- "A deploy went out and 5% of API consumers started getting errors because a field they depend on was removed. How did this slip through?"
+- "A background job failed silently for 3 days. Nobody noticed until a user reported missing data. Why was there no alert?"
+
+**Spawning instructions for the pre-mortem agent:**
+"You are the PRE-MORTEM ANALYST. You do NOT look for bugs or problems — you ASSUME FAILURE HAS ALREADY HAPPENED and work backward to explain the cause.
+
+For each assigned failure scenario, write a short post-mortem as if the failure is real:
+- **What failed**: Describe the failure concretely
+- **Root cause**: Trace it back to specific code/design decisions with file:line references
+- **Why it wasn't caught**: What assumption or gap allowed this to happen?
+- **Severity**: CRITICAL / MEDIUM / LOW using the same scale as other reviewers
+
+Your failure scenarios: [SCENARIO 1], [SCENARIO 2], [SCENARIO 3]
+
+You are READ-ONLY. Report findings but do NOT edit files. Include file paths and line numbers."
+
+The pre-mortem agent spawns once (cycle 1 only). Its findings merge with the main reviewer's findings for the fix loop. It does NOT re-spawn in subsequent cycles — its value is the initial perspective shift.
+
 ## EXECUTION FLOW
 
 1. Announce detected phase and reasoning
-2. Identify if multiple threads are needed
-3. Spawn double-check-reviewer with appropriate instructions
-4. If multiple threads, spawn them with distinct focus areas
-5. When reviewer results come back, evaluate findings:
+2. **Discover project context** using PRE-REVIEW CONTEXT DISCOVERY above. Announce what was found.
+3. Identify if multiple threads are needed
+4. Spawn TWO reviewers in parallel (one message, two Task calls):
+   a. **Main reviewer**: double-check-reviewer with phase-appropriate instructions + discovered context
+   b. **Pre-mortem analyst**: double-check-reviewer with pre-mortem instructions from the PRE-MORTEM ANALYST section above, with 2-3 shuffled failure scenarios + discovered context
+5. If the main review needs additional threads (multi-domain), spawn those too — the pre-mortem agent is always additive
+6. When ALL reviewer results come back (main + pre-mortem), merge findings and evaluate:
    - If **no CRITICAL or MEDIUM issues** → report clean pass. Done.
-   - If **CRITICAL or MEDIUM issues found** → proceed to step 6
-6. **Fix the issues yourself** based on phase:
+   - If **CRITICAL or MEDIUM issues found** → proceed to step 7
+7. **Fix the issues yourself** based on phase:
    - **Planning phase**: Edit the plan file to address each CRITICAL/MEDIUM finding. Summarize what you changed.
    - **Implementation/Post-implementation phase**: Edit the code to fix each CRITICAL/MEDIUM finding. Run tests to verify fixes don't break anything. Summarize what you changed.
    - LOW issues: Report them but do NOT block the loop for LOWs.
-7. **Re-spawn the double-check-reviewer** with the same phase instructions. Include a note: "Previous review found these issues which have been fixed: [list]. Verify fixes are correct and check for any NEW issues introduced by the fixes."
-8. **Repeat from step 5** until the reviewer returns clean (no CRITICAL/MEDIUM).
-9. Report final clean pass with a summary of all cycles.
+8. **Re-spawn the main double-check-reviewer only** (NOT the pre-mortem agent — it's one-shot) with the same phase instructions + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Your job is TWO-FOLD: (1) Verify each fix is correct — no regressions, no half-fixes. (2) Do a FULL fresh review as if seeing this for the first time. Prior waves found issues, so there may be adjacent problems that were missed. Do NOT limit your scope to verifying prior fixes."
+9. **Repeat from step 6** until the reviewer returns clean (no CRITICAL/MEDIUM).
+10. Report final clean pass with a summary of all cycles.
 
-HARD RULE: Do NOT stop the loop early. Do NOT skip re-verification. Do NOT ask the user "should I continue?" — the answer is always yes. The loop runs until clean pass or until 5 cycles (safety cap to prevent infinite loops). If still not clean after 5 cycles, report remaining issues and stop.
+HARD RULE: Do NOT stop the loop early. Do NOT skip re-verification. Do NOT ask the user "should I continue?" — the answer is always yes. The loop runs until clean pass. If the user's project or global CLAUDE.md specifies a wave/cycle cap, respect it. Otherwise there is no cap — keep going until all issues are resolved.

@@ -23,6 +23,7 @@ import httpx
 from jacked.web.database import Database
 from jacked.web.oauth import (
     CLIENT_ID,
+    DEFAULT_TOKEN_TTL_SECONDS,
     OAUTH_BETA_HEADER,
     ORG_TYPE_MAP,
     PROFILE_URL,
@@ -33,12 +34,17 @@ from jacked.web.oauth import (
 logger = logging.getLogger("jacked.auth")
 
 
+# Shared constant for refresh buffer (used by should_refresh and should_refresh_cc)
+REFRESH_BUFFER_SECONDS = 300
+USAGE_CACHE_FRESHNESS_SECONDS = 30
+
+
 def should_refresh(account: dict) -> bool:
     """Check if an account's token needs refreshing.
 
     Rules:
     - API key accounts (refresh_token is None) cannot be refreshed
-    - Refresh when now > expires_at - 300 (5-minute buffer)
+    - Refresh when now > expires_at - REFRESH_BUFFER_SECONDS (5-minute buffer)
 
     >>> should_refresh({"refresh_token": None, "expires_at": 9999999999})
     False
@@ -49,18 +55,132 @@ def should_refresh(account: dict) -> bool:
     """
     if not account.get("refresh_token"):
         return False
-    return time.time() > account["expires_at"] - 300
+    return account["expires_at"] < time.time() + REFRESH_BUFFER_SECONDS
 
 
-async def refresh_account_token(account_id: int, db: Database) -> bool:
+def should_refresh_cc(account: dict) -> bool:
+    """Check if CC (Claude Code) tokens need refresh.
+
+    Returns False if cc_refresh_token is NULL — can't refresh without one.
+
+    >>> should_refresh_cc({"cc_refresh_token": None, "cc_expires_at": 9999999999})
+    False
+    >>> should_refresh_cc({"cc_refresh_token": "rt", "cc_expires_at": 0})
+    True
+    >>> should_refresh_cc({"cc_refresh_token": "rt", "cc_expires_at": 9999999999})
+    False
+    >>> should_refresh_cc({"cc_refresh_token": "rt", "cc_expires_at": None})
+    True
+    """
+    if not account.get("cc_refresh_token"):
+        return False
+    cc_expires_at = account.get("cc_expires_at")
+    if not cc_expires_at:
+        return True
+    return cc_expires_at < time.time() + REFRESH_BUFFER_SECONDS
+
+
+async def refresh_cc_token(account_id: int, db: Database) -> bool:
+    """Refresh CC token pair independently. Updates cc_* columns only.
+
+    On invalid_grant: clear only cc_refresh_token (consumed by Claude Code).
+    Keep cc_access_token — it may still be valid until cc_expires_at.
+    Does NOT mark account as invalid — primary token health determines
+    account validity.
+
+    Uses a per-account lock to prevent concurrent CC refresh collisions
+    between the background refresh loop and pre-launch refresh.
+    """
+    account = db.get_account(account_id)
+    if not account:
+        return False
+
+    if not should_refresh_cc(account):
+        return True
+
+    if not account.get("cc_refresh_token"):
+        return True
+
+    lock = _get_cc_refresh_lock(account_id)
+    if lock.locked():
+        return True  # Another refresh in progress — skip
+
+    async with lock:
+        # Re-read account under lock — another refresh may have completed
+        account = db.get_account(account_id)
+        if not account or not should_refresh_cc(account):
+            return True
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    TOKEN_URL,
+                    json={
+                        "grant_type": "refresh_token",
+                        "refresh_token": account["cc_refresh_token"],
+                        "client_id": CLIENT_ID,
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-beta": OAUTH_BETA_HEADER,
+                    },
+                )
+
+                if resp.status_code == 200:
+                    tokens = resp.json()
+                    new_refresh = tokens.get(
+                        "refresh_token", account["cc_refresh_token"]
+                    )
+                    new_expires_at = int(time.time()) + tokens.get(
+                        "expires_in", DEFAULT_TOKEN_TTL_SECONDS
+                    )
+
+                    db.update_account(
+                        account_id,
+                        cc_access_token=tokens["access_token"],
+                        cc_refresh_token=new_refresh,
+                        cc_expires_at=new_expires_at,
+                    )
+                    logger.info(f"CC token refreshed for account {account_id}")
+                    return True
+
+                if resp.status_code == 400:
+                    try:
+                        error_data = resp.json()
+                        if error_data.get("error") == "invalid_grant":
+                            logger.warning(
+                                "Account %d: CC invalid_grant — clearing refresh token "
+                                "(access token preserved until expiry)",
+                                account_id,
+                            )
+                            db.update_account(
+                                account_id,
+                                cc_refresh_token=None,
+                            )
+                            return False
+                    except (ValueError, AttributeError):
+                        pass
+
+                logger.warning(
+                    "Account %d: CC refresh HTTP %d", account_id, resp.status_code
+                )
+                return False
+
+        except Exception as e:
+            logger.warning(f"Account {account_id}: CC refresh error: {e}")
+            return False
+
+
+async def refresh_account_token(
+    account_id: int, db: Database
+) -> bool:
     """Refresh an account's token if needed.
 
-    Implements design doc section 10 refresh logic:
     - Skip if no refresh_token (API key account)
     - Skip if token not near expiry
     - POST to TOKEN_URL with JSON body
     - Handle token rotation (new refresh_token in response)
-    - Handle invalid_grant → mark account invalid
+    - Handle invalid_grant → record error, retry next cycle
     - After successful refresh, also refresh profile metadata
 
     Returns True if token is valid (either still fresh or successfully refreshed).
@@ -95,45 +215,86 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
 
                 # Token rotation: save new refresh_token if provided
                 new_refresh = tokens.get("refresh_token", account["refresh_token"])
-                new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
+                new_expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
 
-                # CRITICAL: If DB update fails after consuming the refresh token,
-                # the old refresh token is gone and the new one wasn't saved.
-                try:
-                    db.update_account(
-                        account_id,
-                        access_token=tokens["access_token"],
-                        refresh_token=new_refresh,
-                        expires_at=new_expires_at,
-                        consecutive_failures=0,
-                    )
-                except Exception as db_err:
+                # Update DB with new tokens (retry with backoff)
+                db_updated = False
+                for attempt in range(3):
+                    try:
+                        db.update_account(
+                            account_id,
+                            access_token=tokens["access_token"],
+                            refresh_token=new_refresh,
+                            expires_at=new_expires_at,
+                            consecutive_failures=0,
+                        )
+                        db_updated = True
+                        break
+                    except Exception as db_err:
+                        logger.warning(
+                            "DB update attempt %d/3 failed for account %d: %s",
+                            attempt + 1, account_id, db_err,
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(0.1 * (2 ** attempt))
+
+                if not db_updated:
                     logger.error(
-                        f"Token refresh succeeded but DB update FAILED for "
-                        f"account {account_id}. Token may be lost! Error: {db_err}"
+                        "Token refresh succeeded but DB update FAILED for "
+                        "account %d after 3 attempts.",
+                        account_id,
                     )
                     return False
 
                 logger.info(f"Token refreshed for account {account_id}")
+
+                # Propagate refreshed tokens to credential stores so Claude
+                # Code sees them without needing a manual "Set Active".
+                # Only write to global stores if this IS the active account
+                # (otherwise we'd overwrite a different account's credentials).
+                try:
+                    from jacked.api.credential_helpers import sync_credential_to_all_stores
+
+                    cred_path = Path.home() / ".claude" / ".credentials.json"
+                    is_active = False
+                    if cred_path.exists() and not cred_path.is_symlink():
+                        try:
+                            stamp = json.loads(cred_path.read_text(encoding="utf-8"))
+                            is_active = stamp.get("_jackedAccountId") == account_id
+                        except (json.JSONDecodeError, OSError):
+                            pass
+
+                    if is_active:
+                        refreshed_account = db.get_account(account_id)
+                        if refreshed_account:
+                            sync_credential_to_all_stores(
+                                account_id, refreshed_account,
+                                email=refreshed_account.get("email"),
+                                display_name=refreshed_account.get("display_name"),
+                            )
+                except Exception as sync_err:
+                    logger.warning(
+                        "Token refresh succeeded but credential store sync "
+                        "failed for account %d: %s", account_id, sync_err,
+                    )
 
                 # Also refresh profile metadata after successful refresh
                 await fetch_profile(account_id, db, access_token=tokens["access_token"])
 
                 return True
 
-            # Error handling per design doc section 4d
             if resp.status_code == 400:
                 try:
                     error_data = resp.json()
                     if error_data.get("error") == "invalid_grant":
-                        db.update_account(
-                            account_id,
-                            validation_status="invalid",
-                            last_error="Refresh token expired or revoked — re-authenticate to fix",
-                            last_error_at=datetime.now(timezone.utc).isoformat(),
-                        )
+                        # Refresh token was consumed (likely by Claude Code).
+                        # Don't mark invalid — will retry next cycle.
                         logger.warning(
-                            f"Account {account_id}: invalid_grant — marked invalid"
+                            "Account %d: invalid_grant — will retry next cycle",
+                            account_id,
+                        )
+                        db.record_account_error(
+                            account_id, "Refresh token consumed (will retry)"
                         )
                         return False
                 except Exception:
@@ -195,6 +356,19 @@ async def fetch_usage(
     if not account:
         return None
 
+    # Cache freshness guard — skip API call if data is < USAGE_CACHE_FRESHNESS_SECONDS old.
+    # Prevents multi-tab and double-click storms.
+    # usage_cached_at is stored as an integer (Unix epoch seconds) in the DB.
+    cached_at = account.get("usage_cached_at")
+    if cached_at and not access_token:
+        try:
+            age = int(time.time()) - int(cached_at)
+            if age < USAGE_CACHE_FRESHNESS_SECONDS:
+                logger.debug(f"Usage cache fresh for account {account_id} ({age}s old), skipping")
+                return {"_cached": True}
+        except (ValueError, TypeError):
+            pass  # Malformed timestamp — proceed with fetch
+
     token = access_token or account["access_token"]
 
     try:
@@ -221,16 +395,50 @@ async def fetch_usage(
                     raw=data,
                 )
 
+                # clear_account_errors marks valid, clears last_error, consecutive_failures
                 db.clear_account_errors(account_id)
                 logger.info(f"Usage fetched for account {account_id}")
                 return data
 
+            if resp.status_code in (401, 403):
+                error_msg = f"Usage fetch failed (HTTP {resp.status_code}) — token may be revoked"
+                db.update_account(
+                    account_id,
+                    validation_status="invalid",
+                    last_error=error_msg,
+                    last_error_at=datetime.now(timezone.utc).isoformat(),
+                )
+                logger.warning(
+                    f"Usage fetch auth failure for account {account_id}: {resp.status_code}"
+                )
+                return None
+
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("retry-after", "unknown")
+                # Do NOT increment consecutive_failures — 429 is a rate limit,
+                # not an account health issue.  Incrementing would sideline
+                # accounts from credential rotation after 3 dashboard refreshes.
+                db.record_account_error(
+                    account_id,
+                    f"Usage fetch rate limited (429) — retry after {retry_after}s",
+                    increment_failures=False,
+                )
+                logger.warning(
+                    f"Usage fetch rate limited for account {account_id}, "
+                    f"retry-after: {retry_after}"
+                )
+                return None
+
+            db.record_account_error(
+                account_id, f"Usage fetch failed (HTTP {resp.status_code})"
+            )
             logger.warning(
                 f"Usage fetch HTTP {resp.status_code} for account {account_id}"
             )
             return None
 
     except Exception as e:
+        db.record_account_error(account_id, f"Usage fetch error: {e}")
         logger.warning(f"Usage fetch failed for account {account_id}: {e}")
         return None
 
@@ -279,8 +487,12 @@ async def fetch_profile(
                     updates["rate_limit_tier"] = org["rate_limit_tier"]
                 if "has_extra_usage_enabled" in org:
                     updates["has_extra_usage"] = org["has_extra_usage_enabled"]
-                if acct_info.get("display_name"):
-                    updates["display_name"] = acct_info["display_name"]
+                # NOTE: display_name intentionally NOT updated here — user sets
+                # custom labels via PATCH; profile refresh must not overwrite them.
+                # Keep org name fresh (names can change), but NEVER change
+                # organization_uuid via profile refresh — that's set at auth time
+                if org.get("name"):
+                    updates["organization_name"] = org["name"]
 
                 if updates:
                     db.update_account(account_id, **updates)
@@ -348,8 +560,10 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     updates["rate_limit_tier"] = org["rate_limit_tier"]
                 if "has_extra_usage_enabled" in org:
                     updates["has_extra_usage"] = org["has_extra_usage_enabled"]
-                if acct_info.get("display_name"):
-                    updates["display_name"] = acct_info["display_name"]
+                # NOTE: display_name intentionally NOT updated — user sets
+                # custom labels via PATCH; validation must not overwrite them.
+                if org.get("name"):
+                    updates["organization_name"] = org["name"]
                 if updates:
                     db.update_account(account_id, **updates)
 
@@ -406,6 +620,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
 # Per-account refresh locks to prevent concurrent refresh collisions
 # between the background loop and manual API calls.
 _refresh_locks: dict[int, asyncio.Lock] = {}
+_cc_refresh_locks: dict[int, asyncio.Lock] = {}
 
 
 def _get_refresh_lock(account_id: int) -> asyncio.Lock:
@@ -422,6 +637,13 @@ def _get_refresh_lock(account_id: int) -> asyncio.Lock:
     return _refresh_locks[account_id]
 
 
+def _get_cc_refresh_lock(account_id: int) -> asyncio.Lock:
+    """Get or create a per-account CC refresh lock."""
+    if account_id not in _cc_refresh_locks:
+        _cc_refresh_locks[account_id] = asyncio.Lock()
+    return _cc_refresh_locks[account_id]
+
+
 async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     """Refresh all account tokens expiring within buffer_seconds.
 
@@ -433,70 +655,113 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
         buffer_seconds: Refresh tokens expiring within this many seconds (default 4 hours)
 
     Returns:
-        dict with counts: {"checked": N, "refreshed": N, "skipped": N, "failed": N}
+        dict with counts: {"checked": N, "refreshed": N, "skipped": N, "failed": N,
+                           "cc_refreshed": N, "cc_failed": N}
 
     >>> import asyncio
     >>> result = asyncio.get_event_loop().run_until_complete(refresh_all_expiring_tokens())
-    >>> sorted(result.keys()) == ['checked', 'failed', 'refreshed', 'skipped']
+    >>> all(k in result for k in ['checked', 'failed', 'refreshed', 'skipped', 'cc_refreshed', 'cc_failed'])
     True
     """
     db = Database()
     now = int(time.time())
-    result = {"checked": 0, "refreshed": 0, "skipped": 0, "failed": 0}
-
-    # Read active account from credential file — skip it (Claude Code owns its refresh)
-    # Layer 1: _jackedAccountId, Layer 2: email from ~/.claude.json
-    active_account_id = None
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if cred_path.exists() and not cred_path.is_symlink():
-        try:
-            cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
-            active_account_id = cred_data.get("_jackedAccountId")
-        except (json.JSONDecodeError, OSError):
-            pass
-    if active_account_id is None:
-        claude_config = Path.home() / ".claude.json"
-        if claude_config.exists() and not claude_config.is_symlink():
-            try:
-                config = json.loads(claude_config.read_text(encoding="utf-8"))
-                email = config.get("oauthAccount", {}).get("emailAddress")
-                if email:
-                    acct = db.get_account_by_email(email)
-                    if acct:
-                        active_account_id = acct["id"]
-            except (json.JSONDecodeError, OSError):
-                pass
+    result = {
+        "checked": 0, "refreshed": 0, "skipped": 0, "failed": 0,
+        "cc_refreshed": 0, "cc_failed": 0,
+    }
 
     accounts = db.list_accounts(include_inactive=False)
     for account in accounts:
         result["checked"] += 1
+        account_id = account["id"]
 
-        # Skip account currently active in Claude Code (it refreshes its own tokens)
-        if active_account_id is not None and account["id"] == active_account_id:
-            result["skipped"] += 1
-            continue
+        # --- Primary token refresh ---
+        primary_needs_refresh = (
+            account.get("refresh_token")
+            and now >= (account.get("expires_at") or 0) - buffer_seconds
+        )
 
-        # Skip API key accounts (no refresh_token)
-        if not account.get("refresh_token"):
-            result["skipped"] += 1
-            continue
-
-        # Skip if not expiring within buffer
-        if now < account["expires_at"] - buffer_seconds:
-            result["skipped"] += 1
-            continue
-
-        # Non-blocking lock: skip if another refresh is in progress
-        lock = _get_refresh_lock(account["id"])
-        if lock.locked():
-            result["skipped"] += 1
-            continue
-
-        async with lock:
-            success = await refresh_account_token(account["id"], db)
-            if success:
-                result["refreshed"] += 1
+        if primary_needs_refresh:
+            lock = _get_refresh_lock(account_id)
+            if lock.locked():
+                result["skipped"] += 1
             else:
-                result["failed"] += 1
+                async with lock:
+                    success = await refresh_account_token(account_id, db)
+                    if success:
+                        result["refreshed"] += 1
+                    else:
+                        result["failed"] += 1
+        else:
+            result["skipped"] += 1
 
+        # --- CC token refresh (independent from primary) ---
+        if should_refresh_cc(account):
+            cc_success = await refresh_cc_token(account_id, db)
+            if cc_success:
+                result["cc_refreshed"] += 1
+            else:
+                result["cc_failed"] += 1
+
+    return result
+
+
+async def heal_invalid_accounts() -> dict:
+    """Attempt recovery for accounts with validation_status 'invalid' or 'unknown'.
+
+    Called every 5 minutes by the background heal loop.
+    For each stuck account:
+    - If has refresh_token and token near/past expiry → attempt refresh
+    - Otherwise → validate via profile fetch (works for API key accounts too)
+    - Mark healed (valid) or confirmed-invalid
+
+    Returns dict with counts: {"checked": N, "healed": N, "confirmed_invalid": N}
+    """
+    db = Database()
+    result = {"checked": 0, "healed": 0, "confirmed_invalid": 0}
+
+    accounts = db.list_accounts(include_inactive=True)
+    for account in accounts:
+        if account.get("is_deleted"):
+            continue
+        status = account.get("validation_status", "valid")
+        if status not in ("invalid", "unknown"):
+            continue
+
+        result["checked"] += 1
+        account_id = account["id"]
+
+        # Try refresh first if token is near/past expiry and has RT
+        healed = False
+        if account.get("refresh_token") and should_refresh(account):
+            lock = _get_refresh_lock(account_id)
+            if not lock.locked():
+                async with lock:
+                    success = await refresh_account_token(account_id, db)
+                    if success:
+                        healed = True
+
+        if not healed:
+            # Validate via profile fetch
+            validation = await validate_account(account_id, db)
+            healed = validation.get("valid", False)
+
+        if healed:
+            result["healed"] += 1
+            # Check if CC tokens need re-auth after primary heals
+            if not account.get("cc_refresh_token") and account.get("cc_access_token"):
+                logger.info(
+                    "Account %d healed but CC token needs re-authorization",
+                    account_id,
+                )
+        else:
+            result["confirmed_invalid"] += 1
+
+    if result["checked"] > 0:
+        logger.info(
+            "Heal sweep: checked=%d, healed=%d, confirmed_invalid=%d",
+            result["checked"],
+            result["healed"],
+            result["confirmed_invalid"],
+        )
     return result

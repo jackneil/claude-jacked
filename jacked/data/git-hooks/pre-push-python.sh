@@ -44,7 +44,7 @@ find_ruff() {
         done
     fi
 
-    # 5. pipx / pip --user installs
+    # 5. uv / pipx / pip --user installs
     for candidate in "$HOME_DIR/.local/bin/ruff" "$HOME_DIR/AppData/Roaming/Python/Scripts/ruff.exe"; do
         if [ -f "$candidate" ]; then echo "$candidate"; return; fi
     done
@@ -55,7 +55,7 @@ find_ruff() {
 RUFF=$(find_ruff)
 if [ -z "$RUFF" ]; then
     echo "[jacked] ruff not found — skipping lint check."
-    echo "[jacked] Install ruff: pip install ruff"
+    echo "[jacked] Install ruff: uv tool install ruff"
     exit 0
 fi
 

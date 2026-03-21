@@ -25,17 +25,38 @@ from pathlib import Path
 
 DB_PATH = Path.home() / ".claude" / "jacked.db"
 CRED_PATH = Path.home() / ".claude" / ".credentials.json"
+ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
 
 
 def _get_cred_data() -> tuple[str | None, dict | None]:
     """Read the credential file, return (access_token, full_data).
 
-    Single read — callers reuse full_data for Layer 2 matching.
+    Checks CLAUDE_CONFIG_DIR first (per-account dirs), then global.
 
     >>> token, data = _get_cred_data()
     >>> token is None or isinstance(token, str)
     True
     """
+    # Per-account dir: CLAUDE_CONFIG_DIR is set by jacked claude <id>
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        config_cred = Path(config_dir) / ".credentials.json"
+        try:
+            if config_cred.exists() and not config_cred.is_symlink():
+                data = json.loads(config_cred.read_text(encoding="utf-8"))
+                token = data.get("claudeAiOauth", {}).get("accessToken")
+                if token:
+                    # Derive account_id from directory path
+                    try:
+                        acct_id = int(Path(config_dir).name)
+                        data["_jackedAccountId"] = acct_id
+                    except (ValueError, TypeError):
+                        pass
+                    return token, data
+        except (json.JSONDecodeError, OSError, AttributeError):
+            pass
+
+    # Global credential file
     try:
         if not CRED_PATH.exists():
             return None, None
@@ -50,7 +71,7 @@ CLAUDE_CONFIG = Path.home() / ".claude.json"
 
 
 def _match_token_to_account(
-    token: str,
+    token: str | None,
     cred_data: dict | None = None,
 ) -> tuple[int | None, str | None]:
     """Match the active account using layered matching.
@@ -102,12 +123,13 @@ def _match_token_to_account(
                         return row[0], row[1]
 
             # Layer 3: Exact access_token match (fallback)
-            row = conn.execute(
-                "SELECT id, email FROM accounts WHERE access_token = ? AND is_deleted = 0",
-                (token,),
-            ).fetchone()
-            if row:
-                return row[0], row[1]
+            if token:
+                row = conn.execute(
+                    "SELECT id, email FROM accounts WHERE access_token = ? AND is_deleted = 0",
+                    (token,),
+                ).fetchone()
+                if row:
+                    return row[0], row[1]
         finally:
             conn.close()
     except Exception:
@@ -140,6 +162,7 @@ def _record_session(
     email: str | None,
     method: str,
     repo_path: str | None,
+    pid: int | None = None,
 ) -> str | None:
     """Insert or refresh a session-account record via raw sqlite3.
 
@@ -190,9 +213,9 @@ def _record_session(
                 conn.execute(
                     """INSERT OR IGNORE INTO session_accounts
                        (session_id, account_id, email, detected_at, last_activity_at,
-                        detection_method, repo_path)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (session_id, account_id, email, ts, ts, method, repo_path),
+                        detection_method, repo_path, pid)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, account_id, email, ts, ts, method, repo_path, pid),
                 )
             conn.commit()
             return ts
@@ -325,7 +348,7 @@ def _clear_account_error(account_id: int):
     """Clear stale error on account when a live session proves creds work.
 
     Only fires when validation_status='invalid' — no-op for healthy accounts.
-    Safe because credential_sync.py handles token updates separately.
+    Safe because credential_helpers.py handles token updates separately.
 
     >>> _clear_account_error(99999)
     """
@@ -370,21 +393,18 @@ def _handle_event(event: str, session_id: str, repo_path: str | None):
 
     # SessionStart or Notification(auth_success) — detect account
     token, cred_data = _get_cred_data()
-    if not token:
-        ts = _record_session(session_id, None, None, event.lower(), repo_path)
-        if event == "SessionStart":
-            _tag_subagent(session_id, ts)
-        return
-
     account_id, email = _match_token_to_account(token, cred_data)
+    pid = os.getppid()
 
     if event == "Notification":
         # auth_success — close previous record first
         _end_session(session_id)
-        _record_session(session_id, account_id, email, "auth_success", repo_path)
+        _record_session(session_id, account_id, email, "auth_success", repo_path, pid)
     else:
         # SessionStart
-        ts = _record_session(session_id, account_id, email, "session_start", repo_path)
+        ts = _record_session(
+            session_id, account_id, email, "session_start", repo_path, pid
+        )
         _tag_subagent(session_id, ts)
 
     if account_id is not None:

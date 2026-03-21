@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -13,8 +15,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from jacked import __version__
-from jacked.api.credential_sync import sync_credential_tokens
-from jacked.api.watchers import logs_watch_loop, session_accounts_watch_loop
+from jacked.api.watchers import (
+    logs_watch_loop,
+    process_alive_sweeper_loop,
+    session_accounts_watch_loop,
+)
+from jacked.api.log_capture import server_log_buffer
 from jacked.api.websocket import WebSocketRegistry
 
 logger = logging.getLogger(__name__)
@@ -23,8 +29,10 @@ logger = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent.parent / "data" / "web"
 
 TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes
-CRED_WATCH_INTERVAL = 3  # seconds between credential file checks
 WS_KEEPALIVE_INTERVAL = 30  # seconds between WebSocket pings
+HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
+LOG_FILE_MAX_BYTES = 5_000_000  # 5 MB
+LOG_FILE_BACKUP_COUNT = 3
 
 
 def _build_allowed_origins(host: str, port: int) -> list[str]:
@@ -40,80 +48,8 @@ def _build_allowed_origins(host: str, port: int) -> list[str]:
     return [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
 
 
-async def _credentials_watch_loop(app: FastAPI):
-    """Watch Claude Code's credential file for external changes.
-
-    Polls every 3 seconds.  When the mtime changes, broadcasts a
-    ``credentials_changed`` event through the WebSocket registry.
-    Self-writes from the ``/use`` endpoint are suppressed via mtime
-    comparison.  External changes trigger a token sync back to the DB.
-    """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    last_mtime: float | None = None
-
-    # Seed initial mtime
-    try:
-        last_mtime = await asyncio.to_thread(
-            lambda: cred_path.stat().st_mtime if cred_path.exists() else None
-        )
-    except OSError:
-        pass
-
-    while True:
-        await asyncio.sleep(CRED_WATCH_INTERVAL)
-        try:
-            current_mtime = await asyncio.to_thread(
-                lambda: cred_path.stat().st_mtime if cred_path.exists() else None
-            )
-        except OSError:
-            continue
-
-        if current_mtime is not None and current_mtime != last_mtime:
-            last_mtime = current_mtime
-
-            # Suppress notification if we just wrote the file ourselves
-            self_written = getattr(app.state, "cred_last_written_mtime", None)
-            if self_written is not None and self_written == current_mtime:
-                app.state.cred_last_written_mtime = None
-                continue
-
-            # Sync tokens from file → DB (prevents token desync)
-            db = getattr(app.state, "db", None)
-            if db is not None:
-                try:
-                    data = await asyncio.to_thread(
-                        lambda: (
-                            json.loads(cred_path.read_text(encoding="utf-8"))
-                            if cred_path.exists() and not cred_path.is_symlink()
-                            else None
-                        )
-                    )
-                    if data:
-                        await asyncio.to_thread(sync_credential_tokens, db, data)
-                except Exception as exc:
-                    logger.debug("Token sync failed (non-fatal): %s", exc)
-
-            registry: WebSocketRegistry = getattr(app.state, "ws_registry", None)
-            if registry and registry.client_count > 0:
-                await registry.broadcast(
-                    "credentials_changed",
-                    source="file_watcher",
-                )
-                logger.info(
-                    "Credential file changed — notified %d client(s)",
-                    registry.client_count,
-                )
-        elif current_mtime is None and last_mtime is not None:
-            # File was deleted
-            last_mtime = None
-
-
 async def _token_refresh_loop():
-    """Background task to refresh tokens every 30 minutes.
-
-    Sleeps first (tokens were just loaded), then runs indefinitely.
-    Only logs when something actually happens.
-    """
+    """Background task to refresh tokens every 30 minutes."""
     while True:
         await asyncio.sleep(TOKEN_REFRESH_INTERVAL)
         try:
@@ -131,10 +67,21 @@ async def _token_refresh_loop():
             logger.warning("Token refresh loop error: %s", e)
 
 
+async def _heal_sweep_loop():
+    """Background task to heal stuck accounts every 5 minutes."""
+    while True:
+        await asyncio.sleep(HEAL_SWEEP_INTERVAL)
+        try:
+            from jacked.web.auth import heal_invalid_accounts
+
+            await heal_invalid_accounts()
+        except Exception as e:
+            logger.warning("Heal sweep error: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
-    # Startup: initialize database
     try:
         from jacked.web.database import Database
 
@@ -144,15 +91,44 @@ async def lifespan(app: FastAPI):
         logger.warning("Database init failed: %s", e)
         app.state.db = None
 
-    # WebSocket registry + host/port/origin config
     app.state.ws_registry = WebSocketRegistry()
-    app.state.cred_last_written_mtime = None
 
     host = os.environ.get("JACKED_HOST", "127.0.0.1")
     port = int(os.environ.get("JACKED_PORT", "8321"))
     app.state.host = host
     app.state.port = port
     app.state.allowed_origins = _build_allowed_origins(host, port)
+
+    # Wire server log capture (buffer-only until loop/registry set)
+    _log_handler = server_log_buffer.handler
+    server_log_buffer.set_loop(asyncio.get_running_loop())
+    server_log_buffer.set_registry(app.state.ws_registry)
+    logging.getLogger().addHandler(_log_handler)
+
+    # Persistent file logging with rotation
+    _file_handler = None
+    log_path = Path.home() / ".claude" / "jacked-server.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _fh = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=LOG_FILE_MAX_BYTES, backupCount=LOG_FILE_BACKUP_COUNT,
+        )
+        _fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        _fmt.converter = time.gmtime
+        _fh.setFormatter(_fmt)
+        os.chmod(str(log_path), 0o600)
+        # Attach only after chmod succeeds — prevents handler leak if chmod fails
+        logging.getLogger().addHandler(_fh)
+        _file_handler = _fh
+    except Exception as e:
+        logger.warning("File logging unavailable: %s", e)
+        _file_handler = None
+
+    # Lower jacked namespace to INFO so messages reach the capture handler.
+    # basicConfig() in cli.py sets root to WARNING which would suppress them.
+    _jacked_logger = logging.getLogger("jacked")
+    if _jacked_logger.getEffectiveLevel() > logging.INFO:
+        _jacked_logger.setLevel(logging.INFO)
 
     if host == "0.0.0.0":
         logger.warning(
@@ -161,25 +137,34 @@ async def lifespan(app: FastAPI):
 
     # Start background tasks
     refresh_task = asyncio.create_task(_token_refresh_loop())
-    cred_watch_task = asyncio.create_task(_credentials_watch_loop(app))
     session_watch_task = asyncio.create_task(session_accounts_watch_loop(app))
     logs_watch_task = asyncio.create_task(logs_watch_loop(app))
+    sweeper_task = asyncio.create_task(process_alive_sweeper_loop(app))
+    heal_task = asyncio.create_task(_heal_sweep_loop())
     logger.info("Started background token refresh (every 30min)")
-    logger.info("Started credential file watcher (every 3s)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started logs watcher (every 3s)")
+    logger.info("Started process-alive sweeper (every 60s)")
+    logger.info("Started heal sweep (every 5min)")
 
     yield
 
     # Shutdown: cancel background tasks
-    for task in (refresh_task, cred_watch_task, session_watch_task, logs_watch_task):
+    for task in (refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task):
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
 
-    # Shutdown: close database
+    # Detach server log capture
+    logging.getLogger().removeHandler(_log_handler)
+    server_log_buffer.detach()
+
+    if _file_handler:
+        logging.getLogger().removeHandler(_file_handler)
+        _file_handler.close()
+
     db = getattr(app.state, "db", None)
     if db is not None:
         try:
@@ -195,13 +180,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — dynamic origins based on JACKED_HOST / JACKED_PORT env vars
-# At middleware init time we read env vars directly (lifespan hasn't run yet).
 _cors_origins = _build_allowed_origins(
     os.environ.get("JACKED_HOST", "127.0.0.1"),
     int(os.environ.get("JACKED_PORT", "8321")),
 )
-# allow_credentials must be False when origins is ["*"] (CORS spec violation otherwise)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -209,9 +191,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# --- Exception handlers ---
 
 
 @app.exception_handler(ValueError)
@@ -241,18 +220,9 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
-# --- WebSocket event bus ---
-
-
 @app.websocket("/api/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """General-purpose WebSocket event bus.
-
-    Clients connect and optionally specify topics via query param:
-    ``/api/ws?topics=credentials_changed,usage_updated``
-    Default is ``*`` (all topics).
-    """
-    # Origin check — only enforced when not binding to 0.0.0.0
+    """General-purpose WebSocket event bus."""
     allowed = getattr(app.state, "allowed_origins", ["*"])
     if "*" not in allowed:
         origin = ws.headers.get("origin", "")
@@ -262,7 +232,6 @@ async def websocket_endpoint(ws: WebSocket):
 
     await ws.accept()
 
-    # Parse topic subscriptions from query param
     raw_topics = ws.query_params.get("topics", "*")
     topics = [t.strip() for t in raw_topics.split(",") if t.strip()]
     if not topics:
@@ -277,7 +246,6 @@ async def websocket_endpoint(ws: WebSocket):
     )
 
     try:
-        # Server-side keepalive — send ping every 30s to survive reverse proxies
         async def _keepalive():
             while True:
                 await asyncio.sleep(WS_KEEPALIVE_INTERVAL)
@@ -289,8 +257,6 @@ async def websocket_endpoint(ws: WebSocket):
         keepalive_task = asyncio.create_task(_keepalive())
         try:
             while True:
-                # We don't expect client messages, but must consume them
-                # to detect disconnects
                 await ws.receive_text()
         except WebSocketDisconnect:
             pass
@@ -307,21 +273,16 @@ async def websocket_endpoint(ws: WebSocket):
 
 # --- Include route modules ---
 
-from jacked.api.routes import system, analytics, features  # noqa: E402
+from jacked.api.routes import system, analytics, features, logs, permissions, profiles  # noqa: E402
 
 app.include_router(system.router, prefix="/api", tags=["system"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(features.router, prefix="/api", tags=["features"])
+app.include_router(logs.router, prefix="/api", tags=["logs"])
+app.include_router(permissions.router, prefix="/api", tags=["permissions"])
+app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
 
-# Credential switching + session tracking endpoints
-try:
-    from jacked.api.routes import credentials  # noqa: E402
-
-    app.include_router(credentials.router, prefix="/api/auth", tags=["credentials"])
-except ImportError:
-    logger.debug("Credentials routes not loaded")
-
-# Auth routes loaded conditionally (depend on web.database, web.oauth, web.auth)
+# Auth routes (includes credential switching + session queries)
 try:
     from jacked.api.routes import auth  # noqa: E402
 
@@ -333,7 +294,6 @@ except ImportError:
 # --- Static files + SPA catch-all ---
 
 if WEB_DIR.exists():
-    # Mount css/js/assets as static
     _css_dir = WEB_DIR / "css"
     _js_dir = WEB_DIR / "js"
     _assets_dir = WEB_DIR / "assets"
@@ -348,14 +308,12 @@ if WEB_DIR.exists():
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         """Serve static files or fall back to index.html for SPA routing."""
-        # Don't serve SPA for API routes
         if full_path.startswith("api/"):
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"error": {"message": "Not found", "code": "NOT_FOUND"}},
             )
 
-        # Serve static files if they exist (with path traversal protection)
         file_path = (WEB_DIR / full_path).resolve()
         web_resolved = WEB_DIR.resolve()
 
@@ -370,7 +328,6 @@ if WEB_DIR.exists():
         if file_path.exists() and file_path.is_file():
             return FileResponse(file_path)
 
-        # SPA catch-all: serve index.html
         index_path = WEB_DIR / "index.html"
         if index_path.exists():
             return FileResponse(index_path)

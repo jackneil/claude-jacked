@@ -24,17 +24,17 @@ Paste this into Claude Code and it handles everything:
 ```
 Install claude-jacked for me. Use AskUserQuestion to ask me which features I want:
 
-1. First check if pipx and jacked are already installed
+1. First check if uv and jacked are already installed (if uv is missing: curl -LsSf https://astral.sh/uv/install.sh | sh)
 2. Ask me which install tier I want:
    - BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard
    - SEARCH: Everything above + search past Claude sessions across machines (requires Qdrant Cloud)
    - SECURITY: Everything above + auto-approve safe bash commands (fewer permission prompts)
    - ALL: Everything
 3. Install based on my choice:
-   - BASE: pipx install claude-jacked && jacked install --force
-   - SEARCH: pipx install "claude-jacked[search]" && jacked install --force
-   - SECURITY: pipx install "claude-jacked[security]" && jacked install --force --security
-   - ALL: pipx install "claude-jacked[all]" && jacked install --force --security
+   - BASE: uv tool install claude-jacked && jacked install --force
+   - SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
+   - SECURITY: uv tool install claude-jacked && jacked install --force --security
+   - ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
 4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
 5. Verify with: jacked --help
 6. Launch the dashboard: jacked webux
@@ -45,22 +45,24 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
 Run once from anywhere — installs globally to `~/.claude/` and applies to all your Claude Code sessions:
 
 ```bash
-pipx install claude-jacked
+uv tool install claude-jacked
 jacked install --force
 jacked webux              # opens your dashboard at localhost:8321
 ```
+
+> **Don't have uv?** Install it first: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Mac/Linux) or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
 
 **Want more?** Add optional extras:
 
 ```bash
 # Add session search (needs Qdrant Cloud ~$30/mo)
-pipx install "claude-jacked[search]" --force && jacked install --force
+uv tool install "claude-jacked[search]" --force && jacked install --force
 
-# Add security gatekeeper (auto-approves safe bash commands)
-pipx install "claude-jacked[security]" --force && jacked install --force --security
+# Add security gatekeeper (auto-approves safe bash commands, included in base install)
+jacked install --force --security
 
-# Everything
-pipx install "claude-jacked[all]" --force && jacked install --force --security
+# Everything (base + search)
+uv tool install "claude-jacked[all]" --force && jacked install --force --security
 ```
 
 ---
@@ -71,13 +73,13 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 ### Toggle Features On and Off
 
-Enable or disable any of the 10 built-in code reviewers and 6 slash commands with one click. Each card shows what it does so you know what you're turning on.
+Enable or disable any of the 10 built-in code reviewers and 7 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
 ![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
 
 ### Monitor Security Decisions
 
-Every bash command the gatekeeper evaluates is logged. See the decision, the method used, the full command, and the LLM's reasoning — all filterable by session. Export or purge logs anytime.
+Every tool call the gatekeeper evaluates is logged — bash commands, file operations, web access, and more. See the decision, the method used, the full command, and the LLM's reasoning — all filterable by session and method. Approve commands directly from the log viewer with "Always Allow."
 
 ![Gatekeeper Logs](docs/screenshots/dashboard-logs-detail.png)
 
@@ -90,7 +92,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 <details>
 <summary><strong>More Dashboard Views</strong></summary>
 
-**Security Gatekeeper Configuration** — Configure the 4-tier evaluation pipeline, choose the LLM model, set the evaluation method, manage API keys, and edit the LLM prompt — all from the Gatekeeper tab.
+**Security Gatekeeper Configuration** — Configure the multi-tier evaluation pipeline, toggle per-tool interception, choose the LLM model, set the evaluation method, manage API keys, and edit the LLM prompt — all from the Gatekeeper tab.
 
 ![Settings — Gatekeeper](docs/screenshots/dashboard-settings-gatekeeper.png)
 
@@ -98,9 +100,15 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable slash commands (`/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`).
+**Commands** — Enable or disable slash commands (`/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`).
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
+
+**Permissions Panel** — Manage allowed commands with project-level vs global scope. Add new allow rules or promote commands from the log viewer with "Always Allow."
+
+**Security Profiles** — Export, import, and backup your gatekeeper configuration. Share security settings across machines or teams.
+
+**Analytics Dashboard** — Charts, heatmap, command frequency breakdown, and drill-down by session or method.
 
 </details>
 
@@ -123,20 +131,22 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ## What's Included
 
-### Base (`pipx install claude-jacked`)
+### Base (`uv tool install claude-jacked`)
 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **6 Slash Commands** | `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules` |
+| **7 Slash Commands** | `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
 | **Account Management** | Track Claude accounts, usage limits, subscription status |
 | **Feature Toggles** | Enable/disable any reviewer, command, or hook from the dashboard |
-| **Analytics** | Approval rates, command usage, system health |
+| **Analytics** | Approval rates, command usage, charts, heatmap, drill-down |
+| **Security Profiles** | Export, import, and backup gatekeeper configurations |
+| **Permissions Management** | "Always Allow" from logs, project-level vs global permission scopes |
 
-### Search Extra (`pipx install "claude-jacked[search]"`)
+### Search Extra (`uv tool install "claude-jacked[search]"`)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -144,13 +154,16 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
 | **Team Sharing** | Search your teammates' sessions (with their permission) |
 
-### Security Extra (`pipx install "claude-jacked[security]"`)
+### Security Gatekeeper (activate with `jacked install --security`)
 
 | Feature | What It Does |
 |---------|--------------|
-| **Security Gatekeeper** | Auto-approves safe bash commands, blocks dangerous ones, asks about ambiguous ones |
+| **Security Gatekeeper** | Intercepts all tool calls — auto-approves safe ones, blocks dangerous ones, asks about the rest |
+| **Tool Registry** | Per-tool enable/disable toggles from the dashboard (Bash, Read, Edit, Write, Grep, Glob, Web, MCP) |
 | **Shell Injection Defense** | Detects shell operators (`&&`, `|`, `;`, `>`, `` ` ``, `$()`) to prevent chaining attacks |
+| **Path Safety** | Blocks access to sensitive files (`.env`, `.ssh/`, credentials) across all file tools |
 | **File Context Analysis** | Reads referenced scripts and evaluates what code actually does |
+| **Command Categories** | Configurable per-category behavior (allow/ask/evaluate) for network, packages, git, docker, etc. |
 | **Customizable Prompt** | Tune the safety evaluation via the dashboard or `~/.claude/gatekeeper-prompt.txt` |
 | **Permission Audit** | Scans your permission rules for dangerous wildcards that bypass the gatekeeper |
 | **Session-Tagged Logs** | Every decision tagged with session ID for multi-session tracking |
@@ -168,31 +181,47 @@ jacked webux --no-browser       # Start server without opening browser
 
 The dashboard is a local web app that runs on your machine. All data stays in `~/.claude/jacked.db` — nothing is sent anywhere.
 
-**5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Gatekeeper / Features / Advanced), Logs, Analytics.
+**5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Gatekeeper / Features / Plugins / Claude Code / Advanced / Profiles), Logs, Analytics.
 
 ---
 
 ## Security Gatekeeper
 
-The security gatekeeper intercepts every bash command Claude runs and decides whether to auto-approve it or ask you first. About 90% of commands resolve in under 2 milliseconds.
+The security gatekeeper intercepts **all tool calls** Claude makes — bash commands, file reads/writes, web access, and MCP tools — and decides whether to auto-approve, block, or ask you. Each tool type gets the appropriate level of scrutiny. Most decisions resolve in under 2 milliseconds.
 
 ### How It Works
 
-A 4-tier evaluation chain, fastest first:
+The hook uses an empty matcher to intercept every tool call, then dispatches by tool type:
+
+- **Bash commands** go through the full multi-tier evaluation chain (see below)
+- **File tools** (Read, Edit, Write, Grep, Glob) get path-safety checks for sensitive files and directories
+- **Web tools** (WebFetch, WebSearch) are auto-approved with audit logging (read-only access)
+- **MCP tools** are auto-approved with audit logging (user opted in via toggle)
+
+Each tool can be individually enabled or disabled from the dashboard via the **tool registry** (Settings > Gatekeeper > Tools).
+
+#### Bash Evaluation Chain
+
+A multi-tier chain, fastest first:
 
 | Tier | Speed | What It Does |
 |------|-------|--------------|
-| **Deny patterns** | <1ms | Blocks dangerous commands (sudo, rm -rf, reverse shells, database DROP, etc.) |
+| **Deny patterns** | <1ms | Blocks dangerous commands with labeled reasons (sudo, rm -rf, reverse shells, DROP, etc.) |
+| **Command categories** | <1ms | Configurable per-category behavior — allow, ask, or evaluate (network, packages, git, docker, etc.) |
+| **Path safety** | <1ms | Blocks bash commands targeting sensitive files (`.env`, `.ssh/`, credentials, keystores) |
 | **Permission rules** | <1ms | Checks commands already approved in your Claude settings |
 | **Local allowlist** | <1ms | Matches safe patterns (specific git/gh/docker/make subcommands, pytest, etc.) |
 | **LLM evaluation** | ~2s | Sends ambiguous commands to an LLM with file context for judgment |
 
 Commands containing shell operators (`&&`, `||`, `;`, `|`, etc.) always go to the LLM — they're never auto-approved by the local allowlist.
 
+#### Always Allow
+
+Approve commands directly from the **Logs** page. Click "Always Allow" on any logged command to add it to your permission rules. Permissions can be scoped to the current project or applied globally.
+
 ### Install / Uninstall
 
 ```bash
-pipx install "claude-jacked[security]"
 jacked install --force --security
 ```
 
@@ -303,6 +332,7 @@ Type these directly in Claude Code:
 | `/redo` | **Redo** — Scraps the current approach and re-implements cleanly with full hindsight |
 | `/techdebt` | **Tech Debt** — Scans for TODOs, oversized files, missing tests, dead code |
 | `/audit-rules` | **Audit Rules** — Checks CLAUDE.md for duplicates, contradictions, stale rules |
+| `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome |
 
 ### Smart Reviewers
 
@@ -319,6 +349,10 @@ These work automatically when Claude thinks they'd help, or you can ask for them
 ```
 Use the double-check reviewer to review what we just built
 ```
+
+### QA Browser Testing
+
+The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.
 
 ---
 
@@ -342,14 +376,14 @@ Works on Windows, Mac, and Linux. To remove: `jacked uninstall --sounds`
 ### Uninstall
 
 ```bash
-jacked uninstall && pipx uninstall claude-jacked
+jacked uninstall && uv tool uninstall claude-jacked
 ```
 
 Your cloud database stays intact — reinstall anytime without losing history.
 
 ### Common Issues
 
-**"jacked: command not found"** — Run `pipx ensurepath` and restart your terminal.
+**"jacked: command not found"** — Run `uv tool update-shell` and restart your terminal.
 
 **Search isn't working** — You need Qdrant Cloud set up first. Ask Claude: `Help me set up Qdrant Cloud for jacked`
 
@@ -363,7 +397,7 @@ Your cloud database stays intact — reinstall anytime without losing history.
 
 > **Only needed for the `[search]` extra.** The base install works without Qdrant.
 
-1. Install the search extra: `pipx install "claude-jacked[search]"`
+1. Install the search extra: `uv tool install "claude-jacked[search]"`
 2. Go to [cloud.qdrant.io](https://cloud.qdrant.io) and create an account
 3. Create a cluster (paid tier ~$30/month required)
 4. Copy your cluster URL and API key
@@ -394,6 +428,17 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.9.1** | **Catch-all PreToolUse hook** — intercepts all tools (file tools get path-safety checks, web/MCP tools get auto-approve with logging, Bash keeps full eval chain). Tool registry with per-tool enable/disable. Labeled deny patterns for clearer audit logs. `/qa` command + Stop hook for browser QA. oauthAccount seeding, plugin toggle fix. |
+| **0.9.0** | **Analytics dashboard** with charts, heatmap, and drill-down. **Security profiles** — export, import, and backup gatekeeper configurations. Profile API endpoints + Settings UI panel. |
+| **0.8.0** | **Permissions panel** — manage allowed commands with project-level vs global scope. "Always Allow" from log rows. Method filter on log viewer. |
+| **0.7.5** | Workspace trust, per-account config directories. |
+| **0.7.4** | Per-account launch isolation, credential helpers extraction. |
+| **0.7.3** | Credential sync hardening, gatekeeper security audit. |
+| **0.7.2** | Fix "Set Active" on macOS — Keychain write. |
+| **0.7.1** | macOS Keychain credential support, gatekeeper settings tab, uv migration. |
+| **0.7.0** | **Multi-account credential sync**, WebSocket dashboard, session dedup. |
+| **0.6.0–0.6.1** | Per-row badges, background op auto-approve, mobile responsive dashboard, security hardening. |
+| **0.5.0** | **Guardrails framework**, lessons dashboard viewer, hardlink installs, `jacked check-version` command. Security hardening (shell operator regex, tightened safe prefixes, session-tagged logs, LLM reason logging). |
 | **0.4.0** | **Web dashboard** with 5-page local UI (Accounts, Installations, Settings, Logs, Analytics). Feature toggle API — enable/disable agents, commands, hooks, knowledge from the browser. Settings redesigned as tabbed interface. Account management with OAuth, usage monitoring, multi-account priority ordering. Gatekeeper log viewer with session filtering, search, export, purge. Analytics dashboard. Web deps (FastAPI, uvicorn) now included in base install. |
 | **0.3.11** | Security hardening: shell operator detection, tightened safe prefixes, expanded deny patterns, file context prompt injection defense, path traversal prevention. Session ID tags in logs. LLM reason logging. 375 tests. |
 | **0.3.10** | Fix format string explosion, qdrant test skip fix. |
@@ -431,6 +476,7 @@ jacked uninstall --sounds          # Remove only sounds
 jacked uninstall --security        # Remove only security hook
 jacked backfill                    # Index all existing sessions
 jacked status                      # Check connectivity
+jacked check-version               # Check for newer version
 
 # Security Gatekeeper
 jacked gatekeeper show             # Print current LLM prompt
@@ -439,10 +485,19 @@ jacked gatekeeper diff             # Compare custom vs built-in prompt
 jacked gatekeeper audit            # Audit permission rules
 jacked gatekeeper audit --log      # Also scan recent auto-approved commands
 
+# Security Profiles
+jacked profiles list               # List saved profiles
+jacked profiles export <name>      # Export current config as a named profile
+jacked profiles import <path>      # Import a profile from a JSON file
+jacked profiles delete <name>      # Delete a saved profile
+
 # Dashboard
 jacked webux                       # Open web dashboard
 jacked webux --port 9000           # Custom port
 jacked webux --no-browser          # Server only, no auto-open
+
+# Slash Commands
+# /dc /pr /learn /redo /techdebt /audit-rules /qa
 ```
 
 </details>
@@ -480,7 +535,7 @@ The dashboard is a local web application:
 
 All data stays on your machine. The dashboard reads Claude Code's configuration files (`~/.claude/settings.json`, `~/.claude/agents/`, etc.) and provides a visual interface for managing them.
 
-**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`
+**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`, `/api/profiles/*`, `/api/permissions/*`
 
 </details>
 
@@ -543,17 +598,25 @@ The `jacked install` command adds hooks to `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "Stop": [{
-      "matcher": "",
-      "hooks": [{"type": "command", "command": "jacked index --repo \"$CLAUDE_PROJECT_DIR\"", "async": true}]
-    }],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "jacked index --repo \"$CLAUDE_PROJECT_DIR\"", "async": true}]
+      },
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "python /path/to/qa_suggest.py", "async": true}]
+      }
+    ],
     "PreToolUse": [{
-      "matcher": "Bash",
+      "matcher": "",
       "hooks": [{"type": "command", "command": "python /path/to/security_gatekeeper.py", "timeout": 30}]
     }]
   }
 }
 ```
+
+The PreToolUse matcher is an empty string (catch-all) — the gatekeeper script internally dispatches by tool type and checks the tool registry for per-tool enable/disable settings.
 
 </details>
 
@@ -567,7 +630,7 @@ Install claude-jacked for me. Use the AskUserQuestion tool to guide me through o
 
 PHASE 1 - DIAGNOSTICS:
 - Detect OS (Windows/Mac/Linux)
-- Check: pipx --version (if missing: pip install pipx && pipx ensurepath)
+- Check: uv --version (if missing: curl -LsSf https://astral.sh/uv/install.sh | sh on Mac/Linux, powershell -c "irm https://astral.sh/uv/install.ps1 | iex" on Windows)
 - Check: jacked --version (to see if already installed)
 - Check ~/.claude/settings.json for existing hooks
 
@@ -583,10 +646,10 @@ Options:
 
 PHASE 3 - INSTALL:
 Based on user choice:
-- BASE: pipx install claude-jacked && jacked install --force
-- SEARCH: pipx install "claude-jacked[search]" && jacked install --force
-- SECURITY: pipx install "claude-jacked[security]" && jacked install --force --security
-- ALL: pipx install "claude-jacked[all]" && jacked install --force --security
+- BASE: uv tool install claude-jacked && jacked install --force
+- SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
+- SECURITY: uv tool install claude-jacked && jacked install --force --security
+- ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
 
 PHASE 4 - POST-INSTALL:
 - Launch dashboard: jacked webux
@@ -607,13 +670,15 @@ Claude Code uses Git Bash on Windows, which can cause path issues.
 
 **If "jacked" isn't found:**
 ```bash
-pipx ensurepath
+uv tool update-shell
 # Then restart your terminal
 ```
 
 **If paths are getting mangled:**
 ```bash
-/c/Users/jack/pipx/venvs/claude-jacked/Scripts/jacked.exe status
+# Find the uv tools bin directory
+uv tool dir
+# Use the full path to jacked if needed
 ```
 
 </details>

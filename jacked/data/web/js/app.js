@@ -16,6 +16,7 @@ window.jackedState = {
     activeSessions: {},
     polling: null,
     flowPolling: null,
+    _accountActionInFlight: false,
     logsPaused: false,
     logsInFlight: false,
     // Session display preferences (persisted via localStorage)
@@ -34,6 +35,8 @@ const api = {
         const opts = {
             method,
             headers: { 'Content-Type': 'application/json' },
+            // Bypass browser cache — stale responses after OAuth flows cause UI desync
+            cache: 'no-store',
         };
         if (body !== undefined) {
             opts.body = JSON.stringify(body);
@@ -75,8 +78,9 @@ class ApiError extends Error {
 const ROUTES = ['accounts', 'installations', 'settings', 'logs', 'analytics'];
 
 function getRoute() {
-    const hash = window.location.hash.replace('#', '') || 'accounts';
-    return ROUTES.includes(hash) ? hash : 'accounts';
+    const raw = window.location.hash.replace('#', '') || 'accounts';
+    const route = raw.split('?')[0];
+    return ROUTES.includes(route) ? route : 'accounts';
 }
 
 function navigateTo(route) {
@@ -96,6 +100,14 @@ function updateNavHighlight(route) {
 
 async function renderRoute(route) {
     const content = document.getElementById('content');
+
+    // Clean up any active OAuth polling before switching routes
+    if (window.jackedState.flowPolling) {
+        clearInterval(window.jackedState.flowPolling);
+        window.jackedState.flowPolling = null;
+        window.jackedState._accountActionInFlight = false;
+    }
+
     window.jackedState.activeRoute = route;
     updateNavHighlight(route);
 
@@ -145,7 +157,7 @@ async function renderRoute(route) {
 // ---------------------------------------------------------------------------
 async function loadAccounts() {
     try {
-        const data = await api.get('/api/auth/accounts');
+        const data = await api.get('/api/auth/accounts?include_inactive=true');
         window.jackedState.accounts = data.accounts || data || [];
     } catch (e) {
         console.error('Failed to load accounts:', e);
@@ -296,7 +308,8 @@ function _currentPollInterval() {
 function startPolling() {
     stopPolling();
     window.jackedState.polling = setInterval(async () => {
-        if (typeof _accountActionInFlight !== 'undefined' && _accountActionInFlight) return;
+        if (window.jackedState._accountActionInFlight) return;
+        if (window.jackedState._usageRefreshInProgress) return;
         await loadAccounts();
         await loadActiveSessions();
         rerenderAccountsView();
@@ -348,6 +361,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Load data and render
     await loadAllData();
     renderRoute(getRoute());
+
+    // Pill handlers are registered via bindAccountEvents() inside renderRoute()
+    // No standalone call needed here — it would double-attach on initial load.
 
     // Start account polling
     startPolling();

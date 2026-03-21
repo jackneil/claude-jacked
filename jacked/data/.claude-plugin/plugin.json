@@ -1,0 +1,12 @@
+{
+  "name": "jacked",
+  "description": "Smart reviewers, commands, and agents for Claude Code — parallel code review (DCR), browser QA, swarm implementation, divergent research, tech debt scanning, and more",
+  "version": "0.24.0",
+  "author": {
+    "name": "Jack Neil",
+    "email": "jack@jackneil.com"
+  },
+  "homepage": "https://github.com/jackneil/claude-jacked",
+  "repository": "https://github.com/jackneil/claude-jacked",
+  "license": "MIT"
+}

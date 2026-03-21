@@ -1,10 +1,17 @@
 """System routes — health, version, installations, settings, gatekeeper config."""
 
+import asyncio
+import logging
+import os
+import shutil
+import sys
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -57,11 +64,17 @@ class GatekeeperConfigRequest(BaseModel):
     api_key: Optional[str] = None
 
 
+class TestApiKeyRequest(BaseModel):
+    api_key: Optional[str] = None
+
+
 class PathSafetyConfigRequest(BaseModel):
     enabled: bool = True
     allowed_paths: list[str] = []
     disabled_patterns: list[str] = []
     watched_paths: list[str] = []
+    outside_reads: str = "ask"
+    outside_writes: str = "ask"
 
 
 class PathValidateRequest(BaseModel):
@@ -103,6 +116,7 @@ class GlobalInstallation(BaseModel):
     commands: list[InstalledComponent]
     hooks: list[InstalledComponent]
     knowledge: list[InstalledComponent]
+    skills: list[InstalledComponent] = []
 
 
 class InstallationsOverview(BaseModel):
@@ -550,10 +564,12 @@ async def installations_overview(request: Request):
     from jacked import __version__
     from jacked.api.routes.features import (
         CLAUDE_DIR,
+        DATA_ROOT,
         _detect_hook_installed,
         _detect_rules_status,
         _get_valid_agent_names,
         _get_valid_command_names,
+        _get_valid_skill_names,
         _name_to_display,
         _read_settings_json,
     )
@@ -605,7 +621,6 @@ async def installations_overview(request: Request):
 
     # Knowledge
     rules_status = _detect_rules_status()
-    skill_installed = (CLAUDE_DIR / "skills" / "jacked" / "SKILL.md").exists()
     ref_installed = (CLAUDE_DIR / "jacked-reference.md").exists()
     knowledge = [
         InstalledComponent(
@@ -614,11 +629,18 @@ async def installations_overview(request: Request):
             installed=rules_status.get("installed", False),
         ),
         InstalledComponent(
-            name="skill", display_name="Skill", installed=skill_installed
-        ),
-        InstalledComponent(
             name="reference", display_name="Reference", installed=ref_installed
         ),
+    ]
+
+    # Skills (dynamic — one per SKILL.md in package)
+    skills = [
+        InstalledComponent(
+            name=f"skill_{skill_name}",
+            display_name=f"/{skill_name}",
+            installed=(CLAUDE_DIR / "skills" / skill_name / "SKILL.md").exists(),
+        )
+        for skill_name in _get_valid_skill_names()
     ]
 
     global_install = GlobalInstallation(
@@ -627,6 +649,7 @@ async def installations_overview(request: Request):
         commands=commands,
         hooks=hooks,
         knowledge=knowledge,
+        skills=skills,
     )
 
     # Project activity from DB
@@ -663,13 +686,81 @@ async def installations_overview(request: Request):
                     )
                 )
         except Exception:
-            pass
+            logger.exception("Failed to load project activity")
 
     return InstallationsOverview(
         global_install=global_install,
         projects=projects,
         total_projects=total_projects,
     )
+
+
+# --- Self-upgrade ---
+
+_upgrade_lock = asyncio.Lock()
+
+
+async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
+    if ws_registry:
+        try:
+            await ws_registry.broadcast(event, payload)
+        except Exception:
+            logger.exception("Failed to broadcast %s", event)
+
+
+async def _upgrade_run_cmd(cmd: list[str]) -> None:
+    """Run a subprocess command list, raising RuntimeError on failure or timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"{cmd[0]} timed out after 120s")
+    if proc.returncode != 0:
+        raise RuntimeError((stdout or b"").decode()[-500:] or "Unknown error")
+
+
+async def _do_upgrade(ws_registry) -> None:
+    async with _upgrade_lock:
+        try:
+            await _upgrade_broadcast(ws_registry, "upgrade_started", {})
+
+            uv_bin = shutil.which("uv")
+            if not uv_bin:
+                raise RuntimeError("uv not found on PATH \u2014 cannot upgrade")
+            await _upgrade_broadcast(ws_registry, "upgrade_progress",
+                                     {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
+            await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
+
+            jacked_bin = shutil.which("jacked")
+            if not jacked_bin:
+                raise RuntimeError("jacked not found on PATH \u2014 cannot reinstall")
+            await _upgrade_broadcast(ws_registry, "upgrade_progress",
+                                     {"step": "reinstall", "message": "Reinstalling files\u2026"})
+            await _upgrade_run_cmd([jacked_bin, "install", "--force"])
+
+            await _upgrade_broadcast(ws_registry, "upgrade_complete",
+                                     {"message": "Restarting server\u2026"})
+            await asyncio.sleep(1.5)  # let WS message flush
+            # Replace the running process with a fresh start — entry point shebang picks up new venv
+            os.execv(sys.argv[0], sys.argv)
+
+        except Exception as exc:
+            await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": str(exc)})
+
+
+@router.post("/upgrade")
+async def system_upgrade(request: Request):
+    """Upgrade claude-jacked, reinstall files, and restart the server."""
+    if _upgrade_lock.locked():
+        return JSONResponse(status_code=409, content={"detail": "Upgrade already in progress"})
+    ws_registry = getattr(request.app.state, "ws_registry", None)
+    asyncio.create_task(_do_upgrade(ws_registry))
+    return {"status": "started"}
 
 
 # --- Gatekeeper logs ---
@@ -740,6 +831,18 @@ async def get_gatekeeper_logs(
         "limit": clamped_limit,
         "offset": clamped_offset,
     }
+
+
+@router.get("/logs/gatekeeper/methods")
+async def get_gatekeeper_methods(request: Request):
+    """Return distinct method values from gatekeeper decisions."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"error": {"message": "DB unavailable", "code": "DB_UNAVAILABLE"}},
+        )
+    return {"methods": db.list_gatekeeper_methods()}
 
 
 @router.delete("/logs/gatekeeper")
@@ -936,28 +1039,39 @@ async def update_gatekeeper_config(body: GatekeeperConfigRequest, request: Reque
 
 
 @router.post("/settings/gatekeeper/test-api-key")
-async def test_gatekeeper_api_key(request: Request):
+async def test_gatekeeper_api_key(body: TestApiKeyRequest, request: Request):
     """Test if the configured API key works with a minimal request."""
     import json
     import os
 
     db = getattr(request.app.state, "db", None)
     api_key = ""
+    source = None
 
-    if db is not None:
+    # Priority: request body (unsaved input) > saved DB key > env var
+    if body.api_key:
+        api_key = body.api_key
+        source = "input"
+
+    if not api_key and db is not None:
         key_raw = db.get_setting("gatekeeper.api_key")
         if key_raw:
             try:
                 api_key = json.loads(key_raw)
             except (json.JSONDecodeError, TypeError):
                 api_key = key_raw
+            if api_key:
+                source = "db"
 
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            source = "env"
 
     if not api_key:
         return {
             "success": False,
+            "source": None,
             "error": "No API key configured (check DB or ANTHROPIC_API_KEY env var)",
         }
 
@@ -970,14 +1084,19 @@ async def test_gatekeeper_api_key(request: Request):
             max_tokens=5,
             messages=[{"role": "user", "content": "Say OK"}],
         )
-        return {"success": True, "response": response.content[0].text.strip()[:20]}
+        return {
+            "success": True,
+            "source": source,
+            "response": response.content[0].text.strip()[:20],
+        }
     except ImportError:
         return {
             "success": False,
-            "error": "anthropic SDK not installed (pip install anthropic)",
+            "source": source,
+            "error": "anthropic SDK not available — try reinstalling claude-jacked",
         }
     except Exception as e:
-        return {"success": False, "error": str(e)[:200]}
+        return {"success": False, "source": source, "error": str(e)[:200]}
 
 
 # --- Gatekeeper prompt ---
@@ -1089,6 +1208,8 @@ async def get_path_safety_config(request: Request):
         "disabled_patterns": config.get("disabled_patterns", []),
         "watched_paths": watched,
         "watched_existence": watched_existence,
+        "outside_reads": config.get("outside_reads", "ask"),
+        "outside_writes": config.get("outside_writes", "ask"),
         "available_rules": get_path_safety_rules_metadata(),
     }
 
@@ -1208,11 +1329,36 @@ async def update_path_safety_config(body: PathSafetyConfigRequest, request: Requ
                 resolved = resolved[0].upper() + resolved[1:]
         resolved_watched.append(resolved)
 
+    # Validate outside_reads / outside_writes
+    valid_outside = ("ask", "defer")
+    if body.outside_reads not in valid_outside:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"outside_reads must be one of {valid_outside}",
+                    "code": "INVALID_OUTSIDE_SETTING",
+                }
+            },
+        )
+    if body.outside_writes not in valid_outside:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"outside_writes must be one of {valid_outside}",
+                    "code": "INVALID_OUTSIDE_SETTING",
+                }
+            },
+        )
+
     config = {
         "enabled": body.enabled,
         "allowed_paths": body.allowed_paths,
         "disabled_patterns": body.disabled_patterns,
         "watched_paths": resolved_watched,
+        "outside_reads": body.outside_reads,
+        "outside_writes": body.outside_writes,
     }
     db.set_setting("gatekeeper.path_safety", json.dumps(config))
 
@@ -1336,6 +1482,191 @@ async def browse_path(body: PathBrowseRequest):
     return {"current": current, "parent": parent_path, "directories": directories}
 
 
+# --- Gatekeeper command categories ---
+
+
+class CommandCategoriesRequest(BaseModel):
+    categories: dict[str, Literal["allow", "evaluate", "ask"]]
+
+
+@router.get("/settings/gatekeeper/command-categories")
+async def get_command_categories(request: Request):
+    """Command category metadata + current mode overrides."""
+    import json
+
+    from jacked.data.hooks.security_gatekeeper import get_command_categories_metadata
+
+    db = getattr(request.app.state, "db", None)
+
+    metadata = get_command_categories_metadata()
+
+    # Read current overrides from DB
+    overrides: dict = {}
+    if db is not None:
+        raw = db.get_setting("gatekeeper.command_categories")
+        if raw:
+            try:
+                overrides = json.loads(raw)
+                if not isinstance(overrides, dict):
+                    overrides = {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Merge: current mode = override if present, else default
+    categories = {}
+    for key, meta in metadata.items():
+        mode = overrides.get(key, meta["default_mode"])
+        if mode not in ("allow", "evaluate", "ask"):
+            mode = meta["default_mode"]
+        categories[key] = {
+            **meta,
+            "current_mode": mode,
+        }
+
+    return {"categories": categories}
+
+
+@router.put("/settings/gatekeeper/command-categories")
+async def update_command_categories(body: CommandCategoriesRequest, request: Request):
+    """Save command category mode overrides."""
+    import json
+
+    from jacked.data.hooks.security_gatekeeper import COMMAND_CATEGORIES
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
+        )
+
+    # Validate keys — only known categories accepted
+    invalid = [k for k in body.categories if k not in COMMAND_CATEGORIES]
+    if invalid:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Unknown category keys: {', '.join(invalid)}",
+                    "code": "INVALID_CATEGORY_KEY",
+                }
+            },
+        )
+
+    # Only store overrides that differ from defaults (keeps DB clean)
+    overrides = {}
+    for key, mode in body.categories.items():
+        default = COMMAND_CATEGORIES[key]["default_mode"]
+        if mode != default:
+            overrides[key] = mode
+
+    db.set_setting("gatekeeper.command_categories", json.dumps(overrides))
+
+    return {"updated": True, "overrides": overrides}
+
+
+# --- Gatekeeper tool selection ---
+
+
+class GatedToolsRequest(BaseModel):
+    tools: dict[str, bool]
+
+
+@router.get("/settings/gatekeeper/tools")
+async def get_gated_tools(request: Request):
+    """Tool registry metadata + current enabled state."""
+    import json
+
+    from jacked.data.hooks.security_gatekeeper import get_gatekeeper_tools_metadata
+
+    db = getattr(request.app.state, "db", None)
+
+    metadata = get_gatekeeper_tools_metadata()
+
+    # Read current overrides from DB
+    overrides: dict = {}
+    if db is not None:
+        raw = db.get_setting("gatekeeper.tools")
+        if raw:
+            try:
+                overrides = json.loads(raw)
+                if not isinstance(overrides, dict):
+                    overrides = {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Merge: enabled = override if present, else default_enabled
+    tools = {}
+    for name, meta in metadata.items():
+        enabled = overrides.get(name, meta["default_enabled"])
+        # Locked tools are always enabled regardless of DB
+        if meta["locked"]:
+            enabled = True
+        tools[name] = {
+            **meta,
+            "enabled": enabled,
+        }
+
+    return {"tools": tools}
+
+
+@router.put("/settings/gatekeeper/tools")
+async def update_gated_tools(body: GatedToolsRequest, request: Request):
+    """Save tool enabled/disabled overrides."""
+    import json
+
+    from jacked.gatekeeper_registry import GATEKEEPER_TOOL_REGISTRY
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}
+            },
+        )
+
+    # Validate: only known tools
+    invalid = [k for k in body.tools if k not in GATEKEEPER_TOOL_REGISTRY]
+    if invalid:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Unknown tool names: {', '.join(invalid)}",
+                    "code": "INVALID_TOOL_NAME",
+                }
+            },
+        )
+
+    # Reject disabling locked tools
+    for name, enabled in body.tools.items():
+        info = GATEKEEPER_TOOL_REGISTRY[name]
+        if info["locked"] and not enabled:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "error": {
+                        "message": f"Cannot disable locked tool: {name}",
+                        "code": "TOOL_LOCKED",
+                    }
+                },
+            )
+
+    # Only store overrides that differ from defaults
+    overrides = {}
+    for name, enabled in body.tools.items():
+        default = GATEKEEPER_TOOL_REGISTRY[name]["default_enabled"]
+        if enabled != default:
+            overrides[name] = enabled
+
+    db.set_setting("gatekeeper.tools", json.dumps(overrides))
+
+    return {"updated": True, "overrides": overrides}
+
+
 # --- Generic settings (parameterized routes AFTER static ones) ---
 
 
@@ -1369,10 +1700,31 @@ async def get_settings(request: Request):
     return results
 
 
+_PROTECTED_SETTING_KEYS = {
+    "gatekeeper.command_categories",
+    "gatekeeper.path_safety",
+    "gatekeeper.api_key",
+    "gatekeeper.model",
+    "gatekeeper.eval_method",
+    "gatekeeper.enabled",
+}
+
+
 @router.put("/settings/{key}")
 async def update_setting(key: str, body: SettingUpdateRequest, request: Request):
     """Update a setting."""
     import json
+
+    if key in _PROTECTED_SETTING_KEYS:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Use the dedicated endpoint for '{key}'",
+                    "code": "PROTECTED_KEY",
+                }
+            },
+        )
 
     db = getattr(request.app.state, "db", None)
     if db is None:
@@ -1391,6 +1743,17 @@ async def update_setting(key: str, body: SettingUpdateRequest, request: Request)
 @router.delete("/settings/{key}")
 async def delete_setting(key: str, request: Request):
     """Delete a setting by key."""
+    if key in _PROTECTED_SETTING_KEYS:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": {
+                    "message": f"Use the dedicated endpoint for '{key}'",
+                    "code": "PROTECTED_KEY",
+                }
+            },
+        )
+
     db = getattr(request.app.state, "db", None)
     if db is None:
         return JSONResponse(
