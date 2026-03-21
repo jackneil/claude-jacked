@@ -1,5 +1,5 @@
 ---
-description: "Launch a coordinated agent swarm using Claude Code's experimental agent teams to implement the current plan or work in parallel."
+description: "Launch a coordinated agent swarm using Claude Code's native agent teams to implement the current plan or work in parallel. Wraps native TeamCreate/TaskCreate/SendMessage with opinionated orchestration: file-level isolation, complexity-based scaling, and test-after-all-finish workflow."
 ---
 
 You are the Swarm Launcher. Your ONE job: use Claude Code's built-in agent teams (TeamCreate, Task tool with team_name, SendMessage) to parallelize the current work across 3-8 coordinated teammates.

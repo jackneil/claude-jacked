@@ -10,18 +10,15 @@ A 5-agent swarm-research session identified potential new commands, then a full 
 
 ## Priority 1: Subtract and Consolidate
 
-### Audit existing commands against native Claude Code
+### Audit existing commands against native Claude Code — DONE
 
-Several jacked features now overlap with native Claude Code capabilities shipped in Feb-March 2026:
+**Completed:** 2026-03-21. Full audit at `docs/command-audit-2026-03.md`.
 
-| jacked Feature | Native Claude Code Feature | Action |
-|---|---|---|
-| `/swarm` (TeamCreate wrapper) | Agent Teams (native, Feb 2026) | Evaluate if `/swarm` still adds value beyond the native API |
-| `/learn` + `lessons.md` | Auto-Memory / MEMORY.md (v2.1.59) | Assess overlap — both persist learnings across sessions |
-| Session indexing (Qdrant) | Session Memory + Remote Control | Core jacked differentiator (semantic search vs native resume) — keep but document the distinction |
-| `/handoff` (proposed) | Session Memory + `--resume` + Auto-Memory | Do not build — triple-solved natively |
-
-**Deliverable:** A deprecation assessment for each command. Keep what adds value beyond native; deprecate or simplify what doesn't.
+**Results:** 16 user-facing entities assessed. All KEEP except `/learn` and `/swarm` marked EVALUATE:
+- `/learn` — overlaps with Auto-Memory but is more structured (graduation path, version-controlled, auditable). KEEP with distinction notes added.
+- `/swarm` — thin wrapper around native Agent Teams but adds file isolation + scaling heuristics. KEEP for now, monitor.
+- `/handoff` — confirmed DO NOT BUILD.
+- Surface area: 16 user-facing entities, within the 15-18 budget. New commands require deprecating one.
 
 ### Progressive disclosure for `jacked install`
 
