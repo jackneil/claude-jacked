@@ -61,7 +61,7 @@ Add to your team's Claude Code environment — no Python install needed:
 /plugin install jacked@jacked-marketplace
 ```
 
-Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 14 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 22 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
 
 **Want more?** Add optional extras:
 
@@ -147,7 +147,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **14 Slash Commands** | `/dc`, `/dcr`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup` |
+| **22 Slash Commands** | `/dc`, `/dcr`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -173,6 +173,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Tool Registry** | Per-tool enable/disable toggles from the dashboard (Bash, Read, Edit, Write, Grep, Glob, Web, MCP) |
 | **Shell Injection Defense** | Detects shell operators (`&&`, `|`, `;`, `>`, `` ` ``, `$()`) to prevent chaining attacks |
 | **Path Safety** | Blocks access to sensitive files (`.env`, `.ssh/`, credentials) across all file tools |
+| **Freeze Boundary** | `/freeze <path>` restricts Edit/Write operations to one directory — prevents accidental scope creep during focused work |
 | **File Context Analysis** | Reads referenced scripts and evaluates what code actually does |
 | **Command Categories** | Configurable per-category behavior (allow/ask/evaluate) for network, packages, git, docker, etc. |
 | **Customizable Prompt** | Tune the safety evaluation via the dashboard or `~/.claude/gatekeeper-prompt.txt` |
@@ -351,6 +352,14 @@ Type these directly in Claude Code:
 | `/techdebt` | **Tech Debt** — Scans for TODOs, oversized files, missing tests, dead code |
 | `/audit-rules` | **Audit Rules** — Checks CLAUDE.md for duplicates, contradictions, stale rules |
 | `/jacked-setup` | **Repo Setup** — Generates repo-specific configs for `/whats-next`, `/qa`, `/ux`, `/dcr` — faster repeat runs |
+| `/freeze` | **Freeze** — Restricts file edits to a single directory, enforced by the security gatekeeper |
+| `/unfreeze` | **Unfreeze** — Removes the edit restriction set by `/freeze` |
+| `/cso` | **Security Audit** — Systematic OWASP Top 10 + STRIDE threat model analysis with confidence-gated findings |
+| `/retro` | **Retrospective** — Git history analysis for contributor metrics, test health, velocity trends |
+| `/canary` | **Canary** — Post-deploy monitoring with baselines, console errors, performance checks |
+| `/benchmark` | **Benchmark** — Performance regression detection via browser Performance API |
+| `/land-and-deploy` | **Land & Deploy** — Merges PR, waits for CI/deploy, runs canary verification, offers revert |
+| `/browser-reset` | **Browser Reset** — Diagnoses and fixes stuck browser MCP connections |
 
 ### Smart Reviewers
 
@@ -446,6 +455,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.25.0** | **8 new commands** from GStack analysis: `/freeze` + `/unfreeze` (edit scope restriction enforced by gatekeeper), `/cso` (OWASP+STRIDE security audit), `/retro` (engineering retrospective), `/canary` (post-deploy monitoring), `/benchmark` (performance regression detection), `/land-and-deploy` (merge-deploy-verify pipeline), `/browser-reset` (fix stuck browser MCPs). **Credential write fix** — server no longer overwrites Claude Code's credential files during background token refresh, fixing session logout bug. |
 | **0.24.0** | **Plugin marketplace** — repo doubles as a Claude Code plugin marketplace for team distribution. Zero file duplication. |
 | **0.23.x** | **`/swarm-research`** — divergent research skill (2-5 parallel agents from different angles, synthesis, devil's advocate). **Observability & Data Integrity lenses** added to DCR (11 lenses total). New wild cards, pre-mortem scenarios, and reviewer personas. |
 | **0.22.0** | **Chrome DevTools MCP** integration for `/qa` and `/ux` browser testing. |
@@ -527,6 +537,8 @@ jacked webux --no-browser          # Server only, no auto-open
 # Slash Commands
 # /dc /dcr /pr /learn /redo /techdebt /audit-rules /qa /ux
 # /swarm /swarm-research /release /whats-next /jacked-setup
+# /freeze /unfreeze /cso /retro /canary /benchmark
+# /land-and-deploy /browser-reset
 ```
 
 </details>
