@@ -248,35 +248,11 @@ async def refresh_account_token(
 
                 logger.info(f"Token refreshed for account {account_id}")
 
-                # Propagate refreshed tokens to credential stores so Claude
-                # Code sees them without needing a manual "Set Active".
-                # Only write to global stores if this IS the active account
-                # (otherwise we'd overwrite a different account's credentials).
-                try:
-                    from jacked.api.credential_helpers import sync_credential_to_all_stores
-
-                    cred_path = Path.home() / ".claude" / ".credentials.json"
-                    is_active = False
-                    if cred_path.exists() and not cred_path.is_symlink():
-                        try:
-                            stamp = json.loads(cred_path.read_text(encoding="utf-8"))
-                            is_active = stamp.get("_jackedAccountId") == account_id
-                        except (json.JSONDecodeError, OSError):
-                            pass
-
-                    if is_active:
-                        refreshed_account = db.get_account(account_id)
-                        if refreshed_account:
-                            sync_credential_to_all_stores(
-                                account_id, refreshed_account,
-                                email=refreshed_account.get("email"),
-                                display_name=refreshed_account.get("display_name"),
-                            )
-                except Exception as sync_err:
-                    logger.warning(
-                        "Token refresh succeeded but credential store sync "
-                        "failed for account %d: %s", account_id, sync_err,
-                    )
+                # NOTE: Refreshed tokens are stored in the DB only.
+                # We do NOT write to Claude Code's credential files
+                # (~/.claude/.credentials.json, Keychain) here — doing so
+                # causes race conditions that log out active sessions.
+                # Account switching is handled by `jacked claude <id>`.
 
                 # Also refresh profile metadata after successful refresh
                 await fetch_profile(account_id, db, access_token=tokens["access_token"])

@@ -733,72 +733,25 @@ async def start_cc_auth(account_id: int, request: Request):
 # --- Credential switching ---
 
 
-@router.post("/accounts/{account_id}/use", response_model=UseAccountResponse)
+@router.post("/accounts/{account_id}/use")
 async def use_account(account_id: int, request: Request):
-    """Write account credentials to Claude Code's credential stores.
+    """Removed: credential file switching caused session logouts.
 
-    Overwrites ~/.claude/.credentials.json, macOS Keychain, and ~/.claude.json
-    so the next Claude Code session starts with this account's tokens.
+    Use `jacked claude <id>` to launch Claude Code with a specific account.
     """
-    db = _get_db(request)
-    if db is None:
-        return _db_unavailable()
-
-    account = db.get_account(account_id)
-    if not account:
-        return _not_found(f"No account with id={account_id}")
-
-    if not account["is_active"]:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "error": {"message": "Account is disabled", "code": "ACCOUNT_DISABLED"}
-            },
-        )
-
-    access_token = account.get("access_token", "")
-    if not access_token or not access_token.strip():
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "error": {"message": "Account has no access token", "code": "NO_TOKEN"}
-            },
-        )
-
-    if account.get("validation_status") == "invalid":
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "error": {
-                    "message": "Token is invalid — re-authenticate first",
-                    "code": "TOKEN_INVALID",
-                }
-            },
-        )
-
-    # Refresh token if near-expiry before writing
-    if account.get("refresh_token") and should_refresh(account):
-        refreshed = await refresh_account_token(account_id, db)
-        if refreshed:
-            account = db.get_account(account_id)
-            if not account:
-                return _not_found(f"No account with id={account_id}")
-        else:
-            logger.warning(
-                "Token refresh failed for account %d before /use — "
-                "proceeding with current token",
-                account_id,
-            )
-
-    # Write to all credential stores in one call
-    from jacked.api.credential_helpers import sync_credential_to_all_stores
-
-    sync_credential_to_all_stores(account_id, account)
-
-    # Persist in DB — immune to Claude Code overwriting credential files
-    db.set_setting("active_account_id", str(account_id))
-
-    return UseAccountResponse(status="ok", email=account["email"])
+    return JSONResponse(
+        status_code=410,
+        content={
+            "error": {
+                "message": (
+                    "Dashboard credential switching has been removed — it caused "
+                    "active Claude Code sessions to log out. "
+                    f"Use `jacked claude {account_id}` to launch with this account."
+                ),
+                "code": "REMOVED",
+            }
+        },
+    )
 
 
 @router.get("/active-credential", response_model=ActiveCredentialResponse)

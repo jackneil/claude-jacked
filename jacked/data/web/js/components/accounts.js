@@ -174,12 +174,10 @@ function renderActionButtons(acct) {
     const status = getAccountStatus(acct);
     const isActiveInCC = window.jackedState.activeCredentialAccountId === acct.id;
 
-    // Set Active / Active badge (left side, primary action)
+    // Active badge (left side) — account switching is via `jacked claude <id>` only
     let setActiveHtml = '';
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
-    } else if (status === 'valid' || status === 'warning' || status === 'cc-missing' || status === 'unknown') {
-        setActiveHtml = `<button class="btn-set-active text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Set Active</button>`;
     }
 
     // Copy launch command button

@@ -226,44 +226,9 @@ function bindAccountEvents() {
         });
     });
 
-    // Set Active buttons
-    document.querySelectorAll('.btn-set-active').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            if (window.jackedState._accountActionInFlight) {
-                showToast('Another action is in progress', 'warning', 2000);
-                return;
-            }
-            const id = btn.dataset.id;
-            const email = btn.dataset.email || 'this account';
-            const result = await Swal.fire({
-                title: 'Switch Active Account?',
-                html: `Set <strong>${escapeHtml(email)}</strong> as Claude Code's active account?<br><br>You'll need to restart Claude Code for this to take effect.`,
-                icon: 'question',
-                showCancelButton: true,
-                confirmButtonText: 'Switch Account',
-                cancelButtonText: 'Cancel',
-                focusCancel: true,
-            });
-            if (!result.isConfirmed) return;
-
-            btn.disabled = true;
-            const originalHtml = btn.innerHTML;
-            btn.innerHTML = '<div class="spinner" style="width:12px;height:12px;border-width:2px"></div>';
-            window.jackedState._accountActionInFlight = true;
-
-            try {
-                await api.post(`/api/auth/accounts/${id}/use`);
-                showToast(`Switched to ${email} — restart Claude Code`, 'success');
-                await refreshAndRender();
-            } catch (e) {
-                showToast(e.message, 'error');
-                btn.disabled = false;
-                btn.innerHTML = originalHtml;
-            } finally {
-                window.jackedState._accountActionInFlight = false;
-            }
-        });
-    });
+    // "Set Active" removed — account switching is via `jacked claude <id>` only.
+    // The .btn-set-active button no longer renders; this comment replaces the
+    // old event listener that called /api/auth/accounts/{id}/use (now 410 Gone).
 
     // Refresh All Usage button
     const refreshAllBtn = document.getElementById('btn-refresh-all-usage');

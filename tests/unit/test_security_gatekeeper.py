@@ -3463,6 +3463,239 @@ class TestHandleFileTool:
 
 
 # ---------------------------------------------------------------------------
+# Freeze boundary enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestFreezeBoundary:
+    """Tests for /freeze + /unfreeze edit boundary enforcement.
+
+    When ~/.claude/jacked-freeze-dir.txt exists, Edit/Write/NotebookEdit
+    operations outside the frozen directory should be denied. Read-only
+    tools should be unaffected.
+    """
+
+    def _safe_config(self):
+        return {
+            "enabled": True,
+            "disabled_patterns": [],
+            "allowed_paths": [],
+            "watched_paths": [],
+        }
+
+    def _setup_freeze(self, tmp_path, frozen_dir_path):
+        """Create the freeze state file under tmp_path acting as HOME."""
+        freeze_file = tmp_path / ".claude" / "jacked-freeze-dir.txt"
+        freeze_file.parent.mkdir(parents=True, exist_ok=True)
+        freeze_file.write_text(str(frozen_dir_path))
+        return freeze_file
+
+    def test_edit_inside_frozen_dir_not_denied(self, capsys, tmp_path):
+        """Edit to a file inside the frozen directory should NOT be denied.
+
+        Safe writes defer to Claude Code (empty output = DEFER_TO_CC), not emit_allow.
+        The key assertion: freeze boundary does NOT block this.
+        """
+        frozen_dir = tmp_path / "src"
+        frozen_dir.mkdir()
+        target = frozen_dir / "main.py"
+        target.write_text("x = 1")
+        self._setup_freeze(tmp_path, frozen_dir)
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        # Edit defers to Claude Code (empty output) — NOT a deny
+        assert captured.out.strip() == ""
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
+
+    def test_edit_outside_frozen_dir_denied(self, capsys, tmp_path):
+        """Edit to a file outside the frozen directory should be denied."""
+        frozen_dir = tmp_path / "src"
+        frozen_dir.mkdir()
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        target = other_dir / "secret.py"
+        target.write_text("password = '...'")
+        self._setup_freeze(tmp_path, frozen_dir)
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "_record_hook_execution"),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "Freeze boundary" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_write_outside_frozen_dir_denied(self, capsys, tmp_path):
+        """Write tool outside frozen dir should also be denied."""
+        frozen_dir = tmp_path / "src"
+        frozen_dir.mkdir()
+        target = tmp_path / "README.md"
+        target.write_text("# Hello")
+        self._setup_freeze(tmp_path, frozen_dir)
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "_record_hook_execution"),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "Write", {"file_path": str(target)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_read_not_affected_by_freeze(self, capsys, tmp_path):
+        """Read tool should NOT be restricted by freeze — read-only is always OK."""
+        frozen_dir = tmp_path / "src"
+        frozen_dir.mkdir()
+        target = tmp_path / "other" / "file.py"
+        target.parent.mkdir()
+        target.write_text("data = 1")
+        self._setup_freeze(tmp_path, frozen_dir)
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "_record_hook_execution"),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "Read", {"file_path": str(target)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    def test_no_freeze_file_allows_all(self, capsys, tmp_path):
+        """When no freeze file exists, all edits should proceed normally."""
+        target = tmp_path / "anything.py"
+        target.write_text("x = 1")
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
+
+    def test_empty_freeze_file_allows_all(self, capsys, tmp_path):
+        """An empty freeze file should be treated as no freeze."""
+        target = tmp_path / "anything.py"
+        target.write_text("x = 1")
+        freeze_file = tmp_path / ".claude" / "jacked-freeze-dir.txt"
+        freeze_file.parent.mkdir(parents=True, exist_ok=True)
+        freeze_file.write_text("")
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
+
+    def test_edit_file_in_frozen_dir_root_not_denied(self, capsys, tmp_path):
+        """Editing a file directly in the frozen directory root should not be denied."""
+        frozen_dir = tmp_path / "src"
+        frozen_dir.mkdir()
+        target_file = frozen_dir / "app.py"
+        target_file.write_text("run()")
+        self._setup_freeze(tmp_path, frozen_dir)
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
+            patch.object(gk, "_record_decision") as mock_record,
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "Edit", {"file_path": str(target_file)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        mock_record.assert_called_once()
+        assert mock_record.call_args[0][0] == "DEFER_TO_CC"
+
+    def test_notebook_edit_outside_frozen_dir_denied(self, capsys, tmp_path):
+        """NotebookEdit outside frozen dir should be denied too."""
+        frozen_dir = tmp_path / "notebooks"
+        frozen_dir.mkdir()
+        target = tmp_path / "other" / "analysis.ipynb"
+        target.parent.mkdir()
+        target.write_text("{}")
+        self._setup_freeze(tmp_path, frozen_dir)
+
+        with (
+            patch.object(
+                gk, "_read_path_safety_config", return_value=self._safe_config()
+            ),
+            patch.object(gk, "_record_decision"),
+            patch.object(gk, "_record_hook_execution"),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+        ):
+            gk._handle_file_tool(
+                "NotebookEdit", {"notebook_path": str(target)}, str(tmp_path), "test-sess"
+            )
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.strip())
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------------------
 # Bash handler floor check — path safety disabled
 # ---------------------------------------------------------------------------
 

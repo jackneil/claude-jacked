@@ -12,4 +12,11 @@
 - Never mark a task complete without proving it works - run tests, check logs, demonstrate correctness
 - When the user asks about jacked features, gatekeeper, logs, installation, or troubleshooting, read ~/.claude/jacked-reference.md for comprehensive details before answering.
 - At the start of a session, run `jacked check-version` to see if a newer version is available. If outdated, mention it to the user.
+- After implementing security-sensitive changes (auth, RBAC, multi-tenancy, billing, credential handling), suggest /cso for a proactive security audit before merging.
+- When debugging in a focused area or working on sensitive code, suggest /freeze to prevent accidental edits outside the target module.
+- At the end of long sessions or weekly, suggest /retro for an engineering retrospective with contributor metrics and velocity trends.
+- After a production deploy, suggest /canary for post-deploy monitoring. If a canary baseline hasn't been captured yet, suggest /canary baseline first.
+- Before and after performance-sensitive changes, suggest /benchmark for regression detection.
+- When browser MCP tools are failing or stuck, suggest /browser-reset to diagnose and fix the connection.
+- After a PR is approved and CI passes, suggest /land-and-deploy for the full merge-deploy-verify pipeline.
 # end-jacked-behaviors

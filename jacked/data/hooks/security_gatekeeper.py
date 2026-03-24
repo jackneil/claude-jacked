@@ -1736,6 +1736,43 @@ def _handle_file_tool_inner(
         )
         return
 
+    # Freeze boundary check — block Edit/Write/NotebookEdit outside the frozen directory.
+    # /freeze writes a path to this file; /unfreeze deletes it.
+    # Read-only tools (Read, Grep, Glob) are NOT restricted.
+    if tool_name in ("Edit", "Write", "NotebookEdit"):
+        _freeze_path = Path.home() / ".claude" / "jacked-freeze-dir.txt"
+        if _freeze_path.exists():
+            try:
+                _frozen_dir = _freeze_path.read_text().strip()
+                if _frozen_dir:
+                    _resolved_file = str(Path(file_path).resolve())
+                    _frozen_resolved = str(Path(_frozen_dir).resolve())
+                    if (
+                        _resolved_file != _frozen_resolved
+                        and not _resolved_file.startswith(_frozen_resolved + "/")
+                    ):
+                        elapsed = time.time() - start
+                        log(
+                            f"FREEZE BOUNDARY [{tool_name}]: DENY "
+                            f"{file_path[:100]} — outside frozen dir {_frozen_dir}"
+                        )
+                        _record_decision(
+                            "DENY",
+                            f"[{tool_name}] {file_path[:200]}",
+                            "FREEZE_BOUNDARY",
+                            f"outside frozen dir: {_frozen_dir}",
+                            elapsed * 1000,
+                            session_id,
+                            repo_path,
+                        )
+                        _emit_deny(
+                            f"Freeze boundary: edits restricted to {_frozen_dir} "
+                            f"(run /unfreeze to remove)"
+                        )
+                        return
+            except Exception:
+                pass  # fail-open if freeze file is corrupted
+
     # Step 1: Path safety checks FIRST — security always wins over permissions.
     # Split into three calls (watched → sensitive → outside-project) so that
     # "defer" on outside-project can never bypass sensitive file checks.
