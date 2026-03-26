@@ -11,6 +11,8 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked.findbin import find_bin
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -729,14 +731,14 @@ async def _do_upgrade(ws_registry) -> None:
         try:
             await _upgrade_broadcast(ws_registry, "upgrade_started", {})
 
-            uv_bin = shutil.which("uv")
+            uv_bin = find_bin("uv")
             if not uv_bin:
                 raise RuntimeError("uv not found on PATH \u2014 cannot upgrade")
             await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                      {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
             await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
 
-            jacked_bin = shutil.which("jacked")
+            jacked_bin = find_bin("jacked")
             if not jacked_bin:
                 raise RuntimeError("jacked not found on PATH \u2014 cannot reinstall")
             await _upgrade_broadcast(ws_registry, "upgrade_progress",
@@ -1001,7 +1003,7 @@ async def get_gatekeeper_config(request: Request):
     if api_key_source is None and os.environ.get("ANTHROPIC_API_KEY"):
         api_key_source = "env"
 
-    cli_available = shutil.which("claude") is not None
+    cli_available = find_bin("claude") is not None
 
     return {
         "model": model,

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import click
 
+from jacked.findbin import find_bin
 from jacked.api.credential_helpers import (
     _safe_replace,
     build_oauth_data,
@@ -477,7 +478,7 @@ def resolve_account(account_ref, db: Database) -> dict:
 
     >>> # Tested via test_launch.py
     """
-    if not shutil.which("claude"):
+    if not find_bin("claude"):
         raise click.ClickException(
             "claude not found in PATH. Install with: npm install -g @anthropic-ai/claude-code"
         )

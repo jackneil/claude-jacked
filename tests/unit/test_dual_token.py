@@ -379,7 +379,7 @@ class TestSyncTokensCAS:
 
 
 class TestResolveAccountCCMatch:
-    @patch("jacked.launch.shutil.which", return_value="/usr/bin/claude")
+    @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
     @patch("jacked.launch.read_platform_credentials")
     def test_layer4_matches_cc_access_token(self, mock_kc, mock_which, tmp_path):
         """resolve_account Layer 4 matches cc_access_token from Keychain."""
@@ -395,7 +395,7 @@ class TestResolveAccountCCMatch:
         result = resolve_account(None, db)
         assert result["id"] == 1
 
-    @patch("jacked.launch.shutil.which", return_value="/usr/bin/claude")
+    @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
     @patch("jacked.launch.read_platform_credentials")
     def test_layer4_cc_takes_precedence_over_primary(self, mock_kc, mock_which, tmp_path):
         """CC token match takes precedence over primary token match."""
