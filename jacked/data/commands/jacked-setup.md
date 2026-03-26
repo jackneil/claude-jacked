@@ -1,5 +1,5 @@
 ---
-description: "Analyze this repo and generate faster, customized versions of jacked commands (/whats-next, /qa, /ux, /dcr)"
+description: "Analyze this repo and generate faster, customized versions of jacked commands (/whats-next, /qa, /ux, /dcr, /docs-sync)"
 ---
 
 You are a repo analyzer. Your job is to examine the current repo's structure, tech stack, and conventions, then generate fully standalone command files that embed the engine logic with repo-specific config pre-filled.
@@ -18,7 +18,8 @@ Check `$ARGUMENTS` for a target:
 | `qa` | Generate config for `/qa` and `/ux` (always paired — they share one analysis pass) |
 | `ux` | Generate config for `/ux` and `/qa` (always paired — they share one analysis pass) |
 | `dcr` | Generate config for `/dcr` |
-| `all` | Generate all four sequentially (qa and ux share one analysis pass) |
+| `docs-sync` | Generate config for `/docs-sync` |
+| `all` | Generate all five sequentially (qa and ux share one analysis pass) |
 | *(empty)* | Show the explanation below and ask which to generate |
 
 **If no argument provided**, show this:
@@ -31,13 +32,14 @@ Available targets:
   qa          — Pre-configure browser tool, framework checks, component paths (also generates /ux)
   ux          — Pre-configure parallel UX checks (also generates /qa)
   dcr         — Pre-configure lens selection, context paths, domain-specific checks
-  all         — Generate all four
+  docs-sync   — Pre-configure doc inventory, change-to-doc mapping, base branch
+  all         — Generate all five
 
 Usage: /jacked-setup <target>
 ```
 Then ask which target to generate.
 
-If the argument doesn't match any of the above, say: "Unknown target. Valid options: `whats-next`, `qa`, `ux`, `dcr`, `all`."
+If the argument doesn't match any of the above, say: "Unknown target. Valid options: `whats-next`, `qa`, `ux`, `dcr`, `docs-sync`, `all`."
 
 ## Step 2: Common Repo Analysis
 
@@ -202,11 +204,44 @@ From these results, determine default lens weights:
 - Service/API project with external integrations → **Observability & Debuggability** always on
 - Pure library with no I/O or persistence → **Data Integrity & Schema Safety** and **Observability & Debuggability** usually off
 
+### For docs-sync:
+
+```bash
+# Base branch
+git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main"
+
+# Doc files at repo root
+ls README.md CONTRIBUTING.md CHANGELOG.md LICENSE.md 2>/dev/null
+
+# Wiki structure
+ls -d _wiki 2>/dev/null
+ls _wiki/*.md 2>/dev/null | head -30
+ls _wiki/_Sidebar.md _wiki/_Footer.md _wiki/Home.md 2>/dev/null
+
+# Wiki CI workflow
+ls .github/workflows/update-wiki.yml .github/workflows/wiki*.yml 2>/dev/null
+
+# CLAUDE.md sections
+grep -n "^#" CLAUDE.md 2>/dev/null | head -20
+
+# docs/ directory
+find docs -name "*.md" -maxdepth 2 2>/dev/null | head -20
+
+# Other root-level markdown
+ls *.md 2>/dev/null
+```
+
+**No-wiki handling:** If no `_wiki/` directory found, note "no wiki" in the config. Do NOT offer to scaffold one during setup — that's a runtime decision.
+
+Build the **Doc Inventory** from results — list each discovered doc file with its detected sections (grep for `^#` headings).
+
+Build the **Change-to-Doc Map** — a table mapping change categories to the specific doc files that exist in THIS repo. Only include rows where the target doc actually exists.
+
 ## Step 4: Check for Existing Local Files
 
 ```bash
-ls .claude/commands/whats-next.md .claude/commands/qa.md .claude/commands/ux.md .claude/commands/dcr.md 2>/dev/null
-ls .claude/skills/whats-next/SKILL.md .claude/skills/qa/SKILL.md .claude/skills/ux/SKILL.md .claude/skills/dcr/SKILL.md 2>/dev/null
+ls .claude/commands/whats-next.md .claude/commands/qa.md .claude/commands/ux.md .claude/commands/dcr.md .claude/commands/docs-sync.md 2>/dev/null
+ls .claude/skills/whats-next/SKILL.md .claude/skills/qa/SKILL.md .claude/skills/ux/SKILL.md .claude/skills/dcr/SKILL.md .claude/skills/docs-sync/SKILL.md 2>/dev/null
 ```
 
 Only check the **target(s) being generated** (not all files found by the `ls`). For any command file that exists, determine its format using a positive signal:
@@ -221,7 +256,7 @@ grep -q '## Repo Config' .claude/commands/<target>.md 2>/dev/null && echo "STAND
 - If BOTH are `STANDALONE`: ask conversationally: "Both `/qa` and `/ux` already exist. Replace with fresh versions?"
 - If yes → generate both; if no → skip both. Never generate one without the other.
 
-**For non-paired targets (`whats-next`, `dcr`):** if the command **or** skill file already exists:
+**For non-paired targets (`whats-next`, `dcr`, `docs-sync`):** if the command **or** skill file already exists:
 - **If command file exists and is `OLD_FORMAT`**: Warn — "⚠️ Your existing `/<target>` depends on jacked being installed on every developer's machine. Regenerating makes it fully standalone." Ask: "Regenerate now?"
 - **If `STANDALONE` (or only skill file exists, no command file to check)**: Ask conversationally: "A `/<target>` already exists. Replace with a fresh version?"
 - If yes → proceed; if no → skip that target, move to next (if doing `all`)
@@ -451,6 +486,54 @@ description: "Parallel recursive review — selects relevant lenses, spawns focu
 Read `.claude/commands/dcr.md` and follow it.
 ```
 
+### docs-sync standalone template:
+
+```markdown
+---
+description: "Docs sync — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+---
+# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup docs-sync
+
+## Repo Config
+
+- **Project**: <name>
+- **Base Branch**: <main|master|detected>
+- **Stack**: <languages, frameworks>
+
+## Doc Inventory
+<list each discovered doc file with detected sections>
+Examples:
+- README.md (sections: Install, Usage, Features, Config)
+- CLAUDE.md (sections: Architecture, Testing, Env Vars)
+- _wiki/ (N pages, has/no _Sidebar.md)
+- .github/workflows/update-wiki.yml (wiki CI: active/none)
+
+## Change-to-Doc Map
+| Change Category | Affected Docs |
+|----------------|---------------|
+| Pipeline/Architecture | <list existing docs that cover architecture> |
+| Configuration | <list existing docs that cover config/env vars> |
+| Commands/CLI | <list existing docs that cover usage> |
+| Dependencies | <list existing docs that cover installation> |
+| UI/Frontend | <list existing docs that cover features> |
+| Models/Schemas | <list existing docs that cover data models> |
+| Tests | <list existing docs that cover testing> |
+
+<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
+---
+[Engine body from `~/.claude/commands/docs-sync.md` embedded here — front matter and delegation Note stripped]
+```
+
+**docs-sync local skill** (write to `.claude/skills/docs-sync/SKILL.md`):
+```markdown
+---
+name: docs-sync
+description: "Sync docs with code changes — diffs branch, maps to affected docs, spawns parallel update agents. (repo)"
+---
+Read `.claude/commands/docs-sync.md` and follow it.
+```
+
 ## Step 6: Announce Results
 
 For each generated target, announce:
@@ -462,7 +545,7 @@ Also saved local skill at `.claude/skills/<target>/SKILL.md`.
 To pick up future engine improvements: `uv tool install --upgrade claude-jacked && jacked install` then re-run `/jacked-setup <target>`.
 ```
 
-If generating `all`, list all four results together.
+If generating `all`, list all five results together.
 
 **After generation, run a .gitignore check:**
 ```bash
