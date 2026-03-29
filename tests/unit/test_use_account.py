@@ -242,3 +242,119 @@ def test_refresh_all_usage_only_reads_fresh_for_active(client, db, tmp_path):
     assert call_tokens.get(3) is None
     # read_fresh_active_token called only for the active account
     mock_fresh.assert_called_once_with(1)
+
+
+def test_active_credential_refresh_token_match(client, db, tmp_path):
+    """Matches active account via refresh token when access token has been refreshed."""
+    with mock.patch(
+        "jacked.api.credential_helpers.read_platform_credentials",
+        return_value={
+            "claudeAiOauth": {
+                "accessToken": "cc_refreshed_by_claude_code",
+                "refreshToken": "cc_rt_1",
+            }
+        },
+    ):
+        with mock.patch("jacked.api.routes.auth.Path.home", return_value=tmp_path):
+            resp = client.get("/api/auth/active-credential")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["account_id"] == 1
+    assert data["email"] == "alice@test.com"
+
+
+def test_active_credential_email_org_fallback(client, db, tmp_path):
+    """Falls back to ~/.claude.json email+org when stamp and ALL token matches fail."""
+    claude_json = tmp_path / ".claude.json"
+    claude_json.write_text(json.dumps({
+        "oauthAccount": {
+            "emailAddress": "alice@test.com",
+            "organizationUuid": None,
+        }
+    }))
+
+    with (
+        mock.patch("jacked.api.routes.auth.Path.home", return_value=tmp_path),
+        mock.patch(
+            "jacked.api.credential_helpers.read_platform_credentials",
+            return_value={"claudeAiOauth": {
+                "accessToken": "totally_unknown",
+                "refreshToken": "also_unknown",
+            }},
+        ),
+    ):
+        resp = client.get("/api/auth/active-credential")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["account_id"] == 1
+    assert data["email"] == "alice@test.com"
+
+
+def test_active_credential_email_org_disambiguates(client, db, tmp_path):
+    """Email+org match picks the right account when email is shared across orgs."""
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO accounts
+               (id, email, organization_uuid, access_token, refresh_token,
+                expires_at, is_active, is_deleted, validation_status,
+                subscription_type, rate_limit_tier,
+                scopes, consecutive_failures, last_error)
+               VALUES (10, 'shared@test.com', 'org-aaa', 'at_10', 'rt_10',
+                       1900000000, 1, 0, 'valid', 'pro', 't1',
+                       NULL, 0, NULL)"""
+        )
+        conn.execute(
+            """INSERT INTO accounts
+               (id, email, organization_uuid, access_token, refresh_token,
+                expires_at, is_active, is_deleted, validation_status,
+                subscription_type, rate_limit_tier,
+                scopes, consecutive_failures, last_error)
+               VALUES (11, 'shared@test.com', 'org-bbb', 'at_11', 'rt_11',
+                       1900000000, 1, 0, 'valid', 'pro', 't1',
+                       NULL, 0, NULL)"""
+        )
+
+    claude_json = tmp_path / ".claude.json"
+    claude_json.write_text(json.dumps({
+        "oauthAccount": {
+            "emailAddress": "shared@test.com",
+            "organizationUuid": "org-bbb",
+        }
+    }))
+
+    with (
+        mock.patch("jacked.api.routes.auth.Path.home", return_value=tmp_path),
+        mock.patch(
+            "jacked.api.credential_helpers.read_platform_credentials",
+            return_value=None,
+        ),
+    ):
+        resp = client.get("/api/auth/active-credential")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["account_id"] == 11
+    assert data["email"] == "shared@test.com"
+
+
+def test_active_credential_no_match(client, db, tmp_path):
+    """Returns empty when nothing matches (no stamp, no token, no email)."""
+    claude_json = tmp_path / ".claude.json"
+    claude_json.write_text(json.dumps({
+        "oauthAccount": {"emailAddress": "nobody@test.com"}
+    }))
+
+    with (
+        mock.patch("jacked.api.routes.auth.Path.home", return_value=tmp_path),
+        mock.patch(
+            "jacked.api.credential_helpers.read_platform_credentials",
+            return_value=None,
+        ),
+    ):
+        resp = client.get("/api/auth/active-credential")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["account_id"] is None

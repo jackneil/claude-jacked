@@ -883,33 +883,88 @@ async def get_active_credential(request: Request):
         if platform_data:
             cred_data = platform_data
 
-    if not cred_data:
-        return ActiveCredentialResponse()
-
-    # Layer 1: _jackedAccountId stamp
-    jacked_id = cred_data.get("_jackedAccountId")
-    if jacked_id is not None:
-        account = db.get_account(jacked_id)
-        if account and not account.get("is_deleted"):
-            return ActiveCredentialResponse(
-                account_id=account["id"], email=account["email"]
-            )
-
-    # Layer 2: Exact token match (CC token takes precedence over primary)
-    access_token = cred_data.get("claudeAiOauth", {}).get("accessToken")
-    if access_token:
-        accounts = db.list_accounts(include_inactive=True)
-        for acct in accounts:
-            if acct.get("is_deleted"):
-                continue
-            if acct.get("cc_access_token") == access_token:
+    if cred_data:
+        # Layer 1: _jackedAccountId stamp
+        jacked_id = cred_data.get("_jackedAccountId")
+        if jacked_id is not None:
+            account = db.get_account(jacked_id)
+            if account and not account.get("is_deleted"):
                 return ActiveCredentialResponse(
-                    account_id=acct["id"], email=acct["email"]
+                    account_id=account["id"], email=account["email"]
                 )
-            if acct.get("access_token") == access_token:
-                return ActiveCredentialResponse(
-                    account_id=acct["id"], email=acct["email"]
-                )
+
+        # Layer 2: Token match — try refresh token first (more stable than
+        # access token because it only rotates on explicit refresh, not every
+        # API call), then fall back to access token match.
+        oauth_data = cred_data.get("claudeAiOauth", {})
+        refresh_token = oauth_data.get("refreshToken")
+        access_token = oauth_data.get("accessToken")
+
+        if refresh_token or access_token:
+            accounts = db.list_accounts(include_inactive=True)
+            # Pass 1: refresh token match (most stable after dashboard switch)
+            if refresh_token:
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if acct.get("cc_refresh_token") == refresh_token:
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+            # Pass 2: access token match (works briefly before CC refreshes)
+            if access_token:
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if acct.get("cc_access_token") == access_token:
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+                    if acct.get("access_token") == access_token:
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+
+    # Layer 3: Email + org match from ~/.claude.json
+    #
+    # On macOS, .credentials.json may not exist (Claude Code uses keychain
+    # exclusively).  The keychain may lack the _jackedAccountId stamp
+    # (accounts predating the dashboard-switching feature).  Token match
+    # fails because Claude Code refreshes tokens independently.
+    #
+    # ~/.claude.json is maintained by Claude Code on ALL platforms and
+    # always has oauthAccount.emailAddress + organizationUuid after login.
+    # It is NOT overwritten during token refresh — only during login/logout.
+    claude_config = Path.home() / ".claude.json"
+    if claude_config.exists() and not claude_config.is_symlink():
+        try:
+            config = json.loads(claude_config.read_text(encoding="utf-8"))
+            oauth_acct = config.get("oauthAccount", {})
+            config_email = oauth_acct.get("emailAddress")
+            config_org = oauth_acct.get("organizationUuid")
+            if config_email:
+                accounts = db.list_accounts(include_inactive=True)
+                # Prefer email+org match (disambiguates same-email multi-org)
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if (
+                        acct.get("email", "").lower() == config_email.lower()
+                        and acct.get("organization_uuid") == config_org
+                    ):
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+                # Fall back to email-only match (org may be None for personal accounts)
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if acct.get("email", "").lower() == config_email.lower():
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+        except (json.JSONDecodeError, OSError):
+            pass
 
     return ActiveCredentialResponse()
 
