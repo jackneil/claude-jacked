@@ -91,7 +91,9 @@ Output: A reviewed, clean plan.
 
 ### Phase 4: Execute the Plan
 
-**REQUIRED SUB-SKILL:** `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans`
+**REQUIRED SUB-SKILL:** `superpowers:subagent-driven-development`
+
+Always use subagent-driven development — a fresh subagent per task with two-stage review (spec compliance, then code quality). Do not use `superpowers:executing-plans` (that is the inline fallback for environments without subagent support).
 
 Implement the plan task by task. Each task follows TDD (test first, implement, verify). Commit after each task.
 
