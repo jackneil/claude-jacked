@@ -1,5 +1,5 @@
 ---
-description: "Performance regression detection — captures web performance metrics, compares against baselines, flags regressions"
+description: Use before and after performance-sensitive changes. Captures web performance metrics, compares against baselines, flags regressions.
 ---
 
 You are running performance benchmarking on a web application. You capture real browser performance metrics, compare against baselines, and flag regressions with specific thresholds.

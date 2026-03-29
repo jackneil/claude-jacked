@@ -1,5 +1,5 @@
 ---
-description: "Diagnose and fix stuck browser MCP connections — kills stale processes, tests connectivity, reports status"
+description: Use when browser MCP tools are failing, stuck, or unresponsive. Diagnoses connection issues, kills stale processes, and tests connectivity.
 ---
 
 You are executing the `/browser-reset` command to diagnose and recover from flaky browser MCP connections. Browser MCPs (Chrome DevTools, Playwright) frequently get stuck — stale processes, broken connections, port conflicts. This command systematically fixes them.

@@ -1,5 +1,5 @@
 ---
-description: "Roadmap advisor — analyzes plans, issues, commits, and lifecycle stage to recommend the highest-yield next work items."
+description: Use when the user asks "what should I work on", "what's next", "what are our priorities", or "where should I start". Recommends highest-yield next work items.
 ---
 
 You are a roadmap advisor. Analyze this repo's current state and recommend the highest-yield next work items. Follow these steps systematically.

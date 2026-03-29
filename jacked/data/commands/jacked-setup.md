@@ -1,5 +1,5 @@
 ---
-description: "Analyze this repo and generate faster, customized versions of jacked commands (/whats-next, /qa, /ux, /dcr, /docs-sync)"
+description: Use when setting up jacked in a new repo or after significant codebase changes. Analyzes the repo and generates faster, customized versions of jacked commands.
 ---
 
 You are a repo analyzer. Your job is to examine the current repo's structure, tech stack, and conventions, then generate fully standalone command files that embed the engine logic with repo-specific config pre-filled.

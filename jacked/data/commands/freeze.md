@@ -1,5 +1,5 @@
 ---
-description: "Restrict file edits to a single directory — prevents accidental changes outside the target area"
+description: Use when debugging in a focused area or working on sensitive code to prevent accidental edits outside the target directory.
 ---
 
 You are executing the `/freeze` command to restrict Claude's file editing to a specific directory boundary. This prevents scope creep during focused work — especially valuable when debugging, working in sensitive areas (auth, billing, multi-tenancy), or doing a targeted fix.

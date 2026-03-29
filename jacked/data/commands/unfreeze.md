@@ -1,5 +1,5 @@
 ---
-description: "Remove the edit restriction set by /freeze — allows edits anywhere again"
+description: Use when done working in a frozen directory and ready to allow edits anywhere again. Removes the restriction set by /freeze.
 ---
 
 You are executing the `/unfreeze` command to remove the directory edit restriction.

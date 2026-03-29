@@ -1,5 +1,5 @@
 ---
-description: "Docs sync — diffs branch against base, maps code changes to affected docs, spawns parallel agents to update them"
+description: Use when a branch has code changes that may have made documentation stale, after completing a feature, or before creating a PR.
 ---
 
 > **Note:** If `.claude/commands/docs-sync.md` exists in the current repo, that version has pre-filled repo config from `/jacked-setup docs-sync` — use it instead of this global file. If it doesn't exist, continue here.

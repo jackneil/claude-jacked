@@ -1,5 +1,5 @@
 ---
-description: "Post-merge deploy verification — merges PR, waits for CI, waits for deploy, runs canary checks, offers revert on failure"
+description: Use after a PR is approved and CI passes. Merges, waits for deploy, runs canary checks, and offers revert on failure.
 ---
 
 You are running the land-and-deploy pipeline. This picks up where `/commit-push-pr` leaves off — merging the PR, waiting for CI and deployment, then verifying the production site is healthy.

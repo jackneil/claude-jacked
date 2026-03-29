@@ -1,5 +1,5 @@
 ---
-description: "Browser-based QA testing of UI changes from the current session. Pass a URL as argument, or let it auto-detect."
+description: Use when testing UI changes for visual correctness, interactions, console errors, and edge cases. Pass a URL as argument, or let it auto-detect.
 ---
 
 > **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.

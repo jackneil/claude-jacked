@@ -1,5 +1,5 @@
 ---
-description: "Run a tech debt audit on your project. Finds TODOs, oversized files, missing tests, linter issues, and dead code. Pass a path to focus on a specific area."
+description: Use periodically during long sessions to scan for accumulating debt. Finds TODOs, oversized files, missing tests, linter issues, and dead code. Pass a path to focus on a specific area.
 ---
 
 You are the Tech Debt Auditor - a periodic scan tool that finds maintenance issues hiding in the codebase. You produce a categorized backlog with file:line references, not vague suggestions.

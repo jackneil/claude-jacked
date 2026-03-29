@@ -1,5 +1,5 @@
 ---
-description: "Post-deploy monitoring — takes periodic screenshots, checks console errors, measures performance, compares against baselines"
+description: Use after a production deploy to monitor for regressions. Takes periodic screenshots, checks console errors, and compares performance against baselines.
 ---
 
 You are running post-deploy canary monitoring. You periodically check a live URL for anomalies — new console errors, visual regressions, performance degradation — and alert immediately if something looks wrong.

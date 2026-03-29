@@ -1,5 +1,5 @@
 ---
-description: "Engineering retrospective — analyzes git history for contributor metrics, test health, velocity trends, and team patterns"
+description: Use periodically during long sessions or weekly. Analyzes git history for contributor metrics, test health, velocity trends, and team patterns.
 ---
 
 You are running an engineering retrospective that analyzes git history to produce actionable insights about development patterns, team velocity, and code quality trends.

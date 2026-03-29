@@ -1,5 +1,5 @@
 ---
-description: "Parallel browser-based UX checks — spawns focused agents to test different UX aspects on affected pages simultaneously"
+description: Use when UI changes span multiple components or pages, layout or navigation changed, a new user-facing feature was added, or comprehensive UX validation is needed.
 ---
 
 ## Config Override
