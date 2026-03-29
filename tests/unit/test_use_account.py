@@ -64,6 +64,19 @@ def db(tmp_path):
                        'cc_at_4', 'cc_rt_4', 1900000000,
                        NULL, 2, 'Token revoked')"""
         )
+        # Account 5: soft-deleted
+        conn.execute(
+            """INSERT INTO accounts
+               (id, email, access_token, refresh_token, expires_at,
+                is_active, is_deleted, validation_status,
+                subscription_type, rate_limit_tier,
+                cc_access_token, cc_refresh_token, cc_expires_at,
+                scopes, consecutive_failures, last_error)
+               VALUES (5, 'eve@test.com', 'at_5', 'rt_5', 1900000000,
+                       1, 1, 'valid', 'max', 't1',
+                       'cc_at_5', 'cc_rt_5', 1900000000,
+                       NULL, 0, NULL)"""
+        )
     yield db
     db.close()
 
@@ -125,6 +138,12 @@ def test_use_account_invalid_status(client):
     assert resp.status_code == 400
     assert "invalid" in resp.json()["error"]["message"].lower() or \
            "re-auth" in resp.json()["error"]["message"].lower()
+
+
+def test_use_account_deleted(client):
+    """Returns 404 for soft-deleted account."""
+    resp = client.post("/api/auth/accounts/5/use")
+    assert resp.status_code == 404
 
 
 def test_refresh_usage_uses_fresh_token_for_active_account(client, tmp_path):

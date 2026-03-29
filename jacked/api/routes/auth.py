@@ -780,6 +780,11 @@ async def use_account(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
+    # Defense-in-depth: get_account() already filters is_deleted=0,
+    # but guard here in case that query changes in the future.
+    if account.get("is_deleted"):
+        return _not_found(f"No account with id={account_id}")
+
     if not account.get("is_active"):
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -817,6 +822,14 @@ async def use_account(account_id: int, request: Request):
             },
         )
 
+    # SAFETY: This is a user-initiated, one-shot credential write — NOT a
+    # background loop.  The design spec (2026-03-24-kill-background-credential-
+    # writes-design.md) prohibits credential file writes from background loops
+    # (_token_refresh_loop, _heal_sweep_loop) because they caused session
+    # logouts.  This endpoint is safe because: (1) it is user-initiated,
+    # (2) it runs once per click, and (3) Claude Code v2.1.81+ handles
+    # credential file changes gracefully.  Do NOT copy this pattern into
+    # refresh_account_token() or any background loop.
     from jacked.api.credential_helpers import sync_credential_to_all_stores
 
     sync_credential_to_all_stores(
