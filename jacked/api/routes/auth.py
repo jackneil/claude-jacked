@@ -548,7 +548,14 @@ async def refresh_usage(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    usage_data = await fetch_usage(account_id, db)
+    from jacked.api.credential_helpers import read_fresh_active_token
+
+    fresh_token = read_fresh_active_token(account_id)
+    # Only pass fresh_token when it differs from DB token — passing a non-None
+    # access_token to fetch_usage() bypasses its cache freshness guard (auth.py:339).
+    db_token = account.get("access_token")
+    effective_token = fresh_token if (fresh_token and fresh_token != db_token) else None
+    usage_data = await fetch_usage(account_id, db, access_token=effective_token)
 
     if usage_data is None:
         return JSONResponse(
@@ -598,6 +605,20 @@ async def refresh_all_usage(request: Request):
         ws_registry = getattr(request.app.state, "ws_registry", None)
         total = len(accounts)
 
+        # Read active account ID once from file — avoids per-iteration keychain
+        # subprocess calls.  File-only is acceptable because
+        # sync_credential_to_all_stores() writes both file and keychain
+        # atomically, so they should always agree on _jackedAccountId.
+        from jacked.api.credential_helpers import read_fresh_active_token
+        active_acct_id = None
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+        if cred_path.exists() and not cred_path.is_symlink():
+            try:
+                cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
+                active_acct_id = cred_data.get("_jackedAccountId")
+            except (json.JSONDecodeError, OSError):
+                pass
+
         # Notify frontend: full queue so cards can show "Waiting..." immediately
         if ws_registry:
             await ws_registry.broadcast(
@@ -617,7 +638,13 @@ async def refresh_all_usage(request: Request):
                      "progress": i + 1, "total": total},
                 )
 
-            usage_data = await fetch_usage(acct["id"], db)
+            effective_token = None
+            if acct["id"] == active_acct_id:
+                fresh_token = read_fresh_active_token(acct["id"])
+                db_token = acct.get("access_token")
+                if fresh_token and fresh_token != db_token:
+                    effective_token = fresh_token
+            usage_data = await fetch_usage(acct["id"], db, access_token=effective_token)
 
             # Cache hits return {"_cached": True} — read stored values from DB
             is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
