@@ -174,10 +174,12 @@ function renderActionButtons(acct) {
     const status = getAccountStatus(acct);
     const isActiveInCC = window.jackedState.activeCredentialAccountId === acct.id;
 
-    // Active badge (left side) — account switching is via `jacked claude <id>` only
+    // "Use Account" button or "Active" badge
     let setActiveHtml = '';
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
+    } else if (acct.is_active && status !== 'invalid' && status !== 'expired' && status !== 'disabled' && status !== 'cc-missing') {
+        setActiveHtml = `<button class="btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 border border-teal-600/30 rounded font-medium transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Use Account</button>`;
     }
 
     // Copy launch command button
@@ -193,8 +195,6 @@ function renderActionButtons(acct) {
     if (showReauth) {
         reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
     }
-
-    // CC auth now handled by pill click handler — no standalone button
 
     // Toggle active/disabled
     const toggleLabel = acct.is_active ? 'Disable' : 'Enable';
@@ -349,7 +349,7 @@ function renderAccounts(accounts) {
                 <div class="flex items-start justify-between">
                     <div>
                         <strong class="text-slate-200">Per-account sessions</strong> &mdash;
-                        Use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch Claude Code with isolated credentials per account.
+                        Click <strong>Use Account</strong> to switch all sessions, or use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch with isolated credentials.
                         Supports pass-through args: <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude 2 --resume</code>
                     </div>
                     <button id="btn-dismiss-tip" class="text-slate-500 hover:text-slate-300 ml-3 shrink-0 text-lg leading-none" title="Dismiss">&times;</button>

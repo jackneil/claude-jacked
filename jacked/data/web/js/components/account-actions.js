@@ -226,9 +226,30 @@ function bindAccountEvents() {
         });
     });
 
-    // "Set Active" removed — account switching is via `jacked claude <id>` only.
-    // The .btn-set-active button no longer renders; this comment replaces the
-    // old event listener that called /api/auth/accounts/{id}/use (now 410 Gone).
+    // "Use Account" button — switches all Claude Code sessions to this account
+    document.querySelectorAll('.btn-use-account').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            if (window.jackedState._accountActionInFlight) {
+                showToast('Another action is in progress', 'warning', 2000);
+                return;
+            }
+            const id = btn.dataset.id;
+            const email = btn.dataset.email || '';
+            window.jackedState._accountActionInFlight = true;
+            btn.disabled = true;
+            btn.textContent = 'Switching\u2026';
+            try {
+                await api.post(`/api/auth/accounts/${id}/use`);
+                showToast(`Switched to ${email}`, 'success');
+                await loadActiveCredential();
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                window.jackedState._accountActionInFlight = false;
+                await refreshAndRender();
+            }
+        });
+    });
 
     // Refresh All Usage button
     const refreshAllBtn = document.getElementById('btn-refresh-all-usage');
