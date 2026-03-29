@@ -339,6 +339,62 @@ def test_active_credential_email_org_disambiguates(client, db, tmp_path):
     assert data["email"] == "shared@test.com"
 
 
+def test_active_credential_personal_account_null_org(client, db, tmp_path):
+    """Matches personal account when config has null org and DB has empty string.
+
+    DB stores organization_uuid="" for personal accounts, but ~/.claude.json
+    has organizationUuid: null.  The sentinel normalization (or "") ensures
+    the email+org pass matches correctly even with this type difference.
+    """
+    # Add a personal account (org="") and an org account with the same email
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO accounts
+               (id, email, organization_uuid, access_token, refresh_token,
+                expires_at, is_active, is_deleted, validation_status,
+                subscription_type, rate_limit_tier,
+                scopes, consecutive_failures, last_error)
+               VALUES (20, 'same@test.com', '', 'at_20', 'rt_20',
+                       1900000000, 1, 0, 'valid', 'pro', 't1',
+                       NULL, 0, NULL)"""
+        )
+        conn.execute(
+            """INSERT INTO accounts
+               (id, email, organization_uuid, access_token, refresh_token,
+                expires_at, is_active, is_deleted, validation_status,
+                subscription_type, rate_limit_tier,
+                scopes, consecutive_failures, last_error)
+               VALUES (21, 'same@test.com', 'org-xyz', 'at_21', 'rt_21',
+                       1900000000, 1, 0, 'valid', 'pro', 't1',
+                       NULL, 0, NULL)"""
+        )
+
+    # Config says null org (personal account)
+    claude_json = tmp_path / ".claude.json"
+    claude_json.write_text(json.dumps({
+        "oauthAccount": {
+            "emailAddress": "same@test.com",
+            "organizationUuid": None,
+        }
+    }))
+
+    with (
+        mock.patch("jacked.api.routes.auth.Path.home", return_value=tmp_path),
+        mock.patch(
+            "jacked.api.credential_helpers.read_platform_credentials",
+            return_value=None,
+        ),
+    ):
+        resp = client.get("/api/auth/active-credential")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    # Should match account 20 (personal, org="") via email+org pass,
+    # NOT account 21 (org-xyz) and NOT via the email-only fallback
+    assert data["account_id"] == 20
+    assert data["email"] == "same@test.com"
+
+
 def test_active_credential_no_match(client, db, tmp_path):
     """Returns empty when nothing matches (no stamp, no token, no email)."""
     claude_json = tmp_path / ".claude.json"

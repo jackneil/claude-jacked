@@ -860,7 +860,8 @@ async def use_account(account_id: int, request: Request):
 async def get_active_credential(request: Request):
     """Read credential file/keychain and match to a jacked account.
 
-    Simple 2-layer matching: stamp, then access_token.
+    3-layer matching: (1) _jackedAccountId stamp, (2) refresh/access
+    token match, (3) email+org from ~/.claude.json.
     """
     db = _get_db(request)
     if db is None:
@@ -941,16 +942,18 @@ async def get_active_credential(request: Request):
             config = json.loads(claude_config.read_text(encoding="utf-8"))
             oauth_acct = config.get("oauthAccount", {})
             config_email = oauth_acct.get("emailAddress")
-            config_org = oauth_acct.get("organizationUuid")
+            config_org = oauth_acct.get("organizationUuid") or ""
             if config_email:
                 accounts = db.list_accounts(include_inactive=True)
-                # Prefer email+org match (disambiguates same-email multi-org)
+                # Prefer email+org match (disambiguates same-email multi-org).
+                # Normalize org to "" because DB uses "" for personal accounts
+                # while ~/.claude.json uses null (Python None).
                 for acct in accounts:
                     if acct.get("is_deleted"):
                         continue
                     if (
                         acct.get("email", "").lower() == config_email.lower()
-                        and acct.get("organization_uuid") == config_org
+                        and (acct.get("organization_uuid") or "") == config_org
                     ):
                         return ActiveCredentialResponse(
                             account_id=acct["id"], email=acct["email"]
