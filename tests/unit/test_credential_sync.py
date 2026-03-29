@@ -15,6 +15,7 @@ from unittest import mock
 
 from jacked.api.credential_helpers import (
     build_oauth_data,
+    read_fresh_active_token,
     read_platform_credentials,
     sync_credential_to_all_stores,
     update_claude_config_email,
@@ -559,3 +560,102 @@ def test_reassign_sessions_validates_target():
                 )
         finally:
             db.close()
+
+
+# ------------------------------------------------------------------
+# read_fresh_active_token
+# ------------------------------------------------------------------
+
+
+def test_read_fresh_active_token_from_file():
+    """Reads access token from .credentials.json for matching account."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        cred_dir = tmp_path / ".claude"
+        cred_dir.mkdir()
+        cred_path = cred_dir / ".credentials.json"
+        cred_path.write_text(json.dumps({
+            "_jackedAccountId": 1,
+            "claudeAiOauth": {"accessToken": "fresh_token_from_file"},
+        }))
+
+        with (
+            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
+            mock.patch(
+                "jacked.api.credential_helpers.read_platform_credentials",
+                return_value=None,
+            ),
+        ):
+            result = read_fresh_active_token(1)
+
+    assert result == "fresh_token_from_file"
+
+
+def test_read_fresh_active_token_from_keychain():
+    """Prefers keychain over file when both have tokens."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        cred_dir = tmp_path / ".claude"
+        cred_dir.mkdir()
+        cred_path = cred_dir / ".credentials.json"
+        cred_path.write_text(json.dumps({
+            "_jackedAccountId": 1,
+            "claudeAiOauth": {"accessToken": "file_token"},
+        }))
+
+        with (
+            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
+            mock.patch(
+                "jacked.api.credential_helpers.read_platform_credentials",
+                return_value={
+                    "_jackedAccountId": 1,
+                    "claudeAiOauth": {"accessToken": "keychain_token"},
+                },
+            ),
+        ):
+            result = read_fresh_active_token(1)
+
+    assert result == "keychain_token"
+
+
+def test_read_fresh_active_token_wrong_account():
+    """Returns None when credential stores belong to a different account."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        cred_dir = tmp_path / ".claude"
+        cred_dir.mkdir()
+        cred_path = cred_dir / ".credentials.json"
+        cred_path.write_text(json.dumps({
+            "_jackedAccountId": 2,
+            "claudeAiOauth": {"accessToken": "other_account_token"},
+        }))
+
+        with (
+            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
+            mock.patch(
+                "jacked.api.credential_helpers.read_platform_credentials",
+                return_value=None,
+            ),
+        ):
+            result = read_fresh_active_token(1)
+
+    assert result is None
+
+
+def test_read_fresh_active_token_no_credentials():
+    """Returns None when no credential file or keychain entry exists."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        cred_dir = tmp_path / ".claude"
+        cred_dir.mkdir()
+
+        with (
+            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
+            mock.patch(
+                "jacked.api.credential_helpers.read_platform_credentials",
+                return_value=None,
+            ),
+        ):
+            result = read_fresh_active_token(1)
+
+    assert result is None

@@ -162,6 +162,38 @@ def read_platform_credentials() -> dict | None:
     return None
 
 
+def read_fresh_active_token(account_id: int) -> str | None:
+    """Read the current access token from credential stores for an account.
+
+    After activation, Claude Code refreshes the access token on its own
+    schedule, making the DB copy stale.  This reads the live token from
+    the same stores Claude Code uses (Keychain first, then file).
+
+    Returns the access token string, or None if the stores don't belong
+    to this account or are unreadable.
+    """
+    # Try keychain first (same precedence as Claude Code on macOS)
+    kc_data = read_platform_credentials()
+    if kc_data and kc_data.get("_jackedAccountId") == account_id:
+        token = kc_data.get("claudeAiOauth", {}).get("accessToken")
+        if token:
+            return token
+
+    # Fall back to global .credentials.json
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if cred_path.exists() and not cred_path.is_symlink():
+        try:
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+            if data.get("_jackedAccountId") == account_id:
+                token = data.get("claudeAiOauth", {}).get("accessToken")
+                if token:
+                    return token
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return None
+
+
 def write_platform_credentials(data: dict) -> bool:
     """Write credentials to the platform's native credential store.
 
