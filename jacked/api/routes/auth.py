@@ -733,24 +733,75 @@ async def start_cc_auth(account_id: int, request: Request):
 # --- Credential switching ---
 
 
-@router.post("/accounts/{account_id}/use")
+@router.post("/accounts/{account_id}/use", response_model=UseAccountResponse)
 async def use_account(account_id: int, request: Request):
-    """Removed: credential file switching caused session logouts.
+    """Switch all Claude Code sessions to this account's credentials.
 
-    Use `jacked claude <id>` to launch Claude Code with a specific account.
+    Writes the account's tokens to all credential stores (global
+    .credentials.json, macOS Keychain, ~/.claude.json).  Claude Code
+    v2.1.81+ dynamically re-reads credentials, so running sessions
+    pick up the new account without logging out.
+
+    Rejects disabled accounts, accounts with invalid validation status,
+    and accounts without CC tokens (which would be un-refreshable).
     """
-    return JSONResponse(
-        status_code=410,
-        content={
-            "error": {
-                "message": (
-                    "Dashboard credential switching has been removed — it caused "
-                    "active Claude Code sessions to log out. "
-                    f"Use `jacked claude {account_id}` to launch with this account."
-                ),
-                "code": "REMOVED",
-            }
-        },
+    db = _get_db(request)
+    if db is None:
+        return _db_unavailable()
+
+    account = db.get_account(account_id)
+    if not account:
+        return _not_found(f"No account with id={account_id}")
+
+    if not account.get("is_active"):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": "Account is disabled — enable it first",
+                    "code": "ACCOUNT_DISABLED",
+                }
+            },
+        )
+
+    if account.get("validation_status") == "invalid":
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": "Account has invalid credentials — re-auth first",
+                    "code": "ACCOUNT_INVALID",
+                }
+            },
+        )
+
+    if not account.get("cc_access_token"):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": (
+                        "Account has no CC tokens — authorize Claude Code "
+                        "tokens first (credentials without a refresh token "
+                        "would expire in ~8 hours with no way to renew)"
+                    ),
+                    "code": "CC_TOKEN_MISSING",
+                }
+            },
+        )
+
+    from jacked.api.credential_helpers import sync_credential_to_all_stores
+
+    sync_credential_to_all_stores(
+        account_id,
+        account,
+        email=account.get("email"),
+        display_name=account.get("display_name"),
+    )
+
+    return UseAccountResponse(
+        status="active",
+        email=account.get("email", ""),
     )
 
 
