@@ -619,6 +619,17 @@ async def refresh_all_usage(request: Request):
             except (json.JSONDecodeError, OSError):
                 pass
 
+        if active_acct_id is not None:
+            logger.debug(
+                "Bulk refresh: active account from credential file = %s",
+                active_acct_id,
+            )
+        else:
+            logger.debug(
+                "Bulk refresh: no _jackedAccountId in credential file — "
+                "all accounts will use DB tokens"
+            )
+
         # Notify frontend: full queue so cards can show "Waiting..." immediately
         if ws_registry:
             await ws_registry.broadcast(
