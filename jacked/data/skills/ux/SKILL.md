@@ -1,6 +1,6 @@
 ---
 name: ux
-description: "Parallel browser-based UX checks — spawns focused agents to test different UX aspects on affected pages simultaneously. Use when: UI changes span multiple components or pages, layout or navigation structure changed, a new user-facing feature was added, or comprehensive UX validation is needed. For targeted single-component or bug-fix verification, use the qa skill instead."
+description: Use when UI changes span multiple components or pages, layout or navigation changed, a new user-facing feature was added, or comprehensive UX validation is needed. For single-component or bug-fix checks, use the qa skill instead.
 ---
 
 First, check if a repo-scoped version exists in the current project:

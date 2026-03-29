@@ -1,6 +1,6 @@
 ---
 name: swarm-research
-description: "Divergent research — spawns independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate. Use when approaching non-trivial planning: architectural decisions, major features, system design, or any decision with multiple viable approaches."
+description: Use when approaching non-trivial planning — architectural decisions, major features, system design, or any decision with multiple viable approaches.
 ---
 
 First, check if a repo-scoped version exists in the current project:

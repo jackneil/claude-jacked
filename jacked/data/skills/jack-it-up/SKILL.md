@@ -1,6 +1,6 @@
 ---
 name: jack-it-up
-description: Use when starting any significant feature, enhancement, or non-trivial task that deserves a thorough iterative development cycle — brainstorming through implementation with continuous refinement. Triggers on "jack it up", "do this right", "full cycle", "build this properly", or when the user wants quality-first development rather than just getting something done.
+description: Use when starting any significant feature or non-trivial task that deserves a thorough development cycle. Triggers on "jack it up", "do this right", "full cycle", "build this properly", or when the user wants quality-first development over speed.
 ---
 
 # Jack It Up

@@ -1,6 +1,6 @@
 ---
 name: jacked
-description: Search and load context from past Claude Code sessions. Use when: user mentions a past project like "configurator" or other previous work, asks to continue/resume previous work, says "how did I do X before", references past sessions, or starts work on a feature that may have been done before.
+description: Use when the user mentions a past project like "configurator", asks to continue/resume previous work, says "how did I do X before", references past sessions, or starts work on a feature that may have been done before. Searches and loads context from past Claude Code sessions.
 ---
 
 # Jacked

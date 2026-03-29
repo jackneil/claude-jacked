@@ -1,6 +1,6 @@
 ---
 name: docs-sync
-description: "Sync docs with code changes — diffs branch against base, maps changes to affected docs, spawns parallel update agents. Use when a branch has code changes that may have made documentation stale, after completing a feature, or before creating a PR."
+description: Use when a branch has code changes that may have made documentation stale, after completing a feature, or before creating a PR. Diffs branch against base and maps changes to affected docs.
 ---
 
 First, check if a repo-scoped version exists in the current project:

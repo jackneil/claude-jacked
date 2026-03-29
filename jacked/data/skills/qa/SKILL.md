@@ -1,6 +1,6 @@
 ---
 name: qa
-description: Browser-based QA testing of UI changes — returns a detailed issue list for the caller to plan fixes.
+description: Use when testing UI changes for visual correctness, interactions, console errors, and edge cases. Performs browser-based QA and returns a detailed issue list for planning fixes.
 ---
 
 First, check if a repo-scoped version exists in the current project:
