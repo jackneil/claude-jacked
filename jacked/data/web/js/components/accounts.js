@@ -174,20 +174,21 @@ function renderActionButtons(acct) {
     const status = getAccountStatus(acct);
     const isActiveInCC = window.jackedState.activeCredentialAccountId === acct.id;
 
-    // "Use Account" button or "Active" badge
+    // "Use Account" button or "Active" badge.
+    // Show on all enabled accounts — backend validates and returns clear
+    // error messages for cc-missing, invalid, etc.
     let setActiveHtml = '';
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
-    } else if (acct.is_active && status !== 'invalid' && status !== 'expired' && status !== 'disabled' && status !== 'cc-missing') {
+    } else if (acct.is_active) {
         setActiveHtml = `<button class="btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 border border-teal-600/30 rounded font-medium transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Use Account</button>`;
     }
 
-    // Copy launch command button
-    const copyCmd = `jacked claude ${acct.id}`;
-    const copyHtml = `<button class="btn-copy-cmd text-xs px-3 py-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded transition-colors" data-cmd="${escapeHtml(copyCmd)}" title="Copy launch command">
-        <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
-        ${escapeHtml(copyCmd)}
-    </button>`;
+    // Copy launch command — hidden now that dashboard switching works.
+    // Kept commented for future use (per-account isolated sessions).
+    // const copyCmd = `jacked claude ${acct.id}`;
+    // const copyHtml = `<button class="btn-copy-cmd ...">...</button>`;
+    const copyHtml = '';
 
     // Re-auth button (if invalid/expired) — pills also handle this, keep for backward compat
     const showReauth = status === 'invalid' || status === 'expired';
