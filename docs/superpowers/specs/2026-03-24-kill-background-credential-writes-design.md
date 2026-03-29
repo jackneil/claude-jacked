@@ -23,7 +23,7 @@ The dashboard's "Use account" button (`use_account` route in `jacked/api/routes/
 
 Remove all credential **file** writes from the server's token refresh path. The background loops continue running — they still refresh tokens and store them in the DB so the dashboard's accounts/usage tracking page works. The only change is that refreshed tokens are no longer written to Claude Code's credential files (`~/.claude/.credentials.json`, Keychain). The server becomes read-only with respect to Claude Code's credential stores while still maintaining its own DB-side token state.
 
-Account switching is exclusively handled by `jacked claude <id>` which uses per-account `CLAUDE_CONFIG_DIR` directories and never touches the global credential file.
+Account switching has two modes: (1) `jacked claude <id>` uses per-account `CLAUDE_CONFIG_DIR` directories for session isolation, and (2) the dashboard "Use Account" button (`/accounts/{id}/use` endpoint) writes to the global credential stores for all non-isolated sessions. The dashboard endpoint is a user-initiated one-shot write, not a background loop — the read-only invariant for background processes is preserved.
 
 ## Changes
 
