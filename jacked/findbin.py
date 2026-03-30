@@ -54,7 +54,12 @@ def find_bin(name: str) -> str | None:
             candidates.append(os.path.join(local_app, "Programs", "claude", target))
 
     for path in candidates:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
+        if os.path.isfile(path):
+            # On Windows, os.access(path, os.X_OK) is unreliable — it can
+            # return False for valid .exe files depending on UAC, security
+            # policies, or cloud/network drives.  If the file exists and has
+            # an executable extension, that's sufficient.
+            if is_win or os.access(path, os.X_OK):
+                return path
 
     return None
