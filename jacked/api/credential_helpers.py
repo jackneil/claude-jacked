@@ -230,6 +230,16 @@ def write_platform_credentials(data: dict) -> bool:
         json_data = json.dumps(data, separators=(",", ":"))
         hex_value = json_data.encode("utf-8").hex()
 
+        # Clean up orphan keychain entry from old jacked versions that used
+        # -a "Claude Code" instead of -a $USER.  Ignore errors (may not exist).
+        if username != "Claude Code":
+            subprocess.run(
+                ["security", "delete-generic-password",
+                 "-a", "Claude Code",
+                 "-s", "Claude Code-credentials"],
+                capture_output=True, timeout=5,
+            )
+
         # Use -U (update-or-insert) with -X (hex value) to match CC's format.
         result = subprocess.run(
             ["security", "add-generic-password",

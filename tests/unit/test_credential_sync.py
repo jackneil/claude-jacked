@@ -393,9 +393,15 @@ def test_write_platform_credentials_uses_hex_and_user():
         result = write_platform_credentials(cred_data)
 
     assert result is True
-    # Should use -U (update-or-insert), single call (not delete-then-add)
-    assert mock_run.call_count == 1
-    call_args = mock_run.call_args[0][0]
+    # 2 calls: orphan cleanup (delete old -a "Claude Code") + add-generic-password
+    assert mock_run.call_count == 2
+    # First call: cleanup of orphan entry
+    cleanup_args = mock_run.call_args_list[0][0][0]
+    assert "delete-generic-password" in cleanup_args
+    assert "-a" in cleanup_args
+    assert "Claude Code" in cleanup_args
+    # Second call: the actual add
+    call_args = mock_run.call_args_list[1][0][0]
     assert "add-generic-password" in call_args
     assert "-U" in call_args
     # Verify -a uses $USER
