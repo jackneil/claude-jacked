@@ -345,6 +345,19 @@ CREATE TABLE IF NOT EXISTS session_accounts (
     UNIQUE(session_id, detected_at)
 );
 
+CREATE TABLE IF NOT EXISTS swap_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    from_account_id INTEGER,
+    to_account_id INTEGER,
+    reason TEXT,
+    trigger TEXT,
+    from_5h_usage REAL,
+    from_7d_usage REAL,
+    to_5h_usage REAL,
+    to_7d_usage REAL
+);
+
 """
 
 INDEXES_SQL = """
@@ -365,6 +378,7 @@ CREATE INDEX IF NOT EXISTS idx_hook_executions_repo ON hook_executions(repo_path
 CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_account ON session_accounts(account_id);
 CREATE INDEX IF NOT EXISTS idx_sa_active ON session_accounts(ended_at, last_activity_at, detected_at);
+CREATE INDEX IF NOT EXISTS idx_swap_log_ts ON swap_log(timestamp);
 """
 
 
@@ -611,6 +625,16 @@ class Database:
                 conn.execute("DROP TABLE accounts")
                 conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
                 conn.execute("DROP INDEX IF EXISTS idx_accounts_email")
+            # Migration: add auto_swap_enabled to accounts
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_swap = {row[1] for row in cursor.fetchall()}
+            if "auto_swap_enabled" not in acct_cols_swap:
+                try:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN auto_swap_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
+                except sqlite3.OperationalError:
+                    pass
             # Indexes (after migrations so new columns exist)
             conn.executescript(INDEXES_SQL)
             # Migration: rebuild idx_sa_active to cover last_activity_at
@@ -2504,3 +2528,30 @@ class Database:
                 (limit, offset),
             )
             return {"rows": [dict(row) for row in cursor.fetchall()], "total": total}
+
+    # ==================================================================
+    # Swap Log
+    # ==================================================================
+
+    def record_swap(self, from_account_id, to_account_id, reason, trigger,
+                    from_5h=None, from_7d=None, to_5h=None, to_7d=None):
+        """Record an account swap event."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """INSERT INTO swap_log
+                   (from_account_id, to_account_id, reason, trigger,
+                    from_5h_usage, from_7d_usage, to_5h_usage, to_7d_usage)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (from_account_id, to_account_id, reason, trigger,
+                 from_5h, from_7d, to_5h, to_7d),
+            )
+            return cursor.lastrowid
+
+    def list_swaps(self, limit=50):
+        """List recent swap events."""
+        with self._reader() as conn:
+            rows = conn.execute(
+                "SELECT * FROM swap_log ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
