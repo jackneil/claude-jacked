@@ -19,17 +19,21 @@ from jacked.web.auto_swap import (
 # ---------------------------------------------------------------------------
 
 def _acct(id, usage_5h=0, usage_7d=0, cc_token=True, active=True,
-          failures=0, valid=True, auto_swap=True, resets_5h=None):
+          failures=0, valid=True, auto_swap=True, resets_5h=None,
+          rate_limit_tier=None, subscription_type="max", resets_7d=None):
     return {
         "id": id, "email": f"user{id}@test.com",
         "cached_usage_5h": usage_5h, "cached_usage_7d": usage_7d,
         "cached_5h_resets_at": resets_5h,
+        "cached_7d_resets_at": resets_7d,
         "cc_access_token": "tok" if cc_token else None,
         "is_active": 1 if active else 0, "is_deleted": 0,
         "consecutive_failures": failures,
         "validation_status": "valid" if valid else "invalid",
         "auto_swap_enabled": 1 if auto_swap else 0,
         "priority": id - 1, "access_token": f"at_{id}",
+        "rate_limit_tier": rate_limit_tier,
+        "subscription_type": subscription_type,
     }
 
 
@@ -80,8 +84,10 @@ class TestScoreCandidate:
         assert low > high
 
     def test_score_inactive_window_gets_bonus(self):
+        from datetime import datetime, timezone, timedelta
+        future_iso = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         with_reset = score_candidate(_acct(1, usage_5h=20, usage_7d=10,
-                                           resets_5h=time.time() + 3600))
+                                           resets_5h=future_iso))
         without_reset = score_candidate(_acct(2, usage_5h=20, usage_7d=10,
                                               resets_5h=None))
         assert without_reset == with_reset + 15
@@ -90,8 +96,9 @@ class TestScoreCandidate:
         acct = _acct(1)
         acct["cached_usage_5h"] = None
         acct["cached_usage_7d"] = None
-        # 100 - 0 - 0 + 15 (resets_5h=None -> inactive bonus)
-        assert score_candidate(acct) == 115
+        # 100 - 0 (5h) - 0 (7d) + 27.0 (headroom: max tier_crit=90, 90*0.3)
+        # + 15 (resets_5h=None -> inactive bonus)
+        assert score_candidate(acct) == 142.0
 
 
 # ---------------------------------------------------------------------------
@@ -172,3 +179,26 @@ def test_tier_threshold_none_max_sub():
 def test_tier_threshold_unknown():
     """Unknown/missing everything falls to 80%."""
     assert tier_critical_threshold({}) == 80.0
+
+
+# ---------------------------------------------------------------------------
+# score_candidate — reset-time and tier-headroom scoring
+# ---------------------------------------------------------------------------
+
+def test_score_reset_time_aware():
+    """Account resetting sooner gets less 7d penalty at same usage."""
+    from datetime import datetime, timezone, timedelta
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    next_week = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+    a = _acct(1, usage_5h=30, usage_7d=60, resets_7d=next_week)
+    b = _acct(2, usage_5h=30, usage_7d=60, resets_7d=tomorrow)
+    # Account with more days left should score higher (more room)
+    assert score_candidate(a) > score_candidate(b)
+
+
+def test_score_tier_headroom_bonus():
+    """20x account at 85% has more headroom than pro at 85%."""
+    a = _acct(1, usage_5h=85, rate_limit_tier="default_claude_max_20x")
+    b = _acct(2, usage_5h=85, rate_limit_tier="pro", subscription_type="pro")
+    # 20x has 10% headroom (95-85), pro has 0% (80-85 clamped to 0)
+    assert score_candidate(a) > score_candidate(b)

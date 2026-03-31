@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -108,19 +109,49 @@ def _minutes_until(
 # ---------------------------------------------------------------------------
 
 def score_candidate(account: dict) -> float:
-    """Score an account as a swap target.  Higher is better."""
+    """Score an account for swap-to suitability. Higher is better.
+
+    Considers:
+    - 5h utilization (most weight)
+    - 7d utilization weighted by remaining days in window
+    - Tier-aware headroom (room before hitting tier's critical threshold)
+    - Inactive 5h window bonus (encourages opening them)
+    """
     score = 100.0
+    score -= (account.get("cached_usage_5h") or 0)
 
-    usage_5h = account.get("cached_usage_5h") or 0
+    # 7-day: weight by remaining time in window.
+    # Account resetting sooner has burned through more of its window and has
+    # less capacity left per day. Account resetting later has more room.
     usage_7d = account.get("cached_usage_7d") or 0
+    resets_7d = account.get("cached_7d_resets_at")
+    if resets_7d:
+        try:
+            reset_dt = datetime.fromisoformat(resets_7d.replace("Z", "+00:00"))
+            days_left = max(0.1, (reset_dt - datetime.now(timezone.utc)).total_seconds() / 86400)
+            days_factor = min(days_left / 7.0, 1.0)  # 0-1: more days = more room
+            score -= usage_7d * (1.0 - days_factor)  # penalize less when more days remain
+        except (ValueError, TypeError):
+            score -= usage_7d * 0.5
+    else:
+        score -= usage_7d * 0.5
 
-    score -= usage_5h
-    score -= usage_7d * 0.5
+    # Tier-aware headroom: bonus for accounts with more room before their tier limit
+    tier_crit = tier_critical_threshold(account)
+    headroom = max(0, tier_crit - (account.get("cached_usage_5h") or 0))
+    score += headroom * 0.3
 
-    # Inactive-window bonus: resets_at is None (never opened) or in the past.
-    resets_at = account.get("cached_5h_resets_at")
-    if resets_at is None or resets_at < time.time():
-        score += 15
+    # Bonus for inactive/expired 5h window — encourages opening them
+    resets_5h = account.get("cached_5h_resets_at")
+    if not resets_5h:
+        score += 15.0
+    else:
+        try:
+            r = datetime.fromisoformat(resets_5h.replace("Z", "+00:00"))
+            if r < datetime.now(timezone.utc):
+                score += 15.0
+        except (ValueError, TypeError):
+            pass
 
     return score
 
