@@ -383,6 +383,7 @@ function renderAccounts(accounts) {
                     </button>
                 </div>
             </div>
+            ${typeof renderAutoSwapPanel === 'function' ? renderAutoSwapPanel() : ''}
             ${tipHtml}
             ${bannerHtml}
             <div id="oauth-flow-status"></div>
@@ -391,7 +392,6 @@ function renderAccounts(accounts) {
             <div id="accounts-list" class="flex flex-col gap-3">
                 ${cardsHtml}
             </div>
-            ${typeof renderAutoSwapPanel === 'function' ? renderAutoSwapPanel() : ''}
         </div>
     `;
 }
