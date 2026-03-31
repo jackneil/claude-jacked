@@ -1,24 +1,29 @@
-"""Background usage monitor — orchestrates auto-swap and window keeper.
+"""Background usage monitor — two independent loops for active-account
+polling and full-sweep (window keeper + bulk usage refresh).
 
-Runs as a single asyncio task started from main.py lifespan.  Reads
-settings from the DB each tick so changes take effect without restart.
-Window keeper runs BEFORE auto-swap so freshly pinged accounts get
-correct evaluation ordering.
+Started from main.py lifespan as separate asyncio tasks.  Each loop has
+its own ``while True`` with ``try/except`` — one loop crashing does NOT
+affect the other.  Both read settings from DB each tick so changes take
+effect without restart.
 """
 
 import asyncio
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Module-level state for burn-rate tracking and exhaustion cooldown.
+# Module-level state — shared between loops.
+# Only the active poll loop writes to _burn_rates.
 _burn_rates: dict[int, object] = {}
 _last_exhaustion_warning: float = 0.0
 _EXHAUSTION_COOLDOWN_SECONDS = 1800  # 30 minutes
+
+# Track consecutive unchanged ticks per account for burn-rate decay.
+_burn_rate_unchanged_ticks: dict[int, int] = {}
 
 
 def _read_active_account_id() -> int | None:
@@ -61,47 +66,38 @@ def _setting_str(db, key: str, default: str) -> str:
     return val if val is not None else default
 
 
-async def usage_monitor_loop(app):
-    """Background loop that checks usage and triggers auto-swap / window keeper.
+# -----------------------------------------------------------------------
+# Loop 1 — Active account poll (60s)
+# -----------------------------------------------------------------------
 
-    Never crashes — all errors are caught and logged per tick.
+async def active_account_poll_loop(app):
+    """Poll the active account every 60s for fast threshold detection.
+
+    Handles auto-swap decisions, TOCTOU guard, burn-rate tracking with
+    decay, and descriptive swap reason strings.  Never crashes — all
+    errors are caught and logged per tick.
     """
     global _last_exhaustion_warning
 
-    _default_interval = 300  # fallback if settings read fails
-
     while True:
-        check_interval = _default_interval
         try:
             db = getattr(app.state, "db", None)
             if db is None:
                 await asyncio.sleep(60)
                 continue
 
-            # ----------------------------------------------------------
-            # 1. Read settings
-            # ----------------------------------------------------------
+            # -- Settings ------------------------------------------------
             auto_swap_enabled = _setting_bool(db, "auto_swap_enabled", False)
-            window_keeper_enabled = _setting_bool(db, "window_keeper_enabled", False)
-            check_interval = _setting_float(db, "usage_check_interval", 300)
+            if not auto_swap_enabled:
+                await asyncio.sleep(60)
+                continue
+
             critical_5h = _setting_float(db, "auto_swap_5h_critical", 90)
             warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
             threshold_7d = _setting_float(db, "auto_swap_7d_threshold", 85)
-            wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
-            wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
-            wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
+            check_interval = _setting_float(db, "usage_check_interval", 300)
 
-            # ----------------------------------------------------------
-            # 2. Skip if nothing enabled
-            # ----------------------------------------------------------
-            if not auto_swap_enabled and not window_keeper_enabled:
-                await asyncio.sleep(check_interval)
-                continue
-
-            # ----------------------------------------------------------
-            # 3. Fetch usage for all active accounts
-            # ----------------------------------------------------------
-            # Late imports to avoid circular deps
+            # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
             from jacked.api.credential_helpers import (
                 read_fresh_active_token,
@@ -111,7 +107,246 @@ async def usage_monitor_loop(app):
                 should_swap,
                 pick_best_target,
                 update_burn_rate,
+                tier_critical_threshold,
             )
+
+            # -- Active account ID ---------------------------------------
+            active_acct_id = _read_active_account_id()
+            if active_acct_id is None:
+                logger.debug("Active poll: no active account in credential file")
+                await asyncio.sleep(60)
+                continue
+
+            # -- Fetch usage (fresh token, bypasses cache) ---------------
+            effective_token = read_fresh_active_token(active_acct_id)
+            await fetch_usage(
+                active_acct_id, db, access_token=effective_token,
+            )
+
+            # -- Read active account data from DB ------------------------
+            accounts = db.list_accounts(include_inactive=False)
+            active_acct = None
+            for acct in accounts:
+                if acct["id"] == active_acct_id:
+                    active_acct = acct
+                    break
+
+            if active_acct is None:
+                logger.debug(
+                    "Active poll: account %d not in active account list",
+                    active_acct_id,
+                )
+                await asyncio.sleep(60)
+                continue
+
+            usage_5h = active_acct.get("cached_usage_5h")
+            usage_7d = active_acct.get("cached_usage_7d")
+
+            # -- Burn rate (skip if usage unchanged) ---------------------
+            prev = _burn_rates.get(active_acct_id)
+            current_5h_val = usage_5h or 0
+
+            if prev is not None and current_5h_val == prev.last_check_5h:
+                # Usage unchanged — track consecutive ticks
+                ticks = _burn_rate_unchanged_ticks.get(active_acct_id, 0) + 1
+                _burn_rate_unchanged_ticks[active_acct_id] = ticks
+                # Decay after 5+ unchanged ticks, but only when below warning
+                if ticks >= 5 and current_5h_val < warning_5h:
+                    prev.rate_5h_per_min *= 0.8
+                    prev.rate_7d_per_min *= 0.8
+                br = prev
+            else:
+                # Usage changed — update burn rate and reset tick counter
+                _burn_rate_unchanged_ticks[active_acct_id] = 0
+                br = update_burn_rate(
+                    _burn_rates, active_acct_id,
+                    current_5h=current_5h_val,
+                    current_7d=usage_7d or 0,
+                )
+
+            # -- Tier-aware threshold ------------------------------------
+            tier_crit = tier_critical_threshold(active_acct)
+            effective_critical = max(tier_crit, critical_5h)
+
+            # -- Should swap? --------------------------------------------
+            if should_swap(
+                usage_5h=usage_5h,
+                usage_7d=usage_7d,
+                critical_5h=effective_critical,
+                warning_5h=warning_5h,
+                threshold_7d=threshold_7d,
+                burn_rate=br,
+                check_interval_min=check_interval / 60,
+            ):
+                target = pick_best_target(
+                    accounts, current_id=active_acct_id,
+                    threshold_7d=threshold_7d,
+                )
+
+                ws_registry = getattr(app.state, "ws_registry", None)
+
+                if target is not None:
+                    # -- TOCTOU guard: re-read active ID before swap ------
+                    current_active = _read_active_account_id()
+                    if current_active != active_acct_id:
+                        logger.info(
+                            "Active poll: active account changed from %d to %s "
+                            "during swap evaluation — skipping swap",
+                            active_acct_id, current_active,
+                        )
+                        # continue, NOT return — loop keeps running
+                        await asyncio.sleep(60)
+                        continue
+
+                    # -- Build descriptive reason -------------------------
+                    tier_match = None
+                    try:
+                        import re
+                        tier_str = (active_acct.get("rate_limit_tier") or "").lower()
+                        tier_match = re.search(r"(\d+)x", tier_str)
+                    except Exception:
+                        pass
+                    tier_label = f" (tier {tier_match.group(1)}x)" if tier_match else ""
+
+                    if usage_5h is not None and usage_5h >= effective_critical:
+                        reason = (
+                            f"5h critical: {usage_5h:.1f}% >= "
+                            f"{effective_critical:.0f}%{tier_label}"
+                        )
+                    elif usage_7d is not None and usage_7d >= threshold_7d:
+                        reason = (
+                            f"7d threshold: {usage_7d:.1f}% >= "
+                            f"{threshold_7d:.0f}%"
+                        )
+                    else:
+                        projected = usage_5h or 0
+                        if br and br.rate_5h_per_min > 0:
+                            mins = (check_interval / 60) * 2
+                            projected = (usage_5h or 0) + br.rate_5h_per_min * mins
+                        reason = (
+                            f"burn-rate projection: {usage_5h:.1f}% -> "
+                            f"{projected:.1f}% in {int((check_interval / 60) * 2)}min"
+                        )
+
+                    logger.info(
+                        "Auto-swap: switching from account %d (5h=%.1f%%) "
+                        "to account %d (5h=%.1f%%) — %s",
+                        active_acct_id, usage_5h or 0,
+                        target["id"],
+                        target.get("cached_usage_5h") or 0,
+                        reason,
+                    )
+                    sync_credential_to_all_stores(
+                        target["id"], target,
+                        email=target.get("email"),
+                    )
+                    db.record_swap(
+                        from_account_id=active_acct_id,
+                        to_account_id=target["id"],
+                        reason=reason,
+                        trigger="auto_swap",
+                        from_5h=usage_5h,
+                        from_7d=usage_7d,
+                        to_5h=target.get("cached_usage_5h"),
+                        to_7d=target.get("cached_usage_7d"),
+                    )
+
+                    # Re-seed burn rate for new active account
+                    _burn_rates.pop(target["id"], None)
+                    _burn_rate_unchanged_ticks.pop(target["id"], None)
+
+                    if ws_registry:
+                        await ws_registry.broadcast(
+                            "auto_swap_triggered",
+                            {
+                                "from_account_id": active_acct_id,
+                                "to_account_id": target["id"],
+                                "reason": reason,
+                            },
+                        )
+                else:
+                    # No eligible target — cooldown to avoid log spam
+                    now_ts = time.time()
+                    if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
+                        logger.warning(
+                            "Auto-swap needed but no eligible target "
+                            "(active account %d at 5h=%.1f%%)",
+                            active_acct_id, usage_5h or 0,
+                        )
+                        _last_exhaustion_warning = now_ts
+
+                    # Compute next_recovery_at from earliest cached_5h_resets_at
+                    next_recovery_at = None
+                    now_utc = datetime.now(timezone.utc)
+                    for acct in accounts:
+                        resets = acct.get("cached_5h_resets_at")
+                        if not resets:
+                            continue
+                        try:
+                            r = datetime.fromisoformat(
+                                resets.replace("Z", "+00:00"),
+                            )
+                            if r > now_utc and (
+                                next_recovery_at is None or r < next_recovery_at
+                            ):
+                                next_recovery_at = r
+                        except (ValueError, TypeError):
+                            continue
+
+                    if ws_registry:
+                        await ws_registry.broadcast(
+                            "all_accounts_exhausted",
+                            {
+                                "active_account_id": active_acct_id,
+                                "usage_5h": usage_5h,
+                                "usage_7d": usage_7d,
+                                "next_recovery_at": (
+                                    next_recovery_at.isoformat()
+                                    if next_recovery_at else None
+                                ),
+                            },
+                        )
+
+        except asyncio.CancelledError:
+            logger.info("Active account poll loop cancelled — shutting down")
+            raise
+        except Exception:
+            logger.warning("Active account poll loop error", exc_info=True)
+
+        await asyncio.sleep(60)
+
+
+# -----------------------------------------------------------------------
+# Loop 2 — Full sweep (configurable interval, default 5min)
+# -----------------------------------------------------------------------
+
+async def full_sweep_loop(app):
+    """Fetch usage for all non-active accounts and run window keeper.
+
+    Runs at the user-configurable ``usage_check_interval`` (default 300s).
+    Never crashes — all errors are caught and logged per tick.
+    """
+    _default_interval = 300
+
+    while True:
+        check_interval = _default_interval
+        try:
+            db = getattr(app.state, "db", None)
+            if db is None:
+                await asyncio.sleep(60)
+                continue
+
+            # -- Settings ------------------------------------------------
+            window_keeper_enabled = _setting_bool(db, "window_keeper_enabled", False)
+            check_interval = _setting_float(db, "usage_check_interval", 300)
+
+            if not window_keeper_enabled:
+                await asyncio.sleep(check_interval)
+                continue
+
+            # -- Late imports --------------------------------------------
+            from jacked.web.auth import fetch_usage
+            from jacked.api.credential_helpers import read_fresh_active_token
             from jacked.web.window_keeper import (
                 is_active_hours,
                 is_prewake_time,
@@ -119,176 +354,63 @@ async def usage_monitor_loop(app):
                 ping_account,
             )
 
-            accounts = db.list_accounts(include_inactive=False)
-
-            # Determine which account is active for fresh token reads
+            # -- Fetch usage for ALL non-active accounts -----------------
             active_acct_id = _read_active_account_id()
+            accounts = db.list_accounts(include_inactive=False)
 
             for acct in accounts:
                 acct_id = acct["id"]
-                effective_token = None
                 if acct_id == active_acct_id:
-                    effective_token = read_fresh_active_token(acct_id)
-
+                    continue  # active account handled by poll loop
+                effective_token = None
                 result = await fetch_usage(
                     acct_id, db, access_token=effective_token,
                 )
-                # _cached means data is fresh — not an error
-                # None means API error — DB still has cached values
                 if result and not result.get("_cached"):
                     logger.debug(
-                        "Usage fetched for account %d in monitor loop", acct_id,
+                        "Usage fetched for account %d in full sweep", acct_id,
                     )
+                await asyncio.sleep(1)  # pacing
 
-                # Pace between accounts
-                await asyncio.sleep(1)
+            # -- Window keeper -------------------------------------------
+            wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
+            wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
+            wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
 
-            # ----------------------------------------------------------
-            # 4. Re-read accounts with fresh usage data
-            # ----------------------------------------------------------
+            # Re-read accounts after usage fetch for fresh data
             accounts = db.list_accounts(include_inactive=False)
 
-            # ----------------------------------------------------------
-            # 5. Window keeper FIRST
-            # ----------------------------------------------------------
-            if window_keeper_enabled:
-                now = datetime.now()
-                should_ping = (
-                    is_active_hours(now, start=wk_start, end=wk_end)
-                    or is_prewake_time(
-                        now, prewake=wk_prewake,
-                        check_interval_min=check_interval / 60,
-                    )
-                )
-
-                if should_ping:
-                    for acct in accounts:
-                        if not needs_ping(acct.get("cached_5h_resets_at")):
-                            continue
-                        if not acct.get("auto_swap_enabled"):
-                            continue
-                        cc_rt = acct.get("cc_refresh_token")
-                        if not cc_rt:
-                            continue
-
-                        scopes = acct.get("scopes") or ""
-                        logger.info(
-                            "Window keeper: pinging account %d (%s)",
-                            acct["id"], acct.get("email", "?"),
-                        )
-                        await ping_account(cc_rt, scopes)
-                        await asyncio.sleep(2)  # Pace between pings
-
-            # ----------------------------------------------------------
-            # 6. Auto-swap SECOND
-            # ----------------------------------------------------------
-            if auto_swap_enabled:
-                active_acct_id = _read_active_account_id()
-                if active_acct_id is None:
-                    logger.debug("Auto-swap: no active account in credential file")
-                    await asyncio.sleep(check_interval)
-                    continue
-
-                # Find the active account's usage from DB
-                active_acct = None
-                for acct in accounts:
-                    if acct["id"] == active_acct_id:
-                        active_acct = acct
-                        break
-
-                if active_acct is None:
-                    logger.debug(
-                        "Auto-swap: active account %d not in active account list",
-                        active_acct_id,
-                    )
-                    await asyncio.sleep(check_interval)
-                    continue
-
-                usage_5h = active_acct.get("cached_usage_5h")
-                usage_7d = active_acct.get("cached_usage_7d")
-
-                # Track velocity
-                br = update_burn_rate(
-                    _burn_rates, active_acct_id,
-                    current_5h=usage_5h or 0,
-                    current_7d=usage_7d or 0,
-                )
-
-                if should_swap(
-                    usage_5h=usage_5h,
-                    usage_7d=usage_7d,
-                    critical_5h=critical_5h,
-                    warning_5h=warning_5h,
-                    threshold_7d=threshold_7d,
-                    burn_rate=br,
+            now = datetime.now()
+            should_ping = (
+                is_active_hours(now, start=wk_start, end=wk_end)
+                or is_prewake_time(
+                    now, prewake=wk_prewake,
                     check_interval_min=check_interval / 60,
-                ):
-                    target = pick_best_target(
-                        accounts, current_id=active_acct_id,
-                        threshold_7d=threshold_7d,
+                )
+            )
+
+            if should_ping:
+                for acct in accounts:
+                    if not needs_ping(acct.get("cached_5h_resets_at")):
+                        continue
+                    if not acct.get("auto_swap_enabled"):
+                        continue
+                    cc_rt = acct.get("cc_refresh_token")
+                    if not cc_rt:
+                        continue
+
+                    scopes = acct.get("scopes") or ""
+                    logger.info(
+                        "Window keeper: pinging account %d (%s)",
+                        acct["id"], acct.get("email", "?"),
                     )
-
-                    ws_registry = getattr(app.state, "ws_registry", None)
-
-                    if target is not None:
-                        logger.info(
-                            "Auto-swap: switching from account %d (5h=%.1f%%) "
-                            "to account %d (5h=%.1f%%)",
-                            active_acct_id, usage_5h or 0,
-                            target["id"],
-                            target.get("cached_usage_5h") or 0,
-                        )
-                        sync_credential_to_all_stores(
-                            target["id"], target,
-                            email=target.get("email"),
-                        )
-                        reason = (
-                            f"5h={usage_5h:.1f}% "
-                            f"(critical={critical_5h}%)"
-                        )
-                        db.record_swap(
-                            from_account_id=active_acct_id,
-                            to_account_id=target["id"],
-                            reason=reason,
-                            trigger="auto_swap",
-                            from_5h=usage_5h,
-                            from_7d=usage_7d,
-                            to_5h=target.get("cached_usage_5h"),
-                            to_7d=target.get("cached_usage_7d"),
-                        )
-                        if ws_registry:
-                            await ws_registry.broadcast(
-                                "auto_swap_triggered",
-                                {
-                                    "from_account_id": active_acct_id,
-                                    "to_account_id": target["id"],
-                                    "reason": reason,
-                                },
-                            )
-                    else:
-                        # No eligible target — cooldown to avoid log spam
-                        now_ts = time.time()
-                        if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
-                            logger.warning(
-                                "Auto-swap needed but no eligible target "
-                                "(active account %d at 5h=%.1f%%)",
-                                active_acct_id, usage_5h or 0,
-                            )
-                            _last_exhaustion_warning = now_ts
-                        if ws_registry:
-                            await ws_registry.broadcast(
-                                "all_accounts_exhausted",
-                                {
-                                    "active_account_id": active_acct_id,
-                                    "usage_5h": usage_5h,
-                                    "usage_7d": usage_7d,
-                                },
-                            )
+                    await ping_account(cc_rt, scopes)
+                    await asyncio.sleep(2)  # pacing
 
         except asyncio.CancelledError:
-            logger.info("Usage monitor loop cancelled — shutting down")
+            logger.info("Full sweep loop cancelled — shutting down")
             raise
         except Exception:
-            logger.warning("Usage monitor loop error", exc_info=True)
+            logger.warning("Full sweep loop error", exc_info=True)
 
         await asyncio.sleep(check_interval)

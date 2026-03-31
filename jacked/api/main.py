@@ -20,7 +20,7 @@ from jacked.api.watchers import (
     process_alive_sweeper_loop,
     session_accounts_watch_loop,
 )
-from jacked.api.usage_monitor import usage_monitor_loop
+from jacked.api.usage_monitor import active_account_poll_loop, full_sweep_loop
 from jacked.api.log_capture import server_log_buffer
 from jacked.api.websocket import WebSocketRegistry
 
@@ -142,18 +142,20 @@ async def lifespan(app: FastAPI):
     logs_watch_task = asyncio.create_task(logs_watch_loop(app))
     sweeper_task = asyncio.create_task(process_alive_sweeper_loop(app))
     heal_task = asyncio.create_task(_heal_sweep_loop())
-    usage_monitor_task = asyncio.create_task(usage_monitor_loop(app))
+    active_poll_task = asyncio.create_task(active_account_poll_loop(app))
+    full_sweep_task = asyncio.create_task(full_sweep_loop(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started logs watcher (every 3s)")
     logger.info("Started process-alive sweeper (every 60s)")
     logger.info("Started heal sweep (every 5min)")
-    logger.info("Started usage monitor loop")
+    logger.info("Started active account poll loop (60s)")
+    logger.info("Started full sweep loop")
 
     yield
 
     # Shutdown: cancel background tasks
-    for task in (refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task, usage_monitor_task):
+    for task in (refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task, active_poll_task, full_sweep_task):
         task.cancel()
         try:
             await task

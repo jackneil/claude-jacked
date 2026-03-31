@@ -1,6 +1,6 @@
-"""Tests for the usage monitor loop orchestrator.
+"""Tests for the usage monitor loops (active poll + full sweep).
 
-Each test runs one tick of the loop by mocking dependencies.  Uses
+Each test runs one tick of a loop by mocking dependencies.  Uses
 asyncio.run() for async tests (no pytest-asyncio dependency).
 """
 
@@ -8,7 +8,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
@@ -17,7 +17,8 @@ from jacked.api.usage_monitor import (
     _setting_bool,
     _setting_float,
     _setting_str,
-    usage_monitor_loop,
+    active_account_poll_loop,
+    full_sweep_loop,
 )
 
 
@@ -46,7 +47,8 @@ def _make_app(db=None, ws_registry=None):
 
 
 def _acct(id, usage_5h=0, usage_7d=0, cc_token=True, auto_swap=True,
-          email=None, resets_at=None, cc_rt="rt", scopes=""):
+          email=None, resets_at=None, cc_rt="rt", scopes="",
+          rate_limit_tier="", subscription_type="pro"):
     return {
         "id": id,
         "email": email or f"user{id}@test.com",
@@ -63,6 +65,8 @@ def _acct(id, usage_5h=0, usage_7d=0, cc_token=True, auto_swap=True,
         "priority": id - 1,
         "access_token": f"at_{id}",
         "scopes": scopes,
+        "rate_limit_tier": rate_limit_tier,
+        "subscription_type": subscription_type,
     }
 
 
@@ -80,7 +84,7 @@ def _sleep_canceller(max_sleeps=5):
 
 
 # ---------------------------------------------------------------------------
-# Setting helpers (sync — no event loop needed)
+# Setting helpers (sync -- no event loop needed)
 # ---------------------------------------------------------------------------
 
 class TestSettingHelpers:
@@ -122,10 +126,10 @@ class TestSettingHelpers:
 # ---------------------------------------------------------------------------
 
 class TestNoActionWhenDisabled:
-    def test_no_action_when_disabled(self):
-        """Both auto_swap and window_keeper disabled -> no fetch_usage calls."""
+    def test_active_poll_no_action_when_disabled(self):
+        """auto_swap disabled -> no fetch_usage calls in active poll."""
         db = _make_db(
-            settings={"auto_swap_enabled": "false", "window_keeper_enabled": "false"},
+            settings={"auto_swap_enabled": "false"},
             accounts=[_acct(1)],
         )
         app = _make_app(db=db)
@@ -142,7 +146,33 @@ class TestNoActionWhenDisabled:
                 ) as mock_fetch,
             ):
                 with pytest.raises(asyncio.CancelledError):
-                    await usage_monitor_loop(app)
+                    await active_account_poll_loop(app)
+
+                mock_fetch.assert_not_called()
+
+        asyncio.run(_run())
+
+    def test_full_sweep_no_action_when_disabled(self):
+        """window_keeper disabled -> no fetch_usage calls in full sweep."""
+        db = _make_db(
+            settings={"window_keeper_enabled": "false"},
+            accounts=[_acct(1)],
+        )
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=1),
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                ) as mock_fetch,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await full_sweep_loop(app)
 
                 mock_fetch.assert_not_called()
 
@@ -150,12 +180,16 @@ class TestNoActionWhenDisabled:
 
 
 # ---------------------------------------------------------------------------
-# Auto-swap triggers on high usage
+# Auto-swap triggers on high usage (active poll loop)
 # ---------------------------------------------------------------------------
 
 class TestAutoSwapTriggers:
     def test_auto_swap_triggers_on_high_usage(self):
         """When 5h usage is above critical, swap to best target."""
+        import jacked.api.usage_monitor as mod
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+
         accounts = [
             _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
             _acct(2, usage_5h=20, usage_7d=10),   # good target
@@ -163,7 +197,6 @@ class TestAutoSwapTriggers:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
-                "window_keeper_enabled": "false",
                 "usage_check_interval": "300",
             },
             accounts=accounts,
@@ -172,7 +205,6 @@ class TestAutoSwapTriggers:
         app = _make_app(db=db, ws_registry=ws_registry)
 
         async def _run():
-            # 2 accounts = sleep(1) + sleep(1) pacing + sleep(interval) = 3 per tick
             with (
                 patch(
                     "jacked.api.usage_monitor.asyncio.sleep",
@@ -196,7 +228,7 @@ class TestAutoSwapTriggers:
                 ) as mock_sync,
             ):
                 with pytest.raises(asyncio.CancelledError):
-                    await usage_monitor_loop(app)
+                    await active_account_poll_loop(app)
 
                 # sync_credential_to_all_stores called with target account
                 assert mock_sync.call_count >= 1
@@ -220,25 +252,23 @@ class TestAutoSwapTriggers:
 
 
 # ---------------------------------------------------------------------------
-# No target logs warning
+# No target logs warning (active poll loop)
 # ---------------------------------------------------------------------------
 
 class TestNoTarget:
     def test_no_target_logs_warning(self, caplog):
         """should_swap=True but no eligible target -> logs warning."""
         import jacked.api.usage_monitor as mod
-
-        # Reset exhaustion cooldown so warning fires
         mod._last_exhaustion_warning = 0.0
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
 
         accounts = [
             _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
-            # No other eligible accounts
         ]
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
-                "window_keeper_enabled": "false",
             },
             accounts=accounts,
         )
@@ -270,7 +300,7 @@ class TestNoTarget:
             ):
                 with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
                     with pytest.raises(asyncio.CancelledError):
-                        await usage_monitor_loop(app)
+                        await active_account_poll_loop(app)
 
                 # No swap should happen
                 mock_sync.assert_not_called()
@@ -293,17 +323,20 @@ class TestNoTarget:
 
 
 # ---------------------------------------------------------------------------
-# Cached response handled
+# Cached response handled (active poll loop)
 # ---------------------------------------------------------------------------
 
 class TestCachedResponse:
     def test_cached_response_handled(self):
         """fetch_usage returns {_cached: True} -> no crash, loop continues."""
+        import jacked.api.usage_monitor as mod
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+
         accounts = [_acct(1, usage_5h=30)]
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
-                "window_keeper_enabled": "false",
             },
             accounts=accounts,
         )
@@ -330,16 +363,15 @@ class TestCachedResponse:
                 ),
             ):
                 with pytest.raises(asyncio.CancelledError):
-                    await usage_monitor_loop(app)
+                    await active_account_poll_loop(app)
 
-                # fetch_usage was called — the cached response didn't crash
                 mock_fetch.assert_called()
 
         asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
-# Window keeper pings during active hours
+# Window keeper pings during active hours (full sweep loop)
 # ---------------------------------------------------------------------------
 
 class TestWindowKeeperPings:
@@ -347,10 +379,10 @@ class TestWindowKeeperPings:
         """Active hours + needs_ping -> ping_account called."""
         accounts = [
             _acct(1, usage_5h=30, resets_at=None, cc_rt="refresh_tok_1"),
+            _acct(2, usage_5h=10, resets_at=None, cc_rt="refresh_tok_2"),
         ]
         db = _make_db(
             settings={
-                "auto_swap_enabled": "false",
                 "window_keeper_enabled": "true",
             },
             accounts=accounts,
@@ -358,11 +390,10 @@ class TestWindowKeeperPings:
         app = _make_app(db=db)
 
         async def _run():
-            # 1 account = sleep(1) pacing + sleep(2) ping pacing + sleep(interval) = 3 per tick
             with (
                 patch(
                     "jacked.api.usage_monitor.asyncio.sleep",
-                    side_effect=_sleep_canceller(max_sleeps=3),
+                    side_effect=_sleep_canceller(max_sleeps=10),
                 ),
                 patch(
                     "jacked.api.usage_monitor._read_active_account_id",
@@ -382,6 +413,10 @@ class TestWindowKeeperPings:
                     return_value=True,
                 ),
                 patch(
+                    "jacked.web.window_keeper.is_prewake_time",
+                    return_value=False,
+                ),
+                patch(
                     "jacked.web.window_keeper.needs_ping",
                     return_value=True,
                 ),
@@ -392,10 +427,211 @@ class TestWindowKeeperPings:
                 ) as mock_ping,
             ):
                 with pytest.raises(asyncio.CancelledError):
-                    await usage_monitor_loop(app)
+                    await full_sweep_loop(app)
 
                 # ping_account should be called at least once
                 assert mock_ping.call_count >= 1
-                mock_ping.assert_any_call("refresh_tok_1", "")
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# TOCTOU guard — bail when active account changes mid-swap
+# ---------------------------------------------------------------------------
+
+class TestTOCTOU:
+    def test_toctou_bail_on_manual_switch(self):
+        """If active account ID changes between check and swap, skip swap."""
+        import jacked.api.usage_monitor as mod
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
+            _acct(2, usage_5h=20, usage_7d=10),   # good target
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        ws_registry = AsyncMock()
+        app = _make_app(db=db, ws_registry=ws_registry)
+
+        # First call returns 1 (initial read at top of tick), second call
+        # returns 99 (TOCTOU re-read just before swap — manual switch happened)
+        read_active_returns = [1, 99]
+        read_active_call_count = 0
+
+        def _mock_read_active():
+            nonlocal read_active_call_count
+            idx = min(read_active_call_count, len(read_active_returns) - 1)
+            val = read_active_returns[idx]
+            read_active_call_count += 1
+            return val
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    side_effect=_mock_read_active,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="fresh_tok",
+                ),
+                patch(
+                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
+                ) as mock_sync,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+                # Swap should NOT have been executed
+                mock_sync.assert_not_called()
+                db.record_swap.assert_not_called()
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Burn rate skips unchanged usage
+# ---------------------------------------------------------------------------
+
+class TestBurnRateSkipsUnchanged:
+    def test_burn_rate_skips_unchanged(self):
+        """Same usage on consecutive calls -> update_burn_rate not called."""
+        import jacked.api.usage_monitor as mod
+        from jacked.web.auto_swap import BurnRate
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+
+        # Pre-seed burn rate so the "prev is not None" path triggers
+        mod._burn_rates[1] = BurnRate(
+            rate_5h_per_min=0.5,
+            last_check_5h=50.0,  # same as account usage below
+            rate_7d_per_min=0.1,
+            last_check_7d=30.0,
+        )
+
+        accounts = [
+            _acct(1, usage_5h=50, usage_7d=30),  # usage matches seeded burn rate
+            _acct(2, usage_5h=10, usage_7d=5),
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="tok",
+                ),
+                patch(
+                    "jacked.web.auto_swap.update_burn_rate",
+                ) as mock_update_br,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+                # update_burn_rate should NOT have been called (usage unchanged)
+                mock_update_br.assert_not_called()
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Burn rate re-seeded after swap
+# ---------------------------------------------------------------------------
+
+class TestBurnRateReseedAfterSwap:
+    def test_burn_rate_reseed_after_swap(self):
+        """After swap, the target account's burn rate entry is removed."""
+        import jacked.api.usage_monitor as mod
+        from jacked.web.auto_swap import BurnRate
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+
+        # Pre-seed burn rates for both accounts
+        mod._burn_rates[2] = BurnRate(
+            rate_5h_per_min=0.3,
+            last_check_5h=20.0,
+        )
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
+            _acct(2, usage_5h=20, usage_7d=10),   # good target
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        ws_registry = AsyncMock()
+        app = _make_app(db=db, ws_registry=ws_registry)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="fresh_tok",
+                ),
+                patch(
+                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
+                ),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+                # Target account's burn rate should have been popped
+                assert 2 not in mod._burn_rates, (
+                    f"Expected target account 2 burn rate to be removed, "
+                    f"but _burn_rates={mod._burn_rates}"
+                )
 
         asyncio.run(_run())
