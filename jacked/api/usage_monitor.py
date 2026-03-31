@@ -92,6 +92,20 @@ async def active_account_poll_loop(app):
                 await asyncio.sleep(60)
                 continue
 
+            # Check pause
+            paused_until_str = _setting_str(db, "auto_swap_paused_until", "")
+            if paused_until_str:
+                try:
+                    paused_until = datetime.fromisoformat(
+                        paused_until_str.replace("Z", "+00:00"),
+                    )
+                    if paused_until > datetime.now(timezone.utc):
+                        logger.debug("Auto-swap paused until %s", paused_until_str)
+                        await asyncio.sleep(60)
+                        continue
+                except (ValueError, TypeError):
+                    pass  # Invalid timestamp -- treat as not paused
+
             critical_5h = _setting_float(db, "auto_swap_5h_critical", 90)
             warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
             threshold_7d = _setting_float(db, "auto_swap_7d_threshold", 85)

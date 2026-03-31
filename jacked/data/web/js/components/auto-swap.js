@@ -39,6 +39,23 @@ function renderAutoSwapPanel() {
     const crit5h = s.auto_swap_5h_critical ?? 90;
     const thresh7d = s.auto_swap_7d_threshold ?? 85;
     const checkInterval = s.usage_check_interval ?? 300;
+    const pausedUntil = s.auto_swap_paused_until || null;
+
+    // Compute pause status
+    let pauseLabel = '';
+    let isPaused = false;
+    if (pausedUntil) {
+        const pauseEnd = new Date(pausedUntil);
+        const nowMs = Date.now();
+        const remainMs = pauseEnd.getTime() - nowMs;
+        if (remainMs > 0) {
+            isPaused = true;
+            const remainMin = Math.ceil(remainMs / 60000);
+            pauseLabel = remainMin >= 60
+                ? `${Math.floor(remainMin / 60)}h ${remainMin % 60}m`
+                : `${remainMin}m`;
+        }
+    }
 
     const wkEnabled = s.window_keeper_enabled || false;
     const activeStart = s.window_keeper_active_start || '06:00';
@@ -74,6 +91,24 @@ function renderAutoSwapPanel() {
                                         <input type="checkbox" id="chk-auto-swap" ${autoSwapEnabled ? 'checked' : ''}>
                                         <span class="toggle-slider"></span>
                                     </label>
+                                </div>
+
+                                <!-- Pause / Snooze -->
+                                <div class="flex items-center justify-between">
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-slate-400 text-sm">Pause Auto-Swap</span>
+                                        ${isPaused ? `<span class="text-xs px-2 py-0.5 bg-amber-600/20 text-amber-400 border border-amber-600/30 rounded">Paused — ${escapeHtml(pauseLabel)} left</span>` : ''}
+                                    </div>
+                                    <div class="flex items-center gap-1.5">
+                                        ${isPaused
+                                            ? '<button id="btn-swap-resume" class="text-xs px-2.5 py-1 bg-teal-600/20 text-teal-400 border border-teal-600/30 rounded hover:bg-teal-600/30 transition-colors">Resume</button>'
+                                            : `<select id="sel-swap-pause" class="bg-slate-700 border border-slate-600 text-slate-300 text-xs rounded px-2 py-1 cursor-pointer hover:border-slate-500 transition-colors">
+                                                    <option value="">Not paused</option>
+                                                    <option value="30">30 min</option>
+                                                    <option value="60">1 hour</option>
+                                                    <option value="120">2 hours</option>
+                                                </select>`}
+                                    </div>
                                 </div>
 
                                 <!-- 5h Warning Threshold -->
@@ -246,6 +281,36 @@ function bindAutoSwapEvents() {
                 const temp = document.createElement('div');
                 temp.insertAdjacentHTML('afterbegin', renderSwapLogTable(entries));
                 while (temp.firstChild) logContainer.appendChild(temp.firstChild);
+            }
+        });
+    }
+
+    // Pause / Resume
+    const pauseSel = document.getElementById('sel-swap-pause');
+    if (pauseSel) {
+        pauseSel.addEventListener('change', async () => {
+            const minutes = parseInt(pauseSel.value);
+            if (!minutes) return;
+            try {
+                const res = await api.post(`/api/settings/swap-pause?minutes=${minutes}`);
+                window.jackedState.swapSettings.auto_swap_paused_until = res.paused_until;
+                showToast(`Auto-swap paused for ${minutes} min`, 'success', 3000);
+                if (typeof renderPage === 'function') renderPage();
+            } catch (e) {
+                showToast(e.message || 'Failed to pause', 'error');
+            }
+        });
+    }
+    const resumeBtn = document.getElementById('btn-swap-resume');
+    if (resumeBtn) {
+        resumeBtn.addEventListener('click', async () => {
+            try {
+                await api.post('/api/settings/swap-resume');
+                window.jackedState.swapSettings.auto_swap_paused_until = null;
+                showToast('Auto-swap resumed', 'success', 2000);
+                if (typeof renderPage === 'function') renderPage();
+            } catch (e) {
+                showToast(e.message || 'Failed to resume', 'error');
             }
         });
     }

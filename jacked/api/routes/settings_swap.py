@@ -17,6 +17,7 @@ class SwapSettings(BaseModel):
     auto_swap_5h_critical: int = 90
     auto_swap_7d_threshold: int = 85
     usage_check_interval: int = 300
+    auto_swap_paused_until: Optional[str] = None
     window_keeper_enabled: bool = False
     window_keeper_active_start: str = "06:00"
     window_keeper_active_end: str = "23:00"
@@ -44,6 +45,7 @@ async def get_swap_settings(request: Request):
         auto_swap_5h_critical=int(_g("auto_swap_5h_critical", "90")),
         auto_swap_7d_threshold=int(_g("auto_swap_7d_threshold", "85")),
         usage_check_interval=int(_g("usage_check_interval", "300")),
+        auto_swap_paused_until=_g("auto_swap_paused_until", None) or None,
         window_keeper_enabled=_g("window_keeper_enabled", "false") == "true",
         window_keeper_active_start=_g("window_keeper_active_start", "06:00"),
         window_keeper_active_end=_g("window_keeper_active_end", "23:00"),
@@ -69,6 +71,28 @@ async def update_swap_settings(request: Request, body: SwapSettings):
     db.set_setting("window_keeper_prewake", body.window_keeper_prewake)
 
     return body
+
+
+@router.post("/swap-pause")
+async def pause_auto_swap(request: Request, minutes: int = 60):
+    """Pause auto-swap for the specified number of minutes."""
+    db = _get_db(request)
+    if db is None:
+        return {"error": "DB unavailable"}
+    from datetime import datetime, timezone, timedelta
+    pause_until = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+    db.set_setting("auto_swap_paused_until", pause_until)
+    return {"paused_until": pause_until, "minutes": minutes}
+
+
+@router.post("/swap-resume")
+async def resume_auto_swap(request: Request):
+    """Resume auto-swap immediately (clear the pause)."""
+    db = _get_db(request)
+    if db is None:
+        return {"error": "DB unavailable"}
+    db.set_setting("auto_swap_paused_until", "")
+    return {"resumed": True}
 
 
 @router.get("/swap-log")
