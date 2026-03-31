@@ -37,12 +37,12 @@ logger = logging.getLogger("jacked.oauth")
 # ---------------------------------------------------------------------------
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-AUTH_URL = "https://claude.ai/oauth/authorize"
+AUTH_URL = "https://claude.com/cai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 API_KEY_URL = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code"
+SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 CALLBACK_PORT_RANGE = range(45100, 45200)
 DEFAULT_TOKEN_TTL_SECONDS = 28800  # 8 hours — default token lifetime from Anthropic
