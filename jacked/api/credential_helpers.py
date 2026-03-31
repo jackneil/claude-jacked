@@ -16,6 +16,16 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _get_keychain_username() -> str:
+    """Get the system username for keychain account name.
+
+    Claude Code uses process.env.USER || userInfo().username as the
+    keychain account name (-a parameter). We must match this exactly
+    or we write to a different keychain entry.
+    """
+    return os.environ.get("USER") or os.environ.get("USERNAME") or "Claude Code"
+
+
 def _safe_replace(src: str, dst: str, *, retries: int = 3, delay: float = 0.1):
     """os.replace() with retry for Windows PermissionError.
 
@@ -141,15 +151,19 @@ def update_claude_config_email(
 def read_platform_credentials() -> dict | None:
     """Read credentials from the platform's native credential store.
 
-    macOS: Keychain ("Claude Code-credentials")
+    macOS: Keychain entry with service "Claude Code-credentials" and
+    account name matching the system username (same as Claude Code).
     Linux/Windows: not yet needed (still use .credentials.json)
 
-    Returns parsed dict (same shape as .credentials.json) or None."""
+    Returns parsed dict (same shape as .credentials.json) or None.
+    """
     if sys.platform != "darwin":
         return None
     try:
+        username = _get_keychain_username()
         result = subprocess.run(
             ["security", "find-generic-password",
+             "-a", username,
              "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=5,
         )
@@ -197,29 +211,32 @@ def read_fresh_active_token(account_id: int) -> str | None:
 def write_platform_credentials(data: dict) -> bool:
     """Write credentials to the platform's native credential store.
 
-    macOS: Keychain ("Claude Code-credentials")
+    macOS: Keychain entry with service "Claude Code-credentials" and
+    account name matching the system username.  Uses -X hex encoding
+    to match Claude Code's format (avoids plaintext in process args,
+    prevents CrowdStrike/process monitor exposure).
+
     Linux/Windows: no-op (they use .credentials.json)
 
     Returns True if written successfully, False otherwise.
 
     >>> write_platform_credentials({}) if sys.platform != "darwin" else True
-    True"""
+    True
+    """
     if sys.platform != "darwin":
         return True  # no-op on non-macOS (file write is sufficient)
     try:
+        username = _get_keychain_username()
         json_data = json.dumps(data, separators=(",", ":"))
-        # Delete existing entry (ignore failure if not found)
-        subprocess.run(
-            ["security", "delete-generic-password",
-             "-s", "Claude Code-credentials"],
-            capture_output=True, timeout=5,
-        )
-        # Add new entry
+        hex_value = json_data.encode("utf-8").hex()
+
+        # Use -U (update-or-insert) with -X (hex value) to match CC's format.
         result = subprocess.run(
             ["security", "add-generic-password",
+             "-U",
+             "-a", username,
              "-s", "Claude Code-credentials",
-             "-a", "Claude Code",
-             "-w", json_data],
+             "-X", hex_value],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:

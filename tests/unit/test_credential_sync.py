@@ -279,10 +279,10 @@ def test_sync_preserves_existing_keys():
 # ------------------------------------------------------------------
 
 
-def test_read_platform_credentials_macos():
-    """Reads credentials from macOS Keychain when on darwin.
+def test_read_platform_credentials_uses_user_account():
+    """Reads keychain with -a $USER to match Claude Code's entry.
 
-    >>> test_read_platform_credentials_macos()
+    >>> test_read_platform_credentials_uses_user_account()
     """
     keychain_json = json.dumps({
         "claudeAiOauth": {
@@ -296,13 +296,19 @@ def test_read_platform_credentials_macos():
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
-        mock.patch("jacked.api.credential_helpers.subprocess.run", return_value=mock_result),
+        mock.patch("jacked.api.credential_helpers.subprocess.run", return_value=mock_result) as mock_run,
+        mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = read_platform_credentials()
 
     assert result is not None
     assert result["claudeAiOauth"]["accessToken"] == "keychain_token"
+    # Verify the command uses -a with $USER
+    call_args = mock_run.call_args[0][0]
+    assert "-a" in call_args
+    a_idx = call_args.index("-a")
+    assert call_args[a_idx + 1] == "testuser"
 
 
 def test_read_platform_credentials_linux():
@@ -330,6 +336,7 @@ def test_read_platform_credentials_keychain_not_found():
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
         mock.patch("jacked.api.credential_helpers.subprocess.run", return_value=mock_result),
+        mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = read_platform_credentials()
@@ -349,6 +356,7 @@ def test_read_platform_credentials_malformed_json():
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
         mock.patch("jacked.api.credential_helpers.subprocess.run", return_value=mock_result),
+        mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = read_platform_credentials()
@@ -361,37 +369,47 @@ def test_read_platform_credentials_malformed_json():
 # ------------------------------------------------------------------
 
 
-def test_write_platform_credentials_macos():
-    """Writes credentials to macOS Keychain via security commands.
+def test_write_platform_credentials_uses_hex_and_user():
+    """Writes keychain with -X hex encoding and -a $USER to match Claude Code.
 
-    >>> test_write_platform_credentials_macos()
+    >>> test_write_platform_credentials_uses_hex_and_user()
     """
     cred_data = {
         "_jackedAccountId": 1,
         "claudeAiOauth": {"accessToken": "test_token"},
     }
-    mock_delete = mock.MagicMock()
-    mock_delete.returncode = 0
-    mock_add = mock.MagicMock()
-    mock_add.returncode = 0
+    mock_result = mock.MagicMock()
+    mock_result.returncode = 0
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
         mock.patch(
             "jacked.api.credential_helpers.subprocess.run",
-            side_effect=[mock_delete, mock_add],
+            return_value=mock_result,
         ) as mock_run,
+        mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = write_platform_credentials(cred_data)
 
     assert result is True
-    assert mock_run.call_count == 2
-    delete_args = mock_run.call_args_list[0][0][0]
-    assert "delete-generic-password" in delete_args
-    add_args = mock_run.call_args_list[1][0][0]
-    assert "add-generic-password" in add_args
-    assert "Claude Code-credentials" in add_args
+    # Should use -U (update-or-insert), single call (not delete-then-add)
+    assert mock_run.call_count == 1
+    call_args = mock_run.call_args[0][0]
+    assert "add-generic-password" in call_args
+    assert "-U" in call_args
+    # Verify -a uses $USER
+    a_idx = call_args.index("-a")
+    assert call_args[a_idx + 1] == "testuser"
+    # Verify -X is used (hex encoding) not -w
+    assert "-X" in call_args
+    assert "-w" not in call_args
+    # Verify the hex value decodes to the original JSON
+    x_idx = call_args.index("-X")
+    hex_value = call_args[x_idx + 1]
+    decoded = bytes.fromhex(hex_value).decode("utf-8")
+    decoded_data = json.loads(decoded)
+    assert decoded_data["_jackedAccountId"] == 1
 
 
 def test_write_platform_credentials_linux_noop():
@@ -411,18 +429,17 @@ def test_write_platform_credentials_keychain_error():
 
     >>> test_write_platform_credentials_keychain_error()
     """
-    mock_delete = mock.MagicMock()
-    mock_delete.returncode = 0
-    mock_add = mock.MagicMock()
-    mock_add.returncode = 1
-    mock_add.stderr = "errSecAuthFailed"
+    mock_result = mock.MagicMock()
+    mock_result.returncode = 1
+    mock_result.stderr = "errSecAuthFailed"
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
         mock.patch(
             "jacked.api.credential_helpers.subprocess.run",
-            side_effect=[mock_delete, mock_add],
+            return_value=mock_result,
         ),
+        mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = write_platform_credentials({"claudeAiOauth": {"accessToken": "x"}})
