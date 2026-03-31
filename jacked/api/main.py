@@ -277,6 +277,7 @@ async def websocket_endpoint(ws: WebSocket):
 # --- Include route modules ---
 
 from jacked.api.routes import system, analytics, features, logs, permissions, profiles  # noqa: E402
+from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
 
 app.include_router(system.router, prefix="/api", tags=["system"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
@@ -284,6 +285,7 @@ app.include_router(features.router, prefix="/api", tags=["features"])
 app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(permissions.router, prefix="/api", tags=["permissions"])
 app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
+app.include_router(swap_settings_router, prefix="/api/settings", tags=["settings"])
 
 # Auth routes (includes credential switching + session queries)
 try:
