@@ -84,11 +84,11 @@ async def usage_monitor_loop(app):
             auto_swap_enabled = _setting_bool(db, "auto_swap_enabled", False)
             window_keeper_enabled = _setting_bool(db, "window_keeper_enabled", False)
             check_interval = _setting_float(db, "usage_check_interval", 300)
-            critical_5h = _setting_float(db, "auto_swap_critical_5h", 90)
-            warning_5h = _setting_float(db, "auto_swap_warning_5h", 80)
-            threshold_7d = _setting_float(db, "auto_swap_threshold_7d", 85)
-            wk_start = _setting_str(db, "window_keeper_start", "06:00")
-            wk_end = _setting_str(db, "window_keeper_end", "23:00")
+            critical_5h = _setting_float(db, "auto_swap_5h_critical", 90)
+            warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
+            threshold_7d = _setting_float(db, "auto_swap_7d_threshold", 85)
+            wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
+            wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
             wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
 
             # ----------------------------------------------------------
