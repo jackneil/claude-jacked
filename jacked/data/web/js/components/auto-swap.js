@@ -63,6 +63,7 @@ function renderAutoSwapPanel() {
     const preWake = s.window_keeper_prewake || '04:00';
 
     return `
+        <div id="swap-exhaustion-banner" class="hidden mb-3"></div>
         <div class="mt-6">
             <div class="bg-slate-800 border border-slate-700 rounded-lg">
                 <!-- Collapsible Header -->
@@ -239,6 +240,44 @@ function renderSwapLogTable(entries) {
             </thead>
             <tbody>${rows}</tbody>
         </table>
+    `;
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustion banner (persistent, replaces disappearing toast)
+// ---------------------------------------------------------------------------
+
+function renderExhaustionBanner() {
+    const el = document.getElementById('swap-exhaustion-banner');
+    if (!el) return;
+    const data = window.jackedState._exhaustionData;
+    if (!data) {
+        el.innerHTML = '';
+        el.classList.add('hidden');
+        return;
+    }
+    let recoveryText = '';
+    if (data.next_recovery_at) {
+        const recoverAt = new Date(data.next_recovery_at);
+        const now = Date.now();
+        const diffMin = Math.max(0, Math.ceil((recoverAt.getTime() - now) / 60000));
+        if (diffMin > 60) {
+            recoveryText = `Next 5h window opens in ${Math.floor(diffMin/60)}h ${diffMin%60}m`;
+        } else if (diffMin > 0) {
+            recoveryText = `Next 5h window opens in ${diffMin}m`;
+        } else {
+            recoveryText = 'A 5h window should be opening soon';
+        }
+    }
+    el.classList.remove('hidden');
+    el.innerHTML = `
+        <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200 flex items-center gap-3">
+            <svg class="w-5 h-5 shrink-0 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+            <div>
+                <div class="font-medium">All accounts at capacity</div>
+                <div class="text-xs text-red-300 mt-0.5">${recoveryText}</div>
+            </div>
+        </div>
     `;
 }
 

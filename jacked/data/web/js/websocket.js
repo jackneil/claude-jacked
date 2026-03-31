@@ -404,13 +404,18 @@ jackedWS.on('upgrade_failed', (msg) => {
 jackedWS.on('auto_swap_triggered', (msg) => {
     const d = msg.payload || msg;
     const toEmail = d.to_email || 'another account';
+    // Dismiss exhaustion banner — a swap means we found a target
+    window.jackedState._exhaustionData = null;
+    if (typeof renderExhaustionBanner === 'function') renderExhaustionBanner();
     showToast(`Auto-swapped to ${toEmail}`, 'info', 5000);
     if (typeof loadActiveCredential === 'function') loadActiveCredential();
     if (typeof refreshAndRender === 'function') refreshAndRender();
 });
 
-jackedWS.on('all_accounts_exhausted', () => {
-    showToast('All accounts near rate limit \u2014 no swap target available', 'warning', 8000);
+jackedWS.on('all_accounts_exhausted', (msg) => {
+    const d = msg.payload || msg;
+    window.jackedState._exhaustionData = d;
+    if (typeof renderExhaustionBanner === 'function') renderExhaustionBanner();
 });
 
 jackedWS.on('sessions_changed', async () => {
