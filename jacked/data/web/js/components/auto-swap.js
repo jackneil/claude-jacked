@@ -35,15 +35,15 @@ function renderAutoSwapPanel() {
     const s = window.jackedState.swapSettings || {};
 
     const autoSwapEnabled = s.auto_swap_enabled || false;
-    const warn5h = s.threshold_5h_warning ?? 80;
-    const crit5h = s.threshold_5h_critical ?? 90;
-    const thresh7d = s.threshold_7d ?? 85;
-    const checkInterval = s.check_interval_seconds ?? 300;
+    const warn5h = s.auto_swap_5h_warning ?? 80;
+    const crit5h = s.auto_swap_5h_critical ?? 90;
+    const thresh7d = s.auto_swap_7d_threshold ?? 85;
+    const checkInterval = s.usage_check_interval ?? 300;
 
     const wkEnabled = s.window_keeper_enabled || false;
-    const activeStart = s.active_hours_start || '06:00';
-    const activeEnd = s.active_hours_end || '23:00';
-    const preWake = s.pre_wake_time || '04:00';
+    const activeStart = s.window_keeper_active_start || '06:00';
+    const activeEnd = s.window_keeper_active_end || '23:00';
+    const preWake = s.window_keeper_prewake || '04:00';
 
     return `
         <div class="mt-6">
@@ -285,14 +285,14 @@ function _bindSliderLabel(sliderId, labelId) {
 async function _saveSwapSettings() {
     const settings = {
         auto_swap_enabled: document.getElementById('chk-auto-swap')?.checked || false,
-        threshold_5h_warning: parseInt(document.getElementById('rng-warn-5h')?.value) || 80,
-        threshold_5h_critical: parseInt(document.getElementById('rng-crit-5h')?.value) || 90,
-        threshold_7d: parseInt(document.getElementById('rng-thresh-7d')?.value) || 85,
-        check_interval_seconds: parseInt(document.getElementById('sel-check-interval')?.value) || 300,
+        auto_swap_5h_warning: parseInt(document.getElementById('rng-warn-5h')?.value) || 80,
+        auto_swap_5h_critical: parseInt(document.getElementById('rng-crit-5h')?.value) || 90,
+        auto_swap_7d_threshold: parseInt(document.getElementById('rng-thresh-7d')?.value) || 85,
+        usage_check_interval: parseInt(document.getElementById('sel-check-interval')?.value) || 300,
         window_keeper_enabled: document.getElementById('chk-window-keeper')?.checked || false,
-        active_hours_start: document.getElementById('inp-active-start')?.value || '06:00',
-        active_hours_end: document.getElementById('inp-active-end')?.value || '23:00',
-        pre_wake_time: document.getElementById('inp-pre-wake')?.value || '04:00',
+        window_keeper_active_start: document.getElementById('inp-active-start')?.value || '06:00',
+        window_keeper_active_end: document.getElementById('inp-active-end')?.value || '23:00',
+        window_keeper_prewake: document.getElementById('inp-pre-wake')?.value || '04:00',
     };
 
     try {
