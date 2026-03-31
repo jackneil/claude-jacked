@@ -393,24 +393,21 @@ def test_write_platform_credentials_uses_hex_and_user():
         result = write_platform_credentials(cred_data)
 
     assert result is True
-    # 2 calls: orphan cleanup (delete old -a "Claude Code") + add-generic-password
+    # 2 calls: add-generic-password THEN orphan cleanup (delete old -a "Claude Code")
+    # Orphan cleanup runs AFTER successful write so user is never left with no entry.
     assert mock_run.call_count == 2
-    # First call: cleanup of orphan entry
-    cleanup_args = mock_run.call_args_list[0][0][0]
-    assert "delete-generic-password" in cleanup_args
-    assert "-a" in cleanup_args
-    assert "Claude Code" in cleanup_args
-    # Second call: the actual add
-    call_args = mock_run.call_args_list[1][0][0]
+    # First call: the actual add
+    call_args = mock_run.call_args_list[0][0][0]
     assert "add-generic-password" in call_args
+    # Second call: cleanup of orphan entry
+    cleanup_args = mock_run.call_args_list[1][0][0]
+    assert "delete-generic-password" in cleanup_args
+    assert "Claude Code" in cleanup_args
     assert "-U" in call_args
-    # Verify -a uses $USER
     a_idx = call_args.index("-a")
     assert call_args[a_idx + 1] == "testuser"
-    # Verify -X is used (hex encoding) not -w
     assert "-X" in call_args
     assert "-w" not in call_args
-    # Verify the hex value decodes to the original JSON
     x_idx = call_args.index("-X")
     hex_value = call_args[x_idx + 1]
     decoded = bytes.fromhex(hex_value).decode("utf-8")
@@ -435,22 +432,66 @@ def test_write_platform_credentials_keychain_error():
 
     >>> test_write_platform_credentials_keychain_error()
     """
-    mock_result = mock.MagicMock()
-    mock_result.returncode = 1
-    mock_result.stderr = "errSecAuthFailed"
+    # The add call fails — orphan cleanup never runs (it's after the add)
+    mock_add_fail = mock.MagicMock()
+    mock_add_fail.returncode = 1
+    mock_add_fail.stderr = "errSecAuthFailed"
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
         mock.patch(
             "jacked.api.credential_helpers.subprocess.run",
-            return_value=mock_result,
-        ),
+            return_value=mock_add_fail,
+        ) as mock_run,
         mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = write_platform_credentials({"claudeAiOauth": {"accessToken": "x"}})
 
     assert result is False
+    # Only 1 call (the add) — cleanup is skipped because add failed
+    assert mock_run.call_count == 1
+
+
+# ------------------------------------------------------------------
+# _get_keychain_username
+# ------------------------------------------------------------------
+
+
+def test_get_keychain_username_from_user():
+    """Returns $USER when set.
+
+    >>> test_get_keychain_username_from_user()
+    """
+    with mock.patch.dict(os.environ, {"USER": "alice"}, clear=False):
+        from jacked.api.credential_helpers import _get_keychain_username
+        assert _get_keychain_username() == "alice"
+
+
+def test_get_keychain_username_falls_back_to_username():
+    """Returns $USERNAME when $USER is unset (Windows).
+
+    >>> test_get_keychain_username_falls_back_to_username()
+    """
+    env = dict(os.environ)
+    env.pop("USER", None)
+    env["USERNAME"] = "bob"
+    with mock.patch.dict(os.environ, env, clear=True):
+        from jacked.api.credential_helpers import _get_keychain_username
+        assert _get_keychain_username() == "bob"
+
+
+def test_get_keychain_username_fallback_to_claude_code():
+    """Returns 'Claude Code' when both vars are unset.
+
+    >>> test_get_keychain_username_fallback_to_claude_code()
+    """
+    env = dict(os.environ)
+    env.pop("USER", None)
+    env.pop("USERNAME", None)
+    with mock.patch.dict(os.environ, env, clear=True):
+        from jacked.api.credential_helpers import _get_keychain_username
+        assert _get_keychain_username() == "Claude Code"
 
 
 # ------------------------------------------------------------------

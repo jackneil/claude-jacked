@@ -23,7 +23,15 @@ def _get_keychain_username() -> str:
     keychain account name (-a parameter). We must match this exactly
     or we write to a different keychain entry.
     """
-    return os.environ.get("USER") or os.environ.get("USERNAME") or "Claude Code"
+    username = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    if not username:
+        logger.warning(
+            "Neither $USER nor $USERNAME is set — keychain operations will use "
+            "fallback account name 'Claude Code' which may not match Claude Code's "
+            "entry (it uses the system username)"
+        )
+        return "Claude Code"
+    return username
 
 
 def _safe_replace(src: str, dst: str, *, retries: int = 3, delay: float = 0.1):
@@ -171,7 +179,9 @@ def read_platform_credentials() -> dict | None:
             return json.loads(result.stdout.strip())
         if result.returncode != 0:
             logger.debug("Keychain read failed: %s", result.stderr.strip())
-    except (json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+    except json.JSONDecodeError as exc:
+        logger.warning("Keychain data is not valid JSON (corrupted?): %s", exc)
+    except (subprocess.SubprocessError, OSError) as exc:
         logger.debug("Keychain read error: %s", exc)
     return None
 
@@ -202,8 +212,8 @@ def read_fresh_active_token(account_id: int) -> str | None:
                 token = data.get("claudeAiOauth", {}).get("accessToken")
                 if token:
                     return token
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("Credential file read failed for account %d: %s", account_id, exc)
 
     return None
 
@@ -230,16 +240,6 @@ def write_platform_credentials(data: dict) -> bool:
         json_data = json.dumps(data, separators=(",", ":"))
         hex_value = json_data.encode("utf-8").hex()
 
-        # Clean up orphan keychain entry from old jacked versions that used
-        # -a "Claude Code" instead of -a $USER.  Ignore errors (may not exist).
-        if username != "Claude Code":
-            subprocess.run(
-                ["security", "delete-generic-password",
-                 "-a", "Claude Code",
-                 "-s", "Claude Code-credentials"],
-                capture_output=True, timeout=5,
-            )
-
         # Use -U (update-or-insert) with -X (hex value) to match CC's format.
         result = subprocess.run(
             ["security", "add-generic-password",
@@ -250,11 +250,28 @@ def write_platform_credentials(data: dict) -> bool:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
-            logger.warning("Keychain write failed: %s", result.stderr.strip())
+            logger.warning(
+                "Keychain write failed (user=%s, service=Claude Code-credentials): %s",
+                username, result.stderr.strip(),
+            )
             return False
+
+        # Clean up orphan keychain entry from old jacked versions that used
+        # -a "Claude Code" instead of -a $USER.  Runs AFTER successful write
+        # so the user is never left with no entry.  Ignore errors (may not exist).
+        if username != "Claude Code":
+            cleanup = subprocess.run(
+                ["security", "delete-generic-password",
+                 "-a", "Claude Code",
+                 "-s", "Claude Code-credentials"],
+                capture_output=True, timeout=5,
+            )
+            if cleanup.returncode == 0:
+                logger.info("Cleaned up orphan keychain entry (-a 'Claude Code')")
+
         return True
     except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning("Keychain write error: %s", exc)
+        logger.warning("Keychain write error (user=%s): %s", username, exc)
         return False
 
 
