@@ -8,7 +8,12 @@
 // OAuth add-account flow
 // ---------------------------------------------------------------------------
 async function startAddAccountFlow() {
-    if (window.jackedState._accountActionInFlight) return;
+    // If a previous OAuth flow is still polling, cancel it and start fresh.
+    // The user clicking again means they want a new browser window.
+    if (window.jackedState.flowPolling) {
+        clearInterval(window.jackedState.flowPolling);
+        window.jackedState.flowPolling = null;
+    }
     window.jackedState._accountActionInFlight = true;
 
     const statusEl = document.getElementById('oauth-flow-status');
@@ -141,7 +146,12 @@ async function startAddAccountFlow() {
 // OAuth re-auth flow (targets existing account by ID)
 // ---------------------------------------------------------------------------
 async function startReauthFlow(accountId, email) {
-    if (window.jackedState._accountActionInFlight) return;
+    // If a previous OAuth flow is still polling, cancel it and start fresh.
+    // The user clicking again means they want a new browser window.
+    if (window.jackedState.flowPolling) {
+        clearInterval(window.jackedState.flowPolling);
+        window.jackedState.flowPolling = null;
+    }
     window.jackedState._accountActionInFlight = true;
 
     const statusEl = document.getElementById('oauth-flow-status');
@@ -283,7 +293,12 @@ async function startReauthFlow(accountId, email) {
 // CC token authorization flow
 // ---------------------------------------------------------------------------
 async function startCcAuthFlow(accountId, email) {
-    if (window.jackedState._accountActionInFlight) return;
+    // If a previous OAuth flow is still polling, cancel it and start fresh.
+    // The user clicking again means they want a new browser window.
+    if (window.jackedState.flowPolling) {
+        clearInterval(window.jackedState.flowPolling);
+        window.jackedState.flowPolling = null;
+    }
     window.jackedState._accountActionInFlight = true;
 
     const statusEl = document.getElementById('oauth-flow-status');
