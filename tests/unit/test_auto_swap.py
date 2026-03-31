@@ -9,6 +9,7 @@ from jacked.web.auto_swap import (
     pick_best_target,
     score_candidate,
     should_swap,
+    tier_critical_threshold,
     update_burn_rate,
 )
 
@@ -146,3 +147,28 @@ class TestUpdateBurnRate:
         assert br.rate_7d_per_min == 0.0
         assert br.last_check_5h == 45.0
         assert br.last_check_7d == 30.0
+
+
+# ---------------------------------------------------------------------------
+# tier_critical_threshold
+# ---------------------------------------------------------------------------
+
+def test_tier_threshold_20x():
+    assert tier_critical_threshold({"rate_limit_tier": "default_claude_max_20x"}) == 95.0
+
+def test_tier_threshold_10x():
+    assert tier_critical_threshold({"rate_limit_tier": "default_claude_max_10x"}) == 90.0
+
+def test_tier_threshold_5x():
+    assert tier_critical_threshold({"rate_limit_tier": "default_claude_max_5x"}) == 90.0
+
+def test_tier_threshold_pro():
+    assert tier_critical_threshold({"rate_limit_tier": "pro", "subscription_type": "pro"}) == 80.0
+
+def test_tier_threshold_none_max_sub():
+    """Max subscription with missing tier info gets conservative 90%."""
+    assert tier_critical_threshold({"rate_limit_tier": None, "subscription_type": "max"}) == 90.0
+
+def test_tier_threshold_unknown():
+    """Unknown/missing everything falls to 80%."""
+    assert tier_critical_threshold({}) == 80.0

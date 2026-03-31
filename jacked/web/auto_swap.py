@@ -7,6 +7,7 @@ burn-rate state.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -22,6 +23,29 @@ class BurnRate:
     rate_7d_per_min: float = 0.0
     last_check_7d: float = 0.0
     last_check_time: float = field(default_factory=time.time)
+
+
+def tier_critical_threshold(account: dict) -> float:
+    """Compute the auto-swap critical threshold based on account tier.
+
+    Higher-tier accounts can sustain usage longer before needing a swap.
+    Known tiers from Anthropic: default_claude_max_20x, default_claude_max_5x.
+    Test fixtures use t1/t2 which are not real tiers — they fall to the
+    subscription_type fallback.
+    """
+    tier = (account.get("rate_limit_tier") or "").lower()
+    match = re.search(r"(\d+)x", tier)
+    if match:
+        multiplier = int(match.group(1))
+        if multiplier >= 20:
+            return 95.0
+        if multiplier >= 5:
+            return 90.0
+    # Fallback: subscription_type when tier is missing or unrecognized
+    sub = (account.get("subscription_type") or "").lower()
+    if sub == "max":
+        return 90.0  # max without tier info — conservative
+    return 80.0  # pro, free, or unknown
 
 
 # ---------------------------------------------------------------------------
