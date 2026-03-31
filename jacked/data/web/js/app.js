@@ -119,6 +119,7 @@ async function renderRoute(route) {
             if (typeof renderAccounts === 'function') {
                 content.innerHTML = renderAccounts(window.jackedState.accounts);
                 if (typeof bindAccountEvents === 'function') bindAccountEvents();
+                if (typeof bindAutoSwapEvents === 'function') bindAutoSwapEvents();
                 // Auto-validate stale accounts on mount
                 autoValidateStaleAccounts();
             }
@@ -212,6 +213,7 @@ async function loadAllData() {
         loadSettings(),
         loadVersion(),
         typeof loadActiveCredential === 'function' ? loadActiveCredential() : Promise.resolve(),
+        typeof loadAutoSwapSettings === 'function' ? loadAutoSwapSettings() : Promise.resolve(),
     ]);
 }
 
@@ -240,6 +242,7 @@ function rerenderAccountsView() {
 
     content.innerHTML = renderAccounts(window.jackedState.accounts);
     if (typeof bindAccountEvents === 'function') bindAccountEvents();
+    if (typeof bindAutoSwapEvents === 'function') bindAutoSwapEvents();
 
     // Restore expanded details
     expandedDetails.forEach(id => {

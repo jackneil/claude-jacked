@@ -401,6 +401,18 @@ jackedWS.on('upgrade_failed', (msg) => {
     if (typeof _showUpgradeError === 'function') _showUpgradeError(d.error || 'Upgrade failed');
 });
 
+jackedWS.on('auto_swap_triggered', (msg) => {
+    const d = msg.payload || msg;
+    const toEmail = d.to_email || 'another account';
+    showToast(`Auto-swapped to ${toEmail}`, 'info', 5000);
+    if (typeof loadActiveCredential === 'function') loadActiveCredential();
+    if (typeof refreshAndRender === 'function') refreshAndRender();
+});
+
+jackedWS.on('all_accounts_exhausted', () => {
+    showToast('All accounts near rate limit \u2014 no swap target available', 'warning', 8000);
+});
+
 jackedWS.on('sessions_changed', async () => {
     if (typeof loadActiveSessions === 'function') await loadActiveSessions();
     if (typeof loadAccounts === 'function') await loadAccounts();
