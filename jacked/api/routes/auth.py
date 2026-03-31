@@ -757,10 +757,15 @@ async def start_cc_auth(account_id: int, request: Request):
 
     from jacked.web.oauth import OAuthFlow, _active_flows
 
-    # Dedup: if a CC flow for this account is already active, return it
+    # Dedup: if a CC flow for this account is still pending, return it.
+    # Completed/errored/timed-out flows are ignored so a new flow can start.
     # Snapshot with list() — _active_flows may be mutated by concurrent coroutines
     for fid, existing in list(_active_flows.items()):
-        if existing.purpose == "claude_code" and existing._target_account_id == account_id:
+        if (
+            existing.purpose == "claude_code"
+            and existing._target_account_id == account_id
+            and existing._status == "pending"
+        ):
             return {"flow_id": fid, "auth_url": "", "status": "pending"}
 
     flow = OAuthFlow(db, purpose="claude_code", target_account_id=account_id)
