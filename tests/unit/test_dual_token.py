@@ -381,10 +381,11 @@ class TestSyncTokensCAS:
 class TestResolveAccountCCMatch:
     @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
     @patch("jacked.launch.read_platform_credentials")
-    def test_layer4_matches_cc_access_token(self, mock_kc, mock_which, tmp_path):
+    @patch("jacked.launch.Path.home")
+    def test_layer4_matches_cc_access_token(self, mock_home, mock_kc, mock_which, tmp_path):
         """resolve_account Layer 4 matches cc_access_token from Keychain."""
+        mock_home.return_value = tmp_path  # isolate from real credential files
         db = _make_db(tmp_path)
-        # Set CC tokens for account 1
         db.update_account(1, cc_access_token="alice_cc_at")
 
         mock_kc.return_value = {
@@ -397,10 +398,11 @@ class TestResolveAccountCCMatch:
 
     @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
     @patch("jacked.launch.read_platform_credentials")
-    def test_layer4_cc_takes_precedence_over_primary(self, mock_kc, mock_which, tmp_path):
+    @patch("jacked.launch.Path.home")
+    def test_layer4_cc_takes_precedence_over_primary(self, mock_home, mock_kc, mock_which, tmp_path):
         """CC token match takes precedence over primary token match."""
+        mock_home.return_value = tmp_path  # isolate from real credential files
         db = _make_db(tmp_path)
-        # Set same token as both primary of account 2 and CC of account 1
         db.update_account(1, cc_access_token="shared_token")
         db.update_account(2, access_token="shared_token")
 
@@ -410,7 +412,6 @@ class TestResolveAccountCCMatch:
 
         from jacked.launch import resolve_account
         result = resolve_account(None, db)
-        # CC match (account 1) takes precedence over primary match (account 2)
         assert result["id"] == 1
 
 
