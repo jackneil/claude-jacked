@@ -5,7 +5,7 @@ import re as _re
 from typing import Optional
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,18 @@ class SwapSettings(BaseModel):
     usage_check_interval: int = Field(default=300, ge=60, le=3600)
     auto_swap_paused_until: Optional[str] = None
     window_keeper_enabled: bool = False
+
+    @field_validator("auto_swap_paused_until")
+    @classmethod
+    def validate_pause_timestamp(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        from datetime import datetime
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid ISO timestamp: {v!r}")
+        return v
     window_keeper_active_start: str = "06:00"
     window_keeper_active_end: str = "23:00"
     window_keeper_prewake: str = "04:00"
@@ -63,18 +75,23 @@ async def get_swap_settings(request: Request):
         val = db.get_setting(key)
         return val if val is not None else default
 
-    return SwapSettings(
-        auto_swap_enabled=_g("auto_swap_enabled", "false") == "true",
-        auto_swap_5h_warning=int(_g("auto_swap_5h_warning", "80")),
-        auto_swap_5h_critical=int(_g("auto_swap_5h_critical", "90")),
-        auto_swap_7d_threshold=int(_g("auto_swap_7d_threshold", "85")),
-        usage_check_interval=int(_g("usage_check_interval", "300")),
-        auto_swap_paused_until=_g("auto_swap_paused_until", None) or None,
-        window_keeper_enabled=_g("window_keeper_enabled", "false") == "true",
-        window_keeper_active_start=_g("window_keeper_active_start", "06:00"),
-        window_keeper_active_end=_g("window_keeper_active_end", "23:00"),
-        window_keeper_prewake=_g("window_keeper_prewake", "04:00"),
-    )
+    try:
+        return SwapSettings(
+            auto_swap_enabled=_g("auto_swap_enabled", "false") == "true",
+            auto_swap_5h_warning=int(_g("auto_swap_5h_warning", "80")),
+            auto_swap_5h_critical=int(_g("auto_swap_5h_critical", "90")),
+            auto_swap_7d_threshold=int(_g("auto_swap_7d_threshold", "85")),
+            usage_check_interval=int(_g("usage_check_interval", "300")),
+            auto_swap_paused_until=_g("auto_swap_paused_until", None) or None,
+            window_keeper_enabled=_g("window_keeper_enabled", "false") == "true",
+            window_keeper_active_start=_g("window_keeper_active_start", "06:00"),
+            window_keeper_active_end=_g("window_keeper_active_end", "23:00"),
+            window_keeper_prewake=_g("window_keeper_prewake", "04:00"),
+        )
+    except (ValueError, ValidationError):
+        # Corrupt DB values from before validation was added — return defaults
+        logger.warning("Corrupt swap settings in DB, returning defaults")
+        return SwapSettings()
 
 
 @router.put("/swap-settings", response_model=SwapSettings)
@@ -97,6 +114,10 @@ async def update_swap_settings(request: Request, body: SwapSettings):
         db.set_setting("auto_swap_paused_until", body.auto_swap_paused_until)
     else:
         db.set_setting("auto_swap_paused_until", "")
+
+    # Wake the sweep loop immediately so changes take effect now
+    from jacked.api.usage_monitor import _sweep_wake
+    _sweep_wake.set()
 
     return body
 

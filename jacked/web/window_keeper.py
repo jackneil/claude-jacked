@@ -68,9 +68,12 @@ def needs_ping(resets_at: str | None) -> bool:
     if resets_at is None:
         return True
     expiry = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+    # Always compare in UTC — the .replace("Z", "+00:00") ensures
+    # timezone-aware parsing for standard API responses.
+    now = datetime.now(timezone.utc)
     if expiry.tzinfo is None:
-        return expiry <= datetime.now()
-    return expiry <= datetime.now(timezone.utc)
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry <= now
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +113,7 @@ async def ping_account(
     except asyncio.TimeoutError:
         logger.warning("ping_account: timed out after %ds — killing process", timeout)
         proc.kill()
+        await proc.wait()
         return False
     except Exception:
         logger.exception("ping_account: unexpected error")

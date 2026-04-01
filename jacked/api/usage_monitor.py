@@ -27,6 +27,9 @@ _SWAP_COOLDOWN_SECONDS = 300  # 5 minutes between swaps to prevent ping-ponging
 # Track consecutive unchanged ticks per account for burn-rate decay.
 _burn_rate_unchanged_ticks: dict[int, int] = {}
 
+# Wake signal — settings PUT sets this to trigger an immediate sweep.
+_sweep_wake: asyncio.Event = asyncio.Event()
+
 
 def _read_active_account_id() -> int | None:
     """Read the active account ID from the credential file stamp.
@@ -102,7 +105,7 @@ async def active_account_poll_loop(app):
                         paused_until_str.replace("Z", "+00:00"),
                     )
                     if paused_until > datetime.now(timezone.utc):
-                        logger.debug("Auto-swap paused until %s", paused_until_str)
+                        logger.info("Auto-swap paused until %s", paused_until_str)
                         await asyncio.sleep(60)
                         continue
                 except (ValueError, TypeError):
@@ -262,10 +265,11 @@ async def active_account_poll_loop(app):
                         target.get("cached_usage_5h") or 0,
                         reason,
                     )
-                    sync_credential_to_all_stores(
-                        target["id"], target,
-                        email=target.get("email"),
-                    )
+
+                    # Record swap and set cooldown BEFORE credential
+                    # write — if sync_credential_to_all_stores raises,
+                    # we still have the audit trail and cooldown set.
+                    _last_swap_time = time.time()
                     db.record_swap(
                         from_account_id=active_acct_id,
                         to_account_id=target["id"],
@@ -276,11 +280,16 @@ async def active_account_poll_loop(app):
                         to_5h=target.get("cached_usage_5h"),
                         to_7d=target.get("cached_usage_7d"),
                     )
+                    sync_credential_to_all_stores(
+                        target["id"], target,
+                        email=target.get("email"),
+                    )
 
-                    # Re-seed burn rate for new active account
+                    # Clean up burn rate for both old and new account
+                    _burn_rates.pop(active_acct_id, None)
+                    _burn_rate_unchanged_ticks.pop(active_acct_id, None)
                     _burn_rates.pop(target["id"], None)
                     _burn_rate_unchanged_ticks.pop(target["id"], None)
-                    _last_swap_time = time.time()
 
                     if ws_registry:
                         await ws_registry.broadcast(
@@ -407,6 +416,8 @@ async def full_sweep_loop(app):
             # Re-read accounts after usage fetch for fresh data
             accounts = db.list_accounts(include_inactive=False)
 
+            # Local time intentional: users configure active hours in
+            # their local timezone (e.g. "06:00" means local 6am).
             now = datetime.now()
             should_ping = (
                 is_active_hours(now, start=wk_start, end=wk_end)
@@ -446,4 +457,13 @@ async def full_sweep_loop(app):
         except Exception:
             logger.warning("Full sweep loop error", exc_info=True)
 
-        await asyncio.sleep(check_interval)
+        # Sleep in short increments, checking wake signal between each.
+        # This lets settings changes (e.g. toggling window keeper on)
+        # trigger an immediate sweep instead of waiting the full interval.
+        _slept = 0.0
+        while _slept < check_interval and not _sweep_wake.is_set():
+            await asyncio.sleep(min(5, check_interval - _slept))
+            _slept += 5
+        if _sweep_wake.is_set():
+            _sweep_wake.clear()
+            logger.info("Full sweep woken early by settings change")
