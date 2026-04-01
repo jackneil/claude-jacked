@@ -82,17 +82,15 @@ class TestCacheFreshnessGuard:
         assert result.get("five_hour", {}).get("utilization") == 25.0
         db.update_account_usage_cache.assert_called_once()
 
-    def test_access_token_bypasses_fresh_cache(self):
-        """Explicit access_token should bypass cache even when fresh."""
+    def test_access_token_with_min_age_zero_bypasses_cache(self):
+        """Explicit access_token + min_age=0 should bypass cache."""
         db = _mock_db({"usage_cached_at": int(time.time()) - 2})
         client = _mock_client(200, {
             "five_hour": {"utilization": 10.0},
             "seven_day": {"utilization": 20.0},
         })
-
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
-            result = asyncio.run(fetch_usage(1, db, access_token="fresh_token"))
-
+            result = asyncio.run(fetch_usage(1, db, access_token="fresh_token", min_age=0))
         assert result is not None
         assert result != {"_cached": True}
         client.get.assert_called_once()
@@ -152,6 +150,9 @@ class TestFetchUsage429:
 
     def test_429_does_not_increment_failures(self):
         """429 -> record_account_error with increment_failures=False."""
+        import jacked.web.auth as mod
+        mod._usage_backoff.clear()
+
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={"retry-after": "5"})
 
@@ -166,17 +167,23 @@ class TestFetchUsage429:
 
     def test_429_extracts_retry_after_header(self):
         """429 -> error message includes retry-after value."""
+        import jacked.web.auth as mod
+        mod._usage_backoff.clear()
+
         db = _mock_db({"usage_cached_at": None})
-        client = _mock_client(429, headers={"retry-after": "42"})
+        client = _mock_client(429, headers={"retry-after": "120"})
 
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
             asyncio.run(fetch_usage(1, db))
 
         error_msg = db.record_account_error.call_args[0][1]
-        assert "42" in error_msg
+        assert "120" in error_msg
 
     def test_429_returns_none(self):
         """429 -> returns None (signals failure to caller)."""
+        import jacked.web.auth as mod
+        mod._usage_backoff.clear()
+
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={})
 
@@ -185,8 +192,11 @@ class TestFetchUsage429:
 
         assert result is None
 
-    def test_429_without_retry_after_uses_unknown(self):
-        """429 with no retry-after header -> 'unknown' in message."""
+    def test_429_without_retry_after_uses_default_backoff(self):
+        """429 with no retry-after header -> defaults to 60s backoff."""
+        import jacked.web.auth as mod
+        mod._usage_backoff.clear()
+
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={})
 
@@ -194,12 +204,92 @@ class TestFetchUsage429:
             asyncio.run(fetch_usage(1, db))
 
         error_msg = db.record_account_error.call_args[0][1]
-        assert "unknown" in error_msg
+        assert "60" in error_msg
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+
+class TestMinAgeParameter:
+    """fetch_usage min_age controls cache freshness threshold."""
+
+    def setup_method(self):
+        import jacked.web.auth as mod
+        mod._usage_backoff.clear()
+
+    def test_min_age_skips_when_fresh_enough(self):
+        """Cache 10s old, min_age=55 -> skip."""
+        db = _mock_db({"usage_cached_at": int(time.time()) - 10})
+        result = asyncio.run(fetch_usage(1, db, min_age=55))
+        assert result == {"_cached": True}
+
+    def test_min_age_fetches_when_stale(self):
+        """Cache 60s old, min_age=55 -> fetch."""
+        db = _mock_db({"usage_cached_at": int(time.time()) - 60})
+        client = _mock_client(200, {
+            "five_hour": {"utilization": 10.0},
+            "seven_day": {"utilization": 20.0},
+        })
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            result = asyncio.run(fetch_usage(1, db, min_age=55))
+        assert result is not None
+        assert result != {"_cached": True}
+
+    def test_min_age_zero_always_fetches(self):
+        """min_age=0 -> always fetch even with fresh cache."""
+        db = _mock_db({"usage_cached_at": int(time.time()) - 2})
+        client = _mock_client(200, {
+            "five_hour": {"utilization": 5.0},
+            "seven_day": {"utilization": 10.0},
+        })
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            result = asyncio.run(fetch_usage(1, db, min_age=0))
+        assert result is not None
+        assert result != {"_cached": True}
+        client.get.assert_called_once()
+
+    def test_access_token_no_longer_bypasses_cache(self):
+        """access_token alone should NOT bypass cache."""
+        db = _mock_db({"usage_cached_at": int(time.time()) - 2})
+        result = asyncio.run(fetch_usage(1, db, access_token="tok"))
+        assert result == {"_cached": True}
+
+
+class TestUsageBackoff:
+    """fetch_usage should respect 429 backoff."""
+
+    def test_429_sets_backoff(self):
+        """After a 429, subsequent calls should be skipped."""
+        import jacked.web.auth as mod
+        mod._usage_backoff.clear()
+
+        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
+        client = _mock_client(429, {}, headers={"retry-after": "60"})
+
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            result = asyncio.run(fetch_usage(1, db, min_age=0))
+        assert result is None
+
+        result2 = asyncio.run(fetch_usage(1, db, min_age=0))
+        assert result2 == {"_backed_off": True}
+
+    def test_backoff_expires(self):
+        """After backoff expires, fetches proceed normally."""
+        import jacked.web.auth as mod
+        mod._usage_backoff.clear()
+        mod._usage_backoff[1] = time.time() - 10
+
+        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
+        client = _mock_client(200, {
+            "five_hour": {"utilization": 0.0},
+            "seven_day": {"utilization": 0.0},
+        })
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            result = asyncio.run(fetch_usage(1, db, min_age=0))
+        assert result is not None
+        assert result != {"_backed_off": True}
 
 
 class TestConstants:

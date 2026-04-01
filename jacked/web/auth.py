@@ -38,6 +38,9 @@ logger = logging.getLogger("jacked.auth")
 REFRESH_BUFFER_SECONDS = 300
 USAGE_CACHE_FRESHNESS_SECONDS = 30
 
+# Per-account 429 backoff: account_id -> don't-fetch-before timestamp
+_usage_backoff: dict[int, float] = {}
+
 
 def should_refresh(account: dict) -> bool:
     """Check if an account's token needs refreshing.
@@ -321,6 +324,7 @@ async def fetch_usage(
     account_id: int,
     db: Database,
     access_token: Optional[str] = None,
+    min_age: int = USAGE_CACHE_FRESHNESS_SECONDS,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
 
@@ -332,15 +336,23 @@ async def fetch_usage(
     if not account:
         return None
 
-    # Cache freshness guard — skip API call if data is < USAGE_CACHE_FRESHNESS_SECONDS old.
-    # Prevents multi-tab and double-click storms.
-    # usage_cached_at is stored as an integer (Unix epoch seconds) in the DB.
+    # 429 backoff check — skip if still in backoff period
+    backoff_until = _usage_backoff.get(account_id, 0)
+    if time.time() < backoff_until:
+        logger.debug(
+            f"Usage fetch backed off for account {account_id} "
+            f"({int(backoff_until - time.time())}s remaining)"
+        )
+        return {"_backed_off": True}
+
+    # Cache freshness guard — skip API call if data is fresh enough
+    # for this caller's needs. min_age=0 always fetches.
     cached_at = account.get("usage_cached_at")
-    if cached_at and not access_token:
+    if min_age > 0 and cached_at:
         try:
             age = int(time.time()) - int(cached_at)
-            if age < USAGE_CACHE_FRESHNESS_SECONDS:
-                logger.debug(f"Usage cache fresh for account {account_id} ({age}s old), skipping")
+            if age < min_age:
+                logger.debug(f"Usage cache fresh for account {account_id} ({age}s old, min_age={min_age}), skipping")
                 return {"_cached": True}
         except (ValueError, TypeError):
             pass  # Malformed timestamp — proceed with fetch
@@ -390,18 +402,20 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                retry_after = resp.headers.get("retry-after", "unknown")
-                # Do NOT increment consecutive_failures — 429 is a rate limit,
-                # not an account health issue.  Incrementing would sideline
-                # accounts from credential rotation after 3 dashboard refreshes.
+                retry_after = resp.headers.get("retry-after", "60")
+                try:
+                    backoff_seconds = max(int(retry_after), 60)
+                except (ValueError, TypeError):
+                    backoff_seconds = 60
+                _usage_backoff[account_id] = time.time() + backoff_seconds
                 db.record_account_error(
                     account_id,
-                    f"Usage fetch rate limited (429) — retry after {retry_after}s",
+                    f"Usage fetch rate limited (429) — backing off {backoff_seconds}s",
                     increment_failures=False,
                 )
                 logger.warning(
                     f"Usage fetch rate limited for account {account_id}, "
-                    f"retry-after: {retry_after}"
+                    f"backing off {backoff_seconds}s"
                 )
                 return None
 
