@@ -77,12 +77,20 @@ function getPriorityBadge(priority) {
  * NOTE: data-cache-age is a DOM contract — queried by _usageUpdateCardDOM (websocket.js)
  * for surgical updates during usage refresh. Do not rename without updating consumers.
  */
-function renderCacheAge(usageCachedAt) {
+function renderCacheAge(usageCachedAt, acctId) {
     if (usageCachedAt === null || usageCachedAt === undefined) {
         return '<span class="text-xs text-slate-500" data-cache-age>Usage: never fetched</span>';
     }
     const ago = timeAgoFromUnix(usageCachedAt);
-    return `<span class="text-xs text-slate-500" data-cache-age>Usage updated ${escapeHtml(ago)}</span>`;
+    let checkHtml = '';
+    const ss = window.jackedState.swapSettings || {};
+    if (ss.auto_swap_enabled && acctId === window.jackedState.activeCredentialAccountId) {
+        const ageS = Math.floor(Date.now() / 1000) - usageCachedAt;
+        const rem = Math.max(0, 60 - ageS);
+        const label = rem > 0 ? escapeHtml(rem + 's') : 'checking\u2026';
+        checkHtml = ' \u00b7 <span class="text-teal-500" data-next-check data-cached-at="' + usageCachedAt + '">' + label + '</span>';
+    }
+    return '<span class="text-xs text-slate-500" data-cache-age>Usage updated ' + escapeHtml(ago) + checkHtml + '</span>';
 }
 
 /**
@@ -246,7 +254,7 @@ function renderAccountCard(acct, idx, total) {
     const elapsed7d = computeElapsedFraction7d(acct.cached_7d_resets_at);
     const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, elapsed5h, '5h limit');
     const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, elapsed7d, '7d limit');
-    const cacheAgeHtml = renderCacheAge(acct.usage_cached_at);
+    const cacheAgeHtml = renderCacheAge(acct.usage_cached_at, acct.id);
 
     // Priority reorder buttons
     const upDisabled = idx === 0 ? 'disabled' : '';

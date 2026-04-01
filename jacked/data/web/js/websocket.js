@@ -299,7 +299,7 @@ function _usageUpdateCardDOM(card, acctData) {
         const cacheSpan = card.querySelector('[data-cache-age]');
         if (cacheSpan) {
             const tempCache = document.createElement('div');
-            tempCache.insertAdjacentHTML('afterbegin', renderCacheAge(acctData.usage_cached_at));
+            tempCache.insertAdjacentHTML('afterbegin', renderCacheAge(acctData.usage_cached_at, acctData.id));
             const newCache = tempCache.firstElementChild;
             if (newCache) cacheSpan.replaceWith(newCache);
         }

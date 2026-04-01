@@ -5,6 +5,30 @@
 // Auto-refresh usage state
 // ---------------------------------------------------------------------------
 let _autoRefreshInterval = null;
+let _checkCountdownInterval = null;
+
+function _startCheckCountdown() {
+    if (_checkCountdownInterval) return;
+    _checkCountdownInterval = setInterval(function() {
+        var els = document.querySelectorAll('[data-next-check]');
+        if (els.length === 0) return;
+        var now = Math.floor(Date.now() / 1000);
+        els.forEach(function(el) {
+            var cachedAt = parseInt(el.getAttribute('data-cached-at'), 10);
+            if (isNaN(cachedAt)) return;
+            var rem = Math.max(0, 60 - (now - cachedAt));
+            el.textContent = rem > 0 ? rem + 's' : 'checking\u2026';
+        });
+    }, 1000);
+}
+
+function _stopCheckCountdown() {
+    if (_checkCountdownInterval) {
+        clearInterval(_checkCountdownInterval);
+        _checkCountdownInterval = null;
+    }
+}
+
 let _autoRefreshCountdown = 0;
 let _lastAutoRefreshAt = null; // Date.now() of last COMPLETED auto-refresh; null = no prior refresh or stopped
 const _singleRefreshInFlight = new Set(); // tracks accountIds with pending single-refresh
@@ -331,6 +355,8 @@ function bindAccountEvents() {
             }
         });
     });
+
+    _startCheckCountdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +614,7 @@ function _stopAutoRefresh() {
         clearInterval(_autoRefreshInterval);
         _autoRefreshInterval = null;
     }
+    _stopCheckCountdown();
     // Clearing _lastAutoRefreshAt ensures re-enable takes the "fresh start" path in
     // _changeAutoRefreshInterval (null timestamp = no elapsed time to carry over).
     // This applies to both: user selecting "Off" (manual stop) and the error circuit-breaker
