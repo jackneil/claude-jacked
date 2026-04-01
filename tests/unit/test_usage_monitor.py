@@ -438,6 +438,71 @@ class TestWindowKeeperPings:
 
         asyncio.run(_run())
 
+    def test_fetch_usage_bypasses_cache_after_successful_ping(self):
+        """After ping succeeds, fetch_usage must be called with access_token
+        to bypass the cache freshness guard and update cached_5h_resets_at."""
+        accounts = [
+            _acct(1, usage_5h=30, resets_at=None, cc_rt="refresh_tok_1"),
+            _acct(2, usage_5h=10, resets_at=None, cc_rt="refresh_tok_2"),
+        ]
+        db = _make_db(
+            settings={
+                "window_keeper_enabled": "true",
+            },
+            accounts=accounts,
+        )
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=10),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": False},
+                ) as mock_fetch,
+                patch(
+                    "jacked.web.window_keeper.is_active_hours",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.is_prewake_time",
+                    return_value=False,
+                ),
+                patch(
+                    "jacked.web.window_keeper.needs_ping",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.ping_account",
+                    new_callable=AsyncMock,
+                    return_value=True,
+                ),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await full_sweep_loop(app)
+
+                # Find fetch_usage calls that happened AFTER pings
+                # (non-active accounts: id=2 since active=1 is skipped)
+                # The post-ping fetch_usage must pass access_token to bypass cache.
+                post_ping_calls = [
+                    c for c in mock_fetch.call_args_list
+                    if c[1].get("access_token") is not None
+                ]
+                assert len(post_ping_calls) >= 1, (
+                    f"Expected at least one fetch_usage call with access_token set "
+                    f"(to bypass cache), but got: {mock_fetch.call_args_list}"
+                )
+
+        asyncio.run(_run())
+
 
 # ---------------------------------------------------------------------------
 # TOCTOU guard — bail when active account changes mid-swap

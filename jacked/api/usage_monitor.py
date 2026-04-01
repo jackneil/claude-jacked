@@ -446,7 +446,8 @@ async def full_sweep_loop(app):
                         sweep_pinged += 1
                         # Fetch fresh usage so cached_5h_resets_at updates
                         # and needs_ping returns False next sweep.
-                        await fetch_usage(acct["id"], db)
+                        # Pass access_token to bypass the cache freshness guard.
+                        await fetch_usage(acct["id"], db, access_token=cc_at)
                     await asyncio.sleep(2)  # pacing
 
             logger.info(
