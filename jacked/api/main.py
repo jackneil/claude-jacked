@@ -308,6 +308,16 @@ if WEB_DIR.exists():
     _js_dir = WEB_DIR / "js"
     _assets_dir = WEB_DIR / "assets"
 
+    # Middleware: prevent browser caching of static assets so code changes
+    # take effect without hard refresh after jacked install + server restart.
+    @app.middleware("http")
+    async def no_cache_static(request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path.startswith(("/js/", "/css/")):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
     if _css_dir.exists():
         app.mount("/css", StaticFiles(directory=_css_dir), name="css")
     if _js_dir.exists():
@@ -340,7 +350,10 @@ if WEB_DIR.exists():
 
         index_path = WEB_DIR / "index.html"
         if index_path.exists():
-            return FileResponse(index_path)
+            return FileResponse(
+                index_path,
+                headers={"Cache-Control": "no-cache, must-revalidate"},
+            )
 
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
