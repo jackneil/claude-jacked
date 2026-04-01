@@ -93,7 +93,7 @@ async def ping_account(
     from jacked.web.oauth import OAUTH_BETA_HEADER
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=timeout, write=10, pool=5)) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={

@@ -441,9 +441,13 @@ async def full_sweep_loop(app):
                         "Window keeper: pinging account %d (%s)",
                         acct["id"], acct.get("email", "?"),
                     )
-                    await ping_account(cc_at)
+                    success = await ping_account(cc_at)
+                    if success:
+                        sweep_pinged += 1
+                        # Fetch fresh usage so cached_5h_resets_at updates
+                        # and needs_ping returns False next sweep.
+                        await fetch_usage(acct["id"], db)
                     await asyncio.sleep(2)  # pacing
-                    sweep_pinged += 1
 
             logger.info(
                 "Full sweep complete: checked %d accounts, pinged %d windows",

@@ -59,6 +59,19 @@ class SwapSettings(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def check_active_hours_not_crossing_midnight(self) -> "SwapSettings":
+        if not self.window_keeper_enabled:
+            return self
+        start_h, start_m = map(int, self.window_keeper_active_start.split(":"))
+        end_h, end_m = map(int, self.window_keeper_active_end.split(":"))
+        if start_h * 60 + start_m >= end_h * 60 + end_m:
+            raise ValueError(
+                f"active_start ({self.window_keeper_active_start}) must be before "
+                f"active_end ({self.window_keeper_active_end}) — midnight-crossing ranges not supported"
+            )
+        return self
+
 
 def _get_db(request: Request):
     return getattr(request.app.state, "db", None)
