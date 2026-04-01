@@ -404,10 +404,27 @@ jackedWS.on('upgrade_failed', (msg) => {
 jackedWS.on('auto_swap_triggered', (msg) => {
     const d = msg.payload || msg;
     const toEmail = d.to_email || 'another account';
+    const reason = d.reason || '';
     // Dismiss exhaustion banner — a swap means we found a target
     window.jackedState._exhaustionData = null;
     if (typeof renderExhaustionBanner === 'function') renderExhaustionBanner();
-    showToast(`Auto-swapped to ${toEmail}`, 'info', 5000);
+    // Persistent swap banner — dismissible, auto-hides after 5 minutes
+    const existing = document.getElementById('swap-banner');
+    if (existing) existing.remove();
+    const banner = document.createElement('div');
+    banner.id = 'swap-banner';
+    banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-teal-900/95 border border-teal-600 rounded-lg px-5 py-3 shadow-lg max-w-lg flex items-center gap-3';
+    const text = document.createElement('span');
+    text.className = 'text-sm text-teal-100';
+    text.textContent = 'Auto-swapped to ' + toEmail + (reason ? ' \u2014 ' + reason : '');
+    const close = document.createElement('button');
+    close.className = 'text-teal-400 hover:text-white text-lg leading-none ml-auto';
+    close.textContent = '\u00d7';
+    close.onclick = function() { banner.remove(); };
+    banner.appendChild(text);
+    banner.appendChild(close);
+    document.body.appendChild(banner);
+    setTimeout(function() { if (banner.parentNode) banner.remove(); }, 300000);
     if (typeof loadActiveCredential === 'function') loadActiveCredential();
     if (typeof refreshAndRender === 'function') refreshAndRender();
 });

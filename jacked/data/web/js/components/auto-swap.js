@@ -186,16 +186,6 @@ function renderAutoSwapPanel() {
                             </div>
                         </div>
 
-                        <!-- Section 3: Recent Swaps (collapsed by default) -->
-                        <div class="border-t border-slate-700/50 pt-4">
-                            <button id="btn-toggle-swap-log" class="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 transition-colors">
-                                <span>Recent Swaps</span>
-                                <svg id="swap-log-arrow" class="w-3 h-3 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-                            </button>
-                            <div id="swap-log-container" class="hidden mt-3">
-                                <div class="text-xs text-slate-500">Loading...</div>
-                            </div>
-                        </div>
 
                     </div>
                 </div>
@@ -215,7 +205,7 @@ function renderSwapLogTable(entries) {
 
     const rows = entries.map(e => {
         const ts = e.timestamp
-            ? new Date(e.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+            ? escapeHtml(new Date(e.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
             : '\u2014';
         const from = escapeHtml(e.from_email || '\u2014');
         const to = escapeHtml(e.to_email || '\u2014');
@@ -296,30 +286,6 @@ function bindAutoSwapEvents() {
             panelBody.classList.toggle('hidden');
             if (panelArrow) {
                 panelArrow.style.transform = isHidden ? 'rotate(180deg)' : '';
-            }
-        });
-    }
-
-    // Recent swaps sub-collapse
-    const logToggle = document.getElementById('btn-toggle-swap-log');
-    const logContainer = document.getElementById('swap-log-container');
-    const logArrow = document.getElementById('swap-log-arrow');
-    let logLoaded = false;
-    if (logToggle && logContainer) {
-        logToggle.addEventListener('click', async () => {
-            const isHidden = logContainer.classList.contains('hidden');
-            logContainer.classList.toggle('hidden');
-            if (logArrow) {
-                logArrow.style.transform = isHidden ? 'rotate(180deg)' : '';
-            }
-            // Lazy-load log on first expand
-            if (isHidden && !logLoaded) {
-                logLoaded = true;
-                const entries = await loadSwapLog();
-                logContainer.textContent = '';
-                const temp = document.createElement('div');
-                temp.insertAdjacentHTML('afterbegin', renderSwapLogTable(entries));
-                while (temp.firstChild) logContainer.appendChild(temp.firstChild);
             }
         });
     }
