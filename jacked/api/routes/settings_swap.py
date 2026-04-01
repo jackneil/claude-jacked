@@ -61,8 +61,8 @@ class SwapSettings(BaseModel):
 
     @model_validator(mode="after")
     def check_active_hours_not_crossing_midnight(self) -> "SwapSettings":
-        if not self.window_keeper_enabled:
-            return self
+        # Always validate — even when disabled, so bad values can't be
+        # persisted and then silently reset to defaults when re-enabled.
         start_h, start_m = map(int, self.window_keeper_active_start.split(":"))
         end_h, end_m = map(int, self.window_keeper_active_end.split(":"))
         if start_h * 60 + start_m >= end_h * 60 + end_m:
