@@ -20,7 +20,7 @@ async function loadAutoSwapSettings() {
 async function loadSwapLog() {
     try {
         const data = await api.get('/api/settings/swap-log?limit=20');
-        return data.entries || data || [];
+        return Array.isArray(data) ? data : [];
     } catch (e) {
         console.error('Failed to load swap log:', e);
         return [];
