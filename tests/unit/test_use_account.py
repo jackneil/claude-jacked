@@ -218,7 +218,7 @@ def test_refresh_all_usage_only_reads_fresh_for_active(client, db, tmp_path):
 
     call_tokens = {}
 
-    async def capture_fetch_usage(account_id, db_arg, access_token=None):
+    async def capture_fetch_usage(account_id, db_arg, access_token=None, min_age=30):
         call_tokens[account_id] = access_token
         return {"five_hour": {"utilization": 0.1}, "seven_day": {"utilization": 0.2}}
 

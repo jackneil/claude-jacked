@@ -555,7 +555,7 @@ async def refresh_usage(account_id: int, request: Request):
     # access_token to fetch_usage() bypasses its cache freshness guard (auth.py:339).
     db_token = account.get("access_token")
     effective_token = fresh_token if (fresh_token and fresh_token != db_token) else None
-    usage_data = await fetch_usage(account_id, db, access_token=effective_token)
+    usage_data = await fetch_usage(account_id, db, access_token=effective_token, min_age=0)
 
     if usage_data is None:
         return JSONResponse(
@@ -655,7 +655,7 @@ async def refresh_all_usage(request: Request):
                 db_token = acct.get("access_token")
                 if fresh_token and fresh_token != db_token:
                     effective_token = fresh_token
-            usage_data = await fetch_usage(acct["id"], db, access_token=effective_token)
+            usage_data = await fetch_usage(acct["id"], db, access_token=effective_token, min_age=0)
 
             # Cache hits return {"_cached": True} — read stored values from DB
             is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
