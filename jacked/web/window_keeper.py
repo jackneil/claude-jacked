@@ -11,7 +11,7 @@ import asyncio
 import logging
 import os
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from jacked.findbin import find_bin
 
@@ -67,8 +67,10 @@ def needs_ping(resets_at: str | None) -> bool:
     """
     if resets_at is None:
         return True
-    expiry = datetime.fromisoformat(resets_at)
-    return expiry <= datetime.now()
+    expiry = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+    if expiry.tzinfo is None:
+        return expiry <= datetime.now()
+    return expiry <= datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------

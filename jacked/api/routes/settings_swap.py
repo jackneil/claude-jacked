@@ -1,27 +1,51 @@
 """API routes for auto-swap and window keeper settings."""
 
 import logging
+import re as _re
 from typing import Optional
 
-from fastapi import APIRouter, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
+def _validate_time(v: str) -> str:
+    if not _re.fullmatch(r"\d{2}:\d{2}", v):
+        raise ValueError(f"Invalid time format: {v!r} (expected HH:MM)")
+    h, m = map(int, v.split(":"))
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"Invalid time: {v!r} (hours 0-23, minutes 0-59)")
+    return v
+
+
 class SwapSettings(BaseModel):
     auto_swap_enabled: bool = False
-    auto_swap_5h_warning: int = 80
-    auto_swap_5h_critical: int = 90
-    auto_swap_7d_threshold: int = 85
-    usage_check_interval: int = 300
+    auto_swap_5h_warning: int = Field(default=80, ge=0, le=100)
+    auto_swap_5h_critical: int = Field(default=90, ge=0, le=100)
+    auto_swap_7d_threshold: int = Field(default=85, ge=0, le=100)
+    usage_check_interval: int = Field(default=300, ge=60, le=3600)
     auto_swap_paused_until: Optional[str] = None
     window_keeper_enabled: bool = False
     window_keeper_active_start: str = "06:00"
     window_keeper_active_end: str = "23:00"
     window_keeper_prewake: str = "04:00"
+
+    @field_validator("window_keeper_active_start", "window_keeper_active_end", "window_keeper_prewake")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        return _validate_time(v)
+
+    @model_validator(mode="after")
+    def check_warning_below_critical(self) -> "SwapSettings":
+        if self.auto_swap_5h_warning >= self.auto_swap_5h_critical:
+            raise ValueError(
+                f"warning ({self.auto_swap_5h_warning}) must be less than "
+                f"critical ({self.auto_swap_5h_critical})"
+            )
+        return self
 
 
 def _get_db(request: Request):
@@ -69,12 +93,16 @@ async def update_swap_settings(request: Request, body: SwapSettings):
     db.set_setting("window_keeper_active_start", body.window_keeper_active_start)
     db.set_setting("window_keeper_active_end", body.window_keeper_active_end)
     db.set_setting("window_keeper_prewake", body.window_keeper_prewake)
+    if body.auto_swap_paused_until:
+        db.set_setting("auto_swap_paused_until", body.auto_swap_paused_until)
+    else:
+        db.set_setting("auto_swap_paused_until", "")
 
     return body
 
 
 @router.post("/swap-pause")
-async def pause_auto_swap(request: Request, minutes: int = 60):
+async def pause_auto_swap(request: Request, minutes: int = Query(default=60, ge=1, le=1440)):
     """Pause auto-swap for the specified number of minutes."""
     db = _get_db(request)
     if db is None:
@@ -96,7 +124,7 @@ async def resume_auto_swap(request: Request):
 
 
 @router.get("/swap-log")
-async def get_swap_log(request: Request, limit: int = 50):
+async def get_swap_log(request: Request, limit: int = Query(default=50, ge=1, le=500)):
     """Get recent swap events."""
     db = _get_db(request)
     if db is None:

@@ -190,6 +190,7 @@ class TestAutoSwapTriggers:
         import jacked.api.usage_monitor as mod
         mod._burn_rates.clear()
         mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
 
         accounts = [
             _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
@@ -263,6 +264,7 @@ class TestNoTarget:
         mod._last_exhaustion_warning = 0.0
         mod._burn_rates.clear()
         mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
 
         accounts = [
             _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
@@ -333,6 +335,7 @@ class TestCachedResponse:
         import jacked.api.usage_monitor as mod
         mod._burn_rates.clear()
         mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
 
         accounts = [_acct(1, usage_5h=30)]
         db = _make_db(
@@ -446,6 +449,7 @@ class TestTOCTOU:
         import jacked.api.usage_monitor as mod
         mod._burn_rates.clear()
         mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
 
         accounts = [
             _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
@@ -517,6 +521,7 @@ class TestBurnRateSkipsUnchanged:
         from jacked.web.auto_swap import BurnRate
         mod._burn_rates.clear()
         mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
 
         # Pre-seed burn rate so the "prev is not None" path triggers
         mod._burn_rates[1] = BurnRate(
@@ -634,6 +639,376 @@ class TestBurnRateReseedAfterSwap:
                 assert 2 not in mod._burn_rates, (
                     f"Expected target account 2 burn rate to be removed, "
                     f"but _burn_rates={mod._burn_rates}"
+                )
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Swap cooldown prevents ping-ponging
+# ---------------------------------------------------------------------------
+
+class TestSwapCooldown:
+    def test_swap_blocked_during_cooldown(self):
+        """Swap cooldown active -> sync_credential_to_all_stores NOT called."""
+        import jacked.api.usage_monitor as mod
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = time.time()  # cooldown is active right now
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
+            _acct(2, usage_5h=20, usage_7d=10),   # good target
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        ws_registry = AsyncMock()
+        app = _make_app(db=db, ws_registry=ws_registry)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="fresh_tok",
+                ),
+                patch(
+                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
+                ) as mock_sync,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+                # No swap should happen while cooldown is active
+                mock_sync.assert_not_called()
+                db.record_swap.assert_not_called()
+
+        asyncio.run(_run())
+
+    def test_swap_allowed_after_cooldown_expires(self):
+        """Cooldown expired -> swap proceeds normally."""
+        import jacked.api.usage_monitor as mod
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+        # Last swap happened well past the cooldown window
+        mod._last_swap_time = time.time() - _SWAP_COOLDOWN_SECONDS - 10
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
+            _acct(2, usage_5h=20, usage_7d=10),   # good target
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        ws_registry = AsyncMock()
+        app = _make_app(db=db, ws_registry=ws_registry)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="fresh_tok",
+                ),
+                patch(
+                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
+                ) as mock_sync,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+                # Cooldown expired — swap should proceed
+                assert mock_sync.call_count >= 1
+                call_args = mock_sync.call_args
+                assert call_args[0][0] == 2  # target account id
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Pause mechanism skips auto-swap
+# ---------------------------------------------------------------------------
+
+class TestPauseMechanism:
+    def test_swap_skipped_when_paused(self):
+        """auto_swap_paused_until set to future -> fetch_usage NOT called."""
+        import jacked.api.usage_monitor as mod
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
+
+        # Pause until far in the future
+        future_iso = "2099-12-31T23:59:59+00:00"
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),
+            _acct(2, usage_5h=20, usage_7d=10),
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "auto_swap_paused_until": future_iso,
+            },
+            accounts=accounts,
+        )
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ) as mock_fetch,
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="tok",
+                ),
+                patch(
+                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
+                ) as mock_sync,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+                # Pause check happens before usage fetch — fetch should NOT be called
+                mock_fetch.assert_not_called()
+                mock_sync.assert_not_called()
+
+        asyncio.run(_run())
+
+    def test_swap_proceeds_when_pause_expired(self):
+        """auto_swap_paused_until set to past -> swap proceeds normally."""
+        import jacked.api.usage_monitor as mod
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
+
+        # Pause timestamp already in the past
+        past_iso = "2000-01-01T00:00:00+00:00"
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),
+            _acct(2, usage_5h=20, usage_7d=10),
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "auto_swap_paused_until": past_iso,
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        ws_registry = AsyncMock()
+        app = _make_app(db=db, ws_registry=ws_registry)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="fresh_tok",
+                ),
+                patch(
+                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
+                ) as mock_sync,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+                # Pause expired — swap should proceed
+                assert mock_sync.call_count >= 1
+                call_args = mock_sync.call_args
+                assert call_args[0][0] == 2  # target account id
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Burn-rate decay after consecutive unchanged ticks
+# ---------------------------------------------------------------------------
+
+class TestBurnRateDecay:
+    def test_decay_after_5_unchanged_ticks(self):
+        """5th consecutive unchanged tick triggers 20% decay of burn rate."""
+        import jacked.api.usage_monitor as mod
+        from jacked.web.auto_swap import BurnRate
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
+
+        # Pre-seed with 4 ticks already counted — next tick is the 5th
+        mod._burn_rates[1] = BurnRate(
+            rate_5h_per_min=1.0,
+            last_check_5h=50.0,
+            rate_7d_per_min=1.0,
+            last_check_7d=30.0,
+        )
+        mod._burn_rate_unchanged_ticks[1] = 4
+
+        # Account usage matches seeded last_check_5h exactly (unchanged)
+        accounts = [
+            _acct(1, usage_5h=50, usage_7d=30),  # 50% — below 80% warning
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "auto_swap_5h_warning": "80",
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    # max_sleeps=0: first sleep call (at end of tick) raises
+                    # CancelledError immediately, giving exactly 1 tick
+                    side_effect=_sleep_canceller(max_sleeps=0),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="tok",
+                ),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+            # After exactly 1 tick, decay should have been applied (1.0 * 0.8 = 0.8)
+            br = mod._burn_rates.get(1)
+            assert br is not None, "Burn rate entry should still exist after decay tick"
+            assert abs(br.rate_5h_per_min - 0.8) < 0.01, (
+                f"Expected rate_5h_per_min ~0.8 after decay, got {br.rate_5h_per_min}"
+            )
+
+        asyncio.run(_run())
+
+    def test_no_decay_above_warning_threshold(self):
+        """Usage at or above warning threshold -> no burn-rate decay applied."""
+        import jacked.api.usage_monitor as mod
+        from jacked.web.auto_swap import BurnRate
+        mod._burn_rates.clear()
+        mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0
+
+        # Pre-seed with many unchanged ticks
+        mod._burn_rates[1] = BurnRate(
+            rate_5h_per_min=1.0,
+            last_check_5h=85.0,
+            rate_7d_per_min=1.0,
+            last_check_7d=50.0,
+        )
+        mod._burn_rate_unchanged_ticks[1] = 10  # well above the 5-tick threshold
+
+        # Account at 85% — above 80% warning, may trigger swap
+        accounts = [
+            _acct(1, usage_5h=85, usage_7d=50),
+        ]
+        db = _make_db(
+            settings={
+                "auto_swap_enabled": "true",
+                "auto_swap_5h_warning": "80",
+                "usage_check_interval": "300",
+            },
+            accounts=accounts,
+        )
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=1),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="tok",
+                ),
+                patch(
+                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
+                ),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+            # At 85% usage the account may trigger a swap and pop the burn rate.
+            # Only assert the rate is undecayed if the entry still exists.
+            br = mod._burn_rates.get(1)
+            if br is not None:
+                assert br.rate_5h_per_min >= 1.0, (
+                    f"Expected rate_5h_per_min undecayed (>= 1.0), "
+                    f"got {br.rate_5h_per_min}"
                 )
 
         asyncio.run(_run())
