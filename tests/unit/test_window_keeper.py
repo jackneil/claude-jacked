@@ -1,9 +1,8 @@
-"""Tests for window keeper schedule evaluation (pure functions only).
+"""Tests for window keeper schedule evaluation and ping_account."""
 
-ping_account is NOT tested here — it spawns real subprocesses.
-"""
-
+import asyncio
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from jacked.web.window_keeper import is_active_hours, is_prewake_time, needs_ping
 
@@ -55,3 +54,70 @@ class TestNeedsPing:
     def test_needs_ping_active_window(self):
         # A timestamp far in the future
         assert needs_ping("2099-12-31T23:59:59") is False
+
+
+# ---------------------------------------------------------------------------
+# ping_account
+# ---------------------------------------------------------------------------
+
+class TestPingAccount:
+    def test_ping_success(self):
+        """HTTP 200 from messages API -> returns True."""
+        from jacked.web.window_keeper import ping_account
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        async def _run():
+            with patch("httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.post.return_value = mock_resp
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_client_cls.return_value = mock_client
+
+                result = await ping_account("fake-token")
+                assert result is True
+                mock_client.post.assert_called_once()
+                call_kwargs = mock_client.post.call_args
+                assert "Bearer fake-token" in call_kwargs[1]["headers"]["Authorization"]
+
+        asyncio.run(_run())
+
+    def test_ping_401_returns_false(self):
+        """HTTP 401 (expired token) -> returns False."""
+        from jacked.web.window_keeper import ping_account
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.text = "Unauthorized"
+
+        async def _run():
+            with patch("httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.post.return_value = mock_resp
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_client_cls.return_value = mock_client
+
+                result = await ping_account("expired-token")
+                assert result is False
+
+        asyncio.run(_run())
+
+    def test_ping_exception_returns_false(self):
+        """Network error -> returns False, doesn't crash."""
+        from jacked.web.window_keeper import ping_account
+
+        async def _run():
+            with patch("httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.post.side_effect = Exception("connection refused")
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_client_cls.return_value = mock_client
+
+                result = await ping_account("any-token")
+                assert result is False
+
+        asyncio.run(_run())
