@@ -18,9 +18,11 @@ logger = logging.getLogger(__name__)
 
 # Module-level state — shared between loops.
 # Only the active poll loop writes to _burn_rates.
-_burn_rates: dict[int, object] = {}
+_burn_rates: dict[int, "BurnRate"] = {}
 _last_exhaustion_warning: float = 0.0
 _EXHAUSTION_COOLDOWN_SECONDS = 1800  # 30 minutes
+_last_swap_time: float = 0.0
+_SWAP_COOLDOWN_SECONDS = 300  # 5 minutes between swaps to prevent ping-ponging
 
 # Track consecutive unchanged ticks per account for burn-rate decay.
 _burn_rate_unchanged_ticks: dict[int, int] = {}
@@ -77,7 +79,7 @@ async def active_account_poll_loop(app):
     decay, and descriptive swap reason strings.  Never crashes — all
     errors are caught and logged per tick.
     """
-    global _last_exhaustion_warning
+    global _last_exhaustion_warning, _last_swap_time
 
     while True:
         try:
@@ -104,7 +106,10 @@ async def active_account_poll_loop(app):
                         await asyncio.sleep(60)
                         continue
                 except (ValueError, TypeError):
-                    pass  # Invalid timestamp -- treat as not paused
+                    logger.warning(
+                        "Ignoring unparseable pause timestamp: %r",
+                        paused_until_str,
+                    )
 
             critical_5h = _setting_float(db, "auto_swap_5h_critical", 90)
             warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
@@ -122,6 +127,7 @@ async def active_account_poll_loop(app):
                 pick_best_target,
                 update_burn_rate,
                 tier_critical_threshold,
+                tier_label as _tier_label,
             )
 
             # -- Active account ID ---------------------------------------
@@ -168,6 +174,10 @@ async def active_account_poll_loop(app):
                 if ticks >= 5 and current_5h_val < warning_5h:
                     prev.rate_5h_per_min *= 0.8
                     prev.rate_7d_per_min *= 0.8
+                    if prev.rate_5h_per_min < 0.001:
+                        prev.rate_5h_per_min = 0.0
+                    if prev.rate_7d_per_min < 0.001:
+                        prev.rate_7d_per_min = 0.0
                 br = prev
             else:
                 # Usage changed — update burn rate and reset tick counter
@@ -200,6 +210,15 @@ async def active_account_poll_loop(app):
                 ws_registry = getattr(app.state, "ws_registry", None)
 
                 if target is not None:
+                    # -- Swap cooldown: prevent ping-ponging ------
+                    if (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
+                        logger.debug(
+                            "Active poll: swap cooldown active (%.0fs remaining)",
+                            _SWAP_COOLDOWN_SECONDS - (time.time() - _last_swap_time),
+                        )
+                        await asyncio.sleep(60)
+                        continue
+
                     # -- TOCTOU guard: re-read active ID before swap ------
                     current_active = _read_active_account_id()
                     if current_active != active_acct_id:
@@ -213,19 +232,12 @@ async def active_account_poll_loop(app):
                         continue
 
                     # -- Build descriptive reason -------------------------
-                    tier_match = None
-                    try:
-                        import re
-                        tier_str = (active_acct.get("rate_limit_tier") or "").lower()
-                        tier_match = re.search(r"(\d+)x", tier_str)
-                    except Exception:
-                        pass
-                    tier_label = f" (tier {tier_match.group(1)}x)" if tier_match else ""
+                    tier_lbl = _tier_label(active_acct)
 
                     if usage_5h is not None and usage_5h >= effective_critical:
                         reason = (
                             f"5h critical: {usage_5h:.1f}% >= "
-                            f"{effective_critical:.0f}%{tier_label}"
+                            f"{effective_critical:.0f}%{tier_lbl}"
                         )
                     elif usage_7d is not None and usage_7d >= threshold_7d:
                         reason = (
@@ -268,6 +280,7 @@ async def active_account_poll_loop(app):
                     # Re-seed burn rate for new active account
                     _burn_rates.pop(target["id"], None)
                     _burn_rate_unchanged_ticks.pop(target["id"], None)
+                    _last_swap_time = time.time()
 
                     if ws_registry:
                         await ws_registry.broadcast(
@@ -275,6 +288,7 @@ async def active_account_poll_loop(app):
                             {
                                 "from_account_id": active_acct_id,
                                 "to_account_id": target["id"],
+                                "to_email": target.get("email", ""),
                                 "reason": reason,
                             },
                         )
@@ -360,7 +374,6 @@ async def full_sweep_loop(app):
 
             # -- Late imports --------------------------------------------
             from jacked.web.auth import fetch_usage
-            from jacked.api.credential_helpers import read_fresh_active_token
             from jacked.web.window_keeper import (
                 is_active_hours,
                 is_prewake_time,
@@ -371,20 +384,20 @@ async def full_sweep_loop(app):
             # -- Fetch usage for ALL non-active accounts -----------------
             active_acct_id = _read_active_account_id()
             accounts = db.list_accounts(include_inactive=False)
+            sweep_checked = 0
+            sweep_pinged = 0
 
             for acct in accounts:
                 acct_id = acct["id"]
                 if acct_id == active_acct_id:
                     continue  # active account handled by poll loop
-                effective_token = None
-                result = await fetch_usage(
-                    acct_id, db, access_token=effective_token,
-                )
+                result = await fetch_usage(acct_id, db)
                 if result and not result.get("_cached"):
                     logger.debug(
                         "Usage fetched for account %d in full sweep", acct_id,
                     )
                 await asyncio.sleep(1)  # pacing
+                sweep_checked += 1
 
             # -- Window keeper -------------------------------------------
             wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
@@ -420,6 +433,12 @@ async def full_sweep_loop(app):
                     )
                     await ping_account(cc_rt, scopes)
                     await asyncio.sleep(2)  # pacing
+                    sweep_pinged += 1
+
+            logger.info(
+                "Full sweep complete: checked %d accounts, pinged %d windows",
+                sweep_checked, sweep_pinged,
+            )
 
         except asyncio.CancelledError:
             logger.info("Full sweep loop cancelled — shutting down")

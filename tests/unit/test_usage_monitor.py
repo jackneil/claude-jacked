@@ -17,6 +17,7 @@ from jacked.api.usage_monitor import (
     _setting_bool,
     _setting_float,
     _setting_str,
+    _SWAP_COOLDOWN_SECONDS,
     active_account_poll_loop,
     full_sweep_loop,
 )
@@ -581,6 +582,7 @@ class TestBurnRateReseedAfterSwap:
         from jacked.web.auto_swap import BurnRate
         mod._burn_rates.clear()
         mod._burn_rate_unchanged_ticks.clear()
+        mod._last_swap_time = 0.0  # ensure cooldown is not active
 
         # Pre-seed burn rates for both accounts
         mod._burn_rates[2] = BurnRate(

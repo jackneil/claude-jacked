@@ -26,6 +26,13 @@ class BurnRate:
     last_check_time: float = field(default_factory=time.time)
 
 
+def tier_label(account: dict) -> str:
+    """Return a human-readable tier label like '(tier 20x)' or ''."""
+    tier = (account.get("rate_limit_tier") or "").lower()
+    match = re.search(r"(\d+)x", tier)
+    return f" (tier {match.group(1)}x)" if match else ""
+
+
 def tier_critical_threshold(account: dict) -> float:
     """Compute the auto-swap critical threshold based on account tier.
 
