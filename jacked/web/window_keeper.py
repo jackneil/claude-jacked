@@ -1,7 +1,7 @@
 """Window keeper — schedule evaluation (pure) + ping logic (async).
 
 Keeps 5-hour usage windows rolling by pinging idle accounts with a
-lightweight ``claude -p`` call using the account's OAuth refresh token.
+lightweight API call using the account's OAuth access token.
 Schedule-aware: active hours, quiet hours, pre-wake activation.
 """
 
@@ -9,11 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import subprocess
 from datetime import datetime, timedelta, timezone
-
-from jacked.findbin import find_bin
 
 logger = logging.getLogger(__name__)
 
@@ -80,43 +76,47 @@ def needs_ping(resets_at: str | None) -> bool:
 # Async ping
 # ---------------------------------------------------------------------------
 
-# Security note: The refresh token is passed via env var, visible to
-# process monitors.  This is acceptable for a localhost-only tool.
-
 async def ping_account(
-    cc_refresh_token: str,
-    scopes: str,
+    cc_access_token: str,
     timeout: int = 30,
 ) -> bool:
-    """Ping Claude Code with *cc_refresh_token* to start/refresh a window.
+    """Open/refresh a 5-hour usage window via a minimal API call.
 
-    Returns True on success (returncode 0), False on any failure.
+    Makes a single haiku inference call with the account's access token.
+    This is ~10x faster than the old subprocess approach and avoids
+    credential resolution bugs (the subprocess used the keychain, which
+    has the active account's creds — not the target account's).
+
+    Returns True on success (HTTP 200), False on any failure.
     """
-    claude_bin = find_bin("claude")
-    if claude_bin is None:
-        logger.warning("ping_account: claude binary not found — skipping ping")
-        return False
-
-    env = os.environ.copy()
-    env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = cc_refresh_token
-    env["CLAUDE_CODE_OAUTH_SCOPES"] = scopes
-    env.pop("ANTHROPIC_API_KEY", None)
+    import httpx
+    from jacked.web.oauth import OAUTH_BETA_HEADER
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            claude_bin, "-p", ".", "--max-turns", "1",
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("ping_account: timed out after %ds — killing process", timeout)
-        proc.kill()
-        await proc.wait()
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Authorization": f"Bearer {cc_access_token}",
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": OAUTH_BETA_HEADER,
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 401:
+            logger.warning("ping_account: 401 — token expired, will refresh next cycle")
+        elif resp.status_code == 429:
+            logger.warning("ping_account: 429 — rate limited")
+        else:
+            logger.warning("ping_account: HTTP %d — %s", resp.status_code, resp.text[:200])
         return False
     except Exception:
         logger.exception("ping_account: unexpected error")
         return False
-
-    return proc.returncode == 0

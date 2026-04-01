@@ -433,16 +433,15 @@ async def full_sweep_loop(app):
                         continue
                     if not acct.get("auto_swap_enabled"):
                         continue
-                    cc_rt = acct.get("cc_refresh_token")
-                    if not cc_rt:
+                    cc_at = acct.get("cc_access_token")
+                    if not cc_at:
                         continue
 
-                    scopes = acct.get("scopes") or ""
                     logger.info(
                         "Window keeper: pinging account %d (%s)",
                         acct["id"], acct.get("email", "?"),
                     )
-                    await ping_account(cc_rt, scopes)
+                    await ping_account(cc_at)
                     await asyncio.sleep(2)  # pacing
                     sweep_pinged += 1
 
