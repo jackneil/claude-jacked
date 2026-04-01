@@ -739,3 +739,69 @@ class TestSeedOauthAccountOrg:
         )
         assert "organizationUuid" not in data["oauthAccount"]
         assert "organizationName" not in data["oauthAccount"]
+
+
+# ---------------------------------------------------------------------------
+# Re-auth with wrong org redirects to correct account
+# ---------------------------------------------------------------------------
+
+
+class TestReauthWrongOrgRedirect:
+    """When re-auth returns a different org that already has an active account,
+    update THAT account's tokens instead of crashing with UNIQUE constraint."""
+
+    def test_reauth_different_org_updates_matching_account(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        try:
+            # Two accounts, same email, different orgs
+            acct_personal = db.create_account(
+                email="jack@test.com",
+                access_token="at_personal",
+                expires_at=int(time.time()) + 3600,
+                organization_uuid="org-personal",
+                organization_name="Personal",
+            )
+            acct_work = db.create_account(
+                email="jack@test.com",
+                access_token="at_work_old",
+                expires_at=int(time.time()) + 3600,
+                organization_uuid="org-work",
+                organization_name="Work Inc",
+            )
+
+            personal_id = acct_personal["id"]
+            work_id = acct_work["id"]
+
+            # Simulate re-auth on personal account but user picks work org.
+            # The _store_account flow should detect the mismatch and update
+            # the work account instead of the personal one.
+            from jacked.web.oauth import OAuthFlow
+            flow = OAuthFlow(db, target_account_id=personal_id)
+
+            # Mock the OAuth flow internals to simulate callback with work org
+            tokens = {
+                "access_token": "at_work_fresh",
+                "refresh_token": "rt_work_fresh",
+                "email": "jack@test.com",
+                "organization_uuid": "org-work",
+                "organization_name": "Work Inc",
+            }
+            profile = {
+                "account": {"email_address": "jack@test.com", "display_name": "Jack"},
+                "organization": {"organization_type": "max"},
+            }
+            usage = {}
+
+            # This should NOT raise IntegrityError
+            account = flow._store_account(tokens, profile, usage)
+
+            # The WORK account should have been updated (not personal)
+            assert account["id"] == work_id
+            assert account["access_token"] == "at_work_fresh"
+
+            # Personal account should be unchanged
+            personal = db.get_account(personal_id)
+            assert personal["access_token"] == "at_personal"
+            assert personal["organization_uuid"] == "org-personal"
+        finally:
+            db.close()

@@ -160,8 +160,11 @@ class OAuthFlow:
 
         result: dict = {"status": self._status, "flow_id": self.flow_id}
         if self._result:
-            result["account_id"] = self._result.get("account_id")
+            result["account_id"] = self._result.get("account_id") or self._result.get("id")
             result["email"] = self._result.get("email")
+            result["organization_name"] = self._result.get("organization_name")
+            if self._result.get("_redirected_from"):
+                result["redirected_from_account_id"] = self._result["_redirected_from"]
         if self._error:
             result["error"] = self._error
         if self._cc_flow_id:
@@ -535,15 +538,30 @@ class OAuthFlow:
                     f"target account ({target['email']})"
                 )
 
-            # If org_uuid changed, remove any soft-deleted duplicate that would
-            # collide with UNIQUE(email, organization_uuid). This cleans up ghosts
-            # left by the old bug where re-auth created duplicate accounts.
+            # If org_uuid changed, check if there's already an active account
+            # with the new (email, org_uuid). This happens when the user clicks
+            # re-auth on Account A but authorizes Account B's org on Anthropic's
+            # page. Update Account B instead of crashing with UNIQUE violation.
             old_org_uuid = target.get("organization_uuid", "")
+            actual_target_id = self._target_account_id
             if final_org_uuid != old_org_uuid:
-                self.db.hard_delete_duplicate(email, final_org_uuid)
+                existing = self.db.get_account_by_email(email, final_org_uuid)
+                if existing:
+                    # Redirect: update the matching account, not the target
+                    actual_target_id = existing["id"]
+                    logger.info(
+                        "Re-auth org mismatch: target account %d (org %s) "
+                        "but authorized org %s which matches account %d — "
+                        "updating account %d instead",
+                        self._target_account_id, old_org_uuid,
+                        final_org_uuid, existing["id"], existing["id"],
+                    )
+                else:
+                    # No active account for this org — clean up soft-deleted ghosts
+                    self.db.hard_delete_duplicate(email, final_org_uuid)
 
             self.db.update_account(
-                self._target_account_id,
+                actual_target_id,
                 access_token=tokens["access_token"],
                 refresh_token=tokens.get("refresh_token"),
                 expires_at=expires_at,
@@ -559,7 +577,9 @@ class OAuthFlow:
                 last_validated_at=int(time.time()),
                 last_error=None,
             )
-            account = self.db.get_account(self._target_account_id)
+            account = self.db.get_account(actual_target_id)
+            if actual_target_id != self._target_account_id:
+                account["_redirected_from"] = self._target_account_id
         else:
             # ADD: Normal create_account with email+org upsert
             account = self.db.create_account(

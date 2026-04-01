@@ -82,12 +82,20 @@ async function startAddAccountFlow() {
             if (poll.status === 'completed') {
                 clearInterval(pollInterval);
                 window.jackedState.flowPolling = null;
-                statusEl.innerHTML = `
-                    <div class="bg-green-900/30 border border-green-700 rounded-lg px-4 py-3 text-sm text-green-200">
-                        Account connected successfully!
-                    </div>
-                `;
-                setTimeout(() => { statusEl.innerHTML = ''; }, 3000);
+                // Build success message — 10s if org was redirected, 3s normally
+                // All user data is escapeHtml'd before insertion
+                const acctEmail = poll.email || '';
+                const orgName = poll.organization_name || '';
+                const redirected = poll.redirected_from_account_id;
+                let msg = 'Account connected successfully!';
+                if (redirected) {
+                    msg = 'Updated ' + escapeHtml(acctEmail) + (orgName ? ' (' + escapeHtml(orgName) + ')' : '') + ' — you authorized a different org than selected';
+                } else if (acctEmail) {
+                    msg = escapeHtml(acctEmail) + ' connected successfully!';
+                }
+                const msgDuration = redirected ? 10000 : 3000;
+                statusEl.innerHTML = '<div class="bg-green-900/30 border border-green-700 rounded-lg px-4 py-3 text-sm text-green-200">' + msg + '</div>';
+                setTimeout(() => { statusEl.innerHTML = ''; }, msgDuration);
                 try {
                     await refreshAndRender();
                 } finally {
