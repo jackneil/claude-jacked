@@ -120,6 +120,13 @@ async function renderRoute(route) {
                 content.innerHTML = renderAccounts(window.jackedState.accounts);
                 if (typeof bindAccountEvents === 'function') bindAccountEvents();
                 if (typeof bindAutoSwapEvents === 'function') bindAutoSwapEvents();
+                // Load swap history
+                if (typeof loadSwapLog === 'function' && typeof renderSwapLogTable === 'function') {
+                    loadSwapLog().then(entries => {
+                        const el = document.getElementById('swap-history-container');
+                        if (el) el.textContent = '', el.appendChild(Object.assign(document.createElement('div'), {innerHTML: renderSwapLogTable(entries)}));
+                    });
+                }
                 // Auto-validate stale accounts on mount
                 autoValidateStaleAccounts();
             }
@@ -243,6 +250,13 @@ function rerenderAccountsView() {
     content.innerHTML = renderAccounts(window.jackedState.accounts);
     if (typeof bindAccountEvents === 'function') bindAccountEvents();
     if (typeof bindAutoSwapEvents === 'function') bindAutoSwapEvents();
+    // Refresh swap history (renderSwapLogTable escapeHtml's all user data)
+    if (typeof loadSwapLog === 'function' && typeof renderSwapLogTable === 'function') {
+        loadSwapLog().then(entries => {
+            const el = document.getElementById('swap-history-container');
+            if (el) { el.textContent = ''; const w = document.createElement('div'); w.innerHTML = renderSwapLogTable(entries); el.appendChild(w); }
+        });
+    }
 
     // Restore expanded details
     expandedDetails.forEach(id => {

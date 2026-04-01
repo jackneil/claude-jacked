@@ -392,6 +392,13 @@ function renderAccounts(accounts) {
             <div id="accounts-list" class="flex flex-col gap-3">
                 ${cardsHtml}
             </div>
+
+            <div class="mt-6 bg-slate-800 border border-slate-700 rounded-lg p-4">
+                <h3 class="text-sm font-medium text-slate-300 mb-3">Swap History</h3>
+                <div id="swap-history-container">
+                    <div class="text-xs text-slate-500">Loading...</div>
+                </div>
+            </div>
         </div>
     `;
 }
