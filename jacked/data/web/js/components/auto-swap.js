@@ -19,7 +19,7 @@ async function loadAutoSwapSettings() {
 
 async function loadSwapLog() {
     try {
-        const data = await api.get('/api/settings/swap-log?limit=10');
+        const data = await api.get('/api/settings/swap-log?limit=20');
         return data.entries || data || [];
     } catch (e) {
         console.error('Failed to load swap log:', e);
@@ -215,7 +215,7 @@ function renderSwapLogTable(entries) {
 
     const rows = entries.map(e => {
         const ts = e.timestamp
-            ? new Date(e.timestamp * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+            ? new Date(e.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
             : '\u2014';
         const from = escapeHtml(e.from_email || '\u2014');
         const to = escapeHtml(e.to_email || '\u2014');

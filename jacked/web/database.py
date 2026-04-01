@@ -2548,10 +2548,16 @@ class Database:
             return cursor.lastrowid
 
     def list_swaps(self, limit=50):
-        """List recent swap events."""
+        """List recent swap events with account emails."""
         with self._reader() as conn:
             rows = conn.execute(
-                "SELECT * FROM swap_log ORDER BY timestamp DESC LIMIT ?",
+                """SELECT s.*,
+                          fa.email AS from_email,
+                          ta.email AS to_email
+                   FROM swap_log s
+                   LEFT JOIN accounts fa ON fa.id = s.from_account_id
+                   LEFT JOIN accounts ta ON ta.id = s.to_account_id
+                   ORDER BY s.timestamp DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
