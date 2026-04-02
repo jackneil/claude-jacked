@@ -207,6 +207,18 @@ async def active_account_poll_loop(app):
                 await asyncio.sleep(60)
                 continue
 
+            # Push fresh usage data to connected dashboards so the
+            # countdown timer and usage bars update immediately.
+            _ws = getattr(app.state, "ws_registry", None)
+            if _ws and active_acct:
+                await _ws.broadcast(
+                    "usage_poll_updated",
+                    {
+                        "account_id": active_acct_id,
+                        "account_data": active_acct,
+                    },
+                )
+
             usage_5h = active_acct.get("cached_usage_5h")
             usage_7d = active_acct.get("cached_usage_7d")
 
