@@ -38,6 +38,72 @@ logger = logging.getLogger("jacked.auth")
 REFRESH_BUFFER_SECONDS = 300
 USAGE_CACHE_FRESHNESS_SECONDS = 30
 
+# Hard ceiling: never fetch usage more than once per this many seconds per account.
+# The Anthropic usage API rate limits at ~1 req/60s/account.
+_USAGE_RATE_LIMIT_CEILING = 65
+
+# Adaptive polling intervals by urgency tier
+_TIER_INTERVALS = {
+    "idle": 300,
+    "normal": 150,
+    "warning": 90,
+    "critical": 65,
+}
+_TIER_ORDER = ["idle", "normal", "warning", "critical"]
+
+# Per-account usage coordinator state
+_account_usage_state: dict[int, dict] = {}
+
+
+def _get_usage_state(account_id: int) -> dict:
+    """Get or create per-account usage coordinator state."""
+    if account_id not in _account_usage_state:
+        _account_usage_state[account_id] = {
+            "last_fetched_at": 0.0,
+            "backoff_until": 0.0,
+            "tier": "idle",
+            "interval": _TIER_INTERVALS["idle"],
+        }
+    return _account_usage_state[account_id]
+
+
+def compute_urgency_tier(
+    usage_5h: float | None,
+    usage_7d: float | None,
+    burn_rate_5h: float,
+    critical_5h: float = 90.0,
+) -> tuple[str, int]:
+    """Compute the adaptive polling urgency tier and interval.
+
+    Returns (tier_name, interval_seconds).
+    """
+    u5 = usage_5h if usage_5h is not None else 0.0
+    u7 = usage_7d if usage_7d is not None else 0.0
+
+    if u5 > 85:
+        tier = "critical"
+    elif u5 > 70:
+        tier = "warning"
+    elif u5 > 50:
+        tier = "normal"
+    else:
+        tier = "idle"
+
+    if burn_rate_5h > 0.01:
+        mins_to_critical = (critical_5h - u5) / burn_rate_5h if u5 < critical_5h else 0
+        if mins_to_critical <= 5:
+            tier = "critical"
+        elif mins_to_critical <= 15 and _TIER_ORDER.index(tier) < _TIER_ORDER.index("warning"):
+            tier = "warning"
+
+    if u7 > 80:
+        idx = _TIER_ORDER.index(tier)
+        if idx < len(_TIER_ORDER) - 1:
+            tier = _TIER_ORDER[idx + 1]
+
+    return tier, _TIER_INTERVALS[tier]
+
+
 # Per-account 429 backoff: account_id -> don't-fetch-before timestamp
 _usage_backoff: dict[int, float] = {}
 

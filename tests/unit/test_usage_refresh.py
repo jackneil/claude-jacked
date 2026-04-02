@@ -292,6 +292,109 @@ class TestUsageBackoff:
         assert result != {"_backed_off": True}
 
 
+class TestUrgencyTier:
+    """Tests for adaptive polling urgency tier computation."""
+
+    def test_idle_low_usage_no_burn(self):
+        """Usage < 50%, burn rate ~0 -> IDLE (300s)."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=20.0, usage_7d=30.0,
+            burn_rate_5h=0.0, critical_5h=90.0,
+        )
+        assert tier == "idle"
+        assert interval == 300
+
+    def test_normal_moderate_usage(self):
+        """Usage 50-70%, low burn -> NORMAL (150s)."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=60.0, usage_7d=30.0,
+            burn_rate_5h=0.2, critical_5h=90.0,
+        )
+        assert tier == "normal"
+        assert interval == 150
+
+    def test_warning_high_usage(self):
+        """Usage 70-85% -> WARNING (90s)."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=75.0, usage_7d=30.0,
+            burn_rate_5h=0.5, critical_5h=90.0,
+        )
+        assert tier == "warning"
+        assert interval == 90
+
+    def test_critical_very_high_usage(self):
+        """Usage > 85% -> CRITICAL (65s)."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=88.0, usage_7d=30.0,
+            burn_rate_5h=1.0, critical_5h=90.0,
+        )
+        assert tier == "critical"
+        assert interval == 65
+
+    def test_burn_rate_projects_critical_soon(self):
+        """Usage 60% but burn rate projects critical in 5 min -> CRITICAL."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=60.0, usage_7d=30.0,
+            burn_rate_5h=6.0, critical_5h=90.0,
+        )
+        assert tier == "critical"
+        assert interval == 65
+
+    def test_burn_rate_projects_critical_in_15_min(self):
+        """Usage 60% but burn rate projects critical in 15 min -> WARNING."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=60.0, usage_7d=30.0,
+            burn_rate_5h=2.0, critical_5h=90.0,
+        )
+        assert tier == "warning"
+        assert interval == 90
+
+    def test_7d_escalation(self):
+        """7d > 80% bumps up one tier regardless of 5h."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=20.0, usage_7d=85.0,
+            burn_rate_5h=0.0, critical_5h=90.0,
+        )
+        assert tier == "normal"
+        assert interval == 150
+
+    def test_7d_escalation_stacks_with_warning(self):
+        """7d > 80% bumps WARNING to CRITICAL."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=75.0, usage_7d=85.0,
+            burn_rate_5h=0.5, critical_5h=90.0,
+        )
+        assert tier == "critical"
+        assert interval == 65
+
+    def test_none_usage_defaults_to_idle(self):
+        """None usage (never fetched) -> IDLE."""
+        from jacked.web.auth import compute_urgency_tier
+
+        tier, interval = compute_urgency_tier(
+            usage_5h=None, usage_7d=None,
+            burn_rate_5h=0.0, critical_5h=90.0,
+        )
+        assert tier == "idle"
+        assert interval == 300
+
+
 class TestConstants:
     """Verify constants are properly defined."""
 
