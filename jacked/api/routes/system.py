@@ -1709,6 +1709,16 @@ _PROTECTED_SETTING_KEYS = {
     "gatekeeper.model",
     "gatekeeper.eval_method",
     "gatekeeper.enabled",
+    "usage_check_interval",
+    "auto_swap_5h_warning",
+    "auto_swap_5h_critical",
+    "auto_swap_7d_threshold",
+    "auto_swap_enabled",
+    "window_keeper_enabled",
+    "window_keeper_active_start",
+    "window_keeper_active_end",
+    "window_keeper_prewake",
+    "auto_swap_paused_until",
 }
 
 
