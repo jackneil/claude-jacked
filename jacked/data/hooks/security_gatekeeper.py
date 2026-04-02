@@ -815,7 +815,15 @@ def check_permissions(command: str, cwd: str) -> tuple[bool, str | None]:
     patterns.extend(_load_permissions(project_dir / ".claude" / "settings.local.json"))
 
     cmd_core = _strip_env_prefix(command)
-    candidates = [command, cmd_core] if cmd_core != command else [command]
+    cmd_no_comments = _strip_leading_comments(command).strip()
+    cmd_no_comments_core = _strip_env_prefix(cmd_no_comments)
+    # Build candidate list — deduplicated, original first
+    seen = set()
+    candidates = []
+    for c in [command, cmd_core, cmd_no_comments, cmd_no_comments_core]:
+        if c not in seen:
+            seen.add(c)
+            candidates.append(c)
 
     for pat in patterns:
         prefix, is_wildcard = _parse_bash_pattern(pat)
@@ -851,6 +859,24 @@ def _get_base_command(command: str) -> str:
 def _strip_env_prefix(cmd: str) -> str:
     """Strip leading env var assignments: HOME=/x PATH="/y" cmd → cmd"""
     return ENV_ASSIGN_RE.sub("", cmd).strip()
+
+
+def _strip_leading_comments(cmd: str) -> str:
+    """Strip leading # comment lines from multi-line commands.
+
+    Claude Code now prepends description comments before the actual command:
+        # Click on a source element
+        npx agent-browser --session nav click e106
+
+    Without stripping, permission patterns like Bash(npx agent-browser:*)
+    fail because the command starts with '#', not 'npx'.
+    """
+    lines = cmd.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return "\n".join(lines[i:])
+    return cmd  # all comments — return as-is
 
 
 def _is_pipe_safe(cmd: str) -> bool:
@@ -2347,11 +2373,14 @@ def main():
     log(f"EVALUATING: {command[:200]}")
     steps = _Steps(start)
 
-    # Tier 0: Deny check FIRST — security always wins over permissions
-    cmd_stripped = command.strip()
+    # Strip leading # comment lines (Claude Code now prepends descriptions).
+    # Deny checks run on BOTH original and stripped — comments don't make
+    # dangerous commands safe.
+    cmd_raw = command.strip()
+    cmd_stripped = _strip_leading_comments(cmd_raw).strip()
     cmd_core = _strip_env_prefix(cmd_stripped)
     for pattern, label in DENY_PATTERNS:
-        if pattern.search(cmd_stripped) or pattern.search(cmd_core):
+        if pattern.search(cmd_raw) or pattern.search(cmd_stripped) or pattern.search(cmd_core):
             steps.record("deny_pattern", "ask", label)
             elapsed = time.time() - start
             log(f"DENY MATCH ({elapsed:.3f}s)")

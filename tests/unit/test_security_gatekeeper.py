@@ -922,6 +922,24 @@ class TestCheckPermissions:
         with patch.object(Path, "home", return_value=tmp_path):
             assert gk.check_permissions("HOME=/tmp git push", str(tmp_path))[0] is True
 
+    def test_leading_comment_stripped_for_permission_check(self, tmp_path):
+        """Commands with # comment lines before the real command should still match."""
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"permissions": {"allow": ["Bash(npx agent-browser:*)"]}}))
+        cmd = "# Click on a source element\nnpx agent-browser --session nav click e106"
+        with patch.object(Path, "home", return_value=tmp_path):
+            assert gk.check_permissions(cmd, str(tmp_path))[0] is True
+
+    def test_multiline_comments_stripped_for_permission_check(self, tmp_path):
+        """Multiple comment lines before the command should all be stripped."""
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"permissions": {"allow": ["Bash(npx vitest:*)"]}}))
+        cmd = "# Run the test suite\n# with verbose output\nnpx vitest run --reporter=verbose"
+        with patch.object(Path, "home", return_value=tmp_path):
+            assert gk.check_permissions(cmd, str(tmp_path))[0] is True
+
 
 # ---------------------------------------------------------------------------
 # Category perm_override flag and permission-based category bypass
