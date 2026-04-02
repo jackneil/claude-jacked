@@ -557,6 +557,12 @@ async def refresh_usage(account_id: int, request: Request):
     effective_token = fresh_token if (fresh_token and fresh_token != db_token) else None
     usage_data = await fetch_usage(account_id, db, access_token=effective_token)
 
+    if isinstance(usage_data, dict) and usage_data.get("_backed_off"):
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"error": {"message": "Usage API rate limited — try again shortly", "code": "RATE_LIMITED"}},
+        )
+
     if usage_data is None:
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -663,6 +669,10 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
             is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
             if is_cached:
                 usage_data = None  # Treat as skip — use DB values below
+
+            is_backed_off = isinstance(usage_data, dict) and usage_data.get("_backed_off")
+            if is_backed_off:
+                usage_data = None
 
             if usage_data is not None:
                 refreshed += 1
