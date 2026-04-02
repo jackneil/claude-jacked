@@ -114,7 +114,7 @@ def should_swap(
     # Stale-data guard: if the 5h reset is in the past but our usage data
     # is older than the reset, the usage is stale (a real reset happened
     # but we couldn't fetch). Don't trust the data — suppress swap.
-    if resets_5h_at and usage_cached_at:
+    if resets_5h_at is not None and usage_cached_at is not None:
         try:
             reset_dt = datetime.fromisoformat(resets_5h_at.replace("Z", "+00:00"))
             if reset_dt <= datetime.now(timezone.utc):

@@ -259,16 +259,24 @@ async def active_account_poll_loop(app):
             # account just to save a window reset when a much better
             # option is available.
             escape_override = False
-            if (
-                not want_swap
-                and usage_5h is not None
-                and usage_5h >= warning_5h
-                and _resets_within(
-                    active_acct.get("cached_5h_resets_at"),
-                    RESET_SUPPRESS_MINUTES,
-                )
+            if not want_swap and _resets_within(
+                active_acct.get("cached_5h_resets_at"),
+                RESET_SUPPRESS_MINUTES,
             ):
-                escape_override = True
+                # Verify suppression was actually the reason: would a swap
+                # have triggered WITHOUT the reset suppression?
+                would_swap_without_suppress = should_swap(
+                    usage_5h=usage_5h,
+                    usage_7d=usage_7d,
+                    critical_5h=effective_critical,
+                    warning_5h=warning_5h,
+                    threshold_7d=threshold_7d,
+                    burn_rate=br,
+                    check_interval_min=check_interval / 60,
+                    # No reset params → no suppression
+                )
+                if would_swap_without_suppress:
+                    escape_override = True
 
             if want_swap or escape_override:
                 target = pick_best_target(
@@ -278,12 +286,13 @@ async def active_account_poll_loop(app):
 
                 # For escape hatch, verify candidate is good enough
                 if escape_override and not want_swap and target:
-                    if score_candidate(target) <= SUPPRESS_OVERRIDE_SCORE:
+                    target_score = score_candidate(target)
+                    if target_score <= SUPPRESS_OVERRIDE_SCORE:
                         logger.debug(
                             "Escape hatch: candidate %d scores %.0f "
                             "(<= %d), staying put",
                             target["id"],
-                            score_candidate(target),
+                            target_score,
                             SUPPRESS_OVERRIDE_SCORE,
                         )
                         target = None  # not good enough, stay put
