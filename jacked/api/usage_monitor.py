@@ -76,6 +76,39 @@ def _setting_str(db, key: str, default: str) -> str:
 # Loop 1 — Active account poll (60s)
 # -----------------------------------------------------------------------
 
+
+def _compute_poll_interval(
+    active_id: int | None,
+    db,
+    burn_rates: dict,
+) -> tuple[float, str]:
+    """Compute the adaptive poll interval and urgency tier.
+
+    Returns (interval_seconds, tier_name). Falls back to (60, "unknown")
+    on any error.
+    """
+    if active_id is None or db is None:
+        return 60.0, "unknown"
+    try:
+        from jacked.web.auth import compute_urgency_tier, _get_usage_state
+        acct = db.get_account(active_id)
+        br = burn_rates.get(active_id)
+        state = _get_usage_state(active_id)
+        tier, base = compute_urgency_tier(
+            usage_5h=acct.get("cached_usage_5h") if acct else None,
+            usage_7d=acct.get("cached_usage_7d") if acct else None,
+            burn_rate_5h=br.rate_5h_per_min if br else 0.0,
+            critical_5h=_setting_float(db, "auto_swap_5h_critical", 90),
+        )
+        state["tier"] = tier
+        state["interval"] = base
+        jitter = base * 0.15
+        interval = base + random.uniform(-jitter, jitter)
+        return interval, tier
+    except Exception:
+        return 60.0, "unknown"
+
+
 async def active_account_poll_loop(app):
     """Poll the active account with adaptive interval for threshold detection.
 
@@ -358,32 +391,10 @@ async def active_account_poll_loop(app):
         except Exception:
             logger.warning("Active account poll loop error", exc_info=True)
 
-        # Adaptive interval: urgency tier determines how long to wait.
-        # Faster when usage is high or climbing, slower when idle.
-        _poll_interval = 60  # default fallback
-        try:
-            from jacked.web.auth import compute_urgency_tier, _get_usage_state
-            _poll_active_id = _read_active_account_id()
-            if _poll_active_id is not None and db is not None:
-                _poll_acct = db.get_account(_poll_active_id)
-                _poll_br = _burn_rates.get(_poll_active_id)
-                _poll_state = _get_usage_state(_poll_active_id)
-                _poll_tier, _poll_base = compute_urgency_tier(
-                    usage_5h=_poll_acct.get("cached_usage_5h") if _poll_acct else None,
-                    usage_7d=_poll_acct.get("cached_usage_7d") if _poll_acct else None,
-                    burn_rate_5h=_poll_br.rate_5h_per_min if _poll_br else 0.0,
-                    critical_5h=_setting_float(db, "auto_swap_5h_critical", 90),
-                )
-                _poll_state["tier"] = _poll_tier
-                _poll_state["interval"] = _poll_base
-                _poll_jitter = _poll_base * 0.15
-                _poll_interval = _poll_base + random.uniform(-_poll_jitter, _poll_jitter)
-                logger.debug(
-                    "Active poll: tier=%s interval=%.0fs (base=%ds)",
-                    _poll_tier, _poll_interval, _poll_base,
-                )
-        except Exception:
-            logger.debug("Adaptive interval fallback to 60s", exc_info=True)
+        _poll_interval, _poll_tier = _compute_poll_interval(
+            _read_active_account_id(), db, _burn_rates,
+        )
+        logger.debug("Active poll: tier=%s interval=%.0fs", _poll_tier, _poll_interval)
         await asyncio.sleep(_poll_interval)
 
 
