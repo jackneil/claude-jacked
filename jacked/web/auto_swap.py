@@ -210,6 +210,18 @@ def score_candidate(account: dict) -> float:
         except (ValueError, TypeError):
             pass
 
+    # Bonus for imminent 5h reset — encourages swapping TO accounts about
+    # to get a fresh window. Max +30 when reset is 0 min away, tapering
+    # to 0 at 15 min.
+    if resets_5h:
+        try:
+            r = datetime.fromisoformat(resets_5h.replace("Z", "+00:00"))
+            remaining_min = (r - datetime.now(timezone.utc)).total_seconds() / 60.0
+            if 0 < remaining_min <= 15:
+                score += 30 * (1 - remaining_min / 15)
+        except (ValueError, TypeError):
+            pass
+
     return score
 
 

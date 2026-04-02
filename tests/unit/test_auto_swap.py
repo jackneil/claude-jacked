@@ -307,3 +307,26 @@ class TestShouldSwapWindowAware:
             resets_5h_at=reset_time,
             usage_cached_at=cached_at,
         ) is True
+
+
+# ---------------------------------------------------------------------------
+# score_candidate — reset proximity bonus
+# ---------------------------------------------------------------------------
+
+class TestScoreResetBonus:
+    def test_imminent_reset_gets_bonus(self):
+        """Account with 5h reset in 3 min should score higher than one without."""
+        from datetime import datetime, timezone, timedelta
+        resets_soon = (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat()
+        a = _acct(1, usage_5h=80, resets_5h=resets_soon)
+        b = _acct(2, usage_5h=80)
+        assert score_candidate(a) > score_candidate(b)
+
+    def test_no_bonus_beyond_15_min(self):
+        """Account with reset in 20 min should NOT get the bonus."""
+        from datetime import datetime, timezone, timedelta
+        resets_far = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        resets_far2 = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        a = _acct(1, usage_5h=80, resets_5h=resets_far)
+        b = _acct(2, usage_5h=80, resets_5h=resets_far2)
+        assert abs(score_candidate(a) - score_candidate(b)) < 2
