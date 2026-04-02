@@ -2305,6 +2305,52 @@ def _record_decision(
     _record_hook_execution(elapsed_ms, session_id, repo_path)
 
 
+# --- PermissionRequest handler ---
+
+
+def handle_permission_request(
+    tool_name: str, tool_input: dict, cwd: str
+) -> dict | None:
+    """Handle a PermissionRequest hook event.
+
+    Called when Claude Code is about to show the permission popup.
+    If the (comment-stripped) command matches an allow rule, return
+    an approve decision with the stripped command in updatedInput —
+    this auto-approves AND cleans the command so Claude Code's
+    "Always Allow" prefix suggestions don't include comments.
+
+    Returns the JSON response dict, or None to let the popup show.
+    """
+    if tool_name != "Bash":
+        return None
+
+    command = tool_input.get("command", "")
+    if not command:
+        return None
+
+    # Strip comments and check permissions
+    stripped = _strip_leading_comments(command.strip()).strip()
+    matched, pattern = check_permissions(stripped, cwd)
+    if not matched:
+        # Also try the original (might match without stripping)
+        matched, pattern = check_permissions(command, cwd)
+        if not matched:
+            return None
+
+    log(f"PERMISSION_REQUEST: auto-approving via rule '{pattern}' (comment-stripped)")
+
+    return {
+        "hookSpecificOutput": {
+            "decision": {
+                "behavior": "allow",
+                "updatedInput": {
+                    "command": stripped if stripped != command else command,
+                },
+            },
+        },
+    }
+
+
 # --- Main ---
 
 
@@ -2316,12 +2362,22 @@ def main():
     except Exception:
         sys.exit(0)
 
+    hook_event = hook_input.get("hook_event_name", "PreToolUse")
     tool_name = hook_input.get("tool_name", "Bash")
     tool_input = hook_input.get("tool_input", {})
     cwd = hook_input.get("cwd", "")
     repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace(
         "\\", "/"
     )
+
+    # PermissionRequest: auto-approve comment-stripped commands that match
+    # allow rules, with updatedInput so Claude Code's "Always Allow" popup
+    # shows the clean command (no # comment prefix).
+    if hook_event == "PermissionRequest":
+        result = handle_permission_request(tool_name, tool_input, cwd)
+        if result:
+            print(json.dumps(result))
+        sys.exit(0)
 
     global _session_tag
     sid = hook_input.get("session_id", "")

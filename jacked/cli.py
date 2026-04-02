@@ -1403,6 +1403,20 @@ def _verify_session_tracker_hooks(settings: dict):
             )
 
 
+def _ensure_permission_request_hook(existing: dict, command_str: str):
+    """Ensure the gatekeeper is registered for PermissionRequest events."""
+    if "PermissionRequest" not in existing.get("hooks", {}):
+        existing.setdefault("hooks", {})["PermissionRequest"] = []
+    existing["hooks"]["PermissionRequest"] = [
+        h for h in existing["hooks"]["PermissionRequest"]
+        if "security_gatekeeper" not in str(h)
+    ]
+    existing["hooks"]["PermissionRequest"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "timeout": 10}],
+    })
+
+
 def _install_security_hook(existing: dict, settings_path: Path):
     """Install a single catch-all security gatekeeper PreToolUse hook.
 
@@ -1470,26 +1484,30 @@ def _install_security_hook(existing: dict, settings_path: Path):
             for h in entry.get("hooks", []):
                 if h.get("command", "") != command_str:
                     h["command"] = command_str
-                    settings_path.parent.mkdir(parents=True, exist_ok=True)
-                    settings_path.write_text(json.dumps(existing, indent=2))
-                    console.print(
-                        "[green][OK][/green] Updated security gatekeeper hook (python path changed)"
-                    )
-                    return
+
+            # Ensure PermissionRequest hook is also registered
+            _ensure_permission_request_hook(existing, command_str)
+
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            settings_path.write_text(json.dumps(existing, indent=2))
             console.print(
-                "[yellow][-][/yellow] Security gatekeeper hook already configured"
+                "[green][OK][/green] Security gatekeeper hook configured"
             )
             return
 
-    # Add catch-all entry
+    # Add catch-all PreToolUse entry
     existing["hooks"]["PreToolUse"].append({
         "matcher": "",
         "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
     })
 
+    # Also register as PermissionRequest to auto-approve comment-stripped
+    # commands and provide updatedInput (clean command without # comments).
+    _ensure_permission_request_hook(existing, command_str)
+
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(existing, indent=2))
-    console.print("[green][OK][/green] Installed security gatekeeper (catch-all hook)")
+    console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse + PermissionRequest)")
 
     # Clean up stale prompt file from older versions (v0.3.9 and earlier created
     # this automatically, but it goes stale on upgrades and triggers warnings).

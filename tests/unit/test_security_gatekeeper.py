@@ -980,6 +980,50 @@ class TestStripLeadingComments:
         assert gk._strip_leading_comments("") == ""
 
 
+class TestHandlePermissionRequest:
+    """Tests for PermissionRequest hook handling — auto-approve with comment stripping."""
+
+    def test_matching_command_returns_approve_json(self, tmp_path):
+        """Comment-prefixed command matching an allow rule → approve with stripped command."""
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"permissions": {"allow": ["Bash(npx agent-browser:*)"]}}))
+        cmd = "# Take a snapshot\nnpx agent-browser --session nav snapshot"
+        with patch.object(Path, "home", return_value=tmp_path):
+            result = gk.handle_permission_request("Bash", {"command": cmd}, str(tmp_path))
+        assert result is not None
+        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        # updatedInput should have comments stripped
+        assert result["hookSpecificOutput"]["decision"]["updatedInput"]["command"] == "npx agent-browser --session nav snapshot"
+
+    def test_non_matching_command_returns_none(self, tmp_path):
+        """Command that doesn't match any allow rule → None (let Claude Code show popup)."""
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"permissions": {"allow": ["Bash(git :*)"]}}))
+        cmd = "# Run dangerous thing\nrm -rf /"
+        with patch.object(Path, "home", return_value=tmp_path):
+            result = gk.handle_permission_request("Bash", {"command": cmd}, str(tmp_path))
+        assert result is None
+
+    def test_non_bash_tool_returns_none(self, tmp_path):
+        """Non-Bash tools should not be handled by this."""
+        with patch.object(Path, "home", return_value=tmp_path):
+            result = gk.handle_permission_request("Edit", {"file_path": "/foo"}, str(tmp_path))
+        assert result is None
+
+    def test_command_without_comments_still_matches(self, tmp_path):
+        """Plain command (no comments) that matches rule → approve as-is."""
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"permissions": {"allow": ["Bash(npx vitest:*)"]}}))
+        cmd = "npx vitest run"
+        with patch.object(Path, "home", return_value=tmp_path):
+            result = gk.handle_permission_request("Bash", {"command": cmd}, str(tmp_path))
+        assert result is not None
+        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
 class TestDenyBypassWithComments:
     """Verify that deny patterns catch dangerous commands hidden behind comments."""
 
