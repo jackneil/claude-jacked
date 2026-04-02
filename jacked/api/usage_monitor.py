@@ -10,6 +10,7 @@ effect without restart.
 import asyncio
 import json
 import logging
+import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,7 +77,14 @@ def _setting_str(db, key: str, default: str) -> str:
 # -----------------------------------------------------------------------
 
 async def active_account_poll_loop(app):
-    """Poll the active account every 60s for fast threshold detection.
+    """Poll the active account with adaptive interval for threshold detection.
+
+    Interval adapts based on urgency tier:
+    - Idle (<50% usage, no burn): 5 min
+    - Normal (<70% or low burn): 2.5 min
+    - Warning (70-85% or projects critical in 15min): 90s
+    - Critical (>85% or projects critical in 5min): 65s
+    ±15% jitter on each tick to prevent sync patterns.
 
     Handles auto-swap decisions, TOCTOU guard, burn-rate tracking with
     decay, and descriptive swap reason strings.  Never crashes — all
@@ -350,7 +358,33 @@ async def active_account_poll_loop(app):
         except Exception:
             logger.warning("Active account poll loop error", exc_info=True)
 
-        await asyncio.sleep(60)
+        # Adaptive interval: urgency tier determines how long to wait.
+        # Faster when usage is high or climbing, slower when idle.
+        _poll_interval = 60  # default fallback
+        try:
+            from jacked.web.auth import compute_urgency_tier, _get_usage_state
+            _poll_active_id = _read_active_account_id()
+            if _poll_active_id is not None and db is not None:
+                _poll_acct = db.get_account(_poll_active_id)
+                _poll_br = _burn_rates.get(_poll_active_id)
+                _poll_state = _get_usage_state(_poll_active_id)
+                _poll_tier, _poll_base = compute_urgency_tier(
+                    usage_5h=_poll_acct.get("cached_usage_5h") if _poll_acct else None,
+                    usage_7d=_poll_acct.get("cached_usage_7d") if _poll_acct else None,
+                    burn_rate_5h=_poll_br.rate_5h_per_min if _poll_br else 0.0,
+                    critical_5h=_setting_float(db, "auto_swap_5h_critical", 90),
+                )
+                _poll_state["tier"] = _poll_tier
+                _poll_state["interval"] = _poll_base
+                _poll_jitter = _poll_base * 0.15
+                _poll_interval = _poll_base + random.uniform(-_poll_jitter, _poll_jitter)
+                logger.debug(
+                    "Active poll: tier=%s interval=%.0fs (base=%ds)",
+                    _poll_tier, _poll_interval, _poll_base,
+                )
+        except Exception:
+            logger.debug("Adaptive interval fallback to 60s", exc_info=True)
+        await asyncio.sleep(_poll_interval)
 
 
 # -----------------------------------------------------------------------
