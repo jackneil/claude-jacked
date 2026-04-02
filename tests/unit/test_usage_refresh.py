@@ -3,7 +3,7 @@
 Covers:
 - Hard rate-limit ceiling via per-account coordinator state
 - 429 response handling with increment_failures=False
-- force=True parameter behavior
+- 429 backoff cap at 900s
 """
 
 import asyncio
@@ -85,16 +85,6 @@ class TestUsageCeiling:
         assert result is not None
         assert result != {"_cached": True}
 
-    def test_force_still_respects_ceiling(self):
-        """force=True still respects the hard ceiling."""
-        import jacked.web.auth as mod
-        mod._account_usage_state.clear()
-        state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 30
-        db = _mock_db({"usage_cached_at": int(time.time()) - 30})
-        result = asyncio.run(fetch_usage(1, db, force=True))
-        assert result == {"_cached": True}
-
     def test_429_sets_backoff_in_state(self):
         """429 response sets backoff_until in coordinator state."""
         import jacked.web.auth as mod
@@ -107,6 +97,19 @@ class TestUsageCeiling:
             result = asyncio.run(fetch_usage(1, db))
         assert result is None
         assert mod._get_usage_state(1)["backoff_until"] > time.time()
+
+    def test_429_backoff_capped_at_900s(self):
+        """429 with huge retry-after is capped at 900s (15 min)."""
+        import jacked.web.auth as mod
+        mod._account_usage_state.clear()
+        state = mod._get_usage_state(1)
+        state["last_fetched_at"] = time.time() - 120
+        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
+        client = _mock_client(429, {}, headers={"retry-after": "999999"})
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            asyncio.run(fetch_usage(1, db))
+        backoff = mod._get_usage_state(1)["backoff_until"] - time.time()
+        assert backoff <= 901
 
 
 # ---------------------------------------------------------------------------
@@ -147,22 +150,6 @@ class TestCacheFreshnessGuard:
         assert result is not None
         assert result.get("five_hour", {}).get("utilization") == 25.0
         db.update_account_usage_cache.assert_called_once()
-
-    def test_access_token_with_force_bypasses_old_cache(self):
-        """Explicit access_token + force=True bypasses old cache (but not ceiling)."""
-        import jacked.web.auth as mod
-        state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120  # past ceiling
-        db = _mock_db({"usage_cached_at": int(time.time()) - 2})
-        client = _mock_client(200, {
-            "five_hour": {"utilization": 10.0},
-            "seven_day": {"utilization": 20.0},
-        })
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
-            result = asyncio.run(fetch_usage(1, db, access_token="fresh_token", force=True))
-        assert result is not None
-        assert result != {"_cached": True}
-        client.get.assert_called_once()
 
     def test_none_cached_at_proceeds_with_fetch(self):
         """usage_cached_at=None (never fetched) + state default -> make API call."""

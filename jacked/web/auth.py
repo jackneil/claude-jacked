@@ -388,13 +388,12 @@ async def fetch_usage(
     account_id: int,
     db: Database,
     access_token: Optional[str] = None,
-    force: bool = False,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
 
     Uses per-account coordinator state for rate limiting.  The hard ceiling
-    (_USAGE_RATE_LIMIT_CEILING) is always enforced — even with force=True —
-    to prevent 429s from the upstream API.
+    (_USAGE_RATE_LIMIT_CEILING) is always enforced to prevent 429s from the
+    upstream API.
 
     Updates the account's cached usage fields in the database.
 
@@ -473,7 +472,7 @@ async def fetch_usage(
             if resp.status_code == 429:
                 retry_after = resp.headers.get("retry-after", str(_USAGE_RATE_LIMIT_CEILING))
                 try:
-                    backoff_seconds = max(int(retry_after), _USAGE_RATE_LIMIT_CEILING)
+                    backoff_seconds = min(max(int(retry_after), _USAGE_RATE_LIMIT_CEILING), 900)
                 except (ValueError, TypeError):
                     backoff_seconds = _USAGE_RATE_LIMIT_CEILING
                 state["backoff_until"] = time.time() + backoff_seconds
