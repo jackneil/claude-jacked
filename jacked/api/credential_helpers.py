@@ -218,6 +218,86 @@ def read_fresh_active_token(account_id: int) -> str | None:
     return None
 
 
+def reconcile_outgoing_credentials(account_id: int, db) -> None:
+    """Read live credentials for the active account and reconcile with DB.
+
+    Before swapping away from an account, check if Claude Code rotated
+    the refresh token during its session. If so, import the fresh token
+    into our DB so we don't lose it.
+
+    Called before sync_credential_to_all_stores() in the swap path and
+    in the use_account endpoint.
+    """
+    # Read live credentials (Keychain first, file fallback)
+    live = read_platform_credentials()
+    if not live:
+        # Fall back to .credentials.json
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+        if cred_path.exists() and not cred_path.is_symlink():
+            try:
+                live = json.loads(cred_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return
+
+    if not live:
+        return
+
+    # Only reconcile if the credentials belong to the outgoing account
+    if live.get("_jackedAccountId") != account_id:
+        return
+
+    oauth = live.get("claudeAiOauth", {})
+    live_access = oauth.get("accessToken")
+    live_refresh = oauth.get("refreshToken")
+    live_expires = oauth.get("expiresAt")  # milliseconds
+
+    if not live_access:
+        return
+
+    # Read current DB state
+    account = db.get_account(account_id)
+    if not account:
+        return
+
+    db_cc_refresh = account.get("cc_refresh_token")
+
+    updates = {}
+
+    # Always import the latest access token
+    if live_access != account.get("cc_access_token"):
+        updates["cc_access_token"] = live_access
+
+    # Import expiry (convert ms -> seconds)
+    if live_expires:
+        live_expires_s = int(live_expires / 1000) if live_expires > 1e12 else int(live_expires)
+        if live_expires_s != account.get("cc_expires_at"):
+            updates["cc_expires_at"] = live_expires_s
+
+    # Reconcile refresh token
+    if live_refresh:
+        if db_cc_refresh is None:
+            # Recovery: our token was cleared (invalid_grant) but Claude Code has one
+            logger.info(
+                "Account %d: recovering cc_refresh_token from live credentials",
+                account_id,
+            )
+            updates["cc_refresh_token"] = live_refresh
+        elif live_refresh != db_cc_refresh:
+            # Rotation: Claude Code got a new token, update ours
+            logger.info(
+                "Account %d: importing rotated cc_refresh_token from live credentials",
+                account_id,
+            )
+            updates["cc_refresh_token"] = live_refresh
+
+    if updates:
+        db.update_account(account_id, **updates)
+        logger.info(
+            "Account %d: reconciled %d credential field(s) from live store",
+            account_id, len(updates),
+        )
+
+
 def write_platform_credentials(data: dict) -> bool:
     """Write credentials to the platform's native credential store.
 
