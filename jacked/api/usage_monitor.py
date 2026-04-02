@@ -172,6 +172,10 @@ async def active_account_poll_loop(app):
                 update_burn_rate,
                 tier_critical_threshold,
                 tier_label as _tier_label,
+                score_candidate,
+                _resets_within,
+                RESET_SUPPRESS_MINUTES,
+                SUPPRESS_OVERRIDE_SCORE,
             )
 
             # -- Active account ID ---------------------------------------
@@ -237,7 +241,7 @@ async def active_account_poll_loop(app):
             effective_critical = max(tier_crit, critical_5h)
 
             # -- Should swap? --------------------------------------------
-            if should_swap(
+            want_swap = should_swap(
                 usage_5h=usage_5h,
                 usage_7d=usage_7d,
                 critical_5h=effective_critical,
@@ -245,11 +249,44 @@ async def active_account_poll_loop(app):
                 threshold_7d=threshold_7d,
                 burn_rate=br,
                 check_interval_min=check_interval / 60,
+                resets_5h_at=active_acct.get("cached_5h_resets_at"),
+                resets_7d_at=active_acct.get("cached_7d_resets_at"),
+                usage_cached_at=active_acct.get("usage_cached_at"),
+            )
+
+            # -- Escape hatch: override reset suppression if a clearly
+            # better candidate exists.  Don't keep the user on a degraded
+            # account just to save a window reset when a much better
+            # option is available.
+            escape_override = False
+            if (
+                not want_swap
+                and usage_5h is not None
+                and usage_5h >= warning_5h
+                and _resets_within(
+                    active_acct.get("cached_5h_resets_at"),
+                    RESET_SUPPRESS_MINUTES,
+                )
             ):
+                escape_override = True
+
+            if want_swap or escape_override:
                 target = pick_best_target(
                     accounts, current_id=active_acct_id,
                     threshold_7d=threshold_7d,
                 )
+
+                # For escape hatch, verify candidate is good enough
+                if escape_override and not want_swap and target:
+                    if score_candidate(target) <= SUPPRESS_OVERRIDE_SCORE:
+                        logger.debug(
+                            "Escape hatch: candidate %d scores %.0f "
+                            "(<= %d), staying put",
+                            target["id"],
+                            score_candidate(target),
+                            SUPPRESS_OVERRIDE_SCORE,
+                        )
+                        target = None  # not good enough, stay put
 
                 ws_registry = getattr(app.state, "ws_registry", None)
 
@@ -276,9 +313,13 @@ async def active_account_poll_loop(app):
                         continue
 
                     # -- Build descriptive reason -------------------------
-                    tier_lbl = _tier_label(active_acct)
-
-                    if usage_5h is not None and usage_5h >= effective_critical:
+                    if escape_override and not want_swap:
+                        reason = (
+                            f"escape hatch: suppressed swap overridden — "
+                            f"target scores {score_candidate(target):.0f}"
+                        )
+                    elif usage_5h is not None and usage_5h >= effective_critical:
+                        tier_lbl = _tier_label(active_acct)
                         reason = (
                             f"5h critical: {usage_5h:.1f}% >= "
                             f"{effective_critical:.0f}%{tier_lbl}"
