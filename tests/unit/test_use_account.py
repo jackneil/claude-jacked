@@ -99,7 +99,11 @@ def test_use_account_success(client, tmp_path):
     """Activating a valid account with CC tokens writes credentials to all stores."""
     with mock.patch(
         "jacked.api.credential_helpers.sync_credential_to_all_stores"
-    ) as mock_sync:
+    ) as mock_sync, mock.patch(
+        "jacked.api.credential_helpers.reconcile_outgoing_credentials"
+    ), mock.patch(
+        "jacked.api.usage_monitor._read_active_account_id", return_value=None
+    ):
         resp = client.post("/api/auth/accounts/1/use")
 
     assert resp.status_code == 200

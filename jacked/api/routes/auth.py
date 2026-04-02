@@ -841,6 +841,14 @@ async def use_account(account_id: int, request: Request):
             },
         )
 
+    # Reconcile outgoing account's credentials before writing new ones —
+    # captures any token rotation by Claude Code during the outgoing session.
+    from jacked.api.credential_helpers import reconcile_outgoing_credentials
+    from jacked.api.usage_monitor import _read_active_account_id
+    outgoing_id = _read_active_account_id()
+    if outgoing_id and outgoing_id != account_id:
+        reconcile_outgoing_credentials(outgoing_id, db)
+
     # SAFETY: This is a user-initiated, one-shot credential write — NOT a
     # background loop.  The design spec (2026-03-24-kill-background-credential-
     # writes-design.md) prohibits credential file writes from background loops

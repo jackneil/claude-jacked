@@ -383,6 +383,11 @@ async def active_account_poll_loop(app):
                         to_5h=target.get("cached_usage_5h"),
                         to_7d=target.get("cached_usage_7d"),
                     )
+                    # Reconcile outgoing account's credentials before writing
+                    # new ones — captures any token rotation by Claude Code.
+                    from jacked.api.credential_helpers import reconcile_outgoing_credentials
+                    reconcile_outgoing_credentials(active_acct_id, db)
+
                     sync_credential_to_all_stores(
                         target["id"], target,
                         email=target.get("email"),
