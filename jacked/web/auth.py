@@ -421,6 +421,7 @@ async def fetch_usage(
     account_id: int,
     db: Database,
     access_token: Optional[str] = None,
+    manual: bool = False,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
 
@@ -447,14 +448,16 @@ async def fetch_usage(
         )
         return {"_backed_off": True}
 
-    # Hard ceiling: never exceed 1 req per _USAGE_RATE_LIMIT_CEILING seconds
-    elapsed = now - state["last_fetched_at"]
-    if elapsed < _USAGE_RATE_LIMIT_CEILING:
-        logger.debug(
-            f"Usage ceiling for account {account_id}: {int(elapsed)}s < "
-            f"{_USAGE_RATE_LIMIT_CEILING}s, returning cached"
-        )
-        return {"_cached": True}
+    # Hard ceiling: never exceed 1 req per _USAGE_RATE_LIMIT_CEILING seconds.
+    # manual=True bypasses this (user explicitly asked for fresh data).
+    if not manual:
+        elapsed = now - state["last_fetched_at"]
+        if elapsed < _USAGE_RATE_LIMIT_CEILING:
+            logger.debug(
+                f"Usage ceiling for account {account_id}: {int(elapsed)}s < "
+                f"{_USAGE_RATE_LIMIT_CEILING}s, returning cached"
+            )
+            return {"_cached": True}
 
     token = access_token or account["access_token"]
 
