@@ -6,6 +6,7 @@ import pytest
 
 from jacked.web.auto_swap import (
     BurnRate,
+    _resets_within,
     pick_best_target,
     score_candidate,
     should_swap,
@@ -202,3 +203,35 @@ def test_score_tier_headroom_bonus():
     b = _acct(2, usage_5h=85, rate_limit_tier="pro", subscription_type="pro")
     # 20x has 10% headroom (95-85), pro has 0% (80-85 clamped to 0)
     assert score_candidate(a) > score_candidate(b)
+
+
+# ---------------------------------------------------------------------------
+# _resets_within
+# ---------------------------------------------------------------------------
+
+class TestResetsWithin:
+    def test_resets_in_5_min(self):
+        from datetime import datetime, timezone, timedelta
+        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        assert _resets_within(future, 10) is True
+
+    def test_resets_in_15_min(self):
+        from datetime import datetime, timezone, timedelta
+        future = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+        assert _resets_within(future, 10) is False
+
+    def test_already_reset(self):
+        from datetime import datetime, timezone, timedelta
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        assert _resets_within(past, 10) is False
+
+    def test_none_returns_false(self):
+        assert _resets_within(None, 10) is False
+
+    def test_garbage_string_returns_false(self):
+        assert _resets_within("not-a-date", 10) is False
+
+    def test_z_suffix_parsed(self):
+        from datetime import datetime, timezone, timedelta
+        future = (datetime.now(timezone.utc) + timedelta(minutes=3)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        assert _resets_within(future, 10) is True

@@ -57,6 +57,33 @@ def tier_critical_threshold(account: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Window-reset awareness
+# ---------------------------------------------------------------------------
+
+RESET_SUPPRESS_MINUTES = 10
+SUPPRESS_OVERRIDE_SCORE = 80
+
+
+def _resets_within(resets_at: str | None, minutes: float) -> bool:
+    """Return True if the window resets within the given number of minutes.
+
+    Returns False for: None, past timestamps, parsing errors.
+    Assumes system clock is NTP-synchronized within ~1 minute.
+    """
+    if resets_at is None:
+        return False
+    try:
+        reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if reset_dt <= now:
+            return False
+        remaining = (reset_dt - now).total_seconds() / 60.0
+        return remaining <= minutes
+    except (ValueError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 # should_swap
 # ---------------------------------------------------------------------------
 
