@@ -95,25 +95,48 @@ def should_swap(
     threshold_7d: float = 85,
     burn_rate: BurnRate | None = None,
     check_interval_min: float = 5,
+    resets_5h_at: str | None = None,
+    resets_7d_at: str | None = None,
+    usage_cached_at: int | None = None,
 ) -> bool:
     """Decide whether the current account should be swapped out.
 
     Returns False when *usage_5h* is None (no data yet — never swap on
     missing data).
+
+    Suppresses all three swap triggers when the relevant window resets
+    within ``RESET_SUPPRESS_MINUTES``.  Also suppresses when usage data
+    is stale (predates a reset that already happened).
     """
     if usage_5h is None:
         return False
 
-    # Hard ceiling — swap immediately.
-    if usage_5h >= critical_5h:
+    # Stale-data guard: if the 5h reset is in the past but our usage data
+    # is older than the reset, the usage is stale (a real reset happened
+    # but we couldn't fetch). Don't trust the data — suppress swap.
+    if resets_5h_at and usage_cached_at:
+        try:
+            reset_dt = datetime.fromisoformat(resets_5h_at.replace("Z", "+00:00"))
+            if reset_dt <= datetime.now(timezone.utc):
+                reset_epoch = reset_dt.timestamp()
+                if usage_cached_at < reset_epoch:
+                    return False  # usage data predates the reset
+        except (ValueError, TypeError):
+            pass
+
+    suppress_5h = _resets_within(resets_5h_at, RESET_SUPPRESS_MINUTES)
+    suppress_7d = _resets_within(resets_7d_at, RESET_SUPPRESS_MINUTES)
+
+    # Hard ceiling (unless 5h reset imminent).
+    if usage_5h >= critical_5h and not suppress_5h:
         return True
 
-    # 7-day saturation — swap even if the 5-hour window looks OK.
-    if usage_7d is not None and usage_7d >= threshold_7d:
+    # 7-day saturation (unless 7d reset imminent).
+    if usage_7d is not None and usage_7d >= threshold_7d and not suppress_7d:
         return True
 
-    # Warning zone + burn-rate projection.
-    if usage_5h >= warning_5h and burn_rate is not None:
+    # Warning zone + burn-rate projection (unless 5h reset imminent).
+    if usage_5h >= warning_5h and burn_rate is not None and not suppress_5h:
         minutes_to_critical = _minutes_until(
             usage_5h, critical_5h, burn_rate.rate_5h_per_min,
         )

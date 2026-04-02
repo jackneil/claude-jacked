@@ -235,3 +235,75 @@ class TestResetsWithin:
         from datetime import datetime, timezone, timedelta
         future = (datetime.now(timezone.utc) + timedelta(minutes=3)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         assert _resets_within(future, 10) is True
+
+
+# ---------------------------------------------------------------------------
+# should_swap — window-reset-aware suppression
+# ---------------------------------------------------------------------------
+
+class TestShouldSwapWindowAware:
+    def test_suppress_5h_critical_when_reset_imminent(self):
+        """5h at 95% but resets in 5 min -> DON'T swap."""
+        from datetime import datetime, timezone, timedelta
+        resets = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        assert should_swap(
+            usage_5h=95, usage_7d=0,
+            resets_5h_at=resets,
+        ) is False
+
+    def test_swap_5h_critical_when_reset_far(self):
+        """5h at 95% and resets in 3 hours -> swap."""
+        from datetime import datetime, timezone, timedelta
+        resets = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+        assert should_swap(
+            usage_5h=95, usage_7d=0,
+            resets_5h_at=resets,
+        ) is True
+
+    def test_suppress_7d_threshold_when_reset_imminent(self):
+        """7d at 90% but resets in 5 min -> DON'T swap."""
+        from datetime import datetime, timezone, timedelta
+        resets = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        assert should_swap(
+            usage_5h=50, usage_7d=90,
+            resets_7d_at=resets,
+        ) is False
+
+    def test_suppress_burn_rate_when_reset_imminent(self):
+        """Burn rate projects critical but 5h resets in 3 min -> DON'T swap."""
+        from datetime import datetime, timezone, timedelta
+        resets = (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat()
+        br = BurnRate(rate_5h_per_min=5.0, last_check_5h=82.0)
+        assert should_swap(
+            usage_5h=82, usage_7d=0,
+            burn_rate=br,
+            resets_5h_at=resets,
+        ) is False
+
+    def test_no_suppression_without_reset_data(self):
+        """No resets_at data -> normal behavior, swap on critical."""
+        assert should_swap(usage_5h=95, usage_7d=0) is True
+
+    def test_stale_data_guard(self):
+        """Reset is past but usage_cached_at is older than reset -> suppress."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+        reset_time = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        cached_at = int(_time.time()) - 300
+        assert should_swap(
+            usage_5h=95, usage_7d=0,
+            resets_5h_at=reset_time,
+            usage_cached_at=cached_at,
+        ) is False
+
+    def test_stale_guard_not_triggered_when_data_fresh(self):
+        """Reset is past but usage_cached_at is AFTER reset -> normal behavior."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+        reset_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        cached_at = int(_time.time()) - 60  # cached 1 min ago, after the reset
+        assert should_swap(
+            usage_5h=95, usage_7d=0,
+            resets_5h_at=reset_time,
+            usage_cached_at=cached_at,
+        ) is True
