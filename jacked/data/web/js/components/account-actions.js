@@ -9,16 +9,35 @@ let _checkCountdownInterval = null;
 
 function _startCheckCountdown() {
     if (_checkCountdownInterval) return;
+    var _checkingTicks = 0;
     _checkCountdownInterval = setInterval(function() {
         var els = document.querySelectorAll('[data-next-check]');
-        if (els.length === 0) return;
+        if (els.length === 0) { _checkingTicks = 0; return; }
         var now = Math.floor(Date.now() / 1000);
+        // Read latest usage_cached_at from state (updated by UI refresh
+        // and WebSocket), not from the stale data-cached-at HTML attribute.
+        var activeId = window.jackedState.activeCredentialAccountId;
+        var accounts = window.jackedState.accounts || [];
+        var activeAcct = accounts.find(function(a) { return a.id === activeId; });
+        var cachedAt = activeAcct ? activeAcct.usage_cached_at : null;
+        if (!cachedAt) return;
+        var rem = Math.max(0, 60 - (now - cachedAt));
         els.forEach(function(el) {
-            var cachedAt = parseInt(el.getAttribute('data-cached-at'), 10);
-            if (isNaN(cachedAt)) return;
-            var rem = Math.max(0, 60 - (now - cachedAt));
             el.textContent = rem > 0 ? rem + 's' : 'checking\u2026';
+            el.setAttribute('data-cached-at', String(cachedAt));
         });
+        // If stuck at "checking" for >15s, re-fetch accounts to get fresh
+        // usage_cached_at from the server (the backend poll updated it but
+        // didn't push via WebSocket).
+        if (rem === 0) {
+            _checkingTicks++;
+            if (_checkingTicks >= 15 && typeof refreshAndRender === 'function') {
+                _checkingTicks = 0;
+                refreshAndRender();
+            }
+        } else {
+            _checkingTicks = 0;
+        }
     }, 1000);
 }
 
