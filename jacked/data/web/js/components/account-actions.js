@@ -21,7 +21,13 @@ function _startCheckCountdown() {
         var activeAcct = accounts.find(function(a) { return a.id === activeId; });
         var cachedAt = activeAcct ? activeAcct.usage_cached_at : null;
         if (!cachedAt) return;
-        var rem = Math.max(0, 60 - (now - cachedAt));
+        var u5data = activeAcct ? (activeAcct.cached_usage_5h || 0) : 0;
+        var pollInterval = 300;
+        if (u5data > 85) pollInterval = 65;
+        else if (u5data > 70) pollInterval = 90;
+        else if (u5data > 50) pollInterval = 150;
+        else pollInterval = 300;
+        var rem = Math.max(0, pollInterval - (now - cachedAt));
         els.forEach(function(el) {
             el.textContent = rem > 0 ? rem + 's' : 'checking\u2026';
             el.setAttribute('data-cached-at', String(cachedAt));

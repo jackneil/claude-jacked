@@ -88,7 +88,15 @@ function renderCacheAge(usageCachedAt, acctId) {
         var acctArr = window.jackedState.accounts || [];
         var acctObj = acctArr.find(function(a) { return a.id === acctId; });
         var ageS = Math.floor(Date.now() / 1000) - usageCachedAt;
-        var rem = Math.max(0, 60 - ageS);
+        var pollInterval = 300;
+        if (acctObj) {
+            var u5 = acctObj.cached_usage_5h || 0;
+            if (u5 > 85) pollInterval = 65;
+            else if (u5 > 70) pollInterval = 90;
+            else if (u5 > 50) pollInterval = 150;
+            else pollInterval = 300;
+        }
+        var rem = Math.max(0, pollInterval - ageS);
         var label = rem > 0 ? escapeHtml(rem + 's') : 'checking\u2026';
         var tierLabel = '';
         if (acctObj) {
