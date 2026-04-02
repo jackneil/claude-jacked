@@ -1,7 +1,7 @@
 # Window-Aware Swap Decisions
 
 **Date:** 2026-04-02
-**Status:** Approved
+**Status:** Approved (revised after DCR)
 
 ## Problem
 
@@ -19,19 +19,25 @@ Factor time-to-reset into both swap decisions (should we swap away?) and target 
 
 ### 1. `should_swap` — suppress swap when window resets within 10 minutes
 
-Before triggering a swap on high 5h usage, check `cached_5h_resets_at`. If the 5h window resets within 10 minutes, do NOT swap — the account is about to get a free reset to 0%.
+Before triggering a swap on ANY of the three swap triggers (5h critical, 7d threshold, OR burn-rate projection), check the relevant `cached_*_resets_at`. If the window resets within 10 minutes, suppress the swap.
 
-Same for 7d: if `cached_7d_resets_at` is within 10 minutes, suppress the 7d threshold swap.
-
-**Logic:**
+**Logic (applies to ALL three triggers):**
 ```
-if usage_5h >= critical AND 5h_resets_within(10 min):
-    DON'T swap — reset imminent
-if usage_7d >= threshold AND 7d_resets_within(10 min):
-    DON'T swap — reset imminent
+for each swap trigger that would fire:
+    if the relevant window resets within RESET_SUPPRESS_MINUTES (10):
+        suppress this trigger
 ```
 
-The 10-minute cutoff balances: worst case is 10 minutes of degraded rate limits, which is better than wasting a fresh window on another account. The cutoff should be configurable or at least a named constant.
+Specifically:
+- 5h critical trigger: suppress if `cached_5h_resets_at` within 10 min
+- 7d threshold trigger: suppress if `cached_7d_resets_at` within 10 min
+- Burn-rate projection trigger: suppress if `cached_5h_resets_at` within 10 min (burn rate projects 5h, so 5h reset suppresses it)
+
+**Escape hatch:** Suppression is overridden if a clearly better candidate exists. After computing `pick_best_target`, if any candidate scores above `SUPPRESS_OVERRIDE_SCORE` (80), swap anyway — the user-experience cost of staying on a degraded account isn't worth saving a window when a much better option is available.
+
+**Stale data guard:** If `cached_5h_resets_at` is in the past AND `usage_cached_at` is older than the reset timestamp, the usage data is stale (a real reset likely happened but we couldn't fetch). In this case, do NOT trust `cached_usage_5h` for swap decisions — suppress the swap and wait for the next successful fetch to get accurate data.
+
+The 10-minute cutoff is a named constant `RESET_SUPPRESS_MINUTES = 10`.
 
 ### 2. `score_candidate` — bonus for accounts about to reset
 
@@ -52,24 +58,42 @@ excluded IF cached_usage_7d >= threshold_7d AND NOT 7d_resets_within(10 min)
 
 ### 4. Helper function: `_resets_within`
 
-Pure function used by all three changes:
+Pure function used by all changes:
 ```python
 def _resets_within(resets_at: str | None, minutes: float) -> bool:
-    """Return True if the window resets within the given number of minutes."""
+    """Return True if the window resets within the given number of minutes.
+
+    Returns False for: None, past timestamps, parsing errors.
+    Assumes system clock is NTP-synchronized within ~1 minute.
+    """
 ```
 
-Handles None (no data → False), past timestamps (already reset → False), parsing errors (→ False).
+### 5. `should_swap` signature change
+
+`should_swap` needs access to reset timestamps and `usage_cached_at` to implement suppression and the stale-data guard. Add these parameters:
+
+```python
+def should_swap(
+    usage_5h, usage_7d,
+    critical_5h, warning_5h, threshold_7d,
+    burn_rate, check_interval_min,
+    resets_5h_at=None,    # NEW: cached_5h_resets_at ISO string
+    resets_7d_at=None,    # NEW: cached_7d_resets_at ISO string
+    usage_cached_at=None, # NEW: for stale-data guard
+) -> bool:
+```
 
 ## Files Affected
 
 | File | Change |
 |------|--------|
-| `jacked/web/auto_swap.py` | Add `_resets_within`, modify `should_swap`, `score_candidate`, `pick_best_target` |
-| `tests/unit/test_auto_swap.py` | Tests for window-aware behavior: suppressed swap, candidate bonus, filter relaxation |
+| `jacked/web/auto_swap.py` | Add `_resets_within`, `RESET_SUPPRESS_MINUTES`, `SUPPRESS_OVERRIDE_SCORE`. Modify `should_swap` (new params, suppression on all 3 triggers, stale-data guard), `score_candidate` (reset bonus), `pick_best_target` (relax 7d filter) |
+| `jacked/api/usage_monitor.py` | Pass new params to `should_swap` from the active poll loop |
+| `tests/unit/test_auto_swap.py` | Tests: suppressed swap (5h, 7d, burn-rate), escape hatch override, stale-data guard, candidate reset bonus, 7d filter relaxation, burn-rate + imminent reset interaction |
 
 ## What This Does NOT Change
 
 - Adaptive polling intervals (how often to check)
 - Window keeper ping logic
 - UI countdown display
-- The burn-rate projection logic (still works alongside window awareness)
+- Suppression does NOT affect urgency tier calculation (polling stays fast during suppression)
