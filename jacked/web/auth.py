@@ -227,6 +227,8 @@ async def refresh_cc_token(account_id: int, db: Database) -> bool:
                                         live = None
 
                             live_refresh = None
+                            live_access = None
+                            live_expires = None
                             if live and live.get("_jackedAccountId") == account_id:
                                 oauth = live.get("claudeAiOauth", {})
                                 live_refresh = oauth.get("refreshToken")
@@ -258,8 +260,11 @@ async def refresh_cc_token(account_id: int, db: Database) -> bool:
                                 )
                                 db.update_account(account_id, cc_refresh_token=None)
                                 return False
-                    except (ValueError, AttributeError):
-                        pass
+                    except (ValueError, AttributeError) as exc:
+                        logger.warning(
+                            "Account %d: CC refresh error parsing response: %s",
+                            account_id, exc,
+                        )
 
                 logger.warning(
                     "Account %d: CC refresh HTTP %d", account_id, resp.status_code
