@@ -7,6 +7,20 @@ description: Use when the user mentions a past project like "configurator", asks
 
 Search and load context from past Claude Code sessions using semantic search.
 
+## Prerequisites
+
+This skill requires the search extra (`jacked[search]`) and a configured Qdrant instance. **Before doing anything else**, check if search is available:
+
+```bash
+jacked search "test" --limit 1
+```
+
+If this returns an error like `'search' requires the search extra` or fails to connect to Qdrant, **STOP** and tell the user:
+
+> "The /jacked session search feature isn't set up yet. It requires `uv tool install "claude-jacked[search]"` and a Qdrant instance. For now, I can check git history or local session files instead."
+
+Do NOT attempt to install the search extra automatically.
+
 ## Usage
 
 ```

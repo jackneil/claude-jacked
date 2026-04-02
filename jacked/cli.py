@@ -1953,16 +1953,10 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     home = Path.home()
     pkg_root = _get_data_root()
 
-    # Auto-detect extras: if the package is installed, enable by default
-    has_qdrant = False
-    try:
-        import qdrant_client  # noqa: F401
-
-        has_qdrant = True
-    except ImportError:
-        pass
-
-    install_search = search or has_qdrant
+    # Search extra requires explicit --search flag. Do NOT auto-detect
+    # qdrant-client — the search feature requires a configured Qdrant
+    # instance and is not ready for default installation.
+    install_search = search
     install_security = security
 
     console.print("[bold]Installing Jacked...[/bold]\n")
