@@ -104,8 +104,6 @@ def compute_urgency_tier(
     return tier, _TIER_INTERVALS[tier]
 
 
-# Per-account 429 backoff: account_id -> don't-fetch-before timestamp
-_usage_backoff: dict[int, float] = {}
 
 
 def should_refresh(account: dict) -> bool:
@@ -390,9 +388,13 @@ async def fetch_usage(
     account_id: int,
     db: Database,
     access_token: Optional[str] = None,
-    min_age: int = USAGE_CACHE_FRESHNESS_SECONDS,
+    force: bool = False,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
+
+    Uses per-account coordinator state for rate limiting.  The hard ceiling
+    (_USAGE_RATE_LIMIT_CEILING) is always enforced — even with force=True —
+    to prevent 429s from the upstream API.
 
     Updates the account's cached usage fields in the database.
 
@@ -402,26 +404,25 @@ async def fetch_usage(
     if not account:
         return None
 
-    # 429 backoff check — skip if still in backoff period
-    backoff_until = _usage_backoff.get(account_id, 0)
-    if time.time() < backoff_until:
+    now = time.time()
+    state = _get_usage_state(account_id)
+
+    # 429 backoff check
+    if now < state["backoff_until"]:
         logger.debug(
             f"Usage fetch backed off for account {account_id} "
-            f"({int(backoff_until - time.time())}s remaining)"
+            f"({int(state['backoff_until'] - now)}s remaining)"
         )
         return {"_backed_off": True}
 
-    # Cache freshness guard — skip API call if data is fresh enough
-    # for this caller's needs. min_age=0 always fetches.
-    cached_at = account.get("usage_cached_at")
-    if min_age > 0 and cached_at:
-        try:
-            age = int(time.time()) - int(cached_at)
-            if age < min_age:
-                logger.debug(f"Usage cache fresh for account {account_id} ({age}s old, min_age={min_age}), skipping")
-                return {"_cached": True}
-        except (ValueError, TypeError):
-            pass  # Malformed timestamp — proceed with fetch
+    # Hard ceiling: never exceed 1 req per _USAGE_RATE_LIMIT_CEILING seconds
+    elapsed = now - state["last_fetched_at"]
+    if elapsed < _USAGE_RATE_LIMIT_CEILING:
+        logger.debug(
+            f"Usage ceiling for account {account_id}: {int(elapsed)}s < "
+            f"{_USAGE_RATE_LIMIT_CEILING}s, returning cached"
+        )
+        return {"_cached": True}
 
     token = access_token or account["access_token"]
 
@@ -449,6 +450,8 @@ async def fetch_usage(
                     raw=data,
                 )
 
+                state["last_fetched_at"] = time.time()
+
                 # clear_account_errors marks valid, clears last_error, consecutive_failures
                 db.clear_account_errors(account_id)
                 logger.info(f"Usage fetched for account {account_id}")
@@ -468,12 +471,13 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                retry_after = resp.headers.get("retry-after", "60")
+                retry_after = resp.headers.get("retry-after", str(_USAGE_RATE_LIMIT_CEILING))
                 try:
-                    backoff_seconds = max(int(retry_after), 60)
+                    backoff_seconds = max(int(retry_after), _USAGE_RATE_LIMIT_CEILING)
                 except (ValueError, TypeError):
-                    backoff_seconds = 60
-                _usage_backoff[account_id] = time.time() + backoff_seconds
+                    backoff_seconds = _USAGE_RATE_LIMIT_CEILING
+                state["backoff_until"] = time.time() + backoff_seconds
+                state["last_fetched_at"] = time.time()
                 db.record_account_error(
                     account_id,
                     f"Usage fetch rate limited (429) — backing off {backoff_seconds}s",

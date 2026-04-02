@@ -144,7 +144,6 @@ async def active_account_poll_loop(app):
             effective_token = read_fresh_active_token(active_acct_id)
             await fetch_usage(
                 active_acct_id, db, access_token=effective_token,
-                min_age=55,
             )
 
             # -- Read active account data from DB ------------------------
@@ -401,7 +400,7 @@ async def full_sweep_loop(app):
                 acct_id = acct["id"]
                 if acct_id == active_acct_id:
                     continue  # active account handled by poll loop
-                result = await fetch_usage(acct_id, db, min_age=int(check_interval) - 10)
+                result = await fetch_usage(acct_id, db)
                 if result and not result.get("_cached"):
                     logger.debug(
                         "Usage fetched for account %d in full sweep", acct_id,
@@ -448,7 +447,7 @@ async def full_sweep_loop(app):
                         # Fetch fresh usage so cached_5h_resets_at updates
                         # and needs_ping returns False next sweep.
                         # Pass access_token to bypass the cache freshness guard.
-                        await fetch_usage(acct["id"], db, access_token=cc_at, min_age=0)
+                        await fetch_usage(acct["id"], db, access_token=cc_at, force=True)
                     await asyncio.sleep(2)  # pacing
 
             logger.info(
