@@ -244,7 +244,10 @@ def pick_best_target(
         and a.get("validation_status") != "invalid"
         and a.get("cc_access_token") is not None
         and a.get("auto_swap_enabled") != 0
-        and (a.get("cached_usage_7d") or 0) < threshold_7d
+        and (
+            (a.get("cached_usage_7d") or 0) < threshold_7d
+            or _resets_within(a.get("cached_7d_resets_at"), RESET_SUPPRESS_MINUTES)
+        )
     ]
 
     if not candidates:

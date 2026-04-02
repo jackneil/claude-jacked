@@ -330,3 +330,34 @@ class TestScoreResetBonus:
         a = _acct(1, usage_5h=80, resets_5h=resets_far)
         b = _acct(2, usage_5h=80, resets_5h=resets_far2)
         assert abs(score_candidate(a) - score_candidate(b)) < 2
+
+
+# ---------------------------------------------------------------------------
+# pick_best_target — relax 7d filter for imminent resets
+# ---------------------------------------------------------------------------
+
+class TestPickTargetResetRelax:
+    def test_7d_over_threshold_but_reset_imminent_not_excluded(self):
+        """Account over 7d threshold but resetting in 5 min -> still a candidate."""
+        from datetime import datetime, timezone, timedelta
+        resets_soon = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        accounts = [
+            _acct(1, usage_5h=90),
+            _acct(2, usage_5h=10, usage_7d=90),
+        ]
+        accounts[1]["cached_7d_resets_at"] = resets_soon
+        result = pick_best_target(accounts, current_id=1)
+        assert result is not None
+        assert result["id"] == 2
+
+    def test_7d_over_threshold_reset_far_still_excluded(self):
+        """Account over 7d threshold with reset far out -> still excluded."""
+        from datetime import datetime, timezone, timedelta
+        resets_far = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        accounts = [
+            _acct(1, usage_5h=90),
+            _acct(2, usage_5h=10, usage_7d=90),
+        ]
+        accounts[1]["cached_7d_resets_at"] = resets_far
+        result = pick_best_target(accounts, current_id=1)
+        assert result is None
