@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -579,7 +579,7 @@ async def refresh_usage(account_id: int, request: Request):
 
 
 @router.post("/accounts/refresh-all-usage", response_model=BulkUsageRefreshResponse)
-async def refresh_all_usage(request: Request):
+async def refresh_all_usage(request: Request, skip_account: Optional[int] = Query(None)):
     """Refresh usage cache for all active accounts.
 
     Paces requests with a 2-second delay between accounts to avoid
@@ -638,6 +638,8 @@ async def refresh_all_usage(request: Request):
             )
 
         for i, acct in enumerate(accounts):
+            if skip_account is not None and acct["id"] == skip_account:
+                continue
             if i > 0:
                 await asyncio.sleep(2.0)  # Rate-limit pacing
 

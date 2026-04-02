@@ -85,10 +85,20 @@ function renderCacheAge(usageCachedAt, acctId) {
     let checkHtml = '';
     const ss = window.jackedState.swapSettings || {};
     if (ss.auto_swap_enabled && acctId === window.jackedState.activeCredentialAccountId) {
-        const ageS = Math.floor(Date.now() / 1000) - usageCachedAt;
-        const rem = Math.max(0, 60 - ageS);
-        const label = rem > 0 ? escapeHtml(rem + 's') : 'checking\u2026';
-        checkHtml = ' \u00b7 <span class="text-teal-500" data-next-check data-cached-at="' + usageCachedAt + '">' + label + '</span>';
+        var acctArr = window.jackedState.accounts || [];
+        var acctObj = acctArr.find(function(a) { return a.id === acctId; });
+        var ageS = Math.floor(Date.now() / 1000) - usageCachedAt;
+        var rem = Math.max(0, 60 - ageS);
+        var label = rem > 0 ? escapeHtml(rem + 's') : 'checking\u2026';
+        var tierLabel = '';
+        if (acctObj) {
+            var u5 = acctObj.cached_usage_5h || 0;
+            if (u5 > 85) tierLabel = ' (critical)';
+            else if (u5 > 70) tierLabel = ' (warning)';
+            else if (u5 > 50) tierLabel = ' (normal)';
+            else tierLabel = ' (idle)';
+        }
+        checkHtml = ' \u00b7 <span class="text-teal-500" data-next-check data-cached-at="' + usageCachedAt + '">' + label + escapeHtml(tierLabel) + '</span>';
     }
     return '<span class="text-xs text-slate-500" data-cache-age>Usage updated ' + escapeHtml(ago) + checkHtml + '</span>';
 }

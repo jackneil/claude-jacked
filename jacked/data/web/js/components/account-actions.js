@@ -482,7 +482,10 @@ async function _triggerUsageRefresh() {
     }
 
     try {
-        const result = await api.post('/api/auth/accounts/refresh-all-usage');
+        const ss = window.jackedState.swapSettings || {};
+        const activeId = window.jackedState.activeCredentialAccountId;
+        const skipParam = (ss.auto_swap_enabled && activeId) ? '?skip_account=' + activeId : '';
+        const result = await api.post('/api/auth/accounts/refresh-all-usage' + skipParam);
         if (result.refreshed === 0 && result.failed === 0) {
             showToast('No active accounts to refresh', 'warning');
         } else if (result.failed > 0) {
