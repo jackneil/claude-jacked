@@ -435,6 +435,26 @@ jackedWS.on('all_accounts_exhausted', (msg) => {
     if (typeof renderExhaustionBanner === 'function') renderExhaustionBanner();
 });
 
+jackedWS.on('usage_poll_updated', (msg) => {
+    var d = msg.payload || msg;
+    if (!d.account_id || !d.account_data) return;
+
+    // Update the account in jackedState so countdown reads fresh data
+    var accounts = window.jackedState.accounts || [];
+    for (var i = 0; i < accounts.length; i++) {
+        if (accounts[i].id === d.account_id) {
+            Object.assign(accounts[i], d.account_data);
+            break;
+        }
+    }
+
+    // Surgically update the card DOM (usage bars + cache age)
+    var card = document.querySelector('[data-account-id="' + d.account_id + '"]');
+    if (card && typeof _usageUpdateCardDOM === 'function') {
+        _usageUpdateCardDOM(card, d.account_data);
+    }
+});
+
 jackedWS.on('sessions_changed', async () => {
     if (typeof loadActiveSessions === 'function') await loadActiveSessions();
     if (typeof loadAccounts === 'function') await loadAccounts();
