@@ -457,10 +457,11 @@ class TestAccountResponseCCFields:
         assert resp.cc_needs_auth is False
 
     def test_cc_needs_auth_no_refresh_and_expired(self, tmp_path):
-        """cc_needs_auth is True when token is expired and no refresh token."""
+        """cc_needs_auth is True when CC token is expired, no CC refresh, AND no primary refresh."""
         db = _make_db(tmp_path)
         db.update_account(1, cc_access_token="cc_at",
-                          cc_expires_at=int(time.time()) - 60)
+                          cc_expires_at=int(time.time()) - 60,
+                          refresh_token=None)
         acct = db.get_account(1)
 
         from jacked.api.routes.auth import _account_to_response
@@ -469,15 +470,27 @@ class TestAccountResponseCCFields:
         assert resp.cc_needs_auth is True
 
     def test_cc_needs_auth_no_refresh_null_expires(self, tmp_path):
-        """cc_needs_auth is True when cc_expires_at is NULL (safe default — treated as expired)."""
+        """cc_needs_auth is True when cc_expires_at is NULL, no CC refresh, AND no primary refresh."""
         db = _make_db(tmp_path)
-        db.update_account(1, cc_access_token="cc_at")
+        db.update_account(1, cc_access_token="cc_at", refresh_token=None)
         acct = db.get_account(1)
 
         from jacked.api.routes.auth import _account_to_response
         resp = _account_to_response(acct)
         assert resp.has_cc_token is True
         assert resp.cc_needs_auth is True
+
+    def test_cc_needs_auth_false_when_primary_refresh_exists(self, tmp_path):
+        """cc_needs_auth is False when CC token expired but primary refresh_token exists (fallback)."""
+        db = _make_db(tmp_path)
+        db.update_account(1, cc_access_token="cc_at",
+                          cc_expires_at=int(time.time()) - 60)
+        acct = db.get_account(1)
+
+        from jacked.api.routes.auth import _account_to_response
+        resp = _account_to_response(acct)
+        assert resp.has_cc_token is True
+        assert resp.cc_needs_auth is False  # primary refresh_token exists as fallback
 
     def test_no_cc_token_fields(self, tmp_path):
         """has_cc_token False when cc_access_token is None."""

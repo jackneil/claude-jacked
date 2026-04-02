@@ -301,6 +301,7 @@ def _account_to_response(row: dict) -> AccountResponse:
             row.get("cc_access_token") is not None
             and row.get("cc_refresh_token") is None
             and now >= (row.get("cc_expires_at") or 0)
+            and not bool(row.get("refresh_token"))
         ),
         has_refresh_token=bool(row.get("refresh_token")),
         has_cc_refresh_token=bool(row.get("cc_refresh_token")),
