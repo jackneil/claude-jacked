@@ -215,16 +215,49 @@ async def refresh_cc_token(account_id: int, db: Database) -> bool:
                     try:
                         error_data = resp.json()
                         if error_data.get("error") == "invalid_grant":
-                            logger.warning(
-                                "Account %d: CC invalid_grant — clearing refresh token "
-                                "(access token preserved until expiry)",
-                                account_id,
-                            )
-                            db.update_account(
-                                account_id,
-                                cc_refresh_token=None,
-                            )
-                            return False
+                            # Attempt recovery from live credentials before clearing
+                            from jacked.api.credential_helpers import read_platform_credentials
+                            live = read_platform_credentials()
+                            if not live:
+                                cred_path = Path.home() / ".claude" / ".credentials.json"
+                                if cred_path.exists() and not cred_path.is_symlink():
+                                    try:
+                                        live = json.loads(cred_path.read_text(encoding="utf-8"))
+                                    except (json.JSONDecodeError, OSError):
+                                        live = None
+
+                            live_refresh = None
+                            if live and live.get("_jackedAccountId") == account_id:
+                                oauth = live.get("claudeAiOauth", {})
+                                live_refresh = oauth.get("refreshToken")
+                                live_access = oauth.get("accessToken")
+                                live_expires = oauth.get("expiresAt")
+
+                            if live_refresh and live_refresh != account.get("cc_refresh_token"):
+                                live_exp_s = (
+                                    int(live_expires / 1000) if live_expires and live_expires > 1e12
+                                    else int(live_expires) if live_expires else None
+                                )
+                                updates = {"cc_refresh_token": live_refresh}
+                                if live_access:
+                                    updates["cc_access_token"] = live_access
+                                if live_exp_s:
+                                    updates["cc_expires_at"] = live_exp_s
+                                db.update_account(account_id, **updates)
+                                logger.info(
+                                    "Account %d: CC invalid_grant recovered — "
+                                    "imported fresh token from live credentials",
+                                    account_id,
+                                )
+                                return True
+                            else:
+                                logger.warning(
+                                    "Account %d: CC invalid_grant — clearing refresh token "
+                                    "(no live recovery available)",
+                                    account_id,
+                                )
+                                db.update_account(account_id, cc_refresh_token=None)
+                                return False
                     except (ValueError, AttributeError):
                         pass
 
