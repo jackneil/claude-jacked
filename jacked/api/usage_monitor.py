@@ -507,31 +507,14 @@ async def full_sweep_loop(app):
                 ping_account,
             )
 
-            # -- Fetch usage for ALL non-active accounts -----------------
+            # -- Window keeper -------------------------------------------
             active_acct_id = _read_active_account_id()
             accounts = db.list_accounts(include_inactive=False)
-            sweep_checked = 0
             sweep_pinged = 0
 
-            for acct in accounts:
-                acct_id = acct["id"]
-                if acct_id == active_acct_id:
-                    continue  # active account handled by poll loop
-                result = await fetch_usage(acct_id, db)
-                if result and not result.get("_cached"):
-                    logger.debug(
-                        "Usage fetched for account %d in full sweep", acct_id,
-                    )
-                await asyncio.sleep(1)  # pacing
-                sweep_checked += 1
-
-            # -- Window keeper -------------------------------------------
             wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
             wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
             wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
-
-            # Re-read accounts after usage fetch for fresh data
-            accounts = db.list_accounts(include_inactive=False)
 
             # Local time intentional: users configure active hours in
             # their local timezone (e.g. "06:00" means local 6am).
@@ -568,8 +551,8 @@ async def full_sweep_loop(app):
                     await asyncio.sleep(2)  # pacing
 
             logger.info(
-                "Full sweep complete: checked %d accounts, pinged %d windows",
-                sweep_checked, sweep_pinged,
+                "Full sweep complete: pinged %d windows",
+                sweep_pinged,
             )
 
         except asyncio.CancelledError:
