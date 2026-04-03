@@ -27,6 +27,7 @@ _SWAP_COOLDOWN_SECONDS = 300  # 5 minutes between swaps to prevent ping-ponging
 
 # Track consecutive unchanged ticks per account for burn-rate decay.
 _burn_rate_unchanged_ticks: dict[int, int] = {}
+_initial_fetch_done = False
 
 # Wake signal — settings PUT sets this to trigger an immediate sweep.
 _sweep_wake: asyncio.Event = asyncio.Event()
@@ -206,6 +207,17 @@ async def active_account_poll_loop(app):
                 logger.debug("Active poll: no active account in credential file")
                 await asyncio.sleep(60)
                 continue
+
+            global _initial_fetch_done
+            if not _initial_fetch_done:
+                _initial_fetch_done = True
+                from jacked.web.auth import fetch_usage as _prime_fetch
+                logger.info("Auto-swap: priming usage data for all accounts")
+                all_accts = db.list_accounts(include_inactive=False)
+                for a in all_accts:
+                    if a["id"] != active_acct_id:
+                        await _prime_fetch(a["id"], db)
+                        await asyncio.sleep(1)
 
             # -- Fetch usage (fresh token, bypasses cache) ---------------
             effective_token = read_fresh_active_token(active_acct_id)
