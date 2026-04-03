@@ -24,7 +24,11 @@
       "Bash(npx agent-browser open:*)",
       "Bash(npx agent-browser snapshot:*)",
       "Bash(npx agent-browser click:*)",
-      "Bash(npx agent-browser:*)"
+      "Bash(npx agent-browser:*)",
+      "Bash(gh api:*)",
+      "Read(//Users/jack.neil/.claude/**)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   },
   "prefersReducedMotion": true

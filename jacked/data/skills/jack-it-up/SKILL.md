@@ -51,7 +51,8 @@ digraph cycle {
     execute [label="4. Execute Plan\n(superpowers:subagent-driven-development)"];
     review_impl [label="5. Double-Check Review\n(/dc on implementation)"];
     clean [shape=diamond, label="Clean pass?"];
-    done [label="Done — ship it", shape=doublecircle];
+    ship [label="6. Ship It\n(/pr)"];
+    done [label="PR created", shape=doublecircle];
 
     brainstorm -> plan;
     plan -> review_plan;
@@ -59,8 +60,9 @@ digraph cycle {
     review_plan -> plan [label="plan has issues\n(fix and re-review)"];
     execute -> review_impl;
     review_impl -> clean;
-    clean -> done [label="yes"];
+    clean -> ship [label="yes"];
     clean -> plan [label="no — findings become\nspec for next plan"];
+    ship -> done;
 }
 ```
 
@@ -119,6 +121,22 @@ Phases 4 and 5 repeat until a clean pass. Each cycle:
 - Converges toward 10/10 quality
 
 Do NOT declare "done" until the final /dc review passes with no CRITICAL or MEDIUM findings.
+
+### Phase 6: Ship It
+
+Invoke `/pr` to create or update the pull request. The `/pr` command runs the `pr-workflow-checker` agent which now includes a **pre-flight verification** phase that automatically checks for:
+
+- Stale stashes (verifies changes are already in HEAD before suggesting drop)
+- Stale worktrees (verifies branch is merged and clean before suggesting removal)
+- Untracked files that should be committed or gitignored
+- Local branches tracking deleted remotes
+- Memory freshness (MEMORY.md open PRs, test counts, known issues vs reality)
+
+The pre-flight **never auto-cleans** — it reports findings with proof of what's safe to clean and what needs attention, then asks. NEEDS ATTENTION items are warnings, not blockers.
+
+After pre-flight, the agent handles PR creation with issue linking and a comprehensive description.
+
+Output: PR URL. The cycle is complete.
 
 ## When NOT to Use This
 
