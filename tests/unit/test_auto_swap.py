@@ -7,6 +7,7 @@ import pytest
 from jacked.web.auto_swap import (
     BurnRate,
     _resets_within,
+    compute_effective_working_hours,
     pick_best_target,
     score_candidate,
     should_swap,
@@ -361,3 +362,57 @@ class TestPickTargetResetRelax:
         accounts[1]["cached_7d_resets_at"] = resets_far
         result = pick_best_target(accounts, current_id=1)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# compute_effective_working_hours
+# ---------------------------------------------------------------------------
+
+class TestEffectiveWorkingHours:
+    def test_same_day_within_active_hours(self):
+        from datetime import datetime
+        start = datetime(2026, 4, 3, 16, 0)
+        end = datetime(2026, 4, 3, 21, 0)
+        result = compute_effective_working_hours(start, end, "07:00", "22:00")
+        assert abs(result - 5.0) < 0.01
+
+    def test_overnight_skips_sleep(self):
+        from datetime import datetime
+        start = datetime(2026, 4, 3, 16, 0)
+        end = datetime(2026, 4, 4, 10, 0)
+        result = compute_effective_working_hours(start, end, "07:00", "22:00")
+        assert abs(result - 9.0) < 0.01
+
+    def test_multiple_days(self):
+        from datetime import datetime
+        start = datetime(2026, 4, 1, 7, 0)
+        end = datetime(2026, 4, 4, 7, 0)
+        result = compute_effective_working_hours(start, end, "07:00", "22:00")
+        assert abs(result - 45.0) < 0.01
+
+    def test_start_before_active_hours(self):
+        from datetime import datetime
+        start = datetime(2026, 4, 3, 5, 0)
+        end = datetime(2026, 4, 3, 10, 0)
+        result = compute_effective_working_hours(start, end, "07:00", "22:00")
+        assert abs(result - 3.0) < 0.01
+
+    def test_end_after_active_hours(self):
+        from datetime import datetime
+        start = datetime(2026, 4, 3, 20, 0)
+        end = datetime(2026, 4, 3, 23, 0)
+        result = compute_effective_working_hours(start, end, "07:00", "22:00")
+        assert abs(result - 2.0) < 0.01
+
+    def test_zero_when_entirely_outside_active(self):
+        from datetime import datetime
+        start = datetime(2026, 4, 3, 23, 0)
+        end = datetime(2026, 4, 4, 5, 0)
+        result = compute_effective_working_hours(start, end, "07:00", "22:00")
+        assert result == 0.0
+
+    def test_start_equals_end(self):
+        from datetime import datetime
+        start = datetime(2026, 4, 3, 12, 0)
+        result = compute_effective_working_hours(start, start, "07:00", "22:00")
+        assert result == 0.0

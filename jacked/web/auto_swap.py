@@ -84,6 +84,52 @@ def _resets_within(resets_at: str | None, minutes: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# compute_effective_working_hours
+# ---------------------------------------------------------------------------
+
+def compute_effective_working_hours(
+    start_dt: datetime,
+    end_dt: datetime,
+    active_start: str = "07:00",
+    active_end: str = "22:00",
+) -> float:
+    """Count working hours between two LOCAL datetimes, excluding overnight.
+
+    Only counts hours within [active_start, active_end) each day.
+    Both start_dt and end_dt must be in local time.
+    """
+    if end_dt <= start_dt:
+        return 0.0
+
+    from datetime import timedelta
+
+    s_h, s_m = map(int, active_start.split(":"))
+    e_h, e_m = map(int, active_end.split(":"))
+    active_hours_per_day = (e_h * 60 + e_m - s_h * 60 - s_m) / 60.0
+
+    if active_hours_per_day <= 0:
+        return 0.0
+
+    total = 0.0
+    current_day = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = end_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+    while current_day < end_day:
+        day_active_start = current_day.replace(hour=s_h, minute=s_m)
+        day_active_end = current_day.replace(hour=e_h, minute=e_m)
+
+        effective_start = max(start_dt, day_active_start)
+        effective_end = min(end_dt, day_active_end)
+
+        if effective_end > effective_start:
+            total += (effective_end - effective_start).total_seconds() / 3600.0
+
+        current_day += timedelta(days=1)
+
+    return total
+
+
+# ---------------------------------------------------------------------------
 # should_swap
 # ---------------------------------------------------------------------------
 
