@@ -7,6 +7,7 @@ import pytest
 from jacked.web.auto_swap import (
     BurnRate,
     _resets_within,
+    compute_7d_deficit,
     compute_effective_working_hours,
     pick_best_target,
     score_candidate,
@@ -416,3 +417,70 @@ class TestEffectiveWorkingHours:
         start = datetime(2026, 4, 3, 12, 0)
         result = compute_effective_working_hours(start, start, "07:00", "22:00")
         assert result == 0.0
+
+
+# ---------------------------------------------------------------------------
+# compute_7d_deficit
+# ---------------------------------------------------------------------------
+
+class TestCompute7dDeficit:
+    def test_account_behind_schedule(self):
+        """Account at 20% usage, ~57% through the window = high deficit."""
+        from datetime import datetime, timedelta
+        resets_at = (datetime.now() + timedelta(days=3)).isoformat()
+        acct = {
+            "cached_usage_7d": 20.0,
+            "cached_7d_resets_at": resets_at,
+            "usage_cached_at": int(time.time()) - 60,
+        }
+        result = compute_7d_deficit(acct, "07:00", "22:00")
+        assert result is not None
+        assert result["deficit"] > 25
+
+    def test_account_ahead_of_schedule(self):
+        """Account at 80% usage, ~29% through the window = negative deficit."""
+        from datetime import datetime, timedelta
+        resets_at = (datetime.now() + timedelta(days=5)).isoformat()
+        acct = {
+            "cached_usage_7d": 80.0,
+            "cached_7d_resets_at": resets_at,
+            "usage_cached_at": int(time.time()) - 60,
+        }
+        result = compute_7d_deficit(acct, "07:00", "22:00")
+        assert result is not None
+        assert result["deficit"] < 0
+
+    def test_none_when_no_resets_at(self):
+        acct = {"cached_usage_7d": 50.0, "cached_7d_resets_at": None}
+        result = compute_7d_deficit(acct, "07:00", "22:00")
+        assert result is None
+
+    def test_none_when_no_usage(self):
+        from datetime import datetime, timedelta
+        resets_at = (datetime.now() + timedelta(days=3)).isoformat()
+        acct = {"cached_usage_7d": None, "cached_7d_resets_at": resets_at}
+        result = compute_7d_deficit(acct, "07:00", "22:00")
+        assert result is None
+
+    def test_expired_window_returns_none(self):
+        from datetime import datetime, timedelta
+        resets_at = (datetime.now() - timedelta(days=1)).isoformat()
+        acct = {"cached_usage_7d": 50.0, "cached_7d_resets_at": resets_at}
+        result = compute_7d_deficit(acct, "07:00", "22:00")
+        assert result is None
+
+    def test_includes_effective_hours_and_windows(self):
+        from datetime import datetime, timedelta
+        resets_at = (datetime.now() + timedelta(days=2)).isoformat()
+        acct = {
+            "cached_usage_7d": 30.0,
+            "cached_7d_resets_at": resets_at,
+            "usage_cached_at": int(time.time()) - 60,
+        }
+        result = compute_7d_deficit(acct, "07:00", "22:00")
+        assert result is not None
+        assert "effective_hours_remaining" in result
+        assert "effective_windows_remaining" in result
+        assert "unused_7d" in result
+        assert result["effective_hours_remaining"] > 0
+        assert result["unused_7d"] == 70.0

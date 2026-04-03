@@ -130,6 +130,85 @@ def compute_effective_working_hours(
 
 
 # ---------------------------------------------------------------------------
+# Proactive 7d capacity scheduling
+# ---------------------------------------------------------------------------
+
+PROACTIVE_SWAP_THRESHOLD = 15.0  # minimum deficit (%) to trigger proactive swap
+
+
+def compute_7d_deficit(
+    account: dict,
+    active_start: str = "07:00",
+    active_end: str = "22:00",
+) -> dict | None:
+    """Compute 7-day utilization deficit for an account.
+
+    Returns dict with deficit, effective_hours_remaining,
+    effective_windows_remaining, unused_7d. Or None if insufficient data.
+
+    Deficit > 0 means behind schedule (underutilized, wasting capacity).
+    """
+    resets_at_str = account.get("cached_7d_resets_at")
+    usage_7d = account.get("cached_usage_7d")
+
+    if resets_at_str is None or usage_7d is None:
+        return None
+
+    try:
+        resets_at_utc = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
+        if resets_at_utc.tzinfo is None:
+            resets_at_utc = resets_at_utc.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    if resets_at_utc <= now_utc:
+        return None  # window already expired
+
+    # Convert to local time for working-hours calculation.
+    # Uses rough offset: diff between datetime.now() (local naive) and
+    # datetime.now(timezone.utc) stripped of tzinfo. Avoids pytz/zoneinfo.
+    from datetime import timedelta as _td
+
+    now_local = datetime.now()
+    now_utc_naive = now_utc.replace(tzinfo=None)
+    utc_offset_seconds = (now_utc_naive - now_local).total_seconds()
+    # Convert resets_at to local by subtracting the UTC offset
+    resets_local = resets_at_utc.replace(tzinfo=None) - _td(
+        seconds=utc_offset_seconds
+    )
+    window_start_local = resets_local - _td(days=7)
+
+    # Elapsed and total working hours
+    elapsed_hours = compute_effective_working_hours(
+        window_start_local, now_local, active_start, active_end,
+    )
+    total_hours = compute_effective_working_hours(
+        window_start_local, resets_local, active_start, active_end,
+    )
+
+    if total_hours <= 0:
+        return None
+
+    elapsed_fraction = min(elapsed_hours / total_hours, 1.0)
+    expected_usage = elapsed_fraction * 100.0
+    deficit = expected_usage - usage_7d
+
+    # Remaining capacity
+    remaining_hours = compute_effective_working_hours(
+        now_local, resets_local, active_start, active_end,
+    )
+    remaining_windows = remaining_hours / 5.0
+
+    return {
+        "deficit": deficit,
+        "effective_hours_remaining": remaining_hours,
+        "effective_windows_remaining": remaining_windows,
+        "unused_7d": 100.0 - usage_7d,
+    }
+
+
+# ---------------------------------------------------------------------------
 # should_swap
 # ---------------------------------------------------------------------------
 
