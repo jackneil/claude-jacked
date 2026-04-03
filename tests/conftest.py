@@ -32,6 +32,17 @@ def _block_keychain_writes():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _block_browser_open():
+    """Prevent any test from opening a real browser window.
+
+    The OAuth flow calls webbrowser.open() which pops up the Anthropic
+    login page during test runs. Block it globally.
+    """
+    with patch("webbrowser.open", return_value=True):
+        yield
+
+
 @pytest.fixture
 def tmp_db_path(tmp_path, monkeypatch):
     """Temporary path for SQLite database, patched into IndexWriteTracker."""
