@@ -426,6 +426,120 @@ async def refresh_account_token(
         return False
 
 
+async def _try_refresh_on_429(
+    account_id: int, db: Database, state: dict,
+) -> str | None:
+    """Attempt to get a fresh access token to clear a per-token rate limit.
+
+    Acquires the Claude Code cross-process lock, exchanges the refresh
+    token for a fresh access token, and saves all tokens to DB + credential
+    stores. Returns the fresh access token on success, None on failure.
+    """
+    from jacked.api.credential_helpers import (
+        acquire_claude_lock,
+        read_platform_credentials,
+        sync_credential_to_all_stores,
+    )
+
+    account = db.get_account(account_id)
+    if not account:
+        return None
+
+    # Prefer CC refresh token, fall back to primary
+    refresh_token = account.get("cc_refresh_token") or account.get("refresh_token")
+    if not refresh_token:
+        logger.debug("Account %d: no refresh token for 429 recovery", account_id)
+        return None
+
+    with acquire_claude_lock() as locked:
+        if not locked:
+            logger.warning("Account %d: could not acquire lock for 429 recovery", account_id)
+            return None
+
+        # Re-read from live store — another process may have refreshed
+        live = read_platform_credentials()
+        if not live:
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    live = json.loads(cred_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    live = None
+
+        if live and live.get("_jackedAccountId") == account_id:
+            live_token = live.get("claudeAiOauth", {}).get("accessToken")
+            db_token = account.get("cc_access_token") or account.get("access_token")
+            if live_token and live_token != db_token:
+                # Another process already refreshed — use their token
+                logger.info("Account %d: 429 recovery — using token from live store", account_id)
+                db.update_account(account_id, cc_access_token=live_token)
+                return live_token
+
+        # Exchange refresh token for fresh access token
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    TOKEN_URL,
+                    json={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": CLIENT_ID,
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-beta": OAUTH_BETA_HEADER,
+                    },
+                )
+
+            if resp.status_code != 200:
+                logger.warning(
+                    "Account %d: 429 recovery token exchange failed (HTTP %d)",
+                    account_id, resp.status_code,
+                )
+                return None
+
+            tokens = resp.json()
+            fresh_access = tokens["access_token"]
+            new_refresh = tokens.get("refresh_token", refresh_token)
+            new_expires = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
+
+            # Determine which token set was used
+            used_cc = bool(account.get("cc_refresh_token"))
+            if used_cc:
+                db.update_account(
+                    account_id,
+                    cc_access_token=fresh_access,
+                    cc_refresh_token=new_refresh,
+                    cc_expires_at=new_expires,
+                )
+            else:
+                db.update_account(
+                    account_id,
+                    access_token=fresh_access,
+                    refresh_token=new_refresh,
+                    expires_at=new_expires,
+                )
+
+            # Write to credential stores so Claude Code picks up the new token
+            updated_account = db.get_account(account_id)
+            if updated_account:
+                sync_credential_to_all_stores(
+                    account_id, updated_account,
+                    email=updated_account.get("email"),
+                )
+
+            logger.info(
+                "Account %d: 429 recovery — fresh token obtained%s",
+                account_id,
+                " (refresh rotated)" if new_refresh != refresh_token else "",
+            )
+            return fresh_access
+
+        except Exception as exc:
+            logger.warning("Account %d: 429 recovery failed: %s", account_id, exc)
+            return None
+
+
 async def fetch_usage(
     account_id: int,
     db: Database,
@@ -516,7 +630,15 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                # Escalating backoff: 65 -> 130 -> 260 -> 520 -> cap 900
+                # Try to clear the per-token rate limit by getting a fresh token
+                fresh_token = await _try_refresh_on_429(account_id, db, state)
+                if fresh_token:
+                    state["consecutive_429s"] = 0
+                    state["last_fetched_at"] = 0  # Allow immediate retry
+                    logger.info("Account %d: retrying usage fetch with fresh token", account_id)
+                    return await fetch_usage(account_id, db, access_token=fresh_token)
+
+                # No refresh available — escalating backoff
                 state["consecutive_429s"] = state.get("consecutive_429s", 0) + 1
                 n = state["consecutive_429s"]
                 base_backoff = min(_USAGE_RATE_LIMIT_CEILING * (2 ** (n - 1)), 900)
