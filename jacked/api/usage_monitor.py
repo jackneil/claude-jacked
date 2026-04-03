@@ -492,6 +492,84 @@ async def active_account_poll_loop(app):
                             },
                         )
 
+            # -- Proactive 7d capacity scheduler ---------------------------
+            if not want_swap and not escape_override:
+                from jacked.web.auto_swap import compute_7d_deficit, PROACTIVE_SWAP_THRESHOLD
+                _wk_start = _setting_str(db, "window_keeper_active_start", "07:00")
+                _wk_end = _setting_str(db, "window_keeper_active_end", "22:00")
+
+                if usage_5h is not None and usage_5h < warning_5h:
+                    best_deficit_acct = None
+                    best_deficit = 0.0
+                    best_deficit_result = None
+
+                    for acct in accounts:
+                        if acct["id"] == active_acct_id:
+                            continue
+                        result = compute_7d_deficit(acct, _wk_start, _wk_end)
+                        if result and result["deficit"] > best_deficit:
+                            best_deficit = result["deficit"]
+                            best_deficit_acct = acct
+                            best_deficit_result = result
+
+                    if best_deficit_acct and best_deficit > PROACTIVE_SWAP_THRESHOLD:
+                        if (time.time() - _last_swap_time) >= _SWAP_COOLDOWN_SECONDS:
+                            # Fetch fresh usage for the target
+                            await fetch_usage(best_deficit_acct["id"], db)
+                            best_deficit_acct = db.get_account(best_deficit_acct["id"])
+
+                            if best_deficit_acct:
+                                reason = (
+                                    f"proactive: burning {best_deficit_result['unused_7d']:.0f}% "
+                                    f"unused 7d on {best_deficit_acct.get('email', '?')} — "
+                                    f"{best_deficit_result['effective_hours_remaining']:.0f} "
+                                    f"effective hours left "
+                                    f"({best_deficit_result['effective_windows_remaining']:.1f} windows)"
+                                )
+                                logger.info(
+                                    "Proactive swap: account %d is %.0f%% behind 7d schedule",
+                                    best_deficit_acct["id"], best_deficit,
+                                )
+
+                                from jacked.api.credential_helpers import (
+                                    reconcile_outgoing_credentials,
+                                    sync_credential_to_all_stores,
+                                )
+                                reconcile_outgoing_credentials(active_acct_id, db)
+
+                                _last_swap_time = time.time()
+                                db.record_swap(
+                                    from_account_id=active_acct_id,
+                                    to_account_id=best_deficit_acct["id"],
+                                    reason=reason,
+                                    trigger="proactive_7d",
+                                    from_5h=usage_5h,
+                                    from_7d=usage_7d,
+                                    to_5h=best_deficit_acct.get("cached_usage_5h"),
+                                    to_7d=best_deficit_acct.get("cached_usage_7d"),
+                                )
+                                sync_credential_to_all_stores(
+                                    best_deficit_acct["id"], best_deficit_acct,
+                                    email=best_deficit_acct.get("email"),
+                                )
+
+                                _burn_rates.pop(active_acct_id, None)
+                                _burn_rate_unchanged_ticks.pop(active_acct_id, None)
+                                _burn_rates.pop(best_deficit_acct["id"], None)
+                                _burn_rate_unchanged_ticks.pop(best_deficit_acct["id"], None)
+
+                                ws_registry = getattr(app.state, "ws_registry", None)
+                                if ws_registry:
+                                    await ws_registry.broadcast(
+                                        "auto_swap_triggered",
+                                        {
+                                            "from_account_id": active_acct_id,
+                                            "to_account_id": best_deficit_acct["id"],
+                                            "to_email": best_deficit_acct.get("email", ""),
+                                            "reason": reason,
+                                        },
+                                    )
+
         except asyncio.CancelledError:
             logger.info("Active account poll loop cancelled — shutting down")
             raise
