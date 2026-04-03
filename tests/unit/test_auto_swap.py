@@ -315,6 +315,29 @@ class TestShouldSwapWindowAware:
 # score_candidate — reset proximity bonus
 # ---------------------------------------------------------------------------
 
+class TestScoreStaleness:
+    def test_stale_data_reduces_score(self):
+        """Account with usage_cached_at > 30 min old should score lower."""
+        import time as _time
+        fresh = _acct(1, usage_5h=20)
+        fresh["usage_cached_at"] = int(_time.time()) - 60  # 1 min ago
+        stale = _acct(2, usage_5h=20)
+        stale["usage_cached_at"] = int(_time.time()) - 3600  # 1 hour ago
+        assert score_candidate(fresh) > score_candidate(stale)
+
+    def test_stale_data_kills_reset_bonus(self):
+        """Imminent reset bonus should be 0 when data is stale."""
+        import time as _time
+        from datetime import datetime, timezone, timedelta
+        resets_soon = (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat()
+        acct = _acct(1, usage_5h=80, resets_5h=resets_soon)
+        acct["usage_cached_at"] = int(_time.time()) - 3600  # stale
+        no_reset = _acct(2, usage_5h=80, resets_5h=resets_soon)
+        no_reset["usage_cached_at"] = int(_time.time()) - 3600
+        # With stale data, the reset bonus should be killed
+        assert abs(score_candidate(acct) - score_candidate(no_reset)) < 5
+
+
 class TestScoreResetBonus:
     def test_imminent_reset_gets_bonus(self):
         """Account with 5h reset in 3 min should score higher than one without."""

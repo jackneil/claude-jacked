@@ -335,10 +335,20 @@ def score_candidate(account: dict) -> float:
         except (ValueError, TypeError):
             pass
 
+    # Staleness check — used to gate reset bonus and apply flat penalty.
+    _STALENESS_THRESHOLD = 1800  # 30 minutes
+    _is_stale = False
+    cached_at = account.get("usage_cached_at")
+    if cached_at:
+        try:
+            _is_stale = (int(time.time()) - int(cached_at)) > _STALENESS_THRESHOLD
+        except (ValueError, TypeError):
+            pass
+
     # Bonus for imminent 5h reset — encourages swapping TO accounts about
     # to get a fresh window. Max +30 when reset is 0 min away, tapering
     # to 0 at 15 min.
-    if resets_5h:
+    if resets_5h and not _is_stale:
         try:
             r = datetime.fromisoformat(resets_5h.replace("Z", "+00:00"))
             remaining_min = (r - datetime.now(timezone.utc)).total_seconds() / 60.0
@@ -346,6 +356,10 @@ def score_candidate(account: dict) -> float:
                 score += 30 * (1 - remaining_min / 15)
         except (ValueError, TypeError):
             pass
+
+    # Flat staleness penalty
+    if _is_stale:
+        score -= 10
 
     return score
 
