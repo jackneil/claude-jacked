@@ -4,9 +4,12 @@ All credential writes go through sync_credential_to_all_stores().
 This is the ONLY module that writes to credential stores.
 """
 
+import contextlib
 import json
 import logging
 import os
+import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,81 @@ import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process lock (compatible with Claude Code's proper-lockfile)
+# ---------------------------------------------------------------------------
+
+_LOCK_DIR = str(Path.home() / ".claude.lock")
+_LOCK_MAX_RETRIES = 5
+_LOCK_RETRY_BASE_MS = 1000
+
+
+@contextlib.contextmanager
+def acquire_claude_lock(timeout_retries: int = _LOCK_MAX_RETRIES):
+    """Acquire a cross-process lock compatible with Claude Code's proper-lockfile.
+
+    proper-lockfile creates a {path}.lock directory as its lock. We use
+    os.mkdir (atomic on POSIX) to implement the same protocol.
+
+    Includes stale lock detection: if the lock directory exists but the
+    PID file inside is from a dead process, the lock is removed and retried.
+
+    Usage:
+        with acquire_claude_lock() as locked:
+            if locked:
+                # ... exchange tokens, write credentials ...
+    """
+    lock_path = _LOCK_DIR
+    pid_file = os.path.join(lock_path, "pid")
+    acquired = False
+
+    for attempt in range(timeout_retries):
+        try:
+            os.mkdir(lock_path)
+            try:
+                with open(pid_file, "w") as f:
+                    f.write(str(os.getpid()))
+            except OSError:
+                pass
+            acquired = True
+            break
+        except FileExistsError:
+            # Lock exists — check if it's stale
+            try:
+                with open(pid_file, "r") as f:
+                    holder_pid = int(f.read().strip())
+                os.kill(holder_pid, 0)  # signal 0 = existence check
+            except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+                # PID file missing, unreadable, or process dead — stale lock
+                try:
+                    shutil.rmtree(lock_path, ignore_errors=True)
+                    logger.info("Removed stale Claude lock (holder PID gone)")
+                    continue
+                except OSError:
+                    pass
+            except OSError:
+                pass  # Process exists — lock is valid
+
+            if attempt < timeout_retries - 1:
+                wait = (_LOCK_RETRY_BASE_MS + random.randint(0, 1000)) / 1000.0
+                logger.debug("Claude lock held, retrying in %.1fs (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+
+    if not acquired:
+        logger.warning("Failed to acquire Claude lock after %d retries", timeout_retries)
+
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            shutil.rmtree(lock_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Keychain helpers
+# ---------------------------------------------------------------------------
 
 
 def _get_keychain_username() -> str:
