@@ -545,6 +545,7 @@ async def fetch_usage(
     db: Database,
     access_token: Optional[str] = None,
     manual: bool = False,
+    _retry_depth: int = 0,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
 
@@ -630,13 +631,17 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                # Try to clear the per-token rate limit by getting a fresh token
-                fresh_token = await _try_refresh_on_429(account_id, db, state)
-                if fresh_token:
-                    state["consecutive_429s"] = 0
-                    state["last_fetched_at"] = 0  # Allow immediate retry
-                    logger.info("Account %d: retrying usage fetch with fresh token", account_id)
-                    return await fetch_usage(account_id, db, access_token=fresh_token)
+                # Try to clear the per-token rate limit by getting a fresh token.
+                # Only attempt on first try (_retry_depth=0) to prevent recursion.
+                if _retry_depth == 0:
+                    fresh_token = await _try_refresh_on_429(account_id, db, state)
+                    if fresh_token:
+                        state["consecutive_429s"] = 0
+                        state["last_fetched_at"] = 0  # Allow immediate retry
+                        logger.info("Account %d: retrying usage fetch with fresh token", account_id)
+                        return await fetch_usage(
+                            account_id, db, access_token=fresh_token, _retry_depth=1,
+                        )
 
                 # No refresh available — escalating backoff
                 state["consecutive_429s"] = state.get("consecutive_429s", 0) + 1

@@ -93,7 +93,8 @@ class TestUsageCeiling:
         state["last_fetched_at"] = time.time() - 120
         db = _mock_db({"usage_cached_at": int(time.time()) - 120})
         client = _mock_client(429, {}, headers={"retry-after": "120"})
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             result = asyncio.run(fetch_usage(1, db))
         assert result is None
         assert mod._get_usage_state(1)["backoff_until"] > time.time()
@@ -106,7 +107,8 @@ class TestUsageCeiling:
         state["last_fetched_at"] = time.time() - 120
         db = _mock_db({"usage_cached_at": int(time.time()) - 120})
         client = _mock_client(429, {}, headers={"retry-after": "999999"})
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             asyncio.run(fetch_usage(1, db))
         backoff = mod._get_usage_state(1)["backoff_until"] - time.time()
         assert backoff <= 901
@@ -428,10 +430,14 @@ class TestEscalatingBackoff:
         db = _mock_db({"usage_cached_at": int(time.time()) - 200})
         client = _mock_client(429, {}, headers={"retry-after": "0"})
 
+        # Mock out _try_refresh_on_429 so we test pure backoff behavior
+        refresh_mock = AsyncMock(return_value=None)
+
         # First 429
         state = mod._get_usage_state(1)
         state["last_fetched_at"] = time.time() - 200
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", refresh_mock):
             asyncio.run(fetch_usage(1, db))
         assert state["consecutive_429s"] == 1
         backoff1 = state["backoff_until"] - time.time()
@@ -440,7 +446,8 @@ class TestEscalatingBackoff:
         # Second 429
         state["last_fetched_at"] = time.time() - 200
         state["backoff_until"] = 0
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", refresh_mock):
             asyncio.run(fetch_usage(1, db))
         assert state["consecutive_429s"] == 2
         backoff2 = state["backoff_until"] - time.time()

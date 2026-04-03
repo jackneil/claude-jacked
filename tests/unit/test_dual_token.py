@@ -611,8 +611,11 @@ class TestCCInvalidGrantHandling:
     """Verify that CC invalid_grant clears refresh token but preserves access token."""
 
     @patch("jacked.web.auth.httpx.AsyncClient")
-    def test_invalid_grant_clears_refresh_preserves_access(self, mock_client_cls, tmp_path):
-        """invalid_grant clears cc_refresh_token, preserves cc_access_token + cc_expires_at."""
+    @patch("jacked.api.credential_helpers.read_platform_credentials", return_value=None)
+    def test_invalid_grant_clears_refresh_preserves_access(
+        self, mock_read_creds, mock_client_cls, tmp_path
+    ):
+        """invalid_grant clears cc_refresh_token when no live recovery available."""
         db = _make_db(tmp_path)
         expires = int(time.time()) - 100
         db.update_account(
@@ -632,7 +635,9 @@ class TestCCInvalidGrantHandling:
         mock_client.__aexit__ = AsyncMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        result = asyncio.run(refresh_cc_token(1, db))
+        # Also mock the credentials file read to return nothing
+        with patch("pathlib.Path.exists", return_value=False):
+            result = asyncio.run(refresh_cc_token(1, db))
 
         assert result is False
         acct = db.get_account(1)
