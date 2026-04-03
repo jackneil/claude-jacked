@@ -63,8 +63,12 @@ def _get_usage_state(account_id: int) -> dict:
             "backoff_until": 0.0,
             "tier": "idle",
             "interval": _TIER_INTERVALS["idle"],
+            "consecutive_429s": 0,
         }
-    return _account_usage_state[account_id]
+    state = _account_usage_state[account_id]
+    if "consecutive_429s" not in state:
+        state["consecutive_429s"] = 0
+    return state
 
 
 def compute_urgency_tier(
@@ -491,6 +495,7 @@ async def fetch_usage(
                 )
 
                 state["last_fetched_at"] = time.time()
+                state["consecutive_429s"] = 0
 
                 # clear_account_errors marks valid, clears last_error, consecutive_failures
                 db.clear_account_errors(account_id)
@@ -511,21 +516,26 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                retry_after = resp.headers.get("retry-after", str(_USAGE_RATE_LIMIT_CEILING))
+                # Escalating backoff: 65 -> 130 -> 260 -> 520 -> cap 900
+                state["consecutive_429s"] = state.get("consecutive_429s", 0) + 1
+                n = state["consecutive_429s"]
+                base_backoff = min(_USAGE_RATE_LIMIT_CEILING * (2 ** (n - 1)), 900)
+                retry_after = resp.headers.get("retry-after", str(base_backoff))
                 try:
-                    backoff_seconds = min(max(int(retry_after), _USAGE_RATE_LIMIT_CEILING), 900)
+                    backoff_seconds = min(max(int(retry_after), base_backoff), 900)
                 except (ValueError, TypeError):
-                    backoff_seconds = _USAGE_RATE_LIMIT_CEILING
+                    backoff_seconds = base_backoff
                 state["backoff_until"] = time.time() + backoff_seconds
                 state["last_fetched_at"] = time.time()
                 db.record_account_error(
                     account_id,
-                    f"Usage fetch rate limited (429) — backing off {backoff_seconds}s",
+                    f"Usage fetch rate limited (429) — backing off {backoff_seconds}s "
+                    f"(consecutive: {n})",
                     increment_failures=False,
                 )
                 logger.warning(
                     f"Usage fetch rate limited for account {account_id}, "
-                    f"backing off {backoff_seconds}s"
+                    f"backing off {backoff_seconds}s (consecutive: {n})"
                 )
                 return None
 

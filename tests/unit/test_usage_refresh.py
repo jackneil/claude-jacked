@@ -412,3 +412,53 @@ class TestConstants:
 
     def test_cache_freshness_is_positive(self):
         assert USAGE_CACHE_FRESHNESS_SECONDS > 0
+
+
+# ---------------------------------------------------------------------------
+# Escalating backoff on consecutive 429s
+# ---------------------------------------------------------------------------
+
+
+class TestEscalatingBackoff:
+    def test_consecutive_429s_escalate(self):
+        """Each consecutive 429 should increase the backoff."""
+        import jacked.web.auth as mod
+        mod._account_usage_state.clear()
+
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
+        client = _mock_client(429, {}, headers={"retry-after": "0"})
+
+        # First 429
+        state = mod._get_usage_state(1)
+        state["last_fetched_at"] = time.time() - 200
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            asyncio.run(fetch_usage(1, db))
+        assert state["consecutive_429s"] == 1
+        backoff1 = state["backoff_until"] - time.time()
+        assert 60 <= backoff1 <= 70  # ~65s
+
+        # Second 429
+        state["last_fetched_at"] = time.time() - 200
+        state["backoff_until"] = 0
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            asyncio.run(fetch_usage(1, db))
+        assert state["consecutive_429s"] == 2
+        backoff2 = state["backoff_until"] - time.time()
+        assert 125 <= backoff2 <= 135  # ~130s
+
+    def test_success_resets_consecutive_count(self):
+        """Successful fetch should reset consecutive_429s to 0."""
+        import jacked.web.auth as mod
+        mod._account_usage_state.clear()
+        state = mod._get_usage_state(1)
+        state["consecutive_429s"] = 5
+        state["last_fetched_at"] = time.time() - 200
+
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
+        client = _mock_client(200, {
+            "five_hour": {"utilization": 10.0},
+            "seven_day": {"utilization": 20.0},
+        })
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            asyncio.run(fetch_usage(1, db))
+        assert state["consecutive_429s"] == 0
