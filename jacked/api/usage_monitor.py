@@ -114,6 +114,23 @@ def _compute_poll_interval(
         return 60.0, "unknown"
 
 
+async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> list:
+    """Fetch fresh usage for all non-active candidate accounts.
+
+    Called on-demand when a swap decision needs current data.
+    Returns the refreshed accounts list from DB.
+    """
+    from jacked.web.auth import fetch_usage
+
+    for acct in accounts:
+        if acct["id"] == active_acct_id:
+            continue
+        await fetch_usage(acct["id"], db)
+        await asyncio.sleep(1)
+
+    return db.list_accounts(include_inactive=False)
+
+
 async def active_account_poll_loop(app):
     """Poll the active account with adaptive interval for threshold detection.
 
@@ -296,6 +313,9 @@ async def active_account_poll_loop(app):
                     escape_override = True
 
             if want_swap or escape_override:
+                # Fetch fresh usage for candidates before scoring
+                accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
+
                 target = pick_best_target(
                     accounts, current_id=active_acct_id,
                     threshold_7d=threshold_7d,
@@ -415,6 +435,9 @@ async def active_account_poll_loop(app):
                             },
                         )
                 else:
+                    # Fetch fresh data for recovery estimate
+                    accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
+
                     # No eligible target — cooldown to avoid log spam
                     now_ts = time.time()
                     if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
