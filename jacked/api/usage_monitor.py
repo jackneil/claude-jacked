@@ -90,7 +90,7 @@ def _compute_poll_interval(
     if active_id is None or db is None:
         return 60.0, "unknown"
     try:
-        from jacked.web.auth import compute_urgency_tier, _get_usage_state
+        from jacked.web.auth import compute_urgency_tier, _get_usage_state, _TIER_INTERVALS
         acct = db.get_account(active_id)
         br = burn_rates.get(active_id)
         state = _get_usage_state(active_id)
@@ -100,6 +100,11 @@ def _compute_poll_interval(
             burn_rate_5h=br.rate_5h_per_min if br else 0.0,
             critical_5h=_setting_float(db, "auto_swap_5h_critical", 90),
         )
+        # Override: force idle if stuck in 429 cycle — stale data makes
+        # urgency tiers unreliable, and polling faster is pointless.
+        if state.get("consecutive_429s", 0) >= 3:
+            tier = "idle"
+            base = _TIER_INTERVALS["idle"]
         state["tier"] = tier
         state["interval"] = base
         jitter = base * 0.15
