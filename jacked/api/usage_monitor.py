@@ -132,6 +132,108 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
     return db.list_accounts(include_inactive=False)
 
 
+async def _execute_swap(
+    db,
+    active_acct_id: int,
+    active_acct: dict,
+    target: dict,
+    reason: str,
+    trigger: str,
+    usage_5h: float | None,
+    usage_7d: float | None,
+    active_start: str,
+    active_end: str,
+    ws_registry=None,
+) -> bool:
+    """Execute a swap. Returns True if credential write succeeded.
+
+    Canonical ordering:
+    1. TOCTOU guard
+    2. Record swap + arm cooldown (audit trail survives credential failure)
+    3. Reconcile outgoing credentials
+    4. Write incoming credentials under cross-process lock
+    5. Clean up burn-rate state
+    6. Broadcast via WebSocket
+    """
+    global _last_swap_time
+
+    from jacked.api.credential_helpers import (
+        acquire_claude_lock,
+        reconcile_outgoing_credentials,
+        sync_credential_to_all_stores,
+    )
+    from jacked.web.auto_swap import format_account_label
+
+    # 1. TOCTOU guard
+    current_active = _read_active_account_id()
+    if current_active != active_acct_id:
+        logger.info(
+            "Swap aborted: active account changed from %d to %s during evaluation",
+            active_acct_id, current_active,
+        )
+        return False
+
+    # 2. Record swap + arm cooldown BEFORE credential write
+    _last_swap_time = time.time()
+    db.record_swap(
+        from_account_id=active_acct_id,
+        to_account_id=target["id"],
+        reason=reason,
+        trigger=trigger,
+        from_5h=usage_5h,
+        from_7d=usage_7d,
+        to_5h=target.get("cached_usage_5h"),
+        to_7d=target.get("cached_usage_7d"),
+    )
+
+    # 3. Reconcile outgoing credentials
+    reconcile_outgoing_credentials(active_acct_id, db)
+
+    # 4. Write incoming credentials under cross-process lock
+    credential_ok = False
+    with acquire_claude_lock() as locked:
+        if locked:
+            sync_credential_to_all_stores(
+                target["id"], target,
+                email=target.get("email"),
+            )
+            credential_ok = True
+        else:
+            logger.warning(
+                "Swap: could not acquire lock for credential write "
+                "(account %d -> %d)", active_acct_id, target["id"],
+            )
+
+    # 5. Clean up burn-rate state
+    _burn_rates.pop(active_acct_id, None)
+    _burn_rate_unchanged_ticks.pop(active_acct_id, None)
+    _burn_rates.pop(target["id"], None)
+    _burn_rate_unchanged_ticks.pop(target["id"], None)
+
+    # 6. Broadcast via WebSocket
+    if ws_registry:
+        await ws_registry.broadcast(
+            "auto_swap_triggered",
+            {
+                "from_account_id": active_acct_id,
+                "to_account_id": target["id"],
+                "from_email": active_acct.get("email", ""),
+                "to_email": target.get("email", ""),
+                "from_label": format_account_label(active_acct),
+                "to_label": format_account_label(target),
+                "reason": reason,
+            },
+        )
+
+    if not credential_ok:
+        _last_swap_time = 0.0  # Reset cooldown so next tick retries
+        logger.warning(
+            "Swap recorded but credential write failed — will retry next tick"
+        )
+
+    return credential_ok
+
+
 async def active_account_poll_loop(app):
     """Poll the active account with adaptive interval for threshold detection.
 
@@ -187,10 +289,7 @@ async def active_account_poll_loop(app):
 
             # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
-            from jacked.api.credential_helpers import (
-                read_fresh_active_token,
-                sync_credential_to_all_stores,
-            )
+            from jacked.api.credential_helpers import read_fresh_active_token
             from jacked.web.auto_swap import (
                 should_swap,
                 pick_best_target,
@@ -388,18 +487,6 @@ async def active_account_poll_loop(app):
                         await asyncio.sleep(60)
                         continue
 
-                    # -- TOCTOU guard: re-read active ID before swap ------
-                    current_active = _read_active_account_id()
-                    if current_active != active_acct_id:
-                        logger.info(
-                            "Active poll: active account changed from %d to %s "
-                            "during swap evaluation — skipping swap",
-                            active_acct_id, current_active,
-                        )
-                        # continue, NOT return — loop keeps running
-                        await asyncio.sleep(60)
-                        continue
-
                     # -- Build descriptive reason -------------------------
                     if escape_override and not want_swap:
                         reason = (
@@ -436,49 +523,14 @@ async def active_account_poll_loop(app):
                         reason,
                     )
 
-                    # Record swap and set cooldown BEFORE credential
-                    # write — if sync_credential_to_all_stores raises,
-                    # we still have the audit trail and cooldown set.
-                    _last_swap_time = time.time()
-                    db.record_swap(
-                        from_account_id=active_acct_id,
-                        to_account_id=target["id"],
-                        reason=reason,
-                        trigger="auto_swap",
-                        from_5h=usage_5h,
-                        from_7d=usage_7d,
-                        to_5h=target.get("cached_usage_5h"),
-                        to_7d=target.get("cached_usage_7d"),
+                    ws_registry = getattr(app.state, "ws_registry", None)
+                    await _execute_swap(
+                        db, active_acct_id, active_acct, target,
+                        reason=reason, trigger="auto_swap",
+                        usage_5h=usage_5h, usage_7d=usage_7d,
+                        active_start=active_start, active_end=active_end,
+                        ws_registry=ws_registry,
                     )
-                    # Reconcile outgoing account's credentials before writing
-                    # new ones — captures any token rotation by Claude Code.
-                    from jacked.api.credential_helpers import reconcile_outgoing_credentials
-                    reconcile_outgoing_credentials(active_acct_id, db)
-
-                    sync_credential_to_all_stores(
-                        target["id"], target,
-                        email=target.get("email"),
-                    )
-
-                    # Clean up burn rate for both old and new account
-                    _burn_rates.pop(active_acct_id, None)
-                    _burn_rate_unchanged_ticks.pop(active_acct_id, None)
-                    _burn_rates.pop(target["id"], None)
-                    _burn_rate_unchanged_ticks.pop(target["id"], None)
-
-                    if ws_registry:
-                        await ws_registry.broadcast(
-                            "auto_swap_triggered",
-                            {
-                                "from_account_id": active_acct_id,
-                                "to_account_id": target["id"],
-                                "from_email": active_acct.get("email", ""),
-                                "to_email": target.get("email", ""),
-                                "from_label": format_account_label(active_acct),
-                                "to_label": format_account_label(target),
-                                "reason": reason,
-                            },
-                        )
                 else:
                     # Fetch fresh data for recovery estimate
                     accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
@@ -548,61 +600,36 @@ async def active_account_poll_loop(app):
                             target = db.get_account(target["id"])
 
                             if target:
-                                reason = (
-                                    f"proactive: burning {deficit_result['unused_7d']:.0f}% "
-                                    f"unused 7d on {format_account_label(target)} — "
-                                    f"{deficit_result['effective_hours_remaining']:.0f} "
-                                    f"effective hours left "
-                                    f"({deficit_result['effective_windows_remaining']:.1f} windows), "
-                                    f"score={score_candidate(target, active_start, active_end):.0f}"
-                                )
-                                logger.info(
-                                    "Proactive swap: account %d is %.0f%% behind 7d schedule "
-                                    "(score=%.0f)",
-                                    target["id"], deficit_result["deficit"],
-                                    score_candidate(target, active_start, active_end),
-                                )
+                                # Recompute deficit with fresh data
+                                deficit_result = compute_7d_deficit(target, active_start, active_end)
+                                if not deficit_result or deficit_result["deficit"] <= PROACTIVE_SWAP_THRESHOLD:
+                                    logger.debug(
+                                        "Proactive: target %d deficit dropped below threshold after re-fetch",
+                                        target["id"],
+                                    )
+                                else:
+                                    target_score = score_candidate(target, active_start, active_end)
+                                    reason = (
+                                        f"proactive: burning {deficit_result['unused_7d']:.0f}% "
+                                        f"unused 7d on {format_account_label(target)} — "
+                                        f"{deficit_result['effective_hours_remaining']:.0f} "
+                                        f"effective hours left "
+                                        f"({deficit_result['effective_windows_remaining']:.1f} windows), "
+                                        f"score={target_score:.0f}"
+                                    )
+                                    logger.info(
+                                        "Proactive swap: account %d is %.0f%% behind 7d schedule "
+                                        "(score=%.0f)",
+                                        target["id"], deficit_result["deficit"], target_score,
+                                    )
 
-                                from jacked.api.credential_helpers import (
-                                    reconcile_outgoing_credentials,
-                                    sync_credential_to_all_stores,
-                                )
-                                reconcile_outgoing_credentials(active_acct_id, db)
-
-                                _last_swap_time = time.time()
-                                db.record_swap(
-                                    from_account_id=active_acct_id,
-                                    to_account_id=target["id"],
-                                    reason=reason,
-                                    trigger="proactive_7d",
-                                    from_5h=usage_5h,
-                                    from_7d=usage_7d,
-                                    to_5h=target.get("cached_usage_5h"),
-                                    to_7d=target.get("cached_usage_7d"),
-                                )
-                                sync_credential_to_all_stores(
-                                    target["id"], target,
-                                    email=target.get("email"),
-                                )
-
-                                _burn_rates.pop(active_acct_id, None)
-                                _burn_rate_unchanged_ticks.pop(active_acct_id, None)
-                                _burn_rates.pop(target["id"], None)
-                                _burn_rate_unchanged_ticks.pop(target["id"], None)
-
-                                ws_registry = getattr(app.state, "ws_registry", None)
-                                if ws_registry:
-                                    await ws_registry.broadcast(
-                                        "auto_swap_triggered",
-                                        {
-                                            "from_account_id": active_acct_id,
-                                            "to_account_id": target["id"],
-                                            "from_email": active_acct.get("email", ""),
-                                            "to_email": target.get("email", ""),
-                                            "from_label": format_account_label(active_acct),
-                                            "to_label": format_account_label(target),
-                                            "reason": reason,
-                                        },
+                                    ws_registry = getattr(app.state, "ws_registry", None)
+                                    await _execute_swap(
+                                        db, active_acct_id, active_acct, target,
+                                        reason=reason, trigger="proactive_7d",
+                                        usage_5h=usage_5h, usage_7d=usage_7d,
+                                        active_start=active_start, active_end=active_end,
+                                        ws_registry=ws_registry,
                                     )
 
         except asyncio.CancelledError:
