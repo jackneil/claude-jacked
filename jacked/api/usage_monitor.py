@@ -511,6 +511,24 @@ async def active_account_poll_loop(app):
                 # Fetch fresh usage for candidates before scoring
                 accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
 
+                # Build candidate summaries for decision log
+                from jacked.web.auto_swap import compute_7d_deficit
+                _candidate_summaries = []
+                for _cand in accounts:
+                    if _cand["id"] == active_acct_id:
+                        continue
+                    _cand_score = score_candidate(_cand, active_start, active_end)
+                    _cand_deficit = compute_7d_deficit(_cand, active_start, active_end)
+                    _candidate_summaries.append({
+                        "id": _cand["id"],
+                        "email": _cand.get("email", ""),
+                        "label": format_account_label(_cand),
+                        "5h": _cand.get("cached_usage_5h"),
+                        "7d": _cand.get("cached_usage_7d"),
+                        "score": round(_cand_score, 1),
+                        "deficit": round(_cand_deficit["deficit"], 1) if _cand_deficit else None,
+                    })
+
                 target = pick_best_target(
                     accounts, current_id=active_acct_id,
                     threshold_7d=threshold_7d,
