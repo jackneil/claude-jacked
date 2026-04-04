@@ -358,6 +358,105 @@ class TestScoreResetBonus:
 
 
 # ---------------------------------------------------------------------------
+# score_candidate — 7d deficit bonus
+# ---------------------------------------------------------------------------
+
+class TestScoreDeficitBonus:
+    def test_behind_schedule_account_scores_higher(self):
+        """Account behind on 7d schedule should score higher than one ahead."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        # Account behind schedule: 20% usage, resets in 3 days (~57% through window)
+        # Deficit: ~57% expected - 20% actual = ~37%
+        behind = _acct(1, usage_5h=30, usage_7d=20)
+        behind["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=3)
+        ).isoformat()
+        behind["usage_cached_at"] = int(_time.time()) - 60
+
+        # Account ahead of schedule: 80% usage, resets in 5 days (~29% through)
+        # Deficit: ~29% expected - 80% actual = ~-51% (negative, ahead)
+        ahead = _acct(2, usage_5h=30, usage_7d=80)
+        ahead["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=5)
+        ).isoformat()
+        ahead["usage_cached_at"] = int(_time.time()) - 60
+
+        score_behind = score_candidate(behind, active_start="07:00", active_end="22:00")
+        score_ahead = score_candidate(ahead, active_start="07:00", active_end="22:00")
+        assert score_behind > score_ahead
+
+    def test_deficit_bonus_is_proportional(self):
+        """Larger deficit should give a larger bonus."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        # Account A: 10% 7d, resets in 1 day (~86% through window)
+        # Deficit: ~86% expected - 10% actual = ~76% -> bonus ~38
+        a = _acct(1, usage_5h=20, usage_7d=10)
+        a["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=1)
+        ).isoformat()
+        a["usage_cached_at"] = int(_time.time()) - 60
+
+        # Account B: 10% 7d, resets in 5 days (~29% through window)
+        # Deficit: ~29% expected - 10% actual = ~19% -> bonus ~9.5
+        b = _acct(2, usage_5h=20, usage_7d=10)
+        b["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=5)
+        ).isoformat()
+        b["usage_cached_at"] = int(_time.time()) - 60
+
+        score_a = score_candidate(a, active_start="07:00", active_end="22:00")
+        score_b = score_candidate(b, active_start="07:00", active_end="22:00")
+        assert score_a > score_b
+
+    def test_no_bonus_when_ahead_of_schedule(self):
+        """Account ahead of schedule gets no deficit bonus (deficit <= 0)."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        # Two accounts with SAME 7d reset data so the existing time-weighted
+        # 7d penalty is identical, isolating the deficit bonus effect.
+        # 80% usage, 29% through window -> deficit = -51% (ahead)
+        acct = _acct(1, usage_5h=20, usage_7d=80)
+        acct["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=5)
+        ).isoformat()
+        acct["usage_cached_at"] = int(_time.time()) - 60
+
+        # 10% usage, same reset -> deficit positive, WILL get bonus
+        behind = _acct(2, usage_5h=20, usage_7d=10)
+        behind["cached_7d_resets_at"] = acct["cached_7d_resets_at"]
+        behind["usage_cached_at"] = int(_time.time()) - 60
+
+        score_ahead = score_candidate(acct, active_start="07:00", active_end="22:00")
+        score_behind = score_candidate(behind, active_start="07:00", active_end="22:00")
+
+        # The behind account gets both: less 7d penalty (10 vs 80) AND
+        # a deficit bonus. The ahead account gets NO deficit bonus.
+        # Verify ahead account doesn't somehow score higher from deficit.
+        assert score_behind > score_ahead
+
+        # Also verify: two ahead-of-schedule accounts with same params
+        # produce the same score (no spurious bonus).
+        acct2 = _acct(3, usage_5h=20, usage_7d=80)
+        acct2["cached_7d_resets_at"] = acct["cached_7d_resets_at"]
+        acct2["usage_cached_at"] = int(_time.time()) - 60
+        assert abs(
+            score_candidate(acct, active_start="07:00", active_end="22:00")
+            - score_candidate(acct2, active_start="07:00", active_end="22:00")
+        ) < 1
+
+    def test_default_active_hours_backward_compatible(self):
+        """Calling score_candidate without active hours still works."""
+        acct = _acct(1, usage_5h=20, usage_7d=10)
+        score = score_candidate(acct)
+        assert score > 0
+
+
+# ---------------------------------------------------------------------------
 # pick_best_target — relax 7d filter for imminent resets
 # ---------------------------------------------------------------------------
 

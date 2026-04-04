@@ -296,7 +296,11 @@ def _minutes_until(
 # score_candidate
 # ---------------------------------------------------------------------------
 
-def score_candidate(account: dict) -> float:
+def score_candidate(
+    account: dict,
+    active_start: str = "07:00",
+    active_end: str = "22:00",
+) -> float:
     """Score an account for swap-to suitability. Higher is better.
 
     Considers:
@@ -304,6 +308,7 @@ def score_candidate(account: dict) -> float:
     - 7d utilization weighted by remaining days in window
     - Tier-aware headroom (room before hitting tier's critical threshold)
     - Inactive 5h window bonus (encourages opening them)
+    - 7d deficit bonus (behind-schedule accounts get priority)
     """
     score = 100.0
     score -= (account.get("cached_usage_5h") or 0)
@@ -366,6 +371,18 @@ def score_candidate(account: dict) -> float:
     # Flat staleness penalty
     if _is_stale:
         score -= 10
+
+    # 7d deficit bonus: accounts behind schedule on 7d utilization
+    # get a bonus proportional to their deficit.
+    # 0.5 weight: 30% deficit = +15 points, keeping it moderate.
+    deficit_result = compute_7d_deficit(account, active_start, active_end)
+    if deficit_result and deficit_result["deficit"] > 0:
+        bonus = deficit_result["deficit"] * 0.5
+        score += bonus
+        logger.debug(
+            "score_candidate: account %s deficit bonus +%.1f (deficit=%.1f%%)",
+            account.get("id", "?"), bonus, deficit_result["deficit"],
+        )
 
     return score
 
