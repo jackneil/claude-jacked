@@ -127,6 +127,7 @@ async function renderRoute(route) {
                         if (el) el.textContent = '', el.appendChild(Object.assign(document.createElement('div'), {innerHTML: renderSwapLogTable(entries)}));
                     });
                 }
+                if (typeof renderDecisionLog === 'function') renderDecisionLog('decision-log-container');
                 // Auto-validate stale accounts on mount
                 autoValidateStaleAccounts();
             }
@@ -257,6 +258,7 @@ function rerenderAccountsView() {
             if (el) { el.textContent = ''; const w = document.createElement('div'); w.innerHTML = renderSwapLogTable(entries); el.appendChild(w); }
         });
     }
+    if (typeof renderDecisionLog === 'function') renderDecisionLog('decision-log-container');
 
     // Restore expanded details
     expandedDetails.forEach(id => {

@@ -27,6 +27,17 @@ async function loadSwapLog() {
     }
 }
 
+async function loadDecisionLog(showAll) {
+    try {
+        const params = showAll ? '?limit=200' : '?limit=100&action=swap&action=manual_switch';
+        const data = await api.get('/api/settings/decision-log' + params);
+        return Array.isArray(data) ? data : [];
+    } catch (e) {
+        console.error('Failed to load decision log:', e);
+        return [];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
@@ -262,6 +273,158 @@ function renderSwapLogTable(entries) {
             <tbody>${rows}</tbody>
         </table>
     `;
+}
+
+// ---------------------------------------------------------------------------
+// Decision log table (full decision trace with expandable rows)
+// ---------------------------------------------------------------------------
+
+function renderDecisionLogTable(entries) {
+    if (!entries || entries.length === 0) {
+        return '<div class="text-xs text-slate-500">No decisions recorded yet</div>';
+    }
+
+    const rows = entries.map(function(e) {
+        const ts = e.timestamp
+            ? escapeHtml(new Date(e.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
+            : '\u2014';
+
+        const action = e.action || 'unknown';
+        let actionBadge = '';
+        if (action === 'swap') {
+            actionBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-teal-900/50 text-teal-300">swap</span>';
+        } else if (action === 'manual_switch') {
+            actionBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-900/50 text-blue-300">manual</span>';
+        } else {
+            actionBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-700/50 text-slate-400">check</span>';
+        }
+
+        const reason = escapeHtml(e.reason || '\u2014');
+        const hasDetail = e.detail && typeof e.detail === 'object';
+        const detailId = 'decision-detail-' + e.id;
+        const accountLabel = hasDetail && e.detail.active
+            ? escapeHtml(e.detail.active.label || e.detail.active.email || '\u2014')
+            : '\u2014';
+
+        let detailHtml = '';
+        if (hasDetail) {
+            detailHtml = buildDecisionDetailHtml(e.detail, detailId);
+        }
+
+        const clickHandler = hasDetail
+            ? ' onclick="document.getElementById(\'' + detailId + '\').classList.toggle(\'hidden\')"'
+            : '';
+        const rowClass = hasDetail
+            ? 'border-t border-slate-700/30 cursor-pointer hover:bg-slate-800/50'
+            : 'border-t border-slate-700/30';
+
+        return '<tr class="' + rowClass + '"' + clickHandler + '>' +
+            '<td class="py-1.5 pr-3 text-xs text-slate-400 whitespace-nowrap">' + ts + '</td>' +
+            '<td class="py-1.5 pr-3 text-xs">' + actionBadge + '</td>' +
+            '<td class="py-1.5 pr-3 text-xs text-slate-300">' + accountLabel + '</td>' +
+            '<td class="py-1.5 text-xs text-slate-500">' + reason + '</td>' +
+            '</tr>' + detailHtml;
+    }).join('');
+
+    return '<table class="w-full">' +
+        '<thead><tr class="text-left">' +
+        '<th class="pb-1 pr-3 text-xs text-slate-500 font-medium">Time</th>' +
+        '<th class="pb-1 pr-3 text-xs text-slate-500 font-medium">Action</th>' +
+        '<th class="pb-1 pr-3 text-xs text-slate-500 font-medium">Account</th>' +
+        '<th class="pb-1 text-xs text-slate-500 font-medium">Reason</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+function buildDecisionDetailHtml(d, detailId) {
+    const parts = [];
+
+    // Active account info
+    if (d.active) {
+        parts.push(
+            '<div class="mb-2"><span class="text-slate-400">Active:</span> ' +
+            escapeHtml(d.active.label || d.active.email || '?') +
+            ' <span class="text-slate-500">(5h=' +
+            escapeHtml(String(d.active['5h'] != null ? d.active['5h'] : '?')) +
+            '% 7d=' +
+            escapeHtml(String(d.active['7d'] != null ? d.active['7d'] : '?')) +
+            '%)</span></div>'
+        );
+    }
+
+    // Suppression info
+    if (d.suppression) {
+        parts.push(
+            '<div class="mb-2"><span class="text-yellow-400">Suppression:</span> ' +
+            escapeHtml(d.suppression.type || '?') +
+            (d.suppression.usage_7d != null ? ' (7d=' + escapeHtml(String(d.suppression.usage_7d)) + '%)' : '') +
+            '</div>'
+        );
+    }
+
+    // Candidates table
+    if (d.candidates && d.candidates.length > 0) {
+        let table = '<div class="mb-2"><span class="text-slate-400">Candidates evaluated:</span></div>' +
+            '<table class="w-full text-[10px] mb-2"><thead><tr class="text-slate-500">' +
+            '<th class="text-left pr-2">Account</th><th class="pr-2 text-right">7d</th>' +
+            '<th class="pr-2 text-right">Deficit</th><th class="pr-2 text-right">Windows</th>' +
+            '<th class="pr-2">Tier</th><th>Pass</th></tr></thead><tbody>';
+
+        d.candidates.forEach(function(c) {
+            const pass = c.passes ? '\u2705' : '\u274c';
+            const rowCls = c.passes ? 'text-teal-300' : 'text-slate-500';
+            table += '<tr class="' + rowCls + '">' +
+                '<td class="pr-2">' + escapeHtml(c.label || c.email || '?') + '</td>' +
+                '<td class="pr-2 text-right">' + escapeHtml(String(c['7d'] != null ? c['7d'] : '?')) + '%</td>' +
+                '<td class="pr-2 text-right">' + escapeHtml(String(c.deficit != null ? c.deficit : '?')) + '%</td>' +
+                '<td class="pr-2 text-right">' + escapeHtml(String(c.windows_remaining != null ? c.windows_remaining : '?')) + '</td>' +
+                '<td class="pr-2">' + escapeHtml(c.urgency_tier || c.skip_reason || '\u2014') + '</td>' +
+                '<td>' + pass + '</td></tr>';
+        });
+        table += '</tbody></table>';
+        parts.push(table);
+    }
+
+    // Decision flags
+    parts.push(
+        '<div class="text-slate-500">should_swap=' +
+        escapeHtml(String(d.should_swap)) +
+        ' escape=' + escapeHtml(String(d.escape_override)) +
+        ' cooldown=' + escapeHtml(String(d.cooldown_active)) +
+        '</div>'
+    );
+
+    return '<tr id="' + escapeHtml(detailId) + '" class="hidden">' +
+        '<td colspan="4" class="py-2 px-3 bg-slate-900/50 border-t border-slate-700/30">' +
+        '<div class="text-[11px] font-mono">' + parts.join('') + '</div></td></tr>';
+}
+
+async function renderDecisionLog(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    const showAll = container.dataset.showAll === 'true';
+    const entries = await loadDecisionLog(showAll);
+
+    const toggleLabel = showAll ? 'Show swaps only' : 'Show all checks';
+    const toggleBtn = '<button onclick="toggleDecisionLogFilter()" ' +
+        'class="text-xs text-teal-400 hover:text-teal-300 mb-2">' +
+        escapeHtml(toggleLabel) + '</button>';
+
+    container.textContent = '';
+    const btnDiv = document.createElement('div');
+    btnDiv.innerHTML = toggleBtn;
+    container.appendChild(btnDiv);
+
+    const tableDiv = document.createElement('div');
+    tableDiv.innerHTML = renderDecisionLogTable(entries);
+    container.appendChild(tableDiv);
+}
+
+function toggleDecisionLogFilter() {
+    const container = document.getElementById('decision-log-container');
+    if (!container) return;
+    container.dataset.showAll = container.dataset.showAll === 'true' ? 'false' : 'true';
+    renderDecisionLog('decision-log-container');
 }
 
 // ---------------------------------------------------------------------------
