@@ -132,6 +132,42 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
     return db.list_accounts(include_inactive=False)
 
 
+def _build_tick_detail(
+    active_acct: dict,
+    usage_5h: float | None,
+    usage_7d: float | None,
+    want_swap: bool,
+    suppression: dict | None,
+    escape_override: bool,
+    candidates: list[dict] | None,
+    proactive_target_id: int | None,
+    cooldown_active: bool,
+    decision: str,
+) -> dict:
+    """Build the detail JSON for a decision log entry."""
+    from jacked.web.auto_swap import format_account_label
+    detail = {
+        "active": {
+            "id": active_acct.get("id"),
+            "email": active_acct.get("email", ""),
+            "label": format_account_label(active_acct),
+            "5h": usage_5h,
+            "7d": usage_7d,
+        },
+        "should_swap": want_swap,
+        "escape_override": escape_override,
+        "cooldown_active": cooldown_active,
+        "decision": decision,
+    }
+    if suppression:
+        detail["suppression"] = suppression
+    if candidates is not None:
+        detail["candidates"] = candidates
+    if proactive_target_id is not None:
+        detail["proactive_target_id"] = proactive_target_id
+    return detail
+
+
 async def _execute_swap(
     db,
     active_acct_id: int,
@@ -287,6 +323,13 @@ async def active_account_poll_loop(app):
             active_start = _setting_str(db, "window_keeper_active_start", "06:00")
             active_end = _setting_str(db, "window_keeper_active_end", "23:00")
 
+            _decision_action = "stay"
+            _decision_target_id = None
+            _decision_reason = None
+            _candidate_summaries = None
+            _proactive_target_id = None
+            _suppression = None
+
             # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
             from jacked.api.credential_helpers import read_fresh_active_token
@@ -430,6 +473,12 @@ async def active_account_poll_loop(app):
                 active_end=active_end,
             )
 
+            if not want_swap:
+                if usage_5h is not None and usage_5h >= effective_critical:
+                    _suppression = {"type": "5h_reset_imminent"}
+                elif usage_7d is not None and usage_7d >= threshold_7d:
+                    _suppression = {"type": "deficit", "usage_7d": usage_7d}
+
             # -- Escape hatch: override reset suppression if a clearly
             # better candidate exists.  Don't keep the user on a degraded
             # account just to save a window reset when a much better
@@ -538,6 +587,9 @@ async def active_account_poll_loop(app):
                         active_start=active_start, active_end=active_end,
                         ws_registry=ws_registry,
                     )
+                    _decision_action = "swap"
+                    _decision_target_id = target["id"]
+                    _decision_reason = reason
                 else:
                     # accounts already fetched before pick_best_target — reuse
 
@@ -604,6 +656,7 @@ async def active_account_poll_loop(app):
                     best_urgent = None
                     best_urgency = 0.0
                     best_deficit_result = None
+                    _candidate_summaries = []
 
                     for acct in accounts:
                         if acct["id"] == active_acct_id:
@@ -636,6 +689,25 @@ async def active_account_poll_loop(app):
                             dr["effective_windows_remaining"] * burn,
                         )
                         urgency = recoverable / max(dr["effective_hours_remaining"], 0.5)
+
+                        _candidate_summaries.append({
+                            "id": acct["id"],
+                            "email": acct.get("email", ""),
+                            "label": format_account_label(acct),
+                            "5h": acct.get("cached_usage_5h"),
+                            "7d": acct.get("cached_usage_7d"),
+                            "deficit": round(dr["deficit"], 1),
+                            "windows_remaining": round(dr["effective_windows_remaining"], 1),
+                            "urgency_tier": (
+                                "CRITICAL" if dr["effective_windows_remaining"] < 1 else
+                                "HIGH" if dr["effective_windows_remaining"] < 3 else
+                                "MEDIUM" if dr["effective_windows_remaining"] < 5 else
+                                "NORMAL"
+                            ),
+                            "threshold": round(threshold, 1),
+                            "passes": dr["deficit"] > threshold,
+                            "urgency_score": round(urgency, 2),
+                        })
 
                         if urgency > best_urgency:
                             best_urgency = urgency
@@ -697,6 +769,47 @@ async def active_account_poll_loop(app):
                                         active_start=active_start, active_end=active_end,
                                         ws_registry=ws_registry,
                                     )
+                                    _decision_action = "swap"
+                                    _decision_target_id = target["id"]
+                                    _decision_reason = reason
+                                    _proactive_target_id = target["id"]
+
+            # Record decision in the log
+            if active_acct is not None:
+                try:
+                    _tick_detail = _build_tick_detail(
+                        active_acct=active_acct,
+                        usage_5h=usage_5h,
+                        usage_7d=usage_7d,
+                        want_swap=want_swap,
+                        suppression=_suppression,
+                        escape_override=escape_override if 'escape_override' in dir() else False,
+                        candidates=_candidate_summaries,
+                        proactive_target_id=_proactive_target_id,
+                        cooldown_active=(time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS,
+                        decision=_decision_action,
+                    )
+                    db.record_decision(
+                        account_id=active_acct_id,
+                        action=_decision_action,
+                        trigger=(
+                            ("proactive_7d" if _proactive_target_id else "auto_swap")
+                            if _decision_action == "swap"
+                            else "tick"
+                        ),
+                        target_id=_decision_target_id,
+                        reason=_decision_reason or "no trigger",
+                        detail=_tick_detail,
+                    )
+                except Exception:
+                    logger.debug("Failed to record decision", exc_info=True)
+
+            # Periodic prune (~1% of ticks)
+            if random.random() < 0.01:
+                try:
+                    db.prune_decision_log()
+                except Exception:
+                    pass
 
         except asyncio.CancelledError:
             logger.info("Active account poll loop cancelled — shutting down")
