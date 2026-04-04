@@ -325,7 +325,11 @@ async def active_account_poll_loop(app):
                     threshold_7d=threshold_7d,
                     burn_rate=br,
                     check_interval_min=check_interval / 60,
-                    # No reset params → no suppression
+                    # No reset params → no reset suppression
+                    # But keep account + active hours for deficit suppression
+                    account=active_acct,
+                    active_start=active_start,
+                    active_end=active_end,
                 )
                 if would_swap_without_suppress:
                     escape_override = True

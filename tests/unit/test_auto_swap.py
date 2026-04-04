@@ -502,6 +502,27 @@ class TestShouldSwapDeficitAware:
         """No account dict = backward compat, fire 7d trigger normally."""
         assert should_swap(usage_5h=50, usage_7d=90) is True
 
+    def test_deficit_suppression_preserved_without_reset_params(self):
+        """Removing reset params should NOT also remove deficit suppression.
+
+        This simulates the escape hatch: it strips resets_5h_at/resets_7d_at
+        but should still pass account for deficit awareness.
+        """
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        acct = _acct(1, usage_5h=50, usage_7d=85)
+        acct["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(hours=12)
+        ).isoformat()
+        acct["usage_cached_at"] = int(_time.time()) - 60
+
+        assert should_swap(
+            usage_5h=50, usage_7d=85,
+            account=acct,
+            active_start="07:00", active_end="22:00",
+        ) is False
+
     def test_5h_critical_still_fires_regardless_of_deficit(self):
         """5h critical trigger fires even if account has deficit (5h is immediate risk)."""
         from datetime import datetime, timezone, timedelta
