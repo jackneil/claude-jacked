@@ -164,3 +164,17 @@ async def get_swap_log(request: Request, limit: int = Query(default=50, ge=1, le
     if db is None:
         return []
     return db.list_swaps(limit=limit)
+
+
+@router.get("/decision-log")
+async def get_decision_log(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=1000),
+    action: list[str] = Query(default=[]),
+):
+    """Get recent decision log entries with optional action filter."""
+    db = _get_db(request)
+    if db is None:
+        return []
+    actions = action if action else None
+    return db.list_decisions(limit=limit, actions=actions)
