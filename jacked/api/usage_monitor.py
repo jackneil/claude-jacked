@@ -739,6 +739,20 @@ async def active_account_poll_loop(app):
                             if (acct.get("consecutive_failures") or 0) >= 3:
                                 continue
 
+                            # Skip accounts without viable headroom —
+                            # swapping to an account that'll exhaust in
+                            # minutes is worse than not swapping at all.
+                            from jacked.web.auto_swap import has_viable_headroom
+                            if not has_viable_headroom(acct, active_start, active_end):
+                                _candidate_summaries.append({
+                                    "id": acct["id"],
+                                    "email": acct.get("email", ""),
+                                    "7d": acct.get("cached_usage_7d"),
+                                    "passes": False,
+                                    "skip_reason": "near_exhaustion",
+                                })
+                                continue
+
                             dr = compute_7d_deficit(acct, active_start, active_end)
                             if not dr:
                                 continue
@@ -778,6 +792,21 @@ async def active_account_poll_loop(app):
                                 dr["unused_7d"],
                                 dr["effective_windows_remaining"] * burn,
                             )
+
+                            # Skip if recoverable < one window's burn —
+                            # not worth the disruption of swapping for scraps.
+                            if recoverable < burn:
+                                _candidate_summaries.append({
+                                    "id": acct["id"],
+                                    "email": acct.get("email", ""),
+                                    "7d": acct.get("cached_usage_7d"),
+                                    "deficit": round(dr["deficit"], 1),
+                                    "recoverable": round(recoverable, 1),
+                                    "passes": False,
+                                    "skip_reason": "recoverable_too_low",
+                                })
+                                continue
+
                             urgency = recoverable / max(dr["effective_hours_remaining"], 0.5)
 
                             _candidate_summaries.append({
