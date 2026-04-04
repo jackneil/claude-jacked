@@ -358,6 +358,17 @@ CREATE TABLE IF NOT EXISTS swap_log (
     to_7d_usage REAL
 );
 
+CREATE TABLE IF NOT EXISTS decision_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    account_id INTEGER,
+    action TEXT NOT NULL,
+    trigger TEXT,
+    target_id INTEGER,
+    reason TEXT,
+    detail TEXT
+);
+
 """
 
 INDEXES_SQL = """
@@ -379,6 +390,8 @@ CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_account ON session_accounts(account_id);
 CREATE INDEX IF NOT EXISTS idx_sa_active ON session_accounts(ended_at, last_activity_at, detected_at);
 CREATE INDEX IF NOT EXISTS idx_swap_log_ts ON swap_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_decision_log_timestamp ON decision_log(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_log_action ON decision_log(action);
 """
 
 
@@ -2565,3 +2578,60 @@ class Database:
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def record_decision(
+        self,
+        account_id: int | None,
+        action: str,
+        trigger: str | None = None,
+        target_id: int | None = None,
+        reason: str | None = None,
+        detail: dict | None = None,
+    ):
+        """Record a swap decision (stay, swap, or manual_switch)."""
+        import json as _json
+        detail_str = _json.dumps(detail) if detail else None
+        with self._writer() as conn:
+            conn.execute(
+                """INSERT INTO decision_log
+                   (account_id, action, trigger, target_id, reason, detail)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (account_id, action, trigger, target_id, reason, detail_str),
+            )
+
+    def list_decisions(self, limit: int = 100, actions: list[str] | None = None) -> list[dict]:
+        """List recent decision log entries, newest first."""
+        import json as _json
+        with self._reader() as conn:
+            if actions:
+                placeholders = ",".join("?" for _ in actions)
+                rows = conn.execute(
+                    f"""SELECT * FROM decision_log
+                        WHERE action IN ({placeholders})
+                        ORDER BY timestamp DESC LIMIT ?""",
+                    (*actions, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM decision_log
+                       ORDER BY timestamp DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                if d.get("detail"):
+                    try:
+                        d["detail"] = _json.loads(d["detail"])
+                    except (ValueError, TypeError):
+                        pass
+                result.append(d)
+            return result
+
+    def prune_decision_log(self, days: int = 7):
+        """Delete decision log entries older than the given number of days."""
+        with self._writer() as conn:
+            conn.execute(
+                "DELETE FROM decision_log WHERE timestamp < datetime('now', ?)",
+                (f"-{days} days",),
+            )
