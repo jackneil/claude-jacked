@@ -874,6 +874,37 @@ class TestComputeUrgencyThreshold:
         # 8h/day → burn = 100/(7*8/5) = 100/11.2 ≈ 8.9%
         assert 8.0 < threshold < 10.0
 
+    def test_account1_scenario_triggers(self):
+        """Real scenario: 86% 7d, 5.7h remaining = 1.14 windows.
+
+        Deficit ~9.2%, urgency threshold for 1.14 windows (HIGH tier) ~4.2%.
+        9.2% > 4.2% → should trigger.
+        """
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        acct = {
+            "email": "jack@jackmd.com",
+            "cached_usage_7d": 86.0,
+            "cached_7d_resets_at": (
+                datetime.now(timezone.utc) + timedelta(hours=5, minutes=42)
+            ).isoformat(),
+            "usage_cached_at": int(_time.time()) - 60,
+        }
+        deficit = compute_7d_deficit(acct, "06:00", "23:00")
+        assert deficit is not None
+        assert deficit["deficit"] > 0
+        assert deficit["effective_windows_remaining"] < 3.0
+
+        threshold = compute_urgency_threshold(
+            deficit["effective_windows_remaining"],
+            "06:00", "23:00",
+        )
+        assert deficit["deficit"] > threshold, (
+            f"deficit {deficit['deficit']:.1f}% should exceed threshold "
+            f"{threshold:.1f}% at {deficit['effective_windows_remaining']:.1f} windows"
+        )
+
 
 # ---------------------------------------------------------------------------
 # format_account_label
