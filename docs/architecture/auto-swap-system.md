@@ -74,12 +74,15 @@ This drives proactive rotation throughout the week, not just at the end.
    b. If no defensive trigger but best candidate has high 7d deficit
       AND active account is comfortable → proactive swap (uses same pick_best_target)
    c. Otherwise → stay
-6. Execute swap if decided:
-   a. Fetch fresh usage for target (on-demand)
-   b. Reconcile outgoing credentials
-   c. Record swap with reason
-   d. Sync credentials to all stores
-   e. Broadcast via WebSocket
+6. Execute swap if decided (via `_execute_swap` helper):
+   a. Fetch fresh usage for target (on-demand, done by caller before execute)
+   b. TOCTOU guard — re-read active account ID, abort if changed
+   c. Record swap with reason + arm cooldown (audit trail survives credential failure)
+   d. Reconcile outgoing credentials (capture token rotation)
+   e. Sync credentials to all stores under cross-process lock
+   f. Clean up burn-rate state for both accounts
+   g. Broadcast via WebSocket (includes org-aware `from_label`/`to_label`)
+   h. If credential write failed, reset cooldown so next tick retries immediately
 ```
 
 ## Swap Triggers
@@ -143,7 +146,7 @@ The active account is polled at an interval determined by urgency:
 
 ### 429 Recovery
 1. **Token refresh:** Rate limits are per-access-token. Exchange refresh token for fresh access token (clears the rate limit). Uses cross-process lock compatible with Claude Code's `proper-lockfile`.
-2. **Escalating backoff:** 65s → 130s → 260s → cap 900s on consecutive 429s
+2. **Escalating backoff:** 65s → 130s → 260s → 520s → cap 900s on consecutive 429s
 3. **Tier override:** After 3+ consecutive 429s, force idle tier
 
 ### Cross-Process Locking
@@ -180,8 +183,8 @@ Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT f
 ## Dashboard Integration
 
 ### WebSocket Events
-- `usage_poll_updated` — after each active poll, push fresh account data
-- `auto_swap_triggered` — persistent banner with reason (5 min, dismissible)
+- `usage_poll_updated` — after each active poll, push fresh account data (whitelisted via `_WS_SAFE_FIELDS` — new DB columns don't leak by default)
+- `auto_swap_triggered` — persistent banner with reason (5 min, dismissible). Includes `from_label`/`to_label` with org-aware account names.
 - `all_accounts_exhausted` — exhaustion banner with recovery estimate
 
 ### Countdown Timer
@@ -191,8 +194,9 @@ Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT f
 
 ### Swap History
 - Always-visible section at bottom of accounts page
-- Shows timestamp, from→to emails, reason
-- Backend JOINs account emails into swap_log query
+- Shows timestamp, from→to with org-aware labels, reason
+- Backend JOINs account emails, org_name, and display_name into swap_log query
+- `format_account_label` (Python + JS): shows `email (org)` or `Label — email (org)`. Personal orgs (`*'s Organization`) display as `(personal)`.
 
 ## Files
 
