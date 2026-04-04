@@ -9,6 +9,7 @@ from jacked.web.auto_swap import (
     _resets_within,
     compute_7d_deficit,
     compute_effective_working_hours,
+    format_account_label,
     pick_best_target,
     score_candidate,
     should_swap,
@@ -779,3 +780,51 @@ class TestCompute7dDeficit:
         assert "unused_7d" in result
         assert result["effective_hours_remaining"] > 0
         assert result["unused_7d"] == 70.0
+
+
+# ---------------------------------------------------------------------------
+# format_account_label
+# ---------------------------------------------------------------------------
+
+class TestFormatAccountLabel:
+    def test_personal_org(self):
+        """Personal org (ends with 's Organization') shows as (personal)."""
+        acct = {"email": "jack@jackmd.com", "organization_name": "jack@jackmd.com's Organization", "display_name": "Jack"}
+        assert format_account_label(acct) == "jack@jackmd.com (personal)"
+
+    def test_real_org(self):
+        """Real org name is shown in parens."""
+        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Jack"}
+        assert format_account_label(acct) == "jack.neil@hank.ai (Hank.ai)"
+
+    def test_custom_label_prepended(self):
+        """User-set display_name that differs from default is prepended."""
+        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Hank Team"}
+        assert format_account_label(acct) == "Hank Team — jack.neil@hank.ai (Hank.ai)"
+
+    def test_default_display_name_not_shown(self):
+        """Default display_name (just first name) is NOT prepended."""
+        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Jack"}
+        result = format_account_label(acct)
+        assert not result.startswith("Jack —")
+        assert result == "jack.neil@hank.ai (Hank.ai)"
+
+    def test_no_org_name(self):
+        """Missing org_name shows just email."""
+        acct = {"email": "user@test.com", "organization_name": None, "display_name": None}
+        assert format_account_label(acct) == "user@test.com"
+
+    def test_empty_org_name(self):
+        """Empty string org_name shows just email."""
+        acct = {"email": "user@test.com", "organization_name": "", "display_name": None}
+        assert format_account_label(acct) == "user@test.com"
+
+    def test_no_display_name(self):
+        """None display_name is fine — just email + org."""
+        acct = {"email": "jack@test.com", "organization_name": "Acme Corp", "display_name": None}
+        assert format_account_label(acct) == "jack@test.com (Acme Corp)"
+
+    def test_display_name_empty_string(self):
+        """Empty string display_name is treated as no label."""
+        acct = {"email": "jack@test.com", "organization_name": "Acme Corp", "display_name": ""}
+        assert format_account_label(acct) == "jack@test.com (Acme Corp)"

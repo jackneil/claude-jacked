@@ -37,6 +37,39 @@ def tier_label(account: dict) -> str:
     return f" (tier {match.group(1)}x)" if match else ""
 
 
+def format_account_label(account: dict) -> str:
+    """Human-readable account label for swap notifications and logs.
+
+    Format: [Label — ] email [(org)]
+    - Personal orgs (ending "'s Organization") show as "(personal)"
+    - Real org names shown as-is: "(Hank.ai)"
+    - Custom display_name prepended only if it differs from the default
+      (default = first name matching email prefix, or generic names)
+    """
+    email = account.get("email") or "unknown"
+    org_name = account.get("organization_name") or ""
+    display_name = (account.get("display_name") or "").strip()
+
+    # Build org suffix
+    org_suffix = ""
+    if org_name:
+        if org_name.endswith("\u2019s Organization") or org_name.endswith("'s Organization"):
+            org_suffix = " (personal)"
+        else:
+            org_suffix = f" ({org_name})"
+
+    # Check if display_name is custom (not the Anthropic default)
+    label_prefix = ""
+    if display_name:
+        # Default display_name is typically the first name from the email
+        # e.g. "Jack" for jack.neil@hank.ai. Don't show these.
+        email_prefix = email.split("@")[0].split(".")[0].lower()
+        if display_name.lower() != email_prefix and display_name.lower() != "user":
+            label_prefix = f"{display_name} \u2014 "
+
+    return f"{label_prefix}{email}{org_suffix}"
+
+
 def tier_critical_threshold(account: dict) -> float:
     """Compute the auto-swap critical threshold based on account tier.
 
