@@ -248,15 +248,23 @@ async def active_account_poll_loop(app):
             # countdown timer and usage bars update immediately.
             _ws = getattr(app.state, "ws_registry", None)
             if _ws and active_acct:
-                # Strip sensitive fields before broadcasting — the raw DB row
-                # includes OAuth tokens that must never reach WebSocket clients.
-                _SENSITIVE_FIELDS = {
-                    "access_token", "refresh_token",
-                    "cc_access_token", "cc_refresh_token",
+                # Whitelist safe fields — new DB columns won't leak by default.
+                # Mirrors _account_to_response in routes/auth.py.
+                _WS_SAFE_FIELDS = {
+                    "id", "email", "organization_uuid", "organization_name",
+                    "display_name", "expires_at", "scopes",
+                    "subscription_type", "rate_limit_tier", "has_extra_usage",
+                    "priority", "is_active", "is_deleted",
+                    "last_used_at", "cached_usage_5h", "cached_usage_7d",
+                    "cached_5h_resets_at", "cached_7d_resets_at",
+                    "usage_cached_at", "last_error", "last_error_at",
+                    "consecutive_failures", "last_validated_at",
+                    "validation_status", "created_at", "updated_at",
+                    "cc_expires_at", "auto_swap_enabled",
                 }
                 safe_acct = {
                     k: v for k, v in active_acct.items()
-                    if k not in _SENSITIVE_FIELDS
+                    if k in _WS_SAFE_FIELDS
                 }
                 await _ws.broadcast(
                     "usage_poll_updated",
