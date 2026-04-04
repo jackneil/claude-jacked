@@ -229,6 +229,9 @@ def should_swap(
     resets_5h_at: str | None = None,
     resets_7d_at: str | None = None,
     usage_cached_at: int | None = None,
+    account: dict | None = None,
+    active_start: str = "07:00",
+    active_end: str = "22:00",
 ) -> bool:
     """Decide whether the current account should be swapped out.
 
@@ -238,6 +241,10 @@ def should_swap(
     Suppresses all three swap triggers when the relevant window resets
     within ``RESET_SUPPRESS_MINUTES``.  Also suppresses when usage data
     is stale (predates a reset that already happened).
+
+    Suppresses the 7d trigger when *account* has a positive deficit
+    (behind schedule) — the proactive scheduler intentionally placed
+    us here to burn capacity, so swapping away would cause ping-pong.
     """
     if usage_5h is None:
         return False
@@ -262,9 +269,21 @@ def should_swap(
     if usage_5h >= critical_5h and not suppress_5h:
         return True
 
-    # 7-day saturation (unless 7d reset imminent).
+    # 7-day saturation (unless 7d reset imminent OR we're burning deficit).
     if usage_7d is not None and usage_7d >= threshold_7d and not suppress_7d:
-        return True
+        # If account has a positive deficit, we're here to burn capacity — stay.
+        if account is not None:
+            deficit_result = compute_7d_deficit(account, active_start, active_end)
+            if deficit_result and deficit_result["deficit"] > 0:
+                logger.debug(
+                    "should_swap: suppressing 7d trigger on deficit account "
+                    "(usage_7d=%.1f%%, deficit=%.1f%%)",
+                    usage_7d, deficit_result["deficit"],
+                )
+            else:
+                return True
+        else:
+            return True
 
     # Warning zone + burn-rate projection (unless 5h reset imminent).
     if usage_5h >= warning_5h and burn_rate is not None and not suppress_5h:

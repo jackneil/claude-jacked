@@ -457,6 +457,69 @@ class TestScoreDeficitBonus:
 
 
 # ---------------------------------------------------------------------------
+# should_swap — deficit-aware 7d suppression (anti-ping-pong)
+# ---------------------------------------------------------------------------
+
+class TestShouldSwapDeficitAware:
+    def test_suppress_7d_trigger_when_account_has_deficit(self):
+        """Account at 85% 7d but with positive deficit -> DON'T swap away."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        # Account behind schedule: 85% usage, 93% through window, deficit ~8%
+        acct = _acct(1, usage_5h=50, usage_7d=85)
+        acct["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(hours=12)
+        ).isoformat()
+        acct["usage_cached_at"] = int(_time.time()) - 60
+
+        assert should_swap(
+            usage_5h=50, usage_7d=85,
+            account=acct,
+            active_start="07:00", active_end="22:00",
+        ) is False
+
+    def test_fire_7d_trigger_when_account_ahead_of_schedule(self):
+        """Account at 90% 7d, ahead of schedule -> swap away (normal behavior)."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        # Ahead of schedule: 90% usage, 29% through window, deficit = -61%
+        acct = _acct(1, usage_5h=50, usage_7d=90)
+        acct["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=5)
+        ).isoformat()
+        acct["usage_cached_at"] = int(_time.time()) - 60
+
+        assert should_swap(
+            usage_5h=50, usage_7d=90,
+            account=acct,
+            active_start="07:00", active_end="22:00",
+        ) is True
+
+    def test_fire_7d_trigger_when_no_account_provided(self):
+        """No account dict = backward compat, fire 7d trigger normally."""
+        assert should_swap(usage_5h=50, usage_7d=90) is True
+
+    def test_5h_critical_still_fires_regardless_of_deficit(self):
+        """5h critical trigger fires even if account has deficit (5h is immediate risk)."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        acct = _acct(1, usage_5h=95, usage_7d=85)
+        acct["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(hours=12)
+        ).isoformat()
+        acct["usage_cached_at"] = int(_time.time()) - 60
+
+        assert should_swap(
+            usage_5h=95, usage_7d=85,
+            account=acct,
+            active_start="07:00", active_end="22:00",
+        ) is True
+
+
+# ---------------------------------------------------------------------------
 # pick_best_target — relax 7d filter for imminent resets
 # ---------------------------------------------------------------------------
 
