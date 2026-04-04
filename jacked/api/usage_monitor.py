@@ -312,14 +312,21 @@ async def active_account_poll_loop(app):
 
             global _initial_fetch_done
             if not _initial_fetch_done:
-                _initial_fetch_done = True
                 from jacked.web.auth import fetch_usage as _prime_fetch
                 logger.info("Auto-swap: priming usage data for all accounts")
                 all_accts = db.list_accounts(include_inactive=False)
+                primed = 0
                 for a in all_accts:
                     if a["id"] != active_acct_id:
-                        await _prime_fetch(a["id"], db)
+                        try:
+                            await _prime_fetch(a["id"], db)
+                            primed += 1
+                        except Exception:
+                            logger.debug("Prime fetch failed for account %d", a["id"])
                         await asyncio.sleep(1)
+                if primed > 0:
+                    _initial_fetch_done = True
+                    logger.info("Auto-swap: primed %d/%d accounts", primed, len(all_accts) - 1)
 
             # -- Fetch usage (fresh token, bypasses cache) ---------------
             effective_token = read_fresh_active_token(active_acct_id)
@@ -532,8 +539,7 @@ async def active_account_poll_loop(app):
                         ws_registry=ws_registry,
                     )
                 else:
-                    # Fetch fresh data for recovery estimate
-                    accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
+                    # accounts already fetched before pick_best_target — reuse
 
                     # No eligible target — cooldown to avoid log spam
                     now_ts = time.time()
@@ -591,6 +597,11 @@ async def active_account_poll_loop(app):
                         active_start=active_start,
                         active_end=active_end,
                     )
+
+                    if not target:
+                        logger.debug("Proactive: no eligible target found")
+                    elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
+                        logger.debug("Proactive: target found but cooldown active")
 
                     if target and (time.time() - _last_swap_time) >= _SWAP_COOLDOWN_SECONDS:
                         deficit_result = compute_7d_deficit(target, active_start, active_end)
