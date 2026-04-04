@@ -116,19 +116,33 @@ def _compute_poll_interval(
         return 60.0, "unknown"
 
 
-async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> list:
-    """Fetch fresh usage for all non-active candidate accounts.
+_CANDIDATE_STALENESS_SECONDS = 600  # 10 minutes — non-active accounts rarely change
 
-    Called on-demand when a swap decision needs current data.
+
+async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> list:
+    """Fetch fresh usage for non-active candidate accounts with stale data.
+
+    Only fetches accounts whose usage_cached_at is older than
+    _CANDIDATE_STALENESS_SECONDS. Non-active accounts rarely change,
+    so there's no need to hit the API every tick.
     Returns the refreshed accounts list from DB.
     """
     from jacked.web.auth import fetch_usage
 
+    now = int(time.time())
+    fetched = 0
     for acct in accounts:
         if acct["id"] == active_acct_id:
             continue
+        cached_at = acct.get("usage_cached_at")
+        if cached_at and (now - int(cached_at)) < _CANDIDATE_STALENESS_SECONDS:
+            continue  # data is fresh enough
         await fetch_usage(acct["id"], db)
+        fetched += 1
         await asyncio.sleep(1)
+
+    if fetched:
+        logger.debug("Candidate usage: refreshed %d stale accounts", fetched)
 
     return db.list_accounts(include_inactive=False)
 
