@@ -536,10 +536,28 @@ async def active_account_poll_loop(app):
                 if target is not None:
                     # -- Swap cooldown: prevent ping-ponging ------
                     if (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
-                        logger.debug(
-                            "Active poll: swap cooldown active (%.0fs remaining)",
-                            _SWAP_COOLDOWN_SECONDS - (time.time() - _last_swap_time),
+                        _decision_reason = (
+                            f"swap needed but cooldown active "
+                            f"({_SWAP_COOLDOWN_SECONDS - (time.time() - _last_swap_time):.0f}s remaining)"
                         )
+                        logger.debug("Active poll: %s", _decision_reason)
+                        try:
+                            _tick_detail = _build_tick_detail(
+                                active_acct=active_acct,
+                                usage_5h=usage_5h, usage_7d=usage_7d,
+                                want_swap=want_swap, suppression=_suppression,
+                                escape_override=escape_override,
+                                candidates=_candidate_summaries,
+                                proactive_target_id=None,
+                                cooldown_active=True, decision="stay",
+                            )
+                            db.record_decision(
+                                account_id=active_acct_id, action="stay",
+                                trigger="tick", target_id=target["id"],
+                                reason=_decision_reason, detail=_tick_detail,
+                            )
+                        except Exception:
+                            pass
                         await asyncio.sleep(60)
                         continue
 
