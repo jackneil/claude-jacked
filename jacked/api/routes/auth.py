@@ -867,6 +867,18 @@ async def use_account(account_id: int, request: Request):
         display_name=account.get("display_name"),
     )
 
+    try:
+        db.record_decision(
+            account_id=account_id,
+            action="manual_switch",
+            trigger="manual",
+            target_id=account_id,
+            reason="user selected via dashboard",
+            detail={"source": "dashboard", "previous_account_id": outgoing_id},
+        )
+    except Exception:
+        pass
+
     return UseAccountResponse(
         status="active",
         email=account.get("email", ""),
