@@ -11,6 +11,7 @@ from jacked.web.auto_swap import (
     compute_effective_working_hours,
     compute_urgency_threshold,
     format_account_label,
+    has_viable_headroom,
     pick_best_target,
     score_candidate,
     should_swap,
@@ -802,6 +803,65 @@ class TestCompute7dDeficit:
         assert "unused_7d" in result
         assert result["effective_hours_remaining"] > 0
         assert result["unused_7d"] == 70.0
+
+
+# ---------------------------------------------------------------------------
+# has_viable_headroom
+# ---------------------------------------------------------------------------
+
+class TestHasViableHeadroom:
+    def test_plenty_of_headroom(self):
+        """Account at 50% 7d has plenty of headroom."""
+        acct = {"cached_usage_7d": 50.0}
+        assert has_viable_headroom(acct) is True
+
+    def test_near_exhaustion_rejected(self):
+        """Account at 98% 7d has only 2% unused < 4.2% burn → rejected."""
+        acct = {"cached_usage_7d": 98.0}
+        assert has_viable_headroom(acct) is False
+
+    def test_just_above_burn_threshold(self):
+        """Account with unused just above burn_per_window is viable."""
+        # burn_per_window ≈ 4.2017% with default 06:00-23:00
+        # 95% 7d → 5% unused > 4.2017% → viable
+        acct = {"cached_usage_7d": 95.0}
+        assert has_viable_headroom(acct) is True
+
+    def test_just_below_burn_threshold(self):
+        """Account with unused < burn_per_window is not viable."""
+        # 96% 7d → 4% unused < 4.2017% → not viable
+        acct = {"cached_usage_7d": 96.0}
+        assert has_viable_headroom(acct) is False
+
+    def test_none_usage_treated_as_zero(self):
+        """None usage = 0% used = 100% headroom → viable."""
+        acct = {"cached_usage_7d": None}
+        assert has_viable_headroom(acct) is True
+
+    def test_narrow_active_hours_higher_burn(self):
+        """Narrow active hours (09:00-17:00) = higher burn per window = stricter."""
+        acct = {"cached_usage_7d": 93.0}
+        assert has_viable_headroom(acct, active_start="09:00", active_end="17:00") is False
+
+    def test_pick_best_target_excludes_near_exhausted(self):
+        """pick_best_target should NOT return an account at 98% 7d even via urgency."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        accounts = [
+            _acct(1, usage_5h=90),
+            _acct(2, usage_5h=0, usage_7d=98),
+        ]
+        accounts[1]["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(hours=2)
+        ).isoformat()
+        accounts[1]["usage_cached_at"] = int(_time.time()) - 60
+
+        result = pick_best_target(
+            accounts, current_id=1,
+            active_start="06:00", active_end="23:00",
+        )
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

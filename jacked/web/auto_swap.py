@@ -193,6 +193,23 @@ def compute_burn_per_window(active_start: str = "06:00", active_end: str = "23:0
     return 100.0 / windows_per_week
 
 
+def has_viable_headroom(
+    account: dict,
+    active_start: str = "06:00",
+    active_end: str = "23:00",
+) -> bool:
+    """Check if an account has enough 7d headroom to survive one 5h window.
+
+    Returns False if unused 7d capacity < burn_per_window. Swapping to
+    an account that can't even fill one window is pointless and risks
+    immediate exhaustion.
+    """
+    usage_7d = account.get("cached_usage_7d") or 0
+    unused = 100.0 - usage_7d
+    burn = compute_burn_per_window(active_start, active_end)
+    return unused >= burn
+
+
 def compute_urgency_threshold(
     effective_windows_remaining: float,
     active_start: str = "06:00",
@@ -533,6 +550,7 @@ def pick_best_target(
         and a.get("validation_status") != "invalid"
         and a.get("cc_access_token") is not None
         and a.get("auto_swap_enabled") != 0
+        and has_viable_headroom(a, active_start, active_end)
         and _passes_7d_filter(a)
     ]
 
