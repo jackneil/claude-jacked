@@ -248,11 +248,21 @@ async def active_account_poll_loop(app):
             # countdown timer and usage bars update immediately.
             _ws = getattr(app.state, "ws_registry", None)
             if _ws and active_acct:
+                # Strip sensitive fields before broadcasting — the raw DB row
+                # includes OAuth tokens that must never reach WebSocket clients.
+                _SENSITIVE_FIELDS = {
+                    "access_token", "refresh_token",
+                    "cc_access_token", "cc_refresh_token",
+                }
+                safe_acct = {
+                    k: v for k, v in active_acct.items()
+                    if k not in _SENSITIVE_FIELDS
+                }
                 await _ws.broadcast(
                     "usage_poll_updated",
                     {
                         "account_id": active_acct_id,
-                        "account_data": active_acct,
+                        "account_data": safe_acct,
                     },
                 )
 
