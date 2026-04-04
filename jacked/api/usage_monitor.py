@@ -182,6 +182,8 @@ async def active_account_poll_loop(app):
             warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
             threshold_7d = _setting_float(db, "auto_swap_7d_threshold", 85)
             check_interval = _setting_float(db, "usage_check_interval", 300)
+            active_start = _setting_str(db, "window_keeper_active_start", "07:00")
+            active_end = _setting_str(db, "window_keeper_active_end", "22:00")
 
             # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
@@ -298,6 +300,9 @@ async def active_account_poll_loop(app):
                 resets_5h_at=active_acct.get("cached_5h_resets_at"),
                 resets_7d_at=active_acct.get("cached_7d_resets_at"),
                 usage_cached_at=active_acct.get("usage_cached_at"),
+                account=active_acct,
+                active_start=active_start,
+                active_end=active_end,
             )
 
             # -- Escape hatch: override reset suppression if a clearly
@@ -331,11 +336,13 @@ async def active_account_poll_loop(app):
                 target = pick_best_target(
                     accounts, current_id=active_acct_id,
                     threshold_7d=threshold_7d,
+                    active_start=active_start,
+                    active_end=active_end,
                 )
 
                 # For escape hatch, verify candidate is good enough
                 if escape_override and not want_swap and target:
-                    target_score = score_candidate(target)
+                    target_score = score_candidate(target, active_start, active_end)
                     if target_score <= SUPPRESS_OVERRIDE_SCORE:
                         logger.debug(
                             "Escape hatch: candidate %d scores %.0f "
@@ -374,7 +381,7 @@ async def active_account_poll_loop(app):
                     if escape_override and not want_swap:
                         reason = (
                             f"escape hatch: suppressed swap overridden — "
-                            f"target scores {score_candidate(target):.0f}"
+                            f"target scores {score_candidate(target, active_start, active_end):.0f}"
                         )
                     elif usage_5h is not None and usage_5h >= effective_critical:
                         tier_lbl = _tier_label(active_acct)
@@ -495,40 +502,39 @@ async def active_account_poll_loop(app):
             # -- Proactive 7d capacity scheduler ---------------------------
             if not want_swap and not escape_override:
                 from jacked.web.auto_swap import compute_7d_deficit, PROACTIVE_SWAP_THRESHOLD
-                _wk_start = _setting_str(db, "window_keeper_active_start", "07:00")
-                _wk_end = _setting_str(db, "window_keeper_active_end", "22:00")
 
                 if usage_5h is not None and usage_5h < warning_5h:
-                    best_deficit_acct = None
-                    best_deficit = 0.0
-                    best_deficit_result = None
+                    # Fetch fresh candidate data for proactive evaluation
+                    accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
 
-                    for acct in accounts:
-                        if acct["id"] == active_acct_id:
-                            continue
-                        result = compute_7d_deficit(acct, _wk_start, _wk_end)
-                        if result and result["deficit"] > best_deficit:
-                            best_deficit = result["deficit"]
-                            best_deficit_acct = acct
-                            best_deficit_result = result
+                    target = pick_best_target(
+                        accounts, current_id=active_acct_id,
+                        threshold_7d=threshold_7d,
+                        active_start=active_start,
+                        active_end=active_end,
+                    )
 
-                    if best_deficit_acct and best_deficit > PROACTIVE_SWAP_THRESHOLD:
-                        if (time.time() - _last_swap_time) >= _SWAP_COOLDOWN_SECONDS:
-                            # Fetch fresh usage for the target
-                            await fetch_usage(best_deficit_acct["id"], db)
-                            best_deficit_acct = db.get_account(best_deficit_acct["id"])
+                    if target and (time.time() - _last_swap_time) >= _SWAP_COOLDOWN_SECONDS:
+                        deficit_result = compute_7d_deficit(target, active_start, active_end)
+                        if deficit_result and deficit_result["deficit"] > PROACTIVE_SWAP_THRESHOLD:
+                            # Fetch one more time for the specific target
+                            await fetch_usage(target["id"], db)
+                            target = db.get_account(target["id"])
 
-                            if best_deficit_acct:
+                            if target:
                                 reason = (
-                                    f"proactive: burning {best_deficit_result['unused_7d']:.0f}% "
-                                    f"unused 7d on {best_deficit_acct.get('email', '?')} — "
-                                    f"{best_deficit_result['effective_hours_remaining']:.0f} "
+                                    f"proactive: burning {deficit_result['unused_7d']:.0f}% "
+                                    f"unused 7d on {target.get('email', '?')} — "
+                                    f"{deficit_result['effective_hours_remaining']:.0f} "
                                     f"effective hours left "
-                                    f"({best_deficit_result['effective_windows_remaining']:.1f} windows)"
+                                    f"({deficit_result['effective_windows_remaining']:.1f} windows), "
+                                    f"score={score_candidate(target, active_start, active_end):.0f}"
                                 )
                                 logger.info(
-                                    "Proactive swap: account %d is %.0f%% behind 7d schedule",
-                                    best_deficit_acct["id"], best_deficit,
+                                    "Proactive swap: account %d is %.0f%% behind 7d schedule "
+                                    "(score=%.0f)",
+                                    target["id"], deficit_result["deficit"],
+                                    score_candidate(target, active_start, active_end),
                                 )
 
                                 from jacked.api.credential_helpers import (
@@ -540,23 +546,23 @@ async def active_account_poll_loop(app):
                                 _last_swap_time = time.time()
                                 db.record_swap(
                                     from_account_id=active_acct_id,
-                                    to_account_id=best_deficit_acct["id"],
+                                    to_account_id=target["id"],
                                     reason=reason,
                                     trigger="proactive_7d",
                                     from_5h=usage_5h,
                                     from_7d=usage_7d,
-                                    to_5h=best_deficit_acct.get("cached_usage_5h"),
-                                    to_7d=best_deficit_acct.get("cached_usage_7d"),
+                                    to_5h=target.get("cached_usage_5h"),
+                                    to_7d=target.get("cached_usage_7d"),
                                 )
                                 sync_credential_to_all_stores(
-                                    best_deficit_acct["id"], best_deficit_acct,
-                                    email=best_deficit_acct.get("email"),
+                                    target["id"], target,
+                                    email=target.get("email"),
                                 )
 
                                 _burn_rates.pop(active_acct_id, None)
                                 _burn_rate_unchanged_ticks.pop(active_acct_id, None)
-                                _burn_rates.pop(best_deficit_acct["id"], None)
-                                _burn_rate_unchanged_ticks.pop(best_deficit_acct["id"], None)
+                                _burn_rates.pop(target["id"], None)
+                                _burn_rate_unchanged_ticks.pop(target["id"], None)
 
                                 ws_registry = getattr(app.state, "ws_registry", None)
                                 if ws_registry:
@@ -564,8 +570,8 @@ async def active_account_poll_loop(app):
                                         "auto_swap_triggered",
                                         {
                                             "from_account_id": active_acct_id,
-                                            "to_account_id": best_deficit_acct["id"],
-                                            "to_email": best_deficit_acct.get("email", ""),
+                                            "to_account_id": target["id"],
+                                            "to_email": target.get("email", ""),
                                             "reason": reason,
                                         },
                                     )
