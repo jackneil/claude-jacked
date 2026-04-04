@@ -2548,12 +2548,16 @@ class Database:
             return cursor.lastrowid
 
     def list_swaps(self, limit=50):
-        """List recent swap events with account emails."""
+        """List recent swap events with account emails and org info."""
         with self._reader() as conn:
             rows = conn.execute(
                 """SELECT s.*,
                           fa.email AS from_email,
-                          ta.email AS to_email
+                          fa.organization_name AS from_org_name,
+                          fa.display_name AS from_display_name,
+                          ta.email AS to_email,
+                          ta.organization_name AS to_org_name,
+                          ta.display_name AS to_display_name
                    FROM swap_log s
                    LEFT JOIN accounts fa ON fa.id = s.from_account_id
                    LEFT JOIN accounts ta ON ta.id = s.to_account_id
