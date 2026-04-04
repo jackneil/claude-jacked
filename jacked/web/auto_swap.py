@@ -173,6 +173,9 @@ def compute_effective_working_hours(
 PROACTIVE_SWAP_THRESHOLD = 15.0  # minimum deficit (%) to trigger proactive swap
 URGENCY_HOURS = 24.0  # accounts behind schedule with fewer effective hours remaining
                        # than this pass through the 7d filter for scoring
+MIN_PROACTIVE_MINUTES = 30  # don't proactively swap if fewer than this many
+                             # working minutes remain today — not worth opening
+                             # a 5h window for a few minutes of use
 
 
 def compute_burn_per_window(active_start: str = "06:00", active_end: str = "23:00") -> float:

@@ -685,153 +685,170 @@ async def active_account_poll_loop(app):
                 )
 
                 if usage_5h is not None and usage_5h < warning_5h:
-                    # Fetch fresh candidate data
-                    accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
-
-                    # Scan ALL candidates for urgency — not pick_best_target,
-                    # because the most-urgent account (expiring capacity) may
-                    # not be the highest-scored account overall.
-                    best_urgent = None
-                    best_urgency = 0.0
-                    best_deficit_result = None
-                    _candidate_summaries = []
-
-                    for acct in accounts:
-                        if acct["id"] == active_acct_id:
-                            continue
-                        if not acct.get("cc_access_token"):
-                            continue
-                        if acct.get("auto_swap_enabled") == 0:
-                            continue
-                        if acct.get("is_active") == 0 or acct.get("is_deleted") == 1:
-                            continue
-                        if (acct.get("consecutive_failures") or 0) >= 3:
-                            continue
-
-                        dr = compute_7d_deficit(acct, active_start, active_end)
-                        if not dr:
-                            continue
-                        if dr["deficit"] <= 0:
-                            _candidate_summaries.append({
-                                "id": acct["id"],
-                                "email": acct.get("email", ""),
-                                "7d": acct.get("cached_usage_7d"),
-                                "deficit": round(dr["deficit"], 1),
-                                "windows_remaining": round(dr["effective_windows_remaining"], 1),
-                                "passes": False,
-                                "skip_reason": "ahead_of_schedule",
-                            })
-                            continue
-
-                        # Urgency threshold scales with remaining windows
-                        threshold = compute_urgency_threshold(
-                            dr["effective_windows_remaining"],
-                            active_start, active_end,
-                        )
-                        if dr["deficit"] <= threshold:
-                            _candidate_summaries.append({
-                                "id": acct["id"],
-                                "email": acct.get("email", ""),
-                                "7d": acct.get("cached_usage_7d"),
-                                "deficit": round(dr["deficit"], 1),
-                                "windows_remaining": round(dr["effective_windows_remaining"], 1),
-                                "threshold": round(threshold, 1),
-                                "passes": False,
-                                "skip_reason": "below_threshold",
-                            })
-                            continue
-
-                        # Urgency = recoverable capacity per hour of inaction
-                        burn = compute_burn_per_window(active_start, active_end)
-                        recoverable = min(
-                            dr["unused_7d"],
-                            dr["effective_windows_remaining"] * burn,
-                        )
-                        urgency = recoverable / max(dr["effective_hours_remaining"], 0.5)
-
-                        _candidate_summaries.append({
-                            "id": acct["id"],
-                            "email": acct.get("email", ""),
-                            "label": format_account_label(acct),
-                            "5h": acct.get("cached_usage_5h"),
-                            "7d": acct.get("cached_usage_7d"),
-                            "deficit": round(dr["deficit"], 1),
-                            "windows_remaining": round(dr["effective_windows_remaining"], 1),
-                            "urgency_tier": (
-                                "CRITICAL" if dr["effective_windows_remaining"] < 1 else
-                                "HIGH" if dr["effective_windows_remaining"] < 3 else
-                                "MEDIUM" if dr["effective_windows_remaining"] < 5 else
-                                "NORMAL"
-                            ),
-                            "threshold": round(threshold, 1),
-                            "passes": dr["deficit"] > threshold,
-                            "urgency_score": round(urgency, 2),
-                        })
-
-                        if urgency > best_urgency:
-                            best_urgency = urgency
-                            best_urgent = acct
-                            best_deficit_result = dr
-
-                    if not best_urgent:
-                        logger.debug("Proactive: no urgent candidate found")
-                    elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
+                    # Don't proactively swap near end of active hours —
+                    # not worth opening a 5h window for a few minutes of use
+                    from jacked.web.auto_swap import MIN_PROACTIVE_MINUTES
+                    _now_local = datetime.now()
+                    _end_h, _end_m = map(int, active_end.split(":"))
+                    _active_end_today = _now_local.replace(
+                        hour=_end_h, minute=_end_m, second=0, microsecond=0,
+                    )
+                    _minutes_left_today = (
+                        _active_end_today - _now_local
+                    ).total_seconds() / 60.0
+                    if 0 < _minutes_left_today < MIN_PROACTIVE_MINUTES:
                         logger.debug(
-                            "Proactive: urgent target %d found but cooldown active",
-                            best_urgent["id"],
+                            "Proactive: skipping — only %.0f min until active hours end",
+                            _minutes_left_today,
                         )
                     else:
-                        # Re-fetch fresh data for the target
-                        await fetch_usage(best_urgent["id"], db)
-                        target = db.get_account(best_urgent["id"])
+                        # Fetch fresh candidate data
+                        accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
 
-                        if target:
-                            deficit_result = compute_7d_deficit(target, active_start, active_end)
-                            if not deficit_result or deficit_result["deficit"] <= 0:
-                                logger.debug(
-                                    "Proactive: target %d deficit gone after re-fetch",
-                                    target["id"],
-                                )
-                            else:
-                                # Re-check threshold with fresh data
-                                threshold = compute_urgency_threshold(
-                                    deficit_result["effective_windows_remaining"],
-                                    active_start, active_end,
-                                )
-                                if deficit_result["deficit"] <= threshold:
+                        # Scan ALL candidates for urgency — not pick_best_target,
+                        # because the most-urgent account (expiring capacity) may
+                        # not be the highest-scored account overall.
+                        best_urgent = None
+                        best_urgency = 0.0
+                        best_deficit_result = None
+                        _candidate_summaries = []
+
+                        for acct in accounts:
+                            if acct["id"] == active_acct_id:
+                                continue
+                            if not acct.get("cc_access_token"):
+                                continue
+                            if acct.get("auto_swap_enabled") == 0:
+                                continue
+                            if acct.get("is_active") == 0 or acct.get("is_deleted") == 1:
+                                continue
+                            if (acct.get("consecutive_failures") or 0) >= 3:
+                                continue
+
+                            dr = compute_7d_deficit(acct, active_start, active_end)
+                            if not dr:
+                                continue
+                            if dr["deficit"] <= 0:
+                                _candidate_summaries.append({
+                                    "id": acct["id"],
+                                    "email": acct.get("email", ""),
+                                    "7d": acct.get("cached_usage_7d"),
+                                    "deficit": round(dr["deficit"], 1),
+                                    "windows_remaining": round(dr["effective_windows_remaining"], 1),
+                                    "passes": False,
+                                    "skip_reason": "ahead_of_schedule",
+                                })
+                                continue
+
+                            # Urgency threshold scales with remaining windows
+                            threshold = compute_urgency_threshold(
+                                dr["effective_windows_remaining"],
+                                active_start, active_end,
+                            )
+                            if dr["deficit"] <= threshold:
+                                _candidate_summaries.append({
+                                    "id": acct["id"],
+                                    "email": acct.get("email", ""),
+                                    "7d": acct.get("cached_usage_7d"),
+                                    "deficit": round(dr["deficit"], 1),
+                                    "windows_remaining": round(dr["effective_windows_remaining"], 1),
+                                    "threshold": round(threshold, 1),
+                                    "passes": False,
+                                    "skip_reason": "below_threshold",
+                                })
+                                continue
+
+                            # Urgency = recoverable capacity per hour of inaction
+                            burn = compute_burn_per_window(active_start, active_end)
+                            recoverable = min(
+                                dr["unused_7d"],
+                                dr["effective_windows_remaining"] * burn,
+                            )
+                            urgency = recoverable / max(dr["effective_hours_remaining"], 0.5)
+
+                            _candidate_summaries.append({
+                                "id": acct["id"],
+                                "email": acct.get("email", ""),
+                                "label": format_account_label(acct),
+                                "5h": acct.get("cached_usage_5h"),
+                                "7d": acct.get("cached_usage_7d"),
+                                "deficit": round(dr["deficit"], 1),
+                                "windows_remaining": round(dr["effective_windows_remaining"], 1),
+                                "urgency_tier": (
+                                    "CRITICAL" if dr["effective_windows_remaining"] < 1 else
+                                    "HIGH" if dr["effective_windows_remaining"] < 3 else
+                                    "MEDIUM" if dr["effective_windows_remaining"] < 5 else
+                                    "NORMAL"
+                                ),
+                                "threshold": round(threshold, 1),
+                                "passes": dr["deficit"] > threshold,
+                                "urgency_score": round(urgency, 2),
+                            })
+
+                            if urgency > best_urgency:
+                                best_urgency = urgency
+                                best_urgent = acct
+                                best_deficit_result = dr
+
+                        if not best_urgent:
+                            logger.debug("Proactive: no urgent candidate found")
+                        elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
+                            logger.debug(
+                                "Proactive: urgent target %d found but cooldown active",
+                                best_urgent["id"],
+                            )
+                        else:
+                            # Re-fetch fresh data for the target
+                            await fetch_usage(best_urgent["id"], db)
+                            target = db.get_account(best_urgent["id"])
+
+                            if target:
+                                deficit_result = compute_7d_deficit(target, active_start, active_end)
+                                if not deficit_result or deficit_result["deficit"] <= 0:
                                     logger.debug(
-                                        "Proactive: target %d deficit %.1f%% below "
-                                        "threshold %.1f%% after re-fetch",
-                                        target["id"], deficit_result["deficit"], threshold,
+                                        "Proactive: target %d deficit gone after re-fetch",
+                                        target["id"],
                                     )
                                 else:
-                                    reason = (
-                                        f"proactive: burning {deficit_result['unused_7d']:.0f}% "
-                                        f"unused 7d on {format_account_label(target)} — "
-                                        f"{deficit_result['effective_hours_remaining']:.0f}h left "
-                                        f"({deficit_result['effective_windows_remaining']:.1f} windows), "
-                                        f"deficit={deficit_result['deficit']:.0f}%"
-                                    )
-                                    logger.info(
-                                        "Proactive swap: account %d has %.0f%% deficit, "
-                                        "%.1f windows remaining, urgency=%.2f",
-                                        target["id"], deficit_result["deficit"],
+                                    # Re-check threshold with fresh data
+                                    threshold = compute_urgency_threshold(
                                         deficit_result["effective_windows_remaining"],
-                                        best_urgency,
+                                        active_start, active_end,
                                     )
+                                    if deficit_result["deficit"] <= threshold:
+                                        logger.debug(
+                                            "Proactive: target %d deficit %.1f%% below "
+                                            "threshold %.1f%% after re-fetch",
+                                            target["id"], deficit_result["deficit"], threshold,
+                                        )
+                                    else:
+                                        reason = (
+                                            f"proactive: burning {deficit_result['unused_7d']:.0f}% "
+                                            f"unused 7d on {format_account_label(target)} — "
+                                            f"{deficit_result['effective_hours_remaining']:.0f}h left "
+                                            f"({deficit_result['effective_windows_remaining']:.1f} windows), "
+                                            f"deficit={deficit_result['deficit']:.0f}%"
+                                        )
+                                        logger.info(
+                                            "Proactive swap: account %d has %.0f%% deficit, "
+                                            "%.1f windows remaining, urgency=%.2f",
+                                            target["id"], deficit_result["deficit"],
+                                            deficit_result["effective_windows_remaining"],
+                                            best_urgency,
+                                        )
 
-                                    ws_registry = getattr(app.state, "ws_registry", None)
-                                    await _execute_swap(
-                                        db, active_acct_id, active_acct, target,
-                                        reason=reason, trigger="proactive_7d",
-                                        usage_5h=usage_5h, usage_7d=usage_7d,
-                                        active_start=active_start, active_end=active_end,
-                                        ws_registry=ws_registry,
-                                    )
-                                    _decision_action = "swap"
-                                    _decision_target_id = target["id"]
-                                    _decision_reason = reason
-                                    _proactive_target_id = target["id"]
+                                        ws_registry = getattr(app.state, "ws_registry", None)
+                                        await _execute_swap(
+                                            db, active_acct_id, active_acct, target,
+                                            reason=reason, trigger="proactive_7d",
+                                            usage_5h=usage_5h, usage_7d=usage_7d,
+                                            active_start=active_start, active_end=active_end,
+                                            ws_registry=ws_registry,
+                                        )
+                                        _decision_action = "swap"
+                                        _decision_target_id = target["id"]
+                                        _decision_reason = reason
+                                        _proactive_target_id = target["id"]
 
             # Record decision in the log
             if active_acct is not None:
