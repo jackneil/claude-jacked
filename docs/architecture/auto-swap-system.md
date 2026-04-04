@@ -58,17 +58,21 @@ This drives proactive rotation throughout the week, not just at the end.
    a. Defensive triggers: 5h critical, 7d threshold, burn-rate projection
    b. Window-aware suppression: don't swap away if reset is imminent
    c. Stale-data guard: don't trust usage if older than the reset timestamp
+   d. Deficit-aware: 7d trigger suppressed if current account has positive deficit
+      (we intentionally placed the user here to burn expiring capacity)
 4. Score ALL candidate accounts (unified scoring):
-   a. Base score from 5h/7d usage (lower usage = higher score)
-   b. Tier-aware headroom bonus
-   c. Inactive/expired 5h window bonus
-   d. Imminent 5h reset bonus (up to +30)
-   e. 7d deficit bonus (behind schedule = higher score)
-   f. Staleness penalty (old data = lower score)
+   a. Filter: usage below 7d threshold, OR imminent 7d reset,
+      OR urgency (deficit > 0 AND < 24 working hours remaining)
+   b. Base score from 5h/7d usage (lower usage = higher score)
+   c. Tier-aware headroom bonus
+   d. Inactive/expired 5h window bonus
+   e. Imminent 5h reset bonus (up to +30)
+   f. 7d deficit bonus (behind schedule = higher score, deficit × 0.5)
+   g. Staleness penalty (old data = lower score)
 5. Compare best candidate against staying:
    a. If defensive trigger fired → swap to best candidate
    b. If no defensive trigger but best candidate has high 7d deficit
-      AND active account is comfortable → proactive swap
+      AND active account is comfortable → proactive swap (uses same pick_best_target)
    c. Otherwise → stay
 6. Execute swap if decided:
    a. Fetch fresh usage for target (on-demand)
@@ -90,7 +94,8 @@ This drives proactive rotation throughout the week, not just at the end.
 
 ### Suppression
 - **Window-aware:** Don't swap away if `cached_5h_resets_at` or `cached_7d_resets_at` is within `RESET_SUPPRESS_MINUTES` (10 min) — the reset will fix it for free
-- **Escape hatch:** Override suppression if a candidate scores > `SUPPRESS_OVERRIDE_SCORE` (80)
+- **Deficit-aware:** Don't fire 7d defensive trigger on accounts with positive deficit (we intentionally placed the user here to burn expiring capacity — prevents ping-ponging)
+- **Escape hatch:** Override suppression if a candidate scores > `SUPPRESS_OVERRIDE_SCORE` (100)
 - **Stale-data guard:** If reset happened but usage data is older than the reset → suppress (data is unreliable)
 
 ## Scoring Model (`score_candidate`)
@@ -102,7 +107,7 @@ score -= cached_usage_7d × time_weight            # 7d weighted by days remaini
 score += tier_headroom × 0.3                      # room before tier limit
 score += 15 if 5h window inactive/expired         # encourage opening windows
 score += reset_proximity_bonus (up to +30)        # imminent 5h reset
-score += 7d_deficit × weight                      # behind-schedule accounts
+score += 7d_deficit × 0.5 (if deficit > 0)        # behind-schedule accounts
 score -= 10 if data is stale (>30 min)            # don't trust old data
 ```
 
