@@ -979,6 +979,7 @@ async def full_sweep_loop(app):
                 is_active_hours,
                 is_prewake_time,
                 needs_ping,
+                needs_7d_ping,
                 ping_account,
             )
 
@@ -1004,7 +1005,12 @@ async def full_sweep_loop(app):
 
             if should_ping:
                 for acct in accounts:
-                    if not needs_ping(acct.get("cached_5h_resets_at")):
+                    needs_5h = needs_ping(acct.get("cached_5h_resets_at"))
+                    needs_7d = needs_7d_ping(
+                        acct.get("cached_7d_resets_at"),
+                        acct.get("usage_cached_at"),
+                    )
+                    if not needs_5h and not needs_7d:
                         continue
                     if not acct.get("auto_swap_enabled"):
                         continue
@@ -1013,8 +1019,10 @@ async def full_sweep_loop(app):
                         continue
 
                     logger.info(
-                        "Window keeper: pinging account %d (%s)",
+                        "Window keeper: pinging account %d (%s)%s%s",
                         acct["id"], acct.get("email", "?"),
+                        " [5h expired]" if needs_5h else "",
+                        " [7d reset]" if needs_7d else "",
                     )
                     success = await ping_account(cc_at)
                     if success:
