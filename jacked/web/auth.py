@@ -520,13 +520,19 @@ async def _try_refresh_on_429(
                     expires_at=new_expires,
                 )
 
-            # Write to credential stores so Claude Code picks up the new token
-            updated_account = db.get_account(account_id)
-            if updated_account:
-                sync_credential_to_all_stores(
-                    account_id, updated_account,
-                    email=updated_account.get("email"),
-                )
+            # Write to credential stores ONLY if this account is currently
+            # the active one. Writing credentials for a non-active account
+            # would overwrite the active account's credentials in
+            # .credentials.json, silently switching Claude Code to the wrong
+            # account. The DB update above is enough for non-active accounts —
+            # the credential file will be written when/if they become active.
+            if live and live.get("_jackedAccountId") == account_id:
+                updated_account = db.get_account(account_id)
+                if updated_account:
+                    sync_credential_to_all_stores(
+                        account_id, updated_account,
+                        email=updated_account.get("email"),
+                    )
 
             logger.info(
                 "Account %d: 429 recovery — fresh token obtained%s",
