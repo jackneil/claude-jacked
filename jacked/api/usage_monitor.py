@@ -28,6 +28,7 @@ _SWAP_COOLDOWN_SECONDS = 300  # 5 minutes between swaps to prevent ping-ponging
 # Track consecutive unchanged ticks per account for burn-rate decay.
 _burn_rate_unchanged_ticks: dict[int, int] = {}
 _initial_fetch_done = False
+_ticks_since_prune = 0
 
 # Wake signal — settings PUT sets this to trigger an immediate sweep.
 _sweep_wake: asyncio.Event = asyncio.Event()
@@ -354,6 +355,7 @@ async def active_account_poll_loop(app):
                 continue
 
             global _initial_fetch_done
+            global _ticks_since_prune
             if not _initial_fetch_done:
                 from jacked.web.auth import fetch_usage as _prime_fetch
                 logger.info("Auto-swap: priming usage data for all accounts")
@@ -861,12 +863,14 @@ async def active_account_poll_loop(app):
                 except Exception:
                     logger.debug("Failed to record decision", exc_info=True)
 
-            # Periodic prune (~1% of ticks)
-            if random.random() < 0.01:
+            # Periodic prune — deterministic fallback every 500 ticks
+            _ticks_since_prune += 1
+            if _ticks_since_prune >= 500 or random.random() < 0.01:
                 try:
                     db.prune_decision_log()
+                    _ticks_since_prune = 0
                 except Exception:
-                    pass
+                    logger.warning("Failed to prune decision log", exc_info=True)
 
         except asyncio.CancelledError:
             logger.info("Active account poll loop cancelled — shutting down")
