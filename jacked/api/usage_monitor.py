@@ -584,54 +584,109 @@ async def active_account_poll_loop(app):
                         )
 
             # -- Proactive 7d capacity scheduler ---------------------------
+            # Scan for accounts with EXPIRING capacity that must be burned.
+            # Uses remaining 5h windows to determine urgency — the closer
+            # to expiry, the lower the threshold for triggering a swap.
             if not want_swap and not escape_override:
-                from jacked.web.auto_swap import compute_7d_deficit, PROACTIVE_SWAP_THRESHOLD
+                from jacked.web.auto_swap import (
+                    compute_7d_deficit,
+                    compute_urgency_threshold,
+                    compute_burn_per_window,
+                )
 
                 if usage_5h is not None and usage_5h < warning_5h:
-                    # Fetch fresh candidate data for proactive evaluation
+                    # Fetch fresh candidate data
                     accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
 
-                    target = pick_best_target(
-                        accounts, current_id=active_acct_id,
-                        threshold_7d=threshold_7d,
-                        active_start=active_start,
-                        active_end=active_end,
-                    )
+                    # Scan ALL candidates for urgency — not pick_best_target,
+                    # because the most-urgent account (expiring capacity) may
+                    # not be the highest-scored account overall.
+                    best_urgent = None
+                    best_urgency = 0.0
+                    best_deficit_result = None
 
-                    if not target:
-                        logger.debug("Proactive: no eligible target found")
+                    for acct in accounts:
+                        if acct["id"] == active_acct_id:
+                            continue
+                        if not acct.get("cc_access_token"):
+                            continue
+                        if acct.get("auto_swap_enabled") == 0:
+                            continue
+                        if acct.get("is_active") == 0 or acct.get("is_deleted") == 1:
+                            continue
+                        if (acct.get("consecutive_failures") or 0) >= 3:
+                            continue
+
+                        dr = compute_7d_deficit(acct, active_start, active_end)
+                        if not dr or dr["deficit"] <= 0:
+                            continue
+
+                        # Urgency threshold scales with remaining windows
+                        threshold = compute_urgency_threshold(
+                            dr["effective_windows_remaining"],
+                            active_start, active_end,
+                        )
+                        if dr["deficit"] <= threshold:
+                            continue
+
+                        # Urgency = recoverable capacity per hour of inaction
+                        burn = compute_burn_per_window(active_start, active_end)
+                        recoverable = min(
+                            dr["unused_7d"],
+                            dr["effective_windows_remaining"] * burn,
+                        )
+                        urgency = recoverable / max(dr["effective_hours_remaining"], 0.5)
+
+                        if urgency > best_urgency:
+                            best_urgency = urgency
+                            best_urgent = acct
+                            best_deficit_result = dr
+
+                    if not best_urgent:
+                        logger.debug("Proactive: no urgent candidate found")
                     elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
-                        logger.debug("Proactive: target found but cooldown active")
+                        logger.debug(
+                            "Proactive: urgent target %d found but cooldown active",
+                            best_urgent["id"],
+                        )
+                    else:
+                        # Re-fetch fresh data for the target
+                        await fetch_usage(best_urgent["id"], db)
+                        target = db.get_account(best_urgent["id"])
 
-                    if target and (time.time() - _last_swap_time) >= _SWAP_COOLDOWN_SECONDS:
-                        deficit_result = compute_7d_deficit(target, active_start, active_end)
-                        if deficit_result and deficit_result["deficit"] > PROACTIVE_SWAP_THRESHOLD:
-                            # Fetch one more time for the specific target
-                            await fetch_usage(target["id"], db)
-                            target = db.get_account(target["id"])
-
-                            if target:
-                                # Recompute deficit with fresh data
-                                deficit_result = compute_7d_deficit(target, active_start, active_end)
-                                if not deficit_result or deficit_result["deficit"] <= PROACTIVE_SWAP_THRESHOLD:
+                        if target:
+                            deficit_result = compute_7d_deficit(target, active_start, active_end)
+                            if not deficit_result or deficit_result["deficit"] <= 0:
+                                logger.debug(
+                                    "Proactive: target %d deficit gone after re-fetch",
+                                    target["id"],
+                                )
+                            else:
+                                # Re-check threshold with fresh data
+                                threshold = compute_urgency_threshold(
+                                    deficit_result["effective_windows_remaining"],
+                                    active_start, active_end,
+                                )
+                                if deficit_result["deficit"] <= threshold:
                                     logger.debug(
-                                        "Proactive: target %d deficit dropped below threshold after re-fetch",
-                                        target["id"],
+                                        "Proactive: target %d deficit %.1f%% below "
+                                        "threshold %.1f%% after re-fetch",
+                                        target["id"], deficit_result["deficit"], threshold,
                                     )
                                 else:
-                                    target_score = score_candidate(target, active_start, active_end)
                                     reason = (
                                         f"proactive: burning {deficit_result['unused_7d']:.0f}% "
                                         f"unused 7d on {format_account_label(target)} — "
-                                        f"{deficit_result['effective_hours_remaining']:.0f} "
-                                        f"effective hours left "
+                                        f"{deficit_result['effective_hours_remaining']:.0f}h left "
                                         f"({deficit_result['effective_windows_remaining']:.1f} windows), "
-                                        f"score={target_score:.0f}"
+                                        f"deficit={deficit_result['deficit']:.0f}%"
                                     )
                                     logger.info(
-                                        "Proactive swap: account %d is %.0f%% behind 7d schedule "
-                                        "(score=%.0f)",
-                                        target["id"], deficit_result["deficit"], target_score,
+                                        "Proactive swap: account %d has %.0f%% deficit, "
+                                        "%.1f windows remaining, urgency=%.2f",
+                                        target["id"], deficit_result["deficit"],
+                                        deficit_result["effective_windows_remaining"],
+                                        best_urgency,
                                     )
 
                                     ws_registry = getattr(app.state, "ws_registry", None)
