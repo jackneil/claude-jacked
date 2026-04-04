@@ -689,7 +689,18 @@ async def active_account_poll_loop(app):
                             continue
 
                         dr = compute_7d_deficit(acct, active_start, active_end)
-                        if not dr or dr["deficit"] <= 0:
+                        if not dr:
+                            continue
+                        if dr["deficit"] <= 0:
+                            _candidate_summaries.append({
+                                "id": acct["id"],
+                                "email": acct.get("email", ""),
+                                "7d": acct.get("cached_usage_7d"),
+                                "deficit": round(dr["deficit"], 1),
+                                "windows_remaining": round(dr["effective_windows_remaining"], 1),
+                                "passes": False,
+                                "skip_reason": "ahead_of_schedule",
+                            })
                             continue
 
                         # Urgency threshold scales with remaining windows
@@ -698,6 +709,16 @@ async def active_account_poll_loop(app):
                             active_start, active_end,
                         )
                         if dr["deficit"] <= threshold:
+                            _candidate_summaries.append({
+                                "id": acct["id"],
+                                "email": acct.get("email", ""),
+                                "7d": acct.get("cached_usage_7d"),
+                                "deficit": round(dr["deficit"], 1),
+                                "windows_remaining": round(dr["effective_windows_remaining"], 1),
+                                "threshold": round(threshold, 1),
+                                "passes": False,
+                                "skip_reason": "below_threshold",
+                            })
                             continue
 
                         # Urgency = recoverable capacity per hour of inaction
