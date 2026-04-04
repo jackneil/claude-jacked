@@ -32,8 +32,8 @@ If a different account is clearly better → swap.
 - **7-day window:** Resets to 0% instantly at `cached_7d_resets_at`. The SCARCE resource. Takes a full week to reset. Unused capacity is permanently lost.
 
 ### Constraints
-- **5h-to-7d burn rate cap:** Each 5h window can only burn a fraction of 7d capacity (~1/15th per week of working 5h windows).
-- **Active hours:** User works during configured hours (e.g., 7 AM - 10 PM). Overnight hours don't count.
+- **5h-to-7d burn rate cap:** Each 5h window can only burn a fraction of 7d capacity. With 17 working hours/day (06:00-23:00), that's ~3.4 windows/day, ~23.8 windows/week, so each window burns ~4.2% of 7d capacity at maximum.
+- **Active hours:** User works during configured hours (default 6 AM - 11 PM). Overnight hours don't count — the system uses `compute_effective_working_hours` which iterates day-by-day, counting only hours within [active_start, active_end).
 - **One account active at a time:** All Claude Code sessions share the same active account.
 
 ### 7-Day Deficit Model
@@ -48,6 +48,40 @@ deficit = expected_usage - actual_usage
 
 Positive deficit = account is behind schedule (underutilized, wasting capacity).
 This drives proactive rotation throughout the week, not just at the end.
+
+### Capacity Waste Model (Proactive Scheduling)
+
+The deficit model answers "how far behind schedule?" but the proactive scheduler needs to answer a different question: **"how much capacity will be permanently lost if we don't act?"**
+
+Key derived values from `compute_7d_deficit`:
+```
+effective_hours_remaining  = working hours until 7d reset (respects active hours, skips overnight)
+effective_windows_remaining = effective_hours_remaining / 5.0
+unused_7d                  = 100% - actual_usage
+burn_per_window            = 100% / (7 × working_hours_per_day / 5.0)  ≈ 4.2%
+recoverable                = min(unused_7d, windows_remaining × burn_per_window)
+```
+
+`recoverable` is the maximum capacity we can save by swapping to this account NOW. The rest of `unused_7d` is already unrecoverable (not enough windows left to burn it). Even partial recovery is valuable — every percent recovered is real Claude usage.
+
+**Urgency tiers** based on remaining 5-hour windows:
+
+| Windows Remaining | Tier | Threshold | Rationale |
+|---|---|---|---|
+| < 1 | CRITICAL | deficit > 0 | Last chance. Any unused capacity is about to be lost forever. |
+| 1 – 2 | HIGH | deficit > burn_per_window (~4%) | Only 1-2 shots. Swap if there's meaningful capacity to recover. |
+| 3 – 4 | MEDIUM | deficit > 2 × burn_per_window (~8%) | Several windows left but time is running out. |
+| 5+ | NORMAL | deficit > PROACTIVE_SWAP_THRESHOLD (15%) | Plenty of time. Only swap for significant deficits. |
+
+**Priority among urgent accounts:** When multiple accounts have expiring capacity, pick the one with the highest `urgency_score = recoverable / max(effective_hours_remaining, 0.5)`. This favors accounts where the most capacity is wasting per hour of inaction.
+
+**Active hours matter:** A 7d window expiring at 3 AM with the user at 10 PM has only 1 effective hour remaining (10-11 PM), not 5 calendar hours. The overnight gap means there's only 0.2 windows left — CRITICAL tier. `compute_effective_working_hours` handles this automatically.
+
+**Example:** Account at 86% 7d, resets in 5.7 effective hours (1.14 windows):
+- Unused: 14%. Recoverable: min(14, 1.14 × 4.2) = 4.8%.
+- Tier: HIGH (1-2 windows). Threshold: 4.2%.
+- Deficit: 9.2% > 4.2% → **swap triggers**.
+- Without this model: deficit 9.2% < old fixed threshold 15% → swap would NOT trigger, 4.8% of capacity permanently wasted.
 
 ## Decision Flow (Per Tick)
 
@@ -93,7 +127,7 @@ This drives proactive rotation throughout the week, not just at the end.
 - **Burn-rate projection:** Warning zone + projected to hit critical within 2× check interval
 
 ### Proactive (capacity optimization)
-- **7d deficit:** Any non-active account has `deficit > PROACTIVE_SWAP_THRESHOLD` (15%) AND active account is comfortable (`usage_5h < warning_5h`)
+- **7d capacity waste:** Scans ALL non-active accounts for expiring capacity using the Capacity Waste Model. Threshold scales down with urgency — from 15% (5+ windows left) to 0% (last window). Active account must be comfortable (`usage_5h < warning_5h`). Picks the most urgent candidate (highest `recoverable / hours_remaining`).
 
 ### Suppression
 - **Window-aware:** Don't swap away if `cached_5h_resets_at` or `cached_7d_resets_at` is within `RESET_SUPPRESS_MINUTES` (10 min) — the reset will fix it for free
