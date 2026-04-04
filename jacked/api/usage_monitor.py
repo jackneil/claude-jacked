@@ -182,8 +182,8 @@ async def active_account_poll_loop(app):
             warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
             threshold_7d = _setting_float(db, "auto_swap_7d_threshold", 85)
             check_interval = _setting_float(db, "usage_check_interval", 300)
-            active_start = _setting_str(db, "window_keeper_active_start", "07:00")
-            active_end = _setting_str(db, "window_keeper_active_end", "22:00")
+            active_start = _setting_str(db, "window_keeper_active_start", "06:00")
+            active_end = _setting_str(db, "window_keeper_active_end", "23:00")
 
             # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
