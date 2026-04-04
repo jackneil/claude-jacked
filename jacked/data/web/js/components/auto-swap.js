@@ -194,6 +194,37 @@ function renderAutoSwapPanel() {
     `;
 }
 
+/**
+ * Format an account label from swap log entry fields.
+ * @param {Object} entry - swap log entry
+ * @param {string} prefix - 'from' or 'to'
+ * @returns {string} formatted label like "jack@test.com (Hank.ai)"
+ */
+function formatAccountLabel(entry, prefix) {
+    const email = entry[prefix + '_email'] || '\u2014';
+    const orgName = entry[prefix + '_org_name'] || '';
+    const displayName = (entry[prefix + '_display_name'] || '').trim();
+
+    let orgSuffix = '';
+    if (orgName) {
+        if (orgName.endsWith("'s Organization") || orgName.endsWith('\u2019s Organization')) {
+            orgSuffix = ' (personal)';
+        } else {
+            orgSuffix = ' (' + orgName + ')';
+        }
+    }
+
+    let labelPrefix = '';
+    if (displayName) {
+        const emailPrefix = email.split('@')[0].split('.')[0].toLowerCase();
+        if (displayName.toLowerCase() !== emailPrefix && displayName.toLowerCase() !== 'user') {
+            labelPrefix = displayName + ' \u2014 ';
+        }
+    }
+
+    return labelPrefix + email + orgSuffix;
+}
+
 // ---------------------------------------------------------------------------
 // Swap log table
 // ---------------------------------------------------------------------------
@@ -207,8 +238,8 @@ function renderSwapLogTable(entries) {
         const ts = e.timestamp
             ? escapeHtml(new Date(e.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
             : '\u2014';
-        const from = escapeHtml(e.from_email || '\u2014');
-        const to = escapeHtml(e.to_email || '\u2014');
+        const from = escapeHtml(formatAccountLabel(e, 'from'));
+        const to = escapeHtml(formatAccountLabel(e, 'to'));
         const reason = escapeHtml(e.reason || '\u2014');
         return `
             <tr class="border-t border-slate-700/30">
