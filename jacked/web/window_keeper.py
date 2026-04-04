@@ -72,6 +72,43 @@ def needs_ping(resets_at: str | None) -> bool:
     return expiry <= now
 
 
+def needs_7d_ping(resets_at: str | None, usage_cached_at: int | None) -> bool:
+    """Return True if an account's 7-day window has reset but not restarted.
+
+    The 7-day window resets at `cached_7d_resets_at`. A new 7d window
+    only STARTS counting when an API call is made to the account. If
+    the reset happened but no call has been made since, the window is
+    "floating" — cached data still shows the old usage.
+
+    Returns True when:
+    - resets_at is None → never opened
+    - resets_at is in the past AND usage_cached_at is older than resets_at
+      (the reset happened but we haven't refreshed since)
+
+    Returns False when:
+    - resets_at is in the future → window still active
+    - resets_at is in the past but data was refreshed after the reset
+      (new window already running)
+    - resets_at is unparseable → safe default
+    """
+    if resets_at is None:
+        return True
+    try:
+        expiry = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+    now = datetime.now(timezone.utc)
+    if expiry > now:
+        return False
+
+    if usage_cached_at is None:
+        return True
+    return usage_cached_at < expiry.timestamp()
+
+
 # ---------------------------------------------------------------------------
 # Async ping
 # ---------------------------------------------------------------------------

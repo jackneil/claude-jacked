@@ -57,6 +57,58 @@ class TestNeedsPing:
 
 
 # ---------------------------------------------------------------------------
+# needs_7d_ping
+# ---------------------------------------------------------------------------
+
+class TestNeeds7dPing:
+    def test_none_resets_at_needs_ping(self):
+        """No 7d window ever opened → needs ping."""
+        from jacked.web.window_keeper import needs_7d_ping
+        assert needs_7d_ping(None, None) is True
+
+    def test_future_reset_no_ping(self):
+        """7d window still active → no ping needed."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+        from jacked.web.window_keeper import needs_7d_ping
+
+        future = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        now = int(_time.time())
+        assert needs_7d_ping(future, now) is False
+
+    def test_past_reset_with_stale_data_needs_ping(self):
+        """7d window reset and cached data is older than reset → needs ping."""
+        from datetime import datetime, timezone, timedelta
+        from jacked.web.window_keeper import needs_7d_ping
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        past_ts = int((datetime.now(timezone.utc) - timedelta(hours=3)).timestamp())
+        assert needs_7d_ping(past, past_ts) is True
+
+    def test_past_reset_with_fresh_data_no_ping(self):
+        """7d reset already happened and data was refreshed after → no ping."""
+        from datetime import datetime, timezone, timedelta
+        from jacked.web.window_keeper import needs_7d_ping
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        fresh_ts = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())
+        assert needs_7d_ping(past, fresh_ts) is False
+
+    def test_none_cached_at_with_past_reset_needs_ping(self):
+        """Never cached + reset in past → needs ping."""
+        from datetime import datetime, timezone, timedelta
+        from jacked.web.window_keeper import needs_7d_ping
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        assert needs_7d_ping(past, None) is True
+
+    def test_garbage_string_returns_false(self):
+        """Unparseable timestamp → safe default: no ping."""
+        from jacked.web.window_keeper import needs_7d_ping
+        assert needs_7d_ping("not-a-date", 12345) is False
+
+
+# ---------------------------------------------------------------------------
 # ping_account
 # ---------------------------------------------------------------------------
 
