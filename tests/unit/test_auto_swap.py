@@ -488,6 +488,116 @@ class TestPickTargetResetRelax:
 
 
 # ---------------------------------------------------------------------------
+# pick_best_target — urgency-based 7d filter relaxation
+# ---------------------------------------------------------------------------
+
+class TestPickTargetUrgencyRelax:
+    def test_behind_schedule_near_expiry_not_filtered(self):
+        """Account at 85% 7d, behind schedule, <24h remaining -> passes filter."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        accounts = [
+            _acct(1, usage_5h=90),  # current
+            _acct(2, usage_5h=10, usage_7d=85),  # high 7d, expiring
+        ]
+        # 12 hours until reset, ~93% through window, deficit ~8%
+        accounts[1]["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(hours=12)
+        ).isoformat()
+        accounts[1]["usage_cached_at"] = int(_time.time()) - 60
+
+        result = pick_best_target(
+            accounts, current_id=1,
+            active_start="07:00", active_end="22:00",
+        )
+        assert result is not None
+        assert result["id"] == 2
+
+    def test_behind_schedule_far_from_expiry_still_filtered(self):
+        """Account at 86% 7d, behind schedule, but 3 days left -> still filtered."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        accounts = [
+            _acct(1, usage_5h=90),  # current
+            _acct(2, usage_5h=10, usage_7d=86),  # 86% usage
+        ]
+        # Resets in 3 days (~57% through window). Deficit = ~57% - 86% = -29%
+        # Deficit is negative (ahead of schedule). Even if it were positive,
+        # 3 days = ~45 working hours >> 24h urgency threshold.
+        accounts[1]["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=3)
+        ).isoformat()
+        accounts[1]["usage_cached_at"] = int(_time.time()) - 60
+
+        result = pick_best_target(
+            accounts, current_id=1,
+            active_start="07:00", active_end="22:00",
+        )
+        assert result is None
+
+    def test_ahead_of_schedule_near_expiry_still_filtered(self):
+        """Account at 95% 7d, AHEAD of schedule, <24h remaining -> filtered."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        accounts = [
+            _acct(1, usage_5h=90),  # current
+            _acct(2, usage_5h=10, usage_7d=95),
+        ]
+        # 12 hours until reset, ~93% through window, deficit = 93% - 95% = -2%
+        # Negative deficit = ahead of schedule. No urgency relaxation.
+        accounts[1]["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(hours=12)
+        ).isoformat()
+        accounts[1]["usage_cached_at"] = int(_time.time()) - 60
+
+        result = pick_best_target(
+            accounts, current_id=1,
+            active_start="07:00", active_end="22:00",
+        )
+        assert result is None
+
+    def test_end_to_end_original_bug_scenario(self):
+        """THE original bug: Account 3 at 85% 7d with 12h left should beat Account 2 at 18% 7d."""
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+
+        accounts = [
+            _acct(1, usage_5h=90, usage_7d=85),  # current (active, triggers swap)
+            _acct(2, usage_5h=74, usage_7d=18),   # low 7d, 6.8 days left
+            _acct(3, usage_5h=5, usage_7d=85),     # high 7d, 0.5 days left
+        ]
+        # Account 2: resets in 6.8 days, ahead of schedule
+        accounts[1]["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=6, hours=19)
+        ).isoformat()
+        accounts[1]["usage_cached_at"] = int(_time.time()) - 60
+
+        # Account 3: resets in 12 hours, behind schedule
+        accounts[2]["cached_7d_resets_at"] = (
+            datetime.now(timezone.utc) + timedelta(hours=12)
+        ).isoformat()
+        accounts[2]["usage_cached_at"] = int(_time.time()) - 60
+
+        result = pick_best_target(
+            accounts, current_id=1,
+            active_start="07:00", active_end="22:00",
+        )
+        assert result is not None
+        # Account 3 should win: low 5h (5%), urgency-relaxed filter, deficit bonus
+        assert result["id"] == 3
+
+    def test_default_active_hours_backward_compatible(self):
+        """Calling pick_best_target without active hours still works."""
+        accounts = [_acct(1, usage_5h=90), _acct(2, usage_5h=10)]
+        result = pick_best_target(accounts, current_id=1)
+        assert result is not None
+        assert result["id"] == 2
+
+
+# ---------------------------------------------------------------------------
 # compute_effective_working_hours
 # ---------------------------------------------------------------------------
 

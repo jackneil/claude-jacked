@@ -395,8 +395,38 @@ def pick_best_target(
     accounts: list[dict],
     current_id: int,
     threshold_7d: float = 85,
+    active_start: str = "07:00",
+    active_end: str = "22:00",
 ) -> dict | None:
     """Return the best swap-target account, or None if nothing qualifies."""
+
+    def _passes_7d_filter(a: dict) -> bool:
+        """Check if account passes the 7d usage filter.
+
+        Passes if: usage below threshold, OR 7d resets within
+        RESET_SUPPRESS_MINUTES, OR account has expiring capacity
+        (behind schedule with limited time remaining).
+        """
+        usage_7d = a.get("cached_usage_7d") or 0
+        if usage_7d < threshold_7d:
+            return True
+        if _resets_within(a.get("cached_7d_resets_at"), RESET_SUPPRESS_MINUTES):
+            return True
+        # Urgency relaxation: behind schedule + limited time = expiring capacity
+        deficit_result = compute_7d_deficit(a, active_start, active_end)
+        if deficit_result:
+            has_deficit = deficit_result["deficit"] > 0
+            urgent = deficit_result["effective_hours_remaining"] < URGENCY_HOURS
+            if has_deficit and urgent:
+                logger.debug(
+                    "pick_best_target: account %s passes 7d filter via urgency "
+                    "(deficit=%.1f%%, hours_remaining=%.1f)",
+                    a.get("id", "?"), deficit_result["deficit"],
+                    deficit_result["effective_hours_remaining"],
+                )
+                return True
+        return False
+
     candidates = [
         a for a in accounts
         if a["id"] != current_id
@@ -406,16 +436,22 @@ def pick_best_target(
         and a.get("validation_status") != "invalid"
         and a.get("cc_access_token") is not None
         and a.get("auto_swap_enabled") != 0
-        and (
-            (a.get("cached_usage_7d") or 0) < threshold_7d
-            or _resets_within(a.get("cached_7d_resets_at"), RESET_SUPPRESS_MINUTES)
-        )
+        and _passes_7d_filter(a)
     ]
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda a: (-score_candidate(a), a.get("priority", 0)))
+    candidates.sort(key=lambda a: (-score_candidate(a, active_start, active_end), a.get("priority", 0)))
+
+    if logger.isEnabledFor(logging.DEBUG):
+        for c in candidates[:3]:
+            logger.debug(
+                "pick_best_target: candidate %s (%s) score=%.1f",
+                c.get("id", "?"), c.get("email", "?"),
+                score_candidate(c, active_start, active_end),
+            )
+
     return candidates[0]
 
 
