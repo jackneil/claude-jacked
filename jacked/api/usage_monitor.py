@@ -199,6 +199,7 @@ async def active_account_poll_loop(app):
                 tier_label as _tier_label,
                 score_candidate,
                 _resets_within,
+                format_account_label,
                 RESET_SUPPRESS_MINUTES,
                 SUPPRESS_OVERRIDE_SCORE,
             )
@@ -449,7 +450,10 @@ async def active_account_poll_loop(app):
                             {
                                 "from_account_id": active_acct_id,
                                 "to_account_id": target["id"],
+                                "from_email": active_acct.get("email", ""),
                                 "to_email": target.get("email", ""),
+                                "from_label": format_account_label(active_acct),
+                                "to_label": format_account_label(target),
                                 "reason": reason,
                             },
                         )
@@ -524,7 +528,7 @@ async def active_account_poll_loop(app):
                             if target:
                                 reason = (
                                     f"proactive: burning {deficit_result['unused_7d']:.0f}% "
-                                    f"unused 7d on {target.get('email', '?')} — "
+                                    f"unused 7d on {format_account_label(target)} — "
                                     f"{deficit_result['effective_hours_remaining']:.0f} "
                                     f"effective hours left "
                                     f"({deficit_result['effective_windows_remaining']:.1f} windows), "
@@ -571,7 +575,10 @@ async def active_account_poll_loop(app):
                                         {
                                             "from_account_id": active_acct_id,
                                             "to_account_id": target["id"],
+                                            "from_email": active_acct.get("email", ""),
                                             "to_email": target.get("email", ""),
+                                            "from_label": format_account_label(active_acct),
+                                            "to_label": format_account_label(target),
                                             "reason": reason,
                                         },
                                     )
