@@ -12,6 +12,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -61,7 +65,7 @@ def tier_critical_threshold(account: dict) -> float:
 # ---------------------------------------------------------------------------
 
 RESET_SUPPRESS_MINUTES = 10
-SUPPRESS_OVERRIDE_SCORE = 80
+SUPPRESS_OVERRIDE_SCORE = 100
 
 
 def _resets_within(resets_at: str | None, minutes: float) -> bool:
@@ -134,6 +138,8 @@ def compute_effective_working_hours(
 # ---------------------------------------------------------------------------
 
 PROACTIVE_SWAP_THRESHOLD = 15.0  # minimum deficit (%) to trigger proactive swap
+URGENCY_HOURS = 24.0  # accounts behind schedule with fewer effective hours remaining
+                       # than this pass through the 7d filter for scoring
 
 
 def compute_7d_deficit(
