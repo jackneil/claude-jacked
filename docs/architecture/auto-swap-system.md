@@ -209,9 +209,10 @@ The active account is polled at an interval determined by urgency:
 
 Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT fetch usage.
 
-- Checks `needs_ping` for each account (uses `cached_5h_resets_at` from DB)
-- Pings via direct `httpx.POST` to messages API (haiku, max_tokens=1)
-- After successful ping, fetches usage to update `cached_5h_resets_at`
+- Checks `needs_ping` (5h expired) AND `needs_7d_ping` (7d reset with stale data) for each account — either triggers a ping
+- The 5h and 7d windows don't always line up — the 7d can reset mid-5h-window, leaving it "floating" until the next API call. `needs_7d_ping` catches this by comparing `cached_7d_resets_at` against `usage_cached_at`.
+- Pings via direct `httpx.POST` to messages API (haiku, max_tokens=1). The same ping starts both windows simultaneously.
+- After successful ping, fetches usage to update cached reset timestamps
 - Only during active hours or pre-wake window
 
 ## Dashboard Integration
