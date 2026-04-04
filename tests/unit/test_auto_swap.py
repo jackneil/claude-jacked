@@ -9,6 +9,7 @@ from jacked.web.auto_swap import (
     _resets_within,
     compute_7d_deficit,
     compute_effective_working_hours,
+    compute_urgency_threshold,
     format_account_label,
     pick_best_target,
     score_candidate,
@@ -801,6 +802,77 @@ class TestCompute7dDeficit:
         assert "unused_7d" in result
         assert result["effective_hours_remaining"] > 0
         assert result["unused_7d"] == 70.0
+
+
+# ---------------------------------------------------------------------------
+# compute_urgency_threshold
+# ---------------------------------------------------------------------------
+
+class TestComputeUrgencyThreshold:
+    def test_critical_last_partial_window(self):
+        """< 1 window remaining: any deficit triggers (threshold = 0)."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=0.5,
+            active_start="06:00", active_end="23:00",
+        )
+        assert threshold == 0.0
+
+    def test_high_one_to_two_windows(self):
+        """1-2 windows: threshold = burn_per_window (~4.2%)."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=1.5,
+            active_start="06:00", active_end="23:00",
+        )
+        assert 3.5 < threshold < 5.0
+
+    def test_medium_three_to_four_windows(self):
+        """3-4 windows: threshold = 2 * burn_per_window (~8.4%)."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=3.5,
+            active_start="06:00", active_end="23:00",
+        )
+        assert 7.0 < threshold < 10.0
+
+    def test_normal_five_plus_windows(self):
+        """5+ windows: full PROACTIVE_SWAP_THRESHOLD (15%)."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=6.0,
+            active_start="06:00", active_end="23:00",
+        )
+        assert threshold == 15.0
+
+    def test_zero_windows(self):
+        """0 windows: threshold = 0 (too late but still try)."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=0.0,
+            active_start="06:00", active_end="23:00",
+        )
+        assert threshold == 0.0
+
+    def test_boundary_exactly_one_window(self):
+        """Exactly 1.0 windows: HIGH tier (1-2 range)."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=1.0,
+            active_start="06:00", active_end="23:00",
+        )
+        assert 3.5 < threshold < 5.0
+
+    def test_boundary_exactly_five_windows(self):
+        """Exactly 5.0 windows: NORMAL tier."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=5.0,
+            active_start="06:00", active_end="23:00",
+        )
+        assert threshold == 15.0
+
+    def test_narrow_active_hours(self):
+        """Narrow active hours (09:00-17:00 = 8h/day) changes burn_per_window."""
+        threshold = compute_urgency_threshold(
+            effective_windows_remaining=1.5,
+            active_start="09:00", active_end="17:00",
+        )
+        # 8h/day → burn = 100/(7*8/5) = 100/11.2 ≈ 8.9%
+        assert 8.0 < threshold < 10.0
 
 
 # ---------------------------------------------------------------------------

@@ -175,6 +175,48 @@ URGENCY_HOURS = 24.0  # accounts behind schedule with fewer effective hours rema
                        # than this pass through the 7d filter for scoring
 
 
+def compute_burn_per_window(active_start: str = "06:00", active_end: str = "23:00") -> float:
+    """Max 7d capacity (%) that can be burned in one 5h window.
+
+    Depends on active hours: more working hours/day = more windows/week
+    = less burn per window.
+    """
+    s_h, s_m = map(int, active_start.split(":"))
+    e_h, e_m = map(int, active_end.split(":"))
+    working_hours_per_day = (e_h * 60 + e_m - s_h * 60 - s_m) / 60.0
+    if working_hours_per_day <= 0:
+        return 0.0
+    windows_per_week = 7.0 * working_hours_per_day / 5.0
+    return 100.0 / windows_per_week
+
+
+def compute_urgency_threshold(
+    effective_windows_remaining: float,
+    active_start: str = "06:00",
+    active_end: str = "23:00",
+) -> float:
+    """Compute the deficit threshold for proactive swaps based on urgency.
+
+    The closer to expiry, the lower the threshold — ensuring expiring
+    capacity is not wasted. Uses remaining 5h windows as the urgency signal.
+
+    Tiers:
+      < 1 window:  CRITICAL — any deficit > 0 triggers (last chance)
+      1-2 windows: HIGH — deficit > burn_per_window (~4%)
+      3-4 windows: MEDIUM — deficit > 2 * burn_per_window (~8%)
+      5+ windows:  NORMAL — deficit > PROACTIVE_SWAP_THRESHOLD (15%)
+    """
+    burn = compute_burn_per_window(active_start, active_end)
+
+    if effective_windows_remaining < 1.0:
+        return 0.0
+    if effective_windows_remaining < 3.0:
+        return burn
+    if effective_windows_remaining < 5.0:
+        return burn * 2.0
+    return PROACTIVE_SWAP_THRESHOLD
+
+
 def compute_7d_deficit(
     account: dict,
     active_start: str = "07:00",
