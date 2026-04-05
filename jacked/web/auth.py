@@ -762,7 +762,20 @@ async def fetch_usage(
                 return data
 
             if resp.status_code in (401, 403):
-                error_msg = f"Usage fetch failed (HTTP {resp.status_code}) — token may be revoked"
+                # Try refreshing the primary token before giving up.
+                if _retry_depth < 1:
+                    fresh = await _try_refresh_primary_token(
+                        account_id, db, stale_token=token,
+                    )
+                    if fresh:
+                        state["last_fetched_at"] = 0  # Reset ceiling for retry
+                        return await fetch_usage(
+                            account_id, db, access_token=fresh,
+                            _retry_depth=_retry_depth + 1,
+                        )
+
+                # Refresh failed or already retried — mark invalid
+                error_msg = f"Usage fetch failed (HTTP {resp.status_code}) — token refresh failed"
                 db.update_account(
                     account_id,
                     validation_status="invalid",
@@ -770,7 +783,8 @@ async def fetch_usage(
                     last_error_at=datetime.now(timezone.utc).isoformat(),
                 )
                 logger.warning(
-                    f"Usage fetch auth failure for account {account_id}: {resp.status_code}"
+                    "Usage fetch auth failure for account %d: %d (refresh failed)",
+                    account_id, resp.status_code,
                 )
                 return None
 
