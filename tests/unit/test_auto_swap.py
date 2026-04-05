@@ -625,16 +625,19 @@ class TestPickTargetUrgencyRelax:
         assert result is None
 
     def test_ahead_of_schedule_near_expiry_still_filtered(self):
-        """Account at 95% 7d, AHEAD of schedule, <24h remaining -> filtered."""
+        """Account at 97% 7d, AHEAD of schedule, <24h remaining -> filtered.
+
+        97% 7d = 3% unused, below burn_per_window (~4.2-4.8% depending
+        on active hours). Filtered by has_viable_headroom before reaching
+        the urgency check.
+        """
         from datetime import datetime, timezone, timedelta
         import time as _time
 
         accounts = [
             _acct(1, usage_5h=90),  # current
-            _acct(2, usage_5h=10, usage_7d=95),
+            _acct(2, usage_5h=10, usage_7d=97),
         ]
-        # 12 hours until reset, ~93% through window, deficit = 93% - 95% = -2%
-        # Negative deficit = ahead of schedule. No urgency relaxation.
         accounts[1]["cached_7d_resets_at"] = (
             datetime.now(timezone.utc) + timedelta(hours=12)
         ).isoformat()
