@@ -56,6 +56,25 @@ _TIER_ORDER = ["idle", "normal", "warning", "critical"]
 _account_usage_state: dict[int, dict] = {}
 
 
+def _update_profile_metadata(account_id: int, data: dict, db) -> None:
+    """Update account metadata from a profile API response."""
+    org = data.get("organization", {})
+    org_type = org.get("organization_type", "")
+    subscription_type = ORG_TYPE_MAP.get(org_type)
+
+    updates: dict = {}
+    if subscription_type:
+        updates["subscription_type"] = subscription_type
+    if org.get("rate_limit_tier"):
+        updates["rate_limit_tier"] = org["rate_limit_tier"]
+    if "has_extra_usage_enabled" in org:
+        updates["has_extra_usage"] = org["has_extra_usage_enabled"]
+    if org.get("name"):
+        updates["organization_name"] = org["name"]
+    if updates:
+        db.update_account(account_id, **updates)
+
+
 @dataclass
 class TokenExchangeResult:
     """Result of exchanging a refresh token for new tokens."""
@@ -842,6 +861,7 @@ async def fetch_profile(
     account_id: int,
     db: Database,
     access_token: Optional[str] = None,
+    _refresh_depth: int = 0,
 ) -> Optional[dict]:
     """Fetch profile from the Anthropic Profile API (design doc section 4e).
 
@@ -868,32 +888,19 @@ async def fetch_profile(
 
             if resp.status_code == 200:
                 data = resp.json()
-                org = data.get("organization", {})
-                acct_info = data.get("account", {})
-
-                # Map organization_type to subscription_type
-                org_type = org.get("organization_type", "")
-                subscription_type = ORG_TYPE_MAP.get(org_type)
-
-                updates: dict = {}
-                if subscription_type:
-                    updates["subscription_type"] = subscription_type
-                if org.get("rate_limit_tier"):
-                    updates["rate_limit_tier"] = org["rate_limit_tier"]
-                if "has_extra_usage_enabled" in org:
-                    updates["has_extra_usage"] = org["has_extra_usage_enabled"]
-                # NOTE: display_name intentionally NOT updated here — user sets
-                # custom labels via PATCH; profile refresh must not overwrite them.
-                # Keep org name fresh (names can change), but NEVER change
-                # organization_uuid via profile refresh — that's set at auth time
-                if org.get("name"):
-                    updates["organization_name"] = org["name"]
-
-                if updates:
-                    db.update_account(account_id, **updates)
-
+                _update_profile_metadata(account_id, data, db)
                 logger.info(f"Profile fetched for account {account_id}")
                 return data
+
+            if resp.status_code in (401, 403) and _refresh_depth < 1:
+                fresh = await _try_refresh_primary_token(
+                    account_id, db, stale_token=token,
+                )
+                if fresh:
+                    return await fetch_profile(
+                        account_id, db, access_token=fresh,
+                        _refresh_depth=_refresh_depth + 1,
+                    )
 
             logger.warning(
                 f"Profile fetch HTTP {resp.status_code} for account {account_id}"
@@ -940,42 +947,40 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     last_validated_at=int(time.time()),
                     consecutive_failures=0,
                 )
-
-                # Also update profile metadata while we're at it
-                data = resp.json()
-                org = data.get("organization", {})
-                acct_info = data.get("account", {})
-                org_type = org.get("organization_type", "")
-                subscription_type = ORG_TYPE_MAP.get(org_type)
-
-                updates: dict = {}
-                if subscription_type:
-                    updates["subscription_type"] = subscription_type
-                if org.get("rate_limit_tier"):
-                    updates["rate_limit_tier"] = org["rate_limit_tier"]
-                if "has_extra_usage_enabled" in org:
-                    updates["has_extra_usage"] = org["has_extra_usage_enabled"]
-                # NOTE: display_name intentionally NOT updated — user sets
-                # custom labels via PATCH; validation must not overwrite them.
-                if org.get("name"):
-                    updates["organization_name"] = org["name"]
-                if updates:
-                    db.update_account(account_id, **updates)
-
+                _update_profile_metadata(account_id, resp.json(), db)
                 return {"valid": True, "error": None}
 
             if resp.status_code in (401, 403):
+                fresh = await _try_refresh_primary_token(
+                    account_id, db, stale_token=account['access_token'],
+                )
+                if fresh:
+                    retry_resp = await client.get(
+                        PROFILE_URL,
+                        headers={
+                            "Authorization": f"Bearer {fresh}",
+                            "anthropic-beta": OAUTH_BETA_HEADER,
+                        },
+                    )
+                    if retry_resp.status_code == 200:
+                        db.update_account(
+                            account_id,
+                            validation_status="valid",
+                            last_validated_at=int(time.time()),
+                            consecutive_failures=0,
+                        )
+                        _update_profile_metadata(account_id, retry_resp.json(), db)
+                        return {"valid": True, "error": None}
+
+                # Refresh failed — truly invalid
                 db.update_account(
                     account_id,
                     validation_status="invalid",
                     last_validated_at=int(time.time()),
-                    last_error=f"Token invalid (HTTP {resp.status_code})",
+                    last_error=f"Token invalid (HTTP {resp.status_code}), refresh failed",
                     last_error_at=datetime.now(timezone.utc).isoformat(),
                 )
-                return {
-                    "valid": False,
-                    "error": f"Token invalid (HTTP {resp.status_code})",
-                }
+                return {"valid": False, "error": f"Token invalid (HTTP {resp.status_code})"}
 
             if resp.status_code == 429:
                 # Rate limited — don't mark invalid, just note the error
