@@ -890,7 +890,7 @@ async def use_account(account_id: int, request: Request):
             action="manual_switch",
             trigger="manual",
             target_id=account_id,
-            reason=f"user switched to {format_account_label(account)}",
+            reason=reason,
             detail={
                 "source": "dashboard",
                 "previous_account_id": outgoing_id,
@@ -906,6 +906,22 @@ async def use_account(account_id: int, request: Request):
                 } if outgoing_id else None,
             },
         )
+
+        # Broadcast via WebSocket so dashboard updates live
+        ws_registry = getattr(request.app.state, "ws_registry", None)
+        if ws_registry:
+            await ws_registry.broadcast(
+                "auto_swap_triggered",
+                {
+                    "from_account_id": outgoing_id,
+                    "to_account_id": account_id,
+                    "from_email": prev_acct.get("email", "") if prev_acct else "",
+                    "to_email": account.get("email", ""),
+                    "from_label": format_account_label(prev_acct) if prev_acct else "",
+                    "to_label": format_account_label(account),
+                    "reason": reason,
+                },
+            )
     except Exception:
         pass
 
