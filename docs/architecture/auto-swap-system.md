@@ -83,6 +83,8 @@ recoverable                = min(unused_7d, windows_remaining × burn_per_window
 - Deficit: 9.2% > 4.2% → **swap triggers**.
 - Without this model: deficit 9.2% < old fixed threshold 15% → swap would NOT trigger, 4.8% of capacity permanently wasted.
 
+**Viability floor:** Even if an account has positive deficit, it's filtered out when `recoverable < burn_per_window` — swapping to an account that can't fill even one full window is disruptive and risks immediate exhaustion. Also filtered: accounts with `unused_7d < burn_per_window` via `has_viable_headroom` (applied to both defensive AND proactive paths in `pick_best_target`).
+
 ## Decision Flow (Per Tick)
 
 ```
@@ -128,11 +130,17 @@ recoverable                = min(unused_7d, windows_remaining × burn_per_window
 
 ### Proactive (capacity optimization)
 - **7d capacity waste:** Scans ALL non-active accounts for expiring capacity using the Capacity Waste Model. Threshold scales down with urgency — from 15% (5+ windows left) to 0% (last window). Active account must be comfortable (`usage_5h < warning_5h`). Picks the most urgent candidate (highest `recoverable / hours_remaining`).
+- **Manual:** User clicks "Set Active" in the dashboard. Recorded in both `swap_log` (trigger=manual) and `decision_log` (action=manual_switch), and broadcast via WebSocket.
+
+### Target Viability Guards (applied to ALL swap paths)
+- **Viable headroom:** `has_viable_headroom` — reject targets whose unused 7d capacity is less than one 5h window's burn (~4.2%). Prevents swapping to near-exhausted accounts that would crash sessions.
+- **Minimum recoverable (proactive only):** Reject candidates where `recoverable < burn_per_window`. Not worth swapping for scraps that won't fill even one window.
+- **Time-of-day (proactive only):** Skip proactive swaps within `MIN_PROACTIVE_MINUTES` (30) of active hours end. Not worth opening a 5h window for a few minutes of use.
 
 ### Suppression
 - **Window-aware:** Don't swap away if `cached_5h_resets_at` or `cached_7d_resets_at` is within `RESET_SUPPRESS_MINUTES` (10 min) — the reset will fix it for free
 - **Deficit-aware:** Don't fire 7d defensive trigger on accounts with positive deficit (we intentionally placed the user here to burn expiring capacity — prevents ping-ponging)
-- **Escape hatch:** Override suppression if a candidate scores > `SUPPRESS_OVERRIDE_SCORE` (100)
+- **Escape hatch:** Override suppression if a candidate scores > `SUPPRESS_OVERRIDE_SCORE` (100). Passes `account` to `should_swap` to preserve deficit suppression during escape evaluation.
 - **Stale-data guard:** If reset happened but usage data is older than the reset → suppress (data is unreliable)
 
 ## Scoring Model (`score_candidate`)
@@ -182,6 +190,7 @@ The active account is polled at an interval determined by urgency:
 1. **Token refresh:** Rate limits are per-access-token. Exchange refresh token for fresh access token (clears the rate limit). Uses cross-process lock compatible with Claude Code's `proper-lockfile`.
 2. **Escalating backoff:** 65s → 130s → 260s → 520s → cap 900s on consecutive 429s
 3. **Tier override:** After 3+ consecutive 429s, force idle tier
+4. **Active-only credential write:** `sync_credential_to_all_stores` is only called when the refreshed account IS the currently active account. Writing credentials for a non-active account would overwrite `.credentials.json` and silently switch Claude Code to the wrong account. Non-active accounts get DB-only updates.
 
 ### Cross-Process Locking
 - Lock: `os.mkdir(~/.claude.lock)` (atomic, same protocol as `proper-lockfile`)
@@ -232,13 +241,24 @@ Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT f
 - Shows timestamp, from→to with org-aware labels, reason
 - Backend JOINs account emails, org_name, and display_name into swap_log query
 - `format_account_label` (Python + JS): shows `email (org)` or `Label — email (org)`. Personal orgs (`*'s Organization`) display as `(personal)`.
+- Manual switches (via `use_account`) also write to `swap_log` with `trigger=manual`.
+
+### Decision Log
+- Full decision trace recorded every poll tick in `decision_log` table — queryable "why" history
+- Records: active account state, should_swap result, suppression reason, ALL candidates evaluated (with scores/deficit/urgency tier/pass-fail), final decision
+- Three action types: `stay`, `swap`, `manual_switch`
+- 7-day retention with deterministic prune (every 500 ticks or 1% random)
+- API: `GET /api/settings/decision-log?limit=N&action=swap&action=manual_switch`
+- Frontend: expandable table below Swap History, color-coded action badges (swap=teal, manual=blue, check=slate), default filter shows only swaps + manual, toggle reveals all ticks
+- Cooldown-blocked swaps ARE recorded (so blocked attempts aren't invisible)
+- Non-passing candidates recorded too (with `skip_reason`: ahead_of_schedule, below_threshold, recoverable_too_low, near_exhaustion)
 
 ## Files
 
 | File | Responsibility |
 |------|---------------|
-| `jacked/web/auto_swap.py` | Pure decision functions: should_swap, score_candidate, pick_best_target, compute_7d_deficit, compute_effective_working_hours |
-| `jacked/api/usage_monitor.py` | Background loops: active poll (adaptive), full sweep (window keeper). Swap execution. |
+| `jacked/web/auto_swap.py` | Pure decision functions: should_swap, score_candidate, pick_best_target, compute_7d_deficit, compute_effective_working_hours, compute_urgency_threshold, compute_burn_per_window, has_viable_headroom, format_account_label |
+| `jacked/api/usage_monitor.py` | Background loops: active poll (adaptive), full sweep (window keeper). `_execute_swap` helper with TOCTOU guard + cross-process lock + partial-swap recovery. Decision log recording every tick. |
 | `jacked/web/auth.py` | Usage coordinator: fetch_usage, rate limiting, 429 recovery, token refresh. Urgency tiers. |
 | `jacked/api/credential_helpers.py` | Credential I/O: reconcile, sync, cross-process lock, keychain access |
 | `jacked/web/window_keeper.py` | Ping logic, schedule helpers |
@@ -253,4 +273,5 @@ Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT f
 - **Tier weighting:** The deficit model treats all tiers equally. Higher-tier accounts can burn more per 5h window.
 - **Clock skew:** `_resets_within` assumes NTP-synchronized system clock within ~1 minute.
 - **Multi-instance:** No coordination between multiple jacked instances managing the same accounts.
-- **Activity log:** No structured log of why the system decided NOT to swap (future enhancement).
+- **User activity signal:** No concept of whether the user is actively coding. The time-of-day guard (`MIN_PROACTIVE_MINUTES`) approximates this by skipping proactive swaps near `active_end`.
+- **DST transitions:** `compute_7d_deficit` uses a rough UTC offset (`datetime.now()` minus `datetime.now(timezone.utc)`). Can be off by 1 hour during the ~1 second of DST transition.
