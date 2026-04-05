@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -53,6 +54,72 @@ _TIER_ORDER = ["idle", "normal", "warning", "critical"]
 
 # Per-account usage coordinator state
 _account_usage_state: dict[int, dict] = {}
+
+
+@dataclass
+class TokenExchangeResult:
+    """Result of exchanging a refresh token for new tokens."""
+    success: bool
+    access_token: str | None = None
+    refresh_token: str | None = None
+    expires_in: int | None = None
+    error: str | None = None       # "invalid_grant", "http_429", "network_error", etc.
+    status_code: int | None = None
+
+
+async def _exchange_refresh_token(
+    refresh_token: str,
+    timeout: float = 15.0,
+) -> TokenExchangeResult:
+    """Exchange a refresh token for new tokens via Anthropic's OAuth endpoint.
+
+    Single implementation of the token exchange POST. All refresh paths
+    (refresh_cc_token, refresh_account_token, _try_refresh_on_429,
+    _try_refresh_primary_token) should use this helper.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                TOKEN_URL,
+                json={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": CLIENT_ID,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-beta": OAUTH_BETA_HEADER,
+                },
+            )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            return TokenExchangeResult(
+                success=True,
+                access_token=data["access_token"],
+                refresh_token=data.get("refresh_token", refresh_token),
+                expires_in=data.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS),
+            )
+
+        # Parse error type from response
+        error = f"http_{resp.status_code}"
+        try:
+            error_data = resp.json()
+            error = error_data.get("error", error)
+        except Exception:
+            pass
+
+        return TokenExchangeResult(
+            success=False,
+            error=error,
+            status_code=resp.status_code,
+        )
+
+    except Exception as exc:
+        return TokenExchangeResult(
+            success=False,
+            error="network_error",
+        )
 
 
 def _get_usage_state(account_id: int) -> dict:
@@ -304,126 +371,102 @@ async def refresh_account_token(
     if not account.get("refresh_token"):
         return True  # API key account — no refresh needed, still valid
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                TOKEN_URL,
-                json={
-                    "grant_type": "refresh_token",
-                    "refresh_token": account["refresh_token"],
-                    "client_id": CLIENT_ID,
-                },
-                headers={
-                    "Content-Type": "application/json",
-                    "anthropic-beta": OAUTH_BETA_HEADER,
-                },
-            )
+    result = await _exchange_refresh_token(account["refresh_token"], timeout=30.0)
 
-            if resp.status_code == 200:
-                tokens = resp.json()
+    if result.success:
+        new_expires_at = int(time.time()) + result.expires_in
 
-                # Token rotation: save new refresh_token if provided
-                new_refresh = tokens.get("refresh_token", account["refresh_token"])
-                new_expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
-
-                # Update DB with new tokens (retry with backoff)
-                db_updated = False
-                for attempt in range(3):
-                    try:
-                        db.update_account(
-                            account_id,
-                            access_token=tokens["access_token"],
-                            refresh_token=new_refresh,
-                            expires_at=new_expires_at,
-                            consecutive_failures=0,
-                        )
-                        db_updated = True
-                        break
-                    except Exception as db_err:
-                        logger.warning(
-                            "DB update attempt %d/3 failed for account %d: %s",
-                            attempt + 1, account_id, db_err,
-                        )
-                        if attempt < 2:
-                            await asyncio.sleep(0.1 * (2 ** attempt))
-
-                if not db_updated:
-                    logger.error(
-                        "Token refresh succeeded but DB update FAILED for "
-                        "account %d after 3 attempts.",
-                        account_id,
-                    )
-                    return False
-
-                logger.info(f"Token refreshed for account {account_id}")
-
-                # NOTE: Refreshed tokens are stored in the DB only.
-                # We do NOT write to Claude Code's credential files
-                # (~/.claude/.credentials.json, Keychain) here — doing so
-                # causes race conditions that log out active sessions.
-                # Account switching is handled by `jacked claude <id>`.
-
-                # Also refresh profile metadata after successful refresh
-                await fetch_profile(account_id, db, access_token=tokens["access_token"])
-
-                return True
-
-            if resp.status_code == 400:
-                try:
-                    error_data = resp.json()
-                    if error_data.get("error") == "invalid_grant":
-                        # Refresh token was consumed (likely by Claude Code).
-                        # Don't mark invalid — will retry next cycle.
-                        logger.warning(
-                            "Account %d: invalid_grant — will retry next cycle",
-                            account_id,
-                        )
-                        db.record_account_error(
-                            account_id, "Refresh token consumed (will retry)"
-                        )
-                        return False
-                except Exception:
-                    pass
-
-            if resp.status_code in (401, 403):
+        # Update DB with new tokens (retry with backoff)
+        db_updated = False
+        for attempt in range(3):
+            try:
                 db.update_account(
                     account_id,
-                    validation_status="invalid",
-                    last_error=f"Token revoked (HTTP {resp.status_code})",
-                    last_error_at=datetime.now(timezone.utc).isoformat(),
+                    access_token=result.access_token,
+                    refresh_token=result.refresh_token,
+                    expires_at=new_expires_at,
+                    consecutive_failures=0,
                 )
-                return False
-
-            if resp.status_code == 429:
-                logger.warning(f"Account {account_id}: rate limited during refresh")
-                db.record_account_error(account_id, "Rate limited during token refresh")
-                return False
-
-            if resp.status_code >= 500:
+                db_updated = True
+                break
+            except Exception as db_err:
                 logger.warning(
-                    f"Account {account_id}: server error {resp.status_code} during refresh"
+                    "DB update attempt %d/3 failed for account %d: %s",
+                    attempt + 1, account_id, db_err,
                 )
-                db.record_account_error(
-                    account_id, f"Server error ({resp.status_code}) during refresh"
-                )
-                return False
+                if attempt < 2:
+                    await asyncio.sleep(0.1 * (2 ** attempt))
 
-            # Unknown error
-            db.record_account_error(
-                account_id, f"Unexpected HTTP {resp.status_code} during refresh"
+        if not db_updated:
+            logger.error(
+                "Token refresh succeeded but DB update FAILED for "
+                "account %d after 3 attempts.",
+                account_id,
             )
             return False
 
-    except httpx.TimeoutException:
-        logger.warning(f"Account {account_id}: timeout during token refresh")
+        logger.info(f"Token refreshed for account {account_id}")
+
+        # NOTE: Refreshed tokens are stored in the DB only.
+        # We do NOT write to Claude Code's credential files
+        # (~/.claude/.credentials.json, Keychain) here — doing so
+        # causes race conditions that log out active sessions.
+        # Account switching is handled by `jacked claude <id>`.
+
+        # Also refresh profile metadata after successful refresh
+        await fetch_profile(account_id, db, access_token=result.access_token)
+
+        return True
+
+    # --- Error handling for failed exchange ---
+
+    if result.error == "invalid_grant":
+        # Refresh token was consumed (likely by Claude Code).
+        # Don't mark invalid — will retry next cycle.
+        logger.warning(
+            "Account %d: invalid_grant — will retry next cycle",
+            account_id,
+        )
         db.record_account_error(
-            account_id, "Timeout during token refresh", increment_failures=False
+            account_id, "Refresh token consumed (will retry)"
         )
         return False
-    except Exception as e:
-        logger.error(f"Account {account_id}: refresh error: {e}")
-        db.record_account_error(account_id, str(e))
+
+    if result.status_code in (401, 403):
+        db.update_account(
+            account_id,
+            validation_status="invalid",
+            last_error=f"Token revoked (HTTP {result.status_code})",
+            last_error_at=datetime.now(timezone.utc).isoformat(),
+        )
         return False
+
+    if result.status_code == 429:
+        logger.warning(f"Account {account_id}: rate limited during refresh")
+        db.record_account_error(account_id, "Rate limited during token refresh")
+        return False
+
+    if result.status_code and result.status_code >= 500:
+        logger.warning(
+            f"Account {account_id}: server error {result.status_code} during refresh"
+        )
+        db.record_account_error(
+            account_id, f"Server error ({result.status_code}) during refresh"
+        )
+        return False
+
+    if result.error == "network_error":
+        logger.warning(f"Account {account_id}: network error during token refresh")
+        db.record_account_error(
+            account_id, "Network error during token refresh", increment_failures=False
+        )
+        return False
+
+    # Unknown error
+    db.record_account_error(
+        account_id, f"Unexpected error during refresh: {result.error}"
+    )
+    return False
 
 
 async def _try_refresh_on_429(
