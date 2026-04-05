@@ -28,7 +28,9 @@
       "Bash(gh api:*)",
       "Read(//Users/jack.neil/.claude/**)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(mkdir -p .firecrawl/research)",
+      "Bash(firecrawl search:*)"
     ]
   },
   "prefersReducedMotion": true
