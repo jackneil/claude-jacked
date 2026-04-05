@@ -134,6 +134,8 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
     for acct in accounts:
         if acct["id"] == active_acct_id:
             continue
+        if acct.get("validation_status") == "invalid":
+            continue  # Don't waste API calls on invalid accounts
         cached_at = acct.get("usage_cached_at")
         if cached_at and (now - int(cached_at)) < _CANDIDATE_STALENESS_SECONDS:
             continue  # data is fresh enough
@@ -1025,6 +1027,14 @@ async def full_sweep_loop(app):
                         " [7d reset]" if needs_7d else "",
                     )
                     success = await ping_account(cc_at)
+                    if not success and acct.get("cc_refresh_token"):
+                        from jacked.web.auth import refresh_cc_token
+                        refreshed = await refresh_cc_token(acct["id"], db)
+                        if refreshed:
+                            fresh_acct = db.get_account(acct["id"])
+                            fresh_cc = fresh_acct.get("cc_access_token") if fresh_acct else None
+                            if fresh_cc and fresh_cc != cc_at:
+                                success = await ping_account(fresh_cc)
                     if success:
                         sweep_pinged += 1
                         # Fetch fresh usage so cached_5h_resets_at updates
