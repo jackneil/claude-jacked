@@ -868,13 +868,28 @@ async def use_account(account_id: int, request: Request):
     )
 
     try:
+        from jacked.web.auto_swap import format_account_label
+        prev_acct = db.get_account(outgoing_id) if outgoing_id else None
         db.record_decision(
             account_id=account_id,
             action="manual_switch",
             trigger="manual",
             target_id=account_id,
-            reason="user selected via dashboard",
-            detail={"source": "dashboard", "previous_account_id": outgoing_id},
+            reason=f"user switched to {format_account_label(account)}",
+            detail={
+                "source": "dashboard",
+                "previous_account_id": outgoing_id,
+                "active": {
+                    "id": account_id,
+                    "email": account.get("email", ""),
+                    "label": format_account_label(account),
+                },
+                "previous": {
+                    "id": outgoing_id,
+                    "email": prev_acct.get("email", "") if prev_acct else "",
+                    "label": format_account_label(prev_acct) if prev_acct else "",
+                } if outgoing_id else None,
+            },
         )
     except Exception:
         pass
