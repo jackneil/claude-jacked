@@ -138,6 +138,18 @@ def _get_usage_state(account_id: int) -> dict:
     return state
 
 
+_primary_refresh_state: dict[int, dict] = {}
+
+
+def _get_primary_refresh_state(account_id: int) -> dict:
+    if account_id not in _primary_refresh_state:
+        _primary_refresh_state[account_id] = {
+            "last_failed_at": 0.0,
+            "dead": False,
+        }
+    return _primary_refresh_state[account_id]
+
+
 def compute_urgency_tier(
     usage_5h: float | None,
     usage_7d: float | None,
@@ -587,6 +599,89 @@ async def _try_refresh_on_429(
         except Exception as exc:
             logger.warning("Account %d: 429 recovery failed: %s", account_id, exc)
             return None
+
+
+async def _try_refresh_primary_token(
+    account_id: int,
+    db,
+    stale_token: str | None = None,
+) -> str | None:
+    """Refresh the primary access token on 401. Returns new token or None.
+
+    Uses per-account asyncio lock to prevent concurrent refresh races.
+    Checks circuit breaker (10-min cooldown after transient failure,
+    permanent skip after invalid_grant). Compares stale_token against
+    current DB to detect if another coroutine already refreshed.
+
+    Does NOT write to credential stores — primary tokens are for
+    jacked's own API calls, not for Claude Code.
+    """
+    _COOLDOWN_SECONDS = 600
+
+    state = _get_primary_refresh_state(account_id)
+
+    # Circuit breaker: skip if refresh token is known dead
+    if state["dead"]:
+        return None
+
+    # Circuit breaker: skip if recently failed (transient cooldown)
+    if time.time() - state["last_failed_at"] < _COOLDOWN_SECONDS:
+        return None
+
+    lock = _get_refresh_lock(account_id)
+    async with lock:
+        # Re-read account under lock — another coroutine may have refreshed
+        account = db.get_account(account_id)
+        if not account:
+            return None
+
+        # If the DB token changed since the caller's stale copy,
+        # someone else already refreshed — use the new token
+        current_token = account.get("access_token")
+        if stale_token and current_token and current_token != stale_token:
+            logger.info(
+                "Account %d: primary token already refreshed by another path",
+                account_id,
+            )
+            return current_token
+
+        refresh_token = account.get("refresh_token")
+        if not refresh_token:
+            return None
+
+        result = await _exchange_refresh_token(refresh_token)
+
+        if result.success:
+            db.update_account(
+                account_id,
+                access_token=result.access_token,
+                refresh_token=result.refresh_token,
+                expires_at=int(time.time()) + result.expires_in,
+            )
+            state["last_failed_at"] = 0.0
+            state["dead"] = False
+            logger.info(
+                "Account %d: primary token refreshed%s",
+                account_id,
+                " (refresh rotated)" if result.refresh_token != refresh_token else "",
+            )
+            return result.access_token
+
+        # Handle specific error types
+        if result.error == "invalid_grant":
+            state["dead"] = True
+            logger.warning(
+                "Account %d: primary refresh token is dead (invalid_grant)",
+                account_id,
+            )
+        else:
+            state["last_failed_at"] = time.time()
+            logger.warning(
+                "Account %d: primary token refresh failed (%s) — will retry in %ds",
+                account_id, result.error, _COOLDOWN_SECONDS,
+            )
+
+        return None
 
 
 async def fetch_usage(
