@@ -870,6 +870,21 @@ async def use_account(account_id: int, request: Request):
     try:
         from jacked.web.auto_swap import format_account_label
         prev_acct = db.get_account(outgoing_id) if outgoing_id else None
+        reason = f"user switched to {format_account_label(account)}"
+
+        # Record in swap_log so it appears in swap history
+        db.record_swap(
+            from_account_id=outgoing_id,
+            to_account_id=account_id,
+            reason=reason,
+            trigger="manual",
+            from_5h=prev_acct.get("cached_usage_5h") if prev_acct else None,
+            from_7d=prev_acct.get("cached_usage_7d") if prev_acct else None,
+            to_5h=account.get("cached_usage_5h"),
+            to_7d=account.get("cached_usage_7d"),
+        )
+
+        # Record in decision_log with full detail
         db.record_decision(
             account_id=account_id,
             action="manual_switch",
