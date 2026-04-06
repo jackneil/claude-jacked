@@ -463,6 +463,13 @@ jackedWS.on('sessions_changed', async () => {
     if (typeof rerenderAccountsView === 'function') rerenderAccountsView();
 });
 
+jackedWS.on('decision_log_entry', (msg) => {
+    const container = document.getElementById('decision-log-container');
+    if (container) {
+        renderDecisionLog('decision-log-container');
+    }
+});
+
 // Adjust polling interval when WebSocket connects (less aggressive polling)
 let _wsPollingAdjusted = false;
 jackedWS.on('*', () => {
