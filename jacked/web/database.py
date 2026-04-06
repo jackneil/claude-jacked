@@ -68,6 +68,8 @@ class Account(BaseModel):
     cc_access_token: Optional[str] = None
     cc_refresh_token: Optional[str] = None
     cc_expires_at: Optional[int] = None
+    refresh_last_failed_at: Optional[int] = None
+    refresh_failure_type: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -648,6 +650,23 @@ class Database:
                     )
                 except sqlite3.OperationalError:
                     pass
+            # Migration: add circuit breaker columns to accounts
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_cb = {row[1] for row in cursor.fetchall()}
+            if "refresh_last_failed_at" not in acct_cols_cb:
+                try:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN refresh_last_failed_at INTEGER"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            if "refresh_failure_type" not in acct_cols_cb:
+                try:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN refresh_failure_type TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass
             # Indexes (after migrations so new columns exist)
             conn.executescript(INDEXES_SQL)
             # Migration: rebuild idx_sa_active to cover last_activity_at
@@ -918,6 +937,8 @@ class Database:
             "cc_refresh_token",
             "cc_expires_at",
             "organization_uuid",
+            "refresh_last_failed_at",
+            "refresh_failure_type",
         }
     )
 
@@ -2587,17 +2608,21 @@ class Database:
         target_id: int | None = None,
         reason: str | None = None,
         detail: dict | None = None,
-    ):
-        """Record a swap decision (stay, swap, or manual_switch)."""
+    ) -> int:
+        """Record a swap decision (stay, swap, or manual_switch).
+
+        Returns the inserted row ID.
+        """
         import json as _json
         detail_str = _json.dumps(detail) if detail else None
         with self._writer() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO decision_log
                    (account_id, action, trigger, target_id, reason, detail)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (account_id, action, trigger, target_id, reason, detail_str),
             )
+            return cursor.lastrowid
 
     def list_decisions(self, limit: int = 100, actions: list[str] | None = None) -> list[dict]:
         """List recent decision log entries, newest first."""
