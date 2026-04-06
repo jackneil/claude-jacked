@@ -127,8 +127,8 @@ def _resets_within(resets_at: str | None, minutes: float) -> bool:
 def compute_effective_working_hours(
     start_dt: datetime,
     end_dt: datetime,
-    active_start: str = "07:00",
-    active_end: str = "22:00",
+    active_start: str = "06:00",
+    active_end: str = "23:00",
 ) -> float:
     """Count working hours between two LOCAL datetimes, excluding overnight.
 
@@ -239,8 +239,8 @@ def compute_urgency_threshold(
 
 def compute_7d_deficit(
     account: dict,
-    active_start: str = "07:00",
-    active_end: str = "22:00",
+    active_start: str = "06:00",
+    active_end: str = "23:00",
 ) -> dict | None:
     """Compute 7-day utilization deficit for an account.
 
@@ -325,8 +325,8 @@ def should_swap(
     resets_7d_at: str | None = None,
     usage_cached_at: int | None = None,
     account: dict | None = None,
-    active_start: str = "07:00",
-    active_end: str = "22:00",
+    active_start: str = "06:00",
+    active_end: str = "23:00",
 ) -> bool:
     """Decide whether the current account should be swapped out.
 
@@ -412,8 +412,8 @@ def _minutes_until(
 
 def score_candidate(
     account: dict,
-    active_start: str = "07:00",
-    active_end: str = "22:00",
+    active_start: str = "06:00",
+    active_end: str = "23:00",
 ) -> float:
     """Score an account for swap-to suitability. Higher is better.
 
@@ -509,8 +509,8 @@ def pick_best_target(
     accounts: list[dict],
     current_id: int,
     threshold_7d: float = 85,
-    active_start: str = "07:00",
-    active_end: str = "22:00",
+    active_start: str = "06:00",
+    active_end: str = "23:00",
 ) -> dict | None:
     """Return the best swap-target account, or None if nothing qualifies."""
 
