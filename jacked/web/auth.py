@@ -1099,7 +1099,7 @@ async def heal_invalid_accounts() -> dict:
         if account.get("is_deleted"):
             continue
         status = account.get("validation_status", "valid")
-        if status not in ("invalid", "unknown"):
+        if status not in ("invalid", "unknown", "checking"):
             continue
 
         result["checked"] += 1
@@ -1145,6 +1145,9 @@ async def heal_invalid_accounts() -> dict:
 
         if healed:
             result["healed"] += 1
+            db.update_account(account_id,
+                              validation_status="valid",
+                              last_validated_at=int(time.time()))
             # Check if CC tokens need re-auth after primary heals
             if not account.get("cc_refresh_token") and account.get("cc_access_token"):
                 logger.info(
