@@ -1,7 +1,7 @@
 # Token Resilience, Poll Accuracy, and Decision Log Live Updates
 
 **Date:** 2026-04-06
-**Status:** Draft
+**Status:** Draft (DCR Wave 1 fixes applied)
 **Scope:** auth.py refactor, UI countdown fix, credential reconciliation, decision log WebSocket
 
 ## Problem Statement
@@ -24,59 +24,84 @@ Six issues discovered during checkpoint review and live observation:
 
 ### 1. Token Exchange Deep Unification
 
-#### 1a. `RefreshConfig` dataclass
+#### 1a. Mode-based `RefreshMode` enum
 
-New dataclass configuring how `_refresh_token_flow` behaves:
+Replace the open-ended `RefreshConfig` dataclass with a closed enum. There are exactly 4 valid configurations — an enum makes that explicit and prevents invalid combinations:
 
 ```python
-@dataclass
-class RefreshConfig:
-    token_set: str              # "primary" | "cc" | "cc_or_primary"
-    timeout: float = 15.0
-    lock_type: str = "async"    # "async" | "cross_process" | "none"
-    circuit_breaker: bool = False
-    cooldown_seconds: int = 600
-    db_retry: bool = False
-    db_retry_attempts: int = 3
-    write_credential_stores: bool = False
-    recovery_from_live: bool = False
-    fetch_profile_after: bool = False
+class RefreshMode(str, Enum):
+    PRIMARY = "primary"             # refresh_account_token
+    CC = "cc"                       # refresh_cc_token
+    CC_OR_PRIMARY_429 = "cc_429"    # _try_refresh_on_429
+    PRIMARY_CIRCUIT_BREAKER = "primary_cb"  # _try_refresh_primary_token
 ```
+
+Each mode's behavior is hardcoded inside `_refresh_token_flow`:
+
+| Mode | Token Set | Lock | Timeout | CB | DB Retry | Cred Stores | Live Recovery | Profile |
+|------|-----------|------|---------|----|----------|-------------|---------------|---------|
+| `PRIMARY` | primary | async (per-account) | 30s | No | Yes (3x) | No | No | Yes |
+| `CC` | cc | async (per-account CC) | 30s | No | Yes (3x) | No | Access token only | No |
+| `CC_OR_PRIMARY_429` | cc→primary | cross-process | 15s | No | Yes (3x) | If active | Access token only | No |
+| `PRIMARY_CIRCUIT_BREAKER` | primary | async (per-account) | 15s | Yes | Yes (3x) | No | No | No |
+
+**Key constraint:** All modes that refresh the same token set (`cc` tokens: CC and CC_429) share the **same per-account lock**. This prevents two callers from simultaneously consuming the same refresh token. Specifically:
+- CC and CC_OR_PRIMARY_429 both acquire `_get_cc_refresh_lock(account_id)` when refreshing cc tokens
+- CC_OR_PRIMARY_429 additionally acquires the cross-process Claude lock for credential store writes
+- PRIMARY and PRIMARY_CIRCUIT_BREAKER both acquire `_get_refresh_lock(account_id)`
+
+**DB retry is always on.** A successful token exchange with a lost DB write is unrecoverable — the old refresh token was consumed and the new one exists only in dead memory. All modes retry DB writes 3x with exponential backoff.
 
 #### 1b. `_refresh_token_flow` function
 
-New mid-level orchestrator between the low-level `_exchange_refresh_token` (unchanged) and the four caller functions. Steps:
+New mid-level orchestrator. All token updates + circuit breaker state changes happen in a **single `update_account()` call** to ensure atomicity.
 
-1. **Resolve refresh token** — read from DB based on `token_set` ("primary" → `refresh_token`, "cc" → `cc_refresh_token`, "cc_or_primary" → CC first, fallback to primary)
-2. **Acquire lock** — per-account asyncio lock (`lock_type="async"`) or cross-process Claude lock (`lock_type="cross_process"`)
-3. **Check circuit breaker** — if enabled, read `refresh_last_failed_at` and `refresh_failure_type` from DB. Skip if within cooldown. No permanent "dead" state.
-4. **Check live credentials** — if `recovery_from_live=True` or `write_credential_stores=True`, read Keychain/`.credentials.json`. If live store has a newer token for this account, import it and skip the exchange.
-5. **Check stale token** — if another process/coroutine already refreshed (DB token differs from caller's copy), return the fresh token.
-6. **Call `_exchange_refresh_token`** — the existing POST helper, unchanged.
-7. **On success:**
-   - Update DB columns (cc_* or primary, based on `token_set`)
-   - If `db_retry=True`, retry DB writes with exponential backoff
-   - If `write_credential_stores=True` and account is active, call `sync_credential_to_all_stores`
-   - If `fetch_profile_after=True`, call `fetch_profile`
-   - Clear circuit breaker state in DB
-8. **On `invalid_grant`:**
-   - If `recovery_from_live=True`, attempt live credential import (for active account, skip the `_jackedAccountId` gate — trust that the active account owns the live credentials)
-   - If recovery succeeds, return recovered tokens
-   - If recovery fails and `token_set="cc"`, clear `cc_refresh_token` (consumed, unrecoverable)
-   - Set circuit breaker cooldown in DB (NOT permanent death)
-9. **On other errors:** Set circuit breaker cooldown in DB, log appropriately.
-10. **Return `TokenExchangeResult`** — extended with `fresh_access_token` field for callers that need the token string.
+Steps:
+
+1. **Resolve refresh token** — read from DB based on mode's token set
+2. **Acquire lock** — per mode's lock type. All callers sharing a token set share the same lock.
+3. **Re-read DB under lock** — prevent stale reads. If DB token differs from caller's copy, another coroutine already refreshed → return the fresh token. **Log:** `"Account %d: token already refreshed by another path"`
+4. **Check circuit breaker** (PRIMARY_CIRCUIT_BREAKER mode only) — read `refresh_last_failed_at` and `refresh_failure_type` from DB. **Log:** `"Account %d: circuit breaker active (%s, %ds remaining)"` with failure type and cooldown remaining. Skip if within cooldown.
+5. **Call `_exchange_refresh_token`** — the existing POST helper, unchanged.
+6. **On success — single atomic DB write:**
+   - Token columns (cc_* or primary, based on mode)
+   - `refresh_last_failed_at=None, refresh_failure_type=None` (clear circuit breaker)
+   - Retry 3x with exponential backoff on DB error
+   - **After DB write:** if mode writes credential stores and account is active, call `sync_credential_to_all_stores` (non-atomic side effect — partial failure documented below)
+   - **After DB write:** if PRIMARY mode, call `fetch_profile`
+7. **On `invalid_grant`:**
+   - If CC or CC_429 mode: attempt live credential recovery — import `cc_access_token` and `cc_expires_at` only (NOT `cc_refresh_token` — see Safety Rule below)
+   - If recovery found a fresh access token, update DB and return it
+   - If no recovery, clear `cc_refresh_token=None` in DB
+   - Set circuit breaker in same DB write: `refresh_last_failed_at=now, refresh_failure_type="invalid_grant"`
+   - **Log:** `"Account %d: invalid_grant — recovered from live credentials"` or `"Account %d: invalid_grant — clearing cc_refresh_token (no recovery)"`
+8. **On other errors:** Single atomic DB write setting circuit breaker cooldown. **Log:** `"Account %d: refresh failed (%s) — cooldown %ds"` with error type and cooldown duration.
+9. **Return `TokenExchangeResult`** — extended with `fresh_access_token` field.
+
+**Safety Rule: Never import `cc_refresh_token` from live credentials during `invalid_grant` recovery.**
+
+CC refresh tokens are single-use. If jacked imports Claude Code's active refresh token and exchanges it, Claude Code loses its session. Live credential import is safe for:
+- `cc_access_token` — read-only, shareable, non-destructive
+- `cc_expires_at` — metadata, non-destructive
+
+It is NOT safe for:
+- `cc_refresh_token` — single-use, competitive, importing and exchanging it destroys Claude Code's ability to refresh
+
+The `_jackedAccountId` gate is **never skipped**. It is the ground truth for which account owns the credential file. During a swap, the credential file transitions between accounts — skipping the gate would import the wrong account's tokens.
+
+**Credential store write partial failure:** If `sync_credential_to_all_stores` fails after a successful DB write, the DB has new tokens but the credential file is stale. Recovery: the next poll tick will detect the mismatch and re-sync. This is an existing behavior that the refactor preserves, not introduces.
 
 #### 1c. Caller refactoring
 
-Each caller becomes a thin wrapper:
+Each caller becomes a one-liner:
 
-| Caller | Config |
-|--------|--------|
-| `refresh_account_token` | `token_set="primary", timeout=30, db_retry=True, fetch_profile_after=True` + caller-specific error policy (401/403 → mark invalid, but only after 2 consecutive failures) |
-| `refresh_cc_token` | `token_set="cc", timeout=30, lock_type="async", recovery_from_live=True` |
-| `_try_refresh_on_429` | `token_set="cc_or_primary", lock_type="cross_process", write_credential_stores=True` |
-| `_try_refresh_primary_token` | `token_set="primary", circuit_breaker=True` |
+```python
+async def refresh_cc_token(account_id: int, db: Database) -> bool:
+    result = await _refresh_token_flow(account_id, db, RefreshMode.CC)
+    return result.success
+```
+
+Plus caller-specific error policy for `refresh_account_token` (401/403 → mark invalid after 2 consecutive failures, not 1).
 
 #### 1d. Less aggressive invalid-marking
 
@@ -84,7 +109,7 @@ Each caller becomes a thin wrapper:
 - First failure: record error + set circuit breaker cooldown, do NOT mark invalid
 - Second consecutive failure (after cooldown expires and retry fails): mark invalid
 
-`fetch_usage` 401 path: before marking invalid, attempt live credential import for the active account. Only mark invalid after both refresh AND live import fail.
+`fetch_usage` 401 path: before marking invalid, attempt live credential import for the active account (access token only). Only mark invalid after both refresh AND live import fail.
 
 ### 2. Circuit Breaker to DB
 
@@ -97,48 +122,69 @@ ALTER TABLE accounts ADD COLUMN refresh_failure_type TEXT;
 
 `refresh_failure_type` stores the error string ("invalid_grant", "network_error", "http_429", etc.). `refresh_last_failed_at` stores epoch seconds.
 
+**Required updates for new columns:**
+- Add to `_ACCOUNT_UPDATE_COLS` whitelist in `database.py` (line ~916) — without this, `update_account` raises `ValueError`
+- Add to Pydantic `Account` model in `database.py` (line ~38) as `Optional[int]` / `Optional[str]`
+- Add to `_WS_SAFE_FIELDS` in `usage_monitor.py` (line ~430) — enables future dashboard display
+- Migration uses existing `ALTER TABLE ADD COLUMN` with `try/except OperationalError: pass` pattern (idempotent, forward-only, rollback-safe because old code ignores unknown columns)
+
 #### 2b. Delete in-memory state
 
-Remove `_primary_refresh_state` dict and `_get_primary_refresh_state()`. All circuit breaker reads/writes go through DB columns. This means:
-- State survives process restarts
-- Heal loop can clear it before attempting recovery
-- Dashboard can display why an account is stuck
+Remove `_primary_refresh_state` dict and `_get_primary_refresh_state()`. All circuit breaker reads/writes go through DB columns.
 
-#### 2c. Cooldown logic
+#### 2c. Cooldown logic — scaled by error type
 
-All errors get a TTL-based cooldown (default 600s). No permanent "dead" state. After cooldown expires, the next refresh attempt runs normally. If it fails again, cooldown resets.
+| Error Type | Cooldown | Rationale |
+|-----------|----------|-----------|
+| `invalid_grant` | 600s (10 min) | Token consumed, need time for external recovery |
+| `network_error` | 60s | Transient, usually resolves quickly |
+| `http_429` | 120s | Rate limit, moderate backoff |
+| `http_5xx` | 120s | Server issue, moderate backoff |
+| Other | 300s | Unknown, moderate default |
+
+No permanent "dead" state. After cooldown expires, the next refresh attempt runs normally.
 
 ### 3. Live Credential Reconciliation
 
 #### 3a. Periodic reconciliation
 
-`refresh_all_expiring_tokens` (background loop, every 30 min) gains a step: for the active account, call `reconcile_from_live_credentials(account_id, db)` before attempting token refresh. This catches cases where Claude Code rotated tokens during normal operation.
+`refresh_all_expiring_tokens` (background loop, every 30 min) gains a step: for the active account, call `reconcile_credentials_from_live_store(account_id, db)` before attempting token refresh.
 
-#### 3b. On-demand reconciliation
+**What reconciliation imports:**
+- `cc_access_token` — always (non-destructive)
+- `cc_expires_at` — always (metadata)
+- `cc_refresh_token` — **only if** `refresh_failure_type != "invalid_grant"` in DB. If the circuit breaker was set due to `invalid_grant`, the live refresh token is Claude Code's active token and importing+exchanging it would destroy Claude Code's session.
 
-In `_row_to_account` (routes/auth.py, the function that computes `cc_needs_auth`): if the account is the active one AND any of these are true:
-- `cc_refresh_token` is NULL
-- `cc_expires_at` has passed
-- `cc_access_token` differs from what's in live credentials
+#### 3b. On-demand reconciliation — cached
 
-...then synchronously read live credentials and import fresh CC tokens before computing `cc_needs_auth`. This is a fast local read (Keychain or file), not a network call.
+In the account list API endpoint: for the active account, if `cc_refresh_token` is NULL or `cc_expires_at` has passed, read live credentials and import fresh CC access token + expiry before computing `cc_needs_auth`.
+
+**Caching:** Cache the live credential read result for 30 seconds (in-memory, keyed by active account ID). This prevents thundering herd from multiple concurrent API calls. The cache is invalidated on swap.
+
+**Read-only path preservation:** The import only writes to DB if the live credentials actually differ from what's stored. Most calls will be cache hits or no-ops.
+
+Note: `_row_to_account` doesn't exist as a named function — the `cc_needs_auth` computation is inline in the `AccountResponse(...)` constructor at routes/auth.py:300. The implementation should extract this into a helper or add the reconciliation call before the constructor.
 
 #### 3c. Rename and generalize
 
-Rename `reconcile_outgoing_credentials` → `reconcile_credentials_from_live_store`. Same logic, but callable anytime, not just during swaps. The `_jackedAccountId` gate stays for non-active accounts but is skipped for the known active account.
+Rename `reconcile_outgoing_credentials` → `reconcile_credentials_from_live_store`. Same logic, callable anytime. The `_jackedAccountId` gate is **always enforced** — never skipped, even for the active account.
 
 #### 3d. Heal loop fix
 
 In `heal_invalid_accounts`:
-1. Clear circuit breaker state (`refresh_last_failed_at=None, refresh_failure_type=None`) before attempting recovery
-2. Always attempt refresh if `refresh_token` exists — drop the `should_refresh()` gate (healing is recovery mode, not normal operation)
-3. Before calling `validate_account`, try `reconcile_credentials_from_live_store` to import any fresh tokens Claude Code may have
+1. Clear circuit breaker state (`refresh_last_failed_at=None, refresh_failure_type=None`) **under the per-account lock** before attempting recovery — prevents other coroutines from racing
+2. Always attempt refresh if `refresh_token` exists — drop the `should_refresh()` gate (healing is recovery mode)
+3. Before calling `validate_account`, try `reconcile_credentials_from_live_store` to import fresh access tokens (NOT refresh tokens if `invalid_grant`)
+
+#### 3e. Non-active account CC token recovery
+
+Non-active accounts whose CC refresh token is consumed have NO automatic recovery path — live credentials belong to a different account. The dashboard should show a clear "CC re-auth needed" indicator (the existing `cc_needs_auth` flag already handles this). This is not a new problem — the spec acknowledges it rather than pretending the circuit breaker provides recovery for non-active accounts.
 
 ### 4. Poll Countdown Fix
 
 #### 4a. Backend: include poll metadata in WebSocket payload
 
-After computing `_poll_interval` and `_poll_tier`, include them in the `usage_poll_updated` broadcast:
+Move `_compute_poll_interval` call to BEFORE the broadcast (currently after, at line 943). Include in `usage_poll_updated`:
 
 ```python
 safe_acct["_poll_interval"] = int(_poll_interval)
@@ -146,13 +192,13 @@ safe_acct["_poll_tier"] = _poll_tier
 safe_acct["_last_poll_at"] = int(time.time())
 ```
 
-Move `_compute_poll_interval` call to BEFORE the broadcast (currently it's after, at line 943). This way the frontend knows the actual interval for this tick.
+`_last_poll_at` always updates every tick regardless of cache hits. NOT stored in DB.
 
-`_last_poll_at` is a new field that always updates every tick, regardless of whether `fetch_usage` hit the rate ceiling. This is NOT stored in DB — it's computed in the broadcast payload from `time.time()`.
+**Backend watchdog:** If the poll loop has not completed a tick in 2× the expected interval, log: `"WARN: active account poll loop delayed — last tick %ds ago, expected interval %ds"`. This gives on-call something to grep for.
 
 #### 4b. Frontend: use backend-provided interval
 
-Replace the hardcoded threshold table in `_startCheckCountdown` (lines 24-28) with the backend-provided values:
+Replace the hardcoded threshold table in `_startCheckCountdown` with backend values:
 
 ```javascript
 var pollInterval = activeAcct._poll_interval || 300;
@@ -160,18 +206,17 @@ var lastPollAt = activeAcct._last_poll_at || cachedAt;
 var rem = Math.max(0, pollInterval - (now - lastPollAt));
 ```
 
-This means:
-- Frontend counts down from the backend's actual interval, not its own guess
-- `_last_poll_at` updates every tick even on cache hits, so the countdown always resets
-- Tier name can be displayed: "Next check in 45s (warning)" or just "45s"
+Display tier: "45s (warning)" or just "45s".
 
-#### 4c. Stale guard
+#### 4c. Stale guard and restart handling
 
-If `_last_poll_at` is more than 2× `_poll_interval` ago and no WebSocket event has arrived, show "delayed" instead of "checking...". This handles the case where the WebSocket connection dropped or the backend loop crashed.
+- If `_last_poll_at` is more than 2× `_poll_interval` ago → show "delayed" instead of "checking..."
+- If `_last_poll_at` is absent (process restart, WS reconnect) → show "starting..." until the first poll tick arrives
+- On WS reconnect: the frontend should fetch current state via HTTP (`GET /api/accounts`) to get fresh data, then resume countdown from the next WS event
 
 ### 5. Active Hours Default Normalization
 
-All functions in `auto_swap.py` that accept `active_start`/`active_end` parameters will use the same defaults: `"06:00"` and `"23:00"`. These match the settings defaults in `usage_monitor.py` (line 340-341: `window_keeper_active_start: "06:00"`, `window_keeper_active_end: "23:00"`).
+All functions in `auto_swap.py` that accept `active_start`/`active_end` parameters will use the same defaults: `"06:00"` and `"23:00"`.
 
 Functions to update (currently defaulting to 07:00/22:00):
 - `compute_effective_working_hours`: change `active_start="07:00"` → `"06:00"`, `active_end="22:00"` → `"23:00"`
@@ -190,88 +235,91 @@ Tests that hardcode `active_start="07:00"` will be updated to match.
 
 #### 6a. New WebSocket event: `decision_log_entry`
 
-When `db.record_decision()` is called, broadcast a `decision_log_entry` event with the full decision data. Two recording points:
+When `db.record_decision()` is called, broadcast a `decision_log_entry` event. Two recording points:
 
 1. **Auto-swap tick** (usage_monitor.py:913) — after `db.record_decision()`, broadcast via `ws_registry`
 2. **Manual switch** (routes/auth.py:888) — after `db.record_decision()`, broadcast via `ws_registry`
 
-Payload:
+Payload includes account email/label for self-describing entries:
 ```python
 {
-    "id": <decision_id>,  # from DB insert
+    "id": <decision_id>,
     "account_id": ...,
+    "email": ...,
+    "label": ...,
     "action": "swap" | "stay" | "manual_switch",
     "trigger": "auto_swap" | "proactive_7d" | "tick" | "manual",
     "reason": "...",
     "timestamp": "...",
-    "detail": { ... },  # full tick detail (candidates, flags, etc.)
+    "detail": { ... },  # full tick detail — already sanitized by _build_tick_detail
 }
 ```
 
+The `detail` field comes from `_build_tick_detail()` which constructs the JSON explicitly from safe fields — it does not include raw account rows with tokens. No additional sanitization needed.
+
 #### 6b. `record_decision` returns the inserted ID
 
-Currently `record_decision` is a void method. Change it to return the row ID so the caller can include it in the broadcast.
+Use `cursor.lastrowid` (not `INSERT ... RETURNING` which requires SQLite 3.35+). The `lastrowid` is available on the cursor immediately after `execute()` within the `_writer()` context manager.
 
 #### 6c. Frontend handler
 
-In `websocket.js`, add handler for `decision_log_entry`:
-
 ```javascript
 jackedWS.on('decision_log_entry', (msg) => {
-    const d = msg.payload || msg;
-    // If decision log is currently visible, prepend the new entry
     const container = document.getElementById('decision-log-container');
     if (container) {
-        renderDecisionLog('decision-log-container');  // re-render with fresh data
+        renderDecisionLog('decision-log-container');
     }
 });
 ```
 
-Simple approach: re-render the whole table on new entry. The table is small (100-200 rows) and re-render is fast. No need for incremental DOM insertion.
+Re-render the whole table on new entry. The table is small (100-200 rows).
 
 ### 7. Decision Log Frontend QA
 
-Browser-test the decision log UI with Playwright/Chrome MCP:
-- Verify expandable rows toggle correctly
-- Verify badge colors (teal=swap, blue=manual, gray=check)
-- Verify filter toggle (show all ↔ show swaps only)
-- Verify candidate table renders inside detail rows
-- Verify decision flags display
-- Verify WebSocket live updates (after implementing section 6)
-- Check for XSS in `escapeHtml` calls
-- Test empty state ("No decisions recorded yet")
+Browser-test with Playwright/Chrome MCP:
+- Expandable rows toggle correctly
+- Badge colors (teal=swap, blue=manual, gray=check)
+- Filter toggle (show all ↔ show swaps only)
+- Candidate table renders inside detail rows
+- Decision flags display
+- WebSocket live updates (after implementing section 6)
+- XSS coverage in `escapeHtml` calls
+- Empty state ("No decisions recorded yet")
 
 ### 8. Architecture Doc Update
 
-Update `docs/architecture/auto-swap-system.md` to reflect:
-- **401 auto-refresh system** — `_try_refresh_primary_token`, circuit breaker with DB persistence, integration with `fetch_usage` and `validate_account`
-- **Circuit breaker** — DB-persisted with TTL cooldown, no permanent death
-- **Live credential reconciliation** — periodic + on-demand, not just during swaps
-- **Decision log recording** — all tick decisions recorded, WebSocket push
-- **`auto_swap_enabled` flag** — per-account toggle, checked in `pick_best_target` and proactive scanner
-- **Skip reason values** — document `near_exhaustion`, `recoverable_too_low`, `ahead_of_schedule`, `below_threshold`
-- **Urgency score formula** — promote to first-class definition in capacity waste model section
-- **429 recovery backoff sequence** — exact values: 65s → 130s → 260s → 520s → cap 900s
-- **Active hours** — document normalized defaults (06:00-23:00) and that settings override these
-- **Window keeper execution context** — runs in `full_sweep_loop`, not standalone
-- **WebSocket whitelist maintenance** — note that new DB columns must be added to `_WS_SAFE_FIELDS`
-- **Poll interval metadata** — `_poll_interval`, `_poll_tier`, `_last_poll_at` in WS payload
+Update `docs/architecture/auto-swap-system.md` to reflect all changes from sections 1-7.
+
+## Observability Contract
+
+Every state transition below MUST produce a log message at the specified level:
+
+| Event | Level | Fields | Example |
+|-------|-------|--------|---------|
+| Circuit breaker activating | WARNING | account_id, failure_type, cooldown_seconds | `"Account 3: refresh failed (invalid_grant) — cooldown 600s"` |
+| Circuit breaker blocking | DEBUG | account_id, failure_type, remaining_seconds | `"Account 3: circuit breaker active (invalid_grant, 420s remaining)"` |
+| Circuit breaker expiring | INFO | account_id | `"Account 3: circuit breaker cooldown expired, re-attempting refresh"` |
+| Stale token short-circuit | INFO | account_id, source | `"Account 3: token already refreshed by another path"` |
+| Live credential import | INFO | account_id, fields_imported | `"Account 3: imported cc_access_token from live credentials"` |
+| Live credential skip (invalid_grant) | DEBUG | account_id | `"Account 3: skipping cc_refresh_token import (invalid_grant active)"` |
+| Heal loop clearing CB | INFO | account_id | `"Account 3: clearing circuit breaker for heal attempt"` |
+| Poll loop watchdog | WARNING | last_tick_ago, expected_interval | `"Active poll loop delayed — last tick 340s ago, expected 150s"` |
 
 ## Files Modified
 
 | File | Changes |
 |------|---------|
-| `jacked/web/auth.py` | `RefreshConfig`, `_refresh_token_flow`, refactor 4 callers, circuit breaker to DB, heal loop fixes, poll interval computation moved |
-| `jacked/web/database.py` | Migration: `refresh_last_failed_at`, `refresh_failure_type` columns. `record_decision` returns row ID |
+| `jacked/web/auth.py` | `RefreshMode` enum, `_refresh_token_flow`, refactor 4 callers, circuit breaker to DB, heal loop fixes, poll interval computation moved, delete `_primary_refresh_state` |
+| `jacked/web/database.py` | Migration: `refresh_last_failed_at`, `refresh_failure_type` columns + `_ACCOUNT_UPDATE_COLS` + Pydantic `Account` model. `record_decision` returns `lastrowid` |
 | `jacked/web/auto_swap.py` | Normalize active hours defaults to 06:00/23:00 across all functions |
-| `jacked/api/usage_monitor.py` | Include `_poll_interval`/`_poll_tier`/`_last_poll_at` in WS broadcast, decision log WS push |
-| `jacked/api/credential_helpers.py` | Rename `reconcile_outgoing_credentials` → `reconcile_credentials_from_live_store`, generalize |
-| `jacked/api/routes/auth.py` | On-demand credential reconciliation in `_row_to_account` for active account, decision log WS push for manual switch |
-| `jacked/data/web/js/components/account-actions.js` | Use backend-provided `_poll_interval` and `_last_poll_at` instead of hardcoded thresholds, stale guard |
-| `jacked/data/web/js/websocket.js` | Handle `decision_log_entry` event |
+| `jacked/api/usage_monitor.py` | Include `_poll_interval`/`_poll_tier`/`_last_poll_at` in WS broadcast, move `_compute_poll_interval` before broadcast, decision log WS push, poll watchdog |
+| `jacked/api/credential_helpers.py` | Rename `reconcile_outgoing_credentials` → `reconcile_credentials_from_live_store`, add 30s cache, never import cc_refresh_token during invalid_grant |
+| `jacked/api/routes/auth.py` | Cached on-demand credential reconciliation for active account, decision log WS push for manual switch, extract cc_needs_auth helper |
+| `jacked/data/web/js/components/account-actions.js` | Use backend `_poll_interval` + `_last_poll_at`, stale guard ("delayed"), restart handling ("starting..."), WS reconnect fetch |
+| `jacked/data/web/js/websocket.js` | Handle `decision_log_entry` event, fetch state on reconnect |
 | `jacked/data/web/js/components/auto-swap.js` | Re-render on WS push |
-| `tests/unit/test_auto_swap.py` | Update active hours defaults in tests |
-| `tests/unit/test_auth.py` or new test file | Tests for `_refresh_token_flow`, circuit breaker DB persistence, live credential recovery |
+| `tests/unit/test_auto_swap.py` | Update active hours defaults |
+| `tests/unit/test_auth.py` or new | Tests for `_refresh_token_flow` modes, circuit breaker DB persistence (cooldown expiry, scaled durations), live credential recovery (access token only, not refresh), lock sharing between modes, atomic DB writes |
 | `docs/architecture/auto-swap-system.md` | Full update per section 8 |
 
 ## Non-Goals
@@ -279,4 +327,4 @@ Update `docs/architecture/auto-swap-system.md` to reflect:
 - WebSocket pagination or virtual scrolling for decision log (table is small)
 - Persisting poll tier/interval to DB (only needed for WS broadcast)
 - Changing the adaptive tier thresholds or burn-rate projection logic
-- Adding new UI for circuit breaker state (can show in decision log detail if needed later)
+- Automatic recovery of non-active accounts' consumed CC refresh tokens (requires re-auth — acknowledged in section 3e)
