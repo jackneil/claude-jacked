@@ -16,6 +16,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -86,6 +87,24 @@ class TokenExchangeResult:
     status_code: int | None = None
 
 
+class RefreshMode(str, Enum):
+    """Token refresh modes — one per caller, behavior hardcoded per mode."""
+    PRIMARY = "primary"
+    CC = "cc"
+    CC_OR_PRIMARY_429 = "cc_429"
+    PRIMARY_CIRCUIT_BREAKER = "primary_cb"
+
+
+# Circuit breaker cooldown by error type (seconds)
+CIRCUIT_BREAKER_COOLDOWNS: dict[str, int] = {
+    "invalid_grant": 600,
+    "network_error": 60,
+    "http_429": 120,
+    "http_5xx": 120,
+}
+_DEFAULT_CB_COOLDOWN = 300
+
+
 async def _exchange_refresh_token(
     refresh_token: str,
     timeout: float = 15.0,
@@ -141,6 +160,316 @@ async def _exchange_refresh_token(
         )
 
 
+async def _refresh_token_flow(
+    account_id: int,
+    db: Database,
+    mode: RefreshMode,
+) -> TokenExchangeResult:
+    """Unified token refresh orchestrator — replaces per-caller refresh logic.
+
+    Handles token resolution, locking, circuit breaker, exchange, DB write
+    with retry, credential store sync, and error recovery. Each RefreshMode
+    encodes caller-specific behavior (which token, which lock, timeouts,
+    error handling).
+    """
+    # ------------------------------------------------------------------
+    # 1. Read account from DB
+    # ------------------------------------------------------------------
+    account = db.get_account(account_id)
+    if not account:
+        return TokenExchangeResult(success=False, error="account_not_found")
+
+    # ------------------------------------------------------------------
+    # 2. Resolve which refresh token to use
+    # ------------------------------------------------------------------
+    if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
+        refresh_token = account.get("refresh_token")
+    elif mode == RefreshMode.CC:
+        refresh_token = account.get("cc_refresh_token")
+    elif mode == RefreshMode.CC_OR_PRIMARY_429:
+        refresh_token = account.get("cc_refresh_token") or account.get("refresh_token")
+    else:
+        refresh_token = None
+
+    used_cc = mode == RefreshMode.CC_OR_PRIMARY_429 and bool(account.get("cc_refresh_token"))
+
+    if not refresh_token:
+        return TokenExchangeResult(success=False, error="no_refresh_token")
+
+    # ------------------------------------------------------------------
+    # 3. Determine which lock to acquire
+    # ------------------------------------------------------------------
+    if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
+        lock = _get_refresh_lock(account_id)
+    else:
+        # CC and CC_OR_PRIMARY_429 both use the CC lock
+        lock = _get_cc_refresh_lock(account_id)
+
+    # ------------------------------------------------------------------
+    # 4. Acquire lock and execute under it
+    # ------------------------------------------------------------------
+    async with lock:
+        # 4a. Re-read account under lock
+        account = db.get_account(account_id)
+        if not account:
+            return TokenExchangeResult(success=False, error="account_not_found")
+
+        # 4c. Check circuit breaker (PRIMARY_CIRCUIT_BREAKER only)
+        if mode == RefreshMode.PRIMARY_CIRCUIT_BREAKER:
+            last_failed = account.get("refresh_last_failed_at")
+            failure_type = account.get("refresh_failure_type")
+            if last_failed is not None:
+                cooldown = CIRCUIT_BREAKER_COOLDOWNS.get(failure_type, _DEFAULT_CB_COOLDOWN)
+                remaining = cooldown - (time.time() - last_failed)
+                if remaining > 0:
+                    logger.info(
+                        "Account %d: circuit breaker active (%s, %ds remaining)",
+                        account_id, failure_type, int(remaining),
+                    )
+                    return TokenExchangeResult(success=False, error="circuit_breaker")
+                else:
+                    logger.info(
+                        "Account %d: circuit breaker cooldown expired, re-attempting refresh",
+                        account_id,
+                    )
+
+        # 4d. Re-read refresh token under lock — detect if another coroutine refreshed
+        if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
+            current_refresh = account.get("refresh_token")
+        elif mode == RefreshMode.CC:
+            current_refresh = account.get("cc_refresh_token")
+        else:
+            current_refresh = account.get("cc_refresh_token") or account.get("refresh_token")
+
+        if current_refresh and current_refresh != refresh_token:
+            logger.info("Account %d: token already refreshed by another path", account_id)
+            # Return the new access token
+            if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
+                return TokenExchangeResult(
+                    success=True, access_token=account.get("access_token"),
+                )
+            else:
+                return TokenExchangeResult(
+                    success=True, access_token=account.get("cc_access_token"),
+                )
+
+        # 4e. Determine timeout
+        if mode in (RefreshMode.PRIMARY, RefreshMode.CC):
+            timeout = 30.0
+        else:
+            timeout = 15.0
+
+        # 4f. Exchange refresh token
+        result = await _exchange_refresh_token(refresh_token, timeout=timeout)
+
+        # ------------------------------------------------------------------
+        # 4g. On success — single atomic DB write
+        # ------------------------------------------------------------------
+        if result.success:
+            new_expires_at = int(time.time()) + result.expires_in
+
+            if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
+                updates = {
+                    "access_token": result.access_token,
+                    "refresh_token": result.refresh_token,
+                    "expires_at": new_expires_at,
+                    "refresh_last_failed_at": None,
+                    "refresh_failure_type": None,
+                }
+            elif mode == RefreshMode.CC:
+                updates = {
+                    "cc_access_token": result.access_token,
+                    "cc_refresh_token": result.refresh_token,
+                    "cc_expires_at": new_expires_at,
+                    "refresh_last_failed_at": None,
+                    "refresh_failure_type": None,
+                }
+            elif mode == RefreshMode.CC_OR_PRIMARY_429:
+                if used_cc:
+                    updates = {
+                        "cc_access_token": result.access_token,
+                        "cc_refresh_token": result.refresh_token,
+                        "cc_expires_at": new_expires_at,
+                        "refresh_last_failed_at": None,
+                        "refresh_failure_type": None,
+                    }
+                else:
+                    updates = {
+                        "access_token": result.access_token,
+                        "refresh_token": result.refresh_token,
+                        "expires_at": new_expires_at,
+                        "refresh_last_failed_at": None,
+                        "refresh_failure_type": None,
+                    }
+
+            # DB retry 3x with exponential backoff
+            db_updated = False
+            for attempt in range(3):
+                try:
+                    db.update_account(account_id, **updates)
+                    db_updated = True
+                    break
+                except Exception as db_err:
+                    logger.warning(
+                        "DB update attempt %d/3 failed for account %d: %s",
+                        attempt + 1, account_id, db_err,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.1 * (2 ** attempt))
+
+            if not db_updated:
+                logger.error(
+                    "Token refresh succeeded but DB update FAILED for account %d after 3 attempts.",
+                    account_id,
+                )
+                return TokenExchangeResult(success=False, error="db_write_failed")
+
+            logger.info("Account %d: %s token refreshed", account_id, mode.value)
+
+            # 4h. Post-DB-write actions (still under lock)
+            if mode == RefreshMode.CC_OR_PRIMARY_429:
+                try:
+                    from jacked.api.credential_helpers import (
+                        acquire_claude_lock,
+                        read_platform_credentials,
+                        sync_credential_to_all_stores,
+                    )
+                    live = read_platform_credentials()
+                    if live and live.get("_jackedAccountId") == account_id:
+                        with acquire_claude_lock() as locked:
+                            if locked:
+                                updated_account = db.get_account(account_id)
+                                if updated_account:
+                                    sync_credential_to_all_stores(
+                                        account_id, updated_account,
+                                        email=updated_account.get("email"),
+                                    )
+                except Exception as cred_err:
+                    logger.warning(
+                        "Account %d: credential store sync failed (non-fatal): %s",
+                        account_id, cred_err,
+                    )
+
+            if mode == RefreshMode.PRIMARY:
+                try:
+                    await fetch_profile(account_id, db, access_token=result.access_token)
+                except Exception as prof_err:
+                    logger.warning(
+                        "Account %d: post-refresh profile fetch failed (non-fatal): %s",
+                        account_id, prof_err,
+                    )
+
+            # 4i. Return success
+            return TokenExchangeResult(
+                success=True,
+                access_token=result.access_token,
+                refresh_token=result.refresh_token,
+                expires_in=result.expires_in,
+            )
+
+        # ------------------------------------------------------------------
+        # 4j. On invalid_grant
+        # ------------------------------------------------------------------
+        if result.error == "invalid_grant":
+            if mode in (RefreshMode.CC, RefreshMode.CC_OR_PRIMARY_429):
+                # Attempt live credential recovery (access token ONLY, NOT refresh token)
+                try:
+                    from jacked.api.credential_helpers import read_platform_credentials
+                    live = read_platform_credentials()
+                    if not live:
+                        cred_path = Path.home() / ".claude" / ".credentials.json"
+                        if cred_path.exists() and not cred_path.is_symlink():
+                            try:
+                                live = json.loads(cred_path.read_text(encoding="utf-8"))
+                            except (json.JSONDecodeError, OSError):
+                                live = None
+
+                    if live and live.get("_jackedAccountId") == account_id:
+                        oauth = live.get("claudeAiOauth", {})
+                        live_access = oauth.get("accessToken")
+                        live_expires = oauth.get("expiresAt")
+                        if live_access:
+                            live_exp_s = (
+                                int(live_expires / 1000) if live_expires and live_expires > 1e12
+                                else int(live_expires) if live_expires else None
+                            )
+                            recovery_updates: dict = {"cc_access_token": live_access}
+                            if live_exp_s:
+                                recovery_updates["cc_expires_at"] = live_exp_s
+                            # SAFETY: Never import cc_refresh_token during invalid_grant
+                            recovery_updates["refresh_last_failed_at"] = int(time.time())
+                            recovery_updates["refresh_failure_type"] = "invalid_grant"
+                            db.update_account(account_id, **recovery_updates)
+                            logger.info(
+                                "Account %d: invalid_grant — recovered cc_access_token from live credentials",
+                                account_id,
+                            )
+                            return TokenExchangeResult(success=True, access_token=live_access)
+                except Exception:
+                    pass  # Fall through to no-recovery path
+
+                # No recovery — clear cc_refresh_token + set circuit breaker
+                db.update_account(
+                    account_id,
+                    cc_refresh_token=None,
+                    refresh_last_failed_at=int(time.time()),
+                    refresh_failure_type="invalid_grant",
+                )
+                logger.warning(
+                    "Account %d: invalid_grant — clearing cc_refresh_token (no recovery)",
+                    account_id,
+                )
+
+            elif mode == RefreshMode.PRIMARY_CIRCUIT_BREAKER:
+                db.update_account(
+                    account_id,
+                    refresh_last_failed_at=int(time.time()),
+                    refresh_failure_type="invalid_grant",
+                )
+                logger.warning(
+                    "Account %d: primary refresh token is dead (invalid_grant) — cooldown %ds",
+                    account_id, CIRCUIT_BREAKER_COOLDOWNS["invalid_grant"],
+                )
+
+            elif mode == RefreshMode.PRIMARY:
+                db.update_account(
+                    account_id,
+                    refresh_last_failed_at=int(time.time()),
+                    refresh_failure_type="invalid_grant",
+                )
+                db.record_account_error(account_id, "Refresh token consumed (will retry)")
+
+            return TokenExchangeResult(success=False, error="invalid_grant")
+
+        # ------------------------------------------------------------------
+        # 4k. On other errors — set circuit breaker cooldown
+        # ------------------------------------------------------------------
+        cooldown = CIRCUIT_BREAKER_COOLDOWNS.get(result.error, _DEFAULT_CB_COOLDOWN)
+        db.update_account(
+            account_id,
+            refresh_last_failed_at=int(time.time()),
+            refresh_failure_type=result.error,
+        )
+        logger.warning(
+            "Account %d: refresh failed (%s) — cooldown %ds",
+            account_id, result.error, cooldown,
+        )
+        return result
+
+
+# COMPAT: kept until Task 3 migrates _try_refresh_primary_token to _refresh_token_flow
+_primary_refresh_state: dict[int, dict] = {}
+
+
+def _get_primary_refresh_state(account_id: int) -> dict:
+    if account_id not in _primary_refresh_state:
+        _primary_refresh_state[account_id] = {
+            "last_failed_at": 0.0,
+            "dead": False,
+        }
+    return _primary_refresh_state[account_id]
+
+
 def _get_usage_state(account_id: int) -> dict:
     """Get or create per-account usage coordinator state."""
     if account_id not in _account_usage_state:
@@ -156,17 +485,6 @@ def _get_usage_state(account_id: int) -> dict:
         state["consecutive_429s"] = 0
     return state
 
-
-_primary_refresh_state: dict[int, dict] = {}
-
-
-def _get_primary_refresh_state(account_id: int) -> dict:
-    if account_id not in _primary_refresh_state:
-        _primary_refresh_state[account_id] = {
-            "last_failed_at": 0.0,
-            "dead": False,
-        }
-    return _primary_refresh_state[account_id]
 
 
 def compute_urgency_tier(

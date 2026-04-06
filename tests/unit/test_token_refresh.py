@@ -142,3 +142,23 @@ class TestRecordDecisionReturnsId:
             reason="third",
         )
         assert id1 < id2 < id3
+
+
+# ---------------------------------------------------------------------------
+# RefreshMode enum and cooldown constants
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshMode:
+    def test_refresh_mode_enum_values(self):
+        from jacked.web.auth import RefreshMode
+        assert RefreshMode.PRIMARY.value == "primary"
+        assert RefreshMode.CC.value == "cc"
+        assert RefreshMode.CC_OR_PRIMARY_429.value == "cc_429"
+        assert RefreshMode.PRIMARY_CIRCUIT_BREAKER.value == "primary_cb"
+
+    def test_cooldown_constants_exist(self):
+        from jacked.web.auth import CIRCUIT_BREAKER_COOLDOWNS
+        assert "invalid_grant" in CIRCUIT_BREAKER_COOLDOWNS
+        assert CIRCUIT_BREAKER_COOLDOWNS["invalid_grant"] == 600
+        assert CIRCUIT_BREAKER_COOLDOWNS["network_error"] == 60
