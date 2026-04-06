@@ -270,6 +270,11 @@ class TestHealLoop:
 
 
 class TestReconciliationSafetyGuard:
+    def setup_method(self):
+        """Invalidate the live credential cache before each test."""
+        from jacked.api.credential_helpers import invalidate_live_cred_cache
+        invalidate_live_cred_cache()
+
     def test_skips_cc_refresh_token_when_invalid_grant(self, tmp_path):
         """reconcile_credentials_from_live_store must NOT import cc_refresh_token
         when circuit breaker failure type is invalid_grant."""

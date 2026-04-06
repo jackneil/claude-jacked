@@ -995,6 +995,25 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     }
 
     accounts = db.list_accounts(include_inactive=False)
+
+    # Periodic reconciliation for active account
+    try:
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+        from jacked.api.credential_helpers import read_platform_credentials
+        live = read_platform_credentials()
+        if not live:
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    live = json.loads(cred_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    live = None
+        active_id = live.get("_jackedAccountId") if live else None
+        if active_id:
+            reconcile_credentials_from_live_store(active_id, db)
+    except Exception:
+        logger.debug("Periodic credential reconciliation failed", exc_info=True)
+
     for account in accounts:
         result["checked"] += 1
         account_id = account["id"]

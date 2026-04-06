@@ -296,7 +296,37 @@ def read_fresh_active_token(account_id: int) -> str | None:
     return None
 
 
-def reconcile_outgoing_credentials(account_id: int, db) -> None:
+# ---------------------------------------------------------------------------
+# Cache for live credential reads (30s TTL)
+# ---------------------------------------------------------------------------
+
+_live_cred_cache: dict = {"account_id": None, "data": None, "expires_at": 0.0}
+
+
+def _get_cached_live_credentials(account_id: int):
+    """Return cached live credentials if fresh, else None."""
+    if (_live_cred_cache["account_id"] == account_id
+            and time.time() < _live_cred_cache["expires_at"]
+            and _live_cred_cache["data"] is not None):
+        return _live_cred_cache["data"]
+    return None
+
+
+def _cache_live_credentials(account_id: int, data: dict | None):
+    """Cache live credential read for 30 seconds."""
+    _live_cred_cache["account_id"] = account_id
+    _live_cred_cache["data"] = data
+    _live_cred_cache["expires_at"] = time.time() + 30.0
+
+
+def invalidate_live_cred_cache():
+    """Invalidate the cache (call on swap)."""
+    _live_cred_cache["account_id"] = None
+    _live_cred_cache["data"] = None
+    _live_cred_cache["expires_at"] = 0.0
+
+
+def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     """Read live credentials for the active account and reconcile with DB.
 
     Before swapping away from an account, check if Claude Code rotated
@@ -305,17 +335,27 @@ def reconcile_outgoing_credentials(account_id: int, db) -> None:
 
     Called before sync_credential_to_all_stores() in the swap path and
     in the use_account endpoint.
+
+    SAFETY: Never imports cc_refresh_token when circuit breaker shows
+    invalid_grant — the live token is Claude Code's active token and
+    importing+exchanging it would destroy CC's session.
     """
-    # Read live credentials (Keychain first, file fallback)
-    live = read_platform_credentials()
+    # Check cache first to avoid Keychain subprocess calls
+    live = _get_cached_live_credentials(account_id)
+
     if not live:
-        # Fall back to .credentials.json
-        cred_path = Path.home() / ".claude" / ".credentials.json"
-        if cred_path.exists() and not cred_path.is_symlink():
-            try:
-                live = json.loads(cred_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                return
+        # Read live credentials (Keychain first, file fallback)
+        live = read_platform_credentials()
+        if not live:
+            # Fall back to .credentials.json
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    live = json.loads(cred_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    return
+        # Cache the result (even if None would be returned early below)
+        _cache_live_credentials(account_id, live)
 
     if not live:
         return
@@ -351,17 +391,26 @@ def reconcile_outgoing_credentials(account_id: int, db) -> None:
         if live_expires_s != account.get("cc_expires_at"):
             updates["cc_expires_at"] = live_expires_s
 
-    # Reconcile refresh token
+    # Reconcile refresh token — BUT skip if circuit breaker shows invalid_grant
+    # Importing a live CC refresh token during invalid_grant would compete with
+    # Claude Code for the single-use token, destroying CC's session.
     if live_refresh:
-        if db_cc_refresh is None:
-            # Recovery: our token was cleared (invalid_grant) but Claude Code has one
+        account_row = account
+        cb_failure = account_row.get("refresh_failure_type") if account_row else None
+        if cb_failure == "invalid_grant":
+            logger.debug(
+                "Account %d: skipping cc_refresh_token import (invalid_grant active)",
+                account_id,
+            )
+        elif db_cc_refresh is None:
+            # Recovery: our token was cleared but Claude Code has one
             logger.info(
                 "Account %d: recovering cc_refresh_token from live credentials",
                 account_id,
             )
             updates["cc_refresh_token"] = live_refresh
         elif live_refresh != db_cc_refresh:
-            # Rotation: Claude Code got a new token, update ours
+            # Rotation: Claude Code got a new token
             logger.info(
                 "Account %d: importing rotated cc_refresh_token from live credentials",
                 account_id,
@@ -374,6 +423,10 @@ def reconcile_outgoing_credentials(account_id: int, db) -> None:
             "Account %d: reconciled %d credential field(s) from live store",
             account_id, len(updates),
         )
+
+
+# Backward-compatible alias
+reconcile_outgoing_credentials = reconcile_credentials_from_live_store
 
 
 def write_platform_credentials(data: dict) -> bool:

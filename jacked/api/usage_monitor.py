@@ -212,7 +212,8 @@ async def _execute_swap(
 
     from jacked.api.credential_helpers import (
         acquire_claude_lock,
-        reconcile_outgoing_credentials,
+        invalidate_live_cred_cache,
+        reconcile_credentials_from_live_store,
         sync_credential_to_all_stores,
     )
     from jacked.web.auto_swap import format_account_label
@@ -240,7 +241,7 @@ async def _execute_swap(
     )
 
     # 3. Reconcile outgoing credentials
-    reconcile_outgoing_credentials(active_acct_id, db)
+    reconcile_credentials_from_live_store(active_acct_id, db)
 
     # 4. Write incoming credentials under cross-process lock
     credential_ok = False
@@ -257,13 +258,16 @@ async def _execute_swap(
                 "(account %d -> %d)", active_acct_id, target["id"],
             )
 
-    # 5. Clean up burn-rate state
+    # 5. Invalidate live credential cache (new account is active now)
+    invalidate_live_cred_cache()
+
+    # 6. Clean up burn-rate state
     _burn_rates.pop(active_acct_id, None)
     _burn_rate_unchanged_ticks.pop(active_acct_id, None)
     _burn_rates.pop(target["id"], None)
     _burn_rate_unchanged_ticks.pop(target["id"], None)
 
-    # 6. Broadcast via WebSocket
+    # 7. Broadcast via WebSocket
     if ws_registry:
         await ws_registry.broadcast(
             "auto_swap_triggered",

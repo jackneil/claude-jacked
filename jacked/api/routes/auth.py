@@ -263,9 +263,44 @@ def _not_found(detail: str):
     )
 
 
-def _account_to_response(row: dict) -> AccountResponse:
+_active_account_cache: dict = {"id": None, "expires_at": 0.0}
+
+
+def _get_active_account_id_cached() -> int | None:
+    """Get active account ID from credential file, cached 30s."""
+    if time.time() < _active_account_cache["expires_at"]:
+        return _active_account_cache["id"]
+    try:
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+        if cred_path.exists():
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+            _active_account_cache["id"] = data.get("_jackedAccountId")
+            _active_account_cache["expires_at"] = time.time() + 30.0
+            return _active_account_cache["id"]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _account_to_response(row: dict, db=None) -> AccountResponse:
     """Convert a DB account row to an API response with computed fields."""
     now = int(time.time())
+
+    # On-demand credential reconciliation for active account
+    # If CC tokens are missing/expired, try importing from live store
+    if db is not None:
+        _active_id = _get_active_account_id_cached()
+        if row["id"] == _active_id and (
+            row.get("cc_refresh_token") is None
+            or (row.get("cc_expires_at") or 0) < now
+        ):
+            try:
+                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                reconcile_credentials_from_live_store(row["id"], db)
+                row = db.get_account(row["id"]) or row  # Re-read after reconciliation
+            except Exception:
+                pass
+
     # Build response without access_token or refresh_token (never expose)
     return AccountResponse(
         id=row["id"],
@@ -396,7 +431,7 @@ async def list_accounts(request: Request, include_inactive: bool = False):
         return _db_unavailable()
 
     rows = db.list_accounts(include_inactive=include_inactive)
-    return [_account_to_response(row) for row in rows]
+    return [_account_to_response(row, db=db) for row in rows]
 
 
 @router.patch("/accounts/{account_id}")
@@ -844,11 +879,11 @@ async def use_account(account_id: int, request: Request):
 
     # Reconcile outgoing account's credentials before writing new ones —
     # captures any token rotation by Claude Code during the outgoing session.
-    from jacked.api.credential_helpers import reconcile_outgoing_credentials
+    from jacked.api.credential_helpers import reconcile_credentials_from_live_store
     from jacked.api.usage_monitor import _read_active_account_id
     outgoing_id = _read_active_account_id()
     if outgoing_id and outgoing_id != account_id:
-        reconcile_outgoing_credentials(outgoing_id, db)
+        reconcile_credentials_from_live_store(outgoing_id, db)
 
     # SAFETY: This is a user-initiated, one-shot credential write — NOT a
     # background loop.  The design spec (2026-03-24-kill-background-credential-
