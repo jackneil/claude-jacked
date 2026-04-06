@@ -191,18 +191,27 @@ async def _refresh_token_flow(
     else:
         refresh_token = None
 
-    used_cc = mode == RefreshMode.CC_OR_PRIMARY_429 and bool(account.get("cc_refresh_token"))
-
     if not refresh_token:
         return TokenExchangeResult(success=False, error="no_refresh_token")
 
+    # Track whether CC_OR_PRIMARY_429 is using CC or primary token
+    # (determines which DB columns to update on success)
+    used_cc = mode == RefreshMode.CC_OR_PRIMARY_429 and bool(account.get("cc_refresh_token"))
+
     # ------------------------------------------------------------------
     # 3. Determine which lock to acquire
+    # Lock rule: all callers sharing a token set share the same lock.
+    # CC_OR_PRIMARY_429 falls back to primary when cc_refresh_token is
+    # absent — in that case, use the primary lock to prevent races with
+    # PRIMARY/PRIMARY_CIRCUIT_BREAKER callers.
     # ------------------------------------------------------------------
     if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
         lock = _get_refresh_lock(account_id)
+    elif mode == RefreshMode.CC_OR_PRIMARY_429 and not used_cc:
+        # Falling back to primary token — use primary lock
+        lock = _get_refresh_lock(account_id)
     else:
-        # CC and CC_OR_PRIMARY_429 both use the CC lock
+        # CC and CC_OR_PRIMARY_429 (with CC token) use the CC lock
         lock = _get_cc_refresh_lock(account_id)
 
     # ------------------------------------------------------------------
@@ -213,6 +222,11 @@ async def _refresh_token_flow(
         account = db.get_account(account_id)
         if not account:
             return TokenExchangeResult(success=False, error="account_not_found")
+
+        # Recompute used_cc under lock — another coroutine may have cleared
+        # cc_refresh_token between our pre-lock read and lock acquisition.
+        if mode == RefreshMode.CC_OR_PRIMARY_429:
+            used_cc = bool(account.get("cc_refresh_token"))
 
         # 4c. Check circuit breaker (PRIMARY_CIRCUIT_BREAKER only)
         if mode == RefreshMode.PRIMARY_CIRCUIT_BREAKER:
