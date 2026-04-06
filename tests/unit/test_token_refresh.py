@@ -209,3 +209,119 @@ class TestRefreshAccountTokenPolicy:
 
         row = db.get_account(acct["id"])
         assert row["validation_status"] == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# Heal loop fixes: circuit breaker clearing + no should_refresh gate
+# ---------------------------------------------------------------------------
+
+
+class TestHealLoop:
+    def test_heal_clears_circuit_breaker(self, tmp_path):
+        """heal_invalid_accounts clears CB state before attempting recovery."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock
+        from jacked.web.auth import heal_invalid_accounts
+
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("heal@test.com", "tok", int(time.time()) + 3600,
+                                 refresh_token="rt-test")
+        db.update_account(acct["id"],
+                          validation_status="invalid",
+                          refresh_last_failed_at=int(time.time()),
+                          refresh_failure_type="invalid_grant")
+
+        # Mock refresh to succeed; mock Database() to return our test db
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.web.auth.refresh_account_token",
+                   new_callable=AsyncMock, return_value=True):
+            result = asyncio.run(heal_invalid_accounts())
+
+        assert result["healed"] == 1
+        row = db.get_account(acct["id"])
+        # Circuit breaker should be cleared
+        assert row["refresh_last_failed_at"] is None
+        assert row["refresh_failure_type"] is None
+
+    def test_heal_attempts_refresh_even_if_not_expiring(self, tmp_path):
+        """Heal loop should attempt refresh even if token hasn't expired (no should_refresh gate)."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock
+        from jacked.web.auth import heal_invalid_accounts
+
+        db = Database(str(tmp_path / "test.db"))
+        # Token expires in 1 hour - should_refresh would return False
+        acct = db.create_account("heal@test.com", "tok", int(time.time()) + 3600,
+                                 refresh_token="rt-test")
+        db.update_account(acct["id"], validation_status="invalid")
+
+        mock_refresh = AsyncMock(return_value=True)
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.web.auth.refresh_account_token", mock_refresh):
+            asyncio.run(heal_invalid_accounts())
+
+        # Should have attempted refresh even though token isn't near expiry
+        mock_refresh.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation safety guard: skip cc_refresh_token on invalid_grant
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliationSafetyGuard:
+    def test_skips_cc_refresh_token_when_invalid_grant(self, tmp_path):
+        """reconcile_credentials_from_live_store must NOT import cc_refresh_token
+        when circuit breaker failure type is invalid_grant."""
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("recon@test.com", "tok", int(time.time()) + 3600)
+        db.update_account(acct["id"],
+                          refresh_last_failed_at=int(time.time()),
+                          refresh_failure_type="invalid_grant",
+                          cc_access_token="old-access",
+                          cc_refresh_token=None)
+
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+        from unittest.mock import patch
+
+        live_creds = {
+            "_jackedAccountId": acct["id"],
+            "claudeAiOauth": {
+                "accessToken": "new-access-from-cc",
+                "refreshToken": "dangerous-refresh-token",
+                "expiresAt": (int(time.time()) + 3600) * 1000,
+            }
+        }
+        with patch("jacked.api.credential_helpers.read_platform_credentials",
+                   return_value=live_creds):
+            reconcile_credentials_from_live_store(acct["id"], db)
+
+        row = db.get_account(acct["id"])
+        assert row["cc_access_token"] == "new-access-from-cc"
+        assert row["cc_refresh_token"] is None  # Must NOT be imported
+
+    def test_imports_cc_refresh_token_when_no_invalid_grant(self, tmp_path):
+        """When circuit breaker is not invalid_grant, cc_refresh_token IS imported."""
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("recon@test.com", "tok", int(time.time()) + 3600)
+        db.update_account(acct["id"],
+                          cc_access_token="old-access",
+                          cc_refresh_token=None)  # No circuit breaker set
+
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+        from unittest.mock import patch
+
+        live_creds = {
+            "_jackedAccountId": acct["id"],
+            "claudeAiOauth": {
+                "accessToken": "new-access",
+                "refreshToken": "new-refresh",
+                "expiresAt": (int(time.time()) + 3600) * 1000,
+            }
+        }
+        with patch("jacked.api.credential_helpers.read_platform_credentials",
+                   return_value=live_creds):
+            reconcile_credentials_from_live_store(acct["id"], db)
+
+        row = db.get_account(acct["id"])
+        assert row["cc_refresh_token"] == "new-refresh"  # Should be imported

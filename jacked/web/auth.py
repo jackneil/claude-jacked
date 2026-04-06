@@ -1055,18 +1055,41 @@ async def heal_invalid_accounts() -> dict:
         result["checked"] += 1
         account_id = account["id"]
 
-        # Try refresh first if token is near/past expiry and has RT
+        # Try refresh first if has refresh token (no should_refresh gate —
+        # healing is recovery mode, always attempt regardless of token expiry)
         healed = False
-        if account.get("refresh_token") and should_refresh(account):
+        if account.get("refresh_token"):
             lock = _get_refresh_lock(account_id)
             if not lock.locked():
                 async with lock:
+                    # Clear circuit breaker state before recovery attempt
+                    logger.info(
+                        "Account %d: clearing circuit breaker for heal attempt",
+                        account_id,
+                    )
+                    db.update_account(
+                        account_id,
+                        refresh_last_failed_at=None,
+                        refresh_failure_type=None,
+                    )
                     success = await refresh_account_token(account_id, db)
                     if success:
                         healed = True
 
         if not healed:
-            # Validate via profile fetch
+            # Try reconciling from live credentials before validate
+            try:
+                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                reconcile_credentials_from_live_store(account_id, db)
+            except ImportError:
+                try:
+                    from jacked.api.credential_helpers import reconcile_outgoing_credentials
+                    reconcile_outgoing_credentials(account_id, db)
+                except (ImportError, Exception):
+                    pass
+            except Exception:
+                logger.debug("Credential reconciliation failed for account %d", account_id)
+
             validation = await validate_account(account_id, db)
             healed = validation.get("valid", False)
 
