@@ -920,27 +920,50 @@ async def use_account(account_id: int, request: Request):
         )
 
         # Record in decision_log with full detail
-        db.record_decision(
+        _manual_detail = {
+            "source": "dashboard",
+            "previous_account_id": outgoing_id,
+            "active": {
+                "id": account_id,
+                "email": account.get("email", ""),
+                "label": format_account_label(account),
+            },
+            "previous": {
+                "id": outgoing_id,
+                "email": prev_acct.get("email", "") if prev_acct else "",
+                "label": format_account_label(prev_acct) if prev_acct else "",
+            } if outgoing_id else None,
+        }
+        decision_id = db.record_decision(
             account_id=account_id,
             action="manual_switch",
             trigger="manual",
             target_id=account_id,
             reason=reason,
-            detail={
-                "source": "dashboard",
-                "previous_account_id": outgoing_id,
-                "active": {
-                    "id": account_id,
-                    "email": account.get("email", ""),
-                    "label": format_account_label(account),
-                },
-                "previous": {
-                    "id": outgoing_id,
-                    "email": prev_acct.get("email", "") if prev_acct else "",
-                    "label": format_account_label(prev_acct) if prev_acct else "",
-                } if outgoing_id else None,
-            },
+            detail=_manual_detail,
         )
+
+        # Broadcast decision log entry
+        ws_registry = getattr(request.app.state, "ws_registry", None)
+        if ws_registry and decision_id:
+            from datetime import datetime, timezone
+            try:
+                await ws_registry.broadcast(
+                    "decision_log_entry",
+                    {
+                        "id": decision_id,
+                        "account_id": account_id,
+                        "email": account.get("email", ""),
+                        "label": format_account_label(account),
+                        "action": "manual_switch",
+                        "trigger": "manual",
+                        "reason": reason,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "detail": _manual_detail,
+                    },
+                )
+            except Exception:
+                logger.debug("Decision log WS broadcast failed", exc_info=True)
 
         # Broadcast via WebSocket so dashboard updates live
         ws_registry = getattr(request.app.state, "ws_registry", None)

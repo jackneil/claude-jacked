@@ -307,6 +307,10 @@ async def active_account_poll_loop(app):
     """
     global _last_exhaustion_warning, _last_swap_time
 
+    _poll_interval: float = 60.0
+    _poll_tier: str = "unknown"
+    _last_tick_at: float = 0.0
+
     while True:
         try:
             db = getattr(app.state, "db", None)
@@ -415,6 +419,13 @@ async def active_account_poll_loop(app):
                 await asyncio.sleep(60)
                 continue
 
+            # Compute adaptive poll interval BEFORE broadcast so the
+            # frontend receives _poll_interval / _poll_tier / _last_poll_at
+            # and can count down accurately instead of guessing.
+            _poll_interval, _poll_tier = _compute_poll_interval(
+                active_acct_id, db, _burn_rates,
+            )
+
             # Push fresh usage data to connected dashboards so the
             # countdown timer and usage bars update immediately.
             _ws = getattr(app.state, "ws_registry", None)
@@ -437,6 +448,9 @@ async def active_account_poll_loop(app):
                     k: v for k, v in active_acct.items()
                     if k in _WS_SAFE_FIELDS
                 }
+                safe_acct["_poll_interval"] = int(_poll_interval)
+                safe_acct["_poll_tier"] = _poll_tier
+                safe_acct["_last_poll_at"] = int(time.time())
                 await _ws.broadcast(
                     "usage_poll_updated",
                     {
@@ -591,11 +605,26 @@ async def active_account_poll_loop(app):
                                 proactive_target_id=None,
                                 cooldown_active=True, decision="stay",
                             )
-                            db.record_decision(
+                            _cooldown_decision_id = db.record_decision(
                                 account_id=active_acct_id, action="stay",
                                 trigger="tick", target_id=target["id"],
                                 reason=_decision_reason, detail=_tick_detail,
                             )
+                            if ws_registry and _cooldown_decision_id:
+                                await ws_registry.broadcast(
+                                    "decision_log_entry",
+                                    {
+                                        "id": _cooldown_decision_id,
+                                        "account_id": active_acct_id,
+                                        "email": active_acct.get("email", ""),
+                                        "label": format_account_label(active_acct),
+                                        "action": "stay",
+                                        "trigger": "tick",
+                                        "reason": _decision_reason,
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "detail": _tick_detail,
+                                    },
+                                )
                         except Exception:
                             pass
                         await asyncio.sleep(60)
@@ -914,7 +943,7 @@ async def active_account_poll_loop(app):
                         cooldown_active=(time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS,
                         decision=_decision_action,
                     )
-                    db.record_decision(
+                    decision_id = db.record_decision(
                         account_id=active_acct_id,
                         action=_decision_action,
                         trigger=(
@@ -926,6 +955,28 @@ async def active_account_poll_loop(app):
                         reason=_decision_reason or "no trigger",
                         detail=_tick_detail,
                     )
+                    if ws_registry and decision_id:
+                        try:
+                            await ws_registry.broadcast(
+                                "decision_log_entry",
+                                {
+                                    "id": decision_id,
+                                    "account_id": active_acct_id,
+                                    "email": active_acct.get("email", ""),
+                                    "label": format_account_label(active_acct),
+                                    "action": _decision_action,
+                                    "trigger": (
+                                        ("proactive_7d" if _proactive_target_id else "auto_swap")
+                                        if _decision_action == "swap"
+                                        else "tick"
+                                    ),
+                                    "reason": _decision_reason or "no trigger",
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "detail": _tick_detail,
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Decision log WS broadcast failed", exc_info=True)
                 except Exception:
                     logger.debug("Failed to record decision", exc_info=True)
 
@@ -944,9 +995,15 @@ async def active_account_poll_loop(app):
         except Exception:
             logger.warning("Active account poll loop error", exc_info=True)
 
-        _poll_interval, _poll_tier = _compute_poll_interval(
-            _read_active_account_id(), db, _burn_rates,
-        )
+        # Watchdog: detect if the event loop was blocked or suspended
+        now_tick = time.time()
+        if _last_tick_at > 0 and _poll_interval > 0 and (now_tick - _last_tick_at) > 2 * _poll_interval:
+            logger.warning(
+                "Active poll loop delayed — last tick %ds ago, expected interval %ds",
+                int(now_tick - _last_tick_at), int(_poll_interval),
+            )
+        _last_tick_at = now_tick
+
         logger.debug("Active poll: tier=%s interval=%.0fs", _poll_tier, _poll_interval)
         await asyncio.sleep(_poll_interval)
 
