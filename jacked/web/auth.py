@@ -717,7 +717,24 @@ async def fetch_usage(
                             _retry_depth=_retry_depth + 1,
                         )
 
-                # Refresh failed or already retried — mark invalid
+                    # Refresh failed — try live credential import for active account
+                    try:
+                        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                        reconcile_credentials_from_live_store(account_id, db)
+                        refreshed_acct = db.get_account(account_id)
+                        if refreshed_acct:
+                            live_token = refreshed_acct.get("access_token")
+                            if live_token and live_token != token:
+                                state["last_fetched_at"] = 0
+                                return await fetch_usage(
+                                    account_id, db, access_token=live_token,
+                                    _retry_depth=_retry_depth + 1,
+                                )
+                    except Exception:
+                        logger.debug("Live credential import failed during 401 recovery",
+                                     exc_info=True)
+
+                # Refresh and live import both failed or already retried — mark invalid
                 error_msg = f"Usage fetch failed (HTTP {resp.status_code}) — token refresh failed"
                 db.update_account(
                     account_id,
