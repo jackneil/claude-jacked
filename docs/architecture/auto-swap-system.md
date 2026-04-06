@@ -1,6 +1,6 @@
 # Auto-Swap System Architecture
 
-**Last updated:** 2026-04-03
+**Last updated:** 2026-04-06
 **Status:** Living document — update when the system changes
 
 ## Purpose
@@ -33,7 +33,8 @@ If a different account is clearly better → swap.
 
 ### Constraints
 - **5h-to-7d burn rate cap:** Each 5h window can only burn a fraction of 7d capacity. With 17 working hours/day (06:00-23:00), that's ~3.4 windows/day, ~23.8 windows/week, so each window burns ~4.2% of 7d capacity at maximum.
-- **Active hours:** User works during configured hours (default 6 AM - 11 PM). Overnight hours don't count — the system uses `compute_effective_working_hours` which iterates day-by-day, counting only hours within [active_start, active_end).
+- **Active hours:** Normalized defaults are 06:00-23:00. The system uses `compute_effective_working_hours` which iterates day-by-day, counting only hours within [active_start, active_end). All pure-decision functions (`compute_burn_per_window`, `compute_7d_deficit`, `compute_urgency_threshold`, `has_viable_headroom`, `score_candidate`, `pick_best_target`) default their `active_start`/`active_end` params to `"06:00"`/`"23:00"`.
+- **Per-account opt-out:** Each account has an `auto_swap_enabled` flag (default 1). Accounts with `auto_swap_enabled == 0` are excluded from candidate selection in `pick_best_target`. The flag does not prevent an account from being the active account — it only prevents the system from swapping TO it.
 - **One account active at a time:** All Claude Code sessions share the same active account.
 
 ### 7-Day Deficit Model
@@ -73,7 +74,11 @@ recoverable                = min(unused_7d, windows_remaining × burn_per_window
 | 3 – 4 | MEDIUM | deficit > 2 × burn_per_window (~8%) | Several windows left but time is running out. |
 | 5+ | NORMAL | deficit > PROACTIVE_SWAP_THRESHOLD (15%) | Plenty of time. Only swap for significant deficits. |
 
-**Priority among urgent accounts:** When multiple accounts have expiring capacity, pick the one with the highest `urgency_score = recoverable / max(effective_hours_remaining, 0.5)`. This favors accounts where the most capacity is wasting per hour of inaction.
+**Urgency score** (first-class metric for proactive scheduling):
+```
+urgency_score = recoverable / max(effective_hours_remaining, 0.5)
+```
+When multiple accounts have expiring capacity, the system picks the one with the highest urgency score. This favors accounts where the most capacity is wasting per hour of inaction. The `0.5` floor prevents division-by-zero when an account is in its final minutes.
 
 **Active hours matter:** A 7d window expiring at 3 AM with the user at 10 PM has only 1 effective hour remaining (10-11 PM), not 5 calendar hours. The overnight gap means there's only 0.2 windows left — CRITICAL tier. `compute_effective_working_hours` handles this automatically.
 
@@ -89,7 +94,7 @@ recoverable                = min(unused_7d, windows_remaining × burn_per_window
 
 ```
 1. Fetch active account usage (adaptive interval)
-2. Push fresh data to dashboard via WebSocket
+2. Push fresh data to dashboard via WebSocket (usage_poll_updated)
 3. Compute: should I consider switching?
    a. Defensive triggers: 5h critical, 7d threshold, burn-rate projection
    b. Window-aware suppression: don't swap away if reset is imminent
@@ -110,7 +115,12 @@ recoverable                = min(unused_7d, windows_remaining × burn_per_window
    b. If no defensive trigger but best candidate has high 7d deficit
       AND active account is comfortable → proactive swap (uses same pick_best_target)
    c. Otherwise → stay
-6. Execute swap if decided (via `_execute_swap` helper):
+6. Record decision (ALL ticks — stay AND swap):
+   a. `db.record_decision()` returns the inserted row ID
+   b. Broadcast `decision_log_entry` via WebSocket with ID, action, reason, detail
+   c. Non-passing candidates include `skip_reason` in detail:
+      `near_exhaustion`, `recoverable_too_low`, `ahead_of_schedule`, `below_threshold`
+7. Execute swap if decided (via `_execute_swap` helper):
    a. Fetch fresh usage for target (on-demand, done by caller before execute)
    b. TOCTOU guard — re-read active account ID, abort if changed
    c. Record swap with reason + arm cooldown (audit trail survives credential failure)
@@ -186,8 +196,16 @@ The active account is polled at an interval determined by urgency:
 - `manual=True` bypasses ceiling (user clicked Refresh)
 - All callers go through the same entry point
 
+### 401 Auto-Refresh
+On HTTP 401/403 from the usage API, `fetch_usage` runs a recovery chain (single retry depth):
+1. **Primary token refresh:** `_try_refresh_primary_token` via `_refresh_token_flow(PRIMARY_CIRCUIT_BREAKER)`. Uses DB circuit breaker — will not attempt refresh if the circuit breaker is active (see Circuit Breaker section).
+2. **Live credential import:** If refresh fails, call `reconcile_credentials_from_live_store` to import tokens that Claude Code may have refreshed. If a fresh `access_token` is found, retry the usage fetch.
+3. **Mark invalid:** If both fail, mark the account `validation_status="invalid"`.
+
+Less aggressive invalid-marking: `refresh_account_token` requires 2 consecutive 401/403 failures before marking invalid (checks `refresh_failure_type` for prior `http_401`/`http_403`). First failure records the error and sets the circuit breaker cooldown but does NOT mark invalid.
+
 ### 429 Recovery
-1. **Token refresh:** Rate limits are per-access-token. Exchange refresh token for fresh access token (clears the rate limit). Uses cross-process lock compatible with Claude Code's `proper-lockfile`.
+1. **Token refresh:** Rate limits are per-access-token. Exchange refresh token for fresh access token (clears the rate limit) via `_try_refresh_on_429` → `_refresh_token_flow(CC_OR_PRIMARY_429)`.
 2. **Escalating backoff:** 65s → 130s → 260s → 520s → cap 900s on consecutive 429s
 3. **Tier override:** After 3+ consecutive 429s, force idle tier
 4. **Active-only credential write:** `sync_credential_to_all_stores` is only called when the refreshed account IS the currently active account. Writing credentials for a non-active account would overwrite `.credentials.json` and silently switch Claude Code to the wrong account. Non-active accounts get DB-only updates.
@@ -201,7 +219,7 @@ The active account is polled at an interval determined by urgency:
 ## Credential Management
 
 ### Before Every Swap
-1. **Reconcile outgoing:** Read live credentials from Keychain/file, import rotated tokens into DB
+1. **Reconcile outgoing:** `reconcile_credentials_from_live_store` reads live credentials from Keychain/file, imports rotated tokens into DB (see Live Credential Reconciliation section)
 2. **Write incoming:** `sync_credential_to_all_stores` writes to DB, `.credentials.json`, Keychain
 
 ### Token Priority
@@ -213,6 +231,99 @@ The active account is polled at an interval determined by urgency:
 - Before clearing `cc_refresh_token`, check live credential store
 - If Claude Code refreshed successfully, import the fresh token
 - Only clear if no live recovery available
+
+## Token Refresh Architecture
+
+All token refresh paths funnel through a single orchestrator: `_refresh_token_flow(account_id, db, mode)`.
+
+### `RefreshMode` Enum
+
+| Mode | Token Set | Lock | Timeout | Circuit Breaker | Cred Stores | Caller |
+|------|-----------|------|---------|-----------------|-------------|--------|
+| `PRIMARY` | primary | async per-account | 30s | No | No | `refresh_account_token` |
+| `CC` | cc | async per-account CC | 30s | No | No | `refresh_cc_token` |
+| `CC_OR_PRIMARY_429` | cc → primary | cross-process | 15s | No | If active | `_try_refresh_on_429` |
+| `PRIMARY_CIRCUIT_BREAKER` | primary | async per-account | 15s | Yes | No | `_try_refresh_primary_token` |
+
+### Lock Sharing
+- **CC modes** (`CC`, `CC_OR_PRIMARY_429`): share the CC lock (`_get_cc_refresh_lock(account_id)`)
+- **PRIMARY modes** (`PRIMARY`, `PRIMARY_CIRCUIT_BREAKER`): share the primary lock (`_get_refresh_lock(account_id)`)
+- **Lock nesting for `CC_OR_PRIMARY_429`:** Acquires the async CC lock first, then if the active account, acquires the cross-process Claude lock (`os.mkdir(~/.claude.lock)`) for credential store writes. This order prevents deadlocks.
+
+### Flow Steps (inside `_refresh_token_flow`)
+1. Read account from DB
+2. Resolve which refresh token to use (based on mode)
+3. Acquire the appropriate lock
+4. Re-read account under lock (detect if another coroutine already refreshed)
+5. Check circuit breaker (`PRIMARY_CIRCUIT_BREAKER` only)
+6. Exchange via `_exchange_refresh_token` (low-level POST helper, unchanged)
+7. On success: atomic DB write with retry (3x exponential backoff, always on)
+8. On failure: record circuit breaker state in DB (for CB-enabled modes)
+
+### DB Retry
+All modes use 3x exponential backoff for the DB write after a successful token exchange. This prevents a transient SQLite lock from wasting a successfully-exchanged token.
+
+### `_exchange_refresh_token`
+The low-level POST helper. Sends `grant_type=refresh_token` to Anthropic's OAuth endpoint. Returns `TokenExchangeResult` with success/failure, new tokens, error type, and status code. Not modified by the refactor — all behavioral differences live in `_refresh_token_flow`.
+
+## Circuit Breaker
+
+Prevents repeated refresh attempts against tokens that are known-bad. DB-persisted (survives restarts) via two columns on the `accounts` table:
+
+- `refresh_last_failed_at` — Unix timestamp of last failure (or NULL if healthy)
+- `refresh_failure_type` — Error classification string (or NULL if healthy)
+
+### Scaled Cooldowns by Error Type
+
+| Error Type | Cooldown | Rationale |
+|-----------|----------|-----------|
+| `invalid_grant` | 600s (10 min) | Token is revoked — retrying wastes quota and risks rate limits |
+| `network_error` | 60s (1 min) | Transient — retry quickly |
+| `http_429` | 120s (2 min) | Rate limited — give upstream time to recover |
+| `http_5xx` | 120s (2 min) | Server error — moderate wait |
+| (default) | 300s (5 min) | Unknown error — conservative fallback |
+
+### No Permanent "Dead" State
+The circuit breaker always expires. There is no permanent block — even `invalid_grant` will be retried after its cooldown. The heal loop (see below) clears circuit breaker state before recovery attempts, so accounts are never permanently stuck.
+
+### Circuit Breaker Lifecycle
+1. **Activating:** `_refresh_token_flow` records `refresh_last_failed_at` + `refresh_failure_type` on exchange failure
+2. **Blocking:** Subsequent `PRIMARY_CIRCUIT_BREAKER` calls check the cooldown and return `error="circuit_breaker"` without hitting the network
+3. **Expiring:** Cooldown passes → next attempt proceeds normally
+4. **Clearing:** Heal loop clears both columns under per-account lock before recovery
+
+## Live Credential Reconciliation
+
+`reconcile_credentials_from_live_store` (renamed from `reconcile_outgoing_credentials`) imports tokens that Claude Code may have refreshed independently.
+
+### When It Runs
+- **During swaps:** Before writing new credentials (captures outgoing account's rotated tokens)
+- **Periodically:** In `refresh_all_expiring_tokens` (every 30 min) for the active account
+- **On-demand:** In the account list API for the active account (with 30s cache to avoid Keychain subprocess spam)
+
+### What It Imports
+- `cc_access_token` — always (non-destructive, just updates our view)
+- `cc_expires_at` — always (metadata)
+- `cc_refresh_token` — **only if** `refresh_failure_type != "invalid_grant"` in DB
+
+### Safety Rules
+- **`invalid_grant` guard:** Never imports `cc_refresh_token` when the circuit breaker shows `invalid_grant`. The live refresh token is Claude Code's active session token — importing and exchanging it would destroy Claude Code's session.
+- **`_jackedAccountId` gate:** Always enforced, never skipped. Live credentials must have a `_jackedAccountId` field matching the account being reconciled. This prevents importing tokens that belong to a different account (e.g., after a manual credential switch outside jacked).
+
+## Heal Loop
+
+Runs every 5 minutes. Processes accounts with `validation_status` in (`"invalid"`, `"unknown"`).
+
+### Recovery Steps (per account)
+1. **Clear circuit breaker** under per-account lock (`refresh_last_failed_at=NULL`, `refresh_failure_type=NULL`). This ensures the subsequent refresh attempt isn't blocked by stale CB state.
+2. **Attempt token refresh** via `refresh_account_token` — no `should_refresh()` gate. Healing is recovery mode; always attempts regardless of token expiry.
+3. **If refresh fails:** Try `reconcile_credentials_from_live_store` to import tokens Claude Code may have refreshed.
+4. **Validate via profile fetch** (`validate_account`) — works for API key accounts too.
+5. **Mark result:** healed (valid) or confirmed-invalid.
+
+### Design Rationale
+- Dropping the `should_refresh()` gate means accounts with non-expired but invalid tokens still get recovery attempts.
+- Clearing the circuit breaker first is critical — without it, `_refresh_token_flow(PRIMARY)` would see the CB state and skip the exchange, making the heal loop unable to recover.
 
 ## Window Keeper
 
@@ -227,14 +338,28 @@ Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT f
 ## Dashboard Integration
 
 ### WebSocket Events
-- `usage_poll_updated` — after each active poll, push fresh account data (whitelisted via `_WS_SAFE_FIELDS` — new DB columns don't leak by default)
-- `auto_swap_triggered` — persistent banner with reason (5 min, dismissible). Includes `from_label`/`to_label` with org-aware account names.
-- `all_accounts_exhausted` — exhaustion banner with recovery estimate
 
-### Countdown Timer
-- Shows "auto-check in Xs (tier)" on the active account card
-- Uses tier-appropriate interval (not hardcoded 60s)
-- Reads `usage_cached_at` from live state (updated by WebSocket)
+| Event | Payload | Purpose |
+|-------|---------|---------|
+| `usage_poll_updated` | Account data (whitelisted), `_poll_interval`, `_poll_tier`, `_last_poll_at` | Active account data refresh |
+| `auto_swap_triggered` | `from_label`, `to_label`, reason | Swap occurred — persistent banner (5 min, dismissible) |
+| `all_accounts_exhausted` | Recovery estimate | No viable accounts — exhaustion banner |
+| `usage_refresh_started` | — | Bulk refresh begun |
+| `usage_refresh_progress` | Per-account progress | Bulk refresh per-account status |
+| `decision_log_entry` | `id`, `account_id`, `email`, `label`, `action`, `trigger`, `reason`, `timestamp`, `detail` | New decision recorded — real-time dashboard update |
+
+**Field whitelisting:** `_WS_SAFE_FIELDS` controls which account columns are broadcast in `usage_poll_updated`. New DB columns don't leak by default — they must be explicitly added to the whitelist.
+
+### Poll Countdown
+
+The backend is the single source of truth for poll timing. The frontend does NOT compute its own interval.
+
+- **Backend sends:** `_poll_interval`, `_poll_tier`, `_last_poll_at` in every `usage_poll_updated` WebSocket payload
+- **Frontend uses:** These backend values to render "auto-check in Xs (tier)" on the active account card
+- **`_last_poll_at`:** Updates every tick regardless of cache hits — ensures the countdown always reflects the most recent tick
+- **Stale guard:** Frontend shows "delayed" when 2x the interval has passed since `_last_poll_at`
+- **Restart handling:** Frontend shows "starting..." until the first poll tick arrives (no `_last_poll_at` yet)
+- **Backend watchdog:** Logs a warning if the tick loop is 2x overdue (detects event loop stalls or scheduling issues)
 
 ### Swap History
 - Always-visible section at bottom of accounts page
@@ -245,11 +370,13 @@ Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT f
 
 ### Decision Log
 - Full decision trace recorded every poll tick in `decision_log` table — queryable "why" history
+- `record_decision` returns the inserted row ID, used for WebSocket broadcast inclusion
 - Records: active account state, should_swap result, suppression reason, ALL candidates evaluated (with scores/deficit/urgency tier/pass-fail), final decision
 - Three action types: `stay`, `swap`, `manual_switch`
 - 7-day retention with deterministic prune (every 500 ticks or 1% random)
 - API: `GET /api/settings/decision-log?limit=N&action=swap&action=manual_switch`
 - Frontend: expandable table below Swap History, color-coded action badges (swap=teal, manual=blue, check=slate), default filter shows only swaps + manual, toggle reveals all ticks
+- **Real-time push:** Every recorded decision is broadcast via `decision_log_entry` WebSocket event. The frontend appends new entries to the table without polling.
 - Cooldown-blocked swaps ARE recorded (so blocked attempts aren't invisible)
 - Non-passing candidates recorded too (with `skip_reason`: ahead_of_schedule, below_threshold, recoverable_too_low, near_exhaustion)
 
@@ -267,6 +394,27 @@ Runs on the sweep loop timer (`usage_check_interval`). Only pings — does NOT f
 | `jacked/data/web/js/components/accounts.js` | Account cards, countdown timer |
 | `jacked/data/web/js/components/auto-swap.js` | Settings panel, swap log table |
 | `jacked/data/web/js/components/account-actions.js` | Refresh, countdown tick |
+
+## Observability
+
+All state transitions produce structured log messages. This is the observability contract — any automation or monitoring can rely on these log lines existing.
+
+### Circuit Breaker
+- **Activating:** `"Account %d: circuit breaker active (%s, %ds remaining)"` — logged when a `PRIMARY_CIRCUIT_BREAKER` refresh is blocked
+- **Expiring:** `"Account %d: circuit breaker cooldown expired, re-attempting refresh"` — logged when the cooldown has passed and a fresh attempt proceeds
+
+### Token Refresh
+- **Stale token short-circuit:** `"Account %d: token already refreshed by another path"` — another coroutine refreshed while we waited for the lock
+
+### Live Credential Reconciliation
+- **Import:** Logs when tokens are imported from live credential stores into DB
+- **Skip (invalid_grant):** Does not import `cc_refresh_token` when circuit breaker shows `invalid_grant` — logs the skip
+
+### Heal Loop
+- **Clearing CB:** `"Account %d: clearing circuit breaker for heal attempt"` — logged before every recovery attempt
+
+### Poll Loop Watchdog
+- **Overdue tick:** `"Active poll loop delayed — last tick %ds ago, expected interval %ds"` — logged when the tick is 2x overdue (detects event loop stalls)
 
 ## Known Limitations
 
