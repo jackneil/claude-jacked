@@ -50,6 +50,8 @@ Each mode's behavior is hardcoded inside `_refresh_token_flow`:
 - CC_OR_PRIMARY_429 additionally acquires the cross-process Claude lock for credential store writes
 - PRIMARY and PRIMARY_CIRCUIT_BREAKER both acquire `_get_refresh_lock(account_id)`
 
+**Lock nesting order for CC_OR_PRIMARY_429:** Acquire the async CC lock FIRST, then the cross-process Claude lock inside it. This matches the existing pattern where the async lock protects the token read/write and the cross-process lock protects the credential file. Never reverse this order — cross-process lock acquisition uses blocking `time.sleep()` inside `acquire_claude_lock`, so holding it while waiting for an async lock would deadlock the event loop. Known limitation: the blocking `time.sleep()` in `acquire_claude_lock` blocks the event loop for up to ~10s. Future improvement: convert to `asyncio.to_thread`.
+
 **DB retry is always on.** A successful token exchange with a lost DB write is unrecoverable — the old refresh token was consumed and the new one exists only in dead memory. All modes retry DB writes 3x with exponential backoff.
 
 #### 1b. `_refresh_token_flow` function
@@ -89,7 +91,15 @@ It is NOT safe for:
 
 The `_jackedAccountId` gate is **never skipped**. It is the ground truth for which account owns the credential file. During a swap, the credential file transitions between accounts — skipping the gate would import the wrong account's tokens.
 
+**CC_OR_PRIMARY_429 primary fallback failure:** When this mode falls back to the primary refresh token and the exchange fails with `invalid_grant`, the primary token is consumed but the circuit breaker is NOT enabled for this mode. The consumed primary token will be detected by `_try_refresh_primary_token` on the next 401, which DOES use the circuit breaker. No special handling needed — the existing circuit breaker path covers this.
+
 **Credential store write partial failure:** If `sync_credential_to_all_stores` fails after a successful DB write, the DB has new tokens but the credential file is stale. Recovery: the next poll tick will detect the mismatch and re-sync. This is an existing behavior that the refactor preserves, not introduces.
+
+**Cross-reference: cc_refresh_token import safety.** The rule "never import cc_refresh_token from live credentials during invalid_grant" applies to THREE code paths — all must be updated:
+1. `_refresh_token_flow` step 7 (section 1b) — CC/CC_429 mode invalid_grant recovery
+2. `reconcile_credentials_from_live_store` (section 3a) — periodic reconciliation
+3. On-demand reconciliation in account list API (section 3b)
+The existing `refresh_cc_token` (auth.py:340-356) currently imports cc_refresh_token — this must be replaced.
 
 #### 1c. Caller refactoring
 
@@ -125,7 +135,7 @@ ALTER TABLE accounts ADD COLUMN refresh_failure_type TEXT;
 **Required updates for new columns:**
 - Add to `_ACCOUNT_UPDATE_COLS` whitelist in `database.py` (line ~916) — without this, `update_account` raises `ValueError`
 - Add to Pydantic `Account` model in `database.py` (line ~38) as `Optional[int]` / `Optional[str]`
-- Add to `_WS_SAFE_FIELDS` in `usage_monitor.py` (line ~430) — enables future dashboard display
+- Do NOT add to `_WS_SAFE_FIELDS` yet — only add when the dashboard displays circuit breaker state
 - Migration uses existing `ALTER TABLE ADD COLUMN` with `try/except OperationalError: pass` pattern (idempotent, forward-only, rollback-safe because old code ignores unknown columns)
 
 #### 2b. Delete in-memory state
@@ -184,7 +194,7 @@ Non-active accounts whose CC refresh token is consumed have NO automatic recover
 
 #### 4a. Backend: include poll metadata in WebSocket payload
 
-Move `_compute_poll_interval` call to BEFORE the broadcast (currently after, at line 943). Include in `usage_poll_updated`:
+Move `_compute_poll_interval` call to BEFORE the broadcast (currently after, at line 943). Note: the poll interval depends on burn rates updated later in the tick, so the broadcast will show the PREVIOUS tick's interval. This one-tick staleness is acceptable — the tier rarely changes between consecutive ticks. Include in `usage_poll_updated`:
 
 ```python
 safe_acct["_poll_interval"] = int(_poll_interval)
@@ -219,15 +229,16 @@ Display tier: "45s (warning)" or just "45s".
 All functions in `auto_swap.py` that accept `active_start`/`active_end` parameters will use the same defaults: `"06:00"` and `"23:00"`.
 
 Functions to update (currently defaulting to 07:00/22:00):
-- `compute_effective_working_hours`: change `active_start="07:00"` → `"06:00"`, `active_end="22:00"` → `"23:00"`
-- `compute_7d_deficit`: change `active_start="07:00"` → `"06:00"`, `active_end="22:00"` → `"23:00"`
-- `has_viable_headroom`: change `active_start="07:00"` → `"06:00"`, `active_end="22:00"` → `"23:00"`
-- `pick_best_target`: change `active_start="07:00"` → `"06:00"`, `active_end="22:00"` → `"23:00"`
+- `compute_effective_working_hours` (line 130-131)
+- `compute_7d_deficit` (line 242-243)
+- `should_swap` (line 328-329)
+- `has_viable_headroom` (line 415-416)
+- `score_candidate` (line 512-513)
+- `pick_best_target` (line 512-513)
 
 Already correct (06:00/23:00) — no change needed:
-- `compute_burn_per_window`
-- `compute_urgency_threshold`
-- `score_candidate` (uses 06:00/23:00)
+- `compute_burn_per_window` (line 181)
+- `compute_urgency_threshold` (line 215-216)
 
 Tests that hardcode `active_start="07:00"` will be updated to match.
 
