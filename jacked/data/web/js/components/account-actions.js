@@ -19,17 +19,27 @@ function _startCheckCountdown() {
         var accounts = window.jackedState.accounts || [];
         var activeAcct = accounts.find(function(a) { return a.id === activeId; });
         var cachedAt = activeAcct ? activeAcct.usage_cached_at : null;
-        if (!cachedAt) return;
-        var u5data = activeAcct ? (activeAcct.cached_usage_5h || 0) : 0;
-        var pollInterval = 300;
-        if (u5data > 85) pollInterval = 65;
-        else if (u5data > 70) pollInterval = 90;
-        else if (u5data > 50) pollInterval = 150;
-        else pollInterval = 300;
-        var rem = Math.max(0, pollInterval - (now - cachedAt));
+        // Use backend-provided poll interval and last-poll timestamp
+        // instead of guessing from raw usage thresholds.
+        var pollInterval = activeAcct._poll_interval || 300;
+        var lastPollAt = activeAcct._last_poll_at || cachedAt;
+        if (!lastPollAt) {
+            els.forEach(function(el) {
+                el.textContent = 'starting\u2026';
+            });
+            return;
+        }
+        var rem = Math.max(0, pollInterval - (now - lastPollAt));
+        var tierLabel = activeAcct._poll_tier ? ' (' + activeAcct._poll_tier + ')' : '';
         els.forEach(function(el) {
-            el.textContent = rem > 0 ? rem + 's' : 'checking\u2026';
-            el.setAttribute('data-cached-at', String(cachedAt));
+            if (rem > 0) {
+                el.textContent = rem + 's' + tierLabel;
+            } else if (lastPollAt && (now - lastPollAt) > 2 * pollInterval) {
+                el.textContent = 'delayed';
+            } else {
+                el.textContent = 'checking\u2026';
+            }
+            el.setAttribute('data-cached-at', String(lastPollAt));
         });
     }, 1000);
 }

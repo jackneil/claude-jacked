@@ -34,6 +34,9 @@ const jackedWS = {
             this.reconnectDelay = 1000;  // Reset backoff on successful connect
             // Stop logs fallback polling now that WS is live
             if (typeof stopLogsFallbackPolling === 'function') stopLogsFallbackPolling();
+            // Fetch fresh account data on reconnect so the countdown
+            // has _last_poll_at from the backend immediately.
+            if (typeof refreshAndRender === 'function') refreshAndRender();
         };
 
         this.ws.onmessage = (event) => {
