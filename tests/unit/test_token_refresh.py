@@ -162,3 +162,50 @@ class TestRefreshMode:
         assert "invalid_grant" in CIRCUIT_BREAKER_COOLDOWNS
         assert CIRCUIT_BREAKER_COOLDOWNS["invalid_grant"] == 600
         assert CIRCUIT_BREAKER_COOLDOWNS["network_error"] == 60
+
+
+# ---------------------------------------------------------------------------
+# refresh_account_token: 2-strike invalid-marking policy
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshAccountTokenPolicy:
+    """refresh_account_token uses PRIMARY mode with 2-strike invalid policy."""
+
+    def test_first_401_does_not_mark_invalid(self, tmp_path):
+        """First 401 on token exchange sets circuit breaker but does NOT mark invalid."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock
+        from jacked.web.auth import TokenExchangeResult, refresh_account_token
+
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("test@t.com", "tok", 0, refresh_token="rt-test")
+
+        mock_result = TokenExchangeResult(
+            success=False, error="http_401", status_code=401)
+        with patch("jacked.web.auth._refresh_token_flow",
+                   new_callable=AsyncMock, return_value=mock_result):
+            asyncio.run(refresh_account_token(acct["id"], db))
+
+        row = db.get_account(acct["id"])
+        assert row["validation_status"] != "invalid"
+
+    def test_second_401_marks_invalid(self, tmp_path):
+        """Second consecutive 401 (after first set failure_type) marks invalid."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock
+        from jacked.web.auth import TokenExchangeResult, refresh_account_token
+
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("test@t.com", "tok", 0, refresh_token="rt-test")
+        # Simulate first failure already recorded
+        db.update_account(acct["id"], refresh_failure_type="http_401")
+
+        mock_result = TokenExchangeResult(
+            success=False, error="http_401", status_code=401)
+        with patch("jacked.web.auth._refresh_token_flow",
+                   new_callable=AsyncMock, return_value=mock_result):
+            asyncio.run(refresh_account_token(acct["id"], db))
+
+        row = db.get_account(acct["id"])
+        assert row["validation_status"] == "invalid"

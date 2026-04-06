@@ -457,18 +457,6 @@ async def _refresh_token_flow(
         return result
 
 
-# COMPAT: kept until Task 3 migrates _try_refresh_primary_token to _refresh_token_flow
-_primary_refresh_state: dict[int, dict] = {}
-
-
-def _get_primary_refresh_state(account_id: int) -> dict:
-    if account_id not in _primary_refresh_state:
-        _primary_refresh_state[account_id] = {
-            "last_failed_at": 0.0,
-            "dead": False,
-        }
-    return _primary_refresh_state[account_id]
-
 
 def _get_usage_state(account_id: int) -> dict:
     """Get or create per-account usage coordinator state."""
@@ -568,374 +556,65 @@ def should_refresh_cc(account: dict) -> bool:
 
 
 async def refresh_cc_token(account_id: int, db: Database) -> bool:
-    """Refresh CC token pair independently. Updates cc_* columns only.
-
-    On invalid_grant: clear only cc_refresh_token (consumed by Claude Code).
-    Keep cc_access_token — it may still be valid until cc_expires_at.
-    Does NOT mark account as invalid — primary token health determines
-    account validity.
-
-    Uses a per-account lock to prevent concurrent CC refresh collisions
-    between the background refresh loop and pre-launch refresh.
-    """
+    """Refresh CC token pair independently. Updates cc_* columns only."""
     account = db.get_account(account_id)
     if not account:
         return False
-
     if not should_refresh_cc(account):
         return True
-
     if not account.get("cc_refresh_token"):
         return True
 
     lock = _get_cc_refresh_lock(account_id)
     if lock.locked():
-        return True  # Another refresh in progress — skip
+        return True  # Another refresh in progress
 
-    async with lock:
-        # Re-read account under lock — another refresh may have completed
-        account = db.get_account(account_id)
-        if not account or not should_refresh_cc(account):
-            return True
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    TOKEN_URL,
-                    json={
-                        "grant_type": "refresh_token",
-                        "refresh_token": account["cc_refresh_token"],
-                        "client_id": CLIENT_ID,
-                    },
-                    headers={
-                        "Content-Type": "application/json",
-                        "anthropic-beta": OAUTH_BETA_HEADER,
-                    },
-                )
-
-                if resp.status_code == 200:
-                    tokens = resp.json()
-                    new_refresh = tokens.get(
-                        "refresh_token", account["cc_refresh_token"]
-                    )
-                    new_expires_at = int(time.time()) + tokens.get(
-                        "expires_in", DEFAULT_TOKEN_TTL_SECONDS
-                    )
-
-                    db.update_account(
-                        account_id,
-                        cc_access_token=tokens["access_token"],
-                        cc_refresh_token=new_refresh,
-                        cc_expires_at=new_expires_at,
-                    )
-                    logger.info(f"CC token refreshed for account {account_id}")
-                    return True
-
-                if resp.status_code == 400:
-                    try:
-                        error_data = resp.json()
-                        if error_data.get("error") == "invalid_grant":
-                            # Attempt recovery from live credentials before clearing
-                            from jacked.api.credential_helpers import read_platform_credentials
-                            live = read_platform_credentials()
-                            if not live:
-                                cred_path = Path.home() / ".claude" / ".credentials.json"
-                                if cred_path.exists() and not cred_path.is_symlink():
-                                    try:
-                                        live = json.loads(cred_path.read_text(encoding="utf-8"))
-                                    except (json.JSONDecodeError, OSError):
-                                        live = None
-
-                            live_refresh = None
-                            live_access = None
-                            live_expires = None
-                            if live and live.get("_jackedAccountId") == account_id:
-                                oauth = live.get("claudeAiOauth", {})
-                                live_refresh = oauth.get("refreshToken")
-                                live_access = oauth.get("accessToken")
-                                live_expires = oauth.get("expiresAt")
-
-                            if live_refresh and live_refresh != account.get("cc_refresh_token"):
-                                live_exp_s = (
-                                    int(live_expires / 1000) if live_expires and live_expires > 1e12
-                                    else int(live_expires) if live_expires else None
-                                )
-                                updates = {"cc_refresh_token": live_refresh}
-                                if live_access:
-                                    updates["cc_access_token"] = live_access
-                                if live_exp_s:
-                                    updates["cc_expires_at"] = live_exp_s
-                                db.update_account(account_id, **updates)
-                                logger.info(
-                                    "Account %d: CC invalid_grant recovered — "
-                                    "imported fresh token from live credentials",
-                                    account_id,
-                                )
-                                return True
-                            else:
-                                logger.warning(
-                                    "Account %d: CC invalid_grant — clearing refresh token "
-                                    "(no live recovery available)",
-                                    account_id,
-                                )
-                                db.update_account(account_id, cc_refresh_token=None)
-                                return False
-                    except (ValueError, AttributeError) as exc:
-                        logger.warning(
-                            "Account %d: CC refresh error parsing response: %s",
-                            account_id, exc,
-                        )
-
-                logger.warning(
-                    "Account %d: CC refresh HTTP %d", account_id, resp.status_code
-                )
-                return False
-
-        except Exception as e:
-            logger.warning(f"Account {account_id}: CC refresh error: {e}")
-            return False
+    result = await _refresh_token_flow(account_id, db, RefreshMode.CC)
+    return result.success
 
 
-async def refresh_account_token(
-    account_id: int, db: Database
-) -> bool:
-    """Refresh an account's token if needed.
-
-    - Skip if no refresh_token (API key account)
-    - Skip if token not near expiry
-    - POST to TOKEN_URL with JSON body
-    - Handle token rotation (new refresh_token in response)
-    - Handle invalid_grant → record error, retry next cycle
-    - After successful refresh, also refresh profile metadata
-
-    Returns True if token is valid (either still fresh or successfully refreshed).
-    """
+async def refresh_account_token(account_id: int, db: Database) -> bool:
+    """Refresh an account's primary token if needed."""
     account = db.get_account(account_id)
     if not account:
         return False
-
     if not should_refresh(account):
-        return True  # Token still valid
-
+        return True
     if not account.get("refresh_token"):
-        return True  # API key account — no refresh needed, still valid
-
-    result = await _exchange_refresh_token(account["refresh_token"], timeout=30.0)
-
-    if result.success:
-        new_expires_at = int(time.time()) + result.expires_in
-
-        # Update DB with new tokens (retry with backoff)
-        db_updated = False
-        for attempt in range(3):
-            try:
-                db.update_account(
-                    account_id,
-                    access_token=result.access_token,
-                    refresh_token=result.refresh_token,
-                    expires_at=new_expires_at,
-                    consecutive_failures=0,
-                )
-                db_updated = True
-                break
-            except Exception as db_err:
-                logger.warning(
-                    "DB update attempt %d/3 failed for account %d: %s",
-                    attempt + 1, account_id, db_err,
-                )
-                if attempt < 2:
-                    await asyncio.sleep(0.1 * (2 ** attempt))
-
-        if not db_updated:
-            logger.error(
-                "Token refresh succeeded but DB update FAILED for "
-                "account %d after 3 attempts.",
-                account_id,
-            )
-            return False
-
-        logger.info(f"Token refreshed for account {account_id}")
-
-        # NOTE: Refreshed tokens are stored in the DB only.
-        # We do NOT write to Claude Code's credential files
-        # (~/.claude/.credentials.json, Keychain) here — doing so
-        # causes race conditions that log out active sessions.
-        # Account switching is handled by `jacked claude <id>`.
-
-        # Also refresh profile metadata after successful refresh
-        await fetch_profile(account_id, db, access_token=result.access_token)
-
         return True
 
-    # --- Error handling for failed exchange ---
+    result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY)
 
-    if result.error == "invalid_grant":
-        # Refresh token was consumed (likely by Claude Code).
-        # Don't mark invalid — will retry next cycle.
-        logger.warning(
-            "Account %d: invalid_grant — will retry next cycle",
-            account_id,
-        )
-        db.record_account_error(
-            account_id, "Refresh token consumed (will retry)"
-        )
-        return False
+    if result.success:
+        return True
 
+    # Caller-specific error policy: 401/403 marks invalid only after 2 consecutive failures
     if result.status_code in (401, 403):
-        db.update_account(
-            account_id,
-            validation_status="invalid",
-            last_error=f"Token revoked (HTTP {result.status_code})",
-            last_error_at=datetime.now(timezone.utc).isoformat(),
-        )
-        return False
-
-    if result.status_code == 429:
-        logger.warning(f"Account {account_id}: rate limited during refresh")
-        db.record_account_error(account_id, "Rate limited during token refresh")
-        return False
-
-    if result.status_code and result.status_code >= 500:
-        logger.warning(
-            f"Account {account_id}: server error {result.status_code} during refresh"
-        )
-        db.record_account_error(
-            account_id, f"Server error ({result.status_code}) during refresh"
-        )
+        prev_failure = account.get("refresh_failure_type")
+        if prev_failure in ("http_401", "http_403"):
+            # Second consecutive auth failure — mark invalid
+            db.update_account(
+                account_id,
+                validation_status="invalid",
+                last_error=f"Token revoked (HTTP {result.status_code})",
+                last_error_at=datetime.now(timezone.utc).isoformat(),
+            )
         return False
 
     if result.error == "network_error":
-        logger.warning(f"Account {account_id}: network error during token refresh")
         db.record_account_error(
-            account_id, "Network error during token refresh", increment_failures=False
-        )
-        return False
+            account_id, "Network error during token refresh",
+            increment_failures=False)
 
-    # Unknown error
-    db.record_account_error(
-        account_id, f"Unexpected error during refresh: {result.error}"
-    )
     return False
 
 
 async def _try_refresh_on_429(
     account_id: int, db: Database, state: dict,
 ) -> str | None:
-    """Attempt to get a fresh access token to clear a per-token rate limit.
-
-    Acquires the Claude Code cross-process lock, exchanges the refresh
-    token for a fresh access token, and saves all tokens to DB + credential
-    stores. Returns the fresh access token on success, None on failure.
-    """
-    from jacked.api.credential_helpers import (
-        acquire_claude_lock,
-        read_platform_credentials,
-        sync_credential_to_all_stores,
-    )
-
-    account = db.get_account(account_id)
-    if not account:
-        return None
-
-    # Prefer CC refresh token, fall back to primary
-    refresh_token = account.get("cc_refresh_token") or account.get("refresh_token")
-    if not refresh_token:
-        logger.debug("Account %d: no refresh token for 429 recovery", account_id)
-        return None
-
-    with acquire_claude_lock() as locked:
-        if not locked:
-            logger.warning("Account %d: could not acquire lock for 429 recovery", account_id)
-            return None
-
-        # Re-read from live store — another process may have refreshed
-        live = read_platform_credentials()
-        if not live:
-            cred_path = Path.home() / ".claude" / ".credentials.json"
-            if cred_path.exists() and not cred_path.is_symlink():
-                try:
-                    live = json.loads(cred_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    live = None
-
-        if live and live.get("_jackedAccountId") == account_id:
-            live_token = live.get("claudeAiOauth", {}).get("accessToken")
-            db_token = account.get("cc_access_token") or account.get("access_token")
-            if live_token and live_token != db_token:
-                # Another process already refreshed — use their token
-                logger.info("Account %d: 429 recovery — using token from live store", account_id)
-                db.update_account(account_id, cc_access_token=live_token)
-                return live_token
-
-        # Exchange refresh token for fresh access token
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    TOKEN_URL,
-                    json={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": CLIENT_ID,
-                    },
-                    headers={
-                        "Content-Type": "application/json",
-                        "anthropic-beta": OAUTH_BETA_HEADER,
-                    },
-                )
-
-            if resp.status_code != 200:
-                logger.warning(
-                    "Account %d: 429 recovery token exchange failed (HTTP %d)",
-                    account_id, resp.status_code,
-                )
-                return None
-
-            tokens = resp.json()
-            fresh_access = tokens["access_token"]
-            new_refresh = tokens.get("refresh_token", refresh_token)
-            new_expires = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
-
-            # Determine which token set was used
-            used_cc = bool(account.get("cc_refresh_token"))
-            if used_cc:
-                db.update_account(
-                    account_id,
-                    cc_access_token=fresh_access,
-                    cc_refresh_token=new_refresh,
-                    cc_expires_at=new_expires,
-                )
-            else:
-                db.update_account(
-                    account_id,
-                    access_token=fresh_access,
-                    refresh_token=new_refresh,
-                    expires_at=new_expires,
-                )
-
-            # Write to credential stores ONLY if this account is currently
-            # the active one. Writing credentials for a non-active account
-            # would overwrite the active account's credentials in
-            # .credentials.json, silently switching Claude Code to the wrong
-            # account. The DB update above is enough for non-active accounts —
-            # the credential file will be written when/if they become active.
-            if live and live.get("_jackedAccountId") == account_id:
-                updated_account = db.get_account(account_id)
-                if updated_account:
-                    sync_credential_to_all_stores(
-                        account_id, updated_account,
-                        email=updated_account.get("email"),
-                    )
-
-            logger.info(
-                "Account %d: 429 recovery — fresh token obtained%s",
-                account_id,
-                " (refresh rotated)" if new_refresh != refresh_token else "",
-            )
-            return fresh_access
-
-        except Exception as exc:
-            logger.warning("Account %d: 429 recovery failed: %s", account_id, exc)
-            return None
+    """Attempt to get a fresh access token to clear a per-token rate limit."""
+    result = await _refresh_token_flow(account_id, db, RefreshMode.CC_OR_PRIMARY_429)
+    return result.access_token if result.success else None
 
 
 async def _try_refresh_primary_token(
@@ -943,82 +622,9 @@ async def _try_refresh_primary_token(
     db,
     stale_token: str | None = None,
 ) -> str | None:
-    """Refresh the primary access token on 401. Returns new token or None.
-
-    Uses per-account asyncio lock to prevent concurrent refresh races.
-    Checks circuit breaker (10-min cooldown after transient failure,
-    permanent skip after invalid_grant). Compares stale_token against
-    current DB to detect if another coroutine already refreshed.
-
-    Does NOT write to credential stores — primary tokens are for
-    jacked's own API calls, not for Claude Code.
-    """
-    _COOLDOWN_SECONDS = 600
-
-    state = _get_primary_refresh_state(account_id)
-
-    # Circuit breaker: skip if refresh token is known dead
-    if state["dead"]:
-        return None
-
-    # Circuit breaker: skip if recently failed (transient cooldown)
-    if time.time() - state["last_failed_at"] < _COOLDOWN_SECONDS:
-        return None
-
-    lock = _get_refresh_lock(account_id)
-    async with lock:
-        # Re-read account under lock — another coroutine may have refreshed
-        account = db.get_account(account_id)
-        if not account:
-            return None
-
-        # If the DB token changed since the caller's stale copy,
-        # someone else already refreshed — use the new token
-        current_token = account.get("access_token")
-        if stale_token and current_token and current_token != stale_token:
-            logger.info(
-                "Account %d: primary token already refreshed by another path",
-                account_id,
-            )
-            return current_token
-
-        refresh_token = account.get("refresh_token")
-        if not refresh_token:
-            return None
-
-        result = await _exchange_refresh_token(refresh_token)
-
-        if result.success:
-            db.update_account(
-                account_id,
-                access_token=result.access_token,
-                refresh_token=result.refresh_token,
-                expires_at=int(time.time()) + result.expires_in,
-            )
-            state["last_failed_at"] = 0.0
-            state["dead"] = False
-            logger.info(
-                "Account %d: primary token refreshed%s",
-                account_id,
-                " (refresh rotated)" if result.refresh_token != refresh_token else "",
-            )
-            return result.access_token
-
-        # Handle specific error types
-        if result.error == "invalid_grant":
-            state["dead"] = True
-            logger.warning(
-                "Account %d: primary refresh token is dead (invalid_grant)",
-                account_id,
-            )
-        else:
-            state["last_failed_at"] = time.time()
-            logger.warning(
-                "Account %d: primary token refresh failed (%s) — will retry in %ds",
-                account_id, result.error, _COOLDOWN_SECONDS,
-            )
-
-        return None
+    """Refresh the primary access token on 401. Returns new token or None."""
+    result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER)
+    return result.access_token if result.success else None
 
 
 async def fetch_usage(

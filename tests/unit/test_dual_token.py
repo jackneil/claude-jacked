@@ -1039,6 +1039,7 @@ class TestRefreshCCTokenNon400Errors:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 401
+        mock_resp.json.return_value = {"error": "http_401"}
         mock_client = AsyncMock()
         mock_client.post.return_value = mock_resp
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -1068,6 +1069,7 @@ class TestRefreshCCTokenNon400Errors:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 500
+        mock_resp.json.return_value = {"error": "http_500"}
         mock_client = AsyncMock()
         mock_client.post.return_value = mock_resp
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
