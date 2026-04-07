@@ -473,6 +473,32 @@ jackedWS.on('decision_log_entry', (msg) => {
     }
 });
 
+// --- Token usage analytics WS events ---
+
+jackedWS.on('analytics_scan_progress', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof updateAnalyticsScanProgress === 'function') updateAnalyticsScanProgress(d);
+});
+
+jackedWS.on('analytics_scan_complete', () => {
+    if (typeof onAnalyticsScanComplete === 'function') onAnalyticsScanComplete();
+});
+
+jackedWS.on('analytics_live_update', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof onAnalyticsLiveUpdate === 'function') onAnalyticsLiveUpdate(d);
+});
+
+jackedWS.on('analytics_flag_raised', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof onAnalyticsFlagRaised === 'function') onAnalyticsFlagRaised(d);
+});
+
+jackedWS.on('analytics_flag_resolved', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof onAnalyticsFlagResolved === 'function') onAnalyticsFlagResolved(d);
+});
+
 // Adjust polling interval when WebSocket connects (less aggressive polling)
 let _wsPollingAdjusted = false;
 jackedWS.on('*', () => {
