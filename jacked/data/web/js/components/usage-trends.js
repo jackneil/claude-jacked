@@ -5,6 +5,8 @@
  * Exports: renderUsageTrends(container)
  */
 
+let _usageTrendsChart = null;
+
 async function renderUsageTrends(container) {
     const status = await api.get('/api/analytics/usage-scan-status').catch(() => null);
     if (!status?.ready) {
@@ -43,7 +45,13 @@ async function renderUsageTrends(container) {
     const ctx = document.getElementById('usage-trends-chart');
     if (!ctx || !window.Chart) return;
 
-    new Chart(ctx, {
+    // Destroy previous instance to prevent memory leak
+    if (_usageTrendsChart) {
+        _usageTrendsChart.destroy();
+        _usageTrendsChart = null;
+    }
+
+    _usageTrendsChart = new Chart(ctx, {
         type: 'bar',
         data: {
             labels: labels,

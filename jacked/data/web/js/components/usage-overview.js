@@ -78,7 +78,7 @@ function _renderFlags(flags) {
                     <div class="text-sm text-slate-200">${escapeHtml(f.message)}</div>
                     <div class="text-xs text-slate-500">${escapeHtml(f.flag_type || '')} &middot; ${_usageTimeAgo(f.created_at)}</div>
                 </div>
-                <button class="text-xs text-slate-400 hover:text-white px-2 py-1" data-dismiss-flag="${f.id}">dismiss</button>
+                <button class="text-xs text-slate-400 hover:text-white px-2 py-1" data-dismiss-flag="${escapeHtml(String(f.id))}">dismiss</button>
                 <button class="text-xs text-slate-400 hover:text-white px-2 py-1" data-snooze-flag="${escapeHtml(f.flag_type || '')}">snooze 24h</button>
             </div>`;
     }).join('');
@@ -214,13 +214,17 @@ function onAnalyticsScanComplete() {
     if (container && typeof renderUsageOverview === 'function') renderUsageOverview(container);
 }
 
+// Debounce live updates — prevent rapid-fire API calls during active sessions
+let _liveUpdateTimer = null;
 function onAnalyticsLiveUpdate(data) {
-    // Re-render overview if visible
-    const container = document.getElementById('usage-tab-content');
-    const tab = localStorage.getItem('jacked_usage_tab') || 'overview';
-    if (container && tab === 'overview' && typeof renderUsageOverview === 'function') {
-        renderUsageOverview(container);
-    }
+    if (_liveUpdateTimer) clearTimeout(_liveUpdateTimer);
+    _liveUpdateTimer = setTimeout(() => {
+        const container = document.getElementById('usage-tab-content');
+        const tab = localStorage.getItem('jacked_usage_tab') || 'overview';
+        if (container && tab === 'overview' && typeof renderUsageOverview === 'function') {
+            renderUsageOverview(container);
+        }
+    }, 3000);  // 3-second debounce
 }
 
 function onAnalyticsFlagRaised(flag) { onAnalyticsLiveUpdate(); }
@@ -229,14 +233,16 @@ function onAnalyticsFlagResolved(data) { onAnalyticsLiveUpdate(); }
 function _bindFlagActions() {
     document.querySelectorAll('[data-dismiss-flag]').forEach(btn => {
         btn.addEventListener('click', async () => {
-            await api.post('/api/analytics/usage-flag-dismiss/' + btn.dataset.dismissFlag).catch(() => null);
+            const flagId = encodeURIComponent(btn.dataset.dismissFlag);
+            await api.post('/api/analytics/usage-flag-dismiss/' + flagId).catch(() => null);
             const container = document.getElementById('usage-tab-content');
             if (container) renderUsageOverview(container);
         });
     });
     document.querySelectorAll('[data-snooze-flag]').forEach(btn => {
         btn.addEventListener('click', async () => {
-            await api.post('/api/analytics/usage-flag-snooze/' + btn.dataset.snoozeFlag + '?hours=24').catch(() => null);
+            const flagType = encodeURIComponent(btn.dataset.snoozeFlag);
+            await api.post('/api/analytics/usage-flag-snooze/' + flagType + '?hours=24').catch(() => null);
             const container = document.getElementById('usage-tab-content');
             if (container) renderUsageOverview(container);
         });

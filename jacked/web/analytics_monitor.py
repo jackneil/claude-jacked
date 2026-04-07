@@ -59,15 +59,17 @@ def _rollup_pending_days(db) -> None:
                 ).fetchall()
 
         dates = [r["d"] for r in rows if r["d"]]
+        last_success = None
         for date_str in dates:
             try:
                 db.rollup_daily_summaries(date_str)
+                last_success = date_str
             except Exception:
                 logger.debug("Rollup failed for %s", date_str, exc_info=True)
-                continue
+                break  # Stop at first failure — don't skip dates
 
-        if dates:
-            db.set_setting("last_rollup_date", dates[-1])
+        if last_success:
+            db.set_setting("last_rollup_date", last_success)
     except Exception:
         logger.debug("_rollup_pending_days failed", exc_info=True)
 

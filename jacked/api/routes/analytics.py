@@ -425,7 +425,7 @@ async def get_usage_scan_status(request: Request):
 
     # Get basic DB stats
     import os
-    db_path = db._db_path if hasattr(db, '_db_path') else None
+    db_path = db.db_path if hasattr(db, 'db_path') else None
     db_size = os.path.getsize(db_path) if db_path and os.path.exists(db_path) else 0
     purge_days = db.get_setting("purge_days")
 
