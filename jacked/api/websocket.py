@@ -83,3 +83,16 @@ class WebSocketRegistry:
         0
         """
         return len(self._clients)
+
+    def has_subscribers(self, topic: str) -> bool:
+        """Check if any connected client is subscribed to the given topic.
+
+        Returns True if at least one client subscribes to *topic* or ``*``.
+
+        >>> WebSocketRegistry().has_subscribers("analytics")
+        False
+        """
+        for subs in self._clients.values():
+            if "*" in subs or topic in subs:
+                return True
+        return False
