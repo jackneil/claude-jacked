@@ -62,6 +62,11 @@ def _get_db(request: Request):
     return getattr(request.app.state, "db", None)
 
 
+def _get_analytics_db(request: Request):
+    """Get analytics DB from app state, or None if not ready."""
+    return getattr(request.app.state, "analytics_db", None)
+
+
 def _db_unavailable():
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -323,3 +328,128 @@ async def gatekeeper_rules(request: Request, days: int = Query(default=7, ge=1, 
         "suggested": db_analytics.get_suggested_rules(db, days=days),
         "hot": db_analytics.get_hot_rules(db, days=days),
     }
+
+
+# --- Token Usage Analytics ---
+
+
+@router.get("/usage-overview")
+async def get_usage_overview(request: Request, days: int = Query(default=1, ge=1, le=365)):
+    """Overview: today's totals, cache health, project breakdown, active flags."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready — scan in progress"}, status_code=503)
+
+    overview = db.get_overview(days=days)
+    flags = db.get_active_flags()
+    return {"overview": overview, "flags": flags}
+
+
+@router.get("/usage-sessions")
+async def get_usage_sessions(
+    request: Request,
+    days: int = Query(default=1, ge=1, le=365),
+    project: str = Query(default=None),
+    flagged_only: bool = Query(default=False),
+):
+    """Session list ranked by cost."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready"}, status_code=503)
+
+    sessions = db.get_session_list(days=days, project_hash=project, flagged_only=flagged_only)
+    return {"sessions": sessions}
+
+
+@router.get("/usage-session-detail/{session_id}")
+async def get_usage_session_detail(request: Request, session_id: str):
+    """Message-level detail for a single session."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready"}, status_code=503)
+
+    messages = db.get_messages_for_session(session_id)
+    return {"messages": messages}
+
+
+@router.get("/usage-trends")
+async def get_usage_trends(request: Request, days: int = Query(default=7, ge=1, le=365)):
+    """Daily summaries for trends chart."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready"}, status_code=503)
+
+    summaries = db.get_daily_summaries(days=days)
+    return {"summaries": summaries}
+
+
+@router.get("/usage-flags")
+async def get_usage_flags(request: Request):
+    """Active anomaly flags."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready"}, status_code=503)
+
+    return {"flags": db.get_active_flags()}
+
+
+@router.post("/usage-flag-dismiss/{flag_id}")
+async def dismiss_usage_flag(request: Request, flag_id: int):
+    """Dismiss an anomaly flag."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready"}, status_code=503)
+
+    db.resolve_flag(flag_id)
+    return {"dismissed": True}
+
+
+@router.post("/usage-flag-snooze/{flag_type}")
+async def snooze_usage_flag_type(request: Request, flag_type: str, hours: int = Query(default=24)):
+    """Snooze a flag type for N hours."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready"}, status_code=503)
+
+    snooze_until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    db.set_setting(f"snooze_{flag_type}_until", snooze_until)
+    return {"snoozed_until": snooze_until}
+
+
+@router.get("/usage-scan-status")
+async def get_usage_scan_status(request: Request):
+    """Current scan status and DB info."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return {"status": "scanning", "ready": False}
+
+    # Get basic DB stats
+    import os
+    db_path = db._db_path if hasattr(db, '_db_path') else None
+    db_size = os.path.getsize(db_path) if db_path and os.path.exists(db_path) else 0
+    purge_days = db.get_setting("purge_days")
+
+    return {
+        "status": "ready",
+        "ready": True,
+        "db_size_bytes": db_size,
+        "purge_days": int(purge_days) if purge_days else None,
+    }
+
+
+@router.post("/usage-settings")
+async def update_usage_settings(request: Request):
+    """Update analytics settings (purge_days)."""
+    db = _get_analytics_db(request)
+    if db is None:
+        return JSONResponse({"error": "Analytics not ready"}, status_code=503)
+
+    body = await request.json()
+    purge_days = body.get("purge_days")
+    if purge_days is not None:
+        if purge_days == 0 or purge_days is False:
+            db.set_setting("purge_days", None)
+        else:
+            db.set_setting("purge_days", str(int(purge_days)))
+
+    return {"updated": True}

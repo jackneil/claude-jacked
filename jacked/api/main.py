@@ -152,10 +152,26 @@ async def lifespan(app: FastAPI):
     logger.info("Started active account poll loop (60s)")
     logger.info("Started full sweep loop")
 
+    # Start analytics scanner + live monitor
+    analytics_scan_task = None
+    analytics_monitor_task = None
+    try:
+        from jacked.web.analytics_monitor import initial_scan_loop, live_monitor_loop
+        analytics_scan_task = asyncio.create_task(initial_scan_loop(app))
+        analytics_monitor_task = asyncio.create_task(live_monitor_loop(app))
+        logger.info("Started analytics scanner + live monitor")
+    except Exception as e:
+        logger.warning("Analytics module unavailable: %s", e)
+
     yield
 
     # Shutdown: cancel background tasks
-    for task in (refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task, active_poll_task, full_sweep_task):
+    tasks_to_cancel = [refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task, active_poll_task, full_sweep_task]
+    if analytics_scan_task is not None:
+        tasks_to_cancel.append(analytics_scan_task)
+    if analytics_monitor_task is not None:
+        tasks_to_cancel.append(analytics_monitor_task)
+    for task in tasks_to_cancel:
         task.cancel()
         try:
             await task
