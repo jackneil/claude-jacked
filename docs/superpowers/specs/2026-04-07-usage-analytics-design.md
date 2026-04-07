@@ -38,7 +38,10 @@ Three-layer architecture:
   - Haiku input: $0.80/M, output: $4/M, cache read: $0.08/M, cache create: $1/M
 - Writes parsed messages to `usage_analytics.db`
 - Tracks per-file byte offset + mtime for incremental updates (only new bytes parsed on subsequent runs)
+- **Handles JSONL rewrites:** Claude Code rewrites JSONL files on session resume (replays conversation prefix with updated cache counts). If stored byte offset > current file size, reset offset to 0 and re-scan the file. Dedup by message.id prevents duplicate inserts.
+- **Runs in thread pool:** All file I/O and JSON parsing runs via `asyncio.to_thread()` to avoid blocking the event loop. The scanner yields control between projects with `await asyncio.sleep(0)`.
 - Starts automatically on server startup, runs in background asyncio task
+- **Scan state garbage collection:** On each full scan, prune `scan_state` entries where the file no longer exists on disk. Prevents accumulated stale entries from slowing startup over months of use.
 
 **Layer 2: Anomaly Detector** (runs after each scan batch)
 - Compares session metrics against rolling 7-day averages
@@ -144,18 +147,22 @@ CREATE TABLE analytics_settings (
 
 **Purge behavior:** Configurable via UI setting "Auto-purge message data older than N days" (default: off — keep everything). When set, purge runs after each scan cycle. Before purging, un-summarized days are rolled up into `daily_summaries`. Daily summaries are never purged.
 
+**Rollup watermark:** `analytics_settings` stores `last_rollup_date` (YYYY-MM-DD). Rollup only processes days after this date. After successful rollup, the watermark advances. This prevents double-counting if the process crashes mid-rollup. On first run, `last_rollup_date` is NULL and all days are rolled up.
+
 ### 3. Anomaly Detection
 
-Six flag types:
+**V1: Three flag types** (most impactful, lowest false-positive risk). Additional types added in follow-up after user feedback.
 
 | Flag Type | Detection | Warning Threshold | Critical Threshold |
 |-----------|-----------|-------------------|-------------------|
-| `cache_drop` | Session cache hit ratio vs 7-day session average | < 70% (when avg is 90%+) | < 30% |
-| `cost_outlier` | Session estimated cost vs 7-day per-session average | > 2.5× average | > 5× average |
-| `subagent_explosion` | Count of distinct subagent JSONL files for session | > 20 subagents | > 40 subagents |
-| `context_bloat` | Input tokens growth: last 10 messages vs first 10 | > 50% growth | > 150% growth |
-| `resume_spike` | First message in session: cache_read=0, cache_create > 200K | Always warning | cache_create > 400K |
-| `inactive_burn` | Output tokens with no preceding user message | > 50K tokens | > 200K tokens |
+| `cache_drop` | Session cache hit ratio vs 7-day session average. **Excludes first 5 messages** of each session (cache warmup). Only fires for sessions with 10+ messages. | < 70% (when avg is 90%+) | < 30% |
+| `cost_outlier` | Session estimated cost vs 7-day per-session average. Only fires for sessions with 5+ messages and 5+ minutes duration (avoids flagging quick tests). | > 3× average | > 6× average |
+| `subagent_explosion` | Count of subagent messages (is_subagent=1) per session | > 20 subagent messages | > 50 subagent messages |
+
+**Deferred to v2** (need user feedback on false-positive rates first):
+- `context_bloat` — input tokens growth detection
+- `resume_spike` — first-message cache miss detection
+- `inactive_burn` — output without user input (too many false positives with subagent workflows)
 
 **Flag descriptions are actionable and specific:**
 - "hank-rcm session 4a2f: 312K output in 22 min — 3.2× your average"
@@ -166,7 +173,9 @@ Six flag types:
 
 **No model routing recommendations.** Flags focus exclusively on anomalies the user didn't choose.
 
-**Auto-resolution:** Each scan cycle re-evaluates active flags. If the condition has cleared (e.g., session ended, cache recovered), `resolved_at` is set. Resolved flags drop off the active list but remain in DB for history.
+**Auto-resolution:** Flags for completed sessions auto-resolve 1 hour after the last message in that session. Active session flags are re-evaluated each scan cycle — if the condition has cleared (e.g., cache recovered), `resolved_at` is set. Resolved flags drop off the active list but remain in DB for history.
+
+**Dismiss/snooze:** Users can dismiss individual flags (sets `resolved_at`) or snooze a flag type for 24 hours (stored in `analytics_settings` as `snooze_{flag_type}_until`). Snoozed types are excluded from detection.
 
 ### 4. Frontend — Analytics Page
 
@@ -259,34 +268,14 @@ Example: `-Users-jack-neil-Github-claude-jacked` → "claude-jacked"
 
 ### 7. Cost Estimation
 
-Claude Code doesn't report costs for Max/Pro plans (`costUSD` is always null). Compute from token counts using current API pricing:
+Claude Code doesn't report costs for Max/Pro plans (`costUSD` is always null). **Reuse the existing pricing from `jacked/web/db_analytics.py`** which already defines `MODEL_PRICING` with per-model rates. Import and use it — do NOT duplicate the pricing table. The existing pricing:
+- Opus: input $5/M, output $25/M, cache_read $0.50/M, cache_write $6.25/M
+- Sonnet: input $3/M, output $15/M, cache_read $0.30/M, cache_write $3.75/M
+- Haiku: input $0.80/M, output $4/M, cache_read $0.08/M, cache_write $1/M
 
-```python
-MODEL_PRICING = {
-    "claude-opus-4-6": {
-        "input": 15.0,           # $/M tokens
-        "output": 75.0,
-        "cache_read": 1.875,     # 12.5% of input
-        "cache_create": 18.75,   # 125% of input
-    },
-    "claude-sonnet-4-6": {
-        "input": 3.0,
-        "output": 15.0,
-        "cache_read": 0.30,
-        "cache_create": 3.75,
-    },
-    "claude-haiku-4-5": {
-        "input": 0.80,
-        "output": 4.0,
-        "cache_read": 0.08,
-        "cache_create": 1.0,
-    },
-}
-```
+Model names from JSONL (e.g., `claude-opus-4-6`) are matched via `db_analytics.MODEL_PRICING`. Unknown models fall back to Opus pricing (conservative). Costs labeled "estimated API equivalent" in the UI.
 
-Model names from JSONL (e.g., `claude-opus-4-6`) are matched against this table. Unknown models fall back to Opus pricing (conservative estimate). Costs are labeled "estimated API equivalent" in the UI — not a billing statement.
-
-Pricing is defined in a constant dict, easy to update when prices change.
+Note: `cache_write` in the existing code corresponds to `cache_creation_input_tokens` in the JSONL data.
 
 ## Files
 
