@@ -2268,24 +2268,77 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 
 
 def _recommend_external_tools():
-    """Print recommendations for useful external CLI tools."""
+    """Print recommendations for useful external tools and Claude Code plugins."""
+    import json
     import shutil
     import sys
 
-    recommendations = []
+    tools = []
+    plugins_needed = []
 
-    # agent-browser — browser QA, dogfooding, Playwright automation
+    # ---------------------------------------------------------------
+    # Claude Code plugins — check which are installed
+    # ---------------------------------------------------------------
+    settings_path = Path.home() / ".claude" / "settings.json"
+    installed_plugins: set[str] = set()
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            installed_plugins = set(settings.get("enabledPlugins", []))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Plugins that jacked's behaviors and skills depend on
+    required_plugins = {
+        "superpowers@claude-plugins-official": "brainstorming, planning, TDD, subagent workflows",
+        "playwright@claude-plugins-official": "/qa and /ux browser testing",
+        "firecrawl@claude-plugins-official": "web search and scraping in skills",
+        "commit-commands@claude-plugins-official": "/commit, /commit-push-pr",
+        "pr-review-toolkit@claude-plugins-official": "/review-pr, code review agents",
+    }
+
+    # Nice-to-have plugins
+    optional_plugins = {
+        "frontend-design@claude-plugins-official": "UI/UX design quality in code review",
+        "code-simplifier@claude-plugins-official": "code simplification agent",
+        "claude-md-management@claude-plugins-official": "CLAUDE.md audit and improvement",
+    }
+
+    for plugin, desc in required_plugins.items():
+        if plugin not in installed_plugins:
+            plugins_needed.append((plugin, desc, True))
+
+    for plugin, desc in optional_plugins.items():
+        if plugin not in installed_plugins:
+            plugins_needed.append((plugin, desc, False))
+
+    if plugins_needed:
+        required = [(p, d) for p, d, r in plugins_needed if r]
+        optional = [(p, d) for p, d, r in plugins_needed if not r]
+
+        if required:
+            console.print("\n[bold]Required Claude Code plugins:[/bold]")
+            console.print("  Enable these in Claude Code settings or via /plugins:")
+            for plugin, desc in required:
+                name = plugin.split("@")[0]
+                console.print(f"    {name:30s} — {desc}")
+
+        if optional:
+            console.print("\n  Optional plugins:")
+            for plugin, desc in optional:
+                name = plugin.split("@")[0]
+                console.print(f"    {name:30s} — {desc}")
+
+    # ---------------------------------------------------------------
+    # External CLI tools
+    # ---------------------------------------------------------------
     ab = shutil.which("agent-browser")
     if ab:
-        # Check if version has dogfood skill — try common install layouts
         ab_path = Path(ab).resolve()
         has_dogfood = False
-        # Homebrew layout: .../libexec/lib/node_modules/agent-browser/skills/
         for candidate in [
             ab_path.parent.parent / "libexec" / "lib" / "node_modules" / "agent-browser" / "skills",
-            # npm global layout: .../lib/node_modules/agent-browser/skills/
             ab_path.parent.parent / "lib" / "node_modules" / "agent-browser" / "skills",
-            # npm global (Windows): .../node_modules/agent-browser/skills/
             ab_path.parent / "node_modules" / "agent-browser" / "skills",
         ]:
             if (candidate / "dogfood").exists():
@@ -2293,31 +2346,31 @@ def _recommend_external_tools():
                 break
         if not has_dogfood:
             if sys.platform == "darwin" and shutil.which("brew"):
-                recommendations.append(
+                tools.append(
                     "  brew upgrade agent-browser                            "
                     "# Update for /dogfood QA skill"
                 )
             else:
-                recommendations.append(
+                tools.append(
                     "  npm install -g agent-browser@latest                   "
                     "# Update for /dogfood QA skill"
                 )
     else:
         if sys.platform == "darwin" and shutil.which("brew"):
-            recommendations.append(
+            tools.append(
                 "  brew install agent-browser                             "
                 "# Browser QA testing (/dogfood skill)"
             )
         else:
-            recommendations.append(
+            tools.append(
                 "  npm install -g agent-browser                           "
                 "# Browser QA testing (/dogfood skill)"
             )
 
-    if recommendations:
+    if tools:
         console.print("\nRecommended tools:")
-        for r in recommendations:
-            console.print(r)
+        for t in tools:
+            console.print(t)
 
 
 @main.command()
