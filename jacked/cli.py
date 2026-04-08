@@ -2270,25 +2270,49 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
 def _recommend_external_tools():
     """Print recommendations for useful external CLI tools."""
     import shutil
+    import sys
 
     recommendations = []
 
     # agent-browser — browser QA, dogfooding, Playwright automation
     ab = shutil.which("agent-browser")
     if ab:
-        # Check if version has dogfood skill
+        # Check if version has dogfood skill — try common install layouts
         ab_path = Path(ab).resolve()
-        skills_dir = ab_path.parent.parent / "libexec" / "lib" / "node_modules" / "agent-browser" / "skills"
-        if not (skills_dir / "dogfood").exists():
-            recommendations.append(
-                "  brew upgrade agent-browser                            "
-                "# Update for /dogfood QA skill"
-            )
+        has_dogfood = False
+        # Homebrew layout: .../libexec/lib/node_modules/agent-browser/skills/
+        for candidate in [
+            ab_path.parent.parent / "libexec" / "lib" / "node_modules" / "agent-browser" / "skills",
+            # npm global layout: .../lib/node_modules/agent-browser/skills/
+            ab_path.parent.parent / "lib" / "node_modules" / "agent-browser" / "skills",
+            # npm global (Windows): .../node_modules/agent-browser/skills/
+            ab_path.parent / "node_modules" / "agent-browser" / "skills",
+        ]:
+            if (candidate / "dogfood").exists():
+                has_dogfood = True
+                break
+        if not has_dogfood:
+            if sys.platform == "darwin" and shutil.which("brew"):
+                recommendations.append(
+                    "  brew upgrade agent-browser                            "
+                    "# Update for /dogfood QA skill"
+                )
+            else:
+                recommendations.append(
+                    "  npm install -g agent-browser@latest                   "
+                    "# Update for /dogfood QA skill"
+                )
     else:
-        recommendations.append(
-            "  brew install agent-browser                             "
-            "# Browser QA testing (/dogfood skill)"
-        )
+        if sys.platform == "darwin" and shutil.which("brew"):
+            recommendations.append(
+                "  brew install agent-browser                             "
+                "# Browser QA testing (/dogfood skill)"
+            )
+        else:
+            recommendations.append(
+                "  npm install -g agent-browser                           "
+                "# Browser QA testing (/dogfood skill)"
+            )
 
     if recommendations:
         console.print("\nRecommended tools:")
