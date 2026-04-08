@@ -2263,6 +2263,38 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
         )
         console.print(r'  uv tool install "claude-jacked\[all]" --force       # Everything')
 
+    # Check for recommended external tools
+    _recommend_external_tools()
+
+
+def _recommend_external_tools():
+    """Print recommendations for useful external CLI tools."""
+    import shutil
+
+    recommendations = []
+
+    # agent-browser — browser QA, dogfooding, Playwright automation
+    ab = shutil.which("agent-browser")
+    if ab:
+        # Check if version has dogfood skill
+        ab_path = Path(ab).resolve()
+        skills_dir = ab_path.parent.parent / "libexec" / "lib" / "node_modules" / "agent-browser" / "skills"
+        if not (skills_dir / "dogfood").exists():
+            recommendations.append(
+                "  brew upgrade agent-browser                            "
+                "# Update for /dogfood QA skill"
+            )
+    else:
+        recommendations.append(
+            "  brew install agent-browser                             "
+            "# Browser QA testing (/dogfood skill)"
+        )
+
+    if recommendations:
+        console.print("\nRecommended tools:")
+        for r in recommendations:
+            console.print(r)
+
 
 @main.command()
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
