@@ -1929,9 +1929,9 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     help="Install session indexing hook (requires [search] extra)",
 )
 @click.option(
-    "--security",
+    "--no-security",
     is_flag=True,
-    help="Install security gatekeeper hook",
+    help="Skip security gatekeeper hook (installed by default)",
 )
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
 @click.option(
@@ -1940,12 +1940,13 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     is_flag=True,
     help="Overwrite existing agents/commands without prompting",
 )
-def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: bool):
+def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force: bool):
     """Auto-install skill, agents, commands, and optional hooks.
 
-    Base install: agents, commands, behavioral rules, /jacked skill.
+    Base install: agents, commands, behavioral rules, /jacked skill,
+    and the security gatekeeper (auto-approves safe Bash commands).
+    Use --no-security to skip the gatekeeper.
     Use --search to add session indexing (requires qdrant-client).
-    Use --security to add security gatekeeper (requires anthropic SDK).
     """
     import json
     import shutil
@@ -1953,11 +1954,8 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     home = Path.home()
     pkg_root = _get_data_root()
 
-    # Search extra requires explicit --search flag. Do NOT auto-detect
-    # qdrant-client — the search feature requires a configured Qdrant
-    # instance and is not ready for default installation.
     install_search = search
-    install_security = security
+    install_security = not no_security
 
     console.print("[bold]Installing Jacked...[/bold]\n")
 
@@ -2138,7 +2136,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     if sounds:
         _install_sound_hooks(existing, settings_path)
 
-    # Install security gatekeeper — only if --security flag passed
+    # Install security gatekeeper (default — skip with --no-security)
     if install_security:
         _install_security_hook(existing, settings_path)
         # Auto-run static permission audit
@@ -2159,7 +2157,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                 console.print("[green][AUDIT] Permission rules look clean[/green]")
     else:
         console.print(
-            "[dim][-][/dim] Skipping security gatekeeper (use --security to enable)"
+            "[dim][-][/dim] Skipping security gatekeeper (remove --no-security to enable)"
         )
 
     # Install session-account tracker hooks (always — lightweight, no deps)
@@ -2259,7 +2257,7 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             r'  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
         )
         console.print(
-            r'  jacked install --force --security                   # Auto-approve safe Bash commands'
+            r'  jacked install --force                              # Re-install with security gatekeeper (default)'
         )
         console.print(r'  uv tool install "claude-jacked\[all]" --force       # Everything')
 
@@ -3078,7 +3076,7 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
                 "[red]anthropic SDK not installed — cannot run LLM audit[/red]"
             )
             console.print(
-                '[dim]Activate it: jacked install --force --security[/dim]'
+                '[dim]Activate it: jacked install --force[/dim]'
             )
         except json.JSONDecodeError:
             console.print(
