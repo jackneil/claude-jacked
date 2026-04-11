@@ -5,6 +5,7 @@ let _methodOptions = [];  // cached method values from API
 
 // --- Pattern extraction ---
 const _ENV_PREFIX_RE = /^(\w+=\S+\s+)+/;
+const _COMPOUND_SPLIT_RE = /\s*(&&|\|\||;)\s*/;
 
 const _KNOWN_COMMAND_PREFIXES = new Set([
     // 2-word prefixes
@@ -60,6 +61,48 @@ function tokenizeForSelector(command, method) {
     }
 
     const stripped = command.replace(_ENV_PREFIX_RE, '');
+
+    // Compound command detection: split on &&, ||, ; (but NOT single | for pipes)
+    if (/(?:&&|\|\||;)/.test(stripped)) {
+        const segments = stripped.split(_COMPOUND_SPLIT_RE);
+        // segments = [cmd1, op1, cmd2, op2, cmd3, ...]  (capturing group keeps operators)
+        if (segments.length > 2) {
+            const parts = [];
+            for (let si = 0; si < segments.length; si += 2) {
+                const cmdPart = (segments[si] || '').trim();
+                if (!cmdPart) continue;
+                const partTokens = cmdPart.split(/\s+/).filter(Boolean);
+                if (!partTokens.length) continue;
+                const operator = si > 0 ? (segments[si - 1] || '').trim() : null;
+
+                // Compute recommendedIndex for this part
+                let recIdx = partTokens.length - 1;
+                for (const len of [3, 2]) {
+                    if (partTokens.length >= len) {
+                        const candidate = partTokens.slice(0, len).join(' ');
+                        if (_KNOWN_COMMAND_PREFIXES.has(candidate)) {
+                            recIdx = len - 1;
+                            break;
+                        }
+                    }
+                }
+
+                parts.push({
+                    tokens: partTokens,
+                    operator,
+                    boundaryIndex: recIdx,
+                    recommendedIndex: recIdx,
+                    enabled: true,
+                    pattern: _patternForBoundary(partTokens, recIdx),
+                });
+            }
+            if (parts.length > 1) {
+                return { type: 'compound', parts };
+            }
+            // Single part after splitting (e.g. trailing operator) — fall through
+        }
+    }
+
     const tokens = stripped.split(/\s+/).filter(Boolean);
     if (!tokens.length) return null;
 
@@ -129,6 +172,7 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
     if (existing) existing.remove();
 
     const isPath = tokenData.type === 'path';
+    const isCompound = tokenData.type === 'compound';
     const repoName = repoPath ? repoPath.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
 
     const overlay = document.createElement('div');
@@ -141,12 +185,13 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
     // Title
     const title = document.createElement('h3');
     title.className = 'text-lg font-semibold text-white mb-4';
-    title.textContent = isPath ? 'Add Path Rule' : 'Always Allow Rule';
+    title.textContent = isPath ? 'Add Path Rule' : isCompound ? 'Always Allow Rules' : 'Always Allow Rule';
     modal.appendChild(title);
 
     // Track selected pattern for submission
     let selectedPattern = '';
     let useCustom = false;
+    let partStates = null;
 
     if (isPath) {
         // Path safety: token pill selector for path segments
@@ -265,6 +310,143 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
         selectedPattern = _pathPatternForBoundary(toolName, segments, pathBoundary);
         renderPathTokens();
         updatePathDisplay();
+    } else if (isCompound) {
+        // Compound command: split into separately approvable sections
+        partStates = tokenData.parts.map(p => ({
+            tokens: [...p.tokens],
+            operator: p.operator,
+            boundaryIndex: p.boundaryIndex,
+            recommendedIndex: p.recommendedIndex,
+            enabled: true,
+            pattern: p.pattern,
+        }));
+
+        // Instruction label
+        const instrLabel = document.createElement('div');
+        instrLabel.className = 'text-sm text-slate-300 mb-2';
+        instrLabel.textContent = 'Click tokens to set allow boundary for each part:';
+        modal.appendChild(instrLabel);
+
+        // Summary element (updated after each interaction)
+        const summaryDiv = document.createElement('div');
+        summaryDiv.className = 'text-xs text-slate-400 mb-3 bg-slate-900/50 rounded-lg px-3 py-2';
+
+        function updateSummary() {
+            const enabled = partStates.filter(ps => ps.enabled);
+            if (enabled.length === 0) {
+                summaryDiv.textContent = 'No parts selected';
+            } else {
+                const code = document.createElement('div');
+                const label = document.createElement('span');
+                label.className = 'text-slate-500';
+                label.textContent = enabled.length === 1 ? 'Rule: ' : `${enabled.length} rules: `;
+                code.appendChild(label);
+                enabled.forEach((ps, ei) => {
+                    if (ei > 0) {
+                        const sep = document.createTextNode(', ');
+                        code.appendChild(sep);
+                    }
+                    const patternSpan = document.createElement('code');
+                    patternSpan.className = 'text-blue-300 font-mono';
+                    patternSpan.textContent = ps.pattern;
+                    code.appendChild(patternSpan);
+                });
+                while (summaryDiv.firstChild) summaryDiv.removeChild(summaryDiv.firstChild);
+                summaryDiv.appendChild(code);
+            }
+        }
+
+        // Render each part
+        partStates.forEach((ps, partIdx) => {
+            // Operator separator between sections
+            if (ps.operator) {
+                const opDiv = document.createElement('div');
+                opDiv.className = 'text-center text-xs text-slate-500 my-2 select-none';
+                opDiv.textContent = ps.operator;
+                modal.appendChild(opDiv);
+            }
+
+            // Part header: checkbox + label
+            const headerRow = document.createElement('div');
+            headerRow.className = 'flex items-center gap-2 mb-1';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.checked = ps.enabled;
+            checkbox.className = 'accent-blue-500';
+
+            const partLabel = document.createElement('span');
+            partLabel.className = 'text-sm text-slate-300 font-medium';
+            partLabel.textContent = `Part ${partIdx + 1}`;
+
+            headerRow.appendChild(checkbox);
+            headerRow.appendChild(partLabel);
+            modal.appendChild(headerRow);
+
+            // Token pill container
+            const tokenContainer = document.createElement('div');
+            tokenContainer.className = 'mb-2 bg-slate-900/50 rounded-lg px-3 py-3';
+
+            const tokenRow = document.createElement('div');
+            tokenRow.className = 'flex flex-wrap items-center gap-1.5';
+
+            // Pattern display for this part
+            const partPatternRow = document.createElement('div');
+            partPatternRow.className = 'mb-1';
+            const partPatternCode = document.createElement('code');
+            partPatternCode.className = 'text-xs font-mono text-blue-300';
+            partPatternCode.textContent = ps.pattern;
+            partPatternRow.appendChild(partPatternCode);
+
+            function renderPartTokens() {
+                while (tokenRow.firstChild) tokenRow.removeChild(tokenRow.firstChild);
+                ps.tokens.forEach((tok, i) => {
+                    const pill = document.createElement('span');
+                    pill.className = 'cursor-pointer rounded px-2 py-0.5 text-sm font-mono transition-colors select-none';
+                    if (i <= ps.boundaryIndex) {
+                        pill.className += ' text-white bg-slate-700 hover:bg-slate-600';
+                    } else {
+                        pill.className += ' text-slate-500 hover:bg-slate-700/40';
+                    }
+                    pill.textContent = tok;
+                    pill.addEventListener('click', () => {
+                        ps.boundaryIndex = i;
+                        ps.pattern = _patternForBoundary(ps.tokens, ps.boundaryIndex);
+                        partPatternCode.textContent = ps.pattern;
+                        renderPartTokens();
+                        updateSummary();
+                    });
+                    tokenRow.appendChild(pill);
+
+                    // Wildcard indicator after boundary (if not exact match)
+                    if (i === ps.boundaryIndex && ps.boundaryIndex < ps.tokens.length - 1) {
+                        const star = document.createElement('span');
+                        star.className = 'text-blue-400 font-bold text-sm select-none';
+                        star.textContent = '*';
+                        tokenRow.appendChild(star);
+                    }
+                });
+            }
+
+            // Checkbox toggle
+            checkbox.addEventListener('change', () => {
+                ps.enabled = checkbox.checked;
+                tokenContainer.style.opacity = checkbox.checked ? '1' : '0.4';
+                partPatternRow.style.opacity = checkbox.checked ? '1' : '0.4';
+                updateSummary();
+            });
+
+            tokenContainer.appendChild(tokenRow);
+            modal.appendChild(tokenContainer);
+            modal.appendChild(partPatternRow);
+
+            // Initial render
+            renderPartTokens();
+        });
+
+        // Append summary
+        updateSummary();
+        modal.appendChild(summaryDiv);
     } else {
         const { tokens, recommendedIndex } = tokenData;
         let boundaryIndex = recommendedIndex;
@@ -492,27 +674,42 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
 
     const addBtn = document.createElement('button');
     addBtn.className = 'px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors';
-    addBtn.textContent = 'Add Rule';
+    addBtn.textContent = isCompound ? 'Add Rules' : 'Add Rule';
     addBtn.addEventListener('click', async () => {
-        const val = selectedPattern;
-        if (!val) return;
-
         addBtn.disabled = true;
         addBtn.textContent = 'Adding...';
 
         try {
             const scope = modal.querySelector('input[name="aa-scope"]:checked')?.value || 'global';
-            const payload = { pattern: val, list_name: 'allow', scope };
-            if (scope === 'project' && repoPath) {
-                payload.repo_path = repoPath;
+
+            if (isCompound && partStates) {
+                const enabled = partStates.filter(ps => ps.enabled);
+                if (!enabled.length) return;
+                for (const ps of enabled) {
+                    const payload = { pattern: ps.pattern, list_name: 'allow', scope };
+                    if (scope === 'project' && repoPath) {
+                        payload.repo_path = repoPath;
+                    }
+                    await api.post('/api/claude-settings/permissions/rule', payload);
+                }
+                overlay.remove();
+                const patterns = enabled.map(ps => ps.pattern).join(', ');
+                showLogsToast(`Added ${enabled.length} rule${enabled.length !== 1 ? 's' : ''}: ${patterns}`);
+            } else {
+                const val = selectedPattern;
+                if (!val) return;
+                const payload = { pattern: val, list_name: 'allow', scope };
+                if (scope === 'project' && repoPath) {
+                    payload.repo_path = repoPath;
+                }
+                await api.post('/api/claude-settings/permissions/rule', payload);
+                overlay.remove();
+                showLogsToast(`Added rule: ${val}`);
             }
-            await api.post('/api/claude-settings/permissions/rule', payload);
-            overlay.remove();
-            showLogsToast(`Added rule: ${val}`);
         } catch (e) {
             showLogsToast('Failed: ' + e.message, true);
             addBtn.disabled = false;
-            addBtn.textContent = 'Add Rule';
+            addBtn.textContent = isCompound ? 'Add Rules' : 'Add Rule';
         }
     });
 
