@@ -62,8 +62,15 @@ function tokenizeForSelector(command, method) {
 
     const stripped = command.replace(_ENV_PREFIX_RE, '');
 
-    // Compound command detection: split on &&, ||, ; (but NOT single | for pipes)
-    if (/(?:&&|\|\||;)/.test(stripped)) {
+    // Compound command detection: split on &&, ||, ; (but NOT single | for pipes).
+    // Skip if the command contains unbalanced quotes — splitting inside a quoted
+    // string would produce garbage patterns. Fall through to exact-match single command.
+    const _hasBalancedQuotes = (s) => {
+        const dq = (s.match(/"/g) || []).length;
+        const sq = (s.match(/'/g) || []).length;
+        return dq % 2 === 0 && sq % 2 === 0;
+    };
+    if (/(?:&&|\|\||;)/.test(stripped) && _hasBalancedQuotes(stripped) && !/["'][^"']*(?:&&|\|\||;)[^"']*["']/.test(stripped)) {
         const segments = stripped.split(_COMPOUND_SPLIT_RE);
         // segments = [cmd1, op1, cmd2, op2, cmd3, ...]  (capturing group keeps operators)
         if (segments.length > 2) {
@@ -99,7 +106,19 @@ function tokenizeForSelector(command, method) {
             if (parts.length > 1) {
                 return { type: 'compound', parts };
             }
-            // Single part after splitting (e.g. trailing operator) — fall through
+            // Single part after splitting (e.g. trailing ; or && ): return the
+            // cleaned single part instead of re-tokenizing the raw stripped
+            // string (which still contains the operator literal).
+            if (parts.length === 1) {
+                const p = parts[0];
+                return {
+                    type: 'tokens',
+                    tokens: p.tokens,
+                    stripped,
+                    recommendedIndex: p.recommendedIndex,
+                };
+            }
+            // parts.length === 0 — fall through (will hit empty-check below)
         }
     }
 
@@ -398,6 +417,39 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
             partPatternCode.textContent = ps.pattern;
             partPatternRow.appendChild(partPatternCode);
 
+            // Sensitive-base warning for this part
+            const partWarning = document.createElement('div');
+            partWarning.className = 'text-[11px] text-amber-400 mt-1 hidden';
+            partWarning.textContent = '\u26A0 Bypasses LLM safety checks for this command category';
+
+            // Recommended badge for this part
+            const partBadge = document.createElement('div');
+            partBadge.className = 'text-[10px] text-blue-300 mt-1.5';
+
+            function _updatePartBadge() {
+                while (partBadge.firstChild) partBadge.removeChild(partBadge.firstChild);
+                const recTok = ps.tokens[ps.recommendedIndex];
+                if (ps.boundaryIndex === ps.recommendedIndex) {
+                    partBadge.textContent = '\u2191 Recommended';
+                } else {
+                    partBadge.appendChild(document.createTextNode('Recommended: click '));
+                    const span = document.createElement('span');
+                    span.className = 'font-mono text-blue-400';
+                    span.textContent = recTok;
+                    partBadge.appendChild(span);
+                }
+            }
+
+            function _updatePartWarning() {
+                const prefix = ps.tokens.slice(0, ps.boundaryIndex + 1).join(' ');
+                const isBroad = ps.boundaryIndex < ps.tokens.length - 1;
+                if (isBroad && _isSensitive(prefix)) {
+                    partWarning.classList.remove('hidden');
+                } else {
+                    partWarning.classList.add('hidden');
+                }
+            }
+
             function renderPartTokens() {
                 while (tokenRow.firstChild) tokenRow.removeChild(tokenRow.firstChild);
                 ps.tokens.forEach((tok, i) => {
@@ -410,10 +462,13 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
                     }
                     pill.textContent = tok;
                     pill.addEventListener('click', () => {
+                        if (!ps.enabled) return;  // disabled parts are inert
                         ps.boundaryIndex = i;
                         ps.pattern = _patternForBoundary(ps.tokens, ps.boundaryIndex);
                         partPatternCode.textContent = ps.pattern;
                         renderPartTokens();
+                        _updatePartBadge();
+                        _updatePartWarning();
                         updateSummary();
                     });
                     tokenRow.appendChild(pill);
@@ -437,11 +492,15 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
             });
 
             tokenContainer.appendChild(tokenRow);
+            tokenContainer.appendChild(partBadge);
             modal.appendChild(tokenContainer);
             modal.appendChild(partPatternRow);
+            modal.appendChild(partWarning);
 
             // Initial render
             renderPartTokens();
+            _updatePartBadge();
+            _updatePartWarning();
         });
 
         // Append summary
@@ -676,6 +735,18 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
     addBtn.className = 'px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors';
     addBtn.textContent = isCompound ? 'Add Rules' : 'Add Rule';
     addBtn.addEventListener('click', async () => {
+        // Pre-flight: compound with no enabled parts → show toast, don't deadlock
+        if (isCompound && partStates) {
+            const enabled = partStates.filter(ps => ps.enabled);
+            if (!enabled.length) {
+                showLogsToast('No parts selected', true);
+                return;
+            }
+        } else if (!isCompound && !selectedPattern) {
+            showLogsToast('No pattern selected', true);
+            return;
+        }
+
         addBtn.disabled = true;
         addBtn.textContent = 'Adding...';
 
@@ -684,20 +755,29 @@ function showAlwaysAllowModal({ tokenData, repoPath }) {
 
             if (isCompound && partStates) {
                 const enabled = partStates.filter(ps => ps.enabled);
-                if (!enabled.length) return;
+                const results = { added: [], failed: [] };
                 for (const ps of enabled) {
                     const payload = { pattern: ps.pattern, list_name: 'allow', scope };
                     if (scope === 'project' && repoPath) {
                         payload.repo_path = repoPath;
                     }
-                    await api.post('/api/claude-settings/permissions/rule', payload);
+                    try {
+                        await api.post('/api/claude-settings/permissions/rule', payload);
+                        results.added.push(ps.pattern);
+                    } catch (partErr) {
+                        results.failed.push({ pattern: ps.pattern, error: partErr.message || String(partErr) });
+                    }
                 }
                 overlay.remove();
-                const patterns = enabled.map(ps => ps.pattern).join(', ');
-                showLogsToast(`Added ${enabled.length} rule${enabled.length !== 1 ? 's' : ''}: ${patterns}`);
+                if (results.failed.length === 0) {
+                    showLogsToast(`Added ${results.added.length} rule${results.added.length !== 1 ? 's' : ''}: ${results.added.join(', ')}`);
+                } else if (results.added.length === 0) {
+                    showLogsToast(`Failed to add rules: ${results.failed[0].error}`, true);
+                } else {
+                    showLogsToast(`Added ${results.added.length}, failed ${results.failed.length}. First error: ${results.failed[0].error}`, true);
+                }
             } else {
                 const val = selectedPattern;
-                if (!val) return;
                 const payload = { pattern: val, list_name: 'allow', scope };
                 if (scope === 'project' && repoPath) {
                     payload.repo_path = repoPath;
