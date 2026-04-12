@@ -74,6 +74,18 @@ Explore the user's intent, requirements, and design space before touching code. 
 
 Output: A clear understanding of what to build and why.
 
+**Lens awareness:** Before presenting the design, check for installed specialist lenses:
+
+```bash
+ls ~/.claude/lenses/*.md .claude/lenses/*.md 2>/dev/null
+```
+
+If lenses exist, read their frontmatter (name, description, triggers). If any lens triggers match the feature being brainstormed (e.g., building UI → accessibility lens, building API → api-ergonomics lens), surface relevant design considerations:
+
+> "The **{lens.name}** lens suggests considering: {2-3 key items from the lens's 'What to check' section relevant to this feature}"
+
+This is informational only — it doesn't block or change the brainstorm flow. It ensures specialist concerns are raised during design rather than caught late in review.
+
 ### Phase 2: Write Plan
 
 **REQUIRED SUB-SKILL:** `superpowers:writing-plans`

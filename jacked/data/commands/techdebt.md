@@ -58,6 +58,25 @@ Use Grep and Glob to find structural debt:
    - For Python: Grep for `import` statements, check if imported names are used elsewhere in the file
    - Don't chase this too hard - real linters do it better
 
+### Specialist Lens Anti-Patterns
+
+Check for installed specialist lenses:
+
+```bash
+ls ~/.claude/lenses/*.md .claude/lenses/*.md 2>/dev/null
+```
+
+If lenses exist, read their frontmatter to find lenses whose `triggers` match the codebase (check file extensions and directory names in the project). For each matched lens, read its "Common anti-patterns" section.
+
+Use these anti-patterns as **review guidance** — look for them in the codebase alongside the standard TODO/FIXME/HACK scanning. These are interpreted by you (the LLM reviewer), not grepped as literal patterns. For example, if the accessibility lens mentions "Using div/span as buttons instead of semantic button/a elements," look for that pattern in any frontend code you're reviewing.
+
+Report lens-based findings in the same format as other techdebt findings, tagged with the lens name:
+
+```
+[Accessibility] Using <div onClick> as buttons in src/components/NavItem.tsx:23
+  → Should use <button> for keyboard accessibility and screen reader support
+```
+
 ### Step 4: Categorize Findings
 
 Group everything into three buckets:
