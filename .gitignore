@@ -51,5 +51,8 @@ nul
 .firecrawl/
 .playwright-mcp/
 .claude/worktrees/
+.claude/checkpoints/
+.claude/research/
+.superpowers/
 tmp/
 /*.png
