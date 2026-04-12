@@ -941,6 +941,65 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     return "copied"
 
 
+def _install_asset_dir(
+    src_dir: Path,
+    dst_dir: Path,
+    asset_label: str,
+    *,
+    glob_pattern: str = "*.md",
+    force: bool = False,
+) -> tuple[int, int, str | None]:
+    """Install assets from src_dir to dst_dir with conflict handling.
+
+    Handles: symlink detection, hardlink detection, content comparison,
+    force overwrite, and interactive conflict prompts.
+
+    Returns (installed_count, skipped_count, link_method).
+    """
+    if not src_dir.exists():
+        return 0, 0, None
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    installed = 0
+    skipped = 0
+    link_method = None
+
+    for src_file in sorted(src_dir.glob(glob_pattern)):
+        dst_file = dst_dir / src_file.name
+
+        # Already a correct symlink — always skip
+        if dst_file.is_symlink() and dst_file.resolve() == src_file.resolve():
+            skipped += 1
+            continue
+
+        # Already a hardlink to same inode — always skip
+        if not dst_file.is_symlink() and dst_file.exists():
+            try:
+                if dst_file.stat().st_ino == src_file.stat().st_ino:
+                    skipped += 1
+                    continue
+            except OSError:
+                pass
+
+        # Existing file with same content — skip unless --force
+        if not force and not dst_file.is_symlink() and dst_file.exists():
+            if src_file.read_text(encoding="utf-8") == dst_file.read_text(
+                encoding="utf-8"
+            ):
+                skipped += 1
+                continue
+            if sys.stdin.isatty() and not click.confirm(
+                f"{asset_label.title()} '{src_file.name}' exists with different content. Overwrite?"
+            ):
+                skipped += 1
+                continue
+
+        link_method = _link_or_copy(src_file, dst_file)
+        installed += 1
+
+    return installed, skipped, link_method
+
+
 def _sound_hook_marker() -> str:
     """Marker to identify jacked sound hooks."""
     return "# jacked-sound: "
@@ -2047,43 +2106,14 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
     editable = _is_editable_install()
     agents_src = pkg_root / "agents"
     agents_dst = home / ".claude" / "agents"
+    agent_count, agent_skipped, agent_method = _install_asset_dir(
+        agents_src, agents_dst, "agent", glob_pattern="*.md", force=force
+    )
     if agents_src.exists():
-        agents_dst.mkdir(parents=True, exist_ok=True)
-        agent_count = 0
-        skipped = 0
-        link_method = None
-        for agent_file in agents_src.glob("*.md"):
-            dst_file = agents_dst / agent_file.name
-            # Already a correct symlink — always skip
-            if dst_file.is_symlink() and dst_file.resolve() == agent_file.resolve():
-                skipped += 1
-                continue
-            # Already a hardlink to same inode — always skip
-            if not dst_file.is_symlink() and dst_file.exists():
-                try:
-                    if dst_file.stat().st_ino == agent_file.stat().st_ino:
-                        skipped += 1
-                        continue
-                except OSError:
-                    pass
-            # Existing file with same content — skip unless --force
-            if not force and not dst_file.is_symlink() and dst_file.exists():
-                if agent_file.read_text(encoding="utf-8") == dst_file.read_text(
-                    encoding="utf-8"
-                ):
-                    skipped += 1
-                    continue
-                if sys.stdin.isatty() and not click.confirm(
-                    f"Agent '{agent_file.name}' exists with different content. Overwrite?"
-                ):
-                    console.print(f"[yellow][-][/yellow] Skipped {agent_file.name}")
-                    continue
-            link_method = _link_or_copy(agent_file, dst_file)
-            agent_count += 1
-        method_label = f" ({link_method})" if link_method and editable else ""
+        method_label = f" ({agent_method})" if agent_method and editable else ""
         msg = f"[green][OK][/green] Installed {agent_count} agents{method_label}"
-        if skipped:
-            msg += f" ({skipped} unchanged)"
+        if agent_skipped:
+            msg += f" ({agent_skipped} unchanged)"
         console.print(msg)
     else:
         console.print("[yellow][-][/yellow] Agents directory not found")
@@ -2091,46 +2121,32 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
     # Install commands (symlink for editable, copy otherwise)
     commands_src = pkg_root / "commands"
     commands_dst = home / ".claude" / "commands"
+    cmd_count, cmd_skipped, cmd_method = _install_asset_dir(
+        commands_src, commands_dst, "command", glob_pattern="*.md", force=force
+    )
     if commands_src.exists():
-        commands_dst.mkdir(parents=True, exist_ok=True)
-        cmd_count = 0
-        skipped = 0
-        link_method = None
-        for cmd_file in commands_src.glob("*.md"):
-            dst_file = commands_dst / cmd_file.name
-            # Already a correct symlink — always skip
-            if dst_file.is_symlink() and dst_file.resolve() == cmd_file.resolve():
-                skipped += 1
-                continue
-            # Already a hardlink to same inode — always skip
-            if not dst_file.is_symlink() and dst_file.exists():
-                try:
-                    if dst_file.stat().st_ino == cmd_file.stat().st_ino:
-                        skipped += 1
-                        continue
-                except OSError:
-                    pass
-            # Existing file with same content — skip unless --force
-            if not force and not dst_file.is_symlink() and dst_file.exists():
-                if cmd_file.read_text(encoding="utf-8") == dst_file.read_text(
-                    encoding="utf-8"
-                ):
-                    skipped += 1
-                    continue
-                if sys.stdin.isatty() and not click.confirm(
-                    f"Command '{cmd_file.name}' exists with different content. Overwrite?"
-                ):
-                    console.print(f"[yellow][-][/yellow] Skipped {cmd_file.name}")
-                    continue
-            link_method = _link_or_copy(cmd_file, dst_file)
-            cmd_count += 1
-        method_label = f" ({link_method})" if link_method and editable else ""
+        method_label = f" ({cmd_method})" if cmd_method and editable else ""
         msg = f"[green][OK][/green] Installed {cmd_count} commands{method_label}"
-        if skipped:
-            msg += f" ({skipped} unchanged)"
+        if cmd_skipped:
+            msg += f" ({cmd_skipped} unchanged)"
         console.print(msg)
     else:
         console.print("[yellow][-][/yellow] Commands directory not found")
+
+    # Install lenses (symlink for editable, copy otherwise)
+    lenses_src = pkg_root / "lenses"
+    lenses_dst = home / ".claude" / "lenses"
+    lens_count, lens_skipped, lens_method = _install_asset_dir(
+        lenses_src, lenses_dst, "lens", glob_pattern="*.md", force=force
+    )
+    if lenses_src.exists():
+        method_label = f" ({lens_method})" if lens_method and editable else ""
+        msg = f"[green][OK][/green] Installed {lens_count} lenses{method_label}"
+        if lens_skipped:
+            msg += f" ({lens_skipped} unchanged)"
+        console.print(msg)
+    else:
+        console.print("[dim][-][/dim] No lenses found to install")
 
     # Install sound hooks if requested
     if sounds:
@@ -2512,6 +2528,23 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
             console.print("[yellow][-][/yellow] No jacked commands found")
     else:
         console.print("[yellow][-][/yellow] Commands directory not found")
+
+    # Remove only jacked-installed lenses (not the whole directory!)
+    lenses_src = pkg_root / "lenses"
+    lenses_dst = home / ".claude" / "lenses"
+    if lenses_src.exists() and lenses_dst.exists():
+        lens_count = 0
+        for lens_file in lenses_src.glob("*.md"):
+            dst_file = lenses_dst / lens_file.name
+            if dst_file.exists() or dst_file.is_symlink():
+                dst_file.unlink()
+                lens_count += 1
+        if lens_count > 0:
+            console.print(f"[green][OK][/green] Removed {lens_count} lenses")
+        else:
+            console.print("[yellow][-][/yellow] No jacked lenses found")
+    else:
+        console.print("[yellow][-][/yellow] Lenses directory not found")
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(
