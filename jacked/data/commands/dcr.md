@@ -243,6 +243,23 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
     **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum, 2 reviewers).
     Maximum is all 11 (6 reviewers). Use your judgment.
 
+### SPECIALIST LENS DISCOVERY
+
+3d-ii. **Check for installed specialist lenses.**
+
+After selecting built-in lenses, check for specialist lens files:
+
+1. Glob `~/.claude/lenses/*.md` and `.claude/lenses/*.md`. If neither directory exists, skip (lenses are optional).
+2. Parse frontmatter of each file (name, description, triggers).
+3. If both global and project-local have the same filename, project-local wins. Note: "Project lens `{name}.md` overrides global lens."
+4. Match each lens's `triggers` against the domains identified from changed files (the same heuristic used to select built-in lenses above).
+5. If an active checkpoint exists in `.claude/checkpoints/` with `active_lenses` in frontmatter, include those lenses regardless of trigger matching.
+6. **Cap:** include at most 4 specialist lenses. If more match, take the top 4 by trigger specificity (most tags matched). Tiebreaker: alphabetical by filename. List remaining as "also relevant" in the announcement.
+
+Each matched specialist lens is added to the selected lens pool alongside the built-in lenses. When pairing lenses for reviewers, specialist lenses can be paired with built-in lenses or with each other.
+
+Each specialist lens becomes a reviewer instruction: "Additionally review through the **{lens.name}** lens. Use the following checklist and anti-patterns as your guide:\n{full lens file content}"
+
 3e. **Announce selected lenses with reasoning:**
     ```
     **Lenses selected ([N] of 11):**
@@ -257,6 +274,9 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
       ⊘ Simplicity & Reuse — no new logic added, pure config change
       ⊘ Observability & Debuggability — no error handling or async changes
       ⊘ Data Integrity & Schema Safety — no database or schema changes
+    **Specialist lenses:**
+      ✓ Accessibility (specialist) — frontend files changed
+      ⊘ API Ergonomics — no API routes in diff
     ```
 
 ### WAVE 1 — Selected Coverage
