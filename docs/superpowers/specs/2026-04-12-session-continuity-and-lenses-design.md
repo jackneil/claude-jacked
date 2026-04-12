@@ -80,8 +80,11 @@ The most important files to read to get up to speed.
 
 **Frontmatter field semantics:**
 - `plans_in_progress`, `research_files` — **file paths** (resolved against project root)
-- `active_lenses` — **lens names** (matched against lens file `name` field, NOT file paths)
+- `active_lenses` — **lens filenames without extension** (e.g., `accessibility`, `api-ergonomics`). Matched against lens file stems, NOT frontmatter `name` field. This aligns with the filename-based override resolution.
 - All list fields are optional. Missing fields treated as empty lists for backward compatibility with older checkpoints.
+- Older checkpoints may contain deprecated fields (e.g., `files_modified`). These are ignored on read and should not be added to new checkpoints.
+
+**Concurrency assumption:** Checkpoints are single-writer. One Claude session per project at a time. If two sessions save concurrently on the same branch, the second write wins (last-write-wins, no locking). This is acceptable because Claude Code is inherently single-session per project directory.
 
 ### File format — Research summary
 
@@ -114,7 +117,8 @@ Not a copy of the web page, but the actionable knowledge extracted.}
 ```
 /checkpoint              — save current session state
 /checkpoint resume       — load most recent in-progress checkpoint, auto-load all referenced files
-/checkpoint complete     — mark the most recent in-progress checkpoint as completed
+/checkpoint resume {slug} — resume a specific checkpoint (slug from /checkpoint list)
+/checkpoint complete     — mark the most recent in-progress checkpoint (current branch) as completed
 /checkpoint list         — show all checkpoints with status
 ```
 
@@ -125,11 +129,10 @@ Not a copy of the web page, but the actionable knowledge extracted.}
    - Progress, decisions, remaining work
    - **Session Context** — constraints, user intent, verbal domain knowledge
    - **Research & References** — summarize any web fetches or API docs consulted
-3. For research topics with substantial findings (multiple sources, detailed analysis), write a `.claude/research/{YYYYMMDD-HHMMSS}-{topic}.md` file. For quick lookups, inline in the checkpoint.
-4. Write checkpoint file:
-   - Write to a temp file first, then rename to final path (atomic write prevents partial checkpoint on Ctrl+C)
+3. Write checkpoint file first (atomic: temp file → rename). This establishes the parent reference before research files exist.
    - If another in-progress checkpoint exists on the same branch, prompt: "Mark previous checkpoint **{title}** as completed?" (default yes)
-   - Frontmatter references research files, active plan, and which lenses were active
+   - Frontmatter references research files (speculatively — they're written next), active plan, and which lenses were active
+4. For research topics with substantial findings, write `.claude/research/{YYYYMMDD-HHMMSS}-{topic}.md` files. Create `.claude/research/` directory if it doesn't exist. If a research file write fails (Ctrl+C), the checkpoint references a file that doesn't exist — the resume flow's missing-file warning handles this gracefully.
 5. Display confirmation with title, branch, file path
 
 ### Resume flow
@@ -138,7 +141,8 @@ Not a copy of the web page, but the actionable knowledge extracted.}
 2. Read the checkpoint file
 3. **Branch check:** If current branch differs from checkpoint's branch, warn: "Checkpoint was created on branch **{branch}** but you are on **{current_branch}**. Context may not apply. Continue anyway?" Do not auto-switch branches.
 4. **Auto-load referenced files with budget:**
-   - Read files in priority order: `plans_in_progress` → `research_files` → files mentioned in Key Files section
+   - Read files in priority order: `plans_in_progress` → `research_files` → files from Key Files section (each line: `- path/to/file — description`, extract path before em-dash)
+   - Plans first because they define remaining work; research next for decision context; key files last as general reference. This order matters because the budget may truncate later entries.
    - For each file: if it doesn't exist, warn "Referenced file {path} no longer exists (may have been renamed/deleted since checkpoint)" and continue
    - Budget: stop loading after ~3000 total lines across all files. Present remaining as "Also referenced (not loaded): {list}" so the user can request specific ones.
 5. Present the checkpoint summary
@@ -147,7 +151,7 @@ Not a copy of the web page, but the actionable knowledge extracted.}
 ### Checkpoint lifecycle
 
 - **Creating:** `/checkpoint` writes a new file. If another in-progress checkpoint exists on the same branch, offer to mark it completed.
-- **Completing:** `/checkpoint complete` marks the most recent in-progress checkpoint as `completed`. Also happens implicitly when creating a new checkpoint on the same branch (with user confirmation).
+- **Completing:** `/checkpoint complete` marks the most recent in-progress checkpoint **on the current branch** as `completed`. If no in-progress checkpoint exists on the current branch, show all in-progress checkpoints and ask which to complete. Also happens implicitly when creating a new checkpoint on the same branch (with user confirmation).
 - **Multiple in-progress:** Can happen across branches or if the user skips the completion prompt. Session-start shows the most recent one only, with a count of others: "Found active checkpoint: **{title}** ({date}) (+2 older). Run `/checkpoint list` to see all."
 - **Backward compatibility:** Existing checkpoint files that lack `research_files` or `active_lenses` fields work fine — all list fields default to empty.
 
@@ -244,9 +248,9 @@ error states, and any interactive widget.
 
 All skills that consume lenses use the same pattern:
 
-1. Glob `~/.claude/lenses/*.md` and `.claude/lenses/*.md`
+1. Glob `~/.claude/lenses/*.md` and `.claude/lenses/*.md`. If neither directory exists, the matched lens list is empty (no warning, no error — lenses are optional).
 2. Parse frontmatter only (name, description, triggers)
-3. Project-local overrides global on filename collision
+3. Project-local overrides global on filename collision. When a collision is detected, note it in output: "Project lens `accessibility.md` overrides global lens."
 4. Match triggers against context (changed files, directory names, checkpoint domain)
 5. Return matched lens list
 
@@ -259,7 +263,7 @@ Triggers are simple tags. Matching is done by DCR's existing heuristic (which al
 - DCR checks changed files → identifies domains (API, UI, database, etc.)
 - DCR checks installed lenses → matches their `triggers` against identified domains
 - If active checkpoint has `active_lenses`, those are always included regardless of trigger matching
-- **Cap:** If more than 4 specialist lenses match, include the top 4 by specificity (most trigger tags matched). List remaining as "also relevant" in the announcement.
+- **Cap:** If more than 4 specialist lenses match, include the top 4 by specificity (most trigger tags matched). Tiebreaker: alphabetical by filename. List remaining as "also relevant" in the announcement.
 
 No separate trigger matching engine. DCR's lens selection step (which already exists) simply gains awareness of external lens files.
 
@@ -291,7 +295,7 @@ Small, targeted additions to existing skills. Each consumes lenses via the share
 2. If active checkpoint exists, include its `active_lenses` regardless of trigger matching
 3. Matched specialist lenses become additional review angles alongside DCR's built-in lens selection
 4. Each specialist lens becomes a reviewer prompt: "Additionally review through the {lens.name} lens: {lens content}"
-5. **Cap:** max 4 specialist lenses per DCR wave (on top of built-in selections). If more match, prioritize by trigger specificity.
+5. **Cap and prioritization:** follows rules in Section 2, Trigger matching (max 4, specificity-based, alphabetical tiebreaker).
 6. **Announcement:** include specialist lenses in the lens selection announcement: `✓ Accessibility (specialist lens) — frontend files changed`
 
 ### `/coverage-matrix` — Lenses as completeness dimensions
@@ -301,7 +305,7 @@ Small, targeted additions to existing skills. Each consumes lenses via the share
 **Addition:**
 1. Run the shared lens discovery pattern to find all available lenses (global + project-local)
 2. Each specialist lens becomes a completeness dimension: "Has this project addressed {lens.name} concerns?"
-3. Score based on: relevant tests exist, recent reviews covered it, known gaps
+3. Scoring mechanism: check git log for commit messages or DCR output mentioning the lens domain, check for test files in relevant directories, check `.claude/checkpoints/` for DCR results referencing the lens. This is best-effort LLM analysis, not precise measurement.
 
 ### `/qa` — Accessibility and performance checklists
 
@@ -355,7 +359,7 @@ Small, targeted additions to existing skills. Each consumes lenses via the share
 **Where:** During checkpoint save.
 
 **Addition:**
-1. `active_lenses` frontmatter field records which lenses were relevant during the session (by name)
+1. `active_lenses` frontmatter field records which lenses were relevant during the session (by filename stem, e.g., `accessibility`). Populated from: lenses selected by DCR in this session, lenses whose triggers matched files modified during the session, or lenses explicitly referenced in conversation. The LLM generating the checkpoint determines relevance from conversation context.
 2. Next session's `/dcr` includes these lenses regardless of trigger matching
 
 ### Session-start CLAUDE.md rule
@@ -396,8 +400,8 @@ Small, targeted additions to existing skills. Each consumes lenses via the share
 ## Implementation order
 
 1. **Installer refactor** — extract `_install_asset_dir()` helper from agents/commands install loops
-2. **Checkpoint skill** — move existing `~/.claude/skills/checkpoint/SKILL.md` into `jacked/data/skills/checkpoint/SKILL.md`, enhance with: research capture, session context, completion lifecycle, branch check, atomic write, context budget on resume, backward-compatible frontmatter
+2. **Checkpoint skill** — create `jacked/data/skills/checkpoint/SKILL.md` (using existing `~/.claude/skills/checkpoint/SKILL.md` as starting point if present, otherwise from scratch). Enhance with: research capture, session context, completion lifecycle, branch check, atomic write, context budget on resume, backward-compatible frontmatter
 3. **Lenses** — create `jacked/data/lenses/` with 4 initial lens files (accessibility, api-ergonomics, database-design, error-handling)
-4. **Installer update** — add lens installation via `_install_asset_dir()`
+4. **Installer update** — add lens installation via `_install_asset_dir()`. Also add lens removal to `jacked uninstall` via corresponding logic.
 5. **CLAUDE.md rule** — add session-start checkpoint detection
 6. **Skill updates** — add lens/checkpoint awareness to /dcr, /coverage-matrix, /qa, /ux, /jack-it-up, /whats-next, /techdebt (each uses shared lens discovery pattern)
