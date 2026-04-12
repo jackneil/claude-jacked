@@ -22,6 +22,19 @@ If no `## Repo Config` section is present, run all discovery steps normally.
 
 ## Step 1: Orient
 
+**Check for active checkpoint first:**
+
+```bash
+CHECKPOINT_DIR=".claude/checkpoints"
+if [ -d "$CHECKPOINT_DIR" ]; then
+  ls -1t "$CHECKPOINT_DIR"/*.md 2>/dev/null | head -5
+fi
+```
+
+If any checkpoint files exist, read their frontmatter. If one or more have `status: in-progress`, note the most recent one — it becomes **Option 0** in the recommendations (Step 6).
+
+If multiple in-progress checkpoints exist, note the count for the recommendation display.
+
 Run these to establish baseline context:
 
 ```bash
@@ -158,6 +171,26 @@ Focus: [which tier matters most right now and why]
 
 ## Recommended Next Work
 
+### Option 0: Resume Active Checkpoint (if applicable)
+
+If an in-progress checkpoint was found in Step 1:
+
+```
+### Option 0: Resume — {checkpoint title}
+- **Tier**: 0 — Active work in progress
+- **Impact**: 5 — continuing existing momentum
+- **Effort**: S (context already captured)
+- **What to do**: Run `/checkpoint resume` to load full context and continue
+- **Branch**: {checkpoint branch}
+- **Last saved**: {checkpoint date, human-readable}
+- **Remaining**: {first 3 items from checkpoint's Remaining Work section}
+- **Evidence**: checkpoint file at {path}
+```
+
+If multiple in-progress checkpoints: "**+{N} older checkpoints** — run `/checkpoint list` to see all."
+
+Always present other options below Option 0 — the user may want to switch focus.
+
 ### Option 1: [Name]
 - **Tier**: [1-5] — [tier name]
 - **Impact**: [score] — [one sentence on why this matters]
@@ -172,6 +205,20 @@ Focus: [which tier matters most right now and why]
 ## Quick Wins
 [2-3 items that are S-effort with Impact >= 3]
 
+## Lens Coverage Gaps
+
+Check for installed specialist lenses (`~/.claude/lenses/*.md` and `.claude/lenses/*.md`). If lenses exist, cross-reference their `triggers` against recent git activity:
+
+```bash
+git log --name-only --pretty=format: --since="14 days ago" 2>/dev/null | sort -u | head -50
+```
+
+If recently modified files match a lens's triggers but no recent commit messages or DCR output reference that lens domain, suggest:
+
+> "Recent work has touched {domain} files but no {lens.name} review has been done — consider including it in the next `/dcr`."
+
+Only mention gaps for lenses whose triggers match actual recent file changes. Don't suggest lenses for domains the project hasn't touched.
+
 ## Summary Stats
 Open issues: N | Open PRs: N | Planning docs: [list or "none"] | Commit velocity: N/month | TODOs: N files
 ```
@@ -183,3 +230,7 @@ Present **3-5 options** when evidence supports it. If evidence supports fewer, p
 After presenting recommendations, mention once:
 
 > "Run `/jacked-setup whats-next` to generate a repo-specific config — future runs will skip discovery and be faster. Or run `/jacked-setup all` to configure `/whats-next`, `/qa`, and `/dcr` together."
+
+After presenting recommendations, always end with:
+
+> "Ready to start? Use the **Jack It Up** skill (`/jack-it-up` or say 'jack it up') for the full quality cycle: brainstorm → plan → review → implement → review → ship. It ensures nothing gets cut corners."
