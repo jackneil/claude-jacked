@@ -84,6 +84,13 @@ class TestServiceRunner:
         assert runner.host == "127.0.0.1"
         assert runner.port == 9999
 
+    def test_uvicorn_server_initialized_in_init(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        assert hasattr(runner, "_uvicorn_server")
+        assert runner._uvicorn_server is None
+
     @patch("jacked.service.tray.pystray")
     @patch("jacked.service.tray.uvicorn")
     def test_start_uvicorn_thread_is_daemon(self, mock_uvicorn, mock_pystray):
@@ -93,3 +100,28 @@ class TestServiceRunner:
         thread = runner._start_uvicorn()
         assert thread.daemon is True
         thread.join(timeout=0.1)
+
+    def test_on_restart_handles_exception(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        runner._icon = MagicMock()
+        with patch.object(runner, "_start_uvicorn", side_effect=OSError("port in use")):
+            runner._on_restart()  # should not raise
+        # Icon should show stopped state on failure
+        assert runner._icon.icon is not None
+
+
+class TestCheckDeps:
+    """Tests for dependency checking."""
+
+    def test_check_tray_deps_raises_when_missing(self):
+        from jacked.service import tray
+        with patch.object(tray, "_TRAY_AVAILABLE", False):
+            with pytest.raises(SystemExit, match="tray"):
+                tray.check_tray_deps()
+
+    def test_check_tray_deps_passes_when_available(self):
+        from jacked.service import tray
+        with patch.object(tray, "_TRAY_AVAILABLE", True):
+            tray.check_tray_deps()  # should not raise

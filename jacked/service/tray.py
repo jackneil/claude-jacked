@@ -130,6 +130,7 @@ class ServiceRunner:
         self.port = port
         self._stop_event = threading.Event()
         self._uvicorn_thread: threading.Thread | None = None
+        self._uvicorn_server = None
         self._icon: "pystray.Icon | None" = None
         self._autostart_enabled = False
 
@@ -138,18 +139,16 @@ class ServiceRunner:
         os.environ["JACKED_HOST"] = self.host
         os.environ["JACKED_PORT"] = str(self.port)
 
-        def _run():
-            config = uvicorn.Config(
-                "jacked.api.main:app",
-                host=self.host,
-                port=self.port,
-                log_level="warning",
-            )
-            server = uvicorn.Server(config)
-            self._uvicorn_server = server
-            server.run()
+        config = uvicorn.Config(
+            "jacked.api.main:app",
+            host=self.host,
+            port=self.port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        self._uvicorn_server = server
 
-        thread = threading.Thread(target=_run, name="jacked-uvicorn", daemon=True)
+        thread = threading.Thread(target=server.run, name="jacked-uvicorn", daemon=True)
         thread.start()
         return thread
 
@@ -174,17 +173,26 @@ class ServiceRunner:
     def _on_restart(self):
         if self._icon:
             self._icon.icon = create_icon_image("starting")
-        if hasattr(self, "_uvicorn_server"):
+        # Stop existing server
+        if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
         if self._uvicorn_thread:
             self._uvicorn_thread.join(timeout=5)
-        self._uvicorn_thread = self._start_uvicorn()
-        self._wait_for_ready()
-        if self._icon:
-            self._icon.icon = create_icon_image("running")
+        # Restart with error handling
+        try:
+            self._uvicorn_thread = self._start_uvicorn()
+            if self._wait_for_ready():
+                if self._icon:
+                    self._icon.icon = create_icon_image("running")
+            else:
+                if self._icon:
+                    self._icon.icon = create_icon_image("stopped")
+        except Exception:
+            if self._icon:
+                self._icon.icon = create_icon_image("stopped")
 
     def _on_stop(self):
-        if hasattr(self, "_uvicorn_server"):
+        if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
         if self._uvicorn_thread:
             self._uvicorn_thread.join(timeout=5)
@@ -215,11 +223,18 @@ class ServiceRunner:
             icon.icon = create_icon_image("running")
         else:
             icon.icon = create_icon_image("stopped")
+            remove_pid(PID_FILE)
             icon.notify("Jacked failed to start", "Jacked Service")
 
     def run(self) -> None:
         """Start the service: tray icon on main thread, uvicorn in background."""
         check_tray_deps()
+
+        if not _UVICORN_AVAILABLE:
+            raise SystemExit(
+                "Service mode requires uvicorn.\n"
+                'Install it with: uv tool install "claude-jacked" --force'
+            )
 
         if not is_port_available(self.host, self.port):
             raise SystemExit(
