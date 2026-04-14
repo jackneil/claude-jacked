@@ -2801,13 +2801,14 @@ def service():
 
 
 @service.command(name="start")
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
-@click.option("--port", default=8321, type=int, help="Port to bind to")
-def service_start(host: str, port: int):
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+def service_start(host: str | None, port: int | None):
     """Start jacked as a background service with system tray icon."""
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
     from jacked.service.tray import ServiceRunner
 
-    runner = ServiceRunner(host=host, port=port)
+    runner = ServiceRunner(host=host or DEFAULT_HOST, port=port or DEFAULT_PORT)
     runner.run()
 
 
@@ -2824,10 +2825,10 @@ def service_stop():
 
 
 @service.command(name="restart")
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
-@click.option("--port", default=8321, type=int, help="Port to bind to")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 @click.pass_context
-def service_restart(ctx, host: str, port: int):
+def service_restart(ctx, host: str | None, port: int | None):
     """Restart the jacked service."""
     from jacked.service import PID_FILE
     from jacked.service.process import stop_process
@@ -2874,13 +2875,14 @@ def service_status():
 
 
 @service.command(name="install")
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
-@click.option("--port", default=8321, type=int, help="Port to bind to")
-def service_install(host: str, port: int):
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+def service_install(host: str | None, port: int | None):
     """Configure jacked to start automatically on login."""
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
     from jacked.service.platform import install_autostart
 
-    result = install_autostart(host, port)
+    result = install_autostart(host or DEFAULT_HOST, port or DEFAULT_PORT)
     if result.startswith("Could not find"):
         console.print(f"[red]Error:[/red] {result}")
     else:

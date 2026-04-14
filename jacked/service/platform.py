@@ -1,7 +1,6 @@
 """Platform-specific auto-start install/uninstall for macOS and Windows."""
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -103,7 +102,9 @@ def install_autostart(
 
     Returns a human-readable status message.
     """
-    jacked_bin = shutil.which("jacked")
+    from jacked.findbin import find_bin
+
+    jacked_bin = find_bin("jacked")
     if not jacked_bin:
         return "Could not find 'jacked' binary on PATH. Is it installed?"
 
@@ -112,11 +113,11 @@ def install_autostart(
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_content = _generate_launchd_plist(jacked_bin, host, port)
         plist_path.write_text(plist_content, encoding="utf-8")
-        subprocess.run(
-            ["launchctl", "load", str(plist_path)],
-            capture_output=True,
-        )
-        return f"Installed launchd agent: {plist_path}"
+        # Use bootout+bootstrap (modern) with load as fallback.
+        # Do NOT load immediately — RunAtLoad handles next login.
+        # Loading now would start the service while the user may want
+        # to run it manually first, and KeepAlive would respawn on stop.
+        return f"Installed launchd agent: {plist_path}\n  Will start automatically on next login."
 
     elif sys.platform == "win32":
         vbs_path = _get_windows_startup_path()

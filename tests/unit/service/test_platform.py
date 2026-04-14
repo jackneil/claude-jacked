@@ -92,24 +92,23 @@ class TestDetectAutostart:
 
 class TestInstallAutostart:
     @patch("sys.platform", "darwin")
-    @patch("subprocess.run")
-    def test_darwin_writes_plist(self, mock_run, tmp_path):
+    def test_darwin_writes_plist(self, tmp_path):
         plist = tmp_path / "ai.hank.jacked.plist"
         from jacked.service.platform import install_autostart
         with patch("jacked.service.platform._get_launchd_plist_path", return_value=plist):
-            with patch("shutil.which", return_value="/usr/local/bin/jacked"):
-                install_autostart("127.0.0.1", 8321)
+            with patch("jacked.findbin.find_bin", return_value="/usr/local/bin/jacked"):
+                result = install_autostart("127.0.0.1", 8321)
         assert plist.exists()
         content = plist.read_text()
         assert "ai.hank.jacked" in content
-        mock_run.assert_called_once()
+        assert "next login" in result
 
     @patch("sys.platform", "win32")
     def test_win32_writes_vbs(self, tmp_path):
         vbs = tmp_path / "jacked.vbs"
         from jacked.service.platform import install_autostart
         with patch("jacked.service.platform._get_windows_startup_path", return_value=vbs):
-            with patch("shutil.which", return_value=r"C:\bin\jacked.exe"):
+            with patch("jacked.findbin.find_bin", return_value=r"C:\bin\jacked.exe"):
                 install_autostart("127.0.0.1", 8321)
         assert vbs.exists()
         content = vbs.read_text()
@@ -143,7 +142,7 @@ class TestInstallAutostartFailure:
 
     def test_returns_error_when_jacked_not_on_path(self):
         from jacked.service.platform import install_autostart
-        with patch("shutil.which", return_value=None):
+        with patch("jacked.findbin.find_bin", return_value=None):
             result = install_autostart("127.0.0.1", 8321)
         assert "Could not find" in result
 
@@ -153,7 +152,7 @@ class TestInstallAutostartFailure:
         plist = tmp_path / "ai.hank.jacked.plist"
         from jacked.service.platform import install_autostart
         with patch("jacked.service.platform._get_launchd_plist_path", return_value=plist):
-            with patch("shutil.which", return_value="/Users/test/.local/bin/jacked"):
+            with patch("jacked.findbin.find_bin", return_value="/Users/test/.local/bin/jacked"):
                 install_autostart("127.0.0.1", 8321)
         content = plist.read_text()
         assert "/Users/test/.local/bin/jacked" in content

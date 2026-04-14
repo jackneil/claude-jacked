@@ -1,11 +1,14 @@
 """System tray icon and menu for jacked service mode."""
 
+import logging
 import os
 import signal
 import sys
 import threading
 import webbrowser
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from jacked import __version__
 from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
@@ -188,16 +191,22 @@ class ServiceRunner:
                 if self._icon:
                     self._icon.icon = create_icon_image("stopped")
         except Exception:
+            logger.exception("Restart failed")
             if self._icon:
                 self._icon.icon = create_icon_image("stopped")
 
-    def _on_stop(self):
+    def _request_stop(self):
+        """Signal-safe stop request — only sets flags, no locks or I/O."""
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
+        self._stop_event.set()
+
+    def _on_stop(self):
+        """Full stop — called from menu or atexit, not from signal handler."""
+        self._request_stop()
         if self._uvicorn_thread:
             self._uvicorn_thread.join(timeout=5)
         remove_pid(PID_FILE)
-        self._stop_event.set()
         if self._icon:
             self._icon.stop()
 
@@ -246,7 +255,9 @@ class ServiceRunner:
         write_pid(PID_FILE, self.port)
 
         if sys.platform != "win32":
-            signal.signal(signal.SIGTERM, lambda *_: self._on_stop())
+            # Signal handler must be signal-safe — just set the event.
+            # The pystray loop or atexit will handle actual cleanup.
+            signal.signal(signal.SIGTERM, lambda *_: self._request_stop())
 
         from jacked.service.platform import detect_autostart
 
