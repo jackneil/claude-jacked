@@ -2881,7 +2881,10 @@ def service_install(host: str, port: int):
     from jacked.service.platform import install_autostart
 
     result = install_autostart(host, port)
-    console.print(f"[green][OK][/green] {result}")
+    if result.startswith("Could not find"):
+        console.print(f"[red]Error:[/red] {result}")
+    else:
+        console.print(f"[green][OK][/green] {result}")
 
 
 @service.command(name="uninstall")
@@ -2890,7 +2893,10 @@ def service_uninstall():
     from jacked.service.platform import uninstall_autostart
 
     result = uninstall_autostart()
-    console.print(f"[green][OK][/green] {result}")
+    if "not supported" in result.lower() or "not found" in result.lower():
+        console.print(f"[yellow]{result}[/yellow]")
+    else:
+        console.print(f"[green][OK][/green] {result}")
 
 
 HIGH_RISK_PREFIXES = {

@@ -136,3 +136,24 @@ class TestUninstallAutostart:
         with patch("jacked.service.platform._get_windows_startup_path", return_value=vbs):
             uninstall_autostart()
         assert not vbs.exists()
+
+
+class TestInstallAutostartFailure:
+    """Tests for install_autostart error paths."""
+
+    def test_returns_error_when_jacked_not_on_path(self):
+        from jacked.service.platform import install_autostart
+        with patch("shutil.which", return_value=None):
+            result = install_autostart("127.0.0.1", 8321)
+        assert "Could not find" in result
+
+    @patch("sys.platform", "darwin")
+    @patch("subprocess.run")
+    def test_plist_uses_resolved_binary_path(self, mock_run, tmp_path):
+        plist = tmp_path / "ai.hank.jacked.plist"
+        from jacked.service.platform import install_autostart
+        with patch("jacked.service.platform._get_launchd_plist_path", return_value=plist):
+            with patch("shutil.which", return_value="/Users/test/.local/bin/jacked"):
+                install_autostart("127.0.0.1", 8321)
+        content = plist.read_text()
+        assert "/Users/test/.local/bin/jacked" in content

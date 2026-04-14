@@ -52,6 +52,12 @@ class TestReadPid:
         from jacked.service.process import read_pid
         assert read_pid(pid_file) is None
 
+    def test_returns_none_for_empty_file(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("")
+        from jacked.service.process import read_pid
+        assert read_pid(pid_file) is None
+
     def test_handles_pid_only_no_port(self, tmp_path):
         pid_file = tmp_path / "test.pid"
         pid_file.write_text("12345")
