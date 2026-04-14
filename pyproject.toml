@@ -40,8 +40,14 @@ search = [
 ]
 security = []  # backwards compat — anthropic is now a core dependency
 web = []
+tray = [
+    "pystray>=0.19",
+    "Pillow>=9.0",
+]
 all = [
     "qdrant-client>=1.7.0",
+    "pystray>=0.19",
+    "Pillow>=9.0",
 ]
 
 [dependency-groups]
