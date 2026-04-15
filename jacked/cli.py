@@ -2794,6 +2794,113 @@ def profiles_delete(name: str, yes: bool):
         console.print(f"[yellow]Profile '{name}' not found[/yellow]")
 
 
+@main.group()
+def service():
+    """Manage the jacked background service (tray icon + auto-start)."""
+    pass
+
+
+@service.command(name="start")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+def service_start(host: str | None, port: int | None):
+    """Start jacked as a background service with system tray icon."""
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service.tray import ServiceRunner
+
+    runner = ServiceRunner(host=host or DEFAULT_HOST, port=port or DEFAULT_PORT)
+    runner.run()
+
+
+@service.command(name="stop")
+def service_stop():
+    """Stop the running jacked service."""
+    from jacked.service import PID_FILE
+    from jacked.service.process import stop_process
+
+    if stop_process(PID_FILE):
+        console.print("[green][OK][/green] Sent stop signal to jacked service")
+    else:
+        console.print("[yellow]Service is not running[/yellow]")
+
+
+@service.command(name="restart")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+@click.pass_context
+def service_restart(ctx, host: str | None, port: int | None):
+    """Restart the jacked service."""
+    from jacked.service import PID_FILE
+    from jacked.service.process import stop_process
+
+    if stop_process(PID_FILE):
+        console.print("[dim]Stopped existing service[/dim]")
+        import time
+        time.sleep(1)
+
+    ctx.invoke(service_start, host=host, port=port)
+
+
+@service.command(name="status")
+def service_status():
+    """Show whether the jacked service is running."""
+    from jacked.service import PID_FILE
+    from jacked.service.process import read_pid, is_process_alive
+    from jacked.service.platform import detect_autostart
+
+    info = read_pid(PID_FILE)
+    autostart = detect_autostart()
+    autostart_label = "[green]enabled[/green]" if autostart else "[dim]disabled[/dim]"
+
+    if info and is_process_alive(info["pid"]):
+        import time
+        pid_mtime = PID_FILE.stat().st_mtime
+        uptime_secs = time.time() - pid_mtime
+        hours, remainder = divmod(int(uptime_secs), 3600)
+        minutes, _ = divmod(remainder, 60)
+        uptime = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+        console.print("[bold green]Jacked Service: running[/bold green]")
+        console.print(f"  PID:       {info['pid']}")
+        console.print(f"  Port:      {info['port']}")
+        console.print(f"  Uptime:    {uptime}")
+        console.print(f"  Autostart: {autostart_label}")
+        console.print(f"  Dashboard: http://127.0.0.1:{info['port']}")
+    else:
+        console.print("[bold yellow]Jacked Service: stopped[/bold yellow]")
+        console.print(f"  Autostart: {autostart_label}")
+        if info:
+            from jacked.service.process import remove_pid
+            remove_pid(PID_FILE)
+
+
+@service.command(name="install")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+def service_install(host: str | None, port: int | None):
+    """Configure jacked to start automatically on login."""
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service.platform import install_autostart
+
+    result = install_autostart(host or DEFAULT_HOST, port or DEFAULT_PORT)
+    if result.startswith("Could not find"):
+        console.print(f"[red]Error:[/red] {result}")
+    else:
+        console.print(f"[green][OK][/green] {result}")
+
+
+@service.command(name="uninstall")
+def service_uninstall():
+    """Remove jacked auto-start configuration."""
+    from jacked.service.platform import uninstall_autostart
+
+    result = uninstall_autostart()
+    if "not supported" in result.lower() or "not found" in result.lower():
+        console.print(f"[yellow]{result}[/yellow]")
+    else:
+        console.print(f"[green][OK][/green] {result}")
+
+
 HIGH_RISK_PREFIXES = {
     "python": "arbitrary code execution via -c",
     "python3": "arbitrary code execution via -c",
