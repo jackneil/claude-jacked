@@ -132,6 +132,7 @@ class ServiceRunner:
         self.host = host
         self.port = port
         self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._uvicorn_thread: threading.Thread | None = None
         self._uvicorn_server = None
         self._icon: "pystray.Icon | None" = None
@@ -174,26 +175,29 @@ class ServiceRunner:
         webbrowser.open(f"http://{self.host}:{self.port}")
 
     def _on_restart(self):
-        if self._icon:
-            self._icon.icon = create_icon_image("starting")
-        # Stop existing server
-        if self._uvicorn_server is not None:
-            self._uvicorn_server.should_exit = True
-        if self._uvicorn_thread:
-            self._uvicorn_thread.join(timeout=5)
-        # Restart with error handling
+        if not self._lifecycle_lock.acquire(blocking=False):
+            return  # Already restarting or stopping
         try:
-            self._uvicorn_thread = self._start_uvicorn()
-            if self._wait_for_ready():
-                if self._icon:
-                    self._icon.icon = create_icon_image("running")
-            else:
+            if self._icon:
+                self._icon.icon = create_icon_image("starting")
+            if self._uvicorn_server is not None:
+                self._uvicorn_server.should_exit = True
+            if self._uvicorn_thread:
+                self._uvicorn_thread.join(timeout=5)
+            try:
+                self._uvicorn_thread = self._start_uvicorn()
+                if self._wait_for_ready():
+                    if self._icon:
+                        self._icon.icon = create_icon_image("running")
+                else:
+                    if self._icon:
+                        self._icon.icon = create_icon_image("stopped")
+            except Exception:
+                logger.exception("Restart failed")
                 if self._icon:
                     self._icon.icon = create_icon_image("stopped")
-        except Exception:
-            logger.exception("Restart failed")
-            if self._icon:
-                self._icon.icon = create_icon_image("stopped")
+        finally:
+            self._lifecycle_lock.release()
 
     def _request_stop(self):
         """Signal-safe stop request — only sets flags, no locks or I/O."""
@@ -203,12 +207,17 @@ class ServiceRunner:
 
     def _on_stop(self):
         """Full stop — called from menu or atexit, not from signal handler."""
-        self._request_stop()
-        if self._uvicorn_thread:
-            self._uvicorn_thread.join(timeout=5)
-        remove_pid(PID_FILE)
-        if self._icon:
-            self._icon.stop()
+        if not self._lifecycle_lock.acquire(blocking=False):
+            return  # Already stopping or restarting
+        try:
+            self._request_stop()
+            if self._uvicorn_thread:
+                self._uvicorn_thread.join(timeout=5)
+            remove_pid(PID_FILE)
+            if self._icon:
+                self._icon.stop()
+        finally:
+            self._lifecycle_lock.release()
 
     def _on_toggle_autostart(self):
         from jacked.service.platform import (
@@ -224,9 +233,18 @@ class ServiceRunner:
             install_autostart(self.host, self.port)
             self._autostart_enabled = True
 
+    def _stop_monitor(self):
+        """Background thread that watches _stop_event and triggers full stop."""
+        self._stop_event.wait()
+        self._on_stop()
+
     def _setup(self, icon: "pystray.Icon"):
         """pystray setup callback — runs after icon appears."""
         icon.visible = True
+        # Monitor thread bridges signal-safe _request_stop to full _on_stop
+        threading.Thread(
+            target=self._stop_monitor, name="jacked-stop-monitor", daemon=True
+        ).start()
         self._uvicorn_thread = self._start_uvicorn()
         if self._wait_for_ready():
             icon.icon = create_icon_image("running")
@@ -279,4 +297,8 @@ class ServiceRunner:
             title="Jacked",
             menu=menu,
         )
-        self._icon.run(setup=self._setup)
+        try:
+            self._icon.run(setup=self._setup)
+        finally:
+            # Ensure PID file is cleaned up even if pystray crashes
+            remove_pid(PID_FILE)
