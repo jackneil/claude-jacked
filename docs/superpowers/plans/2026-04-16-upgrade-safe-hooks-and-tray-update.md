@@ -8,10 +8,20 @@
 
 **Tech Stack:** click, pystray, existing `jacked.version_check`, existing `jacked.findbin`, ctypes for Windows liveness probe.
 
-**v2 changes from v1** (incorporates /dcr planning review):
+**v3 changes from v2** (incorporates /dcr wave-2 review):
+- `spawn_updater_from_tray` uses a **system Python** (`find_bin("python3")`), not `sys.executable`. The tool venv's Python gets replaced by `uv tool install --force`; running the helper from it deadlocks on Windows.
+- `_lifecycle_lock` is now `threading.RLock` (reentrant). `_on_update_click` holds it through `_on_stop` — no release-then-reacquire window where a second click could slip in and spawn a second updater.
+- Windows liveness check uses `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` — avoids the `STILL_ACTIVE == 259` false-positive of `GetExitCodeProcess`. Explicit `argtypes`/`restype` so 64-bit HANDLE values aren't truncated.
+- Updater does not pass its log file handle to the detached child — the child opens its own. Prevents concurrent appends to the same file across processes.
+- Atomic settings.json writes (`tempfile.mkstemp` + `os.replace`) so a kill during install doesn't corrupt the file.
+- On tray startup, notify if `jacked-update-failed.txt` exists from a prior failed update.
+- Smoke test no longer triggers a real install via PID-that-doesn't-exist trick.
+- Added tests for double-click race + spawn-then-stop ordering.
+
+**v2 changes from v1:**
 - Deleted separate migration helper — install already overwrites; extend existing install funcs.
 - Added `jacked install` call in updater (the key missing step — without it, legacy settings.json stays broken after upgrade).
-- Settings.json atomic write + rotating backups before any mutation.
+- Settings.json rotating backups before any mutation.
 - `find_bin` for `uv` and `jacked` everywhere (not bare `shutil.which`).
 - Windows-correct process liveness via ctypes (`os.kill(pid, 0)` doesn't work).
 - Hold `_lifecycle_lock` through the whole update click, not release-then-reacquire.
@@ -343,6 +353,33 @@ if backup:
     _rotate_backups(claude_dir, prefix="settings.json.bak-", keep=5)
 ```
 
+**Atomic write helper.** Every `settings_path.write_text(json.dumps(...))` in install should go through a tempfile + `os.replace` pattern. Add this helper and use it in all three installers:
+
+```python
+def _write_settings_atomic(settings_path: Path, data: dict) -> None:
+    """Write settings.json atomically: tempfile in same dir → os.replace."""
+    import tempfile
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".settings-",
+        suffix=".tmp",
+        dir=str(settings_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, settings_path)
+    except Exception:
+        # Clean up tempfile on failure; caller's original settings untouched.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+```
+
+Replace every `settings_path.write_text(json.dumps(existing, indent=2))` in the three hook installers with `_write_settings_atomic(settings_path, existing)`.
+
 - [ ] **Step 5: Run tests**
 
 ```bash
@@ -417,19 +454,31 @@ def is_process_alive(pid: int) -> bool:
 
     if sys.platform == "win32":
         import ctypes
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
+        from ctypes import wintypes
+
+        # Use SYNCHRONIZE (0x00100000) so we can call WaitForSingleObject —
+        # this avoids the STILL_ACTIVE==259 false-positive that plagues
+        # GetExitCodeProcess-based liveness checks.
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-        )
+        # Explicit signatures — critical on 64-bit Windows where default
+        # int marshalling truncates HANDLE values and yields false results.
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
         if not handle:
             return False
         try:
-            exit_code = ctypes.c_ulong()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) == 0:
-                return False
-            return exit_code.value == STILL_ACTIVE
+            # 0ms timeout: returns immediately.
+            # WAIT_TIMEOUT → process still running; anything else → exited.
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
         finally:
             kernel32.CloseHandle(handle)
 
@@ -775,21 +824,36 @@ if __name__ == "__main__":
     _cli()
 
 
+def _find_system_python() -> str | None:
+    """Find a Python that WON'T be clobbered by `uv tool install --force`.
+
+    sys.executable points at the tool venv's Python on Windows that gets
+    replaced during upgrade — so we search for a system-independent Python
+    first and only fall back to sys.executable if we have no alternative.
+    """
+    for name in ("python3", "python"):
+        p = find_bin(name)
+        if p and "uv/tools/claude-jacked" not in p.replace("\\", "/"):
+            return p
+    return sys.executable
+
+
 def spawn_updater_from_tray(parent_pid: int, extras: str = "tray") -> None:
-    """Called by the tray on update click. Spawns the detached helper."""
-    uv_python = sys.executable
-    if not uv_python:
+    """Called by the tray on update click. Spawns the detached helper.
+
+    Uses a system Python (not the tool venv's Python, which uv is about
+    to overwrite) so the helper keeps running through the install.
+    """
+    py = _find_system_python()
+    if not py:
         raise SystemExit("No Python executable found for updater spawn")
 
-    UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(UPDATE_LOG, "a", buffering=1, encoding="utf-8", errors="replace")
-    try:
-        _spawn_detached(
-            [uv_python, "-m", "jacked.service.updater", str(parent_pid), extras],
-            log_fh=log_fh,
-        )
-    finally:
-        log_fh.close()
+    # Pass DEVNULL rather than the shared log fh — the helper opens its own.
+    # Prevents two processes appending to the same file concurrently.
+    _spawn_detached(
+        [py, "-m", "jacked.service.updater", str(parent_pid), extras],
+        log_fh=None,  # use DEVNULL
+    )
 ```
 
 - [ ] **Step 4: Run tests**
@@ -901,6 +965,56 @@ class TestOnUpdateClick:
         assert runner._lifecycle_lock.acquire(blocking=False)
         runner._lifecycle_lock.release()
 
+    def test_double_click_does_not_spawn_twice(self):
+        """Rapid double-click should only spawn one updater."""
+        _skip_if_no_tray()
+        import threading as _threading
+        import time as _time
+        from unittest.mock import MagicMock, patch
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+
+        spawn_calls = []
+
+        def slow_spawn(*a, **kw):
+            spawn_calls.append(1)
+            _time.sleep(0.1)
+
+        with patch(
+            "jacked.service.updater.spawn_updater_from_tray", side_effect=slow_spawn
+        ):
+            with patch.object(runner, "_on_stop"):
+                t1 = _threading.Thread(target=runner._on_update_click)
+                t2 = _threading.Thread(target=runner._on_update_click)
+                t1.start(); t2.start()
+                t1.join(); t2.join()
+
+        assert len(spawn_calls) == 1  # only one updater spawned
+
+    def test_spawns_then_stops_in_order(self):
+        """Updater is spawned BEFORE _on_stop is called."""
+        _skip_if_no_tray()
+        from unittest.mock import MagicMock, patch, call
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+
+        parent = MagicMock()
+        with patch(
+            "jacked.service.updater.spawn_updater_from_tray",
+            side_effect=lambda *a, **kw: parent.spawn(*a, **kw),
+        ):
+            with patch.object(
+                runner, "_on_stop", side_effect=lambda: parent.stop(),
+            ):
+                runner._on_update_click()
+
+        assert parent.method_calls[0][0] == "spawn"
+        assert parent.method_calls[1][0] == "stop"
+
 
 class TestVersionCheckThread:
     def test_exits_on_stop_event(self):
@@ -928,11 +1042,9 @@ Add at the top near other imports:
 from jacked.version_check import check_version_cached
 ```
 
-In `ServiceRunner.__init__`, add after existing attributes:
-
-```python
-self._version_info: dict | None = None
-```
+In `ServiceRunner.__init__`:
+1. Change `self._lifecycle_lock = threading.Lock()` to `self._lifecycle_lock = threading.RLock()` — reentrant so `_on_stop` can be called while holding it from the update flow.
+2. Add `self._version_info: dict | None = None` after existing attributes.
 
 Add methods (place near `_on_toggle_autostart`):
 
@@ -968,13 +1080,14 @@ def _version_is_clickable(self) -> bool:
 def _on_update_click(self):
     """User clicked 'Update to vX.Y.Z' in the tray menu.
 
-    Holds _lifecycle_lock across the entire spawn+stop transition so
-    no other menu action (Restart, Stop) can interleave.
+    Uses the reentrant _lifecycle_lock throughout the entire spawn+stop
+    transition. Reentrancy lets _on_stop's own `acquire()` succeed from
+    the same thread, while blocking a concurrent second click.
     """
     if not self._version_is_clickable():
         return
     if not self._lifecycle_lock.acquire(blocking=False):
-        return
+        return  # already updating/stopping
 
     latest = (self._version_info or {}).get("latest", "?")
     try:
@@ -982,20 +1095,12 @@ def _on_update_click(self):
             try:
                 self._icon.icon = create_icon_image("starting")
                 self._icon.notify(
-                    f"Updating jacked to v{latest}. Service will restart.",
+                    f"Updating jacked to v{latest}. If this fails, "
+                    f"see ~/.claude/jacked-update-failed.txt",
                     "Jacked Update",
                 )
             except Exception:
                 logger.exception("Icon update during update-click failed")
-
-        # Fresh version check right before update, in case the cached value is stale.
-        try:
-            fresh = check_version_cached(__version__, force=True)
-            if fresh and not fresh.get("outdated"):
-                logger.info("Update no longer applicable after fresh check — skipping")
-                return
-        except Exception:
-            logger.exception("Fresh version check failed; proceeding anyway")
 
         try:
             from jacked.service.updater import spawn_updater_from_tray
@@ -1011,13 +1116,12 @@ def _on_update_click(self):
                 except Exception:
                     pass
             return
+
+        # Hold the lock through _on_stop via RLock reentrancy.
+        # No gap for a second click to sneak in.
+        self._on_stop()
     finally:
         self._lifecycle_lock.release()
-
-    # Trigger clean shutdown so the updater's wait_for_exit unblocks.
-    # This re-acquires the lock briefly — between release above and _on_stop below,
-    # another click could sneak in and try to stop. That's benign: two stops collapse.
-    self._on_stop()
 ```
 
 Modify the existing `build_menu` call in `ServiceRunner.run()` (don't change the function signature). Replace the old `version` menu item in `build_menu` by passing closures that access `self`:
@@ -1104,11 +1208,26 @@ menu = build_menu(
 )
 ```
 
-In `_setup`, start the version-check thread:
+In `_setup`, start the version-check thread AND surface any stale recovery file from a prior failed update:
 
 ```python
 def _setup(self, icon):
     icon.visible = True
+
+    # Surface a prior failed update if the recovery file exists.
+    # Do this before any other startup so the user sees it immediately.
+    try:
+        from jacked.service.updater import RECOVERY_FILE
+        if RECOVERY_FILE.exists():
+            icon.notify(
+                "Previous update failed. See "
+                "~/.claude/jacked-update-failed.txt for recovery steps.",
+                "Jacked Update Failed Earlier",
+            )
+            # Don't delete the file — the user may want to read it.
+    except Exception:
+        logger.exception("Could not check update recovery file")
+
     threading.Thread(
         target=self._stop_monitor, name="jacked-stop-monitor", daemon=True
     ).start()
@@ -1179,12 +1298,22 @@ ls ~/.claude/settings.json.bak-*  # backup created
 grep "_hook" ~/.claude/settings.json  # shim form present
 ```
 
-- [ ] **Step 5: Smoke test updater CLI**
+- [ ] **Step 5: Smoke test updater CLI arg parsing only (do NOT trigger install)**
 
-Don't actually run the update (would reinstall the package mid-test). Just verify the entry point parses args:
+A bogus PID would pass `wait_for_exit` immediately and actually run `uv tool install --force` on your machine. Test only parsing:
 
 ```bash
-uv run python -c "from jacked.service.updater import _cli; import sys; sys.argv = ['updater', '99999999', 'tray']; _cli()" 2>&1 | head
+# Just verify the module loads and CLI exits 2 on bad args (no real run)
+uv run python -c "
+import sys
+sys.argv = ['updater']  # no PID → exits 2
+from jacked.service.updater import _cli
+try:
+    _cli()
+except SystemExit as e:
+    assert e.code == 2, f'expected 2, got {e.code}'
+    print('ok: missing arg rejected')
+"
 ```
 
 - [ ] **Step 6: Commit**
