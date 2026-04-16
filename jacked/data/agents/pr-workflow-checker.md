@@ -121,7 +121,19 @@ Before creating or updating a PR, check code quality:
 3. **Fix auto-fixable issues** silently, commit the fixes if any were applied
 4. **If unfixable lint errors remain**, warn the user and ask if they want to proceed anyway
 5. **Check if /dc was recently run** in this conversation. If not, suggest: "Consider running /dc before creating this PR."
-6. **Check guardrails compliance**: If JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md exists in the project root, read it and verify the PR changes comply with its rules (file sizes, structure, testing requirements). Flag any violations.
+6. **Check if /docs-sync was recently run** in this conversation. Determine relevance by scanning the diff:
+   - Run `git diff main...HEAD --name-only` and check for any of:
+     - Code changes in `src/`, `jacked/`, `lib/`, or the project's main package directory
+     - New/modified CLI commands (decorators, click groups, argparse, etc.)
+     - New/modified environment variables, flags, or config keys
+     - New/modified hooks, settings.json interactions, or installation logic
+     - Changes to entry points in `pyproject.toml`, `package.json`, `setup.py`
+     - New features, breaking changes, or API surface changes
+   - If ANY of the above are present AND /docs-sync was NOT run recently:
+     - If the user said "jack it up" earlier in the conversation or asked for thorough review, **auto-run /docs-sync** before proceeding.
+     - Otherwise, strongly recommend: "This PR touches code that likely affects docs (README, user-facing entry points, or CLI surface). Run /docs-sync before I create the PR? (y/n)"
+   - Do NOT block if the user declines — they may have already synced docs manually.
+7. **Check guardrails compliance**: If JACKED_GUARDRAILS.md or DESIGN_GUARDRAILS.md exists in the project root, read it and verify the PR changes comply with its rules (file sizes, structure, testing requirements). Flag any violations.
 
 ### PHASE 2: DECISION LOGIC
 

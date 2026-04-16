@@ -72,7 +72,10 @@ uv tool install "claude-jacked[search]" --force && jacked install --force
 # Add security gatekeeper (auto-approves safe bash commands, included in base install)
 jacked install --force --security
 
-# Everything (base + search)
+# Add the background service + system tray icon (auto-start on login)
+uv tool install "claude-jacked[tray]" --force && jacked service install && jacked service start
+
+# Everything (base + search + tray)
 uv tool install "claude-jacked[all]" --force && jacked install --force --security
 ```
 
@@ -129,6 +132,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 - [What's Included](#whats-included)
 - [Web Dashboard](#web-dashboard)
+- [Background Service and Tray Icon](#background-service-and-tray-icon)
 - [Security Gatekeeper](#security-gatekeeper)
 - [Session Search](#session-search)
 - [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
@@ -194,6 +198,49 @@ jacked webux --no-browser       # Start server without opening browser
 The dashboard is a local web app that runs on your machine. All data stays in `~/.claude/jacked.db` — nothing is sent anywhere.
 
 **5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Gatekeeper / Features / Plugins / Claude Code / Advanced / Profiles), Logs, Analytics.
+
+---
+
+## Background Service and Tray Icon
+
+Here's the deal: if you don't want to remember to run `jacked webux` every time, run it as a background service instead. You get a purple "J" in the macOS menu bar (or Windows system tray) that stays out of your way until you need it.
+
+### Install
+
+```bash
+uv tool install "claude-jacked[tray]" --force   # add pystray + Pillow
+jacked install --force                          # wire up hooks
+jacked service install                          # configure auto-start on login
+jacked service start                            # start it now
+```
+
+The `[tray]` extra is required — it pulls in `pystray` and `Pillow` for the icon rendering.
+
+### What You Get
+
+- **Purple "J" in your menu bar / system tray** — always-on dashboard, one click away.
+- **Right-click menu:** Open Dashboard, Restart, Stop, Start on Login toggle, and the current version.
+- **Auto-start on login** — `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/com.jacked.service.plist`) or a Windows startup VBS script. Service runs on reboot too.
+- **Crash recovery, not nag-ware** — KeepAlive is scoped to `SuccessfulExit=false`, so a clean stop from the tray or CLI *won't* trigger a respawn. Only actual crashes come back.
+- **One-click upgrades** — when a newer version hits PyPI, the version item in the menu flips to `Update to vX.Y.Z ->`. Click it and jacked runs `uv tool install --force` + `jacked install --force` + restarts the service. Cross-platform, fully detached — survives its own binary being replaced mid-update.
+- **Recovery file** — if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
+
+### Commands
+
+```bash
+jacked service install     # configure auto-start on login (launchd / Startup folder)
+jacked service uninstall   # remove auto-start config
+jacked service start       # start the service with tray icon
+jacked service stop        # stop the running service
+jacked service restart     # stop + start
+jacked service status      # show PID, port, uptime, autostart state
+```
+
+### Troubleshooting
+
+- **Tray icon never appears** — make sure you installed the `[tray]` extra. `uv tool install "claude-jacked[tray]" --force`.
+- **"Port 8321 in use"** — another jacked instance is running. Check with `jacked service status` or use `--port` to pick a different port.
+- **Auto-update failed** — read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file includes exact commands to finish the upgrade manually.
 
 ---
 
@@ -456,6 +503,8 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.41.0** | **Upgrade-safe hooks** — `jacked install` now writes hooks as `jacked _hook <name>` instead of absolute site-packages paths. Survives `uv tool upgrade` and Python version bumps cleanly. Settings.json writes are atomic with timestamped backups at `~/.claude/settings.json.bak-*`. **Tray auto-update** — tray menu flips to `Update to vX.Y.Z ->` when a newer version is on PyPI; one click runs `uv tool install --force` + `jacked install --force` + service restart in a detached helper that survives its own binary being replaced. Cross-platform. **Recovery file** — if auto-update fails, `~/.claude/jacked-update-failed.txt` explains what to do, and the tray surfaces the warning on next startup. **Windows process-liveness fix** — replaces broken `os.kill(pid, 0)` with `WaitForSingleObject` via ctypes, so `jacked service status` works correctly on Windows. |
+| **0.40.0** | **`jacked service` command group** — run jacked as a background service with a system tray icon. Purple "J" in the macOS menu bar / Windows tray, with a right-click menu for Open Dashboard, Restart, Stop, and Start on Login. `jacked service install/uninstall` configures auto-start on login via launchd plist (macOS) or a Startup folder VBS script (Windows). KeepAlive scoped to `SuccessfulExit=false` — service auto-restarts on crash but not on a clean user stop. Requires the new `[tray]` extra (`uv tool install "claude-jacked[tray]"`) which pulls in pystray + Pillow. |
 | **0.26.0** | **`/docs-sync`** — new skill that diffs branch against base, maps code changes to affected docs (README, wiki, CLAUDE.md), and spawns parallel update agents. New `/jacked-setup docs-sync` target for per-repo configuration with Doc Inventory and Change-to-Doc Map. |
 | **0.25.0** | **8 new commands** from GStack analysis: `/freeze` + `/unfreeze` (edit scope restriction enforced by gatekeeper), `/cso` (OWASP+STRIDE security audit), `/retro` (engineering retrospective), `/canary` (post-deploy monitoring), `/benchmark` (performance regression detection), `/land-and-deploy` (merge-deploy-verify pipeline), `/browser-reset` (fix stuck browser MCPs). **Credential write fix** — server no longer overwrites Claude Code's credential files during background token refresh, fixing session logout bug. |
 | **0.24.0** | **Plugin marketplace** — repo doubles as a Claude Code plugin marketplace for team distribution. Zero file duplication. |
@@ -535,6 +584,14 @@ jacked profiles delete <name>      # Delete a saved profile
 jacked webux                       # Open web dashboard
 jacked webux --port 9000           # Custom port
 jacked webux --no-browser          # Server only, no auto-open
+
+# Background Service (requires [tray] extra)
+jacked service install             # Configure auto-start on login
+jacked service uninstall           # Remove auto-start
+jacked service start               # Start service with tray icon
+jacked service stop                # Stop running service
+jacked service restart             # Restart service
+jacked service status              # Show PID, port, uptime, autostart state
 
 # Slash Commands
 # /dc /dcr /docs-sync /pr /learn /redo /techdebt /audit-rules /qa /ux
