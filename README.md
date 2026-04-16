@@ -133,6 +133,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 - [What's Included](#whats-included)
 - [Web Dashboard](#web-dashboard)
 - [Background Service and Tray Icon](#background-service-and-tray-icon)
+- [Upgrading](#upgrading)
 - [Security Gatekeeper](#security-gatekeeper)
 - [Session Search](#session-search)
 - [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
@@ -222,7 +223,8 @@ The `[tray]` extra is required — it pulls in `pystray` and `Pillow` for the ic
 - **Right-click menu:** Open Dashboard, Restart, Stop, Start on Login toggle, and the current version.
 - **Auto-start on login** — `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/com.jacked.service.plist`) or a Windows startup VBS script. Service runs on reboot too.
 - **Crash recovery, not nag-ware** — KeepAlive is scoped to `SuccessfulExit=false`, so a clean stop from the tray or CLI *won't* trigger a respawn. Only actual crashes come back.
-- **One-click upgrades** — when a newer version hits PyPI, the version item in the menu flips to `Update to vX.Y.Z ->`. Click it and jacked runs `uv tool install --force` + `jacked install --force` + restarts the service. Cross-platform, fully detached — survives its own binary being replaced mid-update.
+- **One-click upgrades** — when a newer version hits PyPI, the version item in the menu flips to `Update to vX.Y.Z ->`. Click it and jacked runs the full upgrade sequence (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced mid-update.
+- **CLI equivalent** — `jacked upgrade` does the same three-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
 - **Recovery file** — if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
 
 ### Commands
@@ -241,6 +243,37 @@ jacked service status      # show PID, port, uptime, autostart state
 - **Tray icon never appears** — make sure you installed the `[tray]` extra. `uv tool install "claude-jacked[tray]" --force`.
 - **"Port 8321 in use"** — another jacked instance is running. Check with `jacked service status` or use `--port` to pick a different port.
 - **Auto-update failed** — read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file includes exact commands to finish the upgrade manually.
+
+---
+
+## Upgrading
+
+```bash
+jacked upgrade
+```
+
+That's it. One command. Works on macOS, Linux, and Windows. Does all three things `uv tool install --force` alone doesn't do:
+
+1. `uv tool install "claude-jacked[tray]" --force` — new package on disk
+2. `jacked install --force` — migrate `settings.json` hooks to the shim form (`jacked _hook <name>`) so they survive Python version bumps
+3. `jacked service restart` — reload the running service with the new code (only if a service is running)
+
+**Why you need all three:** `uv tool install --force` just drops the new package on disk. The service you already have running is still executing the old version in memory, and your `settings.json` may still have hook paths that point at the old site-packages location (broken if `uv` upgraded Python under you).
+
+### Options
+
+- `jacked upgrade --extras search` — upgrade with the `[search]` extra instead of `[tray]` (Qdrant session search)
+- `jacked upgrade --extras all` — everything
+- `jacked upgrade --skip-service` — just swap the package and migrate settings, don't restart the running service
+
+### Cross-platform notes
+
+- **macOS/Linux:** runs inline. Your terminal shows live output from each step.
+- **Windows:** spawns a detached `cmd.exe` helper and exits immediately. Windows can't overwrite a running `.exe`, so this process has to step out of the way before `uv tool install` replaces `jacked.exe`. The helper waits for this process to exit, then runs the three steps with output appended to `~/.claude/jacked-update.log`. You can `type %USERPROFILE%\.claude\jacked-update.log` to follow along.
+
+### Tray upgrades
+
+If you're running the background service, you can also click **Update to vX.Y.Z ->** in the tray menu when a newer version is available on PyPI. Same three-step sequence, fully detached — survives its own binary being replaced mid-update.
 
 ---
 

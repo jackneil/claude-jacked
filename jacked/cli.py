@@ -767,10 +767,205 @@ def check_version():
             f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}"
         )
         console.print(
-            "Run: [bold]uv tool upgrade claude-jacked[/bold]"
+            "Run: [bold]jacked upgrade[/bold]  (installs, migrates settings, restarts service)"
         )
     else:
         console.print(f"[green]Up to date:[/green] {__version__}")
+
+
+@main.command()
+@click.option(
+    "--extras",
+    default="tray",
+    help="Optional extras to install (tray, search, all). Default: tray.",
+)
+@click.option(
+    "--skip-service",
+    is_flag=True,
+    help="Don't touch the running service — just upgrade the package + migrate settings.",
+)
+def upgrade(extras: str, skip_service: bool):
+    """Upgrade claude-jacked end-to-end.
+
+    Runs all three steps the tray 'Update' button would do:
+      1. uv tool install 'claude-jacked[<extras>]' --force  (new code on disk)
+      2. jacked install --force                              (migrate settings.json)
+      3. jacked service restart                              (reload running service)
+
+    On POSIX (macOS, Linux): runs inline. Inode semantics let us replace
+    ourselves safely while the interpreter keeps running.
+
+    On Windows: spawns a detached cmd.exe helper that waits for this
+    process to exit before running the install. Windows can't overwrite
+    a running .exe, so we have to step out of the way. This process
+    exits cleanly and the helper takes over.
+    """
+    import subprocess
+    from jacked import __version__
+    from jacked.findbin import find_bin
+    from jacked.service import PID_FILE
+    from jacked.service.process import is_process_alive, read_pid
+
+    uv = find_bin("uv")
+    if not uv:
+        console.print("[red]Error:[/red] `uv` not found on PATH. Install it from https://docs.astral.sh/uv/")
+        sys.exit(1)
+
+    console.print(f"[bold]Upgrading claude-jacked from v{__version__}...[/bold]\n")
+
+    # Windows can't overwrite a running .exe. Spawn a detached cmd.exe that
+    # waits for this process to die, then does the install + migrate + restart.
+    if sys.platform == "win32":
+        _spawn_windows_upgrade_helper(uv, extras, skip_service)
+        return
+
+    # POSIX path: run inline.
+    _run_upgrade_inline(uv, extras, skip_service, PID_FILE, is_process_alive, read_pid)
+
+
+def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, is_process_alive, read_pid):
+    """Inline upgrade for POSIX. Running binary gets replaced safely via inode."""
+    import subprocess
+    from jacked.findbin import find_bin
+
+    # Step 1: uv tool install --force
+    console.print(f"[dim]$ {uv} tool install 'claude-jacked[{extras}]' --force[/dim]")
+    result = subprocess.run(
+        [uv, "tool", "install", f"claude-jacked[{extras}]", "--force"],
+    )
+    if result.returncode != 0:
+        console.print(f"[red]`uv tool install` failed (exit {result.returncode}). Aborting.[/red]")
+        sys.exit(result.returncode)
+
+    # Re-resolve jacked — path may have changed after --force.
+    jacked = find_bin("jacked")
+    if not jacked:
+        console.print(
+            "[red]`jacked` not found after install.[/red] "
+            "Check your PATH includes `~/.local/bin`."
+        )
+        sys.exit(1)
+
+    # Step 2: migrate settings.json.
+    console.print(f"\n[dim]$ {jacked} install --force[/dim]")
+    result = subprocess.run([jacked, "install", "--force"])
+    if result.returncode != 0:
+        console.print(
+            f"[yellow]`jacked install` exited {result.returncode}.[/yellow] "
+            "Your settings.json may be in a partial state — check ~/.claude/settings.json.bak-*"
+        )
+
+    # Step 3: restart running service.
+    if skip_service:
+        console.print("\n[dim]Skipping service restart (--skip-service)[/dim]")
+    else:
+        info = read_pid(pid_file)
+        if info and is_process_alive(info["pid"]):
+            console.print(f"\n[dim]$ {jacked} service restart[/dim]")
+            subprocess.run([jacked, "service", "restart"])
+        else:
+            console.print(
+                "\n[dim]Service is not running — skipping restart. "
+                "Run `jacked service start` to launch it.[/dim]"
+            )
+
+    console.print("\n[green][OK][/green] Upgrade complete.")
+
+
+def _spawn_windows_upgrade_helper(uv: str, extras: str, skip_service: bool):
+    """Windows: spawn a detached cmd.exe helper and exit this process.
+
+    Running jacked.exe can't be overwritten while we're holding it open.
+    The helper is cmd.exe (a system binary we don't own), which stays
+    valid no matter what uv does to the jacked venv.
+
+    Helper steps:
+      1. Wait for our PID to exit (avoids racing against the .exe lock).
+      2. `uv tool install --force` (package).
+      3. `jacked install --force` (migrate settings.json).
+      4. `jacked service restart` (unless --skip-service).
+      5. Append progress to ~/.claude/jacked-update.log.
+    """
+    import os
+    import subprocess
+    import tempfile
+    from jacked.service import CLAUDE_DIR
+
+    my_pid = os.getpid()
+    log_path = CLAUDE_DIR / "jacked-update.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build the batch script. %~dp0 is the script dir. We embed everything
+    # the helper needs — no further Python or jacked invocations until the
+    # new binaries are in place.
+    # `tasklist` polls for our PID; after it disappears, we run install.
+    restart_line = (
+        'if "%SKIP_SERVICE%"=="" (\r\n'
+        '    echo [%date% %time%] service restart >> "%LOGFILE%"\r\n'
+        '    jacked service restart >> "%LOGFILE%" 2>&1\r\n'
+        ')\r\n'
+    )
+    batch_body = (
+        '@echo off\r\n'
+        'set LOGFILE=' + str(log_path) + '\r\n'
+        'set SKIP_SERVICE=' + ("1" if skip_service else "") + '\r\n'
+        'echo [%date% %time%] jacked upgrade helper starting (parent PID ' + str(my_pid) + ') >> "%LOGFILE%"\r\n'
+        ':wait\r\n'
+        'tasklist /FI "PID eq ' + str(my_pid) + '" 2>NUL | find "' + str(my_pid) + '" >NUL\r\n'
+        'if not errorlevel 1 (\r\n'
+        '    timeout /t 1 /nobreak >NUL\r\n'
+        '    goto wait\r\n'
+        ')\r\n'
+        'echo [%date% %time%] parent exited, running uv tool install >> "%LOGFILE%"\r\n'
+        '"' + uv + '" tool install "claude-jacked[' + extras + ']" --force >> "%LOGFILE%" 2>&1\r\n'
+        'if errorlevel 1 (\r\n'
+        '    echo [%date% %time%] ERROR: uv tool install failed >> "%LOGFILE%"\r\n'
+        '    echo Jacked upgrade failed during `uv tool install`. See %LOGFILE% for details.\r\n'
+        '    echo Recovery: uv tool install "claude-jacked[' + extras + ']" --force ^&^& jacked install --force\r\n'
+        '    exit /b 1\r\n'
+        ')\r\n'
+        'echo [%date% %time%] running jacked install --force >> "%LOGFILE%"\r\n'
+        'jacked install --force >> "%LOGFILE%" 2>&1\r\n'
+        + restart_line +
+        'echo [%date% %time%] upgrade complete >> "%LOGFILE%"\r\n'
+        '(goto) 2>nul & del "%~f0"\r\n'
+    )
+
+    # Write the batch file to %TEMP% — it deletes itself at the end.
+    fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-upgrade-")
+    try:
+        with os.fdopen(fd, "w", newline="\r\n") as f:
+            f.write(batch_body)
+    except Exception:
+        try:
+            os.unlink(batch_path)
+        except OSError:
+            pass
+        raise
+
+    # Spawn the batch file detached. DETACHED_PROCESS so it survives our exit.
+    DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    subprocess.Popen(
+        ["cmd.exe", "/c", batch_path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=DETACHED_PROCESS,
+        close_fds=True,
+    )
+
+    console.print(
+        "[yellow]Windows upgrade:[/yellow] spawned detached helper. "
+        "This process will now exit so `jacked.exe` can be replaced."
+    )
+    console.print(f"[dim]Watching log: {log_path}[/dim]")
+    console.print(
+        "The helper will run `uv tool install` + `jacked install --force`"
+        + ("" if skip_service else " + `jacked service restart`")
+        + " after this process exits."
+    )
+    # Exit immediately so the lock on jacked.exe releases.
+    sys.exit(0)
 
 
 def _valid_hook_names() -> frozenset[str]:
