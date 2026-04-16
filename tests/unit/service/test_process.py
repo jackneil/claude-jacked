@@ -2,6 +2,9 @@
 
 import os
 import signal
+import subprocess
+import sys
+import time
 from unittest.mock import patch
 
 import pytest
@@ -88,6 +91,29 @@ class TestIsProcessAlive:
     def test_nonexistent_pid_is_not_alive(self):
         from jacked.service.process import is_process_alive
         assert is_process_alive(999999999) is False
+
+    def test_negative_or_zero_pid_is_not_alive(self):
+        from jacked.service.process import is_process_alive
+        assert is_process_alive(0) is False
+        assert is_process_alive(-1) is False
+
+    def test_exited_subprocess_reported_dead(self):
+        from jacked.service.process import is_process_alive
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        # Small delay so parent can reap on some platforms
+        time.sleep(0.1)
+        assert is_process_alive(p.pid) is False
+
+    def test_running_subprocess_reported_alive(self):
+        from jacked.service.process import is_process_alive
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            time.sleep(0.2)
+            assert is_process_alive(p.pid) is True
+        finally:
+            p.terminate()
+            p.wait(timeout=5)
 
 
 class TestCheckPort:

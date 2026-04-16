@@ -4465,13 +4465,18 @@ class TestCatchAllInstall:
         from jacked.cli import _install_security_hook
 
         settings_path = tmp_path / "settings.json"
-        # Simulate old per-tool entries
+        # Simulate old jacked-installed per-tool entries — realistic paths
+        # that match the anchored markers used by the install migration.
+        legacy_cmd = (
+            "/Users/x/.local/share/uv/tools/claude-jacked/lib/python3.12/"
+            "site-packages/jacked/data/hooks/security_gatekeeper.py"
+        )
         settings = {
             "hooks": {
                 "PreToolUse": [
-                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "python security_gatekeeper.py"}]},
-                    {"matcher": "Read", "hooks": [{"type": "command", "command": "python security_gatekeeper.py"}]},
-                    {"matcher": "Edit", "hooks": [{"type": "command", "command": "python security_gatekeeper.py"}]},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": legacy_cmd}]},
+                    {"matcher": "Read", "hooks": [{"type": "command", "command": legacy_cmd}]},
+                    {"matcher": "Edit", "hooks": [{"type": "command", "command": legacy_cmd}]},
                 ]
             }
         }

@@ -5,6 +5,8 @@ Provides command-line interface for indexing, searching, and
 retrieving Claude Code sessions.
 """
 
+import os
+import shutil
 import sys
 import logging
 from pathlib import Path
@@ -771,6 +773,50 @@ def check_version():
         console.print(f"[green]Up to date:[/green] {__version__}")
 
 
+def _valid_hook_names() -> frozenset[str]:
+    """Allowlist of hook names derived from files in data/hooks/.
+
+    Using the filesystem as the single source of truth means adding a
+    new hook doesn't require updating a separate list.
+    """
+    hooks_dir = _get_data_root() / "hooks"
+    if not hooks_dir.exists():
+        return frozenset()
+    return frozenset(
+        p.stem
+        for p in hooks_dir.glob("*.py")
+        if not p.stem.startswith("_")
+    )
+
+
+@main.command(name="_hook", hidden=True)
+@click.argument("name")
+def _hook_shim(name: str):
+    """Internal: dispatch to a hook handler by name.
+
+    Called by Claude Code hooks via `jacked _hook <name>`. The handler's
+    main() reads hook input from stdin as usual.
+
+    Indirection keeps settings.json paths stable across `uv tool upgrade`.
+    """
+    if name not in _valid_hook_names():
+        click.echo(f"Unknown hook: {name}", err=True)
+        sys.exit(2)
+
+    import importlib
+    try:
+        module = importlib.import_module(f"jacked.data.hooks.{name}")
+    except ImportError as e:
+        click.echo(f"Hook import failed: {name} ({e})", err=True)
+        sys.exit(2)
+
+    if not hasattr(module, "main"):
+        click.echo(f"Hook has no main(): {name}", err=True)
+        sys.exit(2)
+
+    module.main()
+
+
 @main.command()
 @click.argument("category", type=click.Choice(["command", "agent", "hook"]))
 @click.argument("name")
@@ -897,6 +943,101 @@ def _is_editable_install() -> bool:
     """
     repo_root = _get_data_root().parent.parent
     return (repo_root / ".git").is_dir()
+
+
+# Path markers identifying jacked-managed hook entries in settings.json.
+# Anchored to tokens we actually write — won't match a user's unrelated
+# script that happens to share a hook name.
+_JACKED_HOOK_PATH_MARKERS = (
+    "/site-packages/jacked/data/hooks/",   # normal install
+    "/claude-jacked/jacked/data/hooks/",   # editable clone path
+    "jacked\" _hook ",                      # shim form we write: "<path>/jacked" _hook <name>
+    "-m jacked _hook ",                     # fallback form (dev without PATH shim)
+)
+
+
+def _is_jacked_managed_hook_path(command: str) -> bool:
+    """True if this settings.json command value was installed by jacked.
+
+    Anchored to path substrings we write — won't falsely match a user's
+    own script named security_gatekeeper.py in an unrelated directory.
+    """
+    if not command:
+        return False
+    return any(marker in command for marker in _JACKED_HOOK_PATH_MARKERS)
+
+
+def _build_hook_command(hook_name: str) -> str:
+    """Build the settings.json command for a jacked hook.
+
+    Prefers the `jacked _hook <name>` shim (upgrade-safe via uv's stable
+    binary path). Falls back to `{python} -m jacked _hook <name>` when
+    `jacked` isn't on PATH (dev/editable installs). Never writes a bare
+    site-packages path — that's the stale-path bug this exists to fix.
+    """
+    from jacked.findbin import find_bin
+
+    jacked_bin = find_bin("jacked")
+    if jacked_bin:
+        return f'"{jacked_bin}" _hook {hook_name}'
+
+    # Fallback for dev/editable without the shim on PATH.
+    python_exe = sys.executable or shutil.which("python3") or shutil.which("python")
+    return f'"{python_exe}" -m jacked _hook {hook_name}'
+
+
+def _snapshot_settings(settings_path: Path) -> Path | None:
+    """Copy settings.json to a timestamped backup. Returns backup path or None.
+
+    No-op if source doesn't exist.
+    """
+    import shutil as _shutil
+    import time
+
+    if not settings_path.exists():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = settings_path.parent / f"{settings_path.name}.bak-{stamp}"
+    i = 0
+    while backup.exists():
+        i += 1
+        backup = settings_path.parent / f"{settings_path.name}.bak-{stamp}-{i}"
+    _shutil.copy2(settings_path, backup)
+    return backup
+
+
+def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
+    """Keep only the newest `keep` backups; delete older ones."""
+    backups = sorted(dir_path.glob(f"{prefix}*"))
+    while len(backups) > keep:
+        backups[0].unlink(missing_ok=True)
+        backups = backups[1:]
+
+
+def _write_settings_atomic(settings_path: Path, data: dict) -> None:
+    """Atomically write settings.json via tempfile + os.replace.
+
+    Prevents half-written JSON if the process is killed mid-install.
+    """
+    import json as _json
+    import tempfile
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".settings-",
+        suffix=".tmp",
+        dir=str(settings_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+        os.replace(tmp, settings_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _link_or_copy(src: Path, dst: Path) -> str:
@@ -1362,9 +1503,6 @@ def _install_session_tracker_hook(existing: dict, settings_path: Path):
     is using by reading ~/.claude/.credentials.json at session start and on re-auth.
     The Stop hook fires a throttled heartbeat to keep sessions visible in the dashboard.
     """
-    import json
-    import shutil
-
     marker = _session_tracker_marker()
     script_path = _get_data_root() / "hooks" / "session_account_tracker.py"
 
@@ -1375,28 +1513,35 @@ def _install_session_tracker_hook(existing: dict, settings_path: Path):
         console.print("[yellow]Skipping session tracker installation[/yellow]")
         return
 
-    python_exe = sys.executable
-    if not python_exe or not Path(python_exe).exists():
-        python_exe = shutil.which("python3") or shutil.which("python") or "python"
-
-    python_path = str(Path(python_exe)).replace("\\", "/")
-    script_str = str(script_path).replace("\\", "/")
-    command_str = f"{python_path} {script_str}"
+    command_str = _build_hook_command("session_account_tracker")
 
     modified = False
     for event_name, matcher in SESSION_TRACKER_EVENTS:
         if event_name not in existing["hooks"]:
             existing["hooks"][event_name] = []
 
-        # Find existing hook for this event+matcher
+        # Find existing hook for this event+matcher.
+        # Match jacked-managed entries by anchored path markers OR the new shim form.
         hook_index = None
         needs_upgrade = False
         for i, hook_entry in enumerate(existing["hooks"][event_name]):
-            hook_str = str(hook_entry)
             entry_matcher = hook_entry.get("matcher", "")
-            if entry_matcher == matcher and (
-                marker in hook_str or "session_account_tracker" in hook_str
-            ):
+            if entry_matcher != matcher:
+                continue
+            entry_cmd = ""
+            for h in hook_entry.get("hooks", []):
+                entry_cmd = h.get("command", "")
+                break
+            hook_str = str(hook_entry)
+            is_ours = (
+                marker in hook_str
+                or _is_jacked_managed_hook_path(entry_cmd)
+                or (
+                    "session_account_tracker" in entry_cmd
+                    and _is_jacked_managed_hook_path(entry_cmd)
+                )
+            )
+            if is_ours:
                 hook_index = i
                 for h in hook_entry.get("hooks", []):
                     if h.get("command", "") != command_str:
@@ -1428,8 +1573,7 @@ def _install_session_tracker_hook(existing: dict, settings_path: Path):
         console.print("[yellow][-][/yellow] Session tracker hooks already configured")
         return
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2))
+    _write_settings_atomic(settings_path, existing)
     events_str = ", ".join(e for e, _ in SESSION_TRACKER_EVENTS)
     console.print(f"[green][OK][/green] Installed session tracker for: {events_str}")
 
@@ -1466,9 +1610,13 @@ def _ensure_permission_request_hook(existing: dict, command_str: str):
     """Ensure the gatekeeper is registered for PermissionRequest events."""
     if "PermissionRequest" not in existing.get("hooks", {}):
         existing.setdefault("hooks", {})["PermissionRequest"] = []
+    # Only strip jacked-managed entries — leave user custom hooks alone.
     existing["hooks"]["PermissionRequest"] = [
         h for h in existing["hooks"]["PermissionRequest"]
-        if "security_gatekeeper" not in str(h)
+        if not any(
+            _is_jacked_managed_hook_path(inner.get("command", ""))
+            for inner in h.get("hooks", [])
+        )
     ]
     existing["hooks"]["PermissionRequest"].append({
         "matcher": "",
@@ -1484,10 +1632,8 @@ def _install_security_hook(existing: dict, settings_path: Path):
     DB/registry config. Migrates old per-tool entries to catch-all mode.
 
     Handles fresh install, version upgrades, and migration from PermissionRequest.
+    Only rewrites jacked-managed entries — user-custom hooks are left alone.
     """
-    import json
-    import shutil
-
     script_path = _get_data_root() / "hooks" / "security_gatekeeper.py"
 
     if not script_path.exists():
@@ -1497,24 +1643,21 @@ def _install_security_hook(existing: dict, settings_path: Path):
         console.print("[yellow]Skipping security gatekeeper installation[/yellow]")
         return
 
-    # Find python executable — prefer the one running this process
-    python_exe = sys.executable
-    if not python_exe or not Path(python_exe).exists():
-        python_exe = shutil.which("python3") or shutil.which("python") or "python"
+    command_str = _build_hook_command("security_gatekeeper")
 
-    # Use forward slashes for the command (works on Windows too)
-    python_path = str(Path(python_exe)).replace("\\", "/")
-    script_str = str(script_path).replace("\\", "/")
-    command_str = f"{python_path} {script_str}"
+    def _entry_is_jacked_gatekeeper(entry: dict) -> bool:
+        for h in entry.get("hooks", []):
+            cmd = h.get("command", "")
+            if _is_jacked_managed_hook_path(cmd):
+                return True
+        return False
 
-    # Migrate: remove old PermissionRequest hooks
+    # Migrate: remove old jacked-managed PermissionRequest gatekeeper hooks
     if "PermissionRequest" in existing.get("hooks", {}):
         old_hooks = existing["hooks"]["PermissionRequest"]
         before = len(old_hooks)
         existing["hooks"]["PermissionRequest"] = [
-            h
-            for h in old_hooks
-            if "security_gatekeeper" not in str(h)
+            h for h in old_hooks if not _entry_is_jacked_gatekeeper(h)
         ]
         if len(existing["hooks"]["PermissionRequest"]) < before:
             console.print(
@@ -1524,31 +1667,24 @@ def _install_security_hook(existing: dict, settings_path: Path):
     if "PreToolUse" not in existing["hooks"]:
         existing["hooks"]["PreToolUse"] = []
 
-    # Migrate: remove old per-tool gatekeeper entries (non-empty matcher)
+    # Migrate: remove old jacked-managed per-tool gatekeeper entries (non-empty matcher)
     existing["hooks"]["PreToolUse"] = [
         h for h in existing["hooks"]["PreToolUse"]
         if not (
-            "security_gatekeeper" in str(h)
+            _entry_is_jacked_gatekeeper(h)
             and h.get("matcher", "") != ""
         )
     ]
 
-    # Check if catch-all already exists and is up to date
+    # Check if jacked catch-all already exists; upgrade its command if needed.
     for entry in existing["hooks"]["PreToolUse"]:
-        if (
-            entry.get("matcher") == ""
-            and "security_gatekeeper" in str(entry)
-        ):
-            # Update command if python path changed
+        if entry.get("matcher") == "" and _entry_is_jacked_gatekeeper(entry):
             for h in entry.get("hooks", []):
                 if h.get("command", "") != command_str:
                     h["command"] = command_str
 
-            # Ensure PermissionRequest hook is also registered
             _ensure_permission_request_hook(existing, command_str)
-
-            settings_path.parent.mkdir(parents=True, exist_ok=True)
-            settings_path.write_text(json.dumps(existing, indent=2))
+            _write_settings_atomic(settings_path, existing)
             console.print(
                 "[green][OK][/green] Security gatekeeper hook configured"
             )
@@ -1564,8 +1700,7 @@ def _install_security_hook(existing: dict, settings_path: Path):
     # commands and provide updatedInput (clean command without # comments).
     _ensure_permission_request_hook(existing, command_str)
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2))
+    _write_settings_atomic(settings_path, existing)
     console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse + PermissionRequest)")
 
     # Clean up stale prompt file from older versions (v0.3.9 and earlier created
@@ -1703,9 +1838,6 @@ def _install_qa_hook(existing: dict, settings_path: Path):
     >>> callable(_install_qa_hook)
     True
     """
-    import json
-    import shutil
-
     script_path = _get_data_root() / "hooks" / "qa_suggest.py"
 
     if not script_path.exists():
@@ -1714,27 +1846,27 @@ def _install_qa_hook(existing: dict, settings_path: Path):
         )
         return
 
-    python_exe = sys.executable
-    if not python_exe or not Path(python_exe).exists():
-        python_exe = shutil.which("python3") or shutil.which("python") or "python"
-
-    python_path = str(Path(python_exe)).replace("\\", "/")
-    script_str = str(script_path).replace("\\", "/")
-    command_str = f"{python_path} {script_str}"
+    command_str = _build_hook_command("qa_suggest")
 
     if "Stop" not in existing["hooks"]:
         existing["hooks"]["Stop"] = []
 
-    # Check if already installed and up to date
+    def _is_jacked_qa_entry(entry: dict) -> bool:
+        for h in entry.get("hooks", []):
+            if _is_jacked_managed_hook_path(h.get("command", "")):
+                if "qa_suggest" in h.get("command", ""):
+                    return True
+        return False
+
+    # Check if already installed; upgrade the command if path changed.
     for entry in existing["hooks"]["Stop"]:
-        if "qa_suggest" in str(entry):
+        if _is_jacked_qa_entry(entry):
             for h in entry.get("hooks", []):
                 if h.get("command", "") != command_str:
                     h["command"] = command_str
-                    settings_path.parent.mkdir(parents=True, exist_ok=True)
-                    settings_path.write_text(json.dumps(existing, indent=2))
+                    _write_settings_atomic(settings_path, existing)
                     console.print(
-                        "[green][OK][/green] Updated QA suggest hook (python path changed)"
+                        "[green][OK][/green] Updated QA suggest hook (path migrated to shim)"
                     )
                     return
             console.print(
@@ -1747,8 +1879,7 @@ def _install_qa_hook(existing: dict, settings_path: Path):
         "hooks": [{"type": "command", "command": command_str, "async": True}],
     })
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2))
+    _write_settings_atomic(settings_path, existing)
     console.print("[green][OK][/green] Installed QA suggest hook (Stop event)")
 
 
@@ -2021,6 +2152,10 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
     # Check for existing settings
     settings_path = home / ".claude" / "settings.json"
     if settings_path.exists():
+        # Snapshot before we mutate — timestamped, keeps last 5.
+        backup = _snapshot_settings(settings_path)
+        if backup:
+            _rotate_backups(settings_path.parent, prefix="settings.json.bak-", keep=5)
         try:
             existing = json.loads(settings_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:

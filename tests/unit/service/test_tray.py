@@ -125,3 +125,136 @@ class TestCheckDeps:
         from jacked.service import tray
         with patch.object(tray, "_TRAY_AVAILABLE", True):
             tray.check_tray_deps()  # should not raise
+
+
+class TestVersionMenu:
+    def test_version_text_when_current(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.41.0", "outdated": False}
+        assert runner._version_menu_text() == "v0.41.0"
+
+    def test_version_text_when_outdated(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        text = runner._version_menu_text()
+        assert "0.42.0" in text
+        assert "Update" in text
+
+    def test_version_text_when_check_not_yet_run(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        from jacked import __version__
+        runner = ServiceRunner()
+        runner._version_info = None
+        assert __version__ in runner._version_menu_text()
+
+    def test_update_enabled_only_when_outdated(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        assert runner._version_is_clickable() is True
+        runner._version_info = {"latest": "0.41.0", "outdated": False}
+        assert runner._version_is_clickable() is False
+        runner._version_info = None
+        assert runner._version_is_clickable() is False
+
+
+class TestOnUpdateClick:
+    def test_spawns_updater_then_stops(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+        with patch("jacked.service.updater.spawn_updater_from_tray") as mock_spawn:
+            with patch.object(runner, "_on_stop") as mock_stop:
+                runner._on_update_click()
+        mock_spawn.assert_called_once()
+        mock_stop.assert_called_once()
+
+    def test_no_op_when_not_outdated(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.41.0", "outdated": False}
+        with patch("jacked.service.updater.spawn_updater_from_tray") as mock_spawn:
+            runner._on_update_click()
+        mock_spawn.assert_not_called()
+
+    def test_click_releases_lock_on_spawn_failure(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+        with patch("jacked.service.updater.spawn_updater_from_tray", side_effect=RuntimeError("boom")):
+            with patch.object(runner, "_on_stop"):
+                runner._on_update_click()
+        # Lock must be released so subsequent clicks work
+        assert runner._lifecycle_lock.acquire(blocking=False)
+        runner._lifecycle_lock.release()
+
+    def test_double_click_only_spawns_once(self):
+        """Rapid double-click spawns only one updater."""
+        _skip_if_no_tray()
+        import threading as _threading
+        import time as _time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+
+        spawn_calls = []
+        def slow_spawn(*a, **kw):
+            spawn_calls.append(1)
+            _time.sleep(0.1)
+
+        with patch("jacked.service.updater.spawn_updater_from_tray", side_effect=slow_spawn):
+            with patch.object(runner, "_on_stop"):
+                t1 = _threading.Thread(target=runner._on_update_click)
+                t2 = _threading.Thread(target=runner._on_update_click)
+                t1.start(); t2.start()
+                t1.join(); t2.join()
+
+        assert len(spawn_calls) == 1
+
+    def test_spawns_before_stops(self):
+        """Updater is spawned BEFORE _on_stop is called (ordering assertion)."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+
+        parent = MagicMock()
+        with patch(
+            "jacked.service.updater.spawn_updater_from_tray",
+            side_effect=lambda *a, **kw: parent.spawn(*a, **kw),
+        ):
+            with patch.object(runner, "_on_stop", side_effect=lambda: parent.stop()):
+                runner._on_update_click()
+
+        names = [c[0] for c in parent.method_calls]
+        assert names[0] == "spawn"
+        assert "stop" in names
+        assert names.index("spawn") < names.index("stop")
+
+
+class TestVersionCheckThread:
+    def test_exits_on_stop_event(self):
+        _skip_if_no_tray()
+        import threading as _threading
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._icon = None
+        with patch("jacked.service.tray.check_version_cached", return_value=None):
+            t = _threading.Thread(target=runner._check_version, daemon=True)
+            t.start()
+            runner._stop_event.set()
+            t.join(timeout=2)
+        assert not t.is_alive()
