@@ -771,6 +771,50 @@ def check_version():
         console.print(f"[green]Up to date:[/green] {__version__}")
 
 
+def _valid_hook_names() -> frozenset[str]:
+    """Allowlist of hook names derived from files in data/hooks/.
+
+    Using the filesystem as the single source of truth means adding a
+    new hook doesn't require updating a separate list.
+    """
+    hooks_dir = _get_data_root() / "hooks"
+    if not hooks_dir.exists():
+        return frozenset()
+    return frozenset(
+        p.stem
+        for p in hooks_dir.glob("*.py")
+        if not p.stem.startswith("_")
+    )
+
+
+@main.command(name="_hook", hidden=True)
+@click.argument("name")
+def _hook_shim(name: str):
+    """Internal: dispatch to a hook handler by name.
+
+    Called by Claude Code hooks via `jacked _hook <name>`. The handler's
+    main() reads hook input from stdin as usual.
+
+    Indirection keeps settings.json paths stable across `uv tool upgrade`.
+    """
+    if name not in _valid_hook_names():
+        click.echo(f"Unknown hook: {name}", err=True)
+        sys.exit(2)
+
+    import importlib
+    try:
+        module = importlib.import_module(f"jacked.data.hooks.{name}")
+    except ImportError as e:
+        click.echo(f"Hook import failed: {name} ({e})", err=True)
+        sys.exit(2)
+
+    if not hasattr(module, "main"):
+        click.echo(f"Hook has no main(): {name}", err=True)
+        sys.exit(2)
+
+    module.main()
+
+
 @main.command()
 @click.argument("category", type=click.Choice(["command", "agent", "hook"]))
 @click.argument("name")
