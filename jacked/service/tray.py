@@ -17,6 +17,7 @@ from jacked.service.process import (
     remove_pid,
     write_pid,
 )
+from jacked.version_check import check_version_cached
 
 try:
     import pystray
@@ -99,13 +100,31 @@ def build_menu(
     on_restart,
     on_stop,
     on_toggle_autostart,
+    version_text_fn=None,
+    version_click_fn=None,
+    version_enabled_fn=None,
 ) -> "pystray.Menu":
     """Build the tray right-click menu.
 
     Args:
         autostart_check: Callable returning bool — evaluated each time
             the menu is shown, so toggle changes are reflected live.
+        version_text_fn: Optional callable returning the version menu
+            label (e.g. "v0.41.0" or "Update to v0.42.0 ->").
+        version_click_fn: Optional callback invoked when the user clicks
+            the version menu item.
+        version_enabled_fn: Optional callable returning bool — gates
+            whether the version item is clickable (outdated only).
     """
+    if version_text_fn is not None:
+        version_item = pystray.MenuItem(
+            lambda _: version_text_fn(),
+            version_click_fn,
+            enabled=lambda _: version_enabled_fn(),
+        )
+    else:
+        version_item = pystray.MenuItem(f"v{version}", None, enabled=False)
+
     return pystray.Menu(
         pystray.MenuItem("JACKED", None, enabled=False),
         pystray.MenuItem(f"Running on :{port}", None, enabled=False),
@@ -121,7 +140,7 @@ def build_menu(
             checked=lambda _: autostart_check(),
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(f"v{version}", None, enabled=False),
+        version_item,
     )
 
 
@@ -132,11 +151,12 @@ class ServiceRunner:
         self.host = host
         self.port = port
         self._stop_event = threading.Event()
-        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()  # reentrant: update click holds through _on_stop
         self._uvicorn_thread: threading.Thread | None = None
         self._uvicorn_server = None
         self._icon: "pystray.Icon | None" = None
         self._autostart_enabled = False
+        self._version_info: dict | None = None
 
     def _start_uvicorn(self) -> threading.Thread:
         """Start uvicorn in a daemon thread."""
@@ -233,6 +253,79 @@ class ServiceRunner:
             install_autostart(self.host, self.port)
             self._autostart_enabled = True
 
+    def _check_version(self) -> None:
+        """Background: poll PyPI for latest version. Runs periodically."""
+        while not self._stop_event.is_set():
+            try:
+                info = check_version_cached(__version__)
+                if info is not None:
+                    self._version_info = info
+                    if self._icon and not self._stop_event.is_set():
+                        try:
+                            self._icon.update_menu()
+                        except Exception:
+                            pass  # some pystray backends fail during shutdown
+            except Exception:
+                logger.exception("Version check failed")
+            if self._stop_event.wait(timeout=3600):
+                return
+
+    def _version_menu_text(self) -> str:
+        if self._version_info and self._version_info.get("outdated"):
+            latest = self._version_info.get("latest", "?")
+            return f"Update to v{latest} ->"
+        if self._version_info:
+            latest = self._version_info.get("latest", __version__)
+            return f"v{latest}"
+        return f"v{__version__}"
+
+    def _version_is_clickable(self) -> bool:
+        return bool(self._version_info and self._version_info.get("outdated"))
+
+    def _on_update_click(self):
+        """User clicked 'Update to vX.Y.Z' in the tray menu.
+
+        Uses the reentrant _lifecycle_lock throughout the spawn+stop transition.
+        """
+        if not self._version_is_clickable():
+            return
+        if not self._lifecycle_lock.acquire(blocking=False):
+            return  # already updating/stopping
+
+        latest = (self._version_info or {}).get("latest", "?")
+        try:
+            if self._icon:
+                try:
+                    self._icon.icon = create_icon_image("starting")
+                    self._icon.notify(
+                        f"Updating jacked to v{latest}. If this fails, "
+                        f"see ~/.claude/jacked-update-failed.txt",
+                        "Jacked Update",
+                    )
+                except Exception:
+                    logger.exception("Icon update during update-click failed")
+
+            try:
+                from jacked.service.updater import spawn_updater_from_tray
+                spawn_updater_from_tray(parent_pid=os.getpid(), extras="tray")
+            except Exception:
+                logger.exception("Failed to spawn updater")
+                if self._icon:
+                    try:
+                        self._icon.notify(
+                            "Could not start update. See jacked-update.log",
+                            "Jacked Update Failed",
+                        )
+                    except Exception:
+                        pass
+                return
+
+            # RLock reentrancy: _on_stop reacquires the same lock from the same thread.
+            # No release gap — a concurrent click stays blocked.
+            self._on_stop()
+        finally:
+            self._lifecycle_lock.release()
+
     def _stop_monitor(self):
         """Background thread that watches _stop_event and triggers full stop."""
         self._stop_event.wait()
@@ -241,9 +334,25 @@ class ServiceRunner:
     def _setup(self, icon: "pystray.Icon"):
         """pystray setup callback — runs after icon appears."""
         icon.visible = True
+
+        # Surface a prior failed update if recovery file exists.
+        try:
+            from jacked.service.updater import RECOVERY_FILE
+            if RECOVERY_FILE.exists():
+                icon.notify(
+                    "Previous update failed. See "
+                    "~/.claude/jacked-update-failed.txt for recovery steps.",
+                    "Jacked Update Failed Earlier",
+                )
+        except Exception:
+            logger.exception("Could not check update recovery file")
+
         # Monitor thread bridges signal-safe _request_stop to full _on_stop
         threading.Thread(
             target=self._stop_monitor, name="jacked-stop-monitor", daemon=True
+        ).start()
+        threading.Thread(
+            target=self._check_version, name="jacked-version-check", daemon=True
         ).start()
         self._uvicorn_thread = self._start_uvicorn()
         if self._wait_for_ready():
@@ -289,6 +398,9 @@ class ServiceRunner:
             on_restart=self._on_restart,
             on_stop=self._on_stop,
             on_toggle_autostart=self._on_toggle_autostart,
+            version_text_fn=self._version_menu_text,
+            version_click_fn=self._on_update_click,
+            version_enabled_fn=self._version_is_clickable,
         )
 
         self._icon = pystray.Icon(
