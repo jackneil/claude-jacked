@@ -35,7 +35,41 @@ def remove_pid(pid_file: Path) -> None:
 
 
 def is_process_alive(pid: int) -> bool:
-    """Check if a process with the given PID is running."""
+    """Cross-platform check if a PID is running.
+
+    POSIX: `os.kill(pid, 0)` probes process existence.
+    Windows: `os.kill(pid, 0)` is not a valid probe — use the Win32 API
+    via ctypes. WaitForSingleObject with 0 timeout avoids the
+    STILL_ACTIVE==259 false-positive that bites GetExitCodeProcess.
+    """
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+
+        kernel32 = ctypes.windll.kernel32
+        # Explicit argtypes/restype — default int marshalling truncates
+        # 64-bit HANDLE values and yields false results.
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+
     try:
         os.kill(pid, 0)
         return True
