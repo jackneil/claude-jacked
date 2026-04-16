@@ -946,12 +946,12 @@ def _is_editable_install() -> bool:
 
 
 # Path markers identifying jacked-managed hook entries in settings.json.
-# Anchored to paths we actually write — won't match a user's unrelated
+# Anchored to tokens we actually write — won't match a user's unrelated
 # script that happens to share a hook name.
 _JACKED_HOOK_PATH_MARKERS = (
     "/site-packages/jacked/data/hooks/",   # normal install
     "/claude-jacked/jacked/data/hooks/",   # editable clone path
-    " _hook ",                              # new shim form with space delimiter
+    "jacked\" _hook ",                      # shim form we write: "<path>/jacked" _hook <name>
     "-m jacked _hook ",                     # fallback form (dev without PATH shim)
 )
 

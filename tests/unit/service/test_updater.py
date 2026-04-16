@@ -106,23 +106,57 @@ class TestSpawnDetached:
         assert flags & 0x8  # DETACHED_PROCESS
 
 
-class TestFindSystemPython:
-    @patch("jacked.service.updater.find_bin")
-    def test_prefers_python3_when_not_in_tool_venv(self, mock_find):
-        from jacked.service.updater import _find_system_python
-        mock_find.side_effect = lambda name: {"python3": "/usr/bin/python3"}.get(name)
-        assert _find_system_python() == "/usr/bin/python3"
+class TestFindUpdaterPython:
+    def test_uses_current_interpreter(self):
+        """Helper must run in a Python that can import jacked.service.updater —
+        that means the tool venv Python (sys.executable), not a system Python
+        that wouldn't have jacked on its path."""
+        from jacked.service.updater import _find_updater_python
+        assert _find_updater_python() == sys.executable
 
+    def test_chosen_interpreter_can_import_updater_module(self):
+        """Integration check: chosen Python must actually import the module.
+
+        Catches the class of bug where we picked a Python that doesn't have
+        jacked on sys.path. This is what the detached helper depends on."""
+        from jacked.service.updater import _find_updater_python
+        py = _find_updater_python()
+        result = subprocess.run(
+            [py, "-c", "import jacked.service.updater"],
+            capture_output=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, (
+            f"Chosen Python {py} cannot import jacked.service.updater: "
+            f"{result.stderr.decode(errors='replace')}"
+        )
+
+
+class TestJackedInstallFailure:
     @patch("jacked.service.updater.find_bin")
-    def test_skips_tool_venv_python(self, mock_find):
-        from jacked.service.updater import _find_system_python
-        # Simulate find_bin returning the tool venv path (to be skipped)
-        mock_find.side_effect = lambda name: {
-            "python3": "/Users/x/.local/share/uv/tools/claude-jacked/bin/python3",
-            "python": "/usr/bin/python",
-        }.get(name)
-        # Should skip python3 (tool venv) and pick python
-        assert _find_system_python() == "/usr/bin/python"
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_skips_restart_if_jacked_install_fails(
+        self, mock_popen, mock_run, mock_find, tmp_path, monkeypatch,
+    ):
+        """Partial migration must NOT silently restart with broken settings."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        # uv install succeeds, jacked install fails
+        mock_run.side_effect = [
+            MagicMock(returncode=0),
+            MagicMock(returncode=1),
+        ]
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        mock_popen.assert_not_called()
+        assert (tmp_path / "recovery.txt").exists()
+        content = (tmp_path / "recovery.txt").read_text()
+        assert "jacked install --force" in content
 
 
 class TestMainEntrypoint:

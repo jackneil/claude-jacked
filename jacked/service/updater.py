@@ -120,6 +120,20 @@ def run_update(parent_pid: int, extras: str = "tray") -> None:
         )
         log(f"jacked install returncode: {migrate_result.returncode}")
 
+        if migrate_result.returncode != 0:
+            _write_recovery(
+                f"Jacked auto-update: package upgrade succeeded but "
+                f"`jacked install --force` returned {migrate_result.returncode}.\n"
+                f"settings.json may be in a partial state. A backup was saved "
+                f"at ~/.claude/settings.json.bak-*.\n"
+                f"See {UPDATE_LOG} for details.\n\n"
+                "Recovery:\n"
+                "  jacked install --force\n"
+                "  jacked service start\n"
+            )
+            log("NOT restarting service — jacked install failed")
+            return
+
         log(f"Restarting service: {jacked} service start")
         _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
         log("Updater done")
@@ -133,31 +147,32 @@ def run_update(parent_pid: int, extras: str = "tray") -> None:
         log_fh.close()
 
 
-def _find_system_python() -> str | None:
-    """Find a Python that WON'T be clobbered by `uv tool install --force`.
+def _find_updater_python() -> str | None:
+    """Pick the Python to run the detached updater helper.
 
-    sys.executable points at the tool venv's Python on Windows that gets
-    replaced during upgrade. Search for a system Python first; only fall
-    back to sys.executable if we have no alternative.
+    Must be an interpreter that can `import jacked.service.updater` —
+    which means the tool venv's Python (only interpreter with jacked
+    installed). An earlier version tried a "system Python" to avoid
+    being clobbered by `uv tool install --force`, but system Python
+    has no jacked module on sys.path, so the helper can't even start.
+
+    POSIX: `uv tool install --force` can atomically replace the venv
+    while the running interpreter stays valid via its open file
+    descriptor. All imports we need are already resolved before install.
+
+    Windows: python.exe file locks can block uv. uv now hardlinks and
+    retries, and the helper loads all modules before kicking off the
+    install, so no fresh imports are needed during the replace window.
     """
-    for name in ("python3", "python"):
-        p = find_bin(name)
-        if p and "uv/tools/claude-jacked" not in p.replace("\\", "/"):
-            return p
     return sys.executable
 
 
 def spawn_updater_from_tray(parent_pid: int, extras: str = "tray") -> None:
-    """Called by the tray on update click. Spawns the detached helper.
-
-    Uses a system Python (not the tool venv's Python, which uv is about
-    to overwrite) so the helper keeps running through the install.
-    """
-    py = _find_system_python()
+    """Called by the tray on update click. Spawns the detached helper."""
+    py = _find_updater_python()
     if not py:
         raise SystemExit("No Python executable found for updater spawn")
 
-    # Helper opens its own log file; pass DEVNULL to avoid concurrent appends.
     _spawn_detached(
         [py, "-m", "jacked.service.updater", str(parent_pid), extras],
         log_fh=None,
