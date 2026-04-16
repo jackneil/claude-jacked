@@ -30,6 +30,13 @@ class TestGenerateLaunchdPlist:
         plist = _generate_launchd_plist(jacked_bin="/usr/local/bin/jacked", host="127.0.0.1", port=8321)
         assert "<key>KeepAlive</key>" in plist
 
+    def test_keep_alive_scoped_to_crash_only(self):
+        """KeepAlive should only restart on crash, not on clean user stop."""
+        from jacked.service.platform import _generate_launchd_plist
+        plist = _generate_launchd_plist(jacked_bin="/usr/local/bin/jacked", host="127.0.0.1", port=8321)
+        assert "<key>SuccessfulExit</key>" in plist
+        # SuccessfulExit false means "don't restart after successful exit"
+
     def test_custom_port_in_args(self):
         from jacked.service.platform import _generate_launchd_plist
         plist = _generate_launchd_plist(jacked_bin="/usr/local/bin/jacked", host="127.0.0.1", port=9000)
@@ -92,7 +99,8 @@ class TestDetectAutostart:
 
 class TestInstallAutostart:
     @patch("sys.platform", "darwin")
-    def test_darwin_writes_plist(self, tmp_path):
+    @patch("subprocess.run")
+    def test_darwin_writes_plist(self, mock_run, tmp_path):
         plist = tmp_path / "ai.hank.jacked.plist"
         from jacked.service.platform import install_autostart
         with patch("jacked.service.platform._get_launchd_plist_path", return_value=plist):
@@ -101,7 +109,11 @@ class TestInstallAutostart:
         assert plist.exists()
         content = plist.read_text()
         assert "ai.hank.jacked" in content
-        assert "next login" in result
+        # launchctl load should have been called to start service immediately
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert "launchctl" in args and "load" in args
+        assert "running now" in result
 
     @patch("sys.platform", "win32")
     def test_win32_writes_vbs(self, tmp_path):

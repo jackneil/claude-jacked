@@ -57,7 +57,10 @@ def _generate_launchd_plist(
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>{log_path}</string>
     <key>StandardErrorPath</key>
@@ -113,11 +116,18 @@ def install_autostart(
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_content = _generate_launchd_plist(jacked_bin, host, port)
         plist_path.write_text(plist_content, encoding="utf-8")
-        # Use bootout+bootstrap (modern) with load as fallback.
-        # Do NOT load immediately — RunAtLoad handles next login.
-        # Loading now would start the service while the user may want
-        # to run it manually first, and KeepAlive would respawn on stop.
-        return f"Installed launchd agent: {plist_path}\n  Will start automatically on next login."
+        # Load now so the service starts immediately.
+        # KeepAlive is scoped to SuccessfulExit=false, so clean stops
+        # (user-initiated via tray/CLI) will NOT trigger respawn.
+        # Only crashes will restart.
+        subprocess.run(
+            ["launchctl", "load", str(plist_path)],
+            capture_output=True,
+        )
+        return (
+            f"Installed and started launchd agent: {plist_path}\n"
+            "  Service is running now and will auto-start on login."
+        )
 
     elif sys.platform == "win32":
         vbs_path = _get_windows_startup_path()
