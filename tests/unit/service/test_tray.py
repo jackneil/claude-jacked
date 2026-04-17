@@ -129,11 +129,13 @@ class TestCheckDeps:
 
 class TestVersionMenu:
     def test_version_text_when_current(self):
+        """Not outdated: show the running __version__ (not cached latest)."""
         _skip_if_no_tray()
+        from jacked import __version__
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
-        runner._version_info = {"latest": "0.41.0", "outdated": False}
-        assert runner._version_menu_text() == "v0.41.0"
+        runner._version_info = {"latest": __version__, "outdated": False}
+        assert runner._version_menu_text() == f"v{__version__}"
 
     def test_version_text_when_outdated(self):
         _skip_if_no_tray()
@@ -146,6 +148,18 @@ class TestVersionMenu:
         assert __version__ in text
         assert "0.42.0" in text
         assert "update" in text.lower()
+
+    def test_version_text_when_ahead_of_pypi(self):
+        """Running ahead of PyPI cache: show OUR version, not stale cached latest."""
+        _skip_if_no_tray()
+        from jacked import __version__
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        # Simulate scenario: we're on 0.41.6, PyPI cache still holds 0.41.3
+        runner._version_info = {"latest": "0.41.3", "outdated": False, "ahead": True}
+        text = runner._version_menu_text()
+        assert text == f"v{__version__}"
+        assert "0.41.3" not in text  # must NOT show cached latest
 
     def test_version_text_when_check_not_yet_run(self):
         _skip_if_no_tray()

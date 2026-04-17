@@ -271,12 +271,13 @@ class ServiceRunner:
                 return
 
     def _version_menu_text(self) -> str:
+        # Always anchor on __version__ (what this running process actually is),
+        # not on the cached "latest" from PyPI — the latter can be stale or
+        # even older than the running version when the user is ahead.
         if self._version_info and self._version_info.get("outdated"):
             latest = self._version_info.get("latest", "?")
             return f"v{__version__} -> v{latest} (update)"
-        if self._version_info:
-            latest = self._version_info.get("latest", __version__)
-            return f"v{latest}"
+        return f"v{__version__}"
         return f"v{__version__}"
 
     def _version_is_clickable(self) -> bool:
