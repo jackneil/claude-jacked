@@ -29,8 +29,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Server-side guard: only one bulk usage refresh at a time.
+# Server-side guard: only one bulk usage refresh at a time. We track when the
+# lock was acquired so a stuck holder doesn't wedge all future refreshes
+# behind a 409. If the holder has been in there longer than the stale-watchdog
+# threshold we treat the lock as orphaned and allow a fresh attempt.
 _bulk_refresh_lock = asyncio.Lock()
+_bulk_refresh_acquired_at: float = 0.0
+_BULK_REFRESH_STALE_AFTER = 180.0  # 4 accts * ~20s worst case + slack
 
 # --- Pydantic v2 request/response models ---
 
@@ -632,14 +637,28 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
     if db is None:
         return _db_unavailable()
 
-    # Only one bulk refresh at a time (across tabs / auto-refresh overlap)
+    # Only one bulk refresh at a time (across tabs / auto-refresh overlap).
+    # If a prior holder has been inside the lock longer than the stale
+    # threshold, assume it's orphaned and force-reset — we'd rather
+    # double-fetch than be permanently wedged at 409.
+    global _bulk_refresh_lock, _bulk_refresh_acquired_at
     if _bulk_refresh_lock.locked():
-        return JSONResponse(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": "Usage refresh already in progress"},
-        )
+        held_for = time.time() - _bulk_refresh_acquired_at if _bulk_refresh_acquired_at else 0
+        if held_for > _BULK_REFRESH_STALE_AFTER:
+            logger.warning(
+                "Bulk refresh lock held %ds (> %ds) — forcing reset",
+                int(held_for), int(_BULK_REFRESH_STALE_AFTER),
+            )
+            _bulk_refresh_lock = asyncio.Lock()
+            _bulk_refresh_acquired_at = 0.0
+        else:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"detail": "Usage refresh already in progress"},
+            )
 
     async with _bulk_refresh_lock:
+        _bulk_refresh_acquired_at = time.time()
         accounts = db.list_accounts(include_inactive=False)
         refreshed = 0
         failed = 0

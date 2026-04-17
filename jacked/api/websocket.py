@@ -10,6 +10,7 @@ events — only clients subscribed to a matching topic (or the wildcard
 0
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -18,6 +19,12 @@ from typing import Optional
 from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
+
+# Per-client send timeout. A zombie Chrome tab with a stuck WebSocket used to
+# block the broadcast loop indefinitely — and since bulk usage refresh broadcasts
+# progress events while holding _bulk_refresh_lock, one slow client could wedge
+# all future refreshes behind a 409 "already in progress" response.
+_SEND_TIMEOUT_SECONDS = 5.0
 
 
 class WebSocketRegistry:
@@ -53,7 +60,10 @@ class WebSocketRegistry:
     ):
         """Send an event to all clients subscribed to *topic* or ``*``.
 
-        Dead clients (failed sends) are automatically pruned.
+        Sends happen in parallel with a per-client timeout so one stuck
+        socket (e.g. backgrounded Chrome tab with full send buffer) cannot
+        block other clients or the caller. Dead / timed-out clients are
+        pruned from the registry.
         """
         message = json.dumps(
             {
@@ -63,17 +73,27 @@ class WebSocketRegistry:
                 "timestamp": int(time.time()),
             }
         )
-        dead: list[WebSocket] = []
-        for ws in list(self._clients):
-            subs = self._clients[ws]
-            if "*" in subs or topic in subs:
-                try:
-                    await ws.send_text(message)
-                except Exception:
-                    dead.append(ws)
-        for ws in dead:
-            self._clients.pop(ws, None)
-            logger.debug("Pruned dead WebSocket client")
+
+        targets: list[WebSocket] = [
+            ws for ws, subs in list(self._clients.items())
+            if "*" in subs or topic in subs
+        ]
+        if not targets:
+            return
+
+        async def _send(ws: WebSocket) -> Optional[WebSocket]:
+            try:
+                await asyncio.wait_for(ws.send_text(message), timeout=_SEND_TIMEOUT_SECONDS)
+                return None
+            except Exception:
+                return ws
+
+        results = await asyncio.gather(
+            *(_send(ws) for ws in targets), return_exceptions=False
+        )
+        for dead_ws in (r for r in results if r is not None):
+            self._clients.pop(dead_ws, None)
+            logger.debug("Pruned dead / slow WebSocket client")
 
     @property
     def client_count(self) -> int:
