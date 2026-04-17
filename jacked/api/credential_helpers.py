@@ -58,21 +58,26 @@ def acquire_claude_lock(timeout_retries: int = _LOCK_MAX_RETRIES):
             acquired = True
             break
         except FileExistsError:
-            # Lock exists — check if it's stale
+            # Lock exists — check if it's stale. Uses the cross-platform
+            # is_process_alive (ctypes WaitForSingleObject on Windows)
+            # because os.kill(pid, 0) is not a valid probe on Windows and
+            # can surface CPython SystemError for exited PIDs.
+            from jacked.service.process import is_process_alive
+            holder_pid = None
             try:
                 with open(pid_file, "r") as f:
                     holder_pid = int(f.read().strip())
-                os.kill(holder_pid, 0)  # signal 0 = existence check
-            except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-                # PID file missing, unreadable, or process dead — stale lock
+            except (FileNotFoundError, ValueError):
+                pass
+
+            if holder_pid is None or not is_process_alive(holder_pid):
                 try:
                     shutil.rmtree(lock_path, ignore_errors=True)
                     logger.info("Removed stale Claude lock (holder PID gone)")
                     continue
                 except OSError:
                     pass
-            except OSError:
-                pass  # Process exists — lock is valid
+            # Process exists — lock is valid, fall through to retry/timeout
 
             if attempt < timeout_retries - 1:
                 wait = (_LOCK_RETRY_BASE_MS + random.randint(0, 1000)) / 1000.0
