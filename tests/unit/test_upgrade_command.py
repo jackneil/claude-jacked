@@ -75,39 +75,70 @@ class TestUpgradeCommand:
         assert mock_run.call_count == 1
 
     @patch("sys.platform", "darwin")
-    @patch("socket.socket")
     @patch("jacked.findbin.find_bin")
+    @patch("jacked.service.process.wait_for_port_free", return_value=True)
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": True, "died": True, "killed": False},
+    )
     @patch("jacked.service.process.is_process_alive", return_value=True)
     @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_upgrade_stops_then_starts_detached_when_running(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find, mock_sock,
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_stop_graceful,
+        mock_wait_port, mock_find,
     ):
-        """When service is running: stop (blocking), wait for port, start detached."""
+        """When service is running: stop gracefully (in-process), wait for port, start detached."""
         from jacked.cli import main
         mock_find.side_effect = lambda name: {
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
-        # Socket bind "succeeds" immediately so the port-wait loop exits fast.
-        mock_sock.return_value.bind = MagicMock()
 
         runner = CliRunner()
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # 3 blocking runs: uv install, jacked install, jacked service stop
-        assert mock_run.call_count == 3
-        stop_args = mock_run.call_args_list[2][0][0]
-        assert "/fake/jacked" in stop_args
-        assert "service" in stop_args and "stop" in stop_args
+        # 2 blocking runs: uv install + jacked install. stop is now in-process
+        # via stop_process_graceful (no subprocess shell-out).
+        assert mock_run.call_count == 2
+        mock_stop_graceful.assert_called_once()
+        mock_wait_port.assert_called_once()
         # 1 detached Popen: jacked service start
         assert mock_popen.call_count == 1
         start_args = mock_popen.call_args[0][0]
         assert "start" in start_args
         assert mock_popen.call_args[1].get("start_new_session") is True
+
+    @patch("sys.platform", "darwin")
+    @patch("jacked.findbin.find_bin")
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": True, "died": False, "killed": True},
+    )
+    @patch("jacked.service.process.is_process_alive", return_value=True)
+    @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    def test_upgrade_aborts_when_stop_fails(
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_stop_graceful,
+        mock_find,
+    ):
+        """If graceful stop (even with SIGKILL) can't kill the tray, abort before spawning start."""
+        from jacked.cli import main
+        mock_find.side_effect = lambda name: {
+            "uv": "/fake/uv",
+            "jacked": "/fake/jacked",
+        }.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["upgrade"])
+
+        assert result.exit_code != 0
+        mock_popen.assert_not_called()
 
     @patch("sys.platform", "darwin")
     @patch("jacked.findbin.find_bin")

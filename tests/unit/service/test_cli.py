@@ -83,13 +83,14 @@ class TestServiceInstallError:
 
 
 class TestServiceRestart:
-    @patch("socket.socket")
     @patch("jacked.findbin.find_bin", return_value="/fake/jacked")
     @patch("subprocess.Popen")
-    @patch("jacked.service.process.read_pid", return_value=None)
-    @patch("jacked.service.process.stop_process", return_value=False)
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": False, "died": False, "killed": False},
+    )
     def test_restart_when_not_running_starts_fresh_detached(
-        self, mock_stop, mock_read_pid, mock_popen, mock_find, mock_sock,
+        self, mock_stop, mock_popen, mock_find,
     ):
         """Default `service restart` spawns a detached child and returns quickly."""
         from jacked.cli import main
@@ -108,32 +109,46 @@ class TestServiceRestart:
         if _sys.platform != "win32":
             assert kwargs.get("start_new_session") is True
 
-    @patch("socket.socket")
     @patch("jacked.findbin.find_bin", return_value="/fake/jacked")
     @patch("subprocess.Popen")
-    @patch("jacked.service.process.is_process_alive", return_value=False)
-    @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
-    @patch("jacked.service.process.stop_process", return_value=True)
+    @patch("jacked.service.process.wait_for_port_free", return_value=True)
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": True, "died": True, "killed": False},
+    )
     def test_restart_waits_for_pid_and_port(
-        self, mock_stop, mock_read_pid, mock_alive, mock_popen, mock_find, mock_sock,
+        self, mock_stop, mock_wait_port, mock_popen, mock_find,
     ):
-        """After stop, must wait for PID death + port release before start."""
+        """After stop, must wait for port release before start."""
         from jacked.cli import main
-        # Socket bind "succeeds" immediately so port-wait exits fast.
-        mock_sock.return_value.bind = MagicMock()
-
         runner = CliRunner()
         result = runner.invoke(main, ["service", "restart"])
         assert result.exit_code == 0
-        # is_process_alive was polled (at least the initial check)
-        assert mock_alive.call_count >= 1
-        # Port was tested before detaching
-        assert mock_sock.return_value.bind.call_count >= 1
-        # Then detached Popen fired
+        mock_stop.assert_called_once()
+        mock_wait_port.assert_called_once()
         mock_popen.assert_called_once()
 
+    @patch("subprocess.Popen")
+    @patch("jacked.service.process.wait_for_port_free", return_value=False)
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": True, "died": True, "killed": False},
+    )
+    def test_restart_aborts_when_port_stays_bound(
+        self, mock_stop, mock_wait_port, mock_popen,
+    ):
+        """If port never frees, we must NOT spawn the start — would hit 'port in use'."""
+        from jacked.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["service", "restart"])
+        assert result.exit_code != 0
+        mock_popen.assert_not_called()
+
     @patch("jacked.service.tray.ServiceRunner")
-    @patch("jacked.service.process.stop_process", return_value=False)
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": False, "died": False, "killed": False},
+    )
     def test_restart_foreground_blocks_on_ServiceRunner(
         self, mock_stop, mock_runner_cls,
     ):

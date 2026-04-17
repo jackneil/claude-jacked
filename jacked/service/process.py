@@ -4,6 +4,7 @@ import os
 import signal
 import socket
 import sys
+import time
 from pathlib import Path
 
 from jacked.service import DEFAULT_PORT
@@ -114,3 +115,91 @@ def stop_process(pid_file: Path) -> bool:
         os.kill(pid, signal.SIGTERM)
 
     return True
+
+
+def _wait_for_exit(pid: int, timeout: float) -> bool:
+    """Poll is_process_alive() until the PID exits or timeout elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not is_process_alive(pid):
+            return True
+        time.sleep(0.25)
+    return not is_process_alive(pid)
+
+
+def stop_process_graceful(
+    pid_file: Path,
+    term_timeout: float = 10.0,
+    kill_timeout: float = 3.0,
+) -> dict:
+    """Stop the service, waiting for actual exit and escalating to SIGKILL.
+
+    Why this exists: pystray on macOS runs the AppKit NSRunLoop on the main
+    thread, which blocks Python signal delivery until the runloop yields.
+    A plain SIGTERM can be silently ignored for the life of the process,
+    which is exactly what bit `jacked upgrade` — the old tray kept holding
+    port 8321 while the upgrade proceeded anyway.
+
+    Sequence:
+      1. SIGTERM (POSIX) / `taskkill /PID` without /F (Windows) — graceful.
+      2. Wait up to term_timeout for the PID to exit.
+      3. If still alive, SIGKILL (POSIX) / `taskkill /F /T` (Windows).
+      4. Wait up to kill_timeout for the PID to exit.
+
+    Returns a dict with keys:
+      was_running (bool) — the PID existed and was alive at entry.
+      died (bool)        — the process is confirmed dead at return.
+      killed (bool)      — we had to escalate to force-kill.
+    """
+    info = read_pid(pid_file)
+    if info is None:
+        return {"was_running": False, "died": False, "killed": False}
+
+    pid = info["pid"]
+    if not is_process_alive(pid):
+        remove_pid(pid_file)
+        return {"was_running": False, "died": True, "killed": False}
+
+    if sys.platform == "win32":
+        import subprocess
+        # Graceful first — no /F. Sends WM_CLOSE to GUI procs / CTRL_BREAK to consoles.
+        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True)
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            remove_pid(pid_file)
+            return {"was_running": True, "died": True, "killed": False}
+
+    if _wait_for_exit(pid, term_timeout):
+        remove_pid(pid_file)
+        return {"was_running": True, "died": True, "killed": False}
+
+    # Escalate.
+    if sys.platform == "win32":
+        import subprocess
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F", "/T"],
+            capture_output=True,
+        )
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            remove_pid(pid_file)
+            return {"was_running": True, "died": True, "killed": False}
+
+    died = _wait_for_exit(pid, kill_timeout)
+    if died:
+        remove_pid(pid_file)
+    return {"was_running": True, "died": died, "killed": True}
+
+
+def wait_for_port_free(host: str, port: int, timeout: float = 10.0) -> bool:
+    """Poll is_port_available() until the port is bindable or timeout elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if is_port_available(host, port):
+            return True
+        time.sleep(0.25)
+    return is_port_available(host, port)

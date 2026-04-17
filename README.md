@@ -269,11 +269,26 @@ jacked service start
 Common issues:
 
 - **Tray icon never appears after install** — you didn't install the `[tray]` extra. Run `uv tool install "claude-jacked[tray]" --force && jacked service start`.
-- **Tray shows a wrong version** — the menu anchors on the running process's `__version__`, so if it shows "v0.41.2" and you just upgraded, the running process is stale. `jacked service stop && jacked service start` to reload from the new package. `Check for updates...` in the menu forces a fresh PyPI poll (useful if the cached "latest" is stale).
-- **"Port 8321 in use" after `jacked upgrade`** — an old tray didn't fully release the socket before the new one tried to bind. Resolved in 0.41.6+ where `jacked service restart` waits for PID death + port release before starting. Upgrade once more with `jacked upgrade` to pick up the fix.
+- **Tray shows a wrong version** — the menu anchors on the running process's `__version__`, so if it shows "v0.41.2" and you just upgraded, the running process is stale. The tray is still the *old* binary. Fix: `jacked service stop && jacked service start`, or `jacked service restart`. `Check for updates...` in the menu forces a fresh PyPI poll (useful if only the cached "latest" is stale).
+- **`jacked upgrade` said "Upgrade complete" but the tray is still running the old version** — this was the 0.41.6→0.41.9 bug. `jacked service stop` sends SIGTERM, but pystray on macOS runs the AppKit NSRunLoop on the main thread, which can silently swallow Python signals. The upgrade's port-wait timed out and the detached `service start` hit "port in use." Fixed in 0.41.10+: graceful stop now polls for actual PID death and escalates to SIGKILL if SIGTERM is ignored. Confirm the fix took with `curl -s http://127.0.0.1:8321/api/version` and check the `current` field matches your installed version. If you're stuck on an older upgrade, follow the port-recovery sequence above and then `jacked service start`.
+- **"Port 8321 in use" after `jacked upgrade`** — an old tray didn't fully release the socket. Resolved in 0.41.6+ for service restart, and in 0.41.10+ for the upgrade path specifically (with SIGKILL escalation). Run `jacked upgrade` once more to pick up the fix.
 - **Auto-update ran but tray never came back** — the updater's detached `service start` hit the port race. Fixed in 0.41.4+. Follow the cleanup steps above, then run `jacked service start`.
 - **Claude Code keeps asking me to log in** — jacked was rotating the active account's CC refresh token out from under Claude Code. Fixed in 0.41.2+. Update and the issue goes away. Architecture doc at `docs/architecture/oauth-and-credential-flows.md` §7.1-7.3 explains the full mechanism.
 - **Auto-update failed** — read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file lists the exact commands to finish the upgrade manually.
+
+Verify what's actually running:
+
+```bash
+# What version is the live tray reporting?
+curl -s http://127.0.0.1:8321/api/version
+# {"current":"0.41.10","latest":"0.41.10","outdated":false,...}
+
+# Which PID owns the port, and when did it start?
+lsof -iTCP:8321 -sTCP:LISTEN                   # macOS / Linux
+ps -p <PID> -o pid,lstart,command               # when did it launch?
+```
+
+If `current` is older than the version your `uv tool list` shows, the running tray predates the install — stop + start it.
 
 ### Installing from scratch (for Claude or new dev)
 
@@ -587,6 +602,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.41.10** | **Upgrade actually stops the old tray** — `jacked upgrade` and `jacked service restart` now call a new `stop_process_graceful` helper that waits for actual PID death and escalates to `SIGKILL` if the graceful signal is ignored. Fixes the bug where pystray's AppKit runloop on macOS silently swallowed SIGTERM, the upgrade's port-wait timed out, and the detached `service start` hit "port in use" leaving the user on the old binary. README troubleshooting now explains how to confirm the live tray version via `curl http://127.0.0.1:8321/api/version`. |
 | **0.41.0** | **Upgrade-safe hooks** — `jacked install` now writes hooks as `jacked _hook <name>` instead of absolute site-packages paths. Survives `uv tool upgrade` and Python version bumps cleanly. Settings.json writes are atomic with timestamped backups at `~/.claude/settings.json.bak-*`. **Tray auto-update** — tray menu flips to `Update to vX.Y.Z ->` when a newer version is on PyPI; one click runs `uv tool install --force` + `jacked install --force` + service restart in a detached helper that survives its own binary being replaced. Cross-platform. **Recovery file** — if auto-update fails, `~/.claude/jacked-update-failed.txt` explains what to do, and the tray surfaces the warning on next startup. **Windows process-liveness fix** — replaces broken `os.kill(pid, 0)` with `WaitForSingleObject` via ctypes, so `jacked service status` works correctly on Windows. |
 | **0.40.0** | **`jacked service` command group** — run jacked as a background service with a system tray icon. Purple "J" in the macOS menu bar / Windows tray, with a right-click menu for Open Dashboard, Restart, Stop, and Start on Login. `jacked service install/uninstall` configures auto-start on login via launchd plist (macOS) or a Startup folder VBS script (Windows). KeepAlive scoped to `SuccessfulExit=false` — service auto-restarts on crash but not on a clean user stop. Requires the new `[tray]` extra (`uv tool install "claude-jacked[tray]"`) which pulls in pystray + Pillow. |
 | **0.26.0** | **`/docs-sync`** — new skill that diffs branch against base, maps code changes to affected docs (README, wiki, CLAUDE.md), and spawns parallel update agents. New `/jacked-setup docs-sync` target for per-repo configuration with Doc Inventory and Change-to-Doc Map. |

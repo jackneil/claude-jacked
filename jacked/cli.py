@@ -803,8 +803,7 @@ def upgrade(extras: str, skip_service: bool):
     import subprocess
     from jacked import __version__
     from jacked.findbin import find_bin
-    from jacked.service import PID_FILE
-    from jacked.service.process import is_process_alive, read_pid
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
 
     uv = find_bin("uv")
     if not uv:
@@ -820,13 +819,19 @@ def upgrade(extras: str, skip_service: bool):
         return
 
     # POSIX path: run inline.
-    _run_upgrade_inline(uv, extras, skip_service, PID_FILE, is_process_alive, read_pid)
+    _run_upgrade_inline(uv, extras, skip_service, PID_FILE, DEFAULT_HOST, DEFAULT_PORT)
 
 
-def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, is_process_alive, read_pid):
+def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, host: str, port: int):
     """Inline upgrade for POSIX. Running binary gets replaced safely via inode."""
     import subprocess
     from jacked.findbin import find_bin
+    from jacked.service.process import (
+        is_process_alive,
+        read_pid,
+        stop_process_graceful,
+        wait_for_port_free,
+    )
 
     # Step 1: uv tool install --force
     console.print(f"[dim]$ {uv} tool install 'claude-jacked[{extras}]' --force[/dim]")
@@ -855,31 +860,44 @@ def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, is_p
             "Your settings.json may be in a partial state — check ~/.claude/settings.json.bak-*"
         )
 
-    # Step 3: stop any running service, then start fresh detached.
-    # We never call `jacked service restart` directly here because its
-    # internal `service start` runs the tray in the foreground — a
-    # subprocess.run() on it would block `jacked upgrade` forever.
-    # Instead we stop (if running) then Popen a detached start.
+    # Step 3: stop the tray if it's running, then start fresh detached.
+    #
+    # We call stop_process_graceful() directly — not `jacked service stop` —
+    # because the subprocess version sends SIGTERM and returns without
+    # waiting, and pystray's AppKit runloop on macOS can swallow SIGTERM.
+    # The upgrade must not move on until the old PID is actually dead,
+    # otherwise the detached `service start` below hits "port in use" and
+    # the user is left with the pre-upgrade tray still running.
     if skip_service:
         console.print("\n[dim]Skipping service restart (--skip-service)[/dim]")
     else:
         info = read_pid(pid_file)
-        was_running = info and is_process_alive(info["pid"])
+        was_running = bool(info) and is_process_alive(info["pid"])
         if was_running:
-            console.print(f"\n[dim]$ {jacked} service stop[/dim]")
-            subprocess.run([jacked, "service", "stop"], check=False)
-            # Wait for port to release — give uvicorn up to 10s to drain.
-            import socket
-            import time as _time
-            deadline = _time.monotonic() + 10.0
-            while _time.monotonic() < deadline:
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.bind(("127.0.0.1", 8321))
-                    sock.close()
-                    break
-                except OSError:
-                    _time.sleep(0.5)
+            console.print(f"\n[dim]$ stopping service (PID {info['pid']})[/dim]")
+            result = stop_process_graceful(pid_file)
+            if not result["died"]:
+                console.print(
+                    f"[red]Could not stop PID {info['pid']} — port {port} may still be in use.[/red]"
+                )
+                console.print(
+                    "[dim]Run manually: "
+                    f"kill -9 {info['pid']}   then:   {jacked} service start[/dim]"
+                )
+                sys.exit(1)
+            if result["killed"]:
+                console.print(
+                    "[yellow]Tray ignored SIGTERM — force-killed.[/yellow]"
+                )
+            # Port can linger a beat after the PID dies (TIME_WAIT-ish).
+            if not wait_for_port_free(host, port, timeout=10.0):
+                console.print(
+                    f"[red]Port {port} still in use after stop — aborting start.[/red]"
+                )
+                console.print(
+                    f"[dim]Investigate with: lsof -iTCP:{port} -sTCP:LISTEN[/dim]"
+                )
+                sys.exit(1)
 
         # Start detached — the tray must survive this upgrade process exiting.
         console.print(f"\n[dim]$ {jacked} service start  (detached)[/dim]")
@@ -3205,38 +3223,31 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
 
     Use --foreground to run interactively (tray logs to your terminal).
     """
-    import socket as _socket
-    import time as _time
     from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, PID_FILE
-    from jacked.service.process import is_process_alive, read_pid, stop_process
+    from jacked.service.process import (
+        stop_process_graceful,
+        wait_for_port_free,
+    )
 
     the_port = port or DEFAULT_PORT
     the_host = host or DEFAULT_HOST
 
-    # 1. Stop any running service. stop_process sends SIGTERM/taskkill and
-    # returns immediately — we need to wait for the PID to actually exit AND
-    # for the port to be released before starting the replacement.
-    stopped = stop_process(PID_FILE)
-    if stopped:
-        console.print("[dim]Stopped existing service[/dim]")
-        # Wait for old PID to die (up to 10s).
-        info = read_pid(PID_FILE)
-        if info is not None:
-            deadline = _time.monotonic() + 10.0
-            while _time.monotonic() < deadline and is_process_alive(info["pid"]):
-                _time.sleep(0.25)
-        # Wait for port to release (up to 10s). uvicorn graceful shutdown
-        # can leave a brief window where bind fails even after the PID is
-        # gone.
-        port_deadline = _time.monotonic() + 10.0
-        while _time.monotonic() < port_deadline:
-            try:
-                s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                s.bind((the_host, the_port))
-                s.close()
-                break
-            except OSError:
-                _time.sleep(0.25)
+    # 1. Stop any running service. stop_process_graceful waits for actual PID
+    # death and escalates to SIGKILL if SIGTERM is ignored (pystray's AppKit
+    # runloop can swallow signals until it yields to Python).
+    result = stop_process_graceful(PID_FILE)
+    if result["was_running"]:
+        if result["killed"]:
+            console.print("[yellow]Tray ignored SIGTERM — force-killed[/yellow]")
+        elif result["died"]:
+            console.print("[dim]Stopped existing service[/dim]")
+        if not result["died"]:
+            console.print("[red]Could not stop existing service — aborting restart[/red]")
+            sys.exit(1)
+        # Port can linger a beat after the PID dies.
+        if not wait_for_port_free(the_host, the_port, timeout=10.0):
+            console.print(f"[red]Port {the_port} still in use — aborting start[/red]")
+            sys.exit(1)
 
     # 2. Start the new service.
     if foreground:
