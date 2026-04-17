@@ -365,17 +365,43 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         if not account:
             raise click.ClickException(f"Account {account_id} disappeared after refresh")
 
-    # Refresh CC token if near-expiry (independent from primary)
+    # Refresh CC token if near-expiry (independent from primary).
+    # Skip refresh if this account is currently the active Claude Code
+    # session — rotating the CC refresh token upstream would invalidate
+    # the token Claude Code's running process holds in memory/Keychain,
+    # forcing a re-login. See docs/architecture/oauth-and-credential-flows.md §7.2.
     if should_refresh_cc(account):
-        from jacked.web.auth import refresh_cc_token
-
         try:
-            asyncio.run(refresh_cc_token(account_id, db))
-        except Exception as exc:
-            logger.warning("Pre-launch CC token refresh failed: %s", exc)
-        account = db.get_account(account_id)
-        if not account:
-            raise click.ClickException(f"Account {account_id} disappeared after CC refresh")
+            from jacked.api.credential_helpers import read_platform_credentials
+            live = read_platform_credentials()
+            if not live:
+                cred_path = Path.home() / ".claude" / ".credentials.json"
+                if cred_path.exists() and not cred_path.is_symlink():
+                    try:
+                        live = json.loads(cred_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        live = None
+            active_id = live.get("_jackedAccountId") if live else None
+        except Exception:
+            active_id = None
+
+        if active_id != account_id:
+            from jacked.web.auth import refresh_cc_token
+
+            try:
+                asyncio.run(refresh_cc_token(account_id, db))
+            except Exception as exc:
+                logger.warning("Pre-launch CC token refresh failed: %s", exc)
+            account = db.get_account(account_id)
+            if not account:
+                raise click.ClickException(f"Account {account_id} disappeared after CC refresh")
+        else:
+            logger.info(
+                "Account %d: skipping pre-launch CC refresh (account is the "
+                "active Claude Code session — Claude Code manages its own "
+                "token rotation).",
+                account_id,
+            )
 
     # Pre-launch CC token warnings
     cc_at = account.get("cc_access_token")

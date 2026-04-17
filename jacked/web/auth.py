@@ -1070,6 +1070,18 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
             result["skipped"] += 1
 
         # --- CC token refresh (independent from primary) ---
+        # Never rotate the active account's CC refresh token from a background
+        # loop. The CC refresh token is single-use and SHARED with Claude Code
+        # on the active account; if jacked exchanges it upstream, Claude Code's
+        # own refresher sees invalid_grant on its next attempt and forces a
+        # re-login across every session using those credentials. Claude Code
+        # (v2.1.81+) manages rotation for its active account on its own
+        # schedule; jacked imports rotated tokens via
+        # reconcile_credentials_from_live_store at line ~1044 above.
+        # See docs/architecture/oauth-and-credential-flows.md §7.1.
+        if active_id == account_id:
+            continue
+
         if should_refresh_cc(account):
             cc_success = await refresh_cc_token(account_id, db)
             if cc_success:
