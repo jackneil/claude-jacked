@@ -290,37 +290,104 @@ ps -p <PID> -o pid,lstart,command               # when did it launch?
 
 If `current` is older than the version your `uv tool list` shows, the running tray predates the install — stop + start it.
 
-### Installing from scratch (for Claude or new dev)
+### Installing from scratch
 
-If you're reading this to set up `claude-jacked` on a fresh machine, pick one of the three install methods — `jacked upgrade` auto-detects which one you used and re-uses it for future upgrades:
+We use `uv` for installation — it's a standalone tool from Astral that installs and manages Python CLI apps in isolated venvs. Much faster than pip, handles Python interpreter management, and keeps `claude-jacked` from conflicting with anything else on your system. Follow the steps for your OS.
+
+---
+
+#### macOS
 
 ```bash
-# Option A (recommended) — uv tool install: isolated venv, zero system-Python pollution
+# 1. Install uv (skip if you already have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Reload your shell so `uv` is on PATH. Either restart your terminal or:
+source ~/.zshrc   # or ~/.bashrc
+
+# 3. Verify
+uv --version
+
+# 4. Install jacked + tray icon
 uv tool install "claude-jacked[tray]"
 
-# Option B — pipx: also isolated, if uv isn't available
-pipx install "claude-jacked[tray]"
-
-# Option C — pip into the user site-packages: works anywhere Python works
-python -m pip install --user "claude-jacked[tray]"
+# 5. Wire up Claude Code hooks + the launchd auto-start + tray
+jacked install
+jacked service install
 ```
 
-Then on all platforms:
+Notes:
+- uv's installer adds `~/.local/bin` to your shell rc automatically. If `jacked --version` says "command not found" after step 5, run `uv tool update-shell && source ~/.zshrc` or open a fresh terminal.
+- Auto-start plist goes to `~/Library/LaunchAgents/ai.hank.jacked.plist`. Removes cleanly via `jacked service uninstall`.
+
+---
+
+#### Linux
 
 ```bash
-jacked install                           # wire up hooks into ~/.claude/settings.json
-jacked service install                   # configure auto-start on login + launch the service
-# macOS: writes ~/Library/LaunchAgents/ai.hank.jacked.plist
-# Windows: writes a .vbs in the Startup folder
-# Linux: writes a systemd --user service
-# → purple "J" tray icon appears; dashboard at http://localhost:8321
+# 1. Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Reload shell
+source ~/.bashrc   # or ~/.zshrc / ~/.profile
+
+# 3. Verify
+uv --version
+
+# 4. Install jacked
+uv tool install "claude-jacked[tray]"
+
+# 5. Wire up Claude Code hooks + start the tray
+jacked install
+jacked service start
 ```
 
-Extras: `[search]` enables Qdrant-backed session search; `[all]` is `[tray,search]`.
+Notes:
+- Requires a system tray provider (most desktop environments ship one — GNOME may need the AppIndicator extension; KDE/Cinnamon/XFCE work out of the box). On distros without tray support, uvicorn still runs headless and the dashboard is reachable at `http://localhost:8321` — check `~/.claude/jacked-service.log`.
+- `jacked service install` isn't wired for Linux yet — for boot-time auto-start, add `jacked service start` to your DE's Startup Applications, or drop a systemd user unit yourself (see issue tracker).
 
-Requirements: Python 3.10+. For Option A, install `uv` from [docs.astral.sh/uv](https://docs.astral.sh/uv/). For Option C, make sure the Python user-scripts dir is on your PATH — on Windows it's typically `%APPDATA%\Python\Python3XX\Scripts`; on POSIX it's `~/.local/bin`.
+---
 
-Requires `uv` already on PATH — install from [docs.astral.sh/uv](https://docs.astral.sh/uv/) if you don't have it. Requires Python 3.10+.
+#### Windows
+
+```powershell
+# 1. Install uv (standalone installer, no Python prerequisite)
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2. Close and reopen your terminal so `uv` is on PATH.
+#    The installer added %USERPROFILE%\.local\bin to User PATH.
+
+# 3. Verify
+uv --version
+
+# 4. Install jacked
+uv tool install "claude-jacked[tray]"
+
+# 5. Wire up Claude Code hooks + Startup-folder auto-start + tray
+jacked install
+jacked service install
+```
+
+Notes:
+- After step 4, `jacked.exe` lives at `%USERPROFILE%\.local\bin\jacked.exe`. uv's installer adds that dir to PATH — if `jacked --version` fails, open a new terminal (PATH changes don't propagate into open ones).
+- `jacked service install` writes a `.vbs` launcher into `shell:startup` (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\jacked.vbs`). It re-runs on login. Remove via `jacked service uninstall`.
+- **PowerShell execution policy warning**: if `irm | iex` is blocked, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` first, or download and run the installer script manually from [astral.sh/uv/install.ps1](https://astral.sh/uv/install.ps1).
+- If the tray icon doesn't appear, the service is still running headless — check `%USERPROFILE%\.claude\jacked-service.log` and hit `http://127.0.0.1:8321` in your browser.
+
+---
+
+#### After install (all platforms)
+
+Dashboard is at `http://localhost:8321`. The tray icon's right-click menu has Open Dashboard, Restart, Stop, Start on Login, version + "Check for updates...", and the clickable "Update to vX.Y.Z ->" item when a newer version hits PyPI.
+
+Upgrading later is one command: `jacked upgrade` (from the terminal) or click the Update line in the tray menu. Both auto-detect that you installed via uv and re-use it. Don't have uv anymore? Reinstall it first: same curl/powershell commands as step 1.
+
+Extras:
+- `uv tool install "claude-jacked[search]" --force` — adds Qdrant-backed semantic session search (requires Qdrant Cloud).
+- `uv tool install "claude-jacked[all]" --force` — tray + search together.
+- `jacked install --force --security` — turns on the smart security gatekeeper (auto-approves safe bash, blocks dangerous patterns).
+
+Requirements: Python 3.10+ (uv will fetch one for you if your system doesn't have a compatible version — you don't need to install Python separately).
 
 ---
 
@@ -614,6 +681,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.41.17** | **README: uv-only install instructions per OS.** Rewrote "Installing from scratch" with explicit macOS / Linux / Windows steps — each includes the uv installer command, shell-reload, PATH verification, and OS-specific auto-start notes. Dropped the pip / pipx options from the docs (the upgrade code still supports them for anyone who used them pre-0.41.17, but uv is now the documented path). Corrected the Linux claim — we don't install systemd units; Linux users need to wire their own auto-start. |
 | **0.41.16** | **Install method auto-detection.** `jacked upgrade` and the tray "Update" button now detect whether jacked was installed via `uv tool install`, `pipx install`, or `pip install [--user]` and call the matching upgrade command. Prior versions hardcoded `uv tool install --force`, which silently failed for pip/pipx users by either erroring out (`uv` not on PATH) or installing the package a second time in the wrong place. New detection logic lives in `jacked/install_method.py` and drives both the inline POSIX upgrade and the Windows cmd.exe batch helper. |
 | **0.41.15** | **Windows: tray-update click now actually works + Ctrl+C stops the service.** (1) Tray-update on Windows was using a Python subprocess to drive `uv tool install --force`, but Windows can't replace `python.exe` while any process holds it open, so the update reliably failed. Now uses the same detached `cmd.exe` batch pattern as `jacked upgrade` — cmd.exe is a system binary we don't own, so it survives whatever uv does. (2) `jacked service start` in a console on Windows ignored Ctrl+C because pystray's native Win32 message pump blocks Python signal delivery. Installed a `SetConsoleCtrlHandler` via ctypes (delivered on a dedicated Windows thread) + SIGINT/SIGBREAK handlers so Ctrl+C, Ctrl+Break, and window-close all trigger a clean stop. |
 | **0.41.14** | **Windows: fixes process-sweeper crash spam.** The session process-alive sweeper and the Claude-lock stale-holder check both called `os.kill(pid, 0)` unconditionally — but Windows Python doesn't treat signal 0 as an existence probe, so exited PIDs raised CPython `SystemError: returned a result with an exception set` (which isn't an `OSError` and slipped past the wrapper). Both paths now delegate to the cross-platform `is_process_alive` helper (ctypes `OpenProcess` + `WaitForSingleObject` on Windows) and fail-safe return True on unexpected errors so live user sessions aren't incorrectly closed. |
