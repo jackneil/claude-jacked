@@ -10,11 +10,12 @@ class TestUpgradeCommand:
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.is_process_alive", return_value=False)
     @patch("jacked.service.process.read_pid", return_value=None)
+    @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_upgrade_runs_uv_then_jacked_install(
-        self, mock_run, mock_read_pid, mock_alive, mock_find,
+    def test_upgrade_starts_detached_service_even_when_not_running(
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
     ):
-        """Success path: uv install, then jacked install, then (no service)."""
+        """Service wasn't running → still start it detached (user ran `upgrade` expecting it)."""
         from jacked.cli import main
 
         mock_find.side_effect = lambda name: {
@@ -27,21 +28,24 @@ class TestUpgradeCommand:
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # First call: uv tool install
+        # Two blocking subprocess.run calls: uv install + jacked install
+        assert mock_run.call_count == 2
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
-        assert "tool" in uv_args and "install" in uv_args
         assert "claude-jacked[tray]" in uv_args
-        assert "--force" in uv_args
-
-        # Second call: jacked install --force
         install_args = mock_run.call_args_list[1][0][0]
         assert "/fake/jacked" in install_args
         assert "install" in install_args
-        assert "--force" in install_args
 
-        # Only 2 calls — service wasn't running
-        assert mock_run.call_count == 2
+        # One Popen call: detached `jacked service start`
+        assert mock_popen.call_count == 1
+        popen_args = mock_popen.call_args[0][0]
+        assert "/fake/jacked" in popen_args
+        assert "service" in popen_args and "start" in popen_args
+        # Must be detached
+        kwargs = mock_popen.call_args[1]
+        assert kwargs.get("start_new_session") is True
+        assert kwargs.get("stdin") is __import__("subprocess").DEVNULL
 
     @patch("jacked.findbin.find_bin")
     @patch("subprocess.run")
@@ -71,38 +75,48 @@ class TestUpgradeCommand:
         assert mock_run.call_count == 1
 
     @patch("sys.platform", "darwin")
+    @patch("socket.socket")
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.is_process_alive", return_value=True)
     @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
+    @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_upgrade_restarts_service_when_running(
-        self, mock_run, mock_read_pid, mock_alive, mock_find,
+    def test_upgrade_stops_then_starts_detached_when_running(
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find, mock_sock,
     ):
+        """When service is running: stop (blocking), wait for port, start detached."""
         from jacked.cli import main
         mock_find.side_effect = lambda name: {
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
+        # Socket bind "succeeds" immediately so the port-wait loop exits fast.
+        mock_sock.return_value.bind = MagicMock()
 
         runner = CliRunner()
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # 3 calls: uv install, jacked install, jacked service restart
+        # 3 blocking runs: uv install, jacked install, jacked service stop
         assert mock_run.call_count == 3
-        restart_args = mock_run.call_args_list[2][0][0]
-        assert "/fake/jacked" in restart_args
-        assert "service" in restart_args
-        assert "restart" in restart_args
+        stop_args = mock_run.call_args_list[2][0][0]
+        assert "/fake/jacked" in stop_args
+        assert "service" in stop_args and "stop" in stop_args
+        # 1 detached Popen: jacked service start
+        assert mock_popen.call_count == 1
+        start_args = mock_popen.call_args[0][0]
+        assert "start" in start_args
+        assert mock_popen.call_args[1].get("start_new_session") is True
 
     @patch("sys.platform", "darwin")
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.is_process_alive", return_value=True)
     @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
+    @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_upgrade_skip_service_flag_honored(
-        self, mock_run, mock_read_pid, mock_alive, mock_find,
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
     ):
         from jacked.cli import main
         mock_find.side_effect = lambda name: {
@@ -115,16 +129,18 @@ class TestUpgradeCommand:
         result = runner.invoke(main, ["upgrade", "--skip-service"])
 
         assert result.exit_code == 0
-        # Only 2 calls — restart skipped even though service was running
+        # Only 2 blocking runs — service untouched. No detached Popen either.
         assert mock_run.call_count == 2
+        mock_popen.assert_not_called()
 
     @patch("sys.platform", "darwin")
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.is_process_alive", return_value=False)
     @patch("jacked.service.process.read_pid", return_value=None)
+    @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_upgrade_continues_if_jacked_install_fails(
-        self, mock_run, mock_read_pid, mock_alive, mock_find,
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
     ):
         """jacked install failure is non-fatal — package is still upgraded."""
         from jacked.cli import main
@@ -142,7 +158,9 @@ class TestUpgradeCommand:
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
+        # 2 blocking runs (uv + failing jacked install), still attempts detached start
         assert mock_run.call_count == 2
+        assert mock_popen.call_count == 1
 
 
 class TestUpgradeWindows:

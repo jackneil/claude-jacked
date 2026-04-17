@@ -855,19 +855,51 @@ def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, is_p
             "Your settings.json may be in a partial state — check ~/.claude/settings.json.bak-*"
         )
 
-    # Step 3: restart running service.
+    # Step 3: stop any running service, then start fresh detached.
+    # We never call `jacked service restart` directly here because its
+    # internal `service start` runs the tray in the foreground — a
+    # subprocess.run() on it would block `jacked upgrade` forever.
+    # Instead we stop (if running) then Popen a detached start.
     if skip_service:
         console.print("\n[dim]Skipping service restart (--skip-service)[/dim]")
     else:
         info = read_pid(pid_file)
-        if info and is_process_alive(info["pid"]):
-            console.print(f"\n[dim]$ {jacked} service restart[/dim]")
-            subprocess.run([jacked, "service", "restart"])
-        else:
-            console.print(
-                "\n[dim]Service is not running — skipping restart. "
-                "Run `jacked service start` to launch it.[/dim]"
+        was_running = info and is_process_alive(info["pid"])
+        if was_running:
+            console.print(f"\n[dim]$ {jacked} service stop[/dim]")
+            subprocess.run([jacked, "service", "stop"], check=False)
+            # Wait for port to release — give uvicorn up to 10s to drain.
+            import socket
+            import time as _time
+            deadline = _time.monotonic() + 10.0
+            while _time.monotonic() < deadline:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.bind(("127.0.0.1", 8321))
+                    sock.close()
+                    break
+                except OSError:
+                    _time.sleep(0.5)
+
+        # Start detached — the tray must survive this upgrade process exiting.
+        console.print(f"\n[dim]$ {jacked} service start  (detached)[/dim]")
+        from jacked.service import CLAUDE_DIR
+        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = CLAUDE_DIR / "jacked-service.log"
+        try:
+            log_fh = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+            subprocess.Popen(
+                [jacked, "service", "start"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=log_fh,
+                start_new_session=True,
+                close_fds=True,
             )
+            console.print(f"[dim]Logs: {log_path}[/dim]")
+        except Exception as exc:
+            console.print(f"[yellow]Could not spawn detached service: {exc}[/yellow]")
+            console.print(f"[dim]Run manually: {jacked} service start[/dim]")
 
     console.print("\n[green][OK][/green] Upgrade complete.")
 
