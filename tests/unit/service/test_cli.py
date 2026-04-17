@@ -39,6 +39,40 @@ class TestServiceStop:
         assert result.exit_code == 0
         assert "not running" in result.output.lower()
 
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": True, "died": True, "killed": False},
+    )
+    def test_stop_reports_ok_on_clean_stop(self, mock_stop):
+        from jacked.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["service", "stop"])
+        assert result.exit_code == 0
+        assert "ok" in result.output.lower()
+        assert "force-killed" not in result.output.lower()
+
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": True, "died": True, "killed": True},
+    )
+    def test_stop_reports_when_sigkill_needed(self, mock_stop):
+        """If the tray ignored SIGTERM, user should see the force-kill message."""
+        from jacked.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["service", "stop"])
+        assert result.exit_code == 0
+        assert "force-killed" in result.output.lower()
+
+    @patch(
+        "jacked.service.process.stop_process_graceful",
+        return_value={"was_running": True, "died": False, "killed": True},
+    )
+    def test_stop_exits_nonzero_when_kill_fails(self, mock_stop):
+        from jacked.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["service", "stop"])
+        assert result.exit_code != 0
+
 
 class TestServiceInstall:
     @patch("jacked.service.platform.install_autostart")

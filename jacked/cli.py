@@ -3195,14 +3195,28 @@ def service_start(host: str | None, port: int | None):
 
 @service.command(name="stop")
 def service_stop():
-    """Stop the running jacked service."""
-    from jacked.service import PID_FILE
-    from jacked.service.process import stop_process
+    """Stop the running jacked service.
 
-    if stop_process(PID_FILE):
-        console.print("[green][OK][/green] Sent stop signal to jacked service")
-    else:
+    Uses stop_process_graceful which waits for actual PID death and
+    escalates to SIGKILL if SIGTERM is ignored — pystray's AppKit
+    runloop on macOS can silently swallow Python signals.
+    """
+    from jacked.service import PID_FILE
+    from jacked.service.process import stop_process_graceful
+
+    result = stop_process_graceful(PID_FILE)
+    if not result["was_running"]:
         console.print("[yellow]Service is not running[/yellow]")
+        return
+
+    if not result["died"]:
+        console.print("[red]Could not stop service — still alive after SIGKILL[/red]")
+        sys.exit(1)
+
+    if result["killed"]:
+        console.print("[yellow][OK][/yellow] Service ignored SIGTERM — force-killed")
+    else:
+        console.print("[green][OK][/green] Stopped jacked service")
 
 
 @service.command(name="restart")
