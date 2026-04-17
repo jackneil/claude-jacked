@@ -1089,13 +1089,37 @@ async def full_sweep_loop(app):
                     )
                     success = await ping_account(cc_at)
                     if not success and acct.get("cc_refresh_token"):
-                        from jacked.web.auth import refresh_cc_token
-                        refreshed = await refresh_cc_token(acct["id"], db)
-                        if refreshed:
-                            fresh_acct = db.get_account(acct["id"])
-                            fresh_cc = fresh_acct.get("cc_access_token") if fresh_acct else None
-                            if fresh_cc and fresh_cc != cc_at:
-                                success = await ping_account(fresh_cc)
+                        # Never rotate the active account's CC refresh token —
+                        # Claude Code still holds the pre-rotation value in its
+                        # Keychain and will hit invalid_grant on next refresh.
+                        # See architecture doc §7.3 and invariant I2.
+                        # For the active account, reconcile from live creds
+                        # instead (Claude Code keeps its own token fresh).
+                        from jacked.api.credential_helpers import read_active_account_id
+                        active_id_now = read_active_account_id()
+                        if active_id_now == acct["id"]:
+                            logger.info(
+                                "Window keeper: skipping CC refresh for "
+                                "active account %d — reconciling instead",
+                                acct["id"],
+                            )
+                            try:
+                                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                                reconcile_credentials_from_live_store(acct["id"], db)
+                                fresh_acct = db.get_account(acct["id"])
+                                fresh_cc = fresh_acct.get("cc_access_token") if fresh_acct else None
+                                if fresh_cc and fresh_cc != cc_at:
+                                    success = await ping_account(fresh_cc)
+                            except Exception:
+                                logger.exception("Window keeper reconcile failed for active account %d", acct["id"])
+                        else:
+                            from jacked.web.auth import refresh_cc_token
+                            refreshed = await refresh_cc_token(acct["id"], db)
+                            if refreshed:
+                                fresh_acct = db.get_account(acct["id"])
+                                fresh_cc = fresh_acct.get("cc_access_token") if fresh_acct else None
+                                if fresh_cc and fresh_cc != cc_at:
+                                    success = await ping_account(fresh_cc)
                     if success:
                         sweep_pinged += 1
                         # Fetch fresh usage so cached_5h_resets_at updates

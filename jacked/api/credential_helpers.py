@@ -296,6 +296,47 @@ def read_fresh_active_token(account_id: int) -> str | None:
     return None
 
 
+def read_active_account_id() -> int | None:
+    """Return the currently-active jacked account id, or None.
+
+    Consulted by all paths that must NOT rotate the active account's CC
+    refresh token (architecture doc §7.1, §7.2, §7.3 + invariant I2).
+
+    Reads `_jackedAccountId` stamp from Keychain first, then from
+    `~/.claude/.credentials.json`. Returns an `int` for easy `==` comparison
+    against `account["id"]`. Never raises — all errors resolved to None so
+    callers can safely `if read_active_account_id() == account_id: skip`.
+
+    Coerces string values (e.g. hand-edited JSON with "1" instead of 1) to
+    int. Rejects zero and negative values as invalid account ids.
+    """
+    stamp = None
+    try:
+        live = read_platform_credentials()
+        if not live:
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    live = json.loads(cred_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    live = None
+        if isinstance(live, dict):
+            stamp = live.get("_jackedAccountId")
+    except Exception:
+        logger.debug("read_active_account_id failed", exc_info=True)
+        return None
+
+    if stamp is None:
+        return None
+    try:
+        account_id = int(stamp)
+    except (TypeError, ValueError):
+        return None
+    if account_id <= 0:
+        return None
+    return account_id
+
+
 # ---------------------------------------------------------------------------
 # Cache for live credential reads (30s TTL)
 # ---------------------------------------------------------------------------

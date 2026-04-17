@@ -1027,20 +1027,19 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
 
     accounts = db.list_accounts(include_inactive=False)
 
-    # Periodic reconciliation for active account
+    # Identify the active Claude Code session up front so the CC-refresh
+    # skip below can't be defeated by an exception anywhere in reconcile.
+    # Must be initialized BEFORE the try block so it's always bound (a
+    # NameError here would crash the entire refresh pipeline — see
+    # architecture doc §7.1).
+    active_id: int | None = None
     try:
-        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-        from jacked.api.credential_helpers import read_platform_credentials
-        live = read_platform_credentials()
-        if not live:
-            cred_path = Path.home() / ".claude" / ".credentials.json"
-            if cred_path.exists() and not cred_path.is_symlink():
-                try:
-                    live = json.loads(cred_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    live = None
-        active_id = live.get("_jackedAccountId") if live else None
-        if active_id:
+        from jacked.api.credential_helpers import (
+            read_active_account_id,
+            reconcile_credentials_from_live_store,
+        )
+        active_id = read_active_account_id()
+        if active_id is not None:
             reconcile_credentials_from_live_store(active_id, db)
     except Exception:
         logger.debug("Periodic credential reconciliation failed", exc_info=True)

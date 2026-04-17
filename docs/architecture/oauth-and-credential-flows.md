@@ -563,6 +563,8 @@ This layer exists because on macOS Claude Code often uses the Keychain exclusive
 
 ## 7. Known Issues / Active Bugs
 
+> **Update (0.41.2):** §7.1, §7.2, §7.3 are **fixed** by `read_active_account_id()` + a skip check at every CC-refresh call site, plus a shared helper to prevent layer drift. §7.4 and §7.5 remain. See commit history for the exact diffs.
+
 ### 7.1 Background CC refresh rotates the active account's refresh token
 
 **Mechanism.** `_token_refresh_loop` fires every 1800s (`jacked/api/main.py:52-68`). It calls `refresh_all_expiring_tokens` (`jacked/web/auth.py:1002-1080`). The loop body at `jacked/web/auth.py:1048-1078` iterates over `db.list_accounts(include_inactive=False)` and, for each account, if `should_refresh_cc(account)` returns True, calls `refresh_cc_token(account_id, db)` (`auth.py:1073-1078`). There is no active-account exclusion. `refresh_cc_token` delegates to `_refresh_token_flow(..., RefreshMode.CC)` (`auth.py:572-587`).
@@ -616,7 +618,7 @@ Each invariant has a 1-line rationale and enforcement file:line pointer.
 
 - **I1.** jacked's background loops MUST NOT write to CC credential stores. *Background writes preempt Claude Code's own refresh and cause session logouts. Established in `docs/superpowers/specs/2026-03-24-kill-background-credential-writes-design.md`; enforced by `_refresh_token_flow` gating credential writes to `CC_OR_PRIMARY_429` mode only (`jacked/web/auth.py:343-365`) and `refresh_account_token` / `refresh_cc_token` never calling `sync_credential_to_all_stores`.*
 
-- **I2.** CC refresh tokens for the active account MUST NOT be rotated by jacked. *Rotating the refresh token invalidates the copy Claude Code holds in its Keychain, breaking CC's own refresh on the next tick. **Currently VIOLATED** by `refresh_all_expiring_tokens` (§7.1) and latently by `launch.py:369-376` (§7.2) and `full_sweep_loop` 401 recovery (§7.3). Fix in `docs/superpowers/plans/2026-04-17-cc-refresh-active-account-skip.md`.*
+- **I2.** CC refresh tokens for the active account MUST NOT be rotated by jacked. *Rotating the refresh token invalidates the copy Claude Code holds in its Keychain, breaking CC's own refresh on the next tick. Enforced as of 0.41.2 at all three call sites via `read_active_account_id()` skip checks: `jacked/web/auth.py:1082` (30-min loop), `jacked/launch.py:388` (pre-launch), `jacked/api/usage_monitor.py:1091` (window keeper 401 recovery). The shared helper at `jacked/api/credential_helpers.py:267` is the single source of truth — don't duplicate the detection logic.*
 
 - **I3.** Primary and CC token pairs MUST NEVER share values. *They come from separate OAuth flows with different scopes and different rotation schedules. Enforced by: (a) separate DB columns (`jacked/web/database.py:201-235`), (b) `build_oauth_data` never copying `refresh_token` into `refreshToken` in the primary fallback path (`jacked/api/credential_helpers.py:539-550`), (c) migration one-time seeds `cc_access_token` from `access_token` but NEVER seeds `cc_refresh_token` (`jacked/web/database.py:566-573`).*
 

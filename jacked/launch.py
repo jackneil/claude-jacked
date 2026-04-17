@@ -371,19 +371,9 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     # the token Claude Code's running process holds in memory/Keychain,
     # forcing a re-login. See docs/architecture/oauth-and-credential-flows.md §7.2.
     if should_refresh_cc(account):
-        try:
-            from jacked.api.credential_helpers import read_platform_credentials
-            live = read_platform_credentials()
-            if not live:
-                cred_path = Path.home() / ".claude" / ".credentials.json"
-                if cred_path.exists() and not cred_path.is_symlink():
-                    try:
-                        live = json.loads(cred_path.read_text(encoding="utf-8"))
-                    except (json.JSONDecodeError, OSError):
-                        live = None
-            active_id = live.get("_jackedAccountId") if live else None
-        except Exception:
-            active_id = None
+        from jacked.api.credential_helpers import read_active_account_id
+
+        active_id = read_active_account_id()
 
         if active_id != account_id:
             from jacked.web.auth import refresh_cc_token
@@ -396,6 +386,15 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             if not account:
                 raise click.ClickException(f"Account {account_id} disappeared after CC refresh")
         else:
+            # Reconcile live creds into DB before the downstream Keychain
+            # write so we don't roll back Claude Code's fresh token
+            # (architecture doc §7.2 — launch.py:489 stale write gap).
+            try:
+                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                reconcile_credentials_from_live_store(account_id, db)
+                account = db.get_account(account_id) or account
+            except Exception:
+                logger.debug("Pre-launch reconcile failed", exc_info=True)
             logger.info(
                 "Account %d: skipping pre-launch CC refresh (account is the "
                 "active Claude Code session — Claude Code manages its own "
