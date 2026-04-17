@@ -7,13 +7,14 @@ from click.testing import CliRunner
 
 class TestUpgradeCommand:
     @patch("sys.platform", "darwin")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.is_process_alive", return_value=False)
     @patch("jacked.service.process.read_pid", return_value=None)
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_upgrade_starts_detached_service_even_when_not_running(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find, mock_method,
     ):
         """Service wasn't running → still start it detached (user ran `upgrade` expecting it)."""
         from jacked.cli import main
@@ -47,9 +48,13 @@ class TestUpgradeCommand:
         assert kwargs.get("start_new_session") is True
         assert kwargs.get("stdin") is __import__("subprocess").DEVNULL
 
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("subprocess.run")
-    def test_upgrade_aborts_if_uv_not_found(self, mock_run, mock_find):
+    def test_upgrade_aborts_if_uv_not_found_when_method_is_uv(
+        self, mock_run, mock_find, mock_method,
+    ):
+        """uv-install → we must fail fast if uv itself is missing."""
         from jacked.cli import main
         mock_find.return_value = None
 
@@ -60,9 +65,39 @@ class TestUpgradeCommand:
         assert "uv" in result.output.lower()
         mock_run.assert_not_called()
 
+    @patch("sys.platform", "darwin")
+    @patch("jacked.install_method.detect_install_method", return_value="pip")
+    @patch("jacked.install_method.is_user_site_install", return_value=True)
+    @patch("jacked.findbin.find_bin")
+    @patch("jacked.service.process.is_process_alive", return_value=False)
+    @patch("jacked.service.process.read_pid", return_value=None)
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    def test_upgrade_uses_pip_user_when_detected(
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
+        mock_user_site, mock_method,
+    ):
+        """pip-user-install users shouldn't have `uv tool install` forced on them."""
+        from jacked.cli import main
+        mock_find.side_effect = lambda name: {"jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["upgrade"])
+        assert result.exit_code == 0
+
+        first_cmd = mock_run.call_args_list[0][0][0]
+        # Pip path uses current python: sys.executable -m pip install --upgrade --user ...
+        assert first_cmd[0] == sys.executable
+        assert "-m" in first_cmd and "pip" in first_cmd
+        assert "--upgrade" in first_cmd
+        assert "--user" in first_cmd
+        assert "claude-jacked[tray]" in first_cmd
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("subprocess.run")
-    def test_upgrade_aborts_if_uv_install_fails(self, mock_run, mock_find):
+    def test_upgrade_aborts_if_uv_install_fails(self, mock_run, mock_find, mock_method):
         from jacked.cli import main
         mock_find.side_effect = lambda name: {"uv": "/fake/uv"}.get(name)
         mock_run.return_value = MagicMock(returncode=1)
@@ -71,7 +106,7 @@ class TestUpgradeCommand:
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 1
-        # Only one subprocess call — aborts after uv install fails
+        # Only one subprocess call — aborts after package upgrade fails
         assert mock_run.call_count == 1
 
     @patch("sys.platform", "darwin")
@@ -165,13 +200,14 @@ class TestUpgradeCommand:
         mock_popen.assert_not_called()
 
     @patch("sys.platform", "darwin")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.is_process_alive", return_value=False)
     @patch("jacked.service.process.read_pid", return_value=None)
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_upgrade_continues_if_jacked_install_fails(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find, mock_method,
     ):
         """jacked install failure is non-fatal — package is still upgraded."""
         from jacked.cli import main
@@ -196,10 +232,11 @@ class TestUpgradeCommand:
 
 class TestUpgradeWindows:
     @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("subprocess.Popen")
     def test_windows_spawns_detached_helper_and_exits(
-        self, mock_popen, mock_find,
+        self, mock_popen, mock_find, mock_method,
     ):
         """Windows must spawn a detached cmd.exe helper, never try inline."""
         from jacked.cli import main
@@ -209,28 +246,26 @@ class TestUpgradeWindows:
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # Helper was spawned via cmd.exe
         mock_popen.assert_called_once()
         args = mock_popen.call_args[0][0]
         assert "cmd.exe" in args[0]
         assert args[1] == "/c"
         assert args[2].endswith(".bat")
-        # DETACHED_PROCESS flag set
         kwargs = mock_popen.call_args[1]
         flags = kwargs.get("creationflags", 0)
         assert flags & 0x00000008  # DETACHED_PROCESS
 
     @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("subprocess.Popen")
     def test_windows_batch_contains_uv_and_jacked_commands(
-        self, mock_popen, mock_find, tmp_path, monkeypatch,
+        self, mock_popen, mock_find, mock_method, tmp_path, monkeypatch,
     ):
         """Batch file must embed the full upgrade sequence."""
         from jacked.cli import main
         mock_find.side_effect = lambda name: {"uv": r"C:\uv\uv.exe"}.get(name)
 
-        # Redirect tempfile to a place we control so we can read the batch file.
         import tempfile as _tempfile
         real_mkstemp = _tempfile.mkstemp
         created = []
@@ -251,6 +286,39 @@ class TestUpgradeWindows:
         assert "--force" in batch
         assert "jacked install --force" in batch
         assert "service restart" in batch
+
+    @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="pip")
+    @patch("jacked.install_method.is_user_site_install", return_value=True)
+    @patch("jacked.findbin.find_bin", return_value=None)
+    @patch("subprocess.Popen")
+    def test_windows_batch_uses_pip_user_when_method_is_pip(
+        self, mock_popen, mock_find, mock_user_site, mock_method,
+        tmp_path, monkeypatch,
+    ):
+        """Pip-user install on Windows must upgrade via pip, not uv."""
+        from jacked.cli import main
+
+        import tempfile as _tempfile
+        real_mkstemp = _tempfile.mkstemp
+        created = []
+        def fake_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, dir=str(tmp_path), **{k: v for k, v in kwargs.items() if k != "dir"})
+            created.append(path)
+            return fd, path
+        monkeypatch.setattr(_tempfile, "mkstemp", fake_mkstemp)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["upgrade"])
+        assert result.exit_code == 0
+
+        batch = open(created[0]).read()
+        assert "-m" in batch and "pip" in batch
+        assert "--upgrade" in batch
+        assert "--user" in batch
+        assert "claude-jacked[tray]" in batch
+        # Must NOT have uv-tool-install language
+        assert "uv tool install" not in batch
 
     @patch("sys.platform", "win32")
     @patch("jacked.findbin.find_bin")

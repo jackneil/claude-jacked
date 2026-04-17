@@ -803,26 +803,47 @@ def upgrade(extras: str, skip_service: bool):
     import subprocess
     from jacked import __version__
     from jacked.findbin import find_bin
+    from jacked.install_method import (
+        detect_install_method,
+        upgrade_command,
+        upgrade_command_label,
+    )
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
 
-    uv = find_bin("uv")
-    if not uv:
-        console.print("[red]Error:[/red] `uv` not found on PATH. Install it from https://docs.astral.sh/uv/")
-        sys.exit(1)
+    method = detect_install_method()
+    cmd = upgrade_command(extras)
+    label = upgrade_command_label(extras)
 
-    console.print(f"[bold]Upgrading claude-jacked from v{__version__}...[/bold]\n")
+    # uv-based flow requires `uv` on PATH; pip/pipx flows don't.
+    if method == "uv":
+        uv = find_bin("uv")
+        if not uv:
+            console.print(
+                "[red]Error:[/red] jacked was installed via `uv tool install` "
+                "but `uv` isn't on PATH. Install it from https://docs.astral.sh/uv/"
+            )
+            sys.exit(1)
+        cmd[0] = uv  # use resolved absolute path
+
+    console.print(
+        f"[bold]Upgrading claude-jacked from v{__version__}...[/bold]  "
+        f"[dim](install method: {method})[/dim]\n"
+    )
 
     # Windows can't overwrite a running .exe. Spawn a detached cmd.exe that
     # waits for this process to die, then does the install + migrate + restart.
     if sys.platform == "win32":
-        _spawn_windows_upgrade_helper(uv, extras, skip_service)
+        _spawn_windows_upgrade_helper(cmd, label, extras, skip_service)
         return
 
     # POSIX path: run inline.
-    _run_upgrade_inline(uv, extras, skip_service, PID_FILE, DEFAULT_HOST, DEFAULT_PORT)
+    _run_upgrade_inline(cmd, label, extras, skip_service, PID_FILE, DEFAULT_HOST, DEFAULT_PORT)
 
 
-def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, host: str, port: int):
+def _run_upgrade_inline(
+    cmd: list[str], label: str, extras: str, skip_service: bool,
+    pid_file, host: str, port: int,
+):
     """Inline upgrade for POSIX. Running binary gets replaced safely via inode."""
     import subprocess
     from jacked.findbin import find_bin
@@ -833,13 +854,13 @@ def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, host
         wait_for_port_free,
     )
 
-    # Step 1: uv tool install --force
-    console.print(f"[dim]$ {uv} tool install 'claude-jacked[{extras}]' --force[/dim]")
-    result = subprocess.run(
-        [uv, "tool", "install", f"claude-jacked[{extras}]", "--force"],
-    )
+    # Step 1: package upgrade (uv / pipx / pip, auto-detected).
+    console.print(f"[dim]$ {label}[/dim]")
+    result = subprocess.run(cmd)
     if result.returncode != 0:
-        console.print(f"[red]`uv tool install` failed (exit {result.returncode}). Aborting.[/red]")
+        console.print(
+            f"[red]Package upgrade failed (exit {result.returncode}). Aborting.[/red]"
+        )
         sys.exit(result.returncode)
 
     # Re-resolve jacked — path may have changed after --force.
@@ -922,21 +943,25 @@ def _run_upgrade_inline(uv: str, extras: str, skip_service: bool, pid_file, host
     console.print("\n[green][OK][/green] Upgrade complete.")
 
 
-def _spawn_windows_upgrade_helper(uv: str, extras: str, skip_service: bool):
+def _spawn_windows_upgrade_helper(
+    cmd: list[str], label: str, extras: str, skip_service: bool,
+):
     """Windows: spawn a detached cmd.exe helper and exit this process.
 
     Running jacked.exe can't be overwritten while we're holding it open.
     The helper is cmd.exe (a system binary we don't own), which stays
-    valid no matter what uv does to the jacked venv.
+    valid no matter what the upgrade command does to the jacked venv
+    or user site-packages.
 
     Helper steps:
       1. Wait for our PID to exit (avoids racing against the .exe lock).
-      2. `uv tool install --force` (package).
+      2. Run the detected upgrade command (uv / pipx / pip).
       3. `jacked install --force` (migrate settings.json).
       4. `jacked service restart` (unless --skip-service).
       5. Append progress to ~/.claude/jacked-update.log.
     """
     import os
+    import shlex
     import subprocess
     import tempfile
     from jacked.service import CLAUDE_DIR
@@ -945,10 +970,11 @@ def _spawn_windows_upgrade_helper(uv: str, extras: str, skip_service: bool):
     log_path = CLAUDE_DIR / "jacked-update.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build the batch script. %~dp0 is the script dir. We embed everything
-    # the helper needs — no further Python or jacked invocations until the
-    # new binaries are in place.
-    # `tasklist` polls for our PID; after it disappears, we run install.
+    # Re-quote the upgrade command for cmd.exe. Paths may contain spaces
+    # (uv from AppData, user site-packages python.exe, etc.); every argv
+    # element must be individually quoted to survive cmd's tokenization.
+    upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
+
     restart_line = (
         'if "%SKIP_SERVICE%"=="" (\r\n'
         '    echo [%date% %time%] service restart >> "%LOGFILE%"\r\n'
@@ -960,18 +986,19 @@ def _spawn_windows_upgrade_helper(uv: str, extras: str, skip_service: bool):
         'set LOGFILE=' + str(log_path) + '\r\n'
         'set SKIP_SERVICE=' + ("1" if skip_service else "") + '\r\n'
         'echo [%date% %time%] jacked upgrade helper starting (parent PID ' + str(my_pid) + ') >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
         ':wait\r\n'
         'tasklist /FI "PID eq ' + str(my_pid) + '" 2>NUL | find "' + str(my_pid) + '" >NUL\r\n'
         'if not errorlevel 1 (\r\n'
         '    timeout /t 1 /nobreak >NUL\r\n'
         '    goto wait\r\n'
         ')\r\n'
-        'echo [%date% %time%] parent exited, running uv tool install >> "%LOGFILE%"\r\n'
-        '"' + uv + '" tool install "claude-jacked[' + extras + ']" --force >> "%LOGFILE%" 2>&1\r\n'
+        'echo [%date% %time%] parent exited, running upgrade command >> "%LOGFILE%"\r\n'
+        + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
         'if errorlevel 1 (\r\n'
-        '    echo [%date% %time%] ERROR: uv tool install failed >> "%LOGFILE%"\r\n'
-        '    echo Jacked upgrade failed during `uv tool install`. See %LOGFILE% for details.\r\n'
-        '    echo Recovery: uv tool install "claude-jacked[' + extras + ']" --force ^&^& jacked install --force\r\n'
+        '    echo [%date% %time%] ERROR: upgrade command failed >> "%LOGFILE%"\r\n'
+        '    echo Jacked upgrade failed. See %LOGFILE% for details. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 1\r\n'
         ')\r\n'
         'echo [%date% %time%] running jacked install --force >> "%LOGFILE%"\r\n'
@@ -1010,7 +1037,7 @@ def _spawn_windows_upgrade_helper(uv: str, extras: str, skip_service: bool):
     )
     console.print(f"[dim]Watching log: {log_path}[/dim]")
     console.print(
-        "The helper will run `uv tool install` + `jacked install --force`"
+        f"The helper will run `{label}` + `jacked install --force`"
         + ("" if skip_service else " + `jacked service restart`")
         + " after this process exits."
     )

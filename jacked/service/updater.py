@@ -134,32 +134,41 @@ def run_update(parent_pid: int, extras: str = "tray") -> None:
             if not wait_for_exit(parent_pid, timeout=5.0):
                 log(f"Parent {parent_pid} still alive after SIGKILL — continuing anyway")
 
-        uv = find_bin("uv")
-        if not uv:
-            msg = "Could not find `uv` on PATH. Install uv from https://docs.astral.sh/uv/"
-            log(f"ERROR: {msg}")
-            _write_recovery(
-                f"Jacked auto-update failed:\n{msg}\n\n"
-                "Manual recovery:\n"
-                f"  uv tool install 'claude-jacked[{extras}]' --force\n"
-                "  jacked install --force\n"
-                "  jacked service start\n"
-            )
-            return
-
-        log(f"Running: {uv} tool install claude-jacked[{extras}] --force")
-        result = subprocess.run(
-            [uv, "tool", "install", f"claude-jacked[{extras}]", "--force"],
-            stdout=log_fh, stderr=log_fh, check=False,
+        from jacked.install_method import (
+            detect_install_method,
+            upgrade_command,
+            upgrade_command_label,
         )
-        log(f"uv install returncode: {result.returncode}")
+        method = detect_install_method()
+        cmd = upgrade_command(extras)
+        label = upgrade_command_label(extras)
+
+        if method == "uv":
+            uv = find_bin("uv")
+            if not uv:
+                msg = "Could not find `uv` on PATH. Install uv from https://docs.astral.sh/uv/"
+                log(f"ERROR: {msg}")
+                _write_recovery(
+                    f"Jacked auto-update failed:\n{msg}\n\n"
+                    "Manual recovery:\n"
+                    f"  {label}\n"
+                    "  jacked install --force\n"
+                    "  jacked service start\n"
+                )
+                return
+            cmd[0] = uv
+
+        log(f"Install method: {method}")
+        log(f"Running: {label}")
+        result = subprocess.run(cmd, stdout=log_fh, stderr=log_fh, check=False)
+        log(f"upgrade command returncode: {result.returncode}")
 
         if result.returncode != 0:
             _write_recovery(
-                f"Jacked auto-update failed: `uv tool install` returned {result.returncode}.\n"
+                f"Jacked auto-update failed: upgrade command returned {result.returncode}.\n"
                 f"See {UPDATE_LOG} for details.\n\n"
                 "Manual recovery:\n"
-                f"  uv tool install 'claude-jacked[{extras}]' --force\n"
+                f"  {label}\n"
                 "  jacked install --force\n"
                 "  jacked service start\n"
             )
@@ -326,24 +335,44 @@ def spawn_updater_from_tray(parent_pid: int, extras: str = "tray") -> None:
 
 
 def _spawn_windows_tray_updater(parent_pid: int, extras: str) -> None:
-    """Spawn a detached cmd.exe batch that does the full Windows update."""
+    """Spawn a detached cmd.exe batch that does the full Windows update.
+
+    Uses the same install-method detection as `jacked upgrade`, so a user
+    who installed via `pip install --user claude-jacked` gets upgraded via
+    `python -m pip install --upgrade --user`, not `uv tool install` (which
+    would install the package a second time in a different location).
+    """
     import os
     import tempfile
 
     from jacked.findbin import find_bin
+    from jacked.install_method import (
+        detect_install_method,
+        upgrade_command,
+        upgrade_command_label,
+    )
 
-    uv = find_bin("uv") or "uv"
+    method = detect_install_method()
+    cmd = upgrade_command(extras)
+
+    # If uv flow, resolve uv's absolute path so cmd.exe doesn't depend on
+    # PATH resolution working the same inside a detached batch.
+    if method == "uv":
+        resolved_uv = find_bin("uv")
+        if resolved_uv:
+            cmd[0] = resolved_uv
+
+    label = upgrade_command_label(extras)
+    upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
 
     UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
     log_path = str(UPDATE_LOG)
 
-    # Batch waits for parent PID via tasklist, then does uv install +
-    # jacked install + service start. Each step logs timestamp + outcome
-    # to ~/.claude/jacked-update.log so failures are visible.
     batch_body = (
         '@echo off\r\n'
         'set LOGFILE=' + log_path + '\r\n'
-        'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ') >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ', method ' + method + ') >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
         ':wait\r\n'
         'tasklist /FI "PID eq ' + str(parent_pid) + '" 2>NUL | find "' + str(parent_pid) + '" >NUL\r\n'
         'if not errorlevel 1 (\r\n'
@@ -351,10 +380,11 @@ def _spawn_windows_tray_updater(parent_pid: int, extras: str) -> None:
         '    goto wait\r\n'
         ')\r\n'
         'echo [%date% %time%] parent exited >> "%LOGFILE%"\r\n'
-        '"' + uv + '" tool install "claude-jacked[' + extras + ']" --force >> "%LOGFILE%" 2>&1\r\n'
+        + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
         'if errorlevel 1 (\r\n'
-        '    echo [%date% %time%] ERROR: uv tool install failed >> "%LOGFILE%"\r\n'
-        '    echo Jacked tray update failed during `uv tool install`. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    echo [%date% %time%] ERROR: upgrade command failed >> "%LOGFILE%"\r\n'
+        '    echo Jacked tray update failed. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 1\r\n'
         ')\r\n'
         'echo [%date% %time%] running jacked install --force >> "%LOGFILE%"\r\n'

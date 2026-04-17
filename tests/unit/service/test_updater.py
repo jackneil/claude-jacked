@@ -19,12 +19,13 @@ class TestWaitForExit:
 
 
 class TestRunUpdate:
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.is_port_available", return_value=True)
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_order_wait_install_migrate_restart(
-        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_method,
     ):
         """Verify: wait_for_exit -> uv install -> jacked install -> jacked service start."""
         from jacked.service import updater
@@ -39,7 +40,7 @@ class TestRunUpdate:
             updater.run_update(parent_pid=12345, extras="tray")
 
         assert mock_wait.called
-        # Two subprocess.run calls in order: uv install, then jacked install
+        # Two subprocess.run calls in order: package upgrade, then jacked install
         assert mock_run.call_count == 2
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
@@ -57,10 +58,13 @@ class TestRunUpdate:
         assert "/fake/jacked" in restart_args
         assert "service" in restart_args and "start" in restart_args
 
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
-    def test_skips_restart_if_install_fails(self, mock_popen, mock_run, mock_find):
+    def test_skips_restart_if_install_fails(
+        self, mock_popen, mock_run, mock_find, mock_method,
+    ):
         from jacked.service import updater
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = MagicMock(returncode=1)
@@ -70,10 +74,13 @@ class TestRunUpdate:
 
         mock_popen.assert_not_called()
 
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
-    def test_writes_recovery_file_on_install_failure(self, mock_popen, mock_run, mock_find, tmp_path, monkeypatch):
+    def test_writes_recovery_file_on_install_failure(
+        self, mock_popen, mock_run, mock_find, mock_method, tmp_path, monkeypatch,
+    ):
         from jacked.service import updater
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
@@ -86,6 +93,33 @@ class TestRunUpdate:
         assert (tmp_path / "recovery.txt").exists()
         content = (tmp_path / "recovery.txt").read_text()
         assert "uv tool install" in content
+
+    @patch("jacked.install_method.detect_install_method", return_value="pip")
+    @patch("jacked.install_method.is_user_site_install", return_value=True)
+    @patch("jacked.service.updater.is_port_available", return_value=True)
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_pip_user_install_uses_python_m_pip(
+        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        mock_user_site, mock_method,
+    ):
+        """If install method is pip --user, the updater must use
+        `<python> -m pip install --upgrade --user` rather than
+        `uv tool install` (which would install the package a second
+        time in a different location)."""
+        from jacked.service import updater
+        mock_find.side_effect = lambda name: {"jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        upgrade_call = mock_run.call_args_list[0][0][0]
+        assert upgrade_call[0] == sys.executable
+        assert "-m" in upgrade_call and "pip" in upgrade_call
+        assert "--upgrade" in upgrade_call
+        assert "--user" in upgrade_call
 
 
 class TestPortWaitBeforeServiceStart:
@@ -337,10 +371,11 @@ class TestSpawnFromTrayWindows:
         except OSError:
             pass
 
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin", return_value="C:\\Users\\x\\.local\\bin\\uv.exe")
     @patch("subprocess.Popen")
     def test_windows_batch_contains_uv_install_and_service_start(
-        self, mock_popen, mock_find, monkeypatch, tmp_path,
+        self, mock_popen, mock_find, mock_method, monkeypatch, tmp_path,
     ):
         """The batch must run uv tool install --force AND jacked service start."""
         from jacked.service import updater
@@ -355,11 +390,44 @@ class TestSpawnFromTrayWindows:
         with open(batch_path) as f:
             body = f.read()
         try:
-            assert 'tool install "claude-jacked[tray]" --force' in body
+            assert 'tool' in body and 'install' in body
+            assert 'claude-jacked[tray]' in body
+            assert '--force' in body
             assert "jacked install --force" in body
             assert "jacked service start" in body
             assert "PID eq 99999" in body
             assert 'start "" /B' in body
+        finally:
+            import os as _os
+            try:
+                _os.unlink(batch_path)
+            except OSError:
+                pass
+
+    @patch("jacked.install_method.detect_install_method", return_value="pip")
+    @patch("jacked.install_method.is_user_site_install", return_value=True)
+    @patch("subprocess.Popen")
+    def test_windows_batch_uses_pip_user_when_method_is_pip(
+        self, mock_popen, mock_user_site, mock_method, monkeypatch, tmp_path,
+    ):
+        """pip --user install on Windows: tray update must use pip, not uv."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(
+            subprocess, "DETACHED_PROCESS", 0x8, raising=False,
+        )
+
+        updater._spawn_windows_tray_updater(parent_pid=12345, extras="tray")
+
+        batch_path = mock_popen.call_args[0][0][2]
+        with open(batch_path) as f:
+            body = f.read()
+        try:
+            assert "-m" in body and "pip" in body
+            assert "--upgrade" in body
+            assert "--user" in body
+            assert "claude-jacked[tray]" in body
+            assert "uv tool install" not in body  # wrong method
         finally:
             import os as _os
             try:

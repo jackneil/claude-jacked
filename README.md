@@ -292,21 +292,33 @@ If `current` is older than the version your `uv tool list` shows, the running tr
 
 ### Installing from scratch (for Claude or new dev)
 
-If you're reading this to set up `claude-jacked` on a fresh machine:
+If you're reading this to set up `claude-jacked` on a fresh machine, pick one of the three install methods — `jacked upgrade` auto-detects which one you used and re-uses it for future upgrades:
 
 ```bash
-# macOS / Linux
-uv tool install "claude-jacked[tray]"   # add [search] or swap for [all] if you want Qdrant session search
+# Option A (recommended) — uv tool install: isolated venv, zero system-Python pollution
+uv tool install "claude-jacked[tray]"
+
+# Option B — pipx: also isolated, if uv isn't available
+pipx install "claude-jacked[tray]"
+
+# Option C — pip into the user site-packages: works anywhere Python works
+python -m pip install --user "claude-jacked[tray]"
+```
+
+Then on all platforms:
+
+```bash
 jacked install                           # wire up hooks into ~/.claude/settings.json
 jacked service install                   # configure auto-start on login + launch the service
-# → tray icon appears; dashboard at http://localhost:8321
-
-# Windows (PowerShell or cmd)
-uv tool install "claude-jacked[tray]"
-jacked install
-jacked service install                   # creates %APPDATA%\...\Startup\jacked.vbs
-jacked service start                     # launch now; next login it auto-starts
+# macOS: writes ~/Library/LaunchAgents/ai.hank.jacked.plist
+# Windows: writes a .vbs in the Startup folder
+# Linux: writes a systemd --user service
+# → purple "J" tray icon appears; dashboard at http://localhost:8321
 ```
+
+Extras: `[search]` enables Qdrant-backed session search; `[all]` is `[tray,search]`.
+
+Requirements: Python 3.10+. For Option A, install `uv` from [docs.astral.sh/uv](https://docs.astral.sh/uv/). For Option C, make sure the Python user-scripts dir is on your PATH — on Windows it's typically `%APPDATA%\Python\Python3XX\Scripts`; on POSIX it's `~/.local/bin`.
 
 Requires `uv` already on PATH — install from [docs.astral.sh/uv](https://docs.astral.sh/uv/) if you don't have it. Requires Python 3.10+.
 
@@ -602,6 +614,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.41.16** | **Install method auto-detection.** `jacked upgrade` and the tray "Update" button now detect whether jacked was installed via `uv tool install`, `pipx install`, or `pip install [--user]` and call the matching upgrade command. Prior versions hardcoded `uv tool install --force`, which silently failed for pip/pipx users by either erroring out (`uv` not on PATH) or installing the package a second time in the wrong place. New detection logic lives in `jacked/install_method.py` and drives both the inline POSIX upgrade and the Windows cmd.exe batch helper. |
 | **0.41.15** | **Windows: tray-update click now actually works + Ctrl+C stops the service.** (1) Tray-update on Windows was using a Python subprocess to drive `uv tool install --force`, but Windows can't replace `python.exe` while any process holds it open, so the update reliably failed. Now uses the same detached `cmd.exe` batch pattern as `jacked upgrade` — cmd.exe is a system binary we don't own, so it survives whatever uv does. (2) `jacked service start` in a console on Windows ignored Ctrl+C because pystray's native Win32 message pump blocks Python signal delivery. Installed a `SetConsoleCtrlHandler` via ctypes (delivered on a dedicated Windows thread) + SIGINT/SIGBREAK handlers so Ctrl+C, Ctrl+Break, and window-close all trigger a clean stop. |
 | **0.41.14** | **Windows: fixes process-sweeper crash spam.** The session process-alive sweeper and the Claude-lock stale-holder check both called `os.kill(pid, 0)` unconditionally — but Windows Python doesn't treat signal 0 as an existence probe, so exited PIDs raised CPython `SystemError: returned a result with an exception set` (which isn't an `OSError` and slipped past the wrapper). Both paths now delegate to the cross-platform `is_process_alive` helper (ctypes `OpenProcess` + `WaitForSingleObject` on Windows) and fail-safe return True on unexpected errors so live user sessions aren't incorrectly closed. |
 | **0.41.13** | **Tray auto-update actually restarts the tray.** Two fixes: (1) the updater now SIGKILLs the parent tray if pystray doesn't exit on `icon.stop()`, and SIGKILLs whatever is holding port 8321 if it stays bound after the graceful wait. (2) The updater verifies the new service actually bound :8321 before declaring success; if not, writes a recovery file. Also adds a "Last checked: Xm ago" / "Checking PyPI..." line to the tray menu, and disables "Check for updates..." while a check is running — so users with system notifications muted can still see the check happened. |
