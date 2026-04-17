@@ -2529,7 +2529,8 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
                 for pat, _, prefix, reason in warns:
                     console.print(f"  [red][WARN][/red] {pat} — {reason}")
                 console.print(
-                    "[dim]Run 'jacked gatekeeper audit' for full details[/dim]"
+                    "[dim]Run 'jacked gatekeeper audit' for full details, "
+                    "or 'jacked gatekeeper audit --fix' to prune them interactively.[/dim]"
                 )
             else:
                 console.print("[green][AUDIT] Permission rules look clean[/green]")
@@ -3189,18 +3190,94 @@ def service_stop():
 @service.command(name="restart")
 @click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
-@click.pass_context
-def service_restart(ctx, host: str | None, port: int | None):
-    """Restart the jacked service."""
-    from jacked.service import PID_FILE
-    from jacked.service.process import stop_process
+@click.option(
+    "--foreground",
+    is_flag=True,
+    help="Run the new service in the foreground (default: detach and return immediately).",
+)
+def service_restart(host: str | None, port: int | None, foreground: bool):
+    """Restart the jacked service.
 
-    if stop_process(PID_FILE):
+    By default, runs the NEW service detached — this command returns
+    immediately and tray logs go to ~/.claude/jacked-service.log. This
+    lets `jacked upgrade` and other automation call us without blocking
+    on the pystray event loop.
+
+    Use --foreground to run interactively (tray logs to your terminal).
+    """
+    import socket as _socket
+    import time as _time
+    from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service.process import is_process_alive, read_pid, stop_process
+
+    the_port = port or DEFAULT_PORT
+    the_host = host or DEFAULT_HOST
+
+    # 1. Stop any running service. stop_process sends SIGTERM/taskkill and
+    # returns immediately — we need to wait for the PID to actually exit AND
+    # for the port to be released before starting the replacement.
+    stopped = stop_process(PID_FILE)
+    if stopped:
         console.print("[dim]Stopped existing service[/dim]")
-        import time
-        time.sleep(1)
+        # Wait for old PID to die (up to 10s).
+        info = read_pid(PID_FILE)
+        if info is not None:
+            deadline = _time.monotonic() + 10.0
+            while _time.monotonic() < deadline and is_process_alive(info["pid"]):
+                _time.sleep(0.25)
+        # Wait for port to release (up to 10s). uvicorn graceful shutdown
+        # can leave a brief window where bind fails even after the PID is
+        # gone.
+        port_deadline = _time.monotonic() + 10.0
+        while _time.monotonic() < port_deadline:
+            try:
+                s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                s.bind((the_host, the_port))
+                s.close()
+                break
+            except OSError:
+                _time.sleep(0.25)
 
-    ctx.invoke(service_start, host=host, port=port)
+    # 2. Start the new service.
+    if foreground:
+        from jacked.service.tray import ServiceRunner
+        ServiceRunner(host=the_host, port=the_port).run()
+        return
+
+    # Detached — the tray must survive this command returning.
+    import subprocess as _subprocess
+    from jacked.findbin import find_bin
+
+    jacked_bin = find_bin("jacked") or sys.executable
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = CLAUDE_DIR / "jacked-service.log"
+    try:
+        log_fh = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except Exception:
+        log_fh = _subprocess.DEVNULL
+
+    if sys.platform == "win32":
+        creationflags = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+        _subprocess.Popen(
+            [jacked_bin, "service", "start", "--host", the_host, "--port", str(the_port)],
+            stdin=_subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    else:
+        _subprocess.Popen(
+            [jacked_bin, "service", "start", "--host", the_host, "--port", str(the_port)],
+            stdin=_subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    console.print(f"[green][OK][/green] Started jacked service (detached) on :{the_port}")
+    console.print(f"[dim]Logs: {log_path}[/dim]")
 
 
 @service.command(name="status")
@@ -3398,6 +3475,77 @@ def _scan_permission_rules() -> list[tuple[str, str, str, str]]:
     return results
 
 
+def _settings_files_to_search() -> list[Path]:
+    """All settings.json files where permission rules may live."""
+    return [
+        Path.home() / ".claude" / "settings.json",
+        Path(".claude") / "settings.json",
+        Path(".claude") / "settings.local.json",
+    ]
+
+
+def _remove_permission_patterns(
+    settings_path: Path, patterns_to_remove: set[str]
+) -> tuple[int, list[str]]:
+    """Remove matching Bash permission wildcards from a settings.json file.
+
+    Writes atomically with a timestamped backup. Returns (removed_count,
+    actually_removed_list). No-op if the file doesn't exist.
+    """
+    import json as _json
+
+    if not settings_path.exists():
+        return 0, []
+    try:
+        raw = _json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError):
+        return 0, []
+
+    perms = raw.get("permissions") or {}
+    allow = perms.get("allow") or []
+    if not isinstance(allow, list):
+        return 0, []
+
+    # Snapshot before mutation.
+    try:
+        _snapshot_settings(settings_path)
+        _rotate_backups(settings_path.parent, prefix=f"{settings_path.name}.bak-", keep=5)
+    except Exception:
+        pass
+
+    kept = []
+    removed_list = []
+    for entry in allow:
+        if isinstance(entry, str) and entry in patterns_to_remove:
+            removed_list.append(entry)
+            continue
+        kept.append(entry)
+
+    if not removed_list:
+        return 0, []
+
+    raw.setdefault("permissions", {})["allow"] = kept
+    _write_settings_atomic(settings_path, raw)
+    return len(removed_list), removed_list
+
+
+def _prune_dangerous_permissions(
+    patterns: set[str], interactive: bool = True
+) -> tuple[int, list[tuple[Path, list[str]]]]:
+    """Remove each given pattern from whichever settings.json contains it.
+
+    Returns (total_removed, per-file-results).
+    """
+    per_file: list[tuple[Path, list[str]]] = []
+    total = 0
+    for settings_path in _settings_files_to_search():
+        count, removed = _remove_permission_patterns(settings_path, patterns)
+        if count > 0:
+            per_file.append((settings_path, removed))
+            total += count
+    return total, per_file
+
+
 def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
     """Parse hooks-debug.log for auto-approved PERMS MATCH commands.
 
@@ -3436,7 +3584,18 @@ def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
     help="Also scan recent auto-approved commands via LLM",
 )
 @click.option("--limit", "-n", default=50, help="Number of recent log entries to scan")
-def gatekeeper_audit(scan_log, limit):
+@click.option(
+    "--fix",
+    is_flag=True,
+    help="Interactively remove dangerous permission wildcards. Pairs with --yes for non-interactive prune.",
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="With --fix, remove all dangerous wildcards without confirmation.",
+)
+def gatekeeper_audit(scan_log, limit, fix, yes):
     """Audit permission rules for dangerous wildcards."""
     import os
     import json
@@ -3481,10 +3640,75 @@ def gatekeeper_audit(scan_log, limit):
 
     console.print(f"\n{warn_count} warnings, {info_count} info, {ok_count} OK")
 
-    if warn_count > 0:
+    if warn_count > 0 and not fix:
         console.print(
             "\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]"
         )
+        console.print(
+            "[dim]Run 'jacked gatekeeper audit --fix' to prune them interactively.[/dim]"
+        )
+
+    # --fix: interactive prune of dangerous wildcards
+    if fix:
+        warn_patterns = {pat for pat, level, _, _ in results if level == "WARN"}
+        if not warn_patterns:
+            console.print(
+                "\n[green]Nothing to fix — no dangerous wildcards found.[/green]"
+            )
+        else:
+            console.print("")  # spacer
+            to_remove: set[str] = set()
+
+            if yes:
+                to_remove = set(warn_patterns)
+                console.print(
+                    f"[yellow]--yes: will remove all {len(to_remove)} dangerous wildcard(s).[/yellow]"
+                )
+            else:
+                console.print(
+                    "[bold]For each dangerous wildcard, choose: [y]es remove / [n]o keep / [a]ll remove / [q]uit[/bold]\n"
+                )
+                remove_all = False
+                for pat in sorted(warn_patterns):
+                    if remove_all:
+                        to_remove.add(pat)
+                        continue
+                    choice = click.prompt(
+                        f"Remove {pat}? [y/n/a/q]",
+                        type=click.Choice(["y", "n", "a", "q"], case_sensitive=False),
+                        default="n",
+                        show_default=False,
+                    ).lower()
+                    if choice == "y":
+                        to_remove.add(pat)
+                    elif choice == "a":
+                        to_remove.add(pat)
+                        remove_all = True
+                    elif choice == "q":
+                        break
+
+            if not to_remove:
+                console.print("\n[dim]No changes made.[/dim]")
+            else:
+                total, per_file = _prune_dangerous_permissions(to_remove)
+                if total == 0:
+                    console.print(
+                        "\n[yellow]Selected patterns not found in any settings file — nothing to remove.[/yellow]"
+                    )
+                else:
+                    console.print(
+                        f"\n[green][OK][/green] Removed {total} wildcard(s) across {len(per_file)} file(s):"
+                    )
+                    for settings_path, removed in per_file:
+                        console.print(f"  [dim]{settings_path}[/dim]")
+                        for pat in removed:
+                            console.print(f"    - {pat}")
+                    console.print(
+                        "[dim]Backups saved next to each modified file as <name>.bak-YYYYMMDD-HHMMSS.[/dim]"
+                    )
+                    console.print(
+                        "[dim]Gatekeeper will now evaluate these commands via LLM on each use.[/dim]"
+                    )
 
     # Log scanning
     if scan_log:
