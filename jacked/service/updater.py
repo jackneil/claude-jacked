@@ -134,6 +134,28 @@ def run_update(parent_pid: int, extras: str = "tray") -> None:
             log("NOT restarting service — jacked install failed")
             return
 
+        # Wait for the old tray's port to actually release before starting
+        # the replacement. wait_for_exit above only confirms the PID is gone;
+        # on POSIX the kernel reclaims the socket almost immediately, but
+        # uvicorn's graceful shutdown path can leave a brief window where
+        # bind fails. Polling here avoids the spawned service hitting
+        # "Port 8321 is already in use" and exiting silently.
+        log("Waiting for port to become available")
+        import socket as _socket
+        port_deadline = time.monotonic() + 15.0
+        port_ready = False
+        while time.monotonic() < port_deadline:
+            try:
+                s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                s.bind(("127.0.0.1", 8321))
+                s.close()
+                port_ready = True
+                break
+            except OSError:
+                time.sleep(0.5)
+        if not port_ready:
+            log("Port 8321 did not free within 15s — starting anyway")
+
         log(f"Restarting service: {jacked} service start")
         _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
         log("Updater done")

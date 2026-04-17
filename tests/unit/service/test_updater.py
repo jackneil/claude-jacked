@@ -19,10 +19,11 @@ class TestWaitForExit:
 
 
 class TestRunUpdate:
+    @patch("socket.socket")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
-    def test_order_wait_install_migrate_restart(self, mock_popen, mock_run, mock_find):
+    def test_order_wait_install_migrate_restart(self, mock_popen, mock_run, mock_find, mock_sock):
         """Verify: wait_for_exit -> uv install -> jacked install -> jacked service start."""
         from jacked.service import updater
 
@@ -83,6 +84,37 @@ class TestRunUpdate:
         assert (tmp_path / "recovery.txt").exists()
         content = (tmp_path / "recovery.txt").read_text()
         assert "uv tool install" in content
+
+
+class TestPortWaitBeforeServiceStart:
+    @patch("jacked.service.updater.find_bin")
+    @patch("socket.socket")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_polls_port_before_spawning_service(
+        self, mock_popen, mock_run, mock_sock, mock_find,
+    ):
+        """After uv+jacked install, must wait for port 8321 before `service start`."""
+        from jacked.service import updater
+
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        # First two bind attempts fail (port still held), third succeeds
+        bind_calls = [OSError("port busy"), OSError("port busy"), None]
+        def bind_side_effect(addr):
+            r = bind_calls.pop(0)
+            if isinstance(r, Exception):
+                raise r
+        mock_sock.return_value.bind = MagicMock(side_effect=bind_side_effect)
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        # Service start was still spawned
+        mock_popen.assert_called_once()
+        # Socket was tried multiple times (proves we polled, not just bound once)
+        assert mock_sock.return_value.bind.call_count >= 3
 
 
 class TestSpawnDetached:
