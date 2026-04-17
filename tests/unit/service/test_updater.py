@@ -299,6 +299,89 @@ class TestJackedInstallFailure:
         assert "jacked install --force" in content
 
 
+class TestSpawnFromTrayWindows:
+    """Windows tray-update path uses cmd.exe batch, not a Python subprocess.
+
+    These tests call _spawn_windows_tray_updater directly rather than going
+    through the sys.platform dispatch — mocking sys.platform is unreliable
+    because stdlib modules (subprocess, shutil) cached their platform-check
+    at import time.
+    """
+
+    @patch("jacked.service.updater.find_bin", return_value="C:\\Users\\x\\.local\\bin\\uv.exe")
+    @patch("subprocess.Popen")
+    def test_windows_spawns_cmd_batch(
+        self, mock_popen, mock_find, monkeypatch, tmp_path,
+    ):
+        """The helper spawns a detached cmd.exe batch file."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(
+            subprocess, "DETACHED_PROCESS", 0x8, raising=False,
+        )
+
+        updater._spawn_windows_tray_updater(parent_pid=12345, extras="tray")
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert args[0] == "cmd.exe"
+        assert args[1] == "/c"
+        assert args[2].endswith(".bat")
+        kwargs = mock_popen.call_args[1]
+        flags = kwargs.get("creationflags", 0)
+        assert flags & 0x8
+
+        import os as _os
+        try:
+            _os.unlink(args[2])
+        except OSError:
+            pass
+
+    @patch("jacked.service.updater.find_bin", return_value="C:\\Users\\x\\.local\\bin\\uv.exe")
+    @patch("subprocess.Popen")
+    def test_windows_batch_contains_uv_install_and_service_start(
+        self, mock_popen, mock_find, monkeypatch, tmp_path,
+    ):
+        """The batch must run uv tool install --force AND jacked service start."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(
+            subprocess, "DETACHED_PROCESS", 0x8, raising=False,
+        )
+
+        updater._spawn_windows_tray_updater(parent_pid=99999, extras="tray")
+
+        batch_path = mock_popen.call_args[0][0][2]
+        with open(batch_path) as f:
+            body = f.read()
+        try:
+            assert 'tool install "claude-jacked[tray]" --force' in body
+            assert "jacked install --force" in body
+            assert "jacked service start" in body
+            assert "PID eq 99999" in body
+            assert 'start "" /B' in body
+        finally:
+            import os as _os
+            try:
+                _os.unlink(batch_path)
+            except OSError:
+                pass
+
+    @patch("jacked.service.updater.find_bin", return_value="C:\\fake\\uv.exe")
+    @patch("subprocess.Popen")
+    def test_posix_still_uses_python_subprocess(self, mock_popen, mock_find, monkeypatch, tmp_path):
+        """POSIX path unchanged — still spawns python -m jacked.service.updater."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+
+        with patch.object(sys, "platform", "darwin"):
+            updater.spawn_updater_from_tray(parent_pid=12345, extras="tray")
+
+        args = mock_popen.call_args[0][0]
+        assert "-m" in args
+        assert "jacked.service.updater" in args
+
+
 class TestMainEntrypoint:
     def test_missing_pid_exits_2(self):
         from jacked.service import updater

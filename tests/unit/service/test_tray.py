@@ -422,6 +422,37 @@ class TestLastCheckedMenu:
                 break
 
 
+class TestWindowsConsoleHandler:
+    """`jacked service start` on Windows must respond to Ctrl+C / Ctrl+Break."""
+
+    def test_handler_no_op_on_posix(self):
+        """On POSIX the method short-circuits and must not raise."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        # No patching needed — on macOS/Linux it should just return.
+        runner._install_windows_console_handler()
+
+    def test_handler_installs_on_windows(self):
+        """When sys.platform is win32, it installs a SetConsoleCtrlHandler."""
+        _skip_if_no_tray()
+        import sys as _sys
+        from jacked.service.tray import ServiceRunner
+        # Skip if ctypes.windll isn't available (non-Windows systems don't have it
+        # and there's no meaningful way to fake the Win32 API surface).
+        try:
+            import ctypes
+            ctypes.windll  # noqa: B018
+        except (AttributeError, ImportError):
+            pytest.skip("ctypes.windll unavailable on this platform")
+
+        runner = ServiceRunner()
+        with patch.object(_sys, "platform", "win32"):
+            runner._install_windows_console_handler()
+        # Callback must be retained (otherwise GC would invalidate the handler).
+        assert getattr(runner, "_win_ctrl_handler", None) is not None
+
+
 class TestVersionCheckThread:
     def test_exits_on_stop_event(self):
         _skip_if_no_tray()

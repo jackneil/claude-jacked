@@ -294,7 +294,27 @@ def _find_updater_python() -> str | None:
 
 
 def spawn_updater_from_tray(parent_pid: int, extras: str = "tray") -> None:
-    """Called by the tray on update click. Spawns the detached helper."""
+    """Called by the tray on update click. Spawns the detached helper.
+
+    POSIX: detached Python subprocess running this module. `uv tool install`
+    can atomically replace the venv while our interpreter stays valid via
+    its open file descriptor on the binary.
+
+    Windows: Python subprocess doesn't work — `uv tool install --force`
+    can't replace python.exe while this interpreter is using it (classic
+    Windows exclusive-file-lock). Instead spawn a detached cmd.exe batch
+    that:
+      1. Waits for the tray PID to exit.
+      2. Runs `uv tool install --force`.
+      3. Runs `jacked install --force`.
+      4. Runs `jacked service start` (detached).
+    cmd.exe is a system binary we don't own, so it survives whatever uv
+    does to the jacked venv. Same trick as `jacked upgrade` on Windows.
+    """
+    if sys.platform == "win32":
+        _spawn_windows_tray_updater(parent_pid, extras)
+        return
+
     py = _find_updater_python()
     if not py:
         raise SystemExit("No Python executable found for updater spawn")
@@ -302,6 +322,68 @@ def spawn_updater_from_tray(parent_pid: int, extras: str = "tray") -> None:
     _spawn_detached(
         [py, "-m", "jacked.service.updater", str(parent_pid), extras],
         log_fh=None,
+    )
+
+
+def _spawn_windows_tray_updater(parent_pid: int, extras: str) -> None:
+    """Spawn a detached cmd.exe batch that does the full Windows update."""
+    import os
+    import tempfile
+
+    from jacked.findbin import find_bin
+
+    uv = find_bin("uv") or "uv"
+
+    UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_path = str(UPDATE_LOG)
+
+    # Batch waits for parent PID via tasklist, then does uv install +
+    # jacked install + service start. Each step logs timestamp + outcome
+    # to ~/.claude/jacked-update.log so failures are visible.
+    batch_body = (
+        '@echo off\r\n'
+        'set LOGFILE=' + log_path + '\r\n'
+        'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ') >> "%LOGFILE%"\r\n'
+        ':wait\r\n'
+        'tasklist /FI "PID eq ' + str(parent_pid) + '" 2>NUL | find "' + str(parent_pid) + '" >NUL\r\n'
+        'if not errorlevel 1 (\r\n'
+        '    timeout /t 1 /nobreak >NUL\r\n'
+        '    goto wait\r\n'
+        ')\r\n'
+        'echo [%date% %time%] parent exited >> "%LOGFILE%"\r\n'
+        '"' + uv + '" tool install "claude-jacked[' + extras + ']" --force >> "%LOGFILE%" 2>&1\r\n'
+        'if errorlevel 1 (\r\n'
+        '    echo [%date% %time%] ERROR: uv tool install failed >> "%LOGFILE%"\r\n'
+        '    echo Jacked tray update failed during `uv tool install`. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    exit /b 1\r\n'
+        ')\r\n'
+        'echo [%date% %time%] running jacked install --force >> "%LOGFILE%"\r\n'
+        'jacked install --force >> "%LOGFILE%" 2>&1\r\n'
+        'echo [%date% %time%] starting service (detached) >> "%LOGFILE%"\r\n'
+        'start "" /B jacked service start >> "%LOGFILE%" 2>&1\r\n'
+        'echo [%date% %time%] tray update complete >> "%LOGFILE%"\r\n'
+        '(goto) 2>nul & del "%~f0"\r\n'
+    )
+
+    fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-tray-update-")
+    try:
+        with os.fdopen(fd, "w", newline="\r\n") as f:
+            f.write(batch_body)
+    except Exception:
+        try:
+            os.unlink(batch_path)
+        except OSError:
+            pass
+        raise
+
+    DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    subprocess.Popen(
+        ["cmd.exe", "/c", batch_path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=DETACHED_PROCESS,
+        close_fds=True,
     )
 
 

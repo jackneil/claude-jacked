@@ -261,6 +261,48 @@ class ServiceRunner:
             self._uvicorn_server.should_exit = True
         self._stop_event.set()
 
+    def _install_windows_console_handler(self) -> None:
+        """Register a Win32 SetConsoleCtrlHandler so Ctrl+C kills the service.
+
+        Why this is needed: pystray's Windows backend runs an AppKit-equivalent
+        native Win32 message pump on the main thread. Python's signal module
+        on Windows only delivers SIGINT between bytecode ops, which never
+        happen while the message pump is blocked in `GetMessage`. Before
+        this handler, `Ctrl+C` in a console running `jacked service start`
+        was swallowed. The OS-level handler runs in a dedicated thread
+        spawned by Windows and can set our stop event regardless of what
+        the main thread is doing.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            HandlerRoutine = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+            def _handler(ctrl_type):  # noqa: ARG001 — all control types trigger stop
+                try:
+                    self._request_stop()
+                    if self._icon is not None:
+                        # Let pystray exit its own message pump cleanly.
+                        try:
+                            self._icon.stop()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return True  # we handled it — don't chain to default handler
+
+            # Keep a strong reference so the callback isn't GC'd.
+            self._win_ctrl_handler = HandlerRoutine(_handler)
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleCtrlHandler.argtypes = [HandlerRoutine, wintypes.BOOL]
+            kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+            kernel32.SetConsoleCtrlHandler(self._win_ctrl_handler, True)
+        except Exception:
+            logger.exception("Could not install Windows console Ctrl handler")
+
     def _on_stop(self):
         """Full stop — called from menu or atexit, not from signal handler."""
         if not self._lifecycle_lock.acquire(blocking=False):
@@ -514,10 +556,30 @@ class ServiceRunner:
 
         write_pid(PID_FILE, self.port)
 
-        if sys.platform != "win32":
-            # Signal handler must be signal-safe — just set the event.
-            # The pystray loop or atexit will handle actual cleanup.
+        # Signal handlers are signal-safe — they just set the stop event.
+        # The stop-monitor thread bridges that to the full _on_stop() cleanup.
+        if sys.platform == "win32":
+            # Windows: pystray runs a native GUI message pump that blocks
+            # Python bytecode. Installing SIGINT still lets Ctrl+C in the
+            # console deliver a KeyboardInterrupt, and SIGBREAK covers
+            # Ctrl+Break explicitly. Without these, `jacked service start`
+            # in a console ignored Ctrl+C entirely.
+            try:
+                signal.signal(signal.SIGINT, lambda *_: self._request_stop())
+            except (ValueError, OSError):
+                pass  # not a main thread (shouldn't happen here, but harmless)
+            if hasattr(signal, "SIGBREAK"):
+                try:
+                    signal.signal(signal.SIGBREAK, lambda *_: self._request_stop())
+                except (ValueError, OSError):
+                    pass
+            # Console Ctrl-events are delivered by the OS to a separate
+            # handler chain; wire that too so the user's Ctrl+C isn't
+            # swallowed by the GUI message pump before Python sees it.
+            self._install_windows_console_handler()
+        else:
             signal.signal(signal.SIGTERM, lambda *_: self._request_stop())
+            signal.signal(signal.SIGINT, lambda *_: self._request_stop())
 
         from jacked.service.platform import detect_autostart
 
