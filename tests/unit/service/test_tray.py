@@ -262,6 +262,71 @@ class TestOnUpdateClick:
         assert names.index("spawn") < names.index("stop")
 
 
+class TestCheckForUpdatesMenu:
+    def test_menu_has_check_for_updates_item(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import build_menu
+        noop = lambda: None
+        called = []
+        menu = build_menu(
+            port=8321,
+            version="0.41.8",
+            autostart_check=lambda: False,
+            on_open_dashboard=noop,
+            on_restart=noop,
+            on_stop=noop,
+            on_toggle_autostart=noop,
+            version_text_fn=lambda: "v0.41.8",
+            version_click_fn=noop,
+            version_enabled_fn=lambda: False,
+            on_check_for_updates=lambda: called.append(1),
+        )
+        items = list(menu)
+        texts = [str(item) for item in items]
+        assert any("Check for updates" in t for t in texts)
+
+    def test_menu_omits_check_for_updates_when_not_provided(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import build_menu
+        noop = lambda: None
+        menu = build_menu(
+            port=8321,
+            version="0.41.8",
+            autostart_check=lambda: False,
+            on_open_dashboard=noop,
+            on_restart=noop,
+            on_stop=noop,
+            on_toggle_autostart=noop,
+        )
+        items = list(menu)
+        texts = [str(item) for item in items]
+        assert not any("Check for updates" in t for t in texts)
+
+
+class TestOnCheckForUpdates:
+    @patch("jacked.service.tray.check_version_cached")
+    def test_forces_fresh_pypi_check(self, mock_check):
+        _skip_if_no_tray()
+        import time as _time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._icon = MagicMock()
+        mock_check.return_value = {"latest": "9.9.9", "outdated": True}
+
+        runner._on_check_for_updates()
+        # Wait for the one-shot thread
+        deadline = _time.monotonic() + 2.0
+        while _time.monotonic() < deadline:
+            if mock_check.called:
+                break
+            _time.sleep(0.05)
+
+        assert mock_check.called
+        # force=True must have been passed to bypass cache
+        assert mock_check.call_args[1].get("force") is True or \
+               (len(mock_check.call_args[0]) > 1 and mock_check.call_args[0][1] is True)
+
+
 class TestVersionCheckThread:
     def test_exits_on_stop_event(self):
         _skip_if_no_tray()

@@ -220,10 +220,10 @@ The `[tray]` extra is required — it pulls in `pystray` and `Pillow` for the ic
 ### What You Get
 
 - **Purple "J" in your menu bar / system tray** — always-on dashboard, one click away.
-- **Right-click menu:** Open Dashboard, Restart, Stop, Start on Login toggle, and the current version.
-- **Auto-start on login** — `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/com.jacked.service.plist`) or a Windows startup VBS script. Service runs on reboot too.
+- **Right-click menu:** Open Dashboard, Restart, Stop, Start on Login toggle, current version label (e.g. `v0.41.2 -> v0.42.0 (update)` when outdated), and **Check for updates...** to force a fresh PyPI poll on demand.
+- **Auto-start on login** — `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/ai.hank.jacked.plist`) or a Windows startup VBS script. Service runs on reboot too.
 - **Crash recovery, not nag-ware** — KeepAlive is scoped to `SuccessfulExit=false`, so a clean stop from the tray or CLI *won't* trigger a respawn. Only actual crashes come back.
-- **One-click upgrades** — when a newer version hits PyPI, the version item in the menu flips to `Update to vX.Y.Z ->`. Click it and jacked runs the full upgrade sequence (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced mid-update.
+- **One-click upgrades** — when a newer version hits PyPI, the version item flips to a clickable `v{current} -> v{latest} (update)`. Click it and jacked runs the full upgrade sequence (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced mid-update.
 - **CLI equivalent** — `jacked upgrade` does the same three-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
 - **Recovery file** — if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
 
@@ -232,17 +232,68 @@ The `[tray]` extra is required — it pulls in `pystray` and `Pillow` for the ic
 ```bash
 jacked service install     # configure auto-start on login (launchd / Startup folder)
 jacked service uninstall   # remove auto-start config
-jacked service start       # start the service with tray icon
+jacked service start       # start the service with tray icon (foreground — blocks)
 jacked service stop        # stop the running service
-jacked service restart     # stop + start
+jacked service restart     # stop + detached start (returns immediately)
+jacked service restart --foreground   # same but runs in foreground like service start
 jacked service status      # show PID, port, uptime, autostart state
 ```
 
 ### Troubleshooting
 
-- **Tray icon never appears** — make sure you installed the `[tray]` extra. `uv tool install "claude-jacked[tray]" --force`.
-- **"Port 8321 in use"** — another jacked instance is running. Check with `jacked service status` or use `--port` to pick a different port.
-- **Auto-update failed** — read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file includes exact commands to finish the upgrade manually.
+If the tray icon disappears, won't come back, or claims the port is in use, work through these in order:
+
+```bash
+# 1. What's holding port 8321?
+lsof -i :8321 -sTCP:LISTEN            # macOS / Linux
+netstat -ano | findstr :8321          # Windows
+
+# 2. On macOS, stop launchd's KeepAlive loop so it doesn't fight you:
+launchctl unload ~/Library/LaunchAgents/ai.hank.jacked.plist
+
+# 3. Kill whatever's on the port (use the PID from step 1):
+kill -9 <PID>                         # POSIX
+taskkill /PID <PID> /F                # Windows
+
+# 4. Clear stale PID file:
+rm -f ~/.claude/jacked-service.pid    # POSIX
+del %USERPROFILE%\.claude\jacked-service.pid   # Windows
+
+# 5. Wait a couple seconds, then confirm the port is free:
+lsof -i :8321 -sTCP:LISTEN   # should print nothing
+
+# 6. Start fresh:
+jacked service start
+```
+
+Common issues:
+
+- **Tray icon never appears after install** — you didn't install the `[tray]` extra. Run `uv tool install "claude-jacked[tray]" --force && jacked service start`.
+- **Tray shows a wrong version** — the menu anchors on the running process's `__version__`, so if it shows "v0.41.2" and you just upgraded, the running process is stale. `jacked service stop && jacked service start` to reload from the new package. `Check for updates...` in the menu forces a fresh PyPI poll (useful if the cached "latest" is stale).
+- **"Port 8321 in use" after `jacked upgrade`** — an old tray didn't fully release the socket before the new one tried to bind. Resolved in 0.41.6+ where `jacked service restart` waits for PID death + port release before starting. Upgrade once more with `jacked upgrade` to pick up the fix.
+- **Auto-update ran but tray never came back** — the updater's detached `service start` hit the port race. Fixed in 0.41.4+. Follow the cleanup steps above, then run `jacked service start`.
+- **Claude Code keeps asking me to log in** — jacked was rotating the active account's CC refresh token out from under Claude Code. Fixed in 0.41.2+. Update and the issue goes away. Architecture doc at `docs/architecture/oauth-and-credential-flows.md` §7.1-7.3 explains the full mechanism.
+- **Auto-update failed** — read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file lists the exact commands to finish the upgrade manually.
+
+### Installing from scratch (for Claude or new dev)
+
+If you're reading this to set up `claude-jacked` on a fresh machine:
+
+```bash
+# macOS / Linux
+uv tool install "claude-jacked[tray]"   # add [search] or swap for [all] if you want Qdrant session search
+jacked install                           # wire up hooks into ~/.claude/settings.json
+jacked service install                   # configure auto-start on login + launch the service
+# → tray icon appears; dashboard at http://localhost:8321
+
+# Windows (PowerShell or cmd)
+uv tool install "claude-jacked[tray]"
+jacked install
+jacked service install                   # creates %APPDATA%\...\Startup\jacked.vbs
+jacked service start                     # launch now; next login it auto-starts
+```
+
+Requires `uv` already on PATH — install from [docs.astral.sh/uv](https://docs.astral.sh/uv/) if you don't have it. Requires Python 3.10+.
 
 ---
 

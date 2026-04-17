@@ -6,7 +6,7 @@ import urllib.request
 from pathlib import Path
 
 VERSION_CACHE = Path.home() / ".claude" / "jacked-version-cache.json"
-CACHE_TTL = 3600  # 1 hour — tray shows "Update available" promptly after PyPI publish
+CACHE_TTL = 86400  # 24 hours — tray menu has "Check for updates" for on-demand refresh
 
 
 def get_latest_pypi_version(package: str = "claude-jacked", timeout: float = 3.0) -> str | None:
@@ -65,7 +65,7 @@ def is_newer(latest: str, current: str) -> bool:
 
 
 def check_version_cached(current_version: str, force: bool = False) -> dict | None:
-    """Check PyPI with 1h cache. Returns {"latest", "outdated", "checked_at", "next_check_at"} or None.
+    """Check PyPI with 24h cache. Returns {"latest", "outdated", "checked_at", "next_check_at"} or None.
 
     >>> result = check_version_cached.__doc__  # doctest placeholder
     >>> isinstance(result, str)
