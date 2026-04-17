@@ -104,6 +104,8 @@ def build_menu(
     version_click_fn=None,
     version_enabled_fn=None,
     on_check_for_updates=None,
+    last_check_text_fn=None,
+    check_in_progress_fn=None,
 ) -> "pystray.Menu":
     """Build the tray right-click menu.
 
@@ -118,6 +120,13 @@ def build_menu(
             whether the version item is clickable (outdated only).
         on_check_for_updates: Optional callback for a "Check for updates"
             menu item that forces a fresh PyPI poll bypassing the cache.
+        last_check_text_fn: Optional callable returning a human-readable
+            "Last checked: Xm ago" / "Checking PyPI..." / "Last checked:
+            never" label. Shown under the version item so users with
+            system notifications muted can still see the check happened.
+        check_in_progress_fn: Optional callable returning bool — True
+            while a manual PyPI check is in flight. Disables "Check for
+            updates..." during the check so double-clicks don't pile up.
     """
     if version_text_fn is not None:
         version_item = pystray.MenuItem(
@@ -145,8 +154,23 @@ def build_menu(
         pystray.Menu.SEPARATOR,
         version_item,
     ]
+    if last_check_text_fn is not None:
+        items.append(
+            pystray.MenuItem(lambda _: last_check_text_fn(), None, enabled=False)
+        )
     if on_check_for_updates is not None:
-        items.append(pystray.MenuItem("Check for updates...", on_check_for_updates))
+        if check_in_progress_fn is not None:
+            items.append(
+                pystray.MenuItem(
+                    "Check for updates...",
+                    on_check_for_updates,
+                    enabled=lambda _: not check_in_progress_fn(),
+                )
+            )
+        else:
+            items.append(
+                pystray.MenuItem("Check for updates...", on_check_for_updates)
+            )
 
     return pystray.Menu(*items)
 
@@ -164,6 +188,11 @@ class ServiceRunner:
         self._icon: "pystray.Icon | None" = None
         self._autostart_enabled = False
         self._version_info: dict | None = None
+        # Visible last-checked timestamp + in-progress flag for the tray menu,
+        # so users can see the check happened even when system notifications
+        # are muted.
+        self._last_check_at: float | None = None
+        self._version_check_in_progress: bool = False
 
     def _start_uvicorn(self) -> threading.Thread:
         """Start uvicorn in a daemon thread."""
@@ -267,6 +296,7 @@ class ServiceRunner:
         once per day. When called via the tray's "Check for updates" menu
         item with `force=True`, does a single forced PyPI hit and returns.
         """
+        import time as _time
         first = True
         while not self._stop_event.is_set():
             try:
@@ -275,11 +305,14 @@ class ServiceRunner:
                 info = check_version_cached(__version__, force=force if first else False)
                 if info is not None:
                     self._version_info = info
-                    if self._icon and not self._stop_event.is_set():
-                        try:
-                            self._icon.update_menu()
-                        except Exception:
-                            pass  # some pystray backends fail during shutdown
+                # Always stamp the last-checked time (even on PyPI failure) so
+                # the tray menu can reflect that a check just ran.
+                self._last_check_at = _time.time()
+                if self._icon and not self._stop_event.is_set():
+                    try:
+                        self._icon.update_menu()
+                    except Exception:
+                        pass  # some pystray backends fail during shutdown
             except Exception:
                 logger.exception("Version check failed")
             first = False
@@ -290,16 +323,26 @@ class ServiceRunner:
 
     def _on_check_for_updates(self) -> None:
         """Tray menu handler: force a fresh PyPI check now."""
+        # Guard: ignore if a check is already running (double-click, etc.).
+        if self._version_check_in_progress:
+            return
+
+        self._version_check_in_progress = True
+        # Immediately refresh the menu so the "Checking PyPI..." label shows
+        # even for users who have macOS notifications muted.
         if self._icon:
             try:
-                self._icon.notify(
-                    "Checking PyPI for updates...", "Jacked"
-                )
+                self._icon.update_menu()
+            except Exception:
+                pass
+            try:
+                self._icon.notify("Checking PyPI for updates...", "Jacked")
             except Exception:
                 pass
 
         # Fire a one-shot thread so we don't block the menu callback.
         def _once():
+            import time as _time
             try:
                 info = check_version_cached(__version__, force=True)
             except Exception:
@@ -307,38 +350,58 @@ class ServiceRunner:
                 info = None
             if info is not None:
                 self._version_info = info
-                if self._icon and not self._stop_event.is_set():
-                    try:
-                        self._icon.update_menu()
-                    except Exception:
-                        pass
-                    # Notify result
-                    try:
-                        if info.get("outdated"):
-                            latest = info.get("latest", "?")
-                            self._icon.notify(
-                                f"Update available: v{latest}",
-                                "Jacked",
-                            )
-                        else:
-                            self._icon.notify(
-                                f"You're up to date (v{__version__})",
-                                "Jacked",
-                            )
-                    except Exception:
-                        pass
-            elif self._icon:
+            # Stamp last-checked regardless of PyPI reachability — the user
+            # asked for a check; failure or success both happened "just now".
+            self._last_check_at = _time.time()
+            self._version_check_in_progress = False
+
+            if self._icon and not self._stop_event.is_set():
                 try:
-                    self._icon.notify(
-                        "Couldn't reach PyPI. Try again later.",
-                        "Jacked Update Check",
-                    )
+                    self._icon.update_menu()
+                except Exception:
+                    pass
+                try:
+                    if info is None:
+                        self._icon.notify(
+                            "Couldn't reach PyPI. Try again later.",
+                            "Jacked Update Check",
+                        )
+                    elif info.get("outdated"):
+                        latest = info.get("latest", "?")
+                        self._icon.notify(
+                            f"Update available: v{latest}", "Jacked",
+                        )
+                    else:
+                        self._icon.notify(
+                            f"You're up to date (v{__version__})", "Jacked",
+                        )
                 except Exception:
                     pass
 
         threading.Thread(
             target=_once, name="jacked-manual-version-check", daemon=True
         ).start()
+
+    def _last_check_menu_text(self) -> str:
+        """Human-readable summary for the 'Last checked' menu item.
+
+        Shown even when the user has macOS notifications muted so they can
+        see the check actually happened.
+        """
+        if self._version_check_in_progress:
+            return "Checking PyPI..."
+        if self._last_check_at is None:
+            return "Last checked: never"
+
+        import time as _time
+        delta = max(0, int(_time.time() - self._last_check_at))
+        if delta < 60:
+            return "Last checked: just now"
+        if delta < 3600:
+            return f"Last checked: {delta // 60}m ago"
+        if delta < 86400:
+            return f"Last checked: {delta // 3600}h ago"
+        return f"Last checked: {delta // 86400}d ago"
 
     def _version_menu_text(self) -> str:
         # Always anchor on __version__ (what this running process actually is),
@@ -347,7 +410,6 @@ class ServiceRunner:
         if self._version_info and self._version_info.get("outdated"):
             latest = self._version_info.get("latest", "?")
             return f"v{__version__} -> v{latest} (update)"
-        return f"v{__version__}"
         return f"v{__version__}"
 
     def _version_is_clickable(self) -> bool:
@@ -473,6 +535,8 @@ class ServiceRunner:
             version_click_fn=self._on_update_click,
             version_enabled_fn=self._version_is_clickable,
             on_check_for_updates=self._on_check_for_updates,
+            last_check_text_fn=self._last_check_menu_text,
+            check_in_progress_fn=lambda: self._version_check_in_progress,
         )
 
         self._icon = pystray.Icon(

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
-from jacked.service.process import is_process_alive
+from jacked.service.process import is_process_alive, is_port_available
 
 UPDATE_LOG = CLAUDE_DIR / "jacked-update.log"
 RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
@@ -33,6 +33,64 @@ def wait_for_exit(pid: int, timeout: float = 30.0) -> bool:
             return True
         time.sleep(0.5)
     return False
+
+
+def _force_kill_pid(pid: int) -> None:
+    """SIGKILL the PID if it's still alive. No exceptions leak out.
+
+    pystray's AppKit runloop on macOS can swallow Python signals, so the
+    tray's own `icon.stop()` call may not actually end the process. Without
+    this we'd waste 30+ seconds of wait_for_exit and still hit "port in use"
+    on the detached start.
+    """
+    if pid <= 0 or not is_process_alive(pid):
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F", "/T"],
+                capture_output=True, check=False,
+            )
+        else:
+            import signal as _signal
+            os.kill(pid, _signal.SIGKILL)
+    except Exception:
+        logger.exception("force-kill of PID %d failed", pid)
+
+
+def _pids_bound_to_port(port: int) -> list[int]:
+    """Return PIDs holding a LISTEN socket on *port*. Uses lsof on POSIX,
+    netstat on Windows. Best-effort — returns [] on any failure."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True, check=False,
+            ).stdout
+            pids: set[int] = set()
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line.upper():
+                    parts = line.split()
+                    try:
+                        pids.add(int(parts[-1]))
+                    except (ValueError, IndexError):
+                        pass
+            return list(pids)
+        out = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", f"-iTCP:{port}"],
+            capture_output=True, text=True, check=False,
+        ).stdout
+        pids = set()
+        for line in out.splitlines()[1:]:  # skip header
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    pids.add(int(parts[1]))
+                except ValueError:
+                    pass
+        return list(pids)
+    except Exception:
+        return []
 
 
 def _spawn_detached(cmd: list, log_fh=None) -> "subprocess.Popen":
@@ -68,8 +126,13 @@ def run_update(parent_pid: int, extras: str = "tray") -> None:
 
     try:
         log(f"Waiting for parent PID {parent_pid} to exit")
-        if not wait_for_exit(parent_pid, timeout=30.0):
-            log(f"Parent {parent_pid} still alive after 30s - continuing anyway")
+        if not wait_for_exit(parent_pid, timeout=15.0):
+            # Tray is still alive — probably pystray's AppKit runloop didn't
+            # react to icon.stop(). Force-kill so we can reclaim the port.
+            log(f"Parent {parent_pid} still alive after 15s — SIGKILL")
+            _force_kill_pid(parent_pid)
+            if not wait_for_exit(parent_pid, timeout=5.0):
+                log(f"Parent {parent_pid} still alive after SIGKILL — continuing anyway")
 
         uv = find_bin("uv")
         if not uv:
@@ -141,30 +204,71 @@ def run_update(parent_pid: int, extras: str = "tray") -> None:
         # bind fails. Polling here avoids the spawned service hitting
         # "Port 8321 is already in use" and exiting silently.
         log("Waiting for port to become available")
-        import socket as _socket
-        port_deadline = time.monotonic() + 15.0
-        port_ready = False
+        port_deadline = time.monotonic() + 10.0
         while time.monotonic() < port_deadline:
-            try:
-                s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                s.bind(("127.0.0.1", 8321))
-                s.close()
-                port_ready = True
+            if is_port_available("127.0.0.1", 8321):
                 break
-            except OSError:
-                time.sleep(0.5)
-        if not port_ready:
-            log("Port 8321 did not free within 15s — starting anyway")
+            time.sleep(0.5)
+        if not is_port_available("127.0.0.1", 8321):
+            # Port is stuck. Find who's holding it and force-kill.
+            squatters = _pids_bound_to_port(8321)
+            if squatters:
+                log(f"Port 8321 still bound by PIDs {squatters} — SIGKILL")
+                for pid in squatters:
+                    _force_kill_pid(pid)
+                # Brief grace for the kernel to release the socket.
+                kill_deadline = time.monotonic() + 3.0
+                while time.monotonic() < kill_deadline:
+                    if is_port_available("127.0.0.1", 8321):
+                        break
+                    time.sleep(0.2)
+            if not is_port_available("127.0.0.1", 8321):
+                _write_recovery(
+                    "Jacked auto-update: port 8321 could not be freed after "
+                    "the update. Some other process is holding it.\n\n"
+                    "Check with: lsof -iTCP:8321 -sTCP:LISTEN   (macOS/Linux)\n"
+                    "            netstat -ano | findstr :8321   (Windows)\n\n"
+                    "Recovery:\n"
+                    "  kill -9 <PID>  (or taskkill /PID <PID> /F on Windows)\n"
+                    "  jacked service start\n"
+                )
+                log("ABORT: port 8321 could not be freed — see recovery file")
+                return
 
         log(f"Restarting service: {jacked} service start")
         _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
-        log("Updater done")
 
-        if RECOVERY_FILE.exists():
-            try:
-                RECOVERY_FILE.unlink()
-            except Exception:
-                pass
+        # Verify the new service actually came up. Without this we silently
+        # claim success when the child died (bad PATH, missing extras, etc.).
+        log("Verifying new service came up")
+        verify_deadline = time.monotonic() + 20.0
+        came_up = False
+        while time.monotonic() < verify_deadline:
+            if not is_port_available("127.0.0.1", 8321):
+                came_up = True
+                break
+            time.sleep(0.5)
+
+        if came_up:
+            log("Updater done — new service is listening on :8321")
+            if RECOVERY_FILE.exists():
+                try:
+                    RECOVERY_FILE.unlink()
+                except Exception:
+                    pass
+        else:
+            log("WARNING: new service did not bind :8321 within 20s")
+            _write_recovery(
+                "Jacked auto-update: package install + migrate succeeded, but "
+                "the new tray never came up.\n\n"
+                f"See {UPDATE_LOG} for details. Most likely uv installed into\n"
+                "an unexpected PATH location.\n\n"
+                "Recovery:\n"
+                "  jacked service start\n"
+                "If that fails:\n"
+                "  uv tool install 'claude-jacked[tray]' --force\n"
+                "  jacked service start\n"
+            )
     finally:
         log_fh.close()
 

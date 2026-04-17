@@ -327,6 +327,101 @@ class TestOnCheckForUpdates:
                (len(mock_check.call_args[0]) > 1 and mock_check.call_args[0][1] is True)
 
 
+class TestLastCheckedMenu:
+    def test_never_checked(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._last_check_at = None
+        assert runner._last_check_menu_text() == "Last checked: never"
+
+    def test_just_now(self):
+        _skip_if_no_tray()
+        import time as _time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._last_check_at = _time.time() - 5
+        assert "just now" in runner._last_check_menu_text()
+
+    def test_minutes_ago(self):
+        _skip_if_no_tray()
+        import time as _time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._last_check_at = _time.time() - 125  # 2m 5s
+        assert runner._last_check_menu_text() == "Last checked: 2m ago"
+
+    def test_hours_ago(self):
+        _skip_if_no_tray()
+        import time as _time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._last_check_at = _time.time() - 7200  # 2h
+        assert runner._last_check_menu_text() == "Last checked: 2h ago"
+
+    def test_days_ago(self):
+        _skip_if_no_tray()
+        import time as _time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._last_check_at = _time.time() - (3 * 86400)
+        assert runner._last_check_menu_text() == "Last checked: 3d ago"
+
+    def test_checking_now_overrides_timestamp(self):
+        _skip_if_no_tray()
+        import time as _time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._last_check_at = _time.time() - 30
+        runner._version_check_in_progress = True
+        text = runner._last_check_menu_text()
+        assert "Checking" in text
+
+    def test_menu_includes_last_checked_when_fn_provided(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import build_menu
+        noop = lambda: None
+        menu = build_menu(
+            port=8321,
+            version="0.41.13",
+            autostart_check=lambda: False,
+            on_open_dashboard=noop,
+            on_restart=noop,
+            on_stop=noop,
+            on_toggle_autostart=noop,
+            last_check_text_fn=lambda: "Last checked: 1m ago",
+        )
+        texts = [str(item) for item in menu]
+        assert any("Last checked" in t for t in texts)
+
+    def test_check_for_updates_disabled_while_in_progress(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import build_menu
+        noop = lambda: None
+        in_progress = {"v": True}
+        menu = build_menu(
+            port=8321,
+            version="0.41.13",
+            autostart_check=lambda: False,
+            on_open_dashboard=noop,
+            on_restart=noop,
+            on_stop=noop,
+            on_toggle_autostart=noop,
+            on_check_for_updates=noop,
+            check_in_progress_fn=lambda: in_progress["v"],
+        )
+        # Find the "Check for updates..." item and probe its enabled callable.
+        for item in menu:
+            if "Check for updates" in str(item):
+                enabled_cb = getattr(item, "_enabled", None) or getattr(item, "enabled", None)
+                # Menu item's `enabled` is a property that calls the stored callable
+                # with the menu as argument. If it's a plain bool/callable, invoke
+                # it; if it's already resolved, compare directly.
+                if callable(enabled_cb):
+                    assert enabled_cb(None) is False
+                break
+
+
 class TestVersionCheckThread:
     def test_exits_on_stop_event(self):
         _skip_if_no_tray()

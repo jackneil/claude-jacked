@@ -19,11 +19,13 @@ class TestWaitForExit:
 
 
 class TestRunUpdate:
-    @patch("socket.socket")
+    @patch("jacked.service.updater.is_port_available", return_value=True)
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
-    def test_order_wait_install_migrate_restart(self, mock_popen, mock_run, mock_find, mock_sock):
+    def test_order_wait_install_migrate_restart(
+        self, mock_popen, mock_run, mock_find, mock_port_avail,
+    ):
         """Verify: wait_for_exit -> uv install -> jacked install -> jacked service start."""
         from jacked.service import updater
 
@@ -87,12 +89,13 @@ class TestRunUpdate:
 
 
 class TestPortWaitBeforeServiceStart:
+    @patch("jacked.service.updater.time.sleep", lambda _s: None)
     @patch("jacked.service.updater.find_bin")
-    @patch("socket.socket")
+    @patch("jacked.service.updater.is_port_available")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_polls_port_before_spawning_service(
-        self, mock_popen, mock_run, mock_sock, mock_find,
+        self, mock_popen, mock_run, mock_port_avail, mock_find,
     ):
         """After uv+jacked install, must wait for port 8321 before `service start`."""
         from jacked.service import updater
@@ -100,21 +103,126 @@ class TestPortWaitBeforeServiceStart:
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = MagicMock(returncode=0)
 
-        # First two bind attempts fail (port still held), third succeeds
-        bind_calls = [OSError("port busy"), OSError("port busy"), None]
-        def bind_side_effect(addr):
-            r = bind_calls.pop(0)
-            if isinstance(r, Exception):
-                raise r
-        mock_sock.return_value.bind = MagicMock(side_effect=bind_side_effect)
+        # Return False 2 times (port busy), then always True.
+        call_counter = {"n": 0}
+        def port_result(*_args, **_kw):
+            call_counter["n"] += 1
+            return call_counter["n"] > 2
+        mock_port_avail.side_effect = port_result
 
         with patch.object(updater, "wait_for_exit", return_value=True):
             updater.run_update(parent_pid=12345, extras="tray")
 
-        # Service start was still spawned
         mock_popen.assert_called_once()
-        # Socket was tried multiple times (proves we polled, not just bound once)
-        assert mock_sock.return_value.bind.call_count >= 3
+        # is_port_available polled more than once (proves we looped)
+        assert mock_port_avail.call_count >= 3
+
+
+class TestParentKillEscalation:
+    """Updater must force-kill the parent tray if pystray ignores icon.stop()."""
+
+    @patch("jacked.service.updater.is_port_available", return_value=True)
+    @patch("jacked.service.updater._force_kill_pid")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_sigkill_parent_when_it_wont_exit(
+        self, mock_popen, mock_run, mock_find, mock_force_kill, mock_port_avail,
+    ):
+        from jacked.service import updater
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        with patch.object(updater, "wait_for_exit", side_effect=[False, True]):
+            updater.run_update(parent_pid=99999, extras="tray")
+
+        mock_force_kill.assert_called_once_with(99999)
+
+
+class TestPortStuckRecovery:
+    """If port is still bound after the wait loop, force-kill the squatter."""
+
+    @patch("jacked.service.updater.time.sleep", lambda _s: None)
+    @patch("jacked.service.updater._pids_bound_to_port", return_value=[54321])
+    @patch("jacked.service.updater._force_kill_pid")
+    @patch("jacked.service.updater.is_port_available")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_force_kills_port_squatter(
+        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        mock_force_kill, mock_port_pids,
+    ):
+        from jacked.service import updater
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+        # Port-wait loop sees "stuck" (False). After the force-kill grace
+        # loop, port becomes free (True), and verification also sees True.
+        call_state = {"kill_done": False}
+        def port_result(*_args, **_kw):
+            if mock_force_kill.called:
+                call_state["kill_done"] = True
+            return call_state["kill_done"]
+        mock_port_avail.side_effect = port_result
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        mock_force_kill.assert_called_with(54321)
+        mock_popen.assert_called_once()
+
+    @patch("jacked.service.updater.time.sleep", lambda _s: None)
+    @patch("jacked.service.updater._pids_bound_to_port", return_value=[])
+    @patch("jacked.service.updater.is_port_available", return_value=False)
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_aborts_when_port_cannot_be_freed(
+        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_port_pids,
+        tmp_path, monkeypatch,
+    ):
+        """If we can't find who holds the port or can't kill them, don't spawn a start
+        that will silently die — write recovery instructions instead."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        mock_popen.assert_not_called()
+        assert (tmp_path / "recovery.txt").exists()
+        assert "port 8321" in (tmp_path / "recovery.txt").read_text().lower()
+
+
+class TestNewServiceVerification:
+    """After spawning, confirm the new tray actually bound the port."""
+
+    @patch("jacked.service.updater.time.sleep", lambda _s: None)
+    @patch("jacked.service.updater.is_port_available")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_recovery_file_written_when_new_service_never_binds(
+        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+        # Port-wait: True (free). Then verification phase: always True (never bound).
+        mock_port_avail.return_value = True
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        mock_popen.assert_called_once()
+        assert (tmp_path / "recovery.txt").exists()
+        assert "never came up" in (tmp_path / "recovery.txt").read_text()
 
 
 class TestSpawnDetached:
