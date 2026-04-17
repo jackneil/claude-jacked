@@ -137,12 +137,15 @@ class TestVersionMenu:
 
     def test_version_text_when_outdated(self):
         _skip_if_no_tray()
+        from jacked import __version__
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
         text = runner._version_menu_text()
+        # Both current and target versions must be visible.
+        assert __version__ in text
         assert "0.42.0" in text
-        assert "Update" in text
+        assert "update" in text.lower()
 
     def test_version_text_when_check_not_yet_run(self):
         _skip_if_no_tray()

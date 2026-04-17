@@ -273,7 +273,7 @@ class ServiceRunner:
     def _version_menu_text(self) -> str:
         if self._version_info and self._version_info.get("outdated"):
             latest = self._version_info.get("latest", "?")
-            return f"Update to v{latest} ->"
+            return f"v{__version__} -> v{latest} (update)"
         if self._version_info:
             latest = self._version_info.get("latest", __version__)
             return f"v{latest}"
