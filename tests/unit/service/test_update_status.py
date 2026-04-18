@@ -163,3 +163,29 @@ def test_lock_allows_init_after_stale_in_progress(tmp_path):
     old = time.time() - STALE_IN_PROGRESS_SECONDS - 10
     os.utime(p, (old, old))
     init_status(p, from_version="b", to_version="c", method="uv")
+
+
+def test_api_endpoint_returns_null_when_no_status_file(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from jacked.api.main import app as _app
+    from jacked.service import update_status as us_mod
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "nope.json")
+    client = TestClient(_app)
+    r = client.get("/api/update/status")
+    assert r.status_code == 200
+    assert r.json() == {"status": None, "mtime_iso": None}
+
+
+def test_api_endpoint_returns_status_content_with_mtime(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from jacked.api.main import app as _app
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    us_mod.begin_phase(p, "installing_package")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    client = TestClient(_app)
+    r = client.get("/api/update/status")
+    body = r.json()
+    assert body["status"]["current_phase"] == "installing_package"
+    assert body["mtime_iso"] is not None

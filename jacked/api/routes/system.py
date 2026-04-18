@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from jacked.findbin import find_bin
+from jacked.service import update_status as _update_status_mod
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,20 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
                 },
             )
     return None
+
+
+@router.get("/update/status")
+async def get_update_status():
+    """Return the current update-status JSON + its mtime.
+
+    Used by /update.html (polled every 1s). mtime_iso is server-reported
+    so the client-side stuck-detection doesn't reset on repeated stale reads.
+    Returns {"status": null, "mtime_iso": null} when no update is in flight.
+    """
+    data, mtime_iso = _update_status_mod.read_status_with_mtime(
+        _update_status_mod.UPDATE_STATUS_FILE,
+    )
+    return {"status": data, "mtime_iso": mtime_iso}
 
 
 @router.post("/project/guardrails-init")
