@@ -289,3 +289,15 @@ def test_cli_update_status_succeed(tmp_path, monkeypatch):
     result = CliRunner().invoke(main, ["_update_status_succeed"])
     assert result.exit_code == 0
     assert us_mod.read_status(p)["overall"] == "succeeded"
+
+
+def test_update_html_is_served_as_itself_not_spa_rewritten():
+    """The SPA fallback serves index.html for unmatched paths. The .html
+    suffix makes /update.html hit the file branch. Regression-guard."""
+    from fastapi.testclient import TestClient
+    from jacked.api.main import app as _app
+    client = TestClient(_app)
+    r = client.get("/update.html")
+    assert r.status_code == 200
+    assert "Jacked is updating" in r.text
+    assert "waiting_for_parent" in r.text

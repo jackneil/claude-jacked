@@ -506,9 +506,30 @@ class ServiceRunner:
                 except Exception:
                     logger.exception("Icon update during update-click failed")
 
+            # Pre-warm /update.html: sync HTTP GET while the service is still
+            # alive, so the browser's subsequent fetch doesn't race against
+            # uvicorn shutdown and hit ERR_CONNECTION_REFUSED.
+            _url = f"http://{self.host}:{self.port}/update.html"
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen(_url, timeout=2.0):
+                    pass
+            except Exception:
+                logger.exception("Pre-warm of update.html failed (continuing)")
+            try:
+                import webbrowser as _wb
+                _wb.open(_url)
+            except Exception:
+                logger.exception("Failed to open update progress page")
+
             try:
                 from jacked.service.updater import spawn_updater_from_tray
-                spawn_updater_from_tray(parent_pid=os.getpid(), extras="tray")
+                spawn_updater_from_tray(
+                    parent_pid=os.getpid(),
+                    extras="tray",
+                    target_version=(self._version_info or {}).get("latest"),
+                    port=self.port,
+                )
             except Exception:
                 logger.exception("Failed to spawn updater")
                 if self._icon:
