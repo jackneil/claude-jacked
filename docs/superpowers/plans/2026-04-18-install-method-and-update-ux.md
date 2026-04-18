@@ -1023,7 +1023,11 @@ In `jacked/cli.py`, add after the `_hook_shim` command:
 def _update_status_init_shim(
     from_version: str, to_version: str, method: str, log_path: "str | None",
 ):
-    """Internal: initialize a fresh update-status file."""
+    """Internal: initialize a fresh update-status file.
+
+    Exit 0 on success, 2 on LockBusy (another updater active). Windows
+    batch checks errorlevel and aborts on 2 so we don't double-write.
+    """
     from jacked.service import update_status as us_mod
     try:
         us_mod.init_status(
@@ -1034,9 +1038,8 @@ def _update_status_init_shim(
             log_path=log_path,
         )
     except us_mod.LockBusy as exc:
-        # Don't crash — another updater is already running. Log and exit 0
-        # so the batch keeps going (it will append phases to the live file).
         click.echo(f"[update-status] lock busy: {exc}", err=True)
+        sys.exit(2)
 
 
 @main.command(name="_update_status", hidden=True)
@@ -1505,6 +1508,7 @@ In `jacked/service/tray.py` `_on_update_click`, immediately BEFORE the `spawn_up
                 _wb.open(_url)
             except Exception:
                 logger.exception("Failed to open update progress page")
+```
 
 - [ ] **Step 3: Add SPA-bypass integration test**
 
@@ -1680,7 +1684,12 @@ class TestUpdaterWritesStatus:
 At the top of `run_update()` in `jacked/service/updater.py`, add:
 
 ```python
-def run_update(parent_pid: int, extras: str = "tray", target_version: "str | None" = None) -> None:
+def run_update(
+    parent_pid: int,
+    extras: str = "tray",
+    target_version: "str | None" = None,
+    port: int = 8321,
+) -> None:
     UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(UPDATE_LOG, "a", buffering=1, encoding="utf-8", errors="replace")
 
@@ -1733,6 +1742,14 @@ def run_update(parent_pid: int, extras: str = "tray", target_version: "str | Non
         except Exception:
             logger.exception("end_phase failed: %s", phase)
 ```
+
+**Also replace every hardcoded 8321 in `run_update()` with `port`.** In the current `jacked/service/updater.py` there are multiple sites:
+
+- Every `is_port_available("127.0.0.1", 8321)` → `is_port_available("127.0.0.1", port)` (currently ~5 occurrences across the wait-port, force-kill grace, and verify loops)
+- `_pids_bound_to_port(8321)` → `_pids_bound_to_port(port)`
+- Any log/error/recovery string that mentions "port 8321" → `f"port {port}"`
+
+Verify with `grep -n "8321" jacked/service/updater.py` after editing — should only appear in the parameter default value `port: int = 8321` and nowhere else.
 
 Then wrap each phase explicitly. For each phase, the rule is: **exactly one `_begin(X)` and exactly one `_end(X, status=...)` on every code path that traverses that phase.** Specifically:
 
@@ -1916,6 +1933,10 @@ def _spawn_windows_tray_updater(
         # Open progress page (no-op if already open in user's browser)
         'start "" "' + progress_url + '"\r\n'
         'jacked _update_status_init "' + __import__("jacked").__version__ + '" "' + to_version + '" ' + method + ' --log-path "' + log_path + '"\r\n'
+        'if errorlevel 2 (\r\n'
+        '    echo Another jacked updater is already in progress. Aborting. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    exit /b 2\r\n'
+        ')\r\n'
         'jacked _update_status waiting_for_parent in_progress\r\n'
         ':wait\r\n'
         'tasklist /FI "PID eq ' + str(parent_pid) + '" 2>NUL | find "' + str(parent_pid) + '" >NUL\r\n'
