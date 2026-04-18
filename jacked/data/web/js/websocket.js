@@ -5,6 +5,50 @@
  * and typed event dispatch.  Any component can register handlers for
  * specific event types (e.g. "credentials_changed") or "*" for all.
  */
+
+// ---------------------------------------------------------------------------
+// Usage-checking watchdog
+// ---------------------------------------------------------------------------
+// Problem: a card that receives `usage_refresh_progress status=checking` but
+// never receives the matching `done`/`failed` (WS drop, server-side prune from
+// slow-client timeout, tab backgrounded) stays stuck on "Checking usage…"
+// forever. Hard reload alone clears it, but if a bulk is actively re-stamping
+// the card mid-reload the state can re-appear.
+//
+// Fix: arm a per-account setTimeout when we show the checking overlay. If no
+// terminal event arrives within CHECKING_TIMEOUT_MS, force the card back to
+// idle — the user can click refresh again. Both the WS bulk handler and the
+// single-account refresh path use this.
+const _CHECKING_TIMEOUT_MS = 120_000;
+const _checkingWatchdogs = new Map();  // accountId -> setTimeout id
+
+function _armCheckingWatchdog(accountId) {
+    if (!Number.isInteger(accountId)) return;
+    _clearCheckingWatchdog(accountId);  // re-arm resets timer
+    const timerId = setTimeout(() => {
+        _checkingWatchdogs.delete(accountId);
+        const card = document.querySelector('[data-account-id="' + accountId + '"]');
+        if (!card || !card.classList.contains('usage-checking')) return;
+        console.warn('[usage] watchdog cleared stuck checking state for account', accountId);
+        card.classList.remove('usage-checking', 'usage-queued');
+        if (typeof _usageRemoveOverlay === 'function') _usageRemoveOverlay(card);
+    }, _CHECKING_TIMEOUT_MS);
+    _checkingWatchdogs.set(accountId, timerId);
+}
+
+function _clearCheckingWatchdog(accountId) {
+    const existing = _checkingWatchdogs.get(accountId);
+    if (existing !== undefined) {
+        clearTimeout(existing);
+        _checkingWatchdogs.delete(accountId);
+    }
+}
+
+function _clearAllCheckingWatchdogs() {
+    for (const timerId of _checkingWatchdogs.values()) clearTimeout(timerId);
+    _checkingWatchdogs.clear();
+}
+
 const jackedWS = {
     ws: null,
     handlers: {},           // type -> [callback, ...]
@@ -76,6 +120,8 @@ const jackedWS = {
                 el => el.classList.remove('usage-checking', 'usage-queued')
             );
             document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
+            // Cancel any pending watchdogs — they'd clobber the fresh render on reconnect.
+            _clearAllCheckingWatchdogs();
             // If upgrade modal is open and WS drops, server is likely restarting — begin health poll
             if (document.getElementById('upgrade-modal') && typeof _startHealthPolling === 'function') {
                 _startHealthPolling();
@@ -327,6 +373,9 @@ jackedWS.on('usage_refresh_started', (msg) => {
         card.classList.remove('usage-checking', 'usage-done', 'usage-failed');
         card.classList.add('usage-queued');
         _usageInjectOverlay(card, 'queued', 'Waiting\u2026');
+        // Arm watchdog now — queued eventually becomes checking, and without
+        // this a slow-client prune mid-bulk could leave the card stuck.
+        _armCheckingWatchdog(id);
     }
 });
 
@@ -344,7 +393,9 @@ jackedWS.on('usage_refresh_progress', (msg) => {
 
         if (d.status === 'checking') {
             _usageInjectOverlay(card, 'checking', 'Checking usage\u2026');
+            _armCheckingWatchdog(d.account_id);
         } else if (d.status === 'done') {
+            _clearCheckingWatchdog(d.account_id);
             _usageInjectOverlay(card, 'done', 'Updated!');
             // Surgically patch usage data in the card DOM
             if (d.account_data) _usageUpdateCardDOM(card, d.account_data);
@@ -353,6 +404,7 @@ jackedWS.on('usage_refresh_progress', (msg) => {
                 card.classList.remove('usage-done');
             }, _OVERLAY_DONE_MS);
         } else if (d.status === 'failed') {
+            _clearCheckingWatchdog(d.account_id);
             _usageInjectOverlay(card, 'failed', 'Failed');
             setTimeout(() => {
                 _usageRemoveOverlay(card);

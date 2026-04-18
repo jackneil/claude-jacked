@@ -554,9 +554,14 @@ async function _triggerSingleUsageRefresh(accountId) {
     if (typeof _usageInjectOverlay === 'function') {
         _usageInjectOverlay(card, 'checking', 'Checking usage\u2026');
     }
+    // Watchdog: if the fetch hangs or WS events never clear the class, this
+    // returns the card to idle after _CHECKING_TIMEOUT_MS so the user can
+    // click refresh again. The fetch() in api.post has no timeout.
+    if (typeof _armCheckingWatchdog === 'function') _armCheckingWatchdog(accountId);
 
     try {
         await api.post('/api/auth/accounts/' + accountId + '/refresh-usage');
+        if (typeof _clearCheckingWatchdog === 'function') _clearCheckingWatchdog(accountId);
         if (window.jackedState.activeRoute === 'accounts') {
             await refreshAndRender();
             // Apply success overlay to the newly-rendered card (old DOM node was replaced)
@@ -575,6 +580,7 @@ async function _triggerSingleUsageRefresh(accountId) {
             }
         }
     } catch (e) {
+        if (typeof _clearCheckingWatchdog === 'function') _clearCheckingWatchdog(accountId);
         const current = document.querySelector('[data-account-id="' + accountId + '"]');
         if (current) {
             current.classList.remove('usage-checking');
