@@ -25,8 +25,34 @@ import sys
 from pathlib import Path
 
 
+def _is_path_under_any_site_packages(target: Path) -> bool:
+    """Return True if `target` lives under a site-packages/ dir on sys.path."""
+    try:
+        target = target.resolve()
+    except (OSError, RuntimeError):
+        return False
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            p = Path(entry).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if p.name != "site-packages":
+            continue
+        try:
+            target.relative_to(p)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def detect_install_method() -> str:
-    """Return 'uv', 'pipx', or 'pip' based on where sys.executable lives."""
+    """Return 'uv', 'pipx', 'editable', or 'pip' based on install markers.
+
+    Detection order: uv -> pipx -> editable -> pip (fallback).
+    """
     try:
         exe = Path(sys.executable).resolve()
     except (OSError, RuntimeError):
@@ -44,7 +70,65 @@ def detect_install_method() -> str:
         if part == "venvs" and i > 0 and parts_lower[i - 1] == "pipx":
             return "pipx"
 
+    # Editable install: look for marker .pth files on sys.path.
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            d = Path(entry)
+            if not d.is_dir():
+                continue
+            if any(d.glob("_editable_impl_*.pth")):
+                return "editable"
+            if any(d.glob("__editable__.*.pth")):
+                return "editable"
+        except (OSError, RuntimeError):
+            continue
+
+    # Fallback: if jacked/__init__.py resolves to a path NOT under any
+    # site-packages/ on sys.path, treat as editable.
+    try:
+        import jacked
+        if jacked.__file__:
+            jacked_init = Path(jacked.__file__).resolve()
+            if not _is_path_under_any_site_packages(jacked_init):
+                return "editable"
+    except Exception:
+        pass
+
     return "pip"
+
+
+def can_auto_upgrade() -> tuple[bool, str]:
+    """Return (ok, reason) — is it safe to auto-upgrade this install?
+
+    uv / pipx: True, empty reason.
+    editable:  False with a git-pull/uv-sync recovery hint.
+    pip:       False with a 'migrate to uv' recovery hint.
+    any error: False with a defensive message.
+    """
+    try:
+        method = detect_install_method()
+    except Exception:
+        return (
+            False,
+            "Could not detect install method — auto-update disabled. "
+            "Try: `uv tool install \"claude-jacked[tray]\" --force`.",
+        )
+    if method in ("uv", "pipx"):
+        return True, ""
+    if method == "editable":
+        return (
+            False,
+            "This is an editable (dev-clone) install — auto-update disabled. "
+            "Upgrade manually from the repo: `cd <repo> && git pull && uv sync`.",
+        )
+    return (
+        False,
+        "pip install detected — auto-update disabled (uv is the supported "
+        "install method). Migrate with: "
+        "`uv tool install \"claude-jacked[tray]\"`.",
+    )
 
 
 def is_user_site_install() -> bool:

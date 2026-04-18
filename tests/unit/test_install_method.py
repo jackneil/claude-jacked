@@ -32,18 +32,25 @@ class TestDetectInstallMethod:
             with patch("sys.executable", str(fake)):
                 assert detect_install_method() == "pipx"
 
-    def test_defaults_to_pip_for_unknown_path(self):
+    def test_defaults_to_pip_for_unknown_path(self, monkeypatch):
         fake = Path("/usr/bin/python3")
+        # Clear sys.path of editable markers + make the site-packages fallback see
+        # jacked as installed normally (the test's runtime is a dev clone, but
+        # we're simulating a non-editable environment here).
+        monkeypatch.setattr(sys, "path", [])
         with patch("jacked.install_method.Path.resolve", return_value=fake):
             with patch("sys.executable", str(fake)):
-                assert detect_install_method() == "pip"
+                with patch("jacked.install_method._is_path_under_any_site_packages", return_value=True):
+                    assert detect_install_method() == "pip"
 
-    def test_windows_python_user_install_is_pip(self):
+    def test_windows_python_user_install_is_pip(self, monkeypatch):
         """pip install --user on Windows → %APPDATA%\\Python\\Python3XX\\python.exe."""
         fake = Path("C:/Users/u/AppData/Roaming/Python/Python312/python.exe")
+        monkeypatch.setattr(sys, "path", [])
         with patch("jacked.install_method.Path.resolve", return_value=fake):
             with patch("sys.executable", str(fake)):
-                assert detect_install_method() == "pip"
+                with patch("jacked.install_method._is_path_under_any_site_packages", return_value=True):
+                    assert detect_install_method() == "pip"
 
 
 class TestUpgradeCommand:
