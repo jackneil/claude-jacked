@@ -34,6 +34,7 @@ class VersionResponse(BaseModel):
     ahead: bool = False
     checked_at: Optional[str] = None
     next_check_at: Optional[str] = None
+    update_status_file: Optional[str] = None
 
 
 class InstallationResponse(BaseModel):
@@ -145,7 +146,10 @@ def _version_response(result: dict | None) -> "VersionResponse":
     from jacked import __version__
 
     if result is None:
-        return VersionResponse(current=__version__)
+        return VersionResponse(
+            current=__version__,
+            update_status_file=str(_update_status_mod.UPDATE_STATUS_FILE),
+        )
 
     checked_iso = None
     next_iso = None
@@ -165,6 +169,7 @@ def _version_response(result: dict | None) -> "VersionResponse":
         ahead=result.get("ahead", False),
         checked_at=checked_iso,
         next_check_at=next_iso,
+        update_status_file=str(_update_status_mod.UPDATE_STATUS_FILE),
     )
 
 
