@@ -159,9 +159,19 @@ def run_update(
             log_path=str(UPDATE_LOG),
         )
     except _us.LockBusy as exc:
-        log(f"REFUSED: another updater active: {exc}")
-        log_fh.close()
-        return
+        # Distinguish tray pre-init (status file created moments ago with
+        # no phases opened yet — the tray spawned us and we're catching up)
+        # from a real concurrent updater (has phases in flight).
+        prior = _us._read_raw(_us.UPDATE_STATUS_FILE) or {}
+        phases = prior.get("phases") or []
+        current_phase = prior.get("current_phase")
+        if not phases and current_phase is None:
+            log(f"REUSING tray pre-init status file: {exc}")
+            # Don't re-init — the tray's metadata is already there.
+        else:
+            log(f"REFUSED: another updater active: {exc}")
+            log_fh.close()
+            return
     except Exception:
         logger.exception("Could not initialize update status file")
 

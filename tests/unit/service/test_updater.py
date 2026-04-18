@@ -699,3 +699,57 @@ class TestWindowsBatchPhases:
             import os as _os
             try: _os.unlink(mock_popen.call_args[0][0][2])
             except OSError: pass
+
+
+class TestRunUpdateReusesTrayPreInit:
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.is_port_available")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_reuses_tray_pre_init_and_completes(
+        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        mock_gate, mock_method, tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+        mock_port_avail.side_effect = [True, True] + [False] * 100
+
+        us_mod.init_status(
+            us_mod.UPDATE_STATUS_FILE,
+            from_version="0.41.19",
+            to_version="0.41.20",
+            method="uv",
+        )
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.20")
+
+        data = us_mod.read_status(us_mod.UPDATE_STATUS_FILE)
+        assert data["overall"] == "succeeded"
+        assert data["to_version"] == "0.41.20"
+
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    def test_truly_busy_lock_still_refused(
+        self, mock_gate, mock_method, tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+
+        us_mod.init_status(
+            us_mod.UPDATE_STATUS_FILE,
+            from_version="a", to_version="b", method="uv",
+        )
+        us_mod.begin_phase(us_mod.UPDATE_STATUS_FILE, "installing_package")
+
+        updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.20")
+
+        data = us_mod.read_status(us_mod.UPDATE_STATUS_FILE)
+        assert data["current_phase"] == "installing_package"
