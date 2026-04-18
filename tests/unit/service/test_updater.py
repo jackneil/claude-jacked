@@ -829,3 +829,46 @@ class TestRunUpdateTerminalStatus:
         assert data is not None
         assert data["overall"] == "failed"
         assert "mark_succeeded" in (data.get("error") or "")
+
+
+def test_windows_batch_checks_errorlevel_after_status_writes(
+    tmp_path, monkeypatch,
+):
+    """After each `_update_status <phase> in_progress` line, the IMMEDIATELY
+    next non-empty line must be an errorlevel guard."""
+    from unittest.mock import patch as _patch
+    from jacked.service import updater
+    monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+    monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+    with _patch("jacked.install_method.detect_install_method", return_value="uv"), \
+         _patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe"), \
+         _patch("subprocess.Popen") as mock_popen:
+        updater._spawn_windows_tray_updater(
+            parent_pid=12345, extras="tray", target_version="0.41.20",
+        )
+    body_path = mock_popen.call_args[0][0][2]
+    body = open(body_path).read()
+    try:
+        lines = body.splitlines()
+        for phase in ["waiting_for_parent", "installing_package",
+                      "migrating_settings", "waiting_port_free",
+                      "starting_service", "verifying_service"]:
+            in_prog_idx = None
+            for i, ln in enumerate(lines):
+                if f"_update_status {phase} in_progress" in ln:
+                    in_prog_idx = i
+                    break
+            assert in_prog_idx is not None, f"missing begin for {phase}"
+            for j in range(in_prog_idx + 1, len(lines)):
+                candidate = lines[j].strip()
+                if not candidate:
+                    continue
+                assert candidate.startswith("if errorlevel"), (
+                    f"first line after `_update_status {phase} in_progress` "
+                    f"is not an errorlevel guard — got: {candidate!r}"
+                )
+                break
+    finally:
+        import os as _os
+        try: _os.unlink(body_path)
+        except OSError: pass

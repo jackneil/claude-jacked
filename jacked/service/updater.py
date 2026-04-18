@@ -497,19 +497,32 @@ def _spawn_windows_tray_updater(
     log_path = str(UPDATE_LOG)
     progress_url = f"http://127.0.0.1:{port}/update.html"
 
+    # Each phase block follows the pattern:
+    #   jacked _update_status <phase> in_progress
+    #   if errorlevel 1 (... abort — phase-name drift detected)
+    #   <work step>
+    #   if errorlevel 1 (jacked _update_status <phase> failed ... ; exit 1)
+    #   jacked _update_status <phase> ok
+    DRIFT_GUARD = (
+        'if errorlevel 1 (\r\n'
+        '    echo [%date% %time%] ERROR: _update_status shim drifted >> "%LOGFILE%"\r\n'
+        '    exit /b 1\r\n'
+        ')\r\n'
+    )
     batch_body = (
         '@echo off\r\n'
         'set LOGFILE=' + log_path + '\r\n'
         'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ', method ' + method + ') >> "%LOGFILE%"\r\n'
         'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
-        # Open progress page fallback (no-op if already open in browser)
         'start "" "' + progress_url + '"\r\n'
         'jacked _update_status_init "' + current_version + '" "' + to_version + '" ' + method + ' --log-path "' + log_path + '"\r\n'
         'if errorlevel 2 (\r\n'
         '    echo Another jacked updater is already in progress. Aborting. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 2\r\n'
         ')\r\n'
+        # Phase: waiting_for_parent
         'jacked _update_status waiting_for_parent in_progress\r\n'
+        + DRIFT_GUARD +
         ':wait\r\n'
         'tasklist /FI "PID eq ' + str(parent_pid) + '" 2>NUL | find "' + str(parent_pid) + '" >NUL\r\n'
         'if not errorlevel 1 (\r\n'
@@ -517,8 +530,11 @@ def _spawn_windows_tray_updater(
         '    goto wait\r\n'
         ')\r\n'
         'jacked _update_status waiting_for_parent ok\r\n'
+        + DRIFT_GUARD +
         'echo [%date% %time%] parent exited >> "%LOGFILE%"\r\n'
+        # Phase: installing_package
         'jacked _update_status installing_package in_progress\r\n'
+        + DRIFT_GUARD
         + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
         'if errorlevel 1 (\r\n'
         '    jacked _update_status installing_package failed --error "upgrade command failed" --recovery "' + label_for_batch + '"\r\n'
@@ -528,22 +544,32 @@ def _spawn_windows_tray_updater(
         '    exit /b 1\r\n'
         ')\r\n'
         'jacked _update_status installing_package ok\r\n'
+        + DRIFT_GUARD +
+        # Phase: migrating_settings
         'jacked _update_status migrating_settings in_progress\r\n'
+        + DRIFT_GUARD +
         'jacked install --force >> "%LOGFILE%" 2>&1\r\n'
         'if errorlevel 1 (\r\n'
         '    jacked _update_status migrating_settings failed --error "jacked install --force failed" --recovery "jacked install --force"\r\n'
         '    exit /b 1\r\n'
         ')\r\n'
         'jacked _update_status migrating_settings ok\r\n'
-        # Port freed as soon as parent exited; brief wait for kernel to release socket
+        + DRIFT_GUARD +
+        # Phase: waiting_port_free
         'jacked _update_status waiting_port_free in_progress\r\n'
+        + DRIFT_GUARD +
         'timeout /t 1 /nobreak >NUL\r\n'
         'jacked _update_status waiting_port_free ok\r\n'
+        + DRIFT_GUARD +
+        # Phase: starting_service
         'jacked _update_status starting_service in_progress\r\n'
+        + DRIFT_GUARD +
         'start "" /B jacked service start >> "%LOGFILE%" 2>&1\r\n'
         'jacked _update_status starting_service ok\r\n'
-        # Verify the new service actually came up (20s max)
+        + DRIFT_GUARD +
+        # Phase: verifying_service
         'jacked _update_status verifying_service in_progress\r\n'
+        + DRIFT_GUARD +
         'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++){try{$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:' + str(port) + '/api/version -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}Start-Sleep -Milliseconds 500} exit 1"\r\n'
         'if errorlevel 1 (\r\n'
         '    jacked _update_status verifying_service failed --error "service did not bind :' + str(port) + ' in 20s" --recovery "jacked service start"\r\n'
@@ -551,6 +577,7 @@ def _spawn_windows_tray_updater(
         '    exit /b 1\r\n'
         ')\r\n'
         'jacked _update_status verifying_service ok\r\n'
+        + DRIFT_GUARD +
         'jacked _update_status_succeed\r\n'
         'echo [%date% %time%] tray update complete >> "%LOGFILE%"\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
