@@ -1560,6 +1560,85 @@ Add `target_version: str | None = None` and `port: int = 8321` parameters to:
 
 `run_update` uses `port` in the `verifying_service` phase (replacing the hardcoded 8321 in `is_port_available("127.0.0.1", 8321)` with `is_port_available("127.0.0.1", port)`).
 
+**POSIX argv boundary — critical.** On POSIX, `spawn_updater_from_tray` spawns a Python subprocess via `[py, "-m", "jacked.service.updater", str(parent_pid), extras]` and `_cli()` parses it back. New params must cross that boundary too or they're lost:
+
+1. In `spawn_updater_from_tray` POSIX branch, build argv as:
+   ```python
+   argv = [py, "-m", "jacked.service.updater", str(parent_pid), extras,
+           "--target-version", target_version or "",
+           "--port", str(port)]
+   ```
+2. In `_cli()` at the bottom of `updater.py`, replace the positional-only arg parsing with argparse:
+   ```python
+   def _cli() -> None:
+       import argparse
+       ap = argparse.ArgumentParser(prog="python -m jacked.service.updater")
+       ap.add_argument("parent_pid", type=int)
+       ap.add_argument("extras", nargs="?", default="tray")
+       ap.add_argument("--target-version", default=None)
+       ap.add_argument("--port", type=int, default=8321)
+       args = ap.parse_args()
+       target = args.target_version or None  # empty string -> None
+       run_update(args.parent_pid, args.extras,
+                  target_version=target, port=args.port)
+   ```
+
+Add a unit test that the POSIX spawn argv includes both `--target-version` and `--port`:
+
+```python
+@patch("subprocess.Popen")
+@patch("jacked.service.updater._find_updater_python", return_value="/fake/python")
+def test_posix_spawn_threads_target_version_and_port(
+    self, mock_py, mock_popen, monkeypatch,
+):
+    import sys as _sys
+    from jacked.service import updater
+    with patch.object(_sys, "platform", "darwin"):
+        updater.spawn_updater_from_tray(
+            parent_pid=12345, extras="tray",
+            target_version="0.41.19", port=9000,
+        )
+    argv = mock_popen.call_args[0][0]
+    assert "--target-version" in argv
+    i = argv.index("--target-version")
+    assert argv[i + 1] == "0.41.19"
+    assert "--port" in argv
+    j = argv.index("--port")
+    assert argv[j + 1] == "9000"
+```
+
+And a test that `_cli()` forwards parsed values into `run_update`:
+
+```python
+def test_cli_forwards_target_version_and_port(monkeypatch):
+    from jacked.service import updater
+    captured = {}
+    def fake_run(parent_pid, extras="tray", target_version=None, port=8321):
+        captured["target_version"] = target_version
+        captured["port"] = port
+    monkeypatch.setattr(updater, "run_update", fake_run)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["updater", "12345", "tray", "--target-version", "0.41.19", "--port", "9000"],
+    )
+    updater._cli()
+    assert captured["target_version"] == "0.41.19"
+    assert captured["port"] == 9000
+
+
+def test_cli_empty_target_version_becomes_none(monkeypatch):
+    from jacked.service import updater
+    captured = {}
+    monkeypatch.setattr(updater, "run_update",
+                        lambda *a, target_version=None, port=8321, **kw: captured.update(target_version=target_version))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["updater", "12345", "tray", "--target-version", ""],
+    )
+    updater._cli()
+    assert captured["target_version"] is None
+```
+
 Tray `_on_update_click` caller change: the existing call at the top of this plan file (Task 8 Step 2) must pass `target_version` AND `port`:
 
 ```python
