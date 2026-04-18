@@ -19,13 +19,14 @@ class TestWaitForExit:
 
 
 class TestRunUpdate:
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.is_port_available", return_value=True)
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_order_wait_install_migrate_restart(
-        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_method,
+        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_method, mock_gate,
     ):
         """Verify: wait_for_exit -> uv install -> jacked install -> jacked service start."""
         from jacked.service import updater
@@ -58,12 +59,13 @@ class TestRunUpdate:
         assert "/fake/jacked" in restart_args
         assert "service" in restart_args and "start" in restart_args
 
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_skips_restart_if_install_fails(
-        self, mock_popen, mock_run, mock_find, mock_method,
+        self, mock_popen, mock_run, mock_find, mock_method, mock_gate,
     ):
         from jacked.service import updater
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
@@ -74,12 +76,13 @@ class TestRunUpdate:
 
         mock_popen.assert_not_called()
 
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_writes_recovery_file_on_install_failure(
-        self, mock_popen, mock_run, mock_find, mock_method, tmp_path, monkeypatch,
+        self, mock_popen, mock_run, mock_find, mock_method, mock_gate, tmp_path, monkeypatch,
     ):
         from jacked.service import updater
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
@@ -94,42 +97,18 @@ class TestRunUpdate:
         content = (tmp_path / "recovery.txt").read_text()
         assert "uv tool install" in content
 
-    @patch("jacked.install_method.detect_install_method", return_value="pip")
-    @patch("jacked.install_method.is_user_site_install", return_value=True)
-    @patch("jacked.service.updater.is_port_available", return_value=True)
-    @patch("jacked.service.updater.find_bin")
-    @patch("subprocess.run")
-    @patch("subprocess.Popen")
-    def test_pip_user_install_uses_python_m_pip(
-        self, mock_popen, mock_run, mock_find, mock_port_avail,
-        mock_user_site, mock_method,
-    ):
-        """If install method is pip --user, the updater must use
-        `<python> -m pip install --upgrade --user` rather than
-        `uv tool install` (which would install the package a second
-        time in a different location)."""
-        from jacked.service import updater
-        mock_find.side_effect = lambda name: {"jacked": "/fake/jacked"}.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
-
-        with patch.object(updater, "wait_for_exit", return_value=True):
-            updater.run_update(parent_pid=12345, extras="tray")
-
-        upgrade_call = mock_run.call_args_list[0][0][0]
-        assert upgrade_call[0] == sys.executable
-        assert "-m" in upgrade_call and "pip" in upgrade_call
-        assert "--upgrade" in upgrade_call
-        assert "--user" in upgrade_call
+    # Removed in 0.41.19: pip installs are refused by the gate, not auto-upgraded.
 
 
 class TestPortWaitBeforeServiceStart:
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.time.sleep", lambda _s: None)
     @patch("jacked.service.updater.find_bin")
     @patch("jacked.service.updater.is_port_available")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_polls_port_before_spawning_service(
-        self, mock_popen, mock_run, mock_port_avail, mock_find,
+        self, mock_popen, mock_run, mock_port_avail, mock_find, mock_gate,
     ):
         """After uv+jacked install, must wait for port 8321 before `service start`."""
         from jacked.service import updater
@@ -155,13 +134,14 @@ class TestPortWaitBeforeServiceStart:
 class TestParentKillEscalation:
     """Updater must force-kill the parent tray if pystray ignores icon.stop()."""
 
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.is_port_available", return_value=True)
     @patch("jacked.service.updater._force_kill_pid")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_sigkill_parent_when_it_wont_exit(
-        self, mock_popen, mock_run, mock_find, mock_force_kill, mock_port_avail,
+        self, mock_popen, mock_run, mock_find, mock_force_kill, mock_port_avail, mock_gate,
     ):
         from jacked.service import updater
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
@@ -177,6 +157,7 @@ class TestPortStuckRecovery:
     """If port is still bound after the wait loop, force-kill the squatter."""
 
     @patch("jacked.service.updater.time.sleep", lambda _s: None)
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater._pids_bound_to_port", return_value=[54321])
     @patch("jacked.service.updater._force_kill_pid")
     @patch("jacked.service.updater.is_port_available")
@@ -185,7 +166,7 @@ class TestPortStuckRecovery:
     @patch("subprocess.Popen")
     def test_force_kills_port_squatter(
         self, mock_popen, mock_run, mock_find, mock_port_avail,
-        mock_force_kill, mock_port_pids,
+        mock_force_kill, mock_port_pids, mock_gate,
     ):
         from jacked.service import updater
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
@@ -205,6 +186,7 @@ class TestPortStuckRecovery:
         mock_force_kill.assert_called_with(54321)
         mock_popen.assert_called_once()
 
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.time.sleep", lambda _s: None)
     @patch("jacked.service.updater._pids_bound_to_port", return_value=[])
     @patch("jacked.service.updater.is_port_available", return_value=False)
@@ -212,7 +194,7 @@ class TestPortStuckRecovery:
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_aborts_when_port_cannot_be_freed(
-        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_port_pids,
+        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_port_pids, mock_gate,
         tmp_path, monkeypatch,
     ):
         """If we can't find who holds the port or can't kill them, don't spawn a start
@@ -234,13 +216,14 @@ class TestPortStuckRecovery:
 class TestNewServiceVerification:
     """After spawning, confirm the new tray actually bound the port."""
 
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.time.sleep", lambda _s: None)
     @patch("jacked.service.updater.is_port_available")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_recovery_file_written_when_new_service_never_binds(
-        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_gate,
         tmp_path, monkeypatch,
     ):
         from jacked.service import updater
@@ -307,11 +290,12 @@ class TestFindUpdaterPython:
 
 
 class TestJackedInstallFailure:
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_skips_restart_if_jacked_install_fails(
-        self, mock_popen, mock_run, mock_find, tmp_path, monkeypatch,
+        self, mock_popen, mock_run, mock_find, mock_gate, tmp_path, monkeypatch,
     ):
         """Partial migration must NOT silently restart with broken settings."""
         from jacked.service import updater
@@ -478,3 +462,240 @@ class TestMainEntrypoint:
                 assert e.code == 2
         finally:
             real_sys.argv = argv_backup
+
+
+class TestUpdaterWritesStatus:
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.is_port_available")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_writes_succeeded_status_with_all_phases(
+        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_gate, mock_method,
+        tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        from jacked.service.update_phases import PHASE_NAMES
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        # Port-wait phase: True (port is free, break loop) — may be called
+        # twice (loop check + post-loop confirmation). Verify phase: False
+        # (port is bound = service came up).
+        mock_port_avail.side_effect = [True, True] + [False] * 100
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.19")
+
+        data = us_mod.read_status(tmp_path / "status.json")
+        assert data is not None
+        assert data["overall"] == "succeeded"
+        assert data["to_version"] == "0.41.19"
+        phase_names = [p["name"] for p in data["phases"]]
+        for expected in PHASE_NAMES:
+            assert expected in phase_names, f"missing phase {expected}"
+        for p in data["phases"]:
+            assert p["status"] == "ok", f"phase {p['name']} ended with {p['status']}"
+
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_install_failure_writes_failed_phase_and_overall(
+        self, mock_popen, mock_run, mock_find, mock_gate, mock_method,
+        tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=1)
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.19")
+
+        data = us_mod.read_status(tmp_path / "status.json")
+        assert data["overall"] == "failed"
+        install_phase = next(
+            (p for p in data["phases"] if p["name"] == "installing_package"),
+            None,
+        )
+        assert install_phase is not None
+        assert install_phase["status"] == "failed"
+
+
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(False, "editable — run git pull"))
+    def test_run_update_refuses_non_upgradable(
+        self, mock_gate, tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        updater.run_update(parent_pid=12345, extras="tray")
+        # No status file written (run was refused before init_status)
+        assert not (tmp_path / "status.json").exists()
+        # Recovery file written with the reason
+        assert (tmp_path / "recovery.txt").exists()
+        assert "editable" in (tmp_path / "recovery.txt").read_text().lower()
+
+
+class TestPosixSpawnThreadsTargetVersion:
+    @patch("subprocess.Popen")
+    @patch("jacked.service.updater._find_updater_python", return_value="/fake/python")
+    def test_posix_spawn_threads_target_version_and_port(
+        self, mock_py, mock_popen,
+    ):
+        import sys as _sys
+        from jacked.service import updater
+        with patch.object(_sys, "platform", "darwin"):
+            updater.spawn_updater_from_tray(
+                parent_pid=12345, extras="tray",
+                target_version="0.41.19", port=9000,
+            )
+        argv = mock_popen.call_args[0][0]
+        assert "--target-version" in argv
+        i = argv.index("--target-version")
+        assert argv[i + 1] == "0.41.19"
+        assert "--port" in argv
+        j = argv.index("--port")
+        assert argv[j + 1] == "9000"
+
+
+class TestCliForwards:
+    def test_cli_forwards_target_version_and_port(self, monkeypatch):
+        from jacked.service import updater
+        captured = {}
+
+        def fake_run(parent_pid, extras="tray", target_version=None, port=8321):
+            captured["target_version"] = target_version
+            captured["port"] = port
+
+        monkeypatch.setattr(updater, "run_update", fake_run)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["updater", "12345", "tray", "--target-version", "0.41.19", "--port", "9000"],
+        )
+        updater._cli()
+        assert captured["target_version"] == "0.41.19"
+        assert captured["port"] == 9000
+
+
+    def test_cli_empty_target_version_becomes_none(self, monkeypatch):
+        from jacked.service import updater
+        captured = {}
+        def fake_run(*a, target_version=None, port=8321, **kw):
+            captured["target_version"] = target_version
+        monkeypatch.setattr(updater, "run_update", fake_run)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["updater", "12345", "tray", "--target-version", ""],
+        )
+        updater._cli()
+        assert captured["target_version"] is None
+
+
+class TestWindowsBatchPhases:
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe")
+    @patch("subprocess.Popen")
+    def test_batch_has_all_phases_in_order_plus_success_terminal(
+        self, mock_popen, mock_find, mock_method, monkeypatch, tmp_path,
+    ):
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+
+        updater._spawn_windows_tray_updater(
+            parent_pid=12345, extras="tray", target_version="0.41.19",
+        )
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert args[0] == "cmd.exe"
+        batch_path = args[2]
+        body = open(batch_path).read()
+        try:
+            # Target version threaded correctly
+            assert "0.41.19" in body
+            assert '"next"' not in body, "target_version placeholder leaked"
+
+            required_in_order = [
+                "_update_status_init",
+                "waiting_for_parent in_progress",
+                "waiting_for_parent ok",
+                "installing_package in_progress",
+                "installing_package ok",
+                "migrating_settings in_progress",
+                "migrating_settings ok",
+                "waiting_port_free in_progress",
+                "waiting_port_free ok",
+                "starting_service in_progress",
+                "starting_service ok",
+                "verifying_service in_progress",
+                "verifying_service ok",
+                "_update_status_succeed",
+            ]
+            last_idx = -1
+            for frag in required_in_order:
+                idx = body.find(frag)
+                assert idx >= 0, f"batch missing fragment: {frag}"
+                assert idx > last_idx, f"fragment out of order: {frag}"
+                last_idx = idx
+
+            assert 'start "" "http://' in body
+            assert "/update.html" in body
+        finally:
+            import os as _os
+            try: _os.unlink(batch_path)
+            except OSError: pass
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe")
+    @patch("subprocess.Popen")
+    def test_batch_uses_next_placeholder_when_target_version_missing(
+        self, mock_popen, mock_find, mock_method, monkeypatch, tmp_path,
+    ):
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+        updater._spawn_windows_tray_updater(
+            parent_pid=12345, extras="tray", target_version=None,
+        )
+        batch_path = mock_popen.call_args[0][0][2]
+        body = open(batch_path).read()
+        try:
+            assert '"next"' in body
+            assert "waiting_for_parent in_progress" in body
+            assert "_update_status_succeed" in body
+        finally:
+            import os as _os
+            try: _os.unlink(batch_path)
+            except OSError: pass
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe")
+    @patch("subprocess.Popen")
+    def test_batch_threads_custom_port(
+        self, mock_popen, mock_find, mock_method, monkeypatch, tmp_path,
+    ):
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+        updater._spawn_windows_tray_updater(
+            parent_pid=12345, extras="tray", target_version="0.41.19", port=9000,
+        )
+        body = open(mock_popen.call_args[0][0][2]).read()
+        try:
+            assert "127.0.0.1:9000/update.html" in body
+            assert "127.0.0.1:9000/api/version" in body
+            assert "bind :9000" in body
+        finally:
+            import os as _os
+            try: _os.unlink(mock_popen.call_args[0][0][2])
+            except OSError: pass
