@@ -1,5 +1,41 @@
 """Tests for `jacked upgrade` one-shot upgrade command."""
 
+from unittest.mock import patch
+from click.testing import CliRunner
+
+
+class TestUpgradeRefusal:
+    @patch(
+        "jacked.install_method.can_auto_upgrade",
+        return_value=(False, "This is an editable (dev-clone) install — auto-update disabled. Upgrade manually from the repo: `cd <repo> && git pull && uv sync`."),
+    )
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    def test_upgrade_refuses_editable(self, mock_run, mock_popen, mock_gate):
+        from jacked.cli import main
+        result = CliRunner().invoke(main, ["upgrade"])
+        assert result.exit_code == 2
+        assert "editable" in result.output.lower()
+        assert "git pull" in result.output
+        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
+
+    @patch(
+        "jacked.install_method.can_auto_upgrade",
+        return_value=(False, "pip install detected — auto-update disabled. Migrate with: `uv tool install \"claude-jacked[tray]\"`."),
+    )
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    def test_upgrade_refuses_pip(self, mock_run, mock_popen, mock_gate):
+        from jacked.cli import main
+        result = CliRunner().invoke(main, ["upgrade"])
+        assert result.exit_code == 2
+        assert "pip" in result.output.lower()
+        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
+
+
+
 import sys
 from unittest.mock import patch, MagicMock
 from click.testing import CliRunner
@@ -65,34 +101,10 @@ class TestUpgradeCommand:
         assert "uv" in result.output.lower()
         mock_run.assert_not_called()
 
-    @patch("sys.platform", "darwin")
-    @patch("jacked.install_method.detect_install_method", return_value="pip")
-    @patch("jacked.install_method.is_user_site_install", return_value=True)
-    @patch("jacked.findbin.find_bin")
-    @patch("jacked.service.process.is_process_alive", return_value=False)
-    @patch("jacked.service.process.read_pid", return_value=None)
-    @patch("subprocess.Popen")
-    @patch("subprocess.run")
-    def test_upgrade_uses_pip_user_when_detected(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
-        mock_user_site, mock_method,
-    ):
-        """pip-user-install users shouldn't have `uv tool install` forced on them."""
-        from jacked.cli import main
-        mock_find.side_effect = lambda name: {"jacked": "/fake/jacked"}.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
-
-        runner = CliRunner()
-        result = runner.invoke(main, ["upgrade"])
-        assert result.exit_code == 0
-
-        first_cmd = mock_run.call_args_list[0][0][0]
-        # Pip path uses current python: sys.executable -m pip install --upgrade --user ...
-        assert first_cmd[0] == sys.executable
-        assert "-m" in first_cmd and "pip" in first_cmd
-        assert "--upgrade" in first_cmd
-        assert "--user" in first_cmd
-        assert "claude-jacked[tray]" in first_cmd
+    # NOTE: pre-0.41.19 had a test that `jacked upgrade` used pip when
+    # detect_install_method returned 'pip'. That behavior is gone — the
+    # gate now refuses pip and editable installs. See TestUpgradeRefusal
+    # below for the current pip-path contract.
 
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
@@ -110,6 +122,7 @@ class TestUpgradeCommand:
         assert mock_run.call_count == 1
 
     @patch("sys.platform", "darwin")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.wait_for_port_free", return_value=True)
     @patch(
@@ -122,7 +135,7 @@ class TestUpgradeCommand:
     @patch("subprocess.run")
     def test_upgrade_stops_then_starts_detached_when_running(
         self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_stop_graceful,
-        mock_wait_port, mock_find,
+        mock_wait_port, mock_find, mock_method,
     ):
         """When service is running: stop gracefully (in-process), wait for port, start detached."""
         from jacked.cli import main
@@ -176,13 +189,14 @@ class TestUpgradeCommand:
         mock_popen.assert_not_called()
 
     @patch("sys.platform", "darwin")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("jacked.service.process.is_process_alive", return_value=True)
     @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_upgrade_skip_service_flag_honored(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find, mock_method,
     ):
         from jacked.cli import main
         mock_find.side_effect = lambda name: {
@@ -287,44 +301,15 @@ class TestUpgradeWindows:
         assert "jacked install --force" in batch
         assert "service restart" in batch
 
-    @patch("sys.platform", "win32")
-    @patch("jacked.install_method.detect_install_method", return_value="pip")
-    @patch("jacked.install_method.is_user_site_install", return_value=True)
-    @patch("jacked.findbin.find_bin", return_value=None)
-    @patch("subprocess.Popen")
-    def test_windows_batch_uses_pip_user_when_method_is_pip(
-        self, mock_popen, mock_find, mock_user_site, mock_method,
-        tmp_path, monkeypatch,
-    ):
-        """Pip-user install on Windows must upgrade via pip, not uv."""
-        from jacked.cli import main
-
-        import tempfile as _tempfile
-        real_mkstemp = _tempfile.mkstemp
-        created = []
-        def fake_mkstemp(*args, **kwargs):
-            fd, path = real_mkstemp(*args, dir=str(tmp_path), **{k: v for k, v in kwargs.items() if k != "dir"})
-            created.append(path)
-            return fd, path
-        monkeypatch.setattr(_tempfile, "mkstemp", fake_mkstemp)
-
-        runner = CliRunner()
-        result = runner.invoke(main, ["upgrade"])
-        assert result.exit_code == 0
-
-        batch = open(created[0]).read()
-        assert "-m" in batch and "pip" in batch
-        assert "--upgrade" in batch
-        assert "--user" in batch
-        assert "claude-jacked[tray]" in batch
-        # Must NOT have uv-tool-install language
-        assert "uv tool install" not in batch
+    # test_windows_batch_uses_pip_user_when_method_is_pip: removed in 0.41.19
+    # — pip installs are refused by the pre-flight gate, not auto-upgraded.
 
     @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("subprocess.Popen")
     def test_windows_skip_service_flag(
-        self, mock_popen, mock_find, tmp_path, monkeypatch,
+        self, mock_popen, mock_find, mock_method, tmp_path, monkeypatch,
     ):
         """--skip-service should result in SKIP_SERVICE=1 in the batch."""
         from jacked.cli import main

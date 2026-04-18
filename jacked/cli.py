@@ -804,11 +804,18 @@ def upgrade(extras: str, skip_service: bool):
     from jacked import __version__
     from jacked.findbin import find_bin
     from jacked.install_method import (
+        can_auto_upgrade,
         detect_install_method,
         upgrade_command,
         upgrade_command_label,
     )
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+
+    # Pre-flight: refuse editable / pip installs before touching the service.
+    _ok, _reason = can_auto_upgrade()
+    if not _ok:
+        console.print(f"[red]Cannot auto-upgrade:[/red] {_reason}")
+        sys.exit(2)
 
     method = detect_install_method()
     cmd = upgrade_command(extras)
