@@ -753,3 +753,79 @@ class TestRunUpdateReusesTrayPreInit:
 
         data = us_mod.read_status(us_mod.UPDATE_STATUS_FILE)
         assert data["current_phase"] == "installing_package"
+
+
+class TestRunUpdateTerminalStatus:
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.find_bin", return_value=None)
+    def test_uv_missing_branch_writes_failed(
+        self, mock_find, mock_gate, mock_method,
+        tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+        data = us_mod.read_status(tmp_path / "status.json")
+        assert data is not None
+        assert data["overall"] == "failed"
+        assert "uv" in (data.get("error") or "").lower()
+
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.is_port_available", return_value=True)
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_jacked_missing_after_install_writes_failed(
+        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        mock_gate, mock_method, tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        # uv is found (first call), jacked is not (second call)
+        find_calls = iter(["/fake/uv", None])
+        mock_find.side_effect = lambda name: next(find_calls)
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+        data = us_mod.read_status(tmp_path / "status.json")
+        assert data is not None
+        assert data["overall"] == "failed"
+        assert "jacked" in (data.get("error") or "").lower()
+
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.is_port_available")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_mark_succeeded_exception_degrades_to_failed(
+        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        mock_gate, mock_method, tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater, update_status as us_mod
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = MagicMock(returncode=0)
+        mock_port_avail.side_effect = [True, True] + [False] * 100
+
+        def boom(*_args, **_kw):
+            raise OSError("disk full")
+        monkeypatch.setattr(us_mod, "mark_succeeded", boom)
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.20")
+
+        data = us_mod.read_status(tmp_path / "status.json")
+        assert data is not None
+        assert data["overall"] == "failed"
+        assert "mark_succeeded" in (data.get("error") or "")

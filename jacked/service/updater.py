@@ -213,6 +213,14 @@ def run_update(
             if not uv:
                 msg = "Could not find `uv` on PATH. Install uv from https://docs.astral.sh/uv/"
                 log(f"ERROR: {msg}")
+                try:
+                    _us.mark_failed(
+                        _us.UPDATE_STATUS_FILE,
+                        error="uv not found on PATH",
+                        recovery="Install uv from https://docs.astral.sh/uv/ and re-run",
+                    )
+                except Exception:
+                    logger.exception("mark_failed after uv-missing failed")
                 _write_recovery(
                     f"Jacked auto-update failed:\n{msg}\n\n"
                     "Manual recovery:\n"
@@ -247,6 +255,14 @@ def run_update(
         jacked = find_bin("jacked")
         if not jacked:
             log("Could not locate jacked after install - NOT restarting")
+            try:
+                _us.mark_failed(
+                    _us.UPDATE_STATUS_FILE,
+                    error="jacked binary missing after install",
+                    recovery="jacked install --force && jacked service start",
+                )
+            except Exception:
+                logger.exception("mark_failed after jacked-missing failed")
             _write_recovery(
                 "Jacked auto-update: install succeeded but the `jacked` binary "
                 "is no longer on PATH. Run manually:\n"
@@ -346,7 +362,17 @@ def run_update(
             try:
                 _us.mark_succeeded(_us.UPDATE_STATUS_FILE)
             except Exception:
-                logger.exception("mark_succeeded failed")
+                logger.exception("mark_succeeded failed — writing mark_failed fallback")
+                log("WARNING: mark_succeeded raised — attempting mark_failed fallback")
+                try:
+                    _us.mark_failed(
+                        _us.UPDATE_STATUS_FILE,
+                        error="mark_succeeded raised — service came up but final status write failed",
+                        recovery="Reload the dashboard: http://127.0.0.1:8321/",
+                    )
+                except Exception:
+                    logger.exception("mark_failed fallback also raised")
+                    log("ERROR: mark_failed fallback also raised — disk likely full")
         else:
             _end("verifying_service", "failed",
                  error=f"new service did not bind :{port} within 20s",
