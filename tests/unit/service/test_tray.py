@@ -492,3 +492,79 @@ class TestOnUpdateClickRefusal:
         mock_stop.assert_not_called()
         mock_clear.assert_called_once()
         runner._icon.notify.assert_called_once()
+
+
+class TestOnUpdateClickBreadcrumbs:
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.spawn_updater_from_tray")
+    @patch("jacked.service.update_status.init_status")
+    def test_init_status_called_before_spawn(
+        self, mock_init, mock_spawn, mock_gate,
+    ):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+
+        call_order = []
+        mock_init.side_effect = lambda *a, **kw: call_order.append("init")
+        mock_spawn.side_effect = lambda *a, **kw: call_order.append("spawn")
+
+        with patch("urllib.request.urlopen"):
+            with patch("webbrowser.open"):
+                with patch.object(runner, "_on_stop"):
+                    runner._on_update_click()
+
+        assert "init" in call_order
+        assert "spawn" in call_order
+        assert call_order.index("init") < call_order.index("spawn")
+
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.service.updater.spawn_updater_from_tray")
+    def test_breadcrumb_appended_to_update_log(
+        self, mock_spawn, mock_gate, tmp_path, monkeypatch,
+    ):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        from jacked.service import updater as updater_mod
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+        monkeypatch.setattr(updater_mod, "UPDATE_LOG", tmp_path / "update.log")
+
+        with patch("urllib.request.urlopen"):
+            with patch("webbrowser.open"):
+                with patch.object(runner, "_on_stop"):
+                    runner._on_update_click()
+
+        log = (tmp_path / "update.log").read_text()
+        assert "tray: update clicked" in log
+        assert "PID" in log
+
+    def test_pre_warm_uses_127_0_0_1_regardless_of_host(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner(host="0.0.0.0", port=8321)
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+
+        captured_urls = []
+        def capture_urlopen(url, *a, **kw):
+            captured_urls.append(url)
+            class _R:
+                def __enter__(self): return self
+                def __exit__(self, *a): pass
+            return _R()
+
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")):
+            with patch("urllib.request.urlopen", side_effect=capture_urlopen):
+                with patch("webbrowser.open") as mock_wb:
+                    with patch("jacked.service.updater.spawn_updater_from_tray"):
+                        with patch.object(runner, "_on_stop"):
+                            runner._on_update_click()
+
+        assert captured_urls
+        assert "127.0.0.1:8321" in captured_urls[0]
+        wb_url = mock_wb.call_args[0][0]
+        assert "127.0.0.1:8321" in wb_url

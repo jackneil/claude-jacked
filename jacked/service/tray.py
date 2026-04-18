@@ -494,6 +494,22 @@ class ServiceRunner:
             return  # already updating/stopping
 
         latest = (self._version_info or {}).get("latest", "?")
+
+        # Breadcrumb FIRST — proves the click reached us even if everything
+        # downstream fails. Uses the same log file the detached updater
+        # appends to.
+        try:
+            import time as _time_mod
+            from jacked.service.updater import UPDATE_LOG as _bc_log
+            _bc_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(_bc_log, "a", encoding="utf-8") as _lf:
+                _lf.write(
+                    f"[{_time_mod.strftime('%Y-%m-%d %H:%M:%S')}] tray: update clicked "
+                    f"(tray PID {os.getpid()}, target v{latest})\n"
+                )
+        except Exception:
+            logger.exception("Could not write tray-click breadcrumb")
+
         try:
             if self._icon:
                 try:
@@ -506,10 +522,11 @@ class ServiceRunner:
                 except Exception:
                     logger.exception("Icon update during update-click failed")
 
-            # Pre-warm /update.html: sync HTTP GET while the service is still
-            # alive, so the browser's subsequent fetch doesn't race against
-            # uvicorn shutdown and hit ERR_CONNECTION_REFUSED.
-            _url = f"http://{self.host}:{self.port}/update.html"
+            # Pre-warm /update.html against loopback regardless of self.host —
+            # self.host may be 0.0.0.0 (bind-all), which clients can't route
+            # to on Linux. The service is always reachable on 127.0.0.1 after
+            # bind.
+            _url = f"http://127.0.0.1:{self.port}/update.html"
             try:
                 import urllib.request as _ur
                 with _ur.urlopen(_url, timeout=2.0):
@@ -521,6 +538,26 @@ class ServiceRunner:
                 _wb.open(_url)
             except Exception:
                 logger.exception("Failed to open update progress page")
+
+            # init_status BEFORE the spawn so the status file exists from t=0.
+            # If the detached child dies before its own init_status, the UI
+            # still has something to show.
+            try:
+                from jacked.service import update_status as _us
+                from jacked.service.updater import UPDATE_LOG as _upd_log
+                from jacked.install_method import detect_install_method as _det
+                from jacked import __version__ as _cv
+                _us.init_status(
+                    _us.UPDATE_STATUS_FILE,
+                    from_version=_cv,
+                    to_version=latest if latest and latest != "?" else "next",
+                    method=_det(),
+                    log_path=str(_upd_log),
+                )
+            except Exception as _e:
+                # LockBusy or other — just log and continue. The updater
+                # will handle its own init.
+                logger.info("Pre-spawn init_status didn't write: %s", _e)
 
             try:
                 from jacked.service.updater import spawn_updater_from_tray
@@ -540,6 +577,7 @@ class ServiceRunner:
                         )
                     except Exception:
                         pass
+                # Tray stays alive — don't _on_stop if the updater didn't spawn
                 return
 
             # RLock reentrancy: _on_stop reacquires the same lock from the same thread.
@@ -584,8 +622,38 @@ class ServiceRunner:
             remove_pid(PID_FILE)
             icon.notify("Jacked failed to start", "Jacked Service")
 
+    def _install_tray_file_logger(self) -> None:
+        """Route `jacked` logger output to ~/.claude/jacked-tray.log.
+
+        Detached launchd/systemd services pipe stderr to /dev/null by default,
+        so without a file handler any `logger.exception` during tray click
+        handling is lost.
+        """
+        try:
+            import logging as _logging
+            from jacked.service import CLAUDE_DIR
+            CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+            tray_log_path = CLAUDE_DIR / "jacked-tray.log"
+            handler = _logging.FileHandler(tray_log_path, encoding="utf-8")
+            handler.setFormatter(
+                _logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+            )
+            _logger = _logging.getLogger("jacked")
+            # Avoid double-adding if run() is called twice in tests.
+            already = any(
+                isinstance(h, _logging.FileHandler)
+                and getattr(h, "baseFilename", None) == str(tray_log_path)
+                for h in _logger.handlers
+            )
+            if not already:
+                _logger.addHandler(handler)
+                _logger.setLevel(_logging.INFO)
+        except Exception:
+            pass  # best-effort; fall back to stderr
+
     def run(self) -> None:
         """Start the service: tray icon on main thread, uvicorn in background."""
+        self._install_tray_file_logger()
         check_tray_deps()
 
         if not _UVICORN_AVAILABLE:
