@@ -13,6 +13,73 @@ def _get_launchd_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
+def _get_systemd_user_unit_path() -> Path:
+    """Path to a potential user-managed systemd unit for jacked on Linux."""
+    return Path.home() / ".config" / "systemd" / "user" / "jacked.service"
+
+
+def native_restart() -> tuple[bool, str]:
+    """Restart jacked via the platform's native lifecycle manager, if any.
+
+    Returns (ok, reason):
+      - (True, "...")  native restart initiated successfully; caller should
+                       stop its own stop+start dance and let the manager
+                       handle respawn.
+      - (False, "...") no native manager available OR manager command failed;
+                       caller should fall back to manual stop+start.
+
+    Per-platform behavior:
+      - macOS:   if ai.hank.jacked.plist is installed, `launchctl kickstart -k`.
+      - Linux:   if user-installed systemd unit exists, `systemctl --user restart`.
+      - Windows: always returns (False, ...) — the Startup-folder VBS doesn't
+                 supervise lifecycle.
+
+    Rationale: on macOS, launchd's `KeepAlive: SuccessfulExit=false` racing
+    against a manual `service stop && service start` causes the "Port 8321
+    is already in use" error users keep hitting. Delegation to kickstart is
+    atomic.
+    """
+    if sys.platform == "darwin":
+        plist_path = _get_launchd_plist_path()
+        if not plist_path.exists():
+            return (False, "launchd plist not installed")
+        uid = os.getuid()
+        try:
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k", f"gui/{uid}/{LAUNCHD_LABEL}"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            return (False, f"launchctl kickstart failed: {exc}")
+        if result.returncode == 0:
+            return (True, f"launchctl kickstart gui/{uid}/{LAUNCHD_LABEL}")
+        return (
+            False,
+            f"launchctl exit {result.returncode}: {result.stderr.strip() or result.stdout.strip()}",
+        )
+
+    if sys.platform.startswith("linux"):
+        unit_path = _get_systemd_user_unit_path()
+        if not unit_path.exists():
+            return (False, "no user systemd unit installed")
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", "jacked"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            return (False, f"systemctl restart failed: {exc}")
+        if result.returncode == 0:
+            return (True, "systemctl --user restart jacked")
+        return (
+            False,
+            f"systemctl exit {result.returncode}: {result.stderr.strip() or result.stdout.strip()}",
+        )
+
+    # Windows: no supervising manager — VBS only fires on login.
+    return (False, "no native lifecycle manager on this platform")
+
+
 def _get_windows_startup_path() -> Path:
     """Return path to the Windows startup VBS script."""
     appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))

@@ -336,8 +336,19 @@ def run_update(
 
         # Phase: starting_service
         _begin("starting_service")
-        log(f"Restarting service: {jacked} service start")
-        _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
+        # On macOS the tray may be managed by launchd with KeepAlive — a plain
+        # detached `jacked service start` races launchd's respawn to bind :port
+        # and usually loses. Delegate to the platform's native lifecycle
+        # manager when present (launchctl kickstart on macOS; systemctl
+        # --user on Linux if user-installed). Fall back to detached Popen
+        # when no manager is present (Windows or unmanaged Linux).
+        from jacked.service.platform import native_restart
+        native_ok, native_reason = native_restart()
+        if native_ok:
+            log(f"Native lifecycle restart: {native_reason}")
+        else:
+            log(f"Restarting service: {jacked} service start (native not used: {native_reason})")
+            _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
         _end("starting_service", "ok")
 
         # Phase: verifying_service
