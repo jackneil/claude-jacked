@@ -188,9 +188,10 @@ class TestOnUpdateClick:
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
         runner._icon = MagicMock()
-        with patch("jacked.service.updater.spawn_updater_from_tray") as mock_spawn:
-            with patch.object(runner, "_on_stop") as mock_stop:
-                runner._on_update_click()
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")):
+            with patch("jacked.service.updater.spawn_updater_from_tray") as mock_spawn:
+                with patch.object(runner, "_on_stop") as mock_stop:
+                    runner._on_update_click()
         mock_spawn.assert_called_once()
         mock_stop.assert_called_once()
 
@@ -231,12 +232,13 @@ class TestOnUpdateClick:
             spawn_calls.append(1)
             _time.sleep(0.1)
 
-        with patch("jacked.service.updater.spawn_updater_from_tray", side_effect=slow_spawn):
-            with patch.object(runner, "_on_stop"):
-                t1 = _threading.Thread(target=runner._on_update_click)
-                t2 = _threading.Thread(target=runner._on_update_click)
-                t1.start(); t2.start()
-                t1.join(); t2.join()
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")):
+            with patch("jacked.service.updater.spawn_updater_from_tray", side_effect=slow_spawn):
+                with patch.object(runner, "_on_stop"):
+                    t1 = _threading.Thread(target=runner._on_update_click)
+                    t2 = _threading.Thread(target=runner._on_update_click)
+                    t1.start(); t2.start()
+                    t1.join(); t2.join()
 
         assert len(spawn_calls) == 1
 
@@ -249,12 +251,13 @@ class TestOnUpdateClick:
         runner._icon = MagicMock()
 
         parent = MagicMock()
-        with patch(
-            "jacked.service.updater.spawn_updater_from_tray",
-            side_effect=lambda *a, **kw: parent.spawn(*a, **kw),
-        ):
-            with patch.object(runner, "_on_stop", side_effect=lambda: parent.stop()):
-                runner._on_update_click()
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")):
+            with patch(
+                "jacked.service.updater.spawn_updater_from_tray",
+                side_effect=lambda *a, **kw: parent.spawn(*a, **kw),
+            ):
+                with patch.object(runner, "_on_stop", side_effect=lambda: parent.stop()):
+                    runner._on_update_click()
 
         names = [c[0] for c in parent.method_calls]
         assert names[0] == "spawn"
@@ -466,3 +469,26 @@ class TestVersionCheckThread:
             runner._stop_event.set()
             t.join(timeout=2)
         assert not t.is_alive()
+
+
+class TestOnUpdateClickRefusal:
+    @patch("jacked.service.update_status.clear_status")
+    @patch(
+        "jacked.install_method.can_auto_upgrade",
+        return_value=(False, "editable — run `git pull && uv sync`"),
+    )
+    @patch("jacked.service.updater.spawn_updater_from_tray")
+    def test_refuses_editable_clears_status_no_spawn_no_stop(
+        self, mock_spawn, mock_gate, mock_clear,
+    ):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+        with patch.object(runner, "_on_stop") as mock_stop:
+            runner._on_update_click()
+        mock_spawn.assert_not_called()
+        mock_stop.assert_not_called()
+        mock_clear.assert_called_once()
+        runner._icon.notify.assert_called_once()

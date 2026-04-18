@@ -464,6 +464,32 @@ class ServiceRunner:
         """
         if not self._version_is_clickable():
             return
+
+        # Pre-flight: refuse editable / pip installs BEFORE we kill the tray.
+        # Without this the detached updater would later fail silently (or with
+        # ModuleNotFoundError on editable dev-clone venvs that don't ship pip)
+        # and the user would be left with a dead tray and no tray to retry from.
+        from jacked.install_method import can_auto_upgrade as _can_upgrade
+        _ok, _reason = _can_upgrade()
+        if not _ok:
+            if self._icon:
+                try:
+                    self._icon.notify(_reason, "Jacked auto-update disabled")
+                except Exception:
+                    logger.exception("Failed to notify on update refusal")
+            try:
+                from jacked.service.updater import RECOVERY_FILE
+                RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                RECOVERY_FILE.write_text(_reason + "\n")
+            except Exception:
+                logger.exception("Could not write recovery file on refusal")
+            try:
+                from jacked.service import update_status as _us
+                _us.clear_status(_us.UPDATE_STATUS_FILE)
+            except Exception:
+                logger.exception("Could not clear stale status file on refusal")
+            return
+
         if not self._lifecycle_lock.acquire(blocking=False):
             return  # already updating/stopping
 
