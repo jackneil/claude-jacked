@@ -53,22 +53,40 @@ def detect_install_method() -> str:
 
     Detection order: uv -> pipx -> editable -> pip (fallback).
     """
+    # IMPORTANT: use `sys.prefix` (venv root), not `Path(sys.executable).resolve()`.
+    # `.resolve()` follows symlinks; uv-tool venvs on macOS typically symlink
+    # `bin/python` to the real interpreter binary (e.g. miniconda's). After
+    # resolve, the path no longer contains `uv/tools/<pkg>/`. `sys.prefix`
+    # always points to the active venv root regardless of symlinks.
+    #
+    # We also check the raw (unresolved) `sys.executable` as a belt-and-
+    # suspenders for environments where sys.prefix is overridden.
+    candidate_paths = []
     try:
-        exe = Path(sys.executable).resolve()
+        candidate_paths.append(Path(sys.prefix))
     except (OSError, RuntimeError):
-        return "pip"
+        pass
+    try:
+        candidate_paths.append(Path(sys.executable))
+    except (OSError, RuntimeError):
+        pass
+    # Resolved exe as a last fingerprint option (can still match if uv-tool
+    # venv stores the real python bin inside uv/tools/<pkg>/).
+    try:
+        candidate_paths.append(Path(sys.executable).resolve())
+    except (OSError, RuntimeError):
+        pass
 
-    parts_lower = [p.lower() for p in exe.parts]
-
-    # uv tool venv path fingerprint: .../uv/tools/<pkg>/...
-    for i, part in enumerate(parts_lower):
-        if part == "tools" and i > 0 and parts_lower[i - 1] == "uv":
-            return "uv"
-
-    # pipx venv path fingerprint: .../pipx/venvs/<pkg>/...
-    for i, part in enumerate(parts_lower):
-        if part == "venvs" and i > 0 and parts_lower[i - 1] == "pipx":
-            return "pipx"
+    for p in candidate_paths:
+        parts_lower = [part.lower() for part in p.parts]
+        # uv tool venv path fingerprint: .../uv/tools/<pkg>/...
+        for i, part in enumerate(parts_lower):
+            if part == "tools" and i > 0 and parts_lower[i - 1] == "uv":
+                return "uv"
+        # pipx venv path fingerprint: .../pipx/venvs/<pkg>/...
+        for i, part in enumerate(parts_lower):
+            if part == "venvs" and i > 0 and parts_lower[i - 1] == "pipx":
+                return "pipx"
 
     # Editable install: look for marker .pth files on sys.path.
     for entry in sys.path:

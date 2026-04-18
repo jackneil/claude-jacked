@@ -39,6 +39,37 @@ class TestDetectEditable:
             assert detect_install_method() == "uv"
 
 
+class TestUvDetectionThroughSymlinks:
+    """Regression: on macOS, uv-tool venvs symlink bin/python to the real
+    Python (e.g. miniconda). `Path(sys.executable).resolve()` follows that
+    symlink and loses the `uv/tools/<pkg>/` fingerprint. Detection must
+    match via `sys.prefix` too."""
+
+    def test_detects_uv_via_sys_prefix_when_exe_resolves_elsewhere(
+        self, monkeypatch,
+    ):
+        """sys.executable resolves to an unrelated path (miniconda-like),
+        but sys.prefix is the uv-tool venv root."""
+        monkeypatch.setattr(
+            "sys.prefix",
+            "/Users/u/.local/share/uv/tools/claude-jacked",
+        )
+        monkeypatch.setattr(
+            "sys.executable",
+            "/Users/u/.local/share/uv/tools/claude-jacked/bin/python",
+        )
+        # Symlink target (the 'resolve' path)
+        from unittest.mock import patch
+        import pathlib
+        real_resolve = pathlib.Path.resolve
+        def fake_resolve(self, *a, **kw):
+            if "uv/tools" in str(self):
+                return pathlib.Path("/opt/homebrew/Caskroom/miniconda/base/bin/python3.12")
+            return real_resolve(self, *a, **kw)
+        with patch("pathlib.Path.resolve", fake_resolve):
+            assert detect_install_method() == "uv"
+
+
 class TestCanAutoUpgrade:
     def test_uv_is_auto_upgradable(self):
         with patch("jacked.install_method.detect_install_method", return_value="uv"):
