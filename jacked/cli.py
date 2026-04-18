@@ -1108,7 +1108,10 @@ def _update_status_shim(phase, status, error, recovery):
         else:
             us_mod.end_phase(path, phase, status=status, error=error, recovery=recovery)
     except ValueError as exc:
+        # Exit non-zero so the Windows batch's `if errorlevel 1` check fires
+        # on phase-name drift between the batch and update_phases.PHASES.
         click.echo(f"[update-status] {exc}", err=True)
+        sys.exit(1)
 
 
 @main.command(name="_update_status_succeed", hidden=True)

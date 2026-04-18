@@ -335,3 +335,14 @@ def test_mark_failed_on_missing_file_is_noop(tmp_path):
     from jacked.service.update_status import mark_failed, read_status
     mark_failed(tmp_path / "nope.json", error="x", recovery="y")
     assert read_status(tmp_path / "nope.json") is None
+
+
+def test_cli_update_status_exits_1_on_unknown_phase(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    result = CliRunner().invoke(main, ["_update_status", "nonexistent_phase", "ok"])
+    assert result.exit_code == 1
