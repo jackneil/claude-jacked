@@ -190,6 +190,26 @@ def mark_succeeded(path: Path) -> None:
     _atomic_write(path, data)
 
 
+def mark_failed(
+    path: Path,
+    error: str,
+    recovery: Optional[str] = None,
+) -> None:
+    """Mark overall=failed with an explicit error/recovery.
+
+    Use when a failure happens OUTSIDE any active phase (pre-flight failure,
+    post-phase exception). No-op if the status file doesn't exist.
+    """
+    data = _read_raw(path)
+    if data is None:
+        return
+    data["overall"] = "failed"
+    data["error"] = error
+    if recovery:
+        data["recovery"] = recovery
+    _atomic_write(path, data)
+
+
 def clear_status(path: Path) -> None:
     """Delete the status file. Used by the tray's refusal path."""
     try:

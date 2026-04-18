@@ -301,3 +301,37 @@ def test_update_html_is_served_as_itself_not_spa_rewritten():
     assert r.status_code == 200
     assert "Jacked is updating" in r.text
     assert "waiting_for_parent" in r.text
+
+
+def test_mark_failed_sets_overall_with_error_and_recovery(tmp_path):
+    from jacked.service.update_status import (
+        init_status, mark_failed, read_status,
+    )
+    p = tmp_path / "status.json"
+    init_status(p, from_version="a", to_version="b", method="uv")
+    mark_failed(p, error="uv not on PATH",
+                recovery="Install uv from https://docs.astral.sh/uv/")
+    data = read_status(p)
+    assert data["overall"] == "failed"
+    assert data["error"] == "uv not on PATH"
+    assert data["recovery"] == "Install uv from https://docs.astral.sh/uv/"
+
+
+def test_mark_failed_preserves_existing_phases(tmp_path):
+    from jacked.service.update_status import (
+        init_status, begin_phase, end_phase, mark_failed, read_status,
+    )
+    p = tmp_path / "status.json"
+    init_status(p, from_version="a", to_version="b", method="uv")
+    begin_phase(p, "installing_package")
+    end_phase(p, "installing_package", status="ok")
+    mark_failed(p, error="downstream step errored", recovery="")
+    data = read_status(p)
+    assert data["overall"] == "failed"
+    assert data["phases"][0]["status"] == "ok"
+
+
+def test_mark_failed_on_missing_file_is_noop(tmp_path):
+    from jacked.service.update_status import mark_failed, read_status
+    mark_failed(tmp_path / "nope.json", error="x", recovery="y")
+    assert read_status(tmp_path / "nope.json") is None
