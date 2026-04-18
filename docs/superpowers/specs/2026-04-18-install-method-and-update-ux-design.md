@@ -139,10 +139,12 @@ Phase names are stable identifiers:
 Per-phase `status` values: `in_progress`, `ok`, `failed`. Overall:
 `in_progress`, `succeeded`, `failed`.
 
-### Component 4 — `/update` progress page
+### Component 4 — `/update.html` progress page
 
-New page in the dashboard at `/update`. Static HTML + JS, served by the
-current live service **before** the tray kills itself.
+New page in the dashboard at `/update.html`. Static HTML + JS, served by the
+current live service **before** the tray kills itself. The `.html` suffix
+is intentional — without it the SPA catch-all in `jacked/api/main.py` would
+fall back to `index.html` instead of serving our dedicated page.
 
 The page:
 
@@ -158,10 +160,13 @@ The page:
    the dashboard home (`http://127.0.0.1:{port}/`).
 6. If the status JSON ends with `overall: "failed"`, shows the error and the
    recovery instructions from the JSON.
-7. If the status file's last modification time is older than 120s AND the
-   service is unreachable AND the page hasn't seen a version match, shows
-   "Update appears stuck — see log" and exposes the log path plus a "reopen
-   dashboard" button.
+7. If the status file's **server-reported** `mtime` (exposed by
+   `/api/update/status` in a new `mtime_iso` field) is older than 120s AND
+   the service is unreachable AND the page hasn't seen a version match,
+   shows "Update appears stuck — see log" and exposes the log path plus a
+   "reopen dashboard" button. Using server-reported mtime (not client-side
+   `lastStatusSeenAt`) survives page reloads and doesn't reset on repeated
+   reads of a stale file.
 
 ### Component 5 — `/api/update/status` endpoint
 
@@ -188,7 +193,7 @@ The browser tab opens BEFORE the tray dies. Once open, the page's JS is
 driving everything — it survives the service being torn down and re-created.
 
 On Windows the cmd.exe batch opens the page itself as a fallback (after
-parent PID has exited), using `start "" http://127.0.0.1:{port}/update`.
+parent PID has exited), using `start "" http://127.0.0.1:{port}/update.html`.
 If the user already opened it from the tray's `webbrowser.open()` call, this
 just focuses the existing tab.
 
