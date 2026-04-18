@@ -184,7 +184,7 @@ New flow in `_on_update_click`:
 
 ```
 if not can_auto_upgrade(): notify + return
-open browser: http://127.0.0.1:{port}/update
+open browser: http://127.0.0.1:{port}/update.html
 spawn detached updater
 stop tray
 ```

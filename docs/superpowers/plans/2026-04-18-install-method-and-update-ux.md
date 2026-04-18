@@ -1756,32 +1756,31 @@ Then wrap each phase explicitly. For each phase, the rule is: **exactly one `_be
 **Phase `waiting_for_parent`:**
 
 ```python
-    try:
-        _begin("waiting_for_parent")
-        log(f"Waiting for parent PID {parent_pid} to exit")
-        if not wait_for_exit(parent_pid, timeout=15.0):
-            log(f"Parent {parent_pid} still alive after 15s — SIGKILL")
-            _force_kill_pid(parent_pid)
-            if not wait_for_exit(parent_pid, timeout=5.0):
-                log(f"Parent {parent_pid} still alive after SIGKILL — continuing anyway")
-                _end("waiting_for_parent", "failed",
-                     error="parent PID did not exit; upgrade may collide",
-                     recovery="kill -9 the parent PID manually then: jacked service start")
-            else:
-                _end("waiting_for_parent", "ok")
+    _begin("waiting_for_parent")
+    log(f"Waiting for parent PID {parent_pid} to exit")
+    if not wait_for_exit(parent_pid, timeout=15.0):
+        log(f"Parent {parent_pid} still alive after 15s — SIGKILL")
+        _force_kill_pid(parent_pid)
+        if not wait_for_exit(parent_pid, timeout=5.0):
+            log(f"Parent {parent_pid} still alive after SIGKILL — continuing anyway")
+            _end("waiting_for_parent", "failed",
+                 error="parent PID did not exit; upgrade may collide",
+                 recovery="kill -9 the parent PID manually then: jacked service start")
         else:
             _end("waiting_for_parent", "ok")
+    else:
+        _end("waiting_for_parent", "ok")
 ```
 
 **Phase `installing_package`:** wrap the existing `subprocess.run(cmd)` block. On `returncode == 0` → `_end("installing_package", "ok")`. On failure: `_end("installing_package", "failed", error=f"exit {result.returncode}", recovery=label)` and THEN `_write_recovery(...)` as before, then `return`.
 
 **Phase `migrating_settings`:** wrap the `jacked install --force` subprocess.run. Non-zero returncode → `_end("migrating_settings", "failed", error=f"exit {migrate_result.returncode}", recovery="jacked install --force")` + return. Zero → `_end("migrating_settings", "ok")`.
 
-**Phase `waiting_port_free`:** wrap the port-wait loop. On success (port free) → `_end("waiting_port_free", "ok")`. On final-failure-with-port-still-bound → existing `_write_recovery(...)` path, AND `_end("waiting_port_free", "failed", error="port 8321 still bound", recovery="kill the holder manually then jacked service start")` + `return`.
+**Phase `waiting_port_free`:** wrap the port-wait loop. On success (port free) → `_end("waiting_port_free", "ok")`. On final-failure-with-port-still-bound → existing `_write_recovery(...)` path, AND `_end("waiting_port_free", "failed", error=f"port {port} still bound", recovery=f"kill the process holding :{port} manually then jacked service start")` + `return`.
 
 **Phase `starting_service`:** wrap `_spawn_detached([jacked, "service", "start"], ...)`. Popen immediately returns — but we don't know success yet. Emit `_end("starting_service", "ok")` right after spawn (Popen succeeded), and rely on `verifying_service` to catch the actual "did it come up" outcome.
 
-**Phase `verifying_service`:** wrap the verify-loop. On `came_up` → `_end("verifying_service", "ok")`. Otherwise → `_end("verifying_service", "failed", error="new service did not bind :8321 within 20s", recovery="jacked service start")` + existing `_write_recovery(...)`.
+**Phase `verifying_service`:** wrap the verify-loop. On `came_up` → `_end("verifying_service", "ok")`. Otherwise → `_end("verifying_service", "failed", error=f"new service did not bind :{port} within 20s", recovery="jacked service start")` + existing `_write_recovery(...)`.
 
 At the end of the fully-successful path (after the verify-ok path), add:
 
@@ -1871,6 +1870,33 @@ class TestWindowsBatchCallsUpdateStatus:
             # Browser-open fallback
             assert 'start "" "http://' in body
             assert "/update.html" in body
+        finally:
+            import os as _os
+            try: _os.unlink(batch_path)
+            except OSError: pass
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe")
+    @patch("subprocess.Popen")
+    def test_batch_uses_next_placeholder_when_target_version_missing(
+        self, mock_popen, mock_find, mock_method, monkeypatch, tmp_path,
+    ):
+        """When the tray can't resolve the latest version (offline, PyPI
+        unreachable), target_version=None — batch still runs but emits
+        the placeholder. HTML page's renderMeta() hides 'next' explicitly."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+        updater._spawn_windows_tray_updater(
+            parent_pid=12345, extras="tray", target_version=None,
+        )
+        batch_path = mock_popen.call_args[0][0][2]
+        body = open(batch_path).read()
+        try:
+            assert '"next"' in body, "next placeholder should appear as to_version fallback"
+            # Phases still all present — degraded-but-functional update path
+            assert "waiting_for_parent in_progress" in body
+            assert "_update_status_succeed" in body
         finally:
             import os as _os
             try: _os.unlink(batch_path)
@@ -1973,7 +1999,7 @@ def _spawn_windows_tray_updater(
         'jacked _update_status verifying_service in_progress\r\n'
         'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++){try{$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:' + str(port) + '/api/version -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}Start-Sleep -Milliseconds 500} exit 1"\r\n'
         'if errorlevel 1 (\r\n'
-        '    jacked _update_status verifying_service failed --error "service did not bind :8321 in 20s" --recovery "jacked service start"\r\n'
+        '    jacked _update_status verifying_service failed --error "service did not bind :' + str(port) + ' in 20s" --recovery "jacked service start"\r\n'
         '    echo Jacked tray update: service did not come up. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 1\r\n'
         ')\r\n'
