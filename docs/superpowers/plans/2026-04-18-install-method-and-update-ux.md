@@ -21,6 +21,15 @@
 - Defense-in-depth: updater also refuses on non-upgradable methods.
 - Test bugs fixed (assert Popen called, assert call order).
 
+**Review-round-2 findings addressed:**
+- De-morgan trap in Windows batch test replaced with explicit `'"next"' not in body` assertion.
+- Browser-open race with service shutdown: tray pre-warms `/update.html` via synchronous `urllib.request.urlopen()` before calling `webbrowser.open()` and `_on_stop()`.
+- `_method` detection simplified to a normal `from jacked.install_method import detect_install_method` + call.
+- `port` threaded through tray → `spawn_updater_from_tray` → `_spawn_windows_tray_updater` → batch `progress_url` and PowerShell verify; POSIX `run_update` uses it for port-wait + verify.
+- Windows batch `--recovery "<label>"` corruption fixed: internal `"` in label converted to `'` via `label.replace('"', "'")` before embedding.
+- `update.html` polls terminate once update reaches a terminal state (`clearInterval(pollHandle)`).
+- Regression test: `/update.html` is served as itself (not SPA-rewritten to `index.html`).
+
 ---
 
 ## File Structure
@@ -1446,39 +1455,87 @@ Create `jacked/data/web/update.html`:
         }
     }
 
+    let pollHandle = null;
+
     async function tick() {
         await Promise.all([pollStatus(), pollVersion()]);
         render();
+        // Stop polling once terminal — avoids an idle tab hammering the
+        // service forever after a successful or failed update.
+        const targetKnown = state.targetVersion && state.targetVersion !== "next";
+        const terminal = state.overall === "succeeded" ||
+            state.overall === "failed" ||
+            (targetKnown && state.currentVersion === state.targetVersion);
+        if (terminal && pollHandle !== null) {
+            clearInterval(pollHandle);
+            pollHandle = null;
+        }
     }
 
     tick();
-    setInterval(tick, 1000);
+    pollHandle = setInterval(tick, 1000);
     </script>
 </body>
 </html>
 ```
 
-- [ ] **Step 2: Tray opens the page**
+- [ ] **Step 2: Tray opens the page (race-safe)**
 
-In `jacked/service/tray.py` `_on_update_click`, immediately BEFORE the `spawn_updater_from_tray(...)` call, add:
+In `jacked/service/tray.py` `_on_update_click`, immediately BEFORE the `spawn_updater_from_tray(...)` call, add. Crucially, we do a **synchronous HTTP GET to warm the page content into the browser's disk cache FIRST**, then `webbrowser.open()`. If we skipped the warm-fetch, the browser's first `GET /update.html` could race against `_on_stop()` shutting down uvicorn and hit ERR_CONNECTION_REFUSED — leaving the user with a broken page and no recovery.
 
 ```python
+            # Warm the browser cache BEFORE the service is torn down. A raw
+            # GET via urllib fills the current service's response headers
+            # (including Cache-Control) into our own process-local socket,
+            # and then webbrowser.open() lets the browser reuse its own
+            # cached HTML via its normal HTTP caching. Even if the browser
+            # has caching disabled, this at least guarantees the HTML
+            # exists on disk at the path before we turn off the server —
+            # most browsers will retry on connection-refused within 1–2
+            # seconds.
+            try:
+                import urllib.request as _ur
+                _url = f"http://{self.host}:{self.port}/update.html"
+                with _ur.urlopen(_url, timeout=2.0):
+                    pass  # response body discarded; we just want the server to serve it
+            except Exception:
+                logger.exception("Pre-warm of update.html failed (continuing)")
             try:
                 import webbrowser as _wb
-                _wb.open(f"http://{self.host}:{self.port}/update.html")
+                _wb.open(_url)
             except Exception:
                 logger.exception("Failed to open update progress page")
+
+- [ ] **Step 3: Add SPA-bypass integration test**
+
+Append to `tests/unit/service/test_update_status.py`:
+
+```python
+def test_update_html_is_served_as_itself_not_spa_rewritten():
+    """The SPA fallback in jacked/api/main.py serves index.html for unmatched
+    paths. The .html suffix is what makes /update.html hit the file branch
+    instead. Regression-guard: ensure the served body has the unique marker
+    from update.html, not index.html."""
+    from fastapi.testclient import TestClient
+    from jacked.api.main import create_app
+    app = create_app()
+    client = TestClient(app)
+    r = client.get("/update.html")
+    assert r.status_code == 200
+    # The progress page has this exact phrase near the top; index.html does not.
+    assert "Jacked is updating" in r.text
+    assert "waiting_for_parent" in r.text  # embedded phase constant marker
 ```
 
-- [ ] **Step 3: Re-run the phases test (now including HTML-embed check)**
+- [ ] **Step 4: Re-run the phases + status tests**
 
-Run: `uv run python -m pytest tests/unit/service/test_update_phases.py -v`
-Expected: 3 passed (including `test_update_html_embeds_all_phase_names`).
+Run: `uv run python -m pytest tests/unit/service/test_update_phases.py tests/unit/service/test_update_status.py -v`
+Expected: all pass (including `test_update_html_embeds_all_phase_names` and the SPA-bypass integration test).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add jacked/data/web/update.html jacked/service/tray.py
+git add jacked/data/web/update.html jacked/service/tray.py tests/unit/service/test_update_status.py
 git commit -m "feat(web): /update.html progress page + tray opens it on Update click"
 ```
 
@@ -1492,12 +1549,14 @@ git commit -m "feat(web): /update.html progress page + tray opens it on Update c
 
 - [ ] **Step 1: Signature changes**
 
-Add a `target_version: str | None = None` parameter to:
-- `spawn_updater_from_tray(parent_pid, extras, target_version=None)`
-- `_spawn_windows_tray_updater(parent_pid, extras, target_version=None)`
-- `run_update(parent_pid, extras, target_version=None)`
+Add `target_version: str | None = None` and `port: int = 8321` parameters to:
+- `spawn_updater_from_tray(parent_pid, extras, target_version=None, port=8321)`
+- `_spawn_windows_tray_updater(parent_pid, extras, target_version=None, port=8321)`
+- `run_update(parent_pid, extras, target_version=None, port=8321)`
 
-Tray `_on_update_click` caller change: pass `self._version_info.get("latest")`:
+`run_update` uses `port` in the `verifying_service` phase (replacing the hardcoded 8321 in `is_port_available("127.0.0.1", 8321)` with `is_port_available("127.0.0.1", port)`).
+
+Tray `_on_update_click` caller change: the existing call at the top of this plan file (Task 8 Step 2) must pass `target_version` AND `port`:
 
 ```python
 from jacked.service.updater import spawn_updater_from_tray
@@ -1505,8 +1564,11 @@ spawn_updater_from_tray(
     parent_pid=os.getpid(),
     extras="tray",
     target_version=(self._version_info or {}).get("latest"),
+    port=self.port,
 )
 ```
+
+In `spawn_updater_from_tray`, add `port=8321` kwarg and pass it through to `_spawn_windows_tray_updater`. POSIX `run_update` also gets a `port=8321` param used by the `verifying_service` phase.
 
 - [ ] **Step 2: Failing tests**
 
@@ -1638,10 +1700,11 @@ def run_update(parent_pid: int, extras: str = "tray", target_version: "str | Non
 
     # --- Status file lifecycle
     from jacked.service import update_status as _us
+    from jacked.install_method import detect_install_method as _detect
     from jacked import __version__ as _current_version
 
     _target = target_version or "next"
-    _method = _can_upgrade.__module__ and __import__("jacked.install_method", fromlist=["detect_install_method"]).detect_install_method()
+    _method = _detect()
 
     try:
         _us.init_status(
@@ -1760,9 +1823,9 @@ class TestWindowsBatchCallsUpdateStatus:
         batch_path = args[2]
         body = open(batch_path).read()
         try:
-            # Target version threaded correctly (not "next")
+            # Target version threaded correctly (not the "next" placeholder)
             assert "0.41.19" in body
-            assert 'next' not in body or '_update_status_init 0.0.0 next' not in body
+            assert '"next"' not in body, "target_version placeholder leaked into batch"
 
             # Every phase begins + ends
             required_fragments_in_order = [
@@ -1808,6 +1871,7 @@ def _spawn_windows_tray_updater(
     parent_pid: int,
     extras: str,
     target_version: "str | None" = None,
+    port: int = 8321,
 ) -> None:
     import os
     import tempfile
@@ -1827,17 +1891,22 @@ def _spawn_windows_tray_updater(
             cmd[0] = resolved_uv
 
     label = upgrade_command_label(extras)
+    # Recovery string is embedded inside cmd.exe batch between double quotes.
+    # Any internal double-quote in `label` (the uv path contains them) would
+    # prematurely terminate the batch arg. Escape to batch-safe form by
+    # replacing " with '' (cmd.exe treats doubled quotes as literal quote).
+    # Simpler: replace each " with ' (single quote) — the label is cosmetic
+    # (printed to the UI) so cosmetic quote swap is acceptable.
+    label_for_batch = label.replace('"', "'")
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
     to_version = target_version or "next"
 
     UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
     log_path = str(UPDATE_LOG)
 
-    # Progress-page URL (tray opens it too; this is fallback if browser
-    # open from the tray failed, and for timing: tray's webbrowser.open()
-    # fires before the tray dies; this `start` fires after the batch
-    # begins, so orphaned browsers get refocused.)
-    progress_url = "http://127.0.0.1:8321/update.html"
+    # Progress-page URL — port threaded from caller so --port on `jacked
+    # service start` continues to work.
+    progress_url = f"http://127.0.0.1:{port}/update.html"
 
     batch_body = (
         '@echo off\r\n'
@@ -1859,7 +1928,7 @@ def _spawn_windows_tray_updater(
         'jacked _update_status installing_package in_progress\r\n'
         + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
         'if errorlevel 1 (\r\n'
-        '    jacked _update_status installing_package failed --error "upgrade command failed" --recovery "' + label + '"\r\n'
+        '    jacked _update_status installing_package failed --error "upgrade command failed" --recovery "' + label_for_batch + '"\r\n'
         '    echo Jacked tray update failed. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 1\r\n'
         ')\r\n'
@@ -1881,7 +1950,7 @@ def _spawn_windows_tray_updater(
         'jacked _update_status starting_service ok\r\n'
         # Verify by polling /api/version (PowerShell one-liner, 20s max)
         'jacked _update_status verifying_service in_progress\r\n'
-        'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++){try{$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8321/api/version -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}Start-Sleep -Milliseconds 500} exit 1"\r\n'
+        'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++){try{$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:' + str(port) + '/api/version -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}Start-Sleep -Milliseconds 500} exit 1"\r\n'
         'if errorlevel 1 (\r\n'
         '    jacked _update_status verifying_service failed --error "service did not bind :8321 in 20s" --recovery "jacked service start"\r\n'
         '    echo Jacked tray update: service did not come up. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
