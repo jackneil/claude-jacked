@@ -1061,6 +1061,56 @@ def _valid_hook_names() -> frozenset[str]:
     )
 
 
+@main.command(name="_update_status_init", hidden=True)
+@click.argument("from_version")
+@click.argument("to_version")
+@click.argument("method")
+@click.option("--log-path", default=None)
+def _update_status_init_shim(from_version, to_version, method, log_path):
+    """Internal: initialize a fresh update-status file.
+
+    Exit 0 on success, 2 on LockBusy (another updater active).
+    The Windows batch checks errorlevel and aborts on 2.
+    """
+    from jacked.service import update_status as us_mod
+    try:
+        us_mod.init_status(
+            us_mod.UPDATE_STATUS_FILE,
+            from_version=from_version,
+            to_version=to_version,
+            method=method,
+            log_path=log_path,
+        )
+    except us_mod.LockBusy as exc:
+        click.echo(f"[update-status] lock busy: {exc}", err=True)
+        sys.exit(2)
+
+
+@main.command(name="_update_status", hidden=True)
+@click.argument("phase")
+@click.argument("status")
+@click.option("--error", default=None)
+@click.option("--recovery", default=None)
+def _update_status_shim(phase, status, error, recovery):
+    """Internal: write one status transition. `status` is in_progress|ok|failed."""
+    from jacked.service import update_status as us_mod
+    path = us_mod.UPDATE_STATUS_FILE
+    try:
+        if status == "in_progress":
+            us_mod.begin_phase(path, phase)
+        else:
+            us_mod.end_phase(path, phase, status=status, error=error, recovery=recovery)
+    except ValueError as exc:
+        click.echo(f"[update-status] {exc}", err=True)
+
+
+@main.command(name="_update_status_succeed", hidden=True)
+def _update_status_succeed_shim():
+    """Internal: mark overall=succeeded on the update-status file."""
+    from jacked.service import update_status as us_mod
+    us_mod.mark_succeeded(us_mod.UPDATE_STATUS_FILE)
+
+
 @main.command(name="_hook", hidden=True)
 @click.argument("name")
 def _hook_shim(name: str):

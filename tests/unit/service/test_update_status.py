@@ -189,3 +189,103 @@ def test_api_endpoint_returns_status_content_with_mtime(tmp_path, monkeypatch):
     body = r.json()
     assert body["status"]["current_phase"] == "installing_package"
     assert body["mtime_iso"] is not None
+
+
+def test_cli_update_status_init(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+    result = CliRunner().invoke(
+        main, ["_update_status_init", "0.41.18", "0.41.19", "uv"],
+    )
+    assert result.exit_code == 0
+    data = us_mod.read_status(tmp_path / "status.json")
+    assert data["from_version"] == "0.41.18"
+    assert data["to_version"] == "0.41.19"
+    assert data["method"] == "uv"
+
+
+def test_cli_update_status_init_accepts_log_path(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+    CliRunner().invoke(
+        main,
+        ["_update_status_init", "a", "b", "uv", "--log-path", "/tmp/foo.log"],
+    )
+    data = us_mod.read_status(tmp_path / "status.json")
+    assert data["log_path"] == "/tmp/foo.log"
+
+
+def test_cli_update_status_init_exits_2_on_lock_busy(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")  # active
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    result = CliRunner().invoke(main, ["_update_status_init", "a", "b", "uv"])
+    assert result.exit_code == 2
+
+
+def test_cli_update_status_begin(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    result = CliRunner().invoke(
+        main, ["_update_status", "installing_package", "in_progress"],
+    )
+    assert result.exit_code == 0
+    assert us_mod.read_status(p)["current_phase"] == "installing_package"
+
+
+def test_cli_update_status_end_ok(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    us_mod.begin_phase(p, "installing_package")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    result = CliRunner().invoke(
+        main, ["_update_status", "installing_package", "ok"],
+    )
+    assert result.exit_code == 0
+    assert us_mod.read_status(p)["phases"][0]["status"] == "ok"
+
+
+def test_cli_update_status_failed_with_error(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    us_mod.begin_phase(p, "installing_package")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    result = CliRunner().invoke(
+        main,
+        ["_update_status", "installing_package", "failed",
+         "--error", "upgrade failed",
+         "--recovery", "retry command"],
+    )
+    assert result.exit_code == 0
+    data = us_mod.read_status(p)
+    assert data["overall"] == "failed"
+    assert data["error"] == "upgrade failed"
+
+
+def test_cli_update_status_succeed(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    result = CliRunner().invoke(main, ["_update_status_succeed"])
+    assert result.exit_code == 0
+    assert us_mod.read_status(p)["overall"] == "succeeded"
