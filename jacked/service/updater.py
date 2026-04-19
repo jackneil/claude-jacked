@@ -342,12 +342,21 @@ def run_update(
         # manager when present (launchctl kickstart on macOS; systemctl
         # --user on Linux if user-installed). Fall back to detached Popen
         # when no manager is present (Windows or unmanaged Linux).
-        from jacked.service.platform import native_restart
-        native_ok, native_reason = native_restart()
-        if native_ok:
-            log(f"Native lifecycle restart: {native_reason}")
+        from jacked.service.platform import ensure_native_lifecycle, native_restart
+        ens_ok, ens_state, ens_reason = ensure_native_lifecycle()
+        if ens_ok:
+            if ens_state == "just_installed":
+                log(f"Native lifecycle freshly installed (RunAtLoad booted service): {ens_reason}")
+            else:
+                # already_installed → atomic kickstart
+                native_ok, native_reason = native_restart()
+                if native_ok:
+                    log(f"Native lifecycle restart: {native_reason}")
+                else:
+                    log(f"Native kickstart failed ({native_reason}); fallback to manual spawn")
+                    _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
         else:
-            log(f"Restarting service: {jacked} service start (native not used: {native_reason})")
+            log(f"Native lifecycle unavailable ({ens_reason}); manual spawn")
             _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
         _end("starting_service", "ok")
 
