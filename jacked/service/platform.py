@@ -80,6 +80,58 @@ def native_restart() -> tuple[bool, str]:
     return (False, "no native lifecycle manager on this platform")
 
 
+def ensure_native_lifecycle() -> tuple[bool, str, str]:
+    """Ensure the platform's native lifecycle manager is configured.
+
+    Returns a 3-tuple: (ok, state, reason).
+
+    - (True, "already_installed", "..."):  plist/unit was present; caller
+      should run native_restart() to atomically restart the job.
+    - (True, "just_installed", "..."):     we just wrote the plist and
+      launchd already started the service via RunAtLoad=true.  Caller
+      should SKIP native_restart (the job is already fresh and running).
+    - (False, "unavailable", reason):      no plist/unit and we can't
+      create one (Linux systemd: user DIYs; Windows: no manager).
+      Caller falls through to manual stop+start.
+
+    macOS: auto-creates the plist via in-process call to install_autostart()
+    — no subprocess shell-out.  Eliminates the class of bugs that bit us
+    when 0.41.17 detection mis-classified and the ad-hoc "jacked install
+    --tray" command didn't exist.
+
+    Before creating the plist, if an ad-hoc jacked service is running on
+    DEFAULT_PORT (held by some other user-initiated `jacked service start`),
+    stop it first so launchctl load's RunAtLoad can bind the port cleanly.
+    """
+    if sys.platform == "darwin":
+        plist_path = _get_launchd_plist_path()
+        if plist_path.exists():
+            return (True, "already_installed", "launchd plist already installed")
+
+        # Ad-hoc service may be holding :DEFAULT_PORT.  Stop it so the
+        # RunAtLoad inside install_autostart can bind cleanly.
+        from jacked.service import PID_FILE
+        from jacked.service.process import stop_process_graceful
+        stop_process_graceful(PID_FILE)
+
+        status = install_autostart()
+        if plist_path.exists():
+            return (True, "just_installed", status)
+        return (False, "unavailable", f"install_autostart did not produce plist: {status}")
+
+    if sys.platform.startswith("linux"):
+        unit_path = _get_systemd_user_unit_path()
+        if unit_path.exists():
+            return (True, "already_installed", "systemd user unit already installed")
+        return (
+            False, "unavailable",
+            "no systemd user unit installed — create one manually to enable "
+            "native restart.  See docs.",
+        )
+
+    return (False, "unavailable", "no native lifecycle manager on this platform")
+
+
 def _get_windows_startup_path() -> Path:
     """Return path to the Windows startup VBS script."""
     appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
