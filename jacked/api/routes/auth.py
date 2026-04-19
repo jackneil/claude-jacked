@@ -10,6 +10,7 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +36,12 @@ router = APIRouter()
 # threshold we treat the lock as orphaned and allow a fresh attempt.
 _bulk_refresh_lock = asyncio.Lock()
 _bulk_refresh_acquired_at: float = 0.0
+# 0.41.23: track the task holding the lock so the stale-lock guard can
+# cancel it before swapping in a fresh lock.
+_bulk_refresh_task: "asyncio.Task | None" = None
 _BULK_REFRESH_STALE_AFTER = 180.0  # 4 accts * ~20s worst case + slack
+# 0.41.23: max seconds per account in bulk refresh before declaring it hung.
+_BULK_PER_ACCOUNT_TIMEOUT = 60.0
 
 # --- Pydantic v2 request/response models ---
 
@@ -641,7 +647,7 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
     # If a prior holder has been inside the lock longer than the stale
     # threshold, assume it's orphaned and force-reset — we'd rather
     # double-fetch than be permanently wedged at 409.
-    global _bulk_refresh_lock, _bulk_refresh_acquired_at
+    global _bulk_refresh_lock, _bulk_refresh_acquired_at, _bulk_refresh_task
     if _bulk_refresh_lock.locked():
         held_for = time.time() - _bulk_refresh_acquired_at if _bulk_refresh_acquired_at else 0
         if held_for > _BULK_REFRESH_STALE_AFTER:
@@ -649,8 +655,20 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
                 "Bulk refresh lock held %ds (> %ds) — forcing reset",
                 int(held_for), int(_BULK_REFRESH_STALE_AFTER),
             )
+            orphan = _bulk_refresh_task
+            if orphan is not None and not orphan.done():
+                orphan.cancel()
+                # Fire-and-forget: do NOT await the orphan.  The event
+                # loop delivers the cancel on its next tick.  Awaiting
+                # here would re-raise CancelledError in a way that's
+                # impossible to distinguish portably from "we were
+                # cancelled ourselves" on Python 3.10 (no
+                # Task.cancelling()).  The orphan was hung >180s already
+                # — its cancellation-time DB writes are no less suspect
+                # with a 2s wait than without one.
             _bulk_refresh_lock = asyncio.Lock()
             _bulk_refresh_acquired_at = 0.0
+            _bulk_refresh_task = None
         else:
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -659,134 +677,168 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
 
     async with _bulk_refresh_lock:
         _bulk_refresh_acquired_at = time.time()
-        accounts = db.list_accounts(include_inactive=False)
-        refreshed = 0
-        failed = 0
-        results = []
-        ws_registry = getattr(request.app.state, "ws_registry", None)
-        total = len(accounts)
+        my_task = asyncio.current_task()
+        _bulk_refresh_task = my_task
+        try:
+            accounts = db.list_accounts(include_inactive=False)
+            refreshed = 0
+            failed = 0
+            results = []
+            ws_registry = getattr(request.app.state, "ws_registry", None)
+            total = len(accounts)
 
-        # Read active account ID once from file — avoids per-iteration keychain
-        # subprocess calls.  File-only is acceptable because
-        # sync_credential_to_all_stores() writes both file and keychain
-        # atomically, so they should always agree on _jackedAccountId.
-        from jacked.api.credential_helpers import read_fresh_active_token
-        active_acct_id = None
-        cred_path = Path.home() / ".claude" / ".credentials.json"
-        if cred_path.exists() and not cred_path.is_symlink():
-            try:
-                cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
-                active_acct_id = cred_data.get("_jackedAccountId")
-            except (json.JSONDecodeError, OSError):
-                pass
+            # Read active account ID once from file — avoids per-iteration keychain
+            # subprocess calls.  File-only is acceptable because
+            # sync_credential_to_all_stores() writes both file and keychain
+            # atomically, so they should always agree on _jackedAccountId.
+            from jacked.api.credential_helpers import read_fresh_active_token
+            active_acct_id = None
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
+                    active_acct_id = cred_data.get("_jackedAccountId")
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        if active_acct_id is not None:
-            logger.debug(
-                "Bulk refresh: active account from credential file = %s",
-                active_acct_id,
-            )
-        else:
-            logger.debug(
-                "Bulk refresh: no _jackedAccountId in credential file — "
-                "all accounts will use DB tokens"
-            )
-
-        # Notify frontend: full queue so cards can show "Waiting..." immediately
-        if ws_registry:
-            await ws_registry.broadcast(
-                "usage_refresh_started",
-                {"account_ids": [a["id"] for a in accounts], "total": total},
-            )
-
-        for i, acct in enumerate(accounts):
-            if skip_account is not None and acct["id"] == skip_account:
-                continue
-            if i > 0:
-                await asyncio.sleep(2.0)  # Rate-limit pacing
-
-            # Notify frontend: this account is being checked
-            if ws_registry:
-                await ws_registry.broadcast(
-                    "usage_refresh_progress",
-                    {"account_id": acct["id"], "status": "checking",
-                     "progress": i + 1, "total": total},
-                )
-
-            effective_token = None
-            if acct["id"] == active_acct_id:
-                fresh_token = read_fresh_active_token(acct["id"])
-                db_token = acct.get("access_token")
-                if fresh_token and fresh_token != db_token:
-                    effective_token = fresh_token
-            usage_data = await fetch_usage(acct["id"], db, access_token=effective_token, manual=True)
-
-            # Cache hits return {"_cached": True} — read stored values from DB
-            is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
-            if is_cached:
-                usage_data = None  # Treat as skip — use DB values below
-
-            is_backed_off = isinstance(usage_data, dict) and usage_data.get("_backed_off")
-            if is_backed_off:
-                usage_data = None
-
-            if usage_data is not None:
-                refreshed += 1
-                five_hour = usage_data.get("five_hour", {})
-                seven_day = usage_data.get("seven_day", {})
-                results.append(
-                    {
-                        "account_id": acct["id"],
-                        "email": acct["email"],
-                        "success": True,
-                        "cached_usage_5h": five_hour.get("utilization"),
-                        "cached_usage_7d": seven_day.get("utilization"),
-                    }
-                )
-            elif is_cached:
-                # Cache hit — report existing DB values, count as success
-                refreshed += 1
-                results.append(
-                    {
-                        "account_id": acct["id"],
-                        "email": acct["email"],
-                        "success": True,
-                        "cached_usage_5h": acct.get("cached_usage_5h"),
-                        "cached_usage_7d": acct.get("cached_usage_7d"),
-                    }
+            if active_acct_id is not None:
+                logger.debug(
+                    "Bulk refresh: active account from credential file = %s",
+                    active_acct_id,
                 )
             else:
-                failed += 1
-                updated_acct = db.get_account(acct["id"])
-                results.append(
-                    {
-                        "account_id": acct["id"],
-                        "email": acct["email"],
-                        "success": False,
-                        "error": updated_acct.get("last_error") if updated_acct else None,
-                    }
+                logger.debug(
+                    "Bulk refresh: no _jackedAccountId in credential file — "
+                    "all accounts will use DB tokens"
                 )
 
-            # Notify frontend: done or failed (include account data for immediate UI update)
-            progress_status = "failed" if (not is_cached and usage_data is None) else "done"
+            # Notify frontend: full queue so cards can show "Waiting..." immediately
             if ws_registry:
-                updated_row = db.get_account(acct["id"])
-                acct_payload = (
-                    _account_to_response(updated_row).model_dump()
-                    if updated_row else None
-                )
                 await ws_registry.broadcast(
-                    "usage_refresh_progress",
-                    {"account_id": acct["id"],
-                     "status": progress_status,
-                     "progress": i + 1, "total": total,
-                     "account_data": acct_payload},
+                    "usage_refresh_started",
+                    {"account_ids": [a["id"] for a in accounts], "total": total},
                 )
 
-        return BulkUsageRefreshResponse(
-            refreshed=refreshed,
-            failed=failed,
-            results=results,
-        )
+            for i, acct in enumerate(accounts):
+                if skip_account is not None and acct["id"] == skip_account:
+                    continue
+                if i > 0:
+                    await asyncio.sleep(2.0)  # Rate-limit pacing
+
+                # Notify frontend: this account is being checked
+                if ws_registry:
+                    await ws_registry.broadcast(
+                        "usage_refresh_progress",
+                        {"account_id": acct["id"], "status": "checking",
+                         "progress": i + 1, "total": total},
+                    )
+
+                effective_token = None
+                if acct["id"] == active_acct_id:
+                    fresh_token = read_fresh_active_token(acct["id"])
+                    db_token = acct.get("access_token")
+                    if fresh_token and fresh_token != db_token:
+                        effective_token = fresh_token
+                try:
+                    usage_data = await asyncio.wait_for(
+                        fetch_usage(acct["id"], db, access_token=effective_token, manual=True),
+                        timeout=_BULK_PER_ACCOUNT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Bulk refresh: account %d fetch_usage exceeded %.0fs — "
+                        "marking failed and resetting validation_status",
+                        acct["id"], _BULK_PER_ACCOUNT_TIMEOUT,
+                    )
+                    timeout_error = (
+                        f"Usage fetch timed out after {int(_BULK_PER_ACCOUNT_TIMEOUT)}s "
+                        f"during bulk refresh"
+                    )
+                    # Reset validation_status in the same call that records
+                    # the error so the row doesn't sit at 'checking' waiting
+                    # for the watchdog's next 60s tick (PM3 fix).
+                    db.update_account(
+                        acct["id"],
+                        validation_status="unknown",
+                        last_error=timeout_error,
+                        last_error_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    usage_data = None
+
+                # Cache hits return {"_cached": True} — read stored values from DB
+                is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
+                if is_cached:
+                    usage_data = None  # Treat as skip — use DB values below
+
+                is_backed_off = isinstance(usage_data, dict) and usage_data.get("_backed_off")
+                if is_backed_off:
+                    usage_data = None
+
+                if usage_data is not None:
+                    refreshed += 1
+                    five_hour = usage_data.get("five_hour", {})
+                    seven_day = usage_data.get("seven_day", {})
+                    results.append(
+                        {
+                            "account_id": acct["id"],
+                            "email": acct["email"],
+                            "success": True,
+                            "cached_usage_5h": five_hour.get("utilization"),
+                            "cached_usage_7d": seven_day.get("utilization"),
+                        }
+                    )
+                elif is_cached:
+                    # Cache hit — report existing DB values, count as success
+                    refreshed += 1
+                    results.append(
+                        {
+                            "account_id": acct["id"],
+                            "email": acct["email"],
+                            "success": True,
+                            "cached_usage_5h": acct.get("cached_usage_5h"),
+                            "cached_usage_7d": acct.get("cached_usage_7d"),
+                        }
+                    )
+                else:
+                    failed += 1
+                    updated_acct = db.get_account(acct["id"])
+                    results.append(
+                        {
+                            "account_id": acct["id"],
+                            "email": acct["email"],
+                            "success": False,
+                            "error": updated_acct.get("last_error") if updated_acct else None,
+                        }
+                    )
+
+                # Notify frontend: done or failed (include account data for immediate UI update)
+                progress_status = "failed" if (not is_cached and usage_data is None) else "done"
+                if ws_registry:
+                    updated_row = db.get_account(acct["id"])
+                    acct_payload = (
+                        _account_to_response(updated_row).model_dump()
+                        if updated_row else None
+                    )
+                    await ws_registry.broadcast(
+                        "usage_refresh_progress",
+                        {"account_id": acct["id"],
+                         "status": progress_status,
+                         "progress": i + 1, "total": total,
+                         "account_data": acct_payload},
+                    )
+
+            return BulkUsageRefreshResponse(
+                refreshed=refreshed,
+                failed=failed,
+                results=results,
+            )
+        finally:
+            # Only clear the slot if we still own it.  A force-reset during
+            # our long-running loop may have replaced _bulk_refresh_task
+            # with a newer holder — clearing it would wipe the new holder's
+            # state (/dc PM2/Q2 fix).
+            if _bulk_refresh_task is my_task:
+                _bulk_refresh_task = None
 
 
 @router.post("/accounts/{account_id}/validate", response_model=ValidateResponse)
