@@ -901,6 +901,8 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     validation_status="valid",
                     last_validated_at=int(time.time()),
                     consecutive_failures=0,
+                    last_error=None,
+                    last_error_at=None,
                 )
                 _update_profile_metadata(account_id, resp.json(), db)
                 return {"valid": True, "error": None}
@@ -923,6 +925,8 @@ async def validate_account(account_id: int, db: Database) -> dict:
                             validation_status="valid",
                             last_validated_at=int(time.time()),
                             consecutive_failures=0,
+                            last_error=None,
+                            last_error_at=None,
                         )
                         _update_profile_metadata(account_id, retry_resp.json(), db)
                         return {"valid": True, "error": None}
@@ -970,6 +974,45 @@ async def validate_account(account_id: int, db: Database) -> dict:
             last_error_at=datetime.now(timezone.utc).isoformat(),
         )
         return {"valid": False, "error": str(e)}
+
+
+async def reset_stale_checking_accounts(
+    db: "Database",
+    threshold_seconds: int = 120,
+) -> int:
+    """Reset accounts stuck in validation_status='checking' past threshold.
+
+    Iterates the scan result, delegating to db.reset_stuck_checking's
+    WHERE-guarded atomic UPDATE so a concurrent validator can't be
+    clobbered.  Returns total rows actually reset.
+    """
+    reset_count = 0
+    for acct in db.list_stuck_checking_accounts(threshold_seconds=threshold_seconds):
+        now = int(time.time())
+        updated_at = acct.get("updated_at")
+        if updated_at:
+            try:
+                updated_at_dt = datetime.fromisoformat(
+                    updated_at.replace("Z", "+00:00"),
+                )
+                age = int(now - updated_at_dt.timestamp())
+            except (ValueError, TypeError):
+                age = threshold_seconds
+        else:
+            age = threshold_seconds  # NULL updated_at
+
+        reason = f"validation timed out after {age}s — reset by watchdog"
+        rows_reset = db.reset_stuck_checking(
+            acct["id"], threshold_seconds=threshold_seconds, reason=reason,
+        )
+        if rows_reset > 0:
+            logger.warning(
+                "Stuck-checking watchdog: account %d was 'checking' for %ds — "
+                "reset to 'unknown'",
+                acct["id"], age,
+            )
+            reset_count += rows_reset
+    return reset_count
 
 
 # Per-account refresh locks to prevent concurrent refresh collisions
