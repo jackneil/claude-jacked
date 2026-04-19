@@ -1017,10 +1017,16 @@ async def full_sweep_loop(app):
 
     Runs at the user-configurable ``usage_check_interval`` (default 300s).
     Never crashes — all errors are caught and logged per tick.
+    Emits a heartbeat INFO log at the TOP of every iteration (before
+    any early-return shortcut), so operators see a heartbeat regardless
+    of window-keeper state (0.41.23).
     """
     _default_interval = 300
+    iter_count = 0
 
     while True:
+        iter_count += 1
+        logger.info("Full-sweep heartbeat: iter=%d", iter_count)
         check_interval = _default_interval
         try:
             db = getattr(app.state, "db", None)
@@ -1125,7 +1131,17 @@ async def full_sweep_loop(app):
                         # Fetch fresh usage so cached_5h_resets_at updates
                         # and needs_ping returns False next sweep.
                         # Pass access_token to bypass the cache freshness guard.
-                        await fetch_usage(acct["id"], db, access_token=cc_at)
+                        try:
+                            await asyncio.wait_for(
+                                fetch_usage(acct["id"], db, access_token=cc_at),
+                                timeout=60.0,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Full sweep: fetch_usage for account %d "
+                                "exceeded 60s — moving on",
+                                acct["id"],
+                            )
                     await asyncio.sleep(2)  # pacing
 
             logger.info(
