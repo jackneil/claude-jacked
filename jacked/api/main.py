@@ -80,6 +80,32 @@ async def _heal_sweep_loop():
             logger.warning("Heal sweep error: %s", e)
 
 
+async def _stuck_checking_watchdog_loop(app):
+    """Reset stuck validation_status='checking' rows every 60s.
+
+    See 0.41.23 spec (docs/superpowers/specs/2026-04-19-stuck-checking-
+    watchdog-design.md) for the failure mode this defends against.
+    """
+    from jacked.web.auth import reset_stale_checking_accounts
+
+    interval = 60
+    while True:
+        try:
+            db = getattr(app.state, "db", None)
+            if db is not None:
+                count = await reset_stale_checking_accounts(db, threshold_seconds=120)
+                if count > 0:
+                    logger.info(
+                        "Stuck-checking watchdog reset %d account(s)", count,
+                    )
+        except asyncio.CancelledError:
+            logger.info("Stuck-checking watchdog cancelled — shutting down")
+            raise
+        except Exception:
+            logger.warning("Stuck-checking watchdog error", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
@@ -144,6 +170,7 @@ async def lifespan(app: FastAPI):
     heal_task = asyncio.create_task(_heal_sweep_loop())
     active_poll_task = asyncio.create_task(active_account_poll_loop(app))
     full_sweep_task = asyncio.create_task(full_sweep_loop(app))
+    stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started logs watcher (every 3s)")
@@ -151,6 +178,7 @@ async def lifespan(app: FastAPI):
     logger.info("Started heal sweep (every 5min)")
     logger.info("Started active account poll loop (60s)")
     logger.info("Started full sweep loop")
+    logger.info("Started stuck-checking watchdog (every 60s)")
 
     # Start analytics scanner + live monitor
     analytics_scan_task = None
@@ -166,7 +194,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: cancel background tasks
-    tasks_to_cancel = [refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task, active_poll_task, full_sweep_task]
+    tasks_to_cancel = [refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task, active_poll_task, full_sweep_task, stuck_checking_task]
     if analytics_scan_task is not None:
         tasks_to_cancel.append(analytics_scan_task)
     if analytics_monitor_task is not None:
