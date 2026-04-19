@@ -2856,6 +2856,130 @@ def _recommend_external_tools():
 
 
 @main.command()
+def doctor():
+    """Diagnose a broken jacked install and print recovery commands.
+
+    Checks version, install method, launchd/systemd plist/unit, and
+    service running state (via PID + HTTP probe, not just port).
+    Prints exact commands to paste for any detected issue.
+
+    Read-only diagnostic — does not attempt any repair.
+    """
+    import httpx as _httpx
+    from jacked import __version__
+    from jacked.install_method import detect_install_method
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service.process import (
+        is_port_available, is_process_alive, read_pid,
+    )
+
+    console.print(f"[bold]Version:[/bold] {__version__}")
+    try:
+        method = detect_install_method()
+    except Exception as exc:
+        method = f"unknown ({exc})"
+    console.print(f"[bold]Install method:[/bold] {method}")
+
+    # Plist/unit check
+    if sys.platform == "darwin":
+        from jacked.service.platform import _get_launchd_plist_path
+        plist = _get_launchd_plist_path()
+        if plist.exists():
+            console.print(f"[bold]Launchd plist:[/bold] [green]OK[/green] ({plist})")
+        else:
+            console.print(f"[bold]Launchd plist:[/bold] [yellow]MISSING[/yellow]")
+            console.print(f"  Recovery: [cyan]jacked service install[/cyan]")
+    elif sys.platform.startswith("linux"):
+        from jacked.service.platform import _get_systemd_user_unit_path
+        unit = _get_systemd_user_unit_path()
+        if unit.exists():
+            console.print(f"[bold]Systemd user unit:[/bold] [green]OK[/green] ({unit})")
+        else:
+            console.print(
+                "[bold]Systemd user unit:[/bold] [yellow]NOT INSTALLED[/yellow]"
+            )
+            console.print("  Linux users configure their own auto-start; see docs.")
+    else:
+        console.print("[bold]Native lifecycle manager:[/bold] [dim]none (Windows)[/dim]")
+
+    # Service health — real probes, not just port availability
+    port_free = is_port_available(DEFAULT_HOST, DEFAULT_PORT)
+    pid_info = read_pid(PID_FILE)
+    pid_alive = (
+        pid_info is not None
+        and is_process_alive(pid_info.get("pid", 0))
+    )
+
+    if port_free:
+        console.print(
+            f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
+            f"(port {DEFAULT_PORT} free)"
+        )
+        console.print(f"  Recovery: [cyan]jacked service start[/cyan]")
+        if pid_info and not pid_alive:
+            console.print(
+                f"  [dim]Stale PID file at {PID_FILE} "
+                f"(pid {pid_info.get('pid')} is dead).[/dim]"
+            )
+    else:
+        # Port held — probe HTTP to distinguish healthy vs crashed-mid-init
+        try:
+            resp = _httpx.get(
+                f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/api/version",
+                timeout=2.0,
+            )
+            if resp.status_code == 200:
+                console.print(
+                    f"[bold]Service:[/bold] [green]HEALTHY[/green] "
+                    f"(port {DEFAULT_PORT}, HTTP 200)"
+                )
+            else:
+                console.print(
+                    f"[bold]Service:[/bold] [yellow]PORT HELD BUT UNHEALTHY[/yellow] "
+                    f"(HTTP {resp.status_code})"
+                )
+                console.print("  Recovery: [cyan]jacked service restart[/cyan]")
+        except Exception as exc:
+            console.print(
+                f"[bold]Service:[/bold] [red]PORT HELD BUT UNREACHABLE[/red] "
+                f"({type(exc).__name__}: {exc})"
+            )
+            if pid_alive:
+                console.print(
+                    f"  PID {pid_info['pid']} is alive but HTTP probe failed — "
+                    f"service may have crashed mid-init."
+                )
+            else:
+                console.print(
+                    f"  Port held by a process that is NOT the jacked service "
+                    f"(our PID file is stale or missing).  "
+                    f"Run [cyan]lsof -iTCP:{DEFAULT_PORT} -sTCP:LISTEN[/cyan] "
+                    "to see the owner."
+                )
+            console.print("  Recovery: [cyan]jacked service restart[/cyan]")
+
+    # Install-method-specific recovery
+    if method == "editable":
+        console.print(
+            "\n[bold yellow]Editable (dev-clone) install detected.[/bold yellow]\n"
+            "  Auto-upgrade disabled.  Upgrade via:\n"
+            "  [cyan]cd <your-repo> && git pull && uv sync[/cyan]"
+        )
+    elif method == "pip":
+        console.print(
+            "\n[bold yellow]pip install detected.[/bold yellow]\n"
+            "  Auto-upgrade disabled.  Migrate to uv with:\n"
+            "  [cyan]uv tool install \"claude-jacked[tray]\" --force[/cyan]"
+        )
+    elif str(method).startswith("unknown"):
+        console.print(
+            "\n[bold red]Could not detect install method.[/bold red]\n"
+            "  Nuclear-option recovery:\n"
+            "  [cyan]uv tool install \"claude-jacked[tray]\" --force[/cyan]"
+        )
+
+
+@main.command()
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 @click.option("--sounds", is_flag=True, help="Remove only sound hooks")
 @click.option("--security", is_flag=True, help="Remove only security gatekeeper hook")
