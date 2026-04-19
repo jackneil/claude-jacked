@@ -3325,7 +3325,7 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     Use --foreground to run interactively (tray logs to your terminal).
     """
     from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, PID_FILE
-    from jacked.service.platform import native_restart
+    from jacked.service.platform import ensure_native_lifecycle, native_restart
     from jacked.service.process import (
         stop_process_graceful,
         wait_for_port_free,
@@ -3334,17 +3334,25 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     the_port = port or DEFAULT_PORT
     the_host = host or DEFAULT_HOST
 
-    # Prefer the platform's native lifecycle manager (launchd on macOS,
-    # systemd --user on Linux if wired). Eliminates the stop + respawn race
-    # where launchd's KeepAlive beats our start back to :8321.
-    # `--foreground` is an explicit debug path so it skips native handoff.
+    # Preferred path: make sure native lifecycle (launchd plist / systemd
+    # unit) is configured, then delegate.  Skip kickstart when the plist
+    # was just installed — RunAtLoad already started the service fresh
+    # and kickstart would race the boot.
+    # `--foreground` is an explicit debug path — skip native handoff.
     if not foreground:
-        ok, reason = native_restart()
-        if ok:
-            console.print(f"[green][OK][/green] {reason}")
-            return
-        # Fall through to manual stop+start. `reason` often contains useful
-        # info about why (e.g., plist not installed).
+        ok_ens, state, reason_ens = ensure_native_lifecycle()
+        if ok_ens:
+            if state == "just_installed":
+                console.print(f"[green][OK][/green] {reason_ens}")
+                return
+            # already_installed → run native_restart for atomic kickstart
+            ok, reason = native_restart()
+            if ok:
+                console.print(f"[green][OK][/green] {reason}")
+                return
+            console.print(f"[yellow]native_restart failed: {reason}[/yellow]")
+        else:
+            console.print(f"[dim]native lifecycle unavailable: {reason_ens}[/dim]")
 
     # 1. Stop any running service. stop_process_graceful waits for actual PID
     # death and escalates to SIGKILL if SIGTERM is ignored (pystray's AppKit
