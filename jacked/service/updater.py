@@ -205,8 +205,28 @@ def run_update(
             _end("waiting_for_parent", "ok")
 
         method = _method
-        cmd = upgrade_command(extras)
-        label = upgrade_command_label(extras)
+        try:
+            cmd = upgrade_command(extras)
+            label = upgrade_command_label(extras)
+        except ValueError as exc:
+            # Defense in depth: _can_upgrade() gate above should already
+            # refuse pip/editable, but if a future code path skips the gate
+            # the raise here keeps us from crashing the detached helper.
+            log(f"ERROR: {exc}")
+            try:
+                _us.mark_failed(
+                    _us.UPDATE_STATUS_FILE,
+                    error=str(exc),
+                    recovery='uv tool install "claude-jacked[tray]" --force',
+                )
+            except Exception:
+                logger.exception("mark_failed after upgrade_command ValueError")
+            _write_recovery(
+                f"Jacked auto-update failed: {exc}\n\n"
+                "Manual recovery:\n"
+                '  uv tool install "claude-jacked[tray]" --force\n'
+            )
+            return
 
         if method == "uv":
             uv = find_bin("uv")
@@ -492,10 +512,24 @@ def _spawn_windows_tray_updater(
 
     from jacked.findbin import find_bin
     from jacked.install_method import (
+        can_auto_upgrade,
         detect_install_method,
         upgrade_command,
         upgrade_command_label,
     )
+
+    # Gate: same refusal as run_update / jacked upgrade.  Prevents
+    # ValueError from upgrade_command(pip) crashing the detached helper
+    # at batch-script-generation time.
+    _ok, _reason = can_auto_upgrade()
+    if not _ok:
+        logger.warning("Windows tray updater refused: %s", _reason)
+        _write_recovery(
+            f"Jacked auto-update refused: {_reason}\n\n"
+            "Manual recovery:\n"
+            '  uv tool install "claude-jacked[tray]" --force\n'
+        )
+        return
 
     method = detect_install_method()
     cmd = upgrade_command(extras)

@@ -4,9 +4,10 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from jacked.install_method import (
     detect_install_method,
-    is_user_site_install,
     upgrade_command,
     upgrade_command_label,
 )
@@ -69,24 +70,19 @@ class TestUpgradeCommand:
         assert "install" in cmd
         assert "--force" in cmd
 
-    def test_pip_method_uses_current_python(self):
+    def test_pip_method_raises_valueerror(self):
+        """0.41.24: pip auto-upgrade is refused upstream in can_auto_upgrade.
+        upgrade_command must raise if reached anyway (old code shipped a
+        `python -m pip install` command that crashed with 'No module named
+        pip' in uv-managed venvs — the 0.41.17 bug)."""
         with patch("jacked.install_method.detect_install_method", return_value="pip"):
-            with patch("jacked.install_method.is_user_site_install", return_value=False):
-                cmd = upgrade_command(extras="tray")
-        assert cmd[0] == sys.executable
-        assert cmd[1:4] == ["-m", "pip", "install"]
-        assert "--upgrade" in cmd
-        assert "claude-jacked[tray]" in cmd
-        assert "--user" not in cmd
+            with pytest.raises(ValueError, match="pip auto-upgrade is not supported"):
+                upgrade_command(extras="tray")
 
-    def test_pip_method_adds_user_flag_when_user_site(self):
-        """If current install is under the user site, the upgrade must
-        pass --user so it lands in the same place instead of trying to
-        write to a system Python."""
-        with patch("jacked.install_method.detect_install_method", return_value="pip"):
-            with patch("jacked.install_method.is_user_site_install", return_value=True):
-                cmd = upgrade_command(extras="tray")
-        assert "--user" in cmd
+    def test_editable_method_raises_valueerror(self):
+        with patch("jacked.install_method.detect_install_method", return_value="editable"):
+            with pytest.raises(ValueError, match="pip auto-upgrade is not supported"):
+                upgrade_command(extras="tray")
 
 
 class TestUpgradeCommandLabel:
@@ -101,9 +97,7 @@ class TestUpgradeCommandLabel:
         assert "pipx install" in label
         assert "--force" in label
 
-    def test_pip_label_includes_user_flag_when_user_site(self):
+    def test_pip_label_raises_valueerror(self):
         with patch("jacked.install_method.detect_install_method", return_value="pip"):
-            with patch("jacked.install_method.is_user_site_install", return_value=True):
-                label = upgrade_command_label(extras="tray")
-        assert "--user" in label
-        assert "claude-jacked[tray]" in label
+            with pytest.raises(ValueError, match="pip auto-upgrade is not supported"):
+                upgrade_command_label(extras="tray")
