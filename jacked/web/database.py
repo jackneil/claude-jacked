@@ -1219,6 +1219,71 @@ class Database:
             )
             return cursor.rowcount > 0
 
+    def list_stuck_checking_accounts(self, threshold_seconds: int) -> list[dict]:
+        """Return non-deleted accounts where validation_status='checking'
+        AND (updated_at is NULL OR updated_at older than threshold_seconds).
+
+        NULL updated_at is treated as "definitely stuck" — otherwise
+        strftime('%s', NULL) returns NULL and the row is hidden forever.
+
+        Includes inactive accounts (they can still be stuck and need cleanup).
+
+        >>> db = Database(":memory:")
+        >>> db.list_stuck_checking_accounts(120)
+        []
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM accounts
+                   WHERE validation_status = 'checking'
+                     AND is_deleted = 0
+                     AND (
+                       updated_at IS NULL
+                       OR (strftime('%s','now') - strftime('%s', updated_at)) > ?
+                     )
+                   ORDER BY updated_at ASC""",
+                (threshold_seconds,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def reset_stuck_checking(
+        self,
+        account_id: int,
+        threshold_seconds: int,
+        reason: str,
+    ) -> int:
+        """Atomically reset validation_status='checking' to 'unknown' IFF
+        the row still reads 'checking' AND (updated_at is NULL OR stale
+        past threshold_seconds).
+
+        WHERE guard prevents clobbering a row that a concurrent validator
+        already moved to 'valid' (PM1 TOCTOU fix).
+
+        Returns rowcount (0 if already moved).
+
+        >>> db = Database(":memory:")
+        >>> db.reset_stuck_checking(1, 120, "x")
+        0
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE accounts
+                   SET validation_status = 'unknown',
+                       last_error = ?,
+                       last_error_at = ?,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND validation_status = 'checking'
+                     AND is_deleted = 0
+                     AND (
+                       updated_at IS NULL
+                       OR (strftime('%s','now') - strftime('%s', updated_at)) > ?
+                     )""",
+                (reason, now_iso, now_iso, account_id, threshold_seconds),
+            )
+            return cursor.rowcount
+
     # ==================================================================
     # Installation CRUD
     # ==================================================================
