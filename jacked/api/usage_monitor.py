@@ -1134,12 +1134,12 @@ async def full_sweep_loop(app):
                         try:
                             await asyncio.wait_for(
                                 fetch_usage(acct["id"], db, access_token=cc_at),
-                                timeout=60.0,
+                                timeout=10.0,
                             )
                         except asyncio.TimeoutError:
                             logger.warning(
                                 "Full sweep: fetch_usage for account %d "
-                                "exceeded 60s — moving on",
+                                "exceeded 10s — moving on",
                                 acct["id"],
                             )
                     await asyncio.sleep(2)  # pacing

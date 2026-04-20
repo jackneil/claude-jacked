@@ -40,8 +40,10 @@ _bulk_refresh_acquired_at: float = 0.0
 # cancel it before swapping in a fresh lock.
 _bulk_refresh_task: "asyncio.Task | None" = None
 _BULK_REFRESH_STALE_AFTER = 180.0  # 4 accts * ~20s worst case + slack
-# 0.41.23: max seconds per account in bulk refresh before declaring it hung.
-_BULK_PER_ACCOUNT_TIMEOUT = 60.0
+# 0.41.25: max seconds per account in bulk refresh before declaring it hung.
+# Happy path is 1-2s; 10s is plenty of slack for a slow Anthropic refresh.
+# If refresh takes >10s something's wrong upstream — waiting longer doesn't help.
+_BULK_PER_ACCOUNT_TIMEOUT = 10.0
 
 # --- Pydantic v2 request/response models ---
 
