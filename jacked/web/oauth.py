@@ -82,6 +82,27 @@ def generate_pkce() -> tuple[str, str]:
 _active_flows: dict[str, "OAuthFlow"] = {}
 
 
+def reset_locks() -> None:
+    """Clear in-flight OAuth flows on lifespan startup.
+
+    Each OAuthFlow owns an ``asyncio.Event`` bound to the loop that
+    created it (``OAuthFlow.__init__``). When the tray restarts uvicorn
+    in a fresh thread/loop, any mid-OAuth flow's Event is stranded on
+    the dead loop — a later ``await event.wait()`` would raise. Users
+    who clicked Restart mid-OAuth already lost their flow; drop the
+    stale entries so a fresh attempt starts clean. Log the count so
+    on-call can correlate "PKCE callback returned 'flow not found'"
+    complaints with a tray restart.
+    """
+    stranded = len(_active_flows)
+    if stranded:
+        logger.warning(
+            "reset_locks: dropping %d stranded OAuth flow(s) from previous loop: %s",
+            stranded, list(_active_flows.keys()),
+        )
+    _active_flows.clear()
+
+
 def get_flow(flow_id: str) -> Optional["OAuthFlow"]:
     """Get an active OAuth flow by ID.
 

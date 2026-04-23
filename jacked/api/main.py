@@ -26,6 +26,12 @@ from jacked.api.websocket import WebSocketRegistry
 
 logger = logging.getLogger(__name__)
 
+# Monotonic counter of completed lifespan startups in this process.
+# Bumped on each lifespan entry so on-call can distinguish "first
+# startup" from "N-th tray restart" in logs that share the same PID
+# (the tray restarts uvicorn in a new thread without forking).
+_lifespan_startup_count: int = 0
+
 # Static web files shipped with the package
 WEB_DIR = Path(__file__).parent.parent / "data" / "web"
 
@@ -109,6 +115,74 @@ async def _stuck_checking_watchdog_loop(app):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
+    # Rebind every module-level asyncio.Lock / Event to this event loop.
+    # The tray restarts uvicorn in a fresh thread (new loop) while this
+    # process keeps the old modules imported, so primitives from the
+    # previous loop would otherwise raise "bound to a different event
+    # loop" on the next acquire and callers would accumulate as phantom
+    # waiters. Each module is reset independently — one failure should
+    # not skip the rest, and the traceback must be preserved so on-call
+    # can identify which module went sideways.
+    #
+    # Contract for any new module that owns a module-level asyncio.Lock
+    # / Event / Semaphore / Condition: expose ``reset_locks()`` and add
+    # the module to this tuple. ``tests/unit/api/test_reset_locks.py``
+    # enforces this at CI time.
+    global _lifespan_startup_count
+    _lifespan_startup_count += 1
+    startup_n = _lifespan_startup_count
+
+    # Per-module import: one broken module (e.g. syntax error in a fresh
+    # refactor) should not wedge the reset for the other seven.
+    _module_specs: tuple[str, ...] = (
+        "jacked.api.routes.auth",
+        "jacked.web.auth",
+        "jacked.api.routes.features",
+        "jacked.api.routes.permissions",
+        "jacked.api.routes.profiles",
+        "jacked.api.routes.system",
+        "jacked.api.usage_monitor",
+        "jacked.web.oauth",
+    )
+    modules_to_reset: list = []
+    import_failed: list[str] = []
+    import importlib
+    for mod_path in _module_specs:
+        try:
+            modules_to_reset.append(importlib.import_module(mod_path))
+        except Exception:
+            import_failed.append(mod_path)
+            logger.exception("Failed to import %s for lock reset", mod_path)
+
+    reset_ok: list[str] = []
+    reset_failed: list[str] = []
+    for mod in modules_to_reset:
+        name = getattr(mod, "__name__", repr(mod))
+        reset = getattr(mod, "reset_locks", None)
+        if not callable(reset):
+            continue
+        try:
+            reset()
+            reset_ok.append(name)
+        except Exception:
+            reset_failed.append(name)
+            logger.exception("reset_locks failed for %s", name)
+
+    if not modules_to_reset:
+        logger.error(
+            "Lifespan lock reset #%d SKIPPED (pid=%d) — every lock-owning "
+            "module failed to import: %s",
+            startup_n, os.getpid(), import_failed,
+        )
+    else:
+        logger.info(
+            "Lifespan lock reset #%d (pid=%d): ok=%d failed=%d imports_failed=%d modules=%s",
+            startup_n, os.getpid(), len(reset_ok), len(reset_failed),
+            len(import_failed), reset_ok,
+        )
+    if reset_failed:
+        logger.error("Lock reset failures in: %s", reset_failed)
+
     try:
         from jacked.web.database import Database
 

@@ -45,6 +45,36 @@ _BULK_REFRESH_STALE_AFTER = 180.0  # 4 accts * ~20s worst case + slack
 # If refresh takes >10s something's wrong upstream — waiting longer doesn't help.
 _BULK_PER_ACCOUNT_TIMEOUT = 10.0
 
+
+def reset_locks() -> None:
+    """Rebind module-level locks to the current event loop.
+
+    The tray can restart uvicorn in a new thread (see service/tray.py
+    _on_restart). The new thread runs a new event loop, but this module
+    stays imported, so the old asyncio.Lock is still bound to the dead
+    loop. Any acquire on the new loop raises
+    "bound to a different event loop" and callers pile up as waiters.
+    Called from the FastAPI lifespan on startup so each loop gets a
+    fresh lock.
+
+    If the old lock appears held here, it means a previous-loop task
+    was still in flight when the tray restart landed — the new lock
+    won't serialize against it. We log loudly so post-mortem can spot
+    the window. The old task's writes are on the old (dying) loop and
+    will complete or cancel on their own.
+    """
+    global _bulk_refresh_lock, _bulk_refresh_acquired_at, _bulk_refresh_task
+    if _bulk_refresh_lock.locked():
+        logger.warning(
+            "reset_locks: bulk_refresh_lock was held at rebind "
+            "(previous-loop task still in flight); new lock will not "
+            "serialize against it"
+        )
+    _bulk_refresh_lock = asyncio.Lock()
+    _bulk_refresh_acquired_at = 0.0
+    _bulk_refresh_task = None
+
+
 # --- Pydantic v2 request/response models ---
 
 
@@ -649,6 +679,12 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
     # If a prior holder has been inside the lock longer than the stale
     # threshold, assume it's orphaned and force-reset — we'd rather
     # double-fetch than be permanently wedged at 409.
+    #
+    # This runtime watchdog complements the lifespan-level reset_locks()
+    # above: reset_locks handles *cross-loop* staleness at startup (tray
+    # restart installs a fresh loop); this block handles *in-loop* hangs
+    # at runtime (a coroutine stuck on a pathological Anthropic response).
+    # Both are needed.
     global _bulk_refresh_lock, _bulk_refresh_acquired_at, _bulk_refresh_task
     if _bulk_refresh_lock.locked():
         held_for = time.time() - _bulk_refresh_acquired_at if _bulk_refresh_acquired_at else 0

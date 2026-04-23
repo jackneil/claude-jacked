@@ -34,6 +34,21 @@ _ticks_since_prune = 0
 _sweep_wake: asyncio.Event = asyncio.Event()
 
 
+def reset_locks() -> None:
+    """Rebind module-level asyncio primitives to the current event loop.
+
+    See jacked.api.routes.auth.reset_locks for the full explanation of
+    why in-process tray restarts require this. ``_sweep_wake`` is
+    currently only read via sync ``is_set()`` / ``set()`` / ``clear()``
+    calls which do not touch the loop, so today the stale binding is
+    harmless — but the moment a caller switches to ``await wait()``
+    (a natural efficiency refactor) the original bug returns. Rebind
+    pre-emptively.
+    """
+    global _sweep_wake
+    _sweep_wake = asyncio.Event()
+
+
 def _read_active_account_id() -> int | None:
     """Read the active account ID from the credential file stamp.
 

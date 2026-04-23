@@ -1042,6 +1042,26 @@ def _get_cc_refresh_lock(account_id: int) -> asyncio.Lock:
     return _cc_refresh_locks[account_id]
 
 
+def reset_locks() -> None:
+    """Clear per-account locks so the next event loop can bind fresh ones.
+
+    See jacked.api.routes.auth.reset_locks for the full story — in-process
+    uvicorn restarts (tray) create a new event loop while this module stays
+    imported, leaving every cached Lock bound to the dead loop. Log the
+    stranded-lock count if non-zero so on-call can spot "tray restart
+    while refreshes were in flight" from the log stream.
+    """
+    stranded = len(_refresh_locks) + len(_cc_refresh_locks)
+    if stranded:
+        logger.warning(
+            "reset_locks: dropping %d per-account refresh lock(s) from previous loop "
+            "(primary=%d, cc=%d)",
+            stranded, len(_refresh_locks), len(_cc_refresh_locks),
+        )
+    _refresh_locks.clear()
+    _cc_refresh_locks.clear()
+
+
 async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     """Refresh all account tokens expiring within buffer_seconds.
 

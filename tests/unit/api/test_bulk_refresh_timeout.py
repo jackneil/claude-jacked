@@ -15,24 +15,21 @@ def _reset_module_state(monkeypatch, tmp_path):
 
     asyncio.run() creates a fresh event loop per test.  A Lock acquired
     in test A's loop cannot be re-used in test B's loop (asyncio raises
-    'got Future attached to a different loop').  Create a fresh Lock
-    here (binding is lazy; it'll attach to whichever loop uses it first).
+    'got Future attached to a different loop').  Delegate to the
+    production-path ``reset_locks()`` helper so this fixture dogfoods
+    the same code the FastAPI lifespan uses — a future bug in
+    reset_locks (e.g., forgetting a new field) will now break these
+    tests instead of silently diverging.
 
     Also redirect Path.home() into a tmp path so refresh_all_usage's
     read of ~/.claude/.credentials.json hits a non-existent file — tests
     must not depend on the developer's real credential state.
     """
     from jacked.api.routes import auth as routes_auth
-    routes_auth._bulk_refresh_lock = asyncio.Lock()
-    routes_auth._bulk_refresh_task = None
-    routes_auth._bulk_refresh_acquired_at = 0.0
+    routes_auth.reset_locks()
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     yield
-    # Teardown: restore to import-time state so this file's tests can't
-    # pollute tests in other files that touch refresh_all_usage.
-    routes_auth._bulk_refresh_lock = asyncio.Lock()
-    routes_auth._bulk_refresh_task = None
-    routes_auth._bulk_refresh_acquired_at = 0.0
+    routes_auth.reset_locks()
 
 
 def test_hanging_account_times_out_and_others_complete(monkeypatch):

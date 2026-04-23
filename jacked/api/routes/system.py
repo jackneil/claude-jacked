@@ -722,6 +722,12 @@ async def installations_overview(request: Request):
 _upgrade_lock = asyncio.Lock()
 
 
+def reset_locks() -> None:
+    """Rebind to the current event loop — see routes.auth.reset_locks."""
+    global _upgrade_lock
+    _upgrade_lock = asyncio.Lock()
+
+
 async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
     if ws_registry:
         try:
