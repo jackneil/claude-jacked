@@ -1246,3 +1246,156 @@ class TestDeficitVsTarget:
         acct = _acct(1, resets_7d=_iso(now + timedelta(hours=12)))
         acct["cached_usage_7d"] = None
         assert deficit_vs_target(acct, now=now) is None
+
+
+class TestPickBestTargetTierStrict:
+    """Spec scenarios C11-C16 — the headline behavior change."""
+
+    def test_t0_with_room_beats_t3_with_room(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, usage_5h=50, usage_7d=50,
+                       resets_7d=_iso(now + timedelta(days=2)))
+        t0 = _acct(1, usage_5h=10, usage_7d=80,
+                   resets_7d=_iso(now + timedelta(hours=12)))
+        t3 = _acct(2, usage_5h=10, usage_7d=10,
+                   resets_7d=_iso(now + timedelta(days=6)))
+        target = pick_best_target([active, t0, t3], current_id=99, now=now)
+        assert target is not None
+        assert target["id"] == 1
+
+    def test_two_t0s_earlier_expiry_wins(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        t0_early = _acct(1, usage_7d=50,
+                         resets_7d=_iso(now + timedelta(hours=4)))
+        t0_late = _acct(2, usage_7d=50,
+                        resets_7d=_iso(now + timedelta(hours=20)))
+        target = pick_best_target([active, t0_early, t0_late],
+                                  current_id=99, now=now)
+        assert target["id"] == 1
+
+    def test_two_t0s_same_expiry_larger_deficit_wins(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        resets = _iso(now + timedelta(hours=12))
+        small_deficit = _acct(1, usage_7d=90, resets_7d=resets)
+        big_deficit = _acct(2, usage_7d=50, resets_7d=resets)
+        target = pick_best_target([active, small_deficit, big_deficit],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+    def test_t0_at_target_skipped_in_favor_of_t1(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        t0_done = _acct(1, usage_7d=100,
+                        resets_7d=_iso(now + timedelta(hours=12)))
+        t1 = _acct(2, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, t0_done, t1],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+    def test_t0_without_5h_headroom_excluded(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        t0_no_5h = _acct(1, usage_5h=95, usage_7d=50,
+                         resets_7d=_iso(now + timedelta(hours=12)))
+        t1 = _acct(2, usage_5h=10, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, t0_no_5h, t1],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+    def test_no_candidate_when_all_at_target(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        t0_done = _acct(1, usage_7d=100,
+                        resets_7d=_iso(now + timedelta(hours=12)))
+        t1_done = _acct(2, usage_7d=90,
+                        resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, t0_done, t1_done],
+                                  current_id=99, now=now)
+        assert target is None
+
+    def test_excludes_disabled_account(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        disabled = _acct(1, usage_7d=50, auto_swap=False,
+                         resets_7d=_iso(now + timedelta(hours=12)))
+        t1 = _acct(2, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, disabled, t1],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+    def test_excludes_invalid_account(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        invalid = _acct(1, usage_7d=50, valid=False,
+                        resets_7d=_iso(now + timedelta(hours=12)))
+        t1 = _acct(2, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, invalid, t1],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+    def test_excludes_failures_above_threshold(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        failing = _acct(1, usage_7d=50, failures=5,
+                        resets_7d=_iso(now + timedelta(hours=12)))
+        t1 = _acct(2, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, failing, t1],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+    def test_excludes_no_token(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        no_tok = _acct(1, usage_7d=50, cc_token=False,
+                       resets_7d=_iso(now + timedelta(hours=12)))
+        t1 = _acct(2, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, no_tok, t1],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+
+class TestHas5hHeadroom:
+    def test_has_room_when_below_90(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        assert _has_5h_headroom({"cached_usage_5h": 50}) is True
+
+    def test_no_room_at_95_no_imminent_reset(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": None,
+        }) is False
+
+    def test_room_at_95_with_imminent_reset(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        future = datetime.now(timezone.utc) + timedelta(minutes=10)
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": _iso(future),
+        }) is True
+
+    def test_no_room_at_95_with_distant_reset(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        future = datetime.now(timezone.utc) + timedelta(hours=2)
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": _iso(future),
+        }) is False
