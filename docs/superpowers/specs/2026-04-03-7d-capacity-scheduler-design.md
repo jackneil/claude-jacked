@@ -1,7 +1,7 @@
 # 7-Day Capacity Scheduler: Proactive Account Rotation
 
 **Date:** 2026-04-03
-**Status:** Approved (revised after DCR)
+**Status:** SUPERSEDED — decisioning portion replaced by `2026-05-04-auto-swap-utilization-redesign-design.md`
 
 ## Problem
 
