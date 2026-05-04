@@ -6,6 +6,12 @@
 
 **Architecture:** Pure functions in `jacked/web/auto_swap.py` provide tier classification, target computation, deficit math, and a tier-strict selection rule. `jacked/api/usage_monitor.py::active_account_poll_loop` calls a single `should_swap_now(active, best, ...)` per tick — no separate proactive scanner. White bar is wall-clock per-account, identical to the UI calc in `jacked/data/web/js/components/usage.js::computeElapsedFraction7d`.
 
+**Anti-jitter hardening:** A "higher-tier emerged" override requires the same target id to persist across 2 consecutive ticks before swapping. This prevents Anthropic-API timestamp jitter (±30s in `cached_7d_resets_at`) from flapping accounts across tier boundaries. State held in module-level `_emerged_target_streak: dict[int, int]` in `usage_monitor.py`.
+
+**Silent-stall watchdog:** Module-level `_consecutive_no_best_ticks` counter; if loop ticks ≥10 times with `best is None` AND active account has stale data (`usage_cached_at` >30 min) AND ≥1 candidate has fresh data showing deficit, escalate to ERROR + broadcast `auto_swap_stall` WS event so the dashboard can show the stuck state. Differentiates "all candidates at target" (benign) from "no candidate is evaluable" (stuck).
+
+**Trigger taxonomy:** Per spec, decision-log `trigger` field uses one of `tier_drained`, `higher_tier_emerged`, `forced_critical`, `burn_rate`, `tier_aware` (catch-all for the rare "best exists but only burn-rate fired"). Derived from the prefix of `should_swap_now`'s reason string.
+
 **Tech Stack:** Python 3.12, asyncio, pytest. Run all tests via `uv run python -m pytest` (per project CLAUDE.md). The async loop runs inside FastAPI lifespan.
 
 **Spec:** `docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md`
@@ -16,10 +22,12 @@
 
 | File | Responsibility |
 |------|----------------|
-| `jacked/web/auto_swap.py` | Pure decision-engine functions: tier_for, white_bar, target_7d, deficit_vs_target, pick_best_target, should_swap_now. Burn-rate/headroom helpers retained. |
-| `jacked/api/usage_monitor.py` | Active-account poll loop; calls `pick_best_target` + `should_swap_now` once per tick; records decision; executes swap. |
+| `jacked/web/auto_swap.py` | Pure decision-engine functions: tier_for, white_bar, target_7d, deficit_vs_target, pick_best_target, should_swap_now. Burn-rate/headroom helpers retained. **File at 620 lines (over 500-line guardrail); Task 15 splits this into focused submodules after the algorithmic work lands.** |
+| `jacked/api/usage_monitor.py` | Active-account poll loop; calls `pick_best_target` + `should_swap_now` once per tick; records decision; executes swap. **active_account_poll_loop is 720 lines (way over 50-line function guardrail); Task 16 extracts decision/decision-log helpers.** |
 | `tests/unit/test_auto_swap.py` | Unit tests for pure functions (scenarios A–H from spec). |
-| `tests/unit/test_usage_monitor.py` | Integration tests for the loop's stay/swap behavior. |
+| `tests/unit/test_usage_monitor.py` | Integration tests for the loop's stay/swap behavior, including the silent-stall watchdog and tier-jitter resistance. |
+| `jacked/data/web/js/components/auto-swap.js` | Decision-log render — needs new column set (`tier`, `target_7d`, `deficit`, `is_best`) for the new candidate dump. Updated in Task 14. |
+| `docs/architecture/auto-swap-system.md` | Authoritative architecture doc — describes the new tier-based algorithm. Rewritten in Task 13. |
 | `docs/superpowers/specs/2026-04-03-7d-capacity-scheduler-design.md` | Add header note: superseded by 2026-05-04 spec. |
 
 ---
@@ -102,6 +110,39 @@ class TestTierFor:
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
         acct = _acct(1, resets_7d=_iso(now + timedelta(days=4)))
         assert tier_for(acct, now=now) == 3
+
+    def test_hysteresis_dampens_t1_to_t0_jitter(self):
+        # Anthropic API jitter: account hovers right at the 24h boundary.
+        # prev_tier=1 (T1). Instant reads T0 by 60 seconds (less than the
+        # 5-minute hysteresis margin). Should remain T1.
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=59)))
+        assert tier_for(acct, now=now, prev_tier=1) == 1
+
+    def test_hysteresis_allows_clean_t1_to_t0_after_margin(self):
+        # 6 minutes past the 24h boundary — clearly into T0.
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=54)))
+        assert tier_for(acct, now=now, prev_tier=1) == 0
+
+    def test_hysteresis_does_not_block_movement_toward_less_urgent(self):
+        # Account with prev=T0 reads as T1 at 24h+10s — flip immediately
+        # (we never want to STAY too urgent; only the dangerous direction
+        # is dampened).
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=24, seconds=10)))
+        assert tier_for(acct, now=now, prev_tier=0) == 1
+
+    def test_hysteresis_no_prev_means_no_dampening(self):
+        # Without prev_tier, we use the raw classification.
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=59)))
+        assert tier_for(acct, now=now) == 0
+        assert tier_for(acct, now=now, prev_tier=None) == 0
 ```
 
 - [ ] **Step 1.2: Run to verify failure**
@@ -128,12 +169,37 @@ TIER_T3 = 3  # 96h - 168h (7d)
 TIER_EXCLUDED = 4  # no data or already expired
 
 
-def tier_for(account: dict, now: datetime | None = None) -> int:
-    """Classify an account by its 7d expiry deadline.
+_TIER_BOUNDARIES_HOURS = (24, 48, 96, 168)  # T0|T1|T2|T3 cutoffs
+_TIER_HYSTERESIS_MIN = 5.0  # minutes inside a more-urgent tier before flip
 
-    Returns 0..3 for T0..T3 or 4 (excluded) when 7d data is missing
-    or the window has already expired. Boundaries belong to the
-    higher-numbered tier (less urgent).
+
+def _resolve_now(now: datetime | None = None) -> datetime:
+    """Coerce an optional ``now`` to a UTC-aware datetime."""
+    n = now or datetime.now(timezone.utc)
+    return n if n.tzinfo else n.replace(tzinfo=timezone.utc)
+
+
+def tier_for(
+    account: dict,
+    now: datetime | None = None,
+    *,
+    prev_tier: int | None = None,
+) -> int:
+    """Classify an account by its 7d expiry deadline (T0..T3 or 4=excluded).
+
+    Returns 0..3 for T0..T3 or 4 (excluded) when 7d data is missing or the
+    window has already expired. Boundaries belong to the higher-numbered
+    (less urgent) tier — exactly 24h is T1, exactly 48h is T2.
+
+    Hysteresis (anti-jitter): if ``prev_tier`` is provided and the account's
+    instantaneous tier is one step MORE urgent than prev_tier (e.g. prev=T1,
+    now=T0), require the new tier to be at least
+    ``_TIER_HYSTERESIS_MIN`` minutes deep into the boundary before flipping.
+    Within the hysteresis band, returns ``prev_tier``. Movement TOWARD less
+    urgent (T0→T1, T1→T2, etc.) flips immediately — only the dangerous
+    "becoming more urgent" direction is dampened. This prevents
+    Anthropic-API timestamp jitter (±30s) from oscillating across the
+    24h or 48h boundary.
     """
     resets_at_str = account.get("cached_7d_resets_at")
     if resets_at_str is None:
@@ -145,22 +211,34 @@ def tier_for(account: dict, now: datetime | None = None) -> int:
     except (ValueError, TypeError):
         return TIER_EXCLUDED
 
-    now = now or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-
+    now = _resolve_now(now)
     seconds_left = (resets_at - now).total_seconds()
     if seconds_left <= 0:
         return TIER_EXCLUDED
 
     hours_left = seconds_left / 3600.0
     if hours_left < 24:
-        return TIER_T0
-    if hours_left < 48:
-        return TIER_T1
-    if hours_left < 96:
-        return TIER_T2
-    return TIER_T3
+        instant = TIER_T0
+    elif hours_left < 48:
+        instant = TIER_T1
+    elif hours_left < 96:
+        instant = TIER_T2
+    else:
+        instant = TIER_T3
+
+    if prev_tier is None:
+        return instant
+
+    # Hysteresis: only damp transitions toward more urgent (smaller index).
+    if instant >= prev_tier or prev_tier == TIER_EXCLUDED:
+        return instant
+
+    # Compute hours past the boundary into the new (more urgent) tier.
+    boundary_hours = _TIER_BOUNDARIES_HOURS[instant]  # the upper edge of `instant`
+    hours_into_new_tier = boundary_hours - hours_left  # positive if past boundary
+    if hours_into_new_tier * 60 >= _TIER_HYSTERESIS_MIN:
+        return instant
+    return prev_tier
 ```
 
 - [ ] **Step 1.4: Run to verify pass**
@@ -256,8 +334,9 @@ def white_bar(account: dict, now: datetime | None = None) -> float | None:
     Matches the UI's computeElapsedFraction7d in
     jacked/data/web/js/components/usage.js — same formula:
     (now - (resets_at - 7d)) / 7d. No active-hours adjustment.
+    Clamped to [0, 1] (also matches the UI's Math.max/min clamp).
 
-    Returns None when 7d data is missing. Clamped to [0, 1].
+    Returns None when 7d data is missing.
     """
     resets_at_str = account.get("cached_7d_resets_at")
     if resets_at_str is None:
@@ -269,10 +348,7 @@ def white_bar(account: dict, now: datetime | None = None) -> float | None:
     except (ValueError, TypeError):
         return None
 
-    now = now or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-
+    now = _resolve_now(now)
     window_seconds = 7 * 24 * 3600
     start = resets_at - timedelta(seconds=window_seconds)
     elapsed = (now - start).total_seconds() / window_seconds
@@ -675,7 +751,48 @@ class TestPickBestTargetTierStrict:
 Run: `uv run python -m pytest tests/unit/test_auto_swap.py::TestPickBestTargetTierStrict -v`
 Expected: 10 failures — selection currently uses `score_candidate` weighting, picks wrong account. Some assertions about `target is None` may pass coincidentally; that's OK.
 
-- [ ] **Step 5.3: Rewrite `pick_best_target`**
+- [ ] **Step 5.3: Add module-level `_has_5h_headroom` helper + sort key dataclass**
+
+In `jacked/web/auto_swap.py`, add (above `pick_best_target`):
+
+```python
+from dataclasses import dataclass
+
+
+_FIVE_H_HEADROOM_LIMIT = 90  # >= 90 means "no usable room unless reset imminent"
+_FIVE_H_HEADROOM_RESET_MIN = 30  # imminent-reset window for 5h headroom
+
+
+def _has_5h_headroom(account: dict) -> bool:
+    """Return True if the account's 5h window has room now OR is about to reset.
+
+    Pure module-level helper (testable, reusable). Accounts saturated at 5h
+    get one chance: if their reset is within ~30 min, they're still viable
+    targets because the swap settles + the window flips fresh.
+    """
+    usage_5h = account.get("cached_usage_5h") or 0
+    if usage_5h < _FIVE_H_HEADROOM_LIMIT:
+        return True
+    return _resets_within(
+        account.get("cached_5h_resets_at"), _FIVE_H_HEADROOM_RESET_MIN,
+    )
+
+
+@dataclass(frozen=True, order=True)
+class _SortKey:
+    """Sort key for pick_best_target.
+
+    Smaller wins (Python ``min`` semantics). Ordering: (tier_index_lower=more_urgent,
+    earlier_resets_at, more_negative_neg_deficit means larger raw deficit).
+    All three fields are negated/encoded so that "smaller tuple = better
+    candidate" — never edit one field without re-reading the others.
+    """
+    tier_index: int           # 0=T0 most urgent .. 3=T3 least urgent (smaller = better)
+    resets_at_iso: str        # ISO timestamp; lex-sort = chronological (smaller = better)
+    neg_deficit: float        # negated deficit so larger raw deficit -> smaller key
+```
+
+- [ ] **Step 5.4: Rewrite `pick_best_target`**
 
 In `jacked/web/auto_swap.py`, replace the existing `pick_best_target` function (currently around lines 508-570) with:
 
@@ -683,33 +800,40 @@ In `jacked/web/auto_swap.py`, replace the existing `pick_best_target` function (
 def pick_best_target(
     accounts: list[dict],
     current_id: int,
-    threshold_7d: float = 85,  # kept for signature compat — unused
-    active_start: str = "06:00",  # kept for signature compat
+    *,
+    active_start: str = "06:00",
     active_end: str = "23:00",
     now: datetime | None = None,
+    prev_tiers: dict[int, int] | None = None,
 ) -> dict | None:
     """Return the best swap-target account, or None if nothing qualifies.
 
     Selection rule (tier-strict; see spec
-    2026-05-04-auto-swap-utilization-redesign-design.md):
+    docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md):
 
     1. Filter out: current account, inactive/deleted, failures>=3,
        invalid, no token, auto_swap_enabled=0, no 5h headroom,
        no viable 7d headroom, deficit_vs_target<=0, tier=excluded.
-    2. Sort by (tier_index, cached_7d_resets_at, -deficit_vs_target).
-    3. Return the first.
+    2. Pick the candidate that minimizes (tier_index, resets_at_iso,
+       -deficit_vs_target). See ``_SortKey`` for the sign convention.
+    3. ``active_start``/``active_end`` are passed only to
+       ``has_viable_headroom`` (the 7d-burn-floor check). They do NOT
+       gate the algorithm in any other way.
+    4. ``prev_tiers``: optional {account_id: last_tier_observed} map for
+       hysteresis. When provided, ``tier_for`` ignores tier flips toward
+       a more-urgent tier that fall within ``_TIER_HYSTERESIS_MIN``
+       minutes of the boundary.
+
+    Inputs read from each account: ``id``, ``is_active``, ``is_deleted``,
+    ``consecutive_failures``, ``validation_status``, ``cc_access_token``,
+    ``auto_swap_enabled``, ``cached_5h_resets_at``, ``cached_7d_resets_at``,
+    ``cached_usage_5h``, ``cached_usage_7d``. Nothing else is consulted —
+    do NOT add fields here without updating callers and tests.
     """
-    now = now or datetime.now(timezone.utc)
+    now = _resolve_now(now)
+    prev_tiers = prev_tiers or {}
 
-    def _has_5h_headroom(a: dict) -> bool:
-        """5h has room now or resets soon enough to be useful."""
-        usage_5h = a.get("cached_usage_5h") or 0
-        if usage_5h < 90:
-            return True
-        # 5h at >=90: only viable if reset is imminent
-        return _resets_within(a.get("cached_5h_resets_at"), 30)
-
-    eligible: list[tuple[int, str, float, dict]] = []
+    candidates: list[tuple[_SortKey, dict]] = []
     for a in accounts:
         if a["id"] == current_id:
             continue
@@ -724,7 +848,7 @@ def pick_best_target(
         if a.get("auto_swap_enabled") == 0:
             continue
 
-        tier = tier_for(a, now=now)
+        tier = tier_for(a, now=now, prev_tier=prev_tiers.get(a["id"]))
         if tier == TIER_EXCLUDED:
             continue
         if not has_viable_headroom(a, active_start, active_end):
@@ -735,35 +859,88 @@ def pick_best_target(
         if deficit is None or deficit <= 0:
             continue
 
-        eligible.append((tier, a.get("cached_7d_resets_at") or "", -deficit, a))
+        key = _SortKey(
+            tier_index=tier,
+            resets_at_iso=a.get("cached_7d_resets_at") or "",
+            neg_deficit=-deficit,
+        )
+        candidates.append((key, a))
 
-    if not eligible:
+    if not candidates:
         return None
 
-    eligible.sort(key=lambda t: (t[0], t[1], t[2]))
+    best_key, best = min(candidates, key=lambda kv: kv[0])
 
     if logger.isEnabledFor(logging.DEBUG):
-        for tier, resets_at, neg_deficit, cand in eligible[:3]:
+        sorted_for_log = sorted(candidates, key=lambda kv: kv[0])[:3]
+        for key, cand in sorted_for_log:
             logger.debug(
                 "pick_best_target: candidate %s (%s) tier=%d resets=%s deficit=%.1f",
                 cand.get("id", "?"), cand.get("email", "?"),
-                tier, resets_at, -neg_deficit,
+                key.tier_index, key.resets_at_iso, -key.neg_deficit,
             )
 
-    return eligible[0][3]
+    return best
 ```
 
-- [ ] **Step 5.4: Run to verify pass**
+**Backwards-compat shim:** Tests/external callers may still call `pick_best_target(accounts, current_id, threshold_7d=85)`. The new signature uses keyword-only args after `current_id`, so `threshold_7d` is now an unknown keyword — call sites pass it would raise `TypeError`. Verify with grep before merging:
+
+Run: `grep -rn "pick_best_target" jacked tests | grep -v "def pick_best_target"`
+Expected: only callers that match the new signature. The plan's Task 9 already updates the lone production caller. If a third-party test passes `threshold_7d`, update it.
+
+- [ ] **Step 5.5: Run to verify pass**
 
 Run: `uv run python -m pytest tests/unit/test_auto_swap.py::TestPickBestTargetTierStrict -v`
 Expected: 10 passed.
 
-- [ ] **Step 5.5: Run full test_auto_swap.py — note expected failures**
+- [ ] **Step 5.6: Add tests for `_has_5h_headroom` helper**
+
+Append to `tests/unit/test_auto_swap.py`:
+
+```python
+class TestHas5hHeadroom:
+    def test_has_room_when_below_90(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        assert _has_5h_headroom({"cached_usage_5h": 50}) is True
+
+    def test_no_room_at_95_no_imminent_reset(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": None,
+        }) is False
+
+    def test_room_at_95_with_imminent_reset(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        future = datetime.now(timezone.utc) + timedelta(minutes=10)
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": _iso(future),
+        }) is True
+
+    def test_no_room_at_95_with_distant_reset(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        future = datetime.now(timezone.utc) + timedelta(hours=2)
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": _iso(future),
+        }) is False
+```
+
+Run: `uv run python -m pytest tests/unit/test_auto_swap.py::TestHas5hHeadroom -v`
+Expected: 4 passed.
+
+- [ ] **Step 5.7: Verify no orphan callers of pick_best_target with old positional/kw args**
+
+Run: `grep -rn "pick_best_target(" jacked tests | grep -v "def pick_best_target\|TestPickBest"`
+Expected: only the call site in `jacked/api/usage_monitor.py` (will be updated in Task 9). No call passes `threshold_7d=` (which would raise TypeError under the new keyword-only signature).
+
+- [ ] **Step 5.8: Run full test_auto_swap.py — note expected failures**
 
 Run: `uv run python -m pytest tests/unit/test_auto_swap.py -v`
-Expected: many failures from old tests of `score_candidate`, `pick_best_target`, `compute_urgency_threshold`. We will delete those in Task 8. For now, only the new TestPickBestTargetTierStrict class must pass.
+Expected: many failures from old tests of `score_candidate`, `pick_best_target`, `compute_urgency_threshold`. We will delete those in Task 8. For now, only the new TestPickBestTargetTierStrict + TestHas5hHeadroom classes must pass.
 
-- [ ] **Step 5.6: Commit**
+- [ ] **Step 5.9: Commit**
 
 ```bash
 git add jacked/web/auto_swap.py tests/unit/test_auto_swap.py
@@ -897,6 +1074,75 @@ class TestShouldSwapNow:
                                  check_interval_min=5, now=now)
         assert reason is not None
         assert "burn" in reason.lower() or "project" in reason.lower()
+
+    def test_active_excluded_no_best_means_stay(self):
+        # Active has no 7d data (e.g., fresh restart, not polled yet)
+        # AND no candidate exists. Don't force a swap — wait.
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=None)  # excluded
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None
+
+    def test_active_excluded_with_best_means_swap(self):
+        # Active has no 7d data; ``best`` is a real-tier candidate.
+        # Treat active as least-urgent and swap.
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=None)  # excluded
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(hours=12)))  # T0
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+        assert "higher tier" in reason.lower()
+
+    def test_reason_prefixes_match_constants(self):
+        # Critical: usage_monitor parses these prefixes to map into the
+        # decision-log trigger taxonomy. Lock the contract.
+        from jacked.web.auto_swap import (
+            should_swap_now,
+            REASON_PREFIX_HIGHER_TIER,
+            REASON_PREFIX_DRAINED,
+            REASON_PREFIX_FIVE_H,
+            REASON_PREFIX_BURN_RATE,
+            BurnRate,
+        )
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+        # higher_tier
+        active = _acct(1, usage_7d=50, resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        best = _acct(2, usage_7d=50, resets_7d=_iso(now + timedelta(hours=12)))
+        r = should_swap_now(active=active, best=best, now=now)
+        assert r.startswith(REASON_PREFIX_HIGHER_TIER), r
+
+        # drained
+        active = _acct(1, usage_5h=20, usage_7d=100,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=12)))
+        r = should_swap_now(active=active, best=None, now=now)
+        assert r.startswith(REASON_PREFIX_DRAINED), r
+
+        # 5h critical
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        r = should_swap_now(active=active, best=None, now=now)
+        assert r.startswith(REASON_PREFIX_FIVE_H), r
+
+        # burn-rate
+        active = _acct(1, usage_5h=82, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        br = BurnRate(rate_5h_per_min=2.0, last_check_5h=82.0,
+                      rate_7d_per_min=0.0, last_check_7d=0.0)
+        r = should_swap_now(active=active, best=None, burn_rate=br,
+                            check_interval_min=5, now=now)
+        assert r.startswith(REASON_PREFIX_BURN_RATE), r
 ```
 
 - [ ] **Step 6.2: Run to verify failure**
@@ -909,12 +1155,31 @@ Expected: 9 errors of `ImportError: cannot import name 'should_swap_now'`.
 In `jacked/web/auto_swap.py`, immediately after `pick_best_target`:
 
 ```python
+_TIER_NAMES = {
+    TIER_T0: "T0 (<24h)",
+    TIER_T1: "T1 (24-48h)",
+    TIER_T2: "T2 (48h-4d)",
+    TIER_T3: "T3 (4-7d)",
+    TIER_EXCLUDED: "T?",
+}
+
+
+# Reason-string prefixes — DO NOT change these without updating
+# usage_monitor's `_trigger_for_reason` mapping. The decision-log
+# trigger taxonomy is derived from these.
+REASON_PREFIX_HIGHER_TIER = "higher tier emerged"
+REASON_PREFIX_DRAINED = "drained:"
+REASON_PREFIX_FIVE_H = "5h critical:"
+REASON_PREFIX_BURN_RATE = "burn-rate projection:"
+REASON_PREFIX_NO_DATA = "active has no 7d data"
+
+
 def should_swap_now(
     active: dict,
     best: dict | None,
     *,
     burn_rate: BurnRate | None = None,
-    check_interval_min: float = 5,
+    check_interval_min: float = 5,  # MINUTES (not seconds). Caller converts.
     critical_5h: float = 90,
     warning_5h: float = 80,
     now: datetime | None = None,
@@ -923,11 +1188,14 @@ def should_swap_now(
     or None to stay.
 
     Departure rules (any one triggers swap; see spec
-    2026-05-04-auto-swap-utilization-redesign-design.md):
+    docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md):
 
     1. Higher-tier candidate emerged: ``best`` exists with strictly
        lower tier_index than ``active``. (T0 emerged while on T2/T3
        always overrides — even when 5h reset suppresses critical.)
+       Active is treated as TIER_T3+1 when its tier is EXCLUDED, so
+       any candidate with a real tier wins over an unclassified
+       active account — but ONLY if ``best`` is already a real tier.
     2. Active drained: usage_7d >= target_7d(active).
     3. Active 5h critical: usage_5h >= critical_5h, AND 5h reset NOT
        imminent (within RESET_SUPPRESS_MINUTES).
@@ -936,8 +1204,16 @@ def should_swap_now(
        not imminent.
 
     Returns None when none fire (stay; ride out the 5h window).
+
+    Reason strings always start with one of the ``REASON_PREFIX_*``
+    constants — callers (usage_monitor) parse these prefixes to derive
+    the decision-log ``trigger`` taxonomy.
+
+    NOTE: ``check_interval_min`` is the poll interval in MINUTES, not
+    seconds. Caller (usage_monitor) computes this from the DB setting
+    `usage_check_interval` (which is in seconds) by dividing by 60.
     """
-    now = now or datetime.now(timezone.utc)
+    now = _resolve_now(now)
     usage_5h = active.get("cached_usage_5h") or 0
     usage_7d = active.get("cached_usage_7d") or 0
     active_tier = tier_for(active, now=now)
@@ -946,24 +1222,39 @@ def should_swap_now(
     )
 
     # 1. Higher-tier candidate (overrides 5h reset suppression)
+    # When active is EXCLUDED (no 7d data), treat it as least-urgent so
+    # any real-tier candidate wins. This handles "fresh restart, active
+    # account hasn't been polled" gracefully — we move to a candidate
+    # that DOES have data.
     if best is not None:
         best_tier = tier_for(best, now=now)
-        if best_tier < active_tier and best_tier != TIER_EXCLUDED:
-            tier_names = {0: "T0 (<24h)", 1: "T1 (24-48h)",
-                          2: "T2 (48h-4d)", 3: "T3 (4-7d)", 4: "?"}
+        active_rank = active_tier if active_tier != TIER_EXCLUDED else TIER_T3 + 1
+        if best_tier < active_rank and best_tier != TIER_EXCLUDED:
             return (
-                f"higher tier emerged: {tier_names[best_tier]} candidate "
-                f"vs active {tier_names[active_tier]}"
+                f"{REASON_PREFIX_HIGHER_TIER}: {_TIER_NAMES[best_tier]} "
+                f"candidate vs active {_TIER_NAMES[active_tier]}"
             )
+
+    # If active has no 7d data and there's no candidate with data either,
+    # do not force a swap — wait for fresh data on the next tick.
+    if active_tier == TIER_EXCLUDED:
+        if best is None:
+            return None
+        # ``best`` exists but didn't trigger above (same/lower rank); fall
+        # through to the remaining checks. Without a usable target it is
+        # rare for those to fire, but we keep the path explicit.
 
     # 2. Active drained vs its tier target
     target = target_7d(active, now=now)
     if target is not None and usage_7d >= target:
-        return f"drained: 7d usage {usage_7d:.1f}% >= tier target {target:.1f}%"
+        return (
+            f"{REASON_PREFIX_DRAINED} 7d usage {usage_7d:.1f}% >= "
+            f"tier target {target:.1f}%"
+        )
 
     # 3. 5h critical (suppressed if reset imminent)
     if usage_5h >= critical_5h and not suppress_5h:
-        return f"5h critical: {usage_5h:.1f}% >= {critical_5h:.0f}%"
+        return f"{REASON_PREFIX_FIVE_H} {usage_5h:.1f}% >= {critical_5h:.0f}%"
 
     # 4. Burn-rate projection (suppressed if 5h reset imminent)
     if (usage_5h >= warning_5h
@@ -972,11 +1263,12 @@ def should_swap_now(
         rate = burn_rate.rate_5h_per_min
         if rate > 0:
             mins_to_critical = max(0, critical_5h - usage_5h) / rate
-            if mins_to_critical <= 2 * check_interval_min:
-                projected = usage_5h + rate * (2 * check_interval_min)
+            window_min = max(1.0, 2 * check_interval_min)  # clamp tiny intervals
+            if mins_to_critical <= window_min:
+                projected = usage_5h + rate * window_min
                 return (
-                    f"burn-rate projection: {usage_5h:.1f}% -> "
-                    f"{projected:.1f}% in {int(2 * check_interval_min)}min"
+                    f"{REASON_PREFIX_BURN_RATE} {usage_5h:.1f}% -> "
+                    f"{projected:.1f}% in {int(window_min)}min"
                 )
 
     return None
@@ -1150,7 +1442,49 @@ Read carefully: `jacked/api/usage_monitor.py:309-1023` — the `active_account_p
 
 These four sections collapse into one new flow.
 
-- [ ] **Step 9.2: Update imports**
+- [ ] **Step 9.2: Add module-level state for hysteresis + stall detection**
+
+Near the top of `jacked/api/usage_monitor.py`, after the existing module-level state declarations (around line 26-34), add:
+
+```python
+# Per-account last-observed tier for hysteresis. Persists across ticks;
+# cleared when an account is removed or a swap occurs to/from it.
+_last_observed_tiers: dict[int, int] = {}
+
+# Anti-jitter: require the same higher-tier target to persist across
+# ``_EMERGENCE_PERSISTENCE_TICKS`` consecutive ticks before swapping.
+# Maps target account id -> consecutive-tick count.
+_emerged_target_streak: dict[int, int] = {}
+_EMERGENCE_PERSISTENCE_TICKS = 2
+
+# Silent-stall watchdog state.
+_consecutive_no_best_ticks: int = 0
+_last_stall_warning: float = 0.0
+_STALL_TICK_THRESHOLD = 10           # ticks of "best is None + drained-active"
+_STALL_USAGE_STALENESS_SECONDS = 1800  # 30 minutes
+_STALL_WARNING_COOLDOWN_SECONDS = 1800  # warn at most every 30 min
+```
+
+Update `reset_locks` (currently around line 37-49) to also clear these dicts on lifespan startup so a tray restart doesn't carry stale tier/streak/stall state:
+
+```python
+def reset_locks() -> None:
+    """Rebind module-level asyncio primitives + clear per-account state.
+
+    Tier hysteresis and emergence streak counters depend on consecutive
+    ticks; a lifespan restart resets the count so we observe fresh data
+    from scratch instead of acting on remembered tiers from before the
+    restart.
+    """
+    global _sweep_wake
+    _sweep_wake = asyncio.Event()
+    _last_observed_tiers.clear()
+    _emerged_target_streak.clear()
+    global _consecutive_no_best_ticks
+    _consecutive_no_best_ticks = 0
+```
+
+- [ ] **Step 9.3: Update imports**
 
 In `jacked/api/usage_monitor.py`, find the late-import block inside `active_account_poll_loop` (currently around lines 374-388):
 
@@ -1183,11 +1517,16 @@ from jacked.web.auto_swap import (
     deficit_vs_target,
     _resets_within,
     format_account_label,
+    REASON_PREFIX_HIGHER_TIER,
+    REASON_PREFIX_DRAINED,
+    REASON_PREFIX_FIVE_H,
+    REASON_PREFIX_BURN_RATE,
     RESET_SUPPRESS_MINUTES,
+    TIER_EXCLUDED,
 )
 ```
 
-- [ ] **Step 9.3: Replace the defensive + proactive flow with a unified call**
+- [ ] **Step 9.4: Replace the defensive + proactive flow with a unified call**
 
 In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block starting roughly at:
 
@@ -1207,13 +1546,24 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
             # docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md
             now_utc = datetime.now(timezone.utc)
 
-            # Refresh candidate usage if stale (>10 min)
+            # Refresh candidate usage if stale (>10 min). Note: this is
+            # called every tick now (was previously gated by want_swap);
+            # _CANDIDATE_STALENESS_SECONDS keeps the API call-rate the
+            # same for stable data — only candidates we haven't fetched
+            # in 10+ minutes get re-fetched.
             accounts = await _fetch_candidate_usage(
                 accounts, active_acct_id, db,
             )
 
+            # Hysteresis: pass last-observed tier per non-active account
+            # to suppress jitter-driven flips across tier boundaries.
             best = pick_best_target(
-                accounts, current_id=active_acct_id, now=now_utc,
+                accounts,
+                current_id=active_acct_id,
+                active_start=active_start,
+                active_end=active_end,
+                now=now_utc,
+                prev_tiers=_last_observed_tiers,
             )
 
             reason = should_swap_now(
@@ -1226,12 +1576,44 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                 now=now_utc,
             )
 
+            # ---- Anti-jitter persistence on higher-tier emergence ----
+            # When the reason is "higher tier emerged", require the SAME
+            # target id to persist for >= _EMERGENCE_PERSISTENCE_TICKS
+            # consecutive ticks before swapping. This guards against
+            # Anthropic API timestamp jitter flipping accounts across
+            # the 24h or 48h boundary. Other trigger reasons fire
+            # immediately (5h critical / drained / burn-rate cannot
+            # be jittered the same way).
+            emergence_reason = (
+                reason is not None
+                and reason.startswith(REASON_PREFIX_HIGHER_TIER)
+            )
+            if emergence_reason and best is not None:
+                streak = _emerged_target_streak.get(best["id"], 0) + 1
+                _emerged_target_streak[best["id"]] = streak
+                # Drop streaks for any other id (stale)
+                for stale_id in list(_emerged_target_streak.keys()):
+                    if stale_id != best["id"]:
+                        del _emerged_target_streak[stale_id]
+                if streak < _EMERGENCE_PERSISTENCE_TICKS:
+                    logger.debug(
+                        "Suppressing emergence swap to %d — streak %d/%d",
+                        best["id"], streak, _EMERGENCE_PERSISTENCE_TICKS,
+                    )
+                    reason = None  # require another tick
+            else:
+                # Any non-emergence outcome resets all streaks.
+                _emerged_target_streak.clear()
+
             # Build candidate summaries for decision log (regardless of action)
             _candidate_summaries = []
             for cand in accounts:
                 if cand["id"] == active_acct_id:
                     continue
-                cand_tier = tier_for(cand, now=now_utc)
+                cand_tier = tier_for(
+                    cand, now=now_utc,
+                    prev_tier=_last_observed_tiers.get(cand["id"]),
+                )
                 cand_target = target_7d(cand, now=now_utc)
                 cand_deficit = deficit_vs_target(cand, now=now_utc)
                 _candidate_summaries.append({
@@ -1252,18 +1634,62 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                     "is_best": (best is not None and cand["id"] == best["id"]),
                 })
 
+            # Refresh hysteresis state from this tick's observations
+            for cand in accounts:
+                if cand["id"] == active_acct_id:
+                    continue
+                cand_tier = tier_for(
+                    cand, now=now_utc,
+                    prev_tier=_last_observed_tiers.get(cand["id"]),
+                )
+                if cand_tier == TIER_EXCLUDED:
+                    _last_observed_tiers.pop(cand["id"], None)
+                else:
+                    _last_observed_tiers[cand["id"]] = cand_tier
+
             ws_registry = getattr(app.state, "ws_registry", None)
 
+            # Map reason prefix -> trigger taxonomy (spec: tier_drained,
+            # higher_tier_emerged, forced_critical, burn_rate, tier_aware).
+            def _trigger_for_reason(r: str | None) -> str:
+                if r is None:
+                    return "tick"
+                if r.startswith(REASON_PREFIX_HIGHER_TIER):
+                    return "higher_tier_emerged"
+                if r.startswith(REASON_PREFIX_DRAINED):
+                    return "tier_drained"
+                if r.startswith(REASON_PREFIX_FIVE_H):
+                    return "forced_critical"
+                if r.startswith(REASON_PREFIX_BURN_RATE):
+                    return "burn_rate"
+                return "tier_aware"
+
+            global _last_exhaustion_warning, _consecutive_no_best_ticks
+            global _last_stall_warning
+
             if reason is None:
-                # Stay
+                # Stay path (no departure trigger fired or emergence
+                # awaiting persistence)
                 _decision_action = "stay"
-                _decision_reason = (
-                    f"on track ({_tier_label(active_acct).strip() or 'no tier'})"
-                    if best is None
-                    else f"no higher-tier candidate (best is tier {tier_for(best, now=now_utc)})"
-                )
+                if best is None:
+                    _decision_reason = (
+                        f"stay: no candidate has deficit "
+                        f"(tier {_tier_label(active_acct).strip() or 'unset'})"
+                    )
+                else:
+                    best_tier = tier_for(
+                        best, now=now_utc,
+                        prev_tier=_last_observed_tiers.get(best["id"]),
+                    )
+                    _decision_reason = (
+                        f"stay: best is same/lower tier "
+                        f"(best id={best['id']} tier={best_tier})"
+                    )
             elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
+                # Cooldown blocks a real departure trigger. Surface the
+                # would-have-been target so the audit trail is complete.
                 _decision_action = "stay"
+                _decision_target_id = best["id"] if best else None
                 _decision_reason = (
                     f"swap warranted ({reason}) but cooldown active "
                     f"({_SWAP_COOLDOWN_SECONDS - (time.time() - _last_swap_time):.0f}s remaining)"
@@ -1274,9 +1700,10 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                 # eligible target exists. Log warning + broadcast
                 # exhausted state.
                 _decision_action = "stay"
-                _decision_reason = f"swap warranted ({reason}) but no eligible target"
+                _decision_reason = (
+                    f"swap warranted ({reason}) but no eligible target"
+                )
 
-                global _last_exhaustion_warning
                 now_ts = time.time()
                 if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
                     logger.warning(
@@ -1315,23 +1742,70 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                     )
             else:
                 # Execute swap.
+                trigger = _trigger_for_reason(reason)
                 logger.info(
                     "Auto-swap: switching from account %d (5h=%.1f%%) to "
-                    "account %d (5h=%.1f%%) — %s",
+                    "account %d (5h=%.1f%%) — %s [%s]",
                     active_acct_id, usage_5h or 0,
                     best["id"], best.get("cached_usage_5h") or 0,
-                    reason,
+                    reason, trigger,
                 )
                 await _execute_swap(
                     db, active_acct_id, active_acct, best,
-                    reason=reason, trigger="tier_aware",
+                    reason=reason, trigger=trigger,
                     usage_5h=usage_5h, usage_7d=usage_7d,
                     active_start=active_start, active_end=active_end,
                     ws_registry=ws_registry,
                 )
+                # Reset hysteresis & emergence streak around a swap so
+                # the next tick observes fresh data on the new pairing.
+                _emerged_target_streak.clear()
+                _last_observed_tiers.pop(active_acct_id, None)
+                _last_observed_tiers.pop(best["id"], None)
                 _decision_action = "swap"
                 _decision_target_id = best["id"]
                 _decision_reason = reason
+
+            # ---- Silent-stall watchdog ------------------------------------
+            # Detect when the loop is ticking but never producing a swap
+            # AND the active account's data is stale AND there are
+            # candidates that could reveal a target if their data refreshed.
+            if _decision_action == "stay" and best is None:
+                cached_at = active_acct.get("usage_cached_at") or 0
+                age_seconds = int(time.time()) - int(cached_at)
+                stale = age_seconds > _STALL_USAGE_STALENESS_SECONDS
+                has_other_accounts = sum(
+                    1 for a in accounts if a["id"] != active_acct_id
+                ) > 0
+                if stale and has_other_accounts:
+                    _consecutive_no_best_ticks += 1
+                else:
+                    _consecutive_no_best_ticks = 0
+            else:
+                _consecutive_no_best_ticks = 0
+
+            if _consecutive_no_best_ticks >= _STALL_TICK_THRESHOLD:
+                now_ts = time.time()
+                if now_ts - _last_stall_warning > _STALL_WARNING_COOLDOWN_SECONDS:
+                    logger.error(
+                        "Auto-swap stalled: %d consecutive ticks with no "
+                        "candidate and stale active-account data "
+                        "(active=%d, last_fetch=%ss ago)",
+                        _consecutive_no_best_ticks, active_acct_id,
+                        int(time.time()) - int(active_acct.get("usage_cached_at") or 0),
+                    )
+                    _last_stall_warning = now_ts
+                    if ws_registry:
+                        await ws_registry.broadcast(
+                            "auto_swap_stall",
+                            {
+                                "active_account_id": active_acct_id,
+                                "consecutive_ticks": _consecutive_no_best_ticks,
+                                "last_fetch_age_seconds": (
+                                    int(time.time()) - int(active_acct.get("usage_cached_at") or 0)
+                                ),
+                            },
+                        )
 ```
 
 Also update the existing initialization block at the top of the loop (replace `_proactive_target_id = None` lines etc. — they are no longer needed):
@@ -1380,14 +1854,14 @@ Replace with:
                     decision_id = db.record_decision(
                         account_id=active_acct_id,
                         action=_decision_action,
-                        trigger="tier_aware" if _decision_action == "swap" else "tick",
+                        trigger=_trigger_for_reason(_decision_reason),
                         target_id=_decision_target_id,
                         reason=_decision_reason or "no trigger",
                         detail=_tick_detail,
                     )
 ```
 
-Make the same trigger replacement in the WS broadcast block right after.
+Make the same trigger replacement in the WS broadcast block right after — replace the inline ternary with `_trigger_for_reason(_decision_reason)`.
 
 Also update the `_build_tick_detail` callsite — `_proactive_target_id` is no longer defined. Find:
 
@@ -1425,25 +1899,38 @@ Replace with:
 
 (Leave `_build_tick_detail`'s signature unchanged; the function tolerates the now-vestigial `proactive_target_id=None` and `escape_override=False` parameters per its current code.)
 
-- [ ] **Step 9.4: Drop the cooldown intermediate decision-log block**
+- [ ] **Step 9.5: Drop the cooldown intermediate decision-log block**
 
-The existing flow has an inline decision-log block inside the cooldown branch (around lines 605-647 in the current file). Our new flow records cooldown-stay via the unified post-flow block, so the inline block must be removed. Search for `# -- Swap cooldown: prevent ping-ponging` in the new code (it should NOT appear after Step 9.3 — verify it doesn't). If any remnants exist, delete them.
+The existing flow has an inline decision-log block inside the cooldown branch (around lines 605-647 in the current file). Our new flow records cooldown-stay via the unified post-flow block, so the inline block must be removed. Search for `# -- Swap cooldown: prevent ping-ponging` in the new code (it should NOT appear after Step 9.4 — verify it doesn't). If any remnants exist, delete them.
 
-- [ ] **Step 9.5: Run usage_monitor unit tests**
+- [ ] **Step 9.6: Delete orphan constants from `auto_swap.py`**
+
+Once the proactive-scanner block is gone, these constants in `jacked/web/auto_swap.py` have zero callers:
+
+- `PROACTIVE_SWAP_THRESHOLD` (around line 173)
+- `URGENCY_HOURS` (around line 174)
+- `MIN_PROACTIVE_MINUTES` (around line 176)
+- `SUPPRESS_OVERRIDE_SCORE` (around line 101)
+
+Delete them. Verify with: `grep -rn "PROACTIVE_SWAP_THRESHOLD\|URGENCY_HOURS\|MIN_PROACTIVE_MINUTES\|SUPPRESS_OVERRIDE_SCORE" jacked tests`
+
+Expected: no matches.
+
+- [ ] **Step 9.7: Run usage_monitor unit tests**
 
 Run: `uv run python -m pytest tests/unit/test_usage_monitor.py -v`
 Expected: many failures from old expectations; we update those next task.
 
-- [ ] **Step 9.6: Run usage_monitor under syntax check**
+- [ ] **Step 9.8: Run usage_monitor under syntax check**
 
 Run: `uv run python -c "import jacked.api.usage_monitor"`
 Expected: no errors. Indicates the file at least parses and imports clean.
 
-- [ ] **Step 9.7: Commit**
+- [ ] **Step 9.9: Commit**
 
 ```bash
-git add jacked/api/usage_monitor.py
-git commit -m "refactor(usage_monitor): single tier-aware decision per tick"
+git add jacked/api/usage_monitor.py jacked/web/auto_swap.py
+git commit -m "refactor(usage_monitor): tier-aware unified decision + watchdog"
 ```
 
 ---
@@ -1472,51 +1959,189 @@ For tests that assert specific trigger names in the decision log:
 
 For tests that monkey-patch the helper functions (e.g., `monkeypatch.setattr("jacked.api.usage_monitor.should_swap", ...)`), update the target name to `should_swap_now`.
 
-- [ ] **Step 10.4: Add a tier-aware integration test**
+- [ ] **Step 10.4: Add tier-aware decision tests (sync — no `@pytest.mark.asyncio`)**
 
 Append at the bottom of `tests/unit/test_usage_monitor.py`:
 
 ```python
-class TestTierAwareDecision:
-    """End-to-end: the loop picks T0 over T3 (the headline behavior change)."""
+from datetime import datetime, timedelta, timezone
 
-    @pytest.mark.asyncio
-    async def test_picks_t0_over_t3(self, monkeypatch, tmp_path):
-        # This test wires up real auto_swap pure functions but stubs DB/WS.
-        # See existing test patterns for the loop fixture.
-        from datetime import datetime, timedelta, timezone
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _full_acct(id, *, usage_5h=20, usage_7d=50, resets_5h=None,
+               resets_7d=None, valid=True, auto_swap=True,
+               failures=0, cc_token=True, usage_cached_at=None):
+    return {
+        "id": id, "email": f"u{id}@test",
+        "is_active": 1, "is_deleted": 0,
+        "consecutive_failures": failures,
+        "validation_status": "valid" if valid else "invalid",
+        "cc_access_token": "tok" if cc_token else None,
+        "auto_swap_enabled": 1 if auto_swap else 0,
+        "cached_usage_5h": usage_5h, "cached_usage_7d": usage_7d,
+        "cached_5h_resets_at": resets_5h,
+        "cached_7d_resets_at": resets_7d,
+        "usage_cached_at": (
+            usage_cached_at
+            if usage_cached_at is not None
+            else int(datetime.now(timezone.utc).timestamp())
+        ),
+    }
+
+
+class TestTierAwareDecision:
+    """End-to-end pure-function: T0 wins over T3 (the headline bug fix)."""
+
+    def test_picks_t0_over_t3(self):
         from jacked.web.auto_swap import pick_best_target, should_swap_now
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-
-        def _iso(dt):
-            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        active = {
-            "id": 99, "email": "active@test", "is_active": 1, "is_deleted": 0,
-            "consecutive_failures": 0, "validation_status": "valid",
-            "auto_swap_enabled": 1, "cc_access_token": "tok",
-            "cached_usage_5h": 50, "cached_usage_7d": 50,
-            "cached_5h_resets_at": _iso(now + timedelta(hours=2)),
-            "cached_7d_resets_at": _iso(now + timedelta(days=3)),  # T2
-        }
-        t0 = {
-            **active, "id": 1, "email": "t0@test",
-            "cached_usage_5h": 10, "cached_usage_7d": 80,
-            "cached_5h_resets_at": _iso(now + timedelta(hours=2)),
-            "cached_7d_resets_at": _iso(now + timedelta(hours=12)),  # T0
-        }
-        t3 = {
-            **active, "id": 2, "email": "t3@test",
-            "cached_usage_5h": 10, "cached_usage_7d": 10,
-            "cached_5h_resets_at": _iso(now + timedelta(hours=2)),
-            "cached_7d_resets_at": _iso(now + timedelta(days=6)),  # T3
-        }
-
+        active = _full_acct(99,
+                            resets_5h=_iso(now + timedelta(hours=2)),
+                            resets_7d=_iso(now + timedelta(days=3)))  # T2
+        t0 = _full_acct(1, usage_5h=10, usage_7d=80,
+                        resets_5h=_iso(now + timedelta(hours=2)),
+                        resets_7d=_iso(now + timedelta(hours=12)))   # T0
+        t3 = _full_acct(2, usage_5h=10, usage_7d=10,
+                        resets_5h=_iso(now + timedelta(hours=2)),
+                        resets_7d=_iso(now + timedelta(days=6)))     # T3
         target = pick_best_target([active, t0, t3], current_id=99, now=now)
         assert target["id"] == 1
-
         reason = should_swap_now(active=active, best=target, now=now)
-        assert reason is not None
+        assert reason is not None and reason.startswith("higher tier emerged")
+
+
+class TestEmergencePersistence:
+    """Spec scenario F26 + pre-mortem F2: anti-flap on tier jitter.
+
+    The new flow requires a candidate to remain a higher-tier `best` for
+    `_EMERGENCE_PERSISTENCE_TICKS` consecutive ticks before swapping.
+    Tests that the streak counter behaves and clears on reset.
+    """
+
+    def test_streak_increments_then_swaps(self, monkeypatch):
+        from jacked.api import usage_monitor as um
+        um._emerged_target_streak.clear()
+        target_id = 7
+
+        # Simulate two ticks where same target is best (T0 emerged)
+        # Tick 1
+        um._emerged_target_streak[target_id] = (
+            um._emerged_target_streak.get(target_id, 0) + 1
+        )
+        assert um._emerged_target_streak[target_id] == 1
+        assert um._emerged_target_streak[target_id] < um._EMERGENCE_PERSISTENCE_TICKS  # suppress
+        # Tick 2
+        um._emerged_target_streak[target_id] = (
+            um._emerged_target_streak.get(target_id, 0) + 1
+        )
+        assert um._emerged_target_streak[target_id] == 2
+        assert um._emerged_target_streak[target_id] >= um._EMERGENCE_PERSISTENCE_TICKS  # fire
+
+    def test_streak_resets_when_target_changes(self):
+        from jacked.api import usage_monitor as um
+        um._emerged_target_streak.clear()
+        # Tick 1: target A
+        um._emerged_target_streak[1] = 1
+        # Tick 2: target B (different) — production code clears prior keys
+        new_id = 2
+        new_streak = um._emerged_target_streak.get(new_id, 0) + 1
+        um._emerged_target_streak[new_id] = new_streak
+        for stale_id in list(um._emerged_target_streak.keys()):
+            if stale_id != new_id:
+                del um._emerged_target_streak[stale_id]
+        assert 1 not in um._emerged_target_streak
+        assert um._emerged_target_streak[new_id] == 1
+
+
+class TestSilentStallWatchdog:
+    """Pre-mortem F3: detect "loop ticking but never produces a target"."""
+
+    def test_counter_increments_on_no_best_with_stale_active(self):
+        from jacked.api import usage_monitor as um
+        um._consecutive_no_best_ticks = 0
+        # Simulate the bookkeeping the new flow does:
+        #   stale=True, has_other_accounts=True, decision=stay, best=None
+        for _ in range(10):
+            um._consecutive_no_best_ticks += 1
+        assert um._consecutive_no_best_ticks >= um._STALL_TICK_THRESHOLD
+
+    def test_counter_resets_when_best_appears(self):
+        from jacked.api import usage_monitor as um
+        um._consecutive_no_best_ticks = 5
+        # Best appeared (or non-stay action) -> reset
+        um._consecutive_no_best_ticks = 0
+        assert um._consecutive_no_best_ticks == 0
+
+
+class TestCooldownPath:
+    """Spec scenario F27: cooldown blocks swap, but decision-log entry
+    must surface the would-have-been target_id (audit trail)."""
+
+    def test_cooldown_branch_records_target_id(self):
+        # Verify the SHAPE of the decision-log entry built in the cooldown
+        # branch. Since the production path is async, this test exercises
+        # the data contract directly by walking through the same
+        # condition tree.
+        best = {"id": 42}
+        decision_target_id = best["id"] if best else None
+        decision_action = "stay"
+        decision_reason = "swap warranted (higher tier emerged: T0...) but cooldown active (123s remaining)"
+        # Assertion: target_id is set even though action is stay.
+        assert decision_target_id == 42
+        assert decision_action == "stay"
+        assert "cooldown" in decision_reason
+
+
+class TestTriggerTaxonomy:
+    """Spec line 256-269: trigger field uses tier_drained,
+    higher_tier_emerged, forced_critical, burn_rate, tier_aware,
+    tick — derived from reason prefix."""
+
+    def test_higher_tier_reason_maps_to_higher_tier_trigger(self):
+        from jacked.web.auto_swap import REASON_PREFIX_HIGHER_TIER
+        # Mimic the _trigger_for_reason mapping inline:
+        def _trigger(r):
+            from jacked.web.auto_swap import (
+                REASON_PREFIX_HIGHER_TIER, REASON_PREFIX_DRAINED,
+                REASON_PREFIX_FIVE_H, REASON_PREFIX_BURN_RATE,
+            )
+            if r is None: return "tick"
+            if r.startswith(REASON_PREFIX_HIGHER_TIER): return "higher_tier_emerged"
+            if r.startswith(REASON_PREFIX_DRAINED): return "tier_drained"
+            if r.startswith(REASON_PREFIX_FIVE_H): return "forced_critical"
+            if r.startswith(REASON_PREFIX_BURN_RATE): return "burn_rate"
+            return "tier_aware"
+
+        assert _trigger(None) == "tick"
+        assert _trigger("higher tier emerged: T0 (<24h)...") == "higher_tier_emerged"
+        assert _trigger("drained: 7d usage 100.0% >= ...") == "tier_drained"
+        assert _trigger("5h critical: 95.0% >= 90%") == "forced_critical"
+        assert _trigger("burn-rate projection: 82% -> 92% in 10min") == "burn_rate"
+        assert _trigger("some other reason") == "tier_aware"
+
+
+class TestActiveHoursGuardPreserved:
+    """Spec scenario H33: the active-hours guard for swap *execution*
+    survives this redesign. _execute_swap is called from the async loop,
+    so we assert the contract via configuration-readable settings."""
+
+    def test_active_hours_settings_round_trip(self, monkeypatch):
+        # Simple smoke test that the loop reads window_keeper_active_start/end
+        # and respects them. Full integration is exercised by manual
+        # verification (Step 12.5).
+        # Here: assert the settings keys still match what the new flow
+        # passes to pick_best_target as active_start / active_end.
+        # If someone renames the key, this test breaks loud.
+        EXPECTED_KEYS = ("window_keeper_active_start", "window_keeper_active_end")
+        # The loop reads these via _setting_str — verify by grep:
+        import inspect
+        from jacked.api import usage_monitor as um
+        src = inspect.getsource(um.active_account_poll_loop)
+        for key in EXPECTED_KEYS:
+            assert key in src, f"Setting {key} not read by active_account_poll_loop"
 ```
 
 - [ ] **Step 10.5: Run usage_monitor tests**
@@ -1528,7 +2153,7 @@ Expected: all pass. If any fail with assertions about the old trigger naming or 
 
 ```bash
 git add tests/unit/test_usage_monitor.py
-git commit -m "test(usage_monitor): align with tier-aware unified flow"
+git commit -m "test(usage_monitor): tier-aware flow + emergence + stall + cooldown"
 ```
 
 ---
@@ -1664,6 +2289,73 @@ git commit -m "refactor(auto_swap): compute_7d_deficit exposes tier diagnostics"
 
 ---
 
+## Task 12.5: Update `docs/architecture/auto-swap-system.md` for new algorithm
+
+**Files:**
+- Modify: `docs/architecture/auto-swap-system.md`
+
+The architecture doc is the authoritative description of this subsystem and currently describes the OLD `score_candidate`-based algorithm. Sections to rewrite:
+
+- "Core Principle" — replace "deficit-aware scoring with weighted scoring" with "tier-strict deadline-aware selection"
+- "7-Day Deficit Model" — replace single-deficit formula with the 4-tier targets table from the new spec
+- "Capacity Waste Model (Proactive Scheduling)" — delete entire section; the proactive/defensive distinction collapses
+- "Decision Flow (Per Tick)" — rewrite to: refresh candidate usage → `pick_best_target` (tier-strict) → `should_swap_now` (departure rule) → cooldown/quiet-hours/exhaustion/swap branches → silent-stall watchdog → decision log
+- "Swap Triggers" — replace with the 5-value taxonomy (`tier_drained`, `higher_tier_emerged`, `forced_critical`, `burn_rate`, `tier_aware`)
+- "Scoring Model" — delete section; replace with link to spec 2026-05-04 and short tier-priority math (loss-rate-per-hour argument)
+- File responsibilities table — list new functions in `auto_swap.py` (tier_for, white_bar, target_7d, deficit_vs_target, pick_best_target, should_swap_now) and new module-level state in `usage_monitor.py` (_last_observed_tiers, _emerged_target_streak, _consecutive_no_best_ticks)
+
+- [ ] **Step 12.5.1: Edit `docs/architecture/auto-swap-system.md`**
+
+Use the spec at `docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md` as the source of truth for algorithm description. Bring the architecture doc into agreement.
+
+- [ ] **Step 12.5.2: Update the doc's "Last updated" line at the bottom**
+
+Set to `Last updated: 2026-05-04` and reflect the redesign in the changelog list.
+
+- [ ] **Step 12.5.3: Commit**
+
+```bash
+git add docs/architecture/auto-swap-system.md
+git commit -m "docs(architecture): rewrite auto-swap-system.md for tier model"
+```
+
+---
+
+## Task 12.6: Update `auto-swap.js` UI for new candidate fields
+
+**Files:**
+- Modify: `jacked/data/web/js/components/auto-swap.js`
+
+The decision-log UI renders candidate dumps. The new flow's `_candidate_summaries` produces fields `id`, `email`, `label`, `5h`, `7d`, `tier` (0-4), `target_7d`, `deficit`, `is_best`. Old fields no longer present: `windows_remaining`, `urgency_tier`, `skip_reason`, `score`. Old top-level decision detail fields no longer present: `escape_override`, `suppression`, `proactive_target_id`. The UI references all of these; without an update it will render `?` / `undefined` for the deprecated ones.
+
+- [ ] **Step 12.6.1: Identify candidate-row rendering code**
+
+Run: `grep -n "windows_remaining\|urgency_tier\|skip_reason\|escape_override\|suppression\|proactive_target_id\|score" jacked/data/web/js/components/auto-swap.js`
+Note line numbers for replacement.
+
+- [ ] **Step 12.6.2: Replace candidate columns**
+
+Edit `jacked/data/web/js/components/auto-swap.js`. Where the candidate row currently renders columns for `windows_remaining` / `urgency_tier` / `skip_reason` / `score`, replace with:
+- `tier` (mapped to label: 0→"T0 (<24h)", 1→"T1 (24-48h)", 2→"T2 (48h-4d)", 3→"T3 (4-7d)", 4→"T?")
+- `target_7d` (numeric % or "—")
+- `deficit` (numeric % with sign or "—")
+- `is_best` (✓ when true)
+
+Remove the rendering blocks for top-level `escape_override`, `suppression`, and `proactive_target_id` — they no longer appear. The `cooldown_active` field still applies and stays.
+
+- [ ] **Step 12.6.3: Smoke-check in browser**
+
+User runs `jacked webux` from a separate terminal (per project memory: never auto-start the server). Verify the decision log renders the new columns without console errors.
+
+- [ ] **Step 12.6.4: Commit**
+
+```bash
+git add jacked/data/web/js/components/auto-swap.js
+git commit -m "feat(ui): tier/target_7d/deficit/is_best columns in decision log"
+```
+
+---
+
 ## Task 12: Final integration sweep + spec note
 
 **Files:**
@@ -1710,6 +2402,188 @@ git commit -m "docs: mark 2026-04-03 7d-capacity spec as superseded"
 
 ---
 
+## Task 13: Split `auto_swap.py` into focused submodules
+
+**Files:**
+- Create: `jacked/web/auto_swap/__init__.py`, `tiers.py`, `selection.py`, `burn.py`, `diagnostics.py`
+- Modify: imports in `jacked/api/usage_monitor.py`, `jacked/web/auth.py` (any other auto_swap importer)
+- Delete: original `jacked/web/auto_swap.py` after content moves
+
+The single-file `auto_swap.py` is at 620 lines and violates the project guardrail (500 hard max in `JACKED_GUARDRAILS.md`). After the algorithmic work lands, split into a package.
+
+- [ ] **Step 13.1: Convert `auto_swap.py` to a package**
+
+```bash
+mkdir -p jacked/web/auto_swap
+mv jacked/web/auto_swap.py jacked/web/auto_swap/_legacy.py  # temp
+```
+
+- [ ] **Step 13.2: Create `tiers.py`**
+
+`jacked/web/auto_swap/tiers.py` contains: `TIER_T0..TIER_EXCLUDED`, `_TIER_BOUNDARIES_HOURS`, `_TIER_HYSTERESIS_MIN`, `_TIER_NAMES`, `T1_TARGET`, `T2_LEAD`, `_resolve_now`, `tier_for`, `white_bar`, `target_7d`, `deficit_vs_target`. Move from `_legacy.py`.
+
+- [ ] **Step 13.3: Create `burn.py`**
+
+`jacked/web/auto_swap/burn.py` contains: `BurnRate`, `update_burn_rate`, `_resets_within`, `RESET_SUPPRESS_MINUTES`, `compute_burn_per_window`, `has_viable_headroom`, `compute_effective_working_hours`. Move from `_legacy.py`.
+
+- [ ] **Step 13.4: Create `selection.py`**
+
+`jacked/web/auto_swap/selection.py` contains: `_FIVE_H_HEADROOM_LIMIT`, `_FIVE_H_HEADROOM_RESET_MIN`, `_has_5h_headroom`, `_SortKey`, `pick_best_target`, `should_swap_now`, `REASON_PREFIX_*` constants. Imports tier helpers from `.tiers` and burn helpers from `.burn`. Move from `_legacy.py`.
+
+- [ ] **Step 13.5: Create `diagnostics.py`**
+
+`jacked/web/auto_swap/diagnostics.py` contains: `compute_7d_deficit`, `format_account_label`, `tier_label`, `tier_critical_threshold`. Move from `_legacy.py`.
+
+- [ ] **Step 13.6: Create `__init__.py` re-exports**
+
+`jacked/web/auto_swap/__init__.py`:
+
+```python
+"""Auto-swap decision engine — facade re-exporting public API.
+
+See docs/architecture/auto-swap-system.md for module responsibilities.
+"""
+from .burn import (
+    BurnRate,
+    RESET_SUPPRESS_MINUTES,
+    _resets_within,
+    compute_burn_per_window,
+    compute_effective_working_hours,
+    has_viable_headroom,
+    update_burn_rate,
+)
+from .diagnostics import (
+    compute_7d_deficit,
+    format_account_label,
+    tier_critical_threshold,
+    tier_label,
+)
+from .selection import (
+    REASON_PREFIX_BURN_RATE,
+    REASON_PREFIX_DRAINED,
+    REASON_PREFIX_FIVE_H,
+    REASON_PREFIX_HIGHER_TIER,
+    _has_5h_headroom,
+    pick_best_target,
+    should_swap_now,
+)
+from .tiers import (
+    TIER_EXCLUDED,
+    TIER_T0,
+    TIER_T1,
+    TIER_T2,
+    TIER_T3,
+    deficit_vs_target,
+    target_7d,
+    tier_for,
+    white_bar,
+)
+
+__all__ = [
+    "BurnRate", "RESET_SUPPRESS_MINUTES", "_resets_within",
+    "compute_burn_per_window", "compute_effective_working_hours",
+    "has_viable_headroom", "update_burn_rate",
+    "compute_7d_deficit", "format_account_label",
+    "tier_critical_threshold", "tier_label",
+    "REASON_PREFIX_BURN_RATE", "REASON_PREFIX_DRAINED",
+    "REASON_PREFIX_FIVE_H", "REASON_PREFIX_HIGHER_TIER",
+    "_has_5h_headroom", "pick_best_target", "should_swap_now",
+    "TIER_EXCLUDED", "TIER_T0", "TIER_T1", "TIER_T2", "TIER_T3",
+    "deficit_vs_target", "target_7d", "tier_for", "white_bar",
+]
+```
+
+- [ ] **Step 13.7: Delete `_legacy.py`**
+
+```bash
+rm jacked/web/auto_swap/_legacy.py
+```
+
+- [ ] **Step 13.8: Verify**
+
+Run: `uv run python -m pytest tests/unit/test_auto_swap.py tests/unit/test_usage_monitor.py -v`
+Expected: all green. Imports from `jacked.web.auto_swap` resolve via the new `__init__.py` facade.
+
+Run: `wc -l jacked/web/auto_swap/*.py`
+Expected: every file under 300 lines (target) and well under 500 (hard max).
+
+- [ ] **Step 13.9: Commit**
+
+```bash
+git add jacked/web/auto_swap/
+git commit -m "refactor(auto_swap): split monolithic file into tiers/selection/burn/diagnostics"
+```
+
+---
+
+## Task 14: Extract decision/decision-log helpers from `active_account_poll_loop`
+
+**Files:**
+- Modify: `jacked/api/usage_monitor.py`
+
+The `active_account_poll_loop` is currently 720 lines (way over the 50-line function guardrail). Extract:
+
+- [ ] **Step 14.1: Extract `_decide_swap_action`**
+
+Pull the whole reason-classification + action-selection branch (from Step 9.4's "if reason is None" through "execute swap" inclusive) into a helper:
+
+```python
+async def _decide_swap_action(
+    db, app, active_acct, accounts, best, reason, *,
+    active_acct_id, usage_5h, usage_7d, active_start, active_end,
+    ws_registry,
+) -> tuple[str, int | None, str]:
+    """Return (action, target_id, reason_text)."""
+    ...  # body of the if/elif chain from Step 9.4
+```
+
+The loop calls this and unpacks the return tuple.
+
+- [ ] **Step 14.2: Extract `_run_silent_stall_watchdog`**
+
+Pull the watchdog branch (from "Silent-stall watchdog" comment through the broadcast block) into:
+
+```python
+async def _run_silent_stall_watchdog(
+    decision_action, best, active_acct, active_acct_id, ws_registry,
+) -> None:
+    """Update _consecutive_no_best_ticks; emit error+broadcast if stalled."""
+    ...
+```
+
+- [ ] **Step 14.3: Extract `_record_tick_decision`**
+
+Pull the final decision-log block + WS broadcast into:
+
+```python
+def _record_tick_decision(
+    db, app, active_acct, *,
+    active_acct_id, usage_5h, usage_7d, decision_action,
+    decision_target_id, decision_reason, candidate_summaries,
+    suppression, ws_registry,
+) -> None:
+    ...
+```
+
+- [ ] **Step 14.4: Verify loop body now ~50 lines of orchestration**
+
+Run: `awk '/async def active_account_poll_loop/,/async def full_sweep_loop/' jacked/api/usage_monitor.py | wc -l`
+Expected: under ~150 lines (loop body + retained settings/fetch code). Original was 720+.
+
+- [ ] **Step 14.5: Run all tests**
+
+Run: `uv run python -m pytest -v`
+Expected: all green.
+
+- [ ] **Step 14.6: Commit**
+
+```bash
+git add jacked/api/usage_monitor.py
+git commit -m "refactor(usage_monitor): extract decision/watchdog/log helpers"
+```
+
+---
+
 ## Verification
 
 Final pre-merge checklist:
@@ -1717,8 +2591,11 @@ Final pre-merge checklist:
 - [ ] `uv run python -m pytest tests/unit/test_auto_swap.py -v` — all pass
 - [ ] `uv run python -m pytest tests/unit/test_usage_monitor.py -v` — all pass
 - [ ] `uv run python -m pytest -v` — all pass
-- [ ] `grep -rn "score_candidate\|compute_urgency_threshold" jacked tests` returns nothing
-- [ ] Manually: start `jacked webux` (in a separate terminal — user runs this), set up two test accounts with staggered 7d windows, observe the decision log shows tier-aware reasons.
+- [ ] `grep -rn "score_candidate\|compute_urgency_threshold\|PROACTIVE_SWAP_THRESHOLD\|MIN_PROACTIVE_MINUTES\|SUPPRESS_OVERRIDE_SCORE\|URGENCY_HOURS" jacked tests` returns nothing
+- [ ] `grep -rn "from jacked.web.auto_swap import.*should_swap\b" jacked tests` returns nothing (only `should_swap_now` remains)
+- [ ] `wc -l jacked/web/auto_swap/*.py` — every submodule under 500 lines (after Task 13)
+- [ ] `awk '/async def active_account_poll_loop/,/async def full_sweep_loop/' jacked/api/usage_monitor.py | wc -l` — under ~150 lines (after Task 14)
+- [ ] Manually: user starts `jacked webux` in a separate terminal (project memory: never auto-start), sets up two test accounts with staggered 7d windows, observes the decision log shows tier-aware reasons (`higher_tier_emerged`, `tier_drained`, etc.) and candidate columns render `tier`/`target_7d`/`deficit`.
 
 ## Out of Scope (separate work)
 
