@@ -1,4 +1,4 @@
-"""Selection rule and departure decision (legacy implementation; rewritten in later tasks)."""
+"""Selection rule and departure decision (tier-aware unified flow)."""
 
 from __future__ import annotations
 
@@ -11,9 +11,6 @@ from jacked.web.auto_swap.burn import (
     RESET_SUPPRESS_MINUTES,
     _resets_within,
     has_viable_headroom,
-)
-from jacked.web.auto_swap.diagnostics import (
-    compute_7d_deficit,
 )
 from jacked.web.auto_swap.tiers import (
     TIER_EXCLUDED,
@@ -28,13 +25,6 @@ from jacked.web.auto_swap.tiers import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-SUPPRESS_OVERRIDE_SCORE = 100
 
 
 def _resets_within_at(
@@ -59,113 +49,6 @@ def _resets_within_at(
         return remaining <= minutes
     except (ValueError, TypeError):
         return False
-
-
-# ---------------------------------------------------------------------------
-# Proactive 7d capacity scheduling
-# ---------------------------------------------------------------------------
-
-PROACTIVE_SWAP_THRESHOLD = 15.0  # minimum deficit (%) to trigger proactive swap
-MIN_PROACTIVE_MINUTES = 30  # don't proactively swap if fewer than this many
-                             # working minutes remain today — not worth opening
-                             # a 5h window for a few minutes of use
-
-
-# ---------------------------------------------------------------------------
-# should_swap
-# ---------------------------------------------------------------------------
-
-def should_swap(
-    usage_5h: float | None,
-    usage_7d: float | None,
-    critical_5h: float = 90,
-    warning_5h: float = 80,
-    threshold_7d: float = 85,
-    burn_rate: BurnRate | None = None,
-    check_interval_min: float = 5,
-    resets_5h_at: str | None = None,
-    resets_7d_at: str | None = None,
-    usage_cached_at: int | None = None,
-    account: dict | None = None,
-    active_start: str = "06:00",
-    active_end: str = "23:00",
-) -> bool:
-    """Decide whether the current account should be swapped out.
-
-    Returns False when *usage_5h* is None (no data yet — never swap on
-    missing data).
-
-    Suppresses all three swap triggers when the relevant window resets
-    within ``RESET_SUPPRESS_MINUTES``.  Also suppresses when usage data
-    is stale (predates a reset that already happened).
-
-    Suppresses the 7d trigger when *account* has a positive deficit
-    (behind schedule) — the proactive scheduler intentionally placed
-    us here to burn capacity, so swapping away would cause ping-pong.
-    """
-    if usage_5h is None:
-        return False
-
-    # Stale-data guard: if the 5h reset is in the past but our usage data
-    # is older than the reset, the usage is stale (a real reset happened
-    # but we couldn't fetch). Don't trust the data — suppress swap.
-    if resets_5h_at is not None and usage_cached_at is not None:
-        try:
-            reset_dt = datetime.fromisoformat(resets_5h_at.replace("Z", "+00:00"))
-            if reset_dt <= datetime.now(timezone.utc):
-                reset_epoch = reset_dt.timestamp()
-                if usage_cached_at < reset_epoch:
-                    return False  # usage data predates the reset
-        except (ValueError, TypeError):
-            pass
-
-    suppress_5h = _resets_within(resets_5h_at, RESET_SUPPRESS_MINUTES)
-    suppress_7d = _resets_within(resets_7d_at, RESET_SUPPRESS_MINUTES)
-
-    # Hard ceiling (unless 5h reset imminent).
-    if usage_5h >= critical_5h and not suppress_5h:
-        return True
-
-    # 7-day saturation (unless 7d reset imminent OR we're burning deficit).
-    if usage_7d is not None and usage_7d >= threshold_7d and not suppress_7d:
-        # If account has a positive deficit, we're here to burn capacity — stay.
-        if account is not None:
-            deficit_result = compute_7d_deficit(account, active_start, active_end)
-            if deficit_result and deficit_result["deficit"] > 0:
-                logger.debug(
-                    "should_swap: suppressing 7d trigger on deficit account "
-                    "(usage_7d=%.1f%%, deficit=%.1f%%)",
-                    usage_7d, deficit_result["deficit"],
-                )
-            else:
-                return True
-        else:
-            return True
-
-    # Warning zone + burn-rate projection (unless 5h reset imminent).
-    if usage_5h >= warning_5h and burn_rate is not None and not suppress_5h:
-        minutes_to_critical = _minutes_until(
-            usage_5h, critical_5h, burn_rate.rate_5h_per_min,
-        )
-        if minutes_to_critical is not None and minutes_to_critical <= 2 * check_interval_min:
-            return True
-
-    return False
-
-
-def _minutes_until(
-    current: float, target: float, rate_per_min: float,
-) -> float | None:
-    """Minutes until *current* reaches *target* at *rate_per_min*.
-
-    Returns None when the rate is zero or negative (will never reach).
-    """
-    if rate_per_min <= 0:
-        return None
-    gap = target - current
-    if gap <= 0:
-        return 0.0
-    return gap / rate_per_min
 
 
 # ---------------------------------------------------------------------------

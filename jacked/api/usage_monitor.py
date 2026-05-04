@@ -14,6 +14,10 @@ import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jacked.web.auto_swap import BurnRate
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +37,26 @@ _ticks_since_prune = 0
 # Wake signal — settings PUT sets this to trigger an immediate sweep.
 _sweep_wake: asyncio.Event = asyncio.Event()
 
+# Per-account last-observed tier for hysteresis. Persists across ticks;
+# cleared when an account is removed or a swap occurs to/from it.
+_last_observed_tiers: dict[int, int] = {}
+
+# Anti-jitter: require the same higher-tier target to persist across
+# ``_EMERGENCE_PERSISTENCE_TICKS`` consecutive ticks before swapping.
+# Maps target account id -> consecutive-tick count.
+_emerged_target_streak: dict[int, int] = {}
+_EMERGENCE_PERSISTENCE_TICKS = 2
+
+# Silent-stall watchdog state.
+_consecutive_no_best_ticks: int = 0
+_last_stall_warning: float = 0.0
+_STALL_TICK_THRESHOLD = 10
+_STALL_USAGE_STALENESS_SECONDS = 1800
+_STALL_WARNING_COOLDOWN_SECONDS = 1800
+
 
 def reset_locks() -> None:
-    """Rebind module-level asyncio primitives to the current event loop.
+    """Rebind module-level asyncio primitives + clear per-account state.
 
     See jacked.api.routes.auth.reset_locks for the full explanation of
     why in-process tray restarts require this. ``_sweep_wake`` is
@@ -44,9 +65,19 @@ def reset_locks() -> None:
     harmless — but the moment a caller switches to ``await wait()``
     (a natural efficiency refactor) the original bug returns. Rebind
     pre-emptively.
+
+    Tier hysteresis and emergence streak counters depend on consecutive
+    ticks; a lifespan restart resets the count so we observe fresh data
+    from scratch instead of acting on remembered tiers from before the
+    restart.
     """
     global _sweep_wake
     _sweep_wake = asyncio.Event()
+    _last_observed_tiers.clear()
+    _emerged_target_streak.clear()
+    global _consecutive_no_best_ticks, _last_stall_warning
+    _consecutive_no_best_ticks = 0
+    _last_stall_warning = 0.0
 
 
 def _read_active_account_id() -> int | None:
@@ -358,7 +389,6 @@ async def active_account_poll_loop(app):
 
             critical_5h = _setting_float(db, "auto_swap_5h_critical", 90)
             warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
-            threshold_7d = _setting_float(db, "auto_swap_7d_threshold", 85)
             check_interval = _setting_float(db, "usage_check_interval", 300)
             active_start = _setting_str(db, "window_keeper_active_start", "06:00")
             active_end = _setting_str(db, "window_keeper_active_end", "23:00")
@@ -367,23 +397,26 @@ async def active_account_poll_loop(app):
             _decision_target_id = None
             _decision_reason = None
             _candidate_summaries = None
-            _proactive_target_id = None
-            _suppression = None
+            _suppression = None  # kept for log-schema compat (always None in new flow)
 
             # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
             from jacked.api.credential_helpers import read_fresh_active_token
             from jacked.web.auto_swap import (
-                should_swap,
+                should_swap_now,
                 pick_best_target,
                 update_burn_rate,
                 tier_critical_threshold,
                 tier_label as _tier_label,
-                score_candidate,
-                _resets_within,
+                tier_for,
+                target_7d,
+                deficit_vs_target,
                 format_account_label,
-                RESET_SUPPRESS_MINUTES,
-                SUPPRESS_OVERRIDE_SCORE,
+                REASON_PREFIX_HIGHER_TIER,
+                REASON_PREFIX_DRAINED,
+                REASON_PREFIX_FIVE_H,
+                REASON_PREFIX_BURN_RATE,
+                TIER_EXCLUDED,
             )
 
             # -- Active account ID ---------------------------------------
@@ -507,441 +540,282 @@ async def active_account_poll_loop(app):
             tier_crit = tier_critical_threshold(active_acct)
             effective_critical = max(tier_crit, critical_5h)
 
-            # -- Should swap? --------------------------------------------
-            want_swap = should_swap(
-                usage_5h=usage_5h,
-                usage_7d=usage_7d,
-                critical_5h=effective_critical,
-                warning_5h=warning_5h,
-                threshold_7d=threshold_7d,
-                burn_rate=br,
-                check_interval_min=check_interval / 60,
-                resets_5h_at=active_acct.get("cached_5h_resets_at"),
-                resets_7d_at=active_acct.get("cached_7d_resets_at"),
-                usage_cached_at=active_acct.get("usage_cached_at"),
-                account=active_acct,
-                active_start=active_start,
-                active_end=active_end,
+            # -- Tier-aware unified decision ----------------------------
+            # Single decision per tick: pick the best candidate across
+            # the whole pool, then ask should_swap_now whether to leave
+            # the active account. Replaces the prior defensive +
+            # proactive split. See spec
+            # docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md
+            now_utc = datetime.now(timezone.utc)
+
+            # Refresh candidate usage if stale (>10 min). Note: this is
+            # called every tick now (was previously gated by want_swap);
+            # _CANDIDATE_STALENESS_SECONDS keeps the API call-rate the
+            # same for stable data — only candidates we haven't fetched
+            # in 10+ minutes get re-fetched.
+            accounts = await _fetch_candidate_usage(
+                accounts, active_acct_id, db,
             )
 
-            if not want_swap:
-                if usage_5h is not None and usage_5h >= effective_critical:
-                    _suppression = {"type": "5h_reset_imminent"}
-                elif usage_7d is not None and usage_7d >= threshold_7d:
-                    _suppression = {"type": "deficit", "usage_7d": usage_7d}
+            # Hysteresis: pass last-observed tier per non-active account
+            # to suppress jitter-driven flips across tier boundaries.
+            best = pick_best_target(
+                accounts,
+                current_id=active_acct_id,
+                active_start=active_start,
+                active_end=active_end,
+                now=now_utc,
+                prev_tiers=_last_observed_tiers,
+            )
 
-            # -- Escape hatch: override reset suppression if a clearly
-            # better candidate exists.  Don't keep the user on a degraded
-            # account just to save a window reset when a much better
-            # option is available.
-            escape_override = False
-            if not want_swap and _resets_within(
-                active_acct.get("cached_5h_resets_at"),
-                RESET_SUPPRESS_MINUTES,
-            ):
-                # Verify suppression was actually the reason: would a swap
-                # have triggered WITHOUT the reset suppression?
-                would_swap_without_suppress = should_swap(
-                    usage_5h=usage_5h,
-                    usage_7d=usage_7d,
-                    critical_5h=effective_critical,
-                    warning_5h=warning_5h,
-                    threshold_7d=threshold_7d,
-                    burn_rate=br,
-                    check_interval_min=check_interval / 60,
-                    # No reset params → no reset suppression
-                    # But keep account + active hours for deficit suppression
-                    account=active_acct,
-                    active_start=active_start,
-                    active_end=active_end,
+            reason = should_swap_now(
+                active=active_acct,
+                best=best,
+                burn_rate=br,
+                check_interval_min=check_interval / 60,
+                critical_5h=effective_critical,
+                warning_5h=warning_5h,
+                now=now_utc,
+            )
+
+            # ---- Anti-jitter persistence on higher-tier emergence ----
+            emergence_reason = (
+                reason is not None
+                and reason.startswith(REASON_PREFIX_HIGHER_TIER)
+            )
+            if emergence_reason and best is not None:
+                streak = _emerged_target_streak.get(best["id"], 0) + 1
+                _emerged_target_streak[best["id"]] = streak
+                for stale_id in list(_emerged_target_streak.keys()):
+                    if stale_id != best["id"]:
+                        del _emerged_target_streak[stale_id]
+                if streak < _EMERGENCE_PERSISTENCE_TICKS:
+                    logger.debug(
+                        "Suppressing emergence swap to %d — streak %d/%d",
+                        best["id"], streak, _EMERGENCE_PERSISTENCE_TICKS,
+                    )
+                    reason = None
+            else:
+                _emerged_target_streak.clear()
+
+            # Build candidate summaries for decision log
+            _candidate_summaries = []
+            for cand in accounts:
+                if cand["id"] == active_acct_id:
+                    continue
+                cand_tier = tier_for(
+                    cand, now=now_utc,
+                    prev_tier=_last_observed_tiers.get(cand["id"]),
                 )
-                if would_swap_without_suppress:
-                    escape_override = True
+                cand_target = target_7d(cand, now=now_utc)
+                cand_deficit = deficit_vs_target(cand, now=now_utc)
+                _candidate_summaries.append({
+                    "id": cand["id"],
+                    "email": cand.get("email", ""),
+                    "label": format_account_label(cand),
+                    "5h": cand.get("cached_usage_5h"),
+                    "7d": cand.get("cached_usage_7d"),
+                    "tier": cand_tier,
+                    "target_7d": (
+                        round(cand_target, 1)
+                        if cand_target is not None else None
+                    ),
+                    "deficit": (
+                        round(cand_deficit, 1)
+                        if cand_deficit is not None else None
+                    ),
+                    "is_best": (best is not None and cand["id"] == best["id"]),
+                })
 
-            if want_swap or escape_override:
-                # Fetch fresh usage for candidates before scoring
-                accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
-
-                # Build candidate summaries for decision log
-                from jacked.web.auto_swap import compute_7d_deficit
-                _candidate_summaries = []
-                for _cand in accounts:
-                    if _cand["id"] == active_acct_id:
-                        continue
-                    _cand_score = score_candidate(_cand, active_start, active_end)
-                    _cand_deficit = compute_7d_deficit(_cand, active_start, active_end)
-                    _candidate_summaries.append({
-                        "id": _cand["id"],
-                        "email": _cand.get("email", ""),
-                        "label": format_account_label(_cand),
-                        "5h": _cand.get("cached_usage_5h"),
-                        "7d": _cand.get("cached_usage_7d"),
-                        "score": round(_cand_score, 1),
-                        "deficit": round(_cand_deficit["deficit"], 1) if _cand_deficit else None,
-                    })
-
-                target = pick_best_target(
-                    accounts, current_id=active_acct_id,
-                    threshold_7d=threshold_7d,
-                    active_start=active_start,
-                    active_end=active_end,
+            # Refresh hysteresis state + prune dead account ids
+            live_ids = {a["id"] for a in accounts if a["id"] != active_acct_id}
+            for stale_id in list(_last_observed_tiers.keys()):
+                if stale_id not in live_ids:
+                    _last_observed_tiers.pop(stale_id, None)
+            for stale_id in list(_emerged_target_streak.keys()):
+                if stale_id not in live_ids:
+                    _emerged_target_streak.pop(stale_id, None)
+            for cand in accounts:
+                if cand["id"] == active_acct_id:
+                    continue
+                cand_tier = tier_for(
+                    cand, now=now_utc,
+                    prev_tier=_last_observed_tiers.get(cand["id"]),
                 )
+                if cand_tier == TIER_EXCLUDED:
+                    _last_observed_tiers.pop(cand["id"], None)
+                else:
+                    _last_observed_tiers[cand["id"]] = cand_tier
 
-                # For escape hatch, verify candidate is good enough
-                if escape_override and not want_swap and target:
-                    target_score = score_candidate(target, active_start, active_end)
-                    if target_score <= SUPPRESS_OVERRIDE_SCORE:
-                        logger.debug(
-                            "Escape hatch: candidate %d scores %.0f "
-                            "(<= %d), staying put",
-                            target["id"],
-                            target_score,
-                            SUPPRESS_OVERRIDE_SCORE,
-                        )
-                        target = None  # not good enough, stay put
+            ws_registry = getattr(app.state, "ws_registry", None)
 
-                ws_registry = getattr(app.state, "ws_registry", None)
+            # Reason-prefix → trigger taxonomy mapping
+            def _trigger_for_reason(r: str | None) -> str:
+                if r is None:
+                    return "tick"
+                if r.startswith(REASON_PREFIX_HIGHER_TIER):
+                    return "higher_tier_emerged"
+                if r.startswith(REASON_PREFIX_DRAINED):
+                    return "tier_drained"
+                if r.startswith(REASON_PREFIX_FIVE_H):
+                    return "forced_critical"
+                if r.startswith(REASON_PREFIX_BURN_RATE):
+                    return "burn_rate"
+                return "tier_aware"
 
-                if target is not None:
-                    # -- Swap cooldown: prevent ping-ponging ------
-                    if (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
+            global _last_exhaustion_warning, _consecutive_no_best_ticks
+            global _last_stall_warning
+
+            if reason is None:
+                _decision_action = "stay"
+                if best is None:
+                    _decision_reason = (
+                        f"stay: no candidate has deficit "
+                        f"(tier {_tier_label(active_acct).strip() or 'unset'})"
+                    )
+                else:
+                    _decision_target_id = best["id"]
+                    active_tier_now = tier_for(active_acct, now=now_utc)
+                    best_tier = tier_for(
+                        best, now=now_utc,
+                        prev_tier=_last_observed_tiers.get(best["id"]),
+                    )
+                    streak = _emerged_target_streak.get(best["id"], 0)
+                    if (best_tier < active_tier_now
+                            and best_tier != TIER_EXCLUDED
+                            and streak > 0):
                         _decision_reason = (
-                            f"swap needed but cooldown active "
-                            f"({_SWAP_COOLDOWN_SECONDS - (time.time() - _last_swap_time):.0f}s remaining)"
-                        )
-                        logger.debug("Active poll: %s", _decision_reason)
-                        try:
-                            _tick_detail = _build_tick_detail(
-                                active_acct=active_acct,
-                                usage_5h=usage_5h, usage_7d=usage_7d,
-                                want_swap=want_swap, suppression=_suppression,
-                                escape_override=escape_override,
-                                candidates=_candidate_summaries,
-                                proactive_target_id=None,
-                                cooldown_active=True, decision="stay",
-                            )
-                            _cooldown_decision_id = db.record_decision(
-                                account_id=active_acct_id, action="stay",
-                                trigger="tick", target_id=target["id"],
-                                reason=_decision_reason, detail=_tick_detail,
-                            )
-                            if ws_registry and _cooldown_decision_id:
-                                await ws_registry.broadcast(
-                                    "decision_log_entry",
-                                    {
-                                        "id": _cooldown_decision_id,
-                                        "account_id": active_acct_id,
-                                        "email": active_acct.get("email", ""),
-                                        "label": format_account_label(active_acct),
-                                        "action": "stay",
-                                        "trigger": "tick",
-                                        "reason": _decision_reason,
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                        "detail": _tick_detail,
-                                    },
-                                )
-                        except Exception:
-                            pass
-                        await asyncio.sleep(60)
-                        continue
-
-                    # -- Build descriptive reason -------------------------
-                    if escape_override and not want_swap:
-                        reason = (
-                            f"escape hatch: suppressed swap overridden — "
-                            f"target scores {score_candidate(target, active_start, active_end):.0f}"
-                        )
-                    elif usage_5h is not None and usage_5h >= effective_critical:
-                        tier_lbl = _tier_label(active_acct)
-                        reason = (
-                            f"5h critical: {usage_5h:.1f}% >= "
-                            f"{effective_critical:.0f}%{tier_lbl}"
-                        )
-                    elif usage_7d is not None and usage_7d >= threshold_7d:
-                        reason = (
-                            f"7d threshold: {usage_7d:.1f}% >= "
-                            f"{threshold_7d:.0f}%"
+                            f"stay: emergence streak "
+                            f"{streak}/{_EMERGENCE_PERSISTENCE_TICKS}, "
+                            f"awaiting confirmation "
+                            f"(best id={best['id']} tier={best_tier})"
                         )
                     else:
-                        projected = usage_5h or 0
-                        if br and br.rate_5h_per_min > 0:
-                            mins = (check_interval / 60) * 2
-                            projected = (usage_5h or 0) + br.rate_5h_per_min * mins
-                        reason = (
-                            f"burn-rate projection: {usage_5h:.1f}% -> "
-                            f"{projected:.1f}% in {int((check_interval / 60) * 2)}min"
+                        _decision_reason = (
+                            f"stay: best is same/lower tier "
+                            f"(best id={best['id']} tier={best_tier})"
                         )
+            elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
+                _decision_action = "stay"
+                _decision_target_id = best["id"] if best else None
+                _decision_reason = (
+                    f"swap warranted ({reason}) but cooldown active "
+                    f"({_SWAP_COOLDOWN_SECONDS - (time.time() - _last_swap_time):.0f}s remaining)"
+                )
+                logger.debug("Active poll: %s", _decision_reason)
+            elif best is None:
+                _decision_action = "stay"
+                _decision_reason = (
+                    f"swap warranted ({reason}) but no eligible target"
+                )
 
-                    logger.info(
-                        "Auto-swap: switching from account %d (5h=%.1f%%) "
-                        "to account %d (5h=%.1f%%) — %s",
+                now_ts = time.time()
+                if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
+                    logger.warning(
+                        "Auto-swap needed but no eligible target "
+                        "(active account %d at 5h=%.1f%%)",
                         active_acct_id, usage_5h or 0,
-                        target["id"],
-                        target.get("cached_usage_5h") or 0,
-                        reason,
                     )
+                    _last_exhaustion_warning = now_ts
 
-                    ws_registry = getattr(app.state, "ws_registry", None)
-                    await _execute_swap(
-                        db, active_acct_id, active_acct, target,
-                        reason=reason, trigger="auto_swap",
-                        usage_5h=usage_5h, usage_7d=usage_7d,
-                        active_start=active_start, active_end=active_end,
-                        ws_registry=ws_registry,
+                next_recovery_at = None
+                for acct in accounts:
+                    resets = acct.get("cached_5h_resets_at")
+                    if not resets:
+                        continue
+                    try:
+                        r = datetime.fromisoformat(resets.replace("Z", "+00:00"))
+                        if r > now_utc and (
+                            next_recovery_at is None or r < next_recovery_at
+                        ):
+                            next_recovery_at = r
+                    except (ValueError, TypeError):
+                        continue
+
+                if ws_registry:
+                    await ws_registry.broadcast(
+                        "all_accounts_exhausted",
+                        {
+                            "active_account_id": active_acct_id,
+                            "usage_5h": usage_5h,
+                            "usage_7d": usage_7d,
+                            "next_recovery_at": (
+                                next_recovery_at.isoformat()
+                                if next_recovery_at else None
+                            ),
+                        },
                     )
-                    _decision_action = "swap"
-                    _decision_target_id = target["id"]
-                    _decision_reason = reason
+            else:
+                trigger = _trigger_for_reason(reason)
+                logger.info(
+                    "Auto-swap: switching from account %d (5h=%.1f%%) to "
+                    "account %d (5h=%.1f%%) — %s [%s]",
+                    active_acct_id, usage_5h or 0,
+                    best["id"], best.get("cached_usage_5h") or 0,
+                    reason, trigger,
+                )
+                await _execute_swap(
+                    db, active_acct_id, active_acct, best,
+                    reason=reason, trigger=trigger,
+                    usage_5h=usage_5h, usage_7d=usage_7d,
+                    active_start=active_start, active_end=active_end,
+                    ws_registry=ws_registry,
+                )
+                _emerged_target_streak.clear()
+                _last_observed_tiers.pop(active_acct_id, None)
+                _last_observed_tiers.pop(best["id"], None)
+                _decision_action = "swap"
+                _decision_target_id = best["id"]
+                _decision_reason = reason
+
+            # ---- Silent-stall watchdog ------------------------------------
+            if _decision_action == "stay":
+                cached_at = active_acct.get("usage_cached_at") or 0
+                age_seconds = int(time.time()) - int(cached_at)
+                stale = age_seconds > _STALL_USAGE_STALENESS_SECONDS
+                has_other_accounts = sum(
+                    1 for a in accounts if a["id"] != active_acct_id
+                ) > 0
+                # `reason` reflects should_swap_now's verdict AS POSSIBLY
+                # MUTATED by emergence persistence (which may set it to
+                # None to defer a higher-tier swap until streak met).
+                # Cooldown does NOT mutate reason — only persistence does.
+                forced_out_reason = reason is not None
+                pattern_a = best is None and stale and has_other_accounts
+                pattern_b = (
+                    not has_other_accounts
+                    and forced_out_reason
+                )
+                pattern_c = best is None and forced_out_reason
+                if pattern_a or pattern_b or pattern_c:
+                    _consecutive_no_best_ticks += 1
                 else:
-                    # accounts already fetched before pick_best_target — reuse
+                    _consecutive_no_best_ticks = 0
+            else:
+                _consecutive_no_best_ticks = 0
 
-                    # No eligible target — cooldown to avoid log spam
-                    now_ts = time.time()
-                    if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
-                        logger.warning(
-                            "Auto-swap needed but no eligible target "
-                            "(active account %d at 5h=%.1f%%)",
-                            active_acct_id, usage_5h or 0,
-                        )
-                        _last_exhaustion_warning = now_ts
-
-                    # Compute next_recovery_at from earliest cached_5h_resets_at
-                    next_recovery_at = None
-                    now_utc = datetime.now(timezone.utc)
-                    for acct in accounts:
-                        resets = acct.get("cached_5h_resets_at")
-                        if not resets:
-                            continue
-                        try:
-                            r = datetime.fromisoformat(
-                                resets.replace("Z", "+00:00"),
-                            )
-                            if r > now_utc and (
-                                next_recovery_at is None or r < next_recovery_at
-                            ):
-                                next_recovery_at = r
-                        except (ValueError, TypeError):
-                            continue
-
+            if _consecutive_no_best_ticks >= _STALL_TICK_THRESHOLD:
+                now_ts = time.time()
+                if now_ts - _last_stall_warning > _STALL_WARNING_COOLDOWN_SECONDS:
+                    logger.error(
+                        "Auto-swap stalled: %d consecutive ticks with no "
+                        "candidate and stale active-account data "
+                        "(active=%d, last_fetch=%ss ago)",
+                        _consecutive_no_best_ticks, active_acct_id,
+                        int(time.time()) - int(active_acct.get("usage_cached_at") or 0),
+                    )
+                    _last_stall_warning = now_ts
                     if ws_registry:
                         await ws_registry.broadcast(
-                            "all_accounts_exhausted",
+                            "auto_swap_stall",
                             {
                                 "active_account_id": active_acct_id,
-                                "usage_5h": usage_5h,
-                                "usage_7d": usage_7d,
-                                "next_recovery_at": (
-                                    next_recovery_at.isoformat()
-                                    if next_recovery_at else None
+                                "consecutive_ticks": _consecutive_no_best_ticks,
+                                "last_fetch_age_seconds": (
+                                    int(time.time()) - int(active_acct.get("usage_cached_at") or 0)
                                 ),
                             },
                         )
-
-            # -- Proactive 7d capacity scheduler ---------------------------
-            # Scan for accounts with EXPIRING capacity that must be burned.
-            # Uses remaining 5h windows to determine urgency — the closer
-            # to expiry, the lower the threshold for triggering a swap.
-            if not want_swap and not escape_override:
-                from jacked.web.auto_swap import (
-                    compute_7d_deficit,
-                    compute_urgency_threshold,
-                    compute_burn_per_window,
-                )
-
-                if usage_5h is not None and usage_5h < warning_5h:
-                    # Don't proactively swap near end of active hours —
-                    # not worth opening a 5h window for a few minutes of use
-                    from jacked.web.auto_swap import MIN_PROACTIVE_MINUTES
-                    _now_local = datetime.now()
-                    _end_h, _end_m = map(int, active_end.split(":"))
-                    _active_end_today = _now_local.replace(
-                        hour=_end_h, minute=_end_m, second=0, microsecond=0,
-                    )
-                    _minutes_left_today = (
-                        _active_end_today - _now_local
-                    ).total_seconds() / 60.0
-                    if 0 < _minutes_left_today < MIN_PROACTIVE_MINUTES:
-                        logger.debug(
-                            "Proactive: skipping — only %.0f min until active hours end",
-                            _minutes_left_today,
-                        )
-                    else:
-                        # Fetch fresh candidate data
-                        accounts = await _fetch_candidate_usage(accounts, active_acct_id, db)
-
-                        # Scan ALL candidates for urgency — not pick_best_target,
-                        # because the most-urgent account (expiring capacity) may
-                        # not be the highest-scored account overall.
-                        best_urgent = None
-                        best_urgency = 0.0
-                        best_deficit_result = None
-                        _candidate_summaries = []
-
-                        for acct in accounts:
-                            if acct["id"] == active_acct_id:
-                                continue
-                            if not acct.get("cc_access_token"):
-                                continue
-                            if acct.get("auto_swap_enabled") == 0:
-                                continue
-                            if acct.get("is_active") == 0 or acct.get("is_deleted") == 1:
-                                continue
-                            if (acct.get("consecutive_failures") or 0) >= 3:
-                                continue
-
-                            # Skip accounts without viable headroom —
-                            # swapping to an account that'll exhaust in
-                            # minutes is worse than not swapping at all.
-                            from jacked.web.auto_swap import has_viable_headroom
-                            if not has_viable_headroom(acct, active_start, active_end):
-                                _candidate_summaries.append({
-                                    "id": acct["id"],
-                                    "email": acct.get("email", ""),
-                                    "7d": acct.get("cached_usage_7d"),
-                                    "passes": False,
-                                    "skip_reason": "near_exhaustion",
-                                })
-                                continue
-
-                            dr = compute_7d_deficit(acct, active_start, active_end)
-                            if not dr:
-                                continue
-                            if dr["deficit"] <= 0:
-                                _candidate_summaries.append({
-                                    "id": acct["id"],
-                                    "email": acct.get("email", ""),
-                                    "7d": acct.get("cached_usage_7d"),
-                                    "deficit": round(dr["deficit"], 1),
-                                    "windows_remaining": round(dr["effective_windows_remaining"], 1),
-                                    "passes": False,
-                                    "skip_reason": "ahead_of_schedule",
-                                })
-                                continue
-
-                            # Urgency threshold scales with remaining windows
-                            threshold = compute_urgency_threshold(
-                                dr["effective_windows_remaining"],
-                                active_start, active_end,
-                            )
-                            if dr["deficit"] <= threshold:
-                                _candidate_summaries.append({
-                                    "id": acct["id"],
-                                    "email": acct.get("email", ""),
-                                    "7d": acct.get("cached_usage_7d"),
-                                    "deficit": round(dr["deficit"], 1),
-                                    "windows_remaining": round(dr["effective_windows_remaining"], 1),
-                                    "threshold": round(threshold, 1),
-                                    "passes": False,
-                                    "skip_reason": "below_threshold",
-                                })
-                                continue
-
-                            # Urgency = recoverable capacity per hour of inaction
-                            burn = compute_burn_per_window(active_start, active_end)
-                            recoverable = min(
-                                dr["unused_7d"],
-                                dr["effective_windows_remaining"] * burn,
-                            )
-
-                            # Skip if recoverable < one window's burn —
-                            # not worth the disruption of swapping for scraps.
-                            if recoverable < burn:
-                                _candidate_summaries.append({
-                                    "id": acct["id"],
-                                    "email": acct.get("email", ""),
-                                    "7d": acct.get("cached_usage_7d"),
-                                    "deficit": round(dr["deficit"], 1),
-                                    "recoverable": round(recoverable, 1),
-                                    "passes": False,
-                                    "skip_reason": "recoverable_too_low",
-                                })
-                                continue
-
-                            urgency = recoverable / max(dr["effective_hours_remaining"], 0.5)
-
-                            _candidate_summaries.append({
-                                "id": acct["id"],
-                                "email": acct.get("email", ""),
-                                "label": format_account_label(acct),
-                                "5h": acct.get("cached_usage_5h"),
-                                "7d": acct.get("cached_usage_7d"),
-                                "deficit": round(dr["deficit"], 1),
-                                "windows_remaining": round(dr["effective_windows_remaining"], 1),
-                                "urgency_tier": (
-                                    "CRITICAL" if dr["effective_windows_remaining"] < 1 else
-                                    "HIGH" if dr["effective_windows_remaining"] < 3 else
-                                    "MEDIUM" if dr["effective_windows_remaining"] < 5 else
-                                    "NORMAL"
-                                ),
-                                "threshold": round(threshold, 1),
-                                "passes": dr["deficit"] > threshold,
-                                "urgency_score": round(urgency, 2),
-                            })
-
-                            if urgency > best_urgency:
-                                best_urgency = urgency
-                                best_urgent = acct
-                                best_deficit_result = dr
-
-                        if not best_urgent:
-                            logger.debug("Proactive: no urgent candidate found")
-                        elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
-                            logger.debug(
-                                "Proactive: urgent target %d found but cooldown active",
-                                best_urgent["id"],
-                            )
-                        else:
-                            # Re-fetch fresh data for the target
-                            await fetch_usage(best_urgent["id"], db)
-                            target = db.get_account(best_urgent["id"])
-
-                            if target:
-                                deficit_result = compute_7d_deficit(target, active_start, active_end)
-                                if not deficit_result or deficit_result["deficit"] <= 0:
-                                    logger.debug(
-                                        "Proactive: target %d deficit gone after re-fetch",
-                                        target["id"],
-                                    )
-                                else:
-                                    # Re-check threshold with fresh data
-                                    threshold = compute_urgency_threshold(
-                                        deficit_result["effective_windows_remaining"],
-                                        active_start, active_end,
-                                    )
-                                    if deficit_result["deficit"] <= threshold:
-                                        logger.debug(
-                                            "Proactive: target %d deficit %.1f%% below "
-                                            "threshold %.1f%% after re-fetch",
-                                            target["id"], deficit_result["deficit"], threshold,
-                                        )
-                                    else:
-                                        reason = (
-                                            f"proactive: burning {deficit_result['unused_7d']:.0f}% "
-                                            f"unused 7d on {format_account_label(target)} — "
-                                            f"{deficit_result['effective_hours_remaining']:.0f}h left "
-                                            f"({deficit_result['effective_windows_remaining']:.1f} windows), "
-                                            f"deficit={deficit_result['deficit']:.0f}%"
-                                        )
-                                        logger.info(
-                                            "Proactive swap: account %d has %.0f%% deficit, "
-                                            "%.1f windows remaining, urgency=%.2f",
-                                            target["id"], deficit_result["deficit"],
-                                            deficit_result["effective_windows_remaining"],
-                                            best_urgency,
-                                        )
-
-                                        ws_registry = getattr(app.state, "ws_registry", None)
-                                        await _execute_swap(
-                                            db, active_acct_id, active_acct, target,
-                                            reason=reason, trigger="proactive_7d",
-                                            usage_5h=usage_5h, usage_7d=usage_7d,
-                                            active_start=active_start, active_end=active_end,
-                                            ws_registry=ws_registry,
-                                        )
-                                        _decision_action = "swap"
-                                        _decision_target_id = target["id"]
-                                        _decision_reason = reason
-                                        _proactive_target_id = target["id"]
 
             # Record decision in the log
             if active_acct is not None:
@@ -950,22 +824,18 @@ async def active_account_poll_loop(app):
                         active_acct=active_acct,
                         usage_5h=usage_5h,
                         usage_7d=usage_7d,
-                        want_swap=want_swap,
+                        want_swap=(_decision_action == "swap"),
                         suppression=_suppression,
-                        escape_override=escape_override if 'escape_override' in dir() else False,
+                        escape_override=False,
                         candidates=_candidate_summaries,
-                        proactive_target_id=_proactive_target_id,
+                        proactive_target_id=None,
                         cooldown_active=(time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS,
                         decision=_decision_action,
                     )
                     decision_id = db.record_decision(
                         account_id=active_acct_id,
                         action=_decision_action,
-                        trigger=(
-                            ("proactive_7d" if _proactive_target_id else "auto_swap")
-                            if _decision_action == "swap"
-                            else "tick"
-                        ),
+                        trigger=_trigger_for_reason(_decision_reason),
                         target_id=_decision_target_id,
                         reason=_decision_reason or "no trigger",
                         detail=_tick_detail,
@@ -980,11 +850,7 @@ async def active_account_poll_loop(app):
                                     "email": active_acct.get("email", ""),
                                     "label": format_account_label(active_acct),
                                     "action": _decision_action,
-                                    "trigger": (
-                                        ("proactive_7d" if _proactive_target_id else "auto_swap")
-                                        if _decision_action == "swap"
-                                        else "tick"
-                                    ),
+                                    "trigger": _trigger_for_reason(_decision_reason),
                                     "reason": _decision_reason or "no trigger",
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "detail": _tick_detail,
@@ -1068,7 +934,6 @@ async def full_sweep_loop(app):
             )
 
             # -- Window keeper -------------------------------------------
-            active_acct_id = _read_active_account_id()
             accounts = db.list_accounts(include_inactive=False)
             sweep_pinged = 0
 
