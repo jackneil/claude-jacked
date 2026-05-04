@@ -118,3 +118,31 @@ def white_bar(account: dict, now: datetime | None = None) -> float | None:
     start = resets_at - timedelta(seconds=window_seconds)
     elapsed = (now - start).total_seconds() / window_seconds
     return max(0.0, min(1.0, elapsed))
+
+
+# Tier targets — see spec 2026-05-04-auto-swap-utilization-redesign-design.md
+T1_TARGET = 90.0  # 24-48h: 10% buffer for last-day 5h windows
+T2_LEAD = 5.0     # 48h-4d: stay slightly ahead of white bar
+
+
+def target_7d(account: dict, now: datetime | None = None) -> float | None:
+    """Tier-based 7d usage target as a percentage (0-100).
+
+    T0 → 100 (drain). T1 → 90 (buffer). T2 → white_bar*100 + 5 (lead).
+    T3 → white_bar*100 (floor). Returns None when 7d data is missing
+    or already expired.
+    """
+    tier = tier_for(account, now=now)
+    if tier == TIER_EXCLUDED:
+        return None
+    if tier == TIER_T0:
+        return 100.0
+    if tier == TIER_T1:
+        return T1_TARGET
+    wb = white_bar(account, now=now)
+    if wb is None:
+        return None
+    if tier == TIER_T2:
+        return min(100.0, wb * 100.0 + T2_LEAD)
+    # TIER_T3
+    return wb * 100.0

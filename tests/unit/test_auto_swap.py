@@ -1150,3 +1150,50 @@ class TestWhiteBar:
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
         acct = _acct(1, resets_7d=_iso(now - timedelta(hours=1)))
         assert white_bar(acct, now=now) == 1.0
+
+
+class TestTarget7d:
+    def test_t0_target_is_100(self):
+        from jacked.web.auto_swap import target_7d
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=12)))
+        assert target_7d(acct, now=now) == 100.0
+
+    def test_t1_target_is_90(self):
+        from jacked.web.auto_swap import target_7d
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=36)))
+        assert target_7d(acct, now=now) == 90.0
+
+    def test_t2_target_is_white_bar_plus_5(self):
+        from jacked.web.auto_swap import target_7d, white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=3)))
+        wb = white_bar(acct, now=now) * 100
+        assert abs(target_7d(acct, now=now) - (wb + 5.0)) < 1e-6
+
+    def test_t2_target_capped_at_100(self):
+        from jacked.web.auto_swap import target_7d
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=48, seconds=1)))
+        result = target_7d(acct, now=now)
+        assert result <= 100.0
+
+    def test_t3_target_is_white_bar_exact(self):
+        from jacked.web.auto_swap import target_7d, white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=6)))
+        wb = white_bar(acct, now=now) * 100
+        assert abs(target_7d(acct, now=now) - wb) < 1e-6
+
+    def test_returns_none_when_no_data(self):
+        from jacked.web.auto_swap import target_7d
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=None)
+        assert target_7d(acct, now=now) is None
+
+    def test_returns_none_when_expired(self):
+        from jacked.web.auto_swap import target_7d
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now - timedelta(hours=1)))
+        assert target_7d(acct, now=now) is None
