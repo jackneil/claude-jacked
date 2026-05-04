@@ -1399,3 +1399,206 @@ class TestHas5hHeadroom:
             "cached_usage_5h": 95,
             "cached_5h_resets_at": _iso(future),
         }) is False
+
+
+class TestShouldSwapNow:
+    """Spec scenarios D17-D23 — departure rule."""
+
+    def test_stay_when_no_higher_tier_candidate(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None
+
+    def test_swap_when_higher_tier_emerged(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        best = _acct(2, usage_5h=10, usage_7d=30,
+                     resets_7d=_iso(now + timedelta(hours=36)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+        assert "higher tier" in reason.lower() or "tier" in reason.lower()
+
+    def test_stay_when_same_tier_candidate(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=80,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        same_tier = _acct(2, usage_5h=10, usage_7d=10,
+                          resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=same_tier, now=now)
+        assert reason is None
+
+    def test_swap_when_active_drained(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=100,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=12)))
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+        assert "drain" in reason.lower() or "target" in reason.lower()
+
+    def test_swap_when_5h_critical(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+        assert "5h" in reason.lower() or "critical" in reason.lower()
+
+    def test_no_swap_when_5h_critical_but_reset_imminent(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(minutes=8)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is None
+
+    def test_swap_when_5h_imminent_but_higher_tier_emerged(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(minutes=8)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(hours=12)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+
+    def test_t3_active_rides_out_5h_window(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=10,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=6)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None
+
+    def test_burn_rate_projection_triggers_swap(self):
+        from jacked.web.auto_swap import should_swap_now, BurnRate
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=82, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(days=3)))
+        br = BurnRate(rate_5h_per_min=2.0, last_check_5h=82.0,
+                      rate_7d_per_min=0.0, last_check_7d=0.0)
+        reason = should_swap_now(active=active, best=best, burn_rate=br,
+                                 check_interval_min=5, now=now)
+        assert reason is not None
+        assert "burn" in reason.lower() or "project" in reason.lower()
+
+    def test_active_excluded_no_best_means_stay(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=None)
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None
+
+    def test_active_excluded_with_best_means_swap(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=None)
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(hours=12)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+        assert "higher tier" in reason.lower()
+
+    def test_t3_above_floor_with_no_best_does_not_drain(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=30,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=6)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None, f"got: {reason}"
+
+    def test_t2_above_floor_with_no_best_does_not_drain(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=80,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None
+
+    def test_t0_at_100_drains_even_without_best(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=100,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=12)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("drained:")
+
+    def test_t1_at_target_drains_even_without_best(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=90,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=36)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("drained:")
+
+    def test_reason_prefixes_match_constants(self):
+        from jacked.web.auto_swap import (
+            should_swap_now,
+            REASON_PREFIX_HIGHER_TIER,
+            REASON_PREFIX_DRAINED,
+            REASON_PREFIX_FIVE_H,
+            REASON_PREFIX_BURN_RATE,
+            BurnRate,
+        )
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+        active = _acct(1, usage_7d=50, resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        best = _acct(2, usage_7d=50, resets_7d=_iso(now + timedelta(hours=12)))
+        r = should_swap_now(active=active, best=best, now=now)
+        assert r.startswith(REASON_PREFIX_HIGHER_TIER), r
+
+        active = _acct(1, usage_5h=20, usage_7d=100,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=12)))
+        r = should_swap_now(active=active, best=None, now=now)
+        assert r.startswith(REASON_PREFIX_DRAINED), r
+
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        r = should_swap_now(active=active, best=None, now=now)
+        assert r.startswith(REASON_PREFIX_FIVE_H), r
+
+        active = _acct(1, usage_5h=82, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        br = BurnRate(rate_5h_per_min=2.0, last_check_5h=82.0,
+                      rate_7d_per_min=0.0, last_check_7d=0.0)
+        r = should_swap_now(active=active, best=None, burn_rate=br,
+                            check_interval_min=5, now=now)
+        assert r.startswith(REASON_PREFIX_BURN_RATE), r

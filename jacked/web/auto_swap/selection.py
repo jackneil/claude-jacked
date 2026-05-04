@@ -20,7 +20,12 @@ from jacked.web.auto_swap.diagnostics import (
 )
 from jacked.web.auto_swap.tiers import (
     TIER_EXCLUDED,
+    TIER_T0,
+    TIER_T1,
+    TIER_T2,
+    TIER_T3,
     deficit_vs_target,
+    target_7d,
     tier_for,
     _resolve_now,
 )
@@ -33,6 +38,30 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SUPPRESS_OVERRIDE_SCORE = 100
+
+
+def _resets_within_at(
+    resets_at: str | None, minutes: float, now: datetime,
+) -> bool:
+    """``now``-aware variant of ``_resets_within`` for testable code paths.
+
+    Returns True if the window resets within ``minutes`` of the supplied
+    ``now`` (must be tz-aware UTC). False for None, past timestamps, or
+    parse errors. Mirrors ``burn._resets_within`` but accepts an injected
+    clock so tests using a frozen ``now`` are deterministic.
+    """
+    if resets_at is None:
+        return False
+    try:
+        reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        if reset_dt.tzinfo is None:
+            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        if reset_dt <= now:
+            return False
+        remaining = (reset_dt - now).total_seconds() / 60.0
+        return remaining <= minutes
+    except (ValueError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +416,119 @@ def pick_best_target(
             )
 
     return best
+
+
+# ---------------------------------------------------------------------------
+# should_swap_now — tier-aware departure rule
+# ---------------------------------------------------------------------------
+
+_TIER_NAMES = {
+    TIER_T0: "T0 (<24h)",
+    TIER_T1: "T1 (24-48h)",
+    TIER_T2: "T2 (48h-4d)",
+    TIER_T3: "T3 (4-7d)",
+    TIER_EXCLUDED: "T?",
+}
+
+
+# Reason-string prefixes — DO NOT change these without updating
+# usage_monitor's `_trigger_for_reason` mapping.
+REASON_PREFIX_HIGHER_TIER = "higher tier emerged"
+REASON_PREFIX_DRAINED = "drained:"
+REASON_PREFIX_FIVE_H = "5h critical:"
+REASON_PREFIX_BURN_RATE = "burn-rate projection:"
+REASON_PREFIX_NO_DATA = "active has no 7d data"
+
+
+def should_swap_now(
+    active: dict,
+    best: dict | None,
+    *,
+    burn_rate: BurnRate | None = None,
+    check_interval_min: float = 5,  # MINUTES (not seconds). Caller converts.
+    critical_5h: float = 90,
+    warning_5h: float = 80,
+    now: datetime | None = None,
+) -> str | None:
+    """Return a reason string if the algorithm should swap off ``active``,
+    or None to stay.
+
+    Departure rules (any one triggers swap; see spec
+    docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md):
+
+    1. Higher-tier candidate emerged: ``best`` exists with strictly
+       lower tier_index than ``active``. (T0 emerged while on T2/T3
+       always overrides — even when 5h reset suppresses critical.)
+       Active is treated as TIER_T3+1 when its tier is EXCLUDED, so
+       any candidate with a real tier wins over an unclassified
+       active account — but ONLY if ``best`` is already a real tier.
+    2. Active drained (T0/T1 only): usage_7d >= target_7d(active).
+       T2/T3 targets are FLOORS (white_bar baseline), not drain-to
+       goals — being above the floor is the desired state.
+    3. Active 5h critical: usage_5h >= critical_5h, AND 5h reset NOT
+       imminent (within RESET_SUPPRESS_MINUTES).
+    4. Burn-rate projection: usage_5h >= warning_5h AND projected to
+       cross critical within 2 * check_interval_min, AND 5h reset
+       not imminent.
+
+    Returns None when none fire (stay; ride out the 5h window).
+
+    Reason strings always start with one of the ``REASON_PREFIX_*``
+    constants — callers (usage_monitor) parse these prefixes to derive
+    the decision-log ``trigger`` taxonomy.
+
+    NOTE: ``check_interval_min`` is the poll interval in MINUTES, not
+    seconds. Caller computes from the DB setting `usage_check_interval`
+    (which is in seconds) by dividing by 60.
+    """
+    now = _resolve_now(now)
+    usage_5h = active.get("cached_usage_5h") or 0
+    usage_7d = active.get("cached_usage_7d") or 0
+    active_tier = tier_for(active, now=now)
+    suppress_5h = _resets_within_at(
+        active.get("cached_5h_resets_at"), RESET_SUPPRESS_MINUTES, now,
+    )
+
+    # 1. Higher-tier candidate (overrides 5h reset suppression)
+    if best is not None:
+        best_tier = tier_for(best, now=now)
+        active_rank = active_tier if active_tier != TIER_EXCLUDED else TIER_T3 + 1
+        if best_tier < active_rank and best_tier != TIER_EXCLUDED:
+            return (
+                f"{REASON_PREFIX_HIGHER_TIER}: {_TIER_NAMES[best_tier]} "
+                f"candidate vs active {_TIER_NAMES[active_tier]}"
+            )
+
+    if active_tier == TIER_EXCLUDED:
+        if best is None:
+            return None
+
+    # 2. Active drained vs tier target — ONLY for T0/T1 (drain-to goals).
+    if active_tier in (TIER_T0, TIER_T1):
+        target = target_7d(active, now=now)
+        if target is not None and usage_7d >= target:
+            return (
+                f"{REASON_PREFIX_DRAINED} 7d usage {usage_7d:.1f}% >= "
+                f"tier target {target:.1f}%"
+            )
+
+    # 3. 5h critical (suppressed if reset imminent)
+    if usage_5h >= critical_5h and not suppress_5h:
+        return f"{REASON_PREFIX_FIVE_H} {usage_5h:.1f}% >= {critical_5h:.0f}%"
+
+    # 4. Burn-rate projection
+    if (usage_5h >= warning_5h
+            and burn_rate is not None
+            and not suppress_5h):
+        rate = burn_rate.rate_5h_per_min
+        if rate > 0:
+            mins_to_critical = max(0, critical_5h - usage_5h) / rate
+            window_min = max(1.0, 2 * check_interval_min)
+            if mins_to_critical <= window_min:
+                projected = usage_5h + rate * window_min
+                return (
+                    f"{REASON_PREFIX_BURN_RATE} {usage_5h:.1f}% -> "
+                    f"{projected:.1f}% in {int(window_min)}min"
+                )
+
+    return None
