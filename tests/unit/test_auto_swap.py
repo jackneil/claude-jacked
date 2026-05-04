@@ -1197,3 +1197,52 @@ class TestTarget7d:
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
         acct = _acct(1, resets_7d=_iso(now - timedelta(hours=1)))
         assert target_7d(acct, now=now) is None
+
+
+class TestDeficitVsTarget:
+    def test_t0_at_80_has_20_deficit(self):
+        from jacked.web.auto_swap import deficit_vs_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, usage_7d=80, resets_7d=_iso(now + timedelta(hours=12)))
+        assert deficit_vs_target(acct, now=now) == 20.0
+
+    def test_t1_at_70_has_20_deficit(self):
+        from jacked.web.auto_swap import deficit_vs_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, usage_7d=70, resets_7d=_iso(now + timedelta(hours=36)))
+        assert deficit_vs_target(acct, now=now) == 20.0
+
+    def test_t2_at_white_bar_minus_3_has_8_deficit(self):
+        from jacked.web.auto_swap import deficit_vs_target, white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct_no_usage = _acct(1, resets_7d=_iso(now + timedelta(days=3)))
+        wb_pct = white_bar(acct_no_usage, now=now) * 100
+        acct = _acct(1, usage_7d=wb_pct - 3, resets_7d=_iso(now + timedelta(days=3)))
+        assert abs(deficit_vs_target(acct, now=now) - 8.0) < 1e-6
+
+    def test_t3_at_white_bar_has_zero_deficit(self):
+        from jacked.web.auto_swap import deficit_vs_target, white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct_no_usage = _acct(1, resets_7d=_iso(now + timedelta(days=6)))
+        wb_pct = white_bar(acct_no_usage, now=now) * 100
+        acct = _acct(1, usage_7d=wb_pct, resets_7d=_iso(now + timedelta(days=6)))
+        assert abs(deficit_vs_target(acct, now=now)) < 1e-6
+
+    def test_negative_deficit_when_above_target(self):
+        from jacked.web.auto_swap import deficit_vs_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, usage_7d=95, resets_7d=_iso(now + timedelta(hours=36)))
+        assert deficit_vs_target(acct, now=now) == -5.0
+
+    def test_returns_none_when_no_data(self):
+        from jacked.web.auto_swap import deficit_vs_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=None)
+        assert deficit_vs_target(acct, now=now) is None
+
+    def test_returns_none_when_usage_missing(self):
+        from jacked.web.auto_swap import deficit_vs_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=12)))
+        acct["cached_usage_7d"] = None
+        assert deficit_vs_target(acct, now=now) is None

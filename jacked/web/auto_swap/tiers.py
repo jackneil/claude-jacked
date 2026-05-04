@@ -146,3 +146,19 @@ def target_7d(account: dict, now: datetime | None = None) -> float | None:
         return min(100.0, wb * 100.0 + T2_LEAD)
     # TIER_T3
     return wb * 100.0
+
+
+def deficit_vs_target(account: dict, now: datetime | None = None) -> float | None:
+    """Difference between tier target and current 7d usage.
+
+    Positive = behind tier target (eligible for selection).
+    Negative = at/above tier target (not a candidate).
+    None when 7d data missing, expired, or usage is None.
+    """
+    target = target_7d(account, now=now)
+    if target is None:
+        return None
+    usage = account.get("cached_usage_7d")
+    if usage is None:
+        return None
+    return target - usage
