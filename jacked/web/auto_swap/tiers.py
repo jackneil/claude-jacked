@@ -4,7 +4,7 @@ See docs/architecture/auto-swap-system.md for the algorithm overview.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -91,3 +91,30 @@ def tier_for(
     if hours_into_new_tier * 60 >= _TIER_HYSTERESIS_MIN:
         return instant
     return prev_tier
+
+
+def white_bar(account: dict, now: datetime | None = None) -> float | None:
+    """Wall-clock elapsed fraction (0.0-1.0) of the 7d window.
+
+    Matches the UI's computeElapsedFraction7d in
+    jacked/data/web/js/components/usage.js — same formula:
+    (now - (resets_at - 7d)) / 7d. No active-hours adjustment.
+    Clamped to [0, 1] (also matches the UI's Math.max/min clamp).
+
+    Returns None when 7d data is missing.
+    """
+    resets_at_str = account.get("cached_7d_resets_at")
+    if resets_at_str is None:
+        return None
+    try:
+        resets_at = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
+        if resets_at.tzinfo is None:
+            resets_at = resets_at.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+    now = _resolve_now(now)
+    window_seconds = 7 * 24 * 3600
+    start = resets_at - timedelta(seconds=window_seconds)
+    elapsed = (now - start).total_seconds() / window_seconds
+    return max(0.0, min(1.0, elapsed))

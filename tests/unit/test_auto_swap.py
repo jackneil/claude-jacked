@@ -1107,3 +1107,46 @@ class TestTierFor:
         acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=59)))
         assert tier_for(acct, now=now) == 0
         assert tier_for(acct, now=now, prev_tier=None) == 0
+
+
+class TestWhiteBar:
+    def test_one_day_left(self):
+        from jacked.web.auto_swap import white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=1)))
+        assert abs(white_bar(acct, now=now) - 6 / 7) < 1e-6
+
+    def test_just_started(self):
+        from jacked.web.auto_swap import white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=7)))
+        assert white_bar(acct, now=now) == 0.0
+
+    def test_about_to_expire(self):
+        from jacked.web.auto_swap import white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=1)))
+        assert abs(white_bar(acct, now=now) - 167 / 168) < 1e-6
+
+    def test_overnight_advances(self):
+        from jacked.web.auto_swap import white_bar
+        resets_at = datetime(2026, 5, 9, 0, 0, tzinfo=timezone.utc)
+        before = datetime(2026, 5, 7, 22, 0, tzinfo=timezone.utc)
+        after = datetime(2026, 5, 8, 6, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(resets_at))
+        wb_before = white_bar(acct, now=before)
+        wb_after = white_bar(acct, now=after)
+        assert wb_after > wb_before
+        assert abs((wb_after - wb_before) - 8 / 168) < 1e-6
+
+    def test_returns_none_when_no_data(self):
+        from jacked.web.auto_swap import white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=None)
+        assert white_bar(acct, now=now) is None
+
+    def test_clamped_at_one_when_expired(self):
+        from jacked.web.auto_swap import white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now - timedelta(hours=1)))
+        assert white_bar(acct, now=now) == 1.0

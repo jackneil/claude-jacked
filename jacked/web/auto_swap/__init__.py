@@ -34,6 +34,7 @@ from .tiers import (
     TIER_T2,
     TIER_T3,
     tier_for,
+    white_bar,
 )
 
 __all__ = [
@@ -47,5 +48,5 @@ __all__ = [
     "SUPPRESS_OVERRIDE_SCORE", "PROACTIVE_SWAP_THRESHOLD",
     "URGENCY_HOURS", "MIN_PROACTIVE_MINUTES",
     "TIER_T0", "TIER_T1", "TIER_T2", "TIER_T3", "TIER_EXCLUDED",
-    "tier_for",
+    "tier_for", "white_bar",
 ]
