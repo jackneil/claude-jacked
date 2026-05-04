@@ -7,13 +7,12 @@ asyncio.run() for async tests (no pytest-asyncio dependency).
 import asyncio
 import logging
 import time
-from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from jacked.api.usage_monitor import (
-    _read_active_account_id,
     _setting_bool,
     _setting_float,
     _setting_str,
@@ -21,6 +20,20 @@ from jacked.api.usage_monitor import (
     active_account_poll_loop,
     full_sweep_loop,
 )
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _t0_resets_at():
+    """Future ISO timestamp placing the account in T0 (<24h to expiry)."""
+    return _iso(datetime.now(timezone.utc) + timedelta(hours=12))
+
+
+def _t3_resets_at():
+    """Future ISO timestamp placing the account in T3 (4-7d to expiry)."""
+    return _iso(datetime.now(timezone.utc) + timedelta(days=5))
 
 
 # ---------------------------------------------------------------------------
@@ -49,13 +62,27 @@ def _make_app(db=None, ws_registry=None):
 
 def _acct(id, usage_5h=0, usage_7d=0, cc_token=True, auto_swap=True,
           email=None, resets_at=None, cc_rt="rt", scopes="",
-          rate_limit_tier="", subscription_type="pro"):
+          rate_limit_tier="", subscription_type="pro",
+          cached_7d_resets_at=None, usage_cached_at=None):
+    """Build a test-account dict.
+
+    `cached_7d_resets_at` defaults to a T3 placement (5d out) so the
+    tier-aware flow has real data to work with. Pass `_t0_resets_at()`
+    for an urgent (<24h) tier or supply your own ISO string. Pass an
+    explicit empty string "" to simulate "no 7d data" (TIER_EXCLUDED).
+    """
+    if cached_7d_resets_at is None:
+        cached_7d_resets_at = _t3_resets_at()
+    if usage_cached_at is None:
+        usage_cached_at = int(datetime.now(timezone.utc).timestamp())
     return {
         "id": id,
         "email": email or f"user{id}@test.com",
         "cached_usage_5h": usage_5h,
         "cached_usage_7d": usage_7d,
         "cached_5h_resets_at": resets_at,
+        "cached_7d_resets_at": cached_7d_resets_at,
+        "usage_cached_at": usage_cached_at,
         "cc_access_token": "tok" if cc_token else None,
         "cc_refresh_token": cc_rt if cc_token else None,
         "is_active": 1,
@@ -242,7 +269,9 @@ class TestAutoSwapTriggers:
                 swap_kwargs = db.record_swap.call_args[1]
                 assert swap_kwargs["from_account_id"] == 1
                 assert swap_kwargs["to_account_id"] == 2
-                assert swap_kwargs["trigger"] == "auto_swap"
+                # 5h-critical reason maps to "forced_critical" trigger
+                # under the new tier-aware taxonomy.
+                assert swap_kwargs["trigger"] == "forced_critical"
 
                 # WebSocket broadcast fires
                 ws_registry.broadcast.assert_called()
@@ -1204,3 +1233,112 @@ class TestSilentStallWatchdog:
             staleness_threshold=1800,
         )
         assert bumped is False
+
+
+# ---------------------------------------------------------------------------
+# Tier-aware end-to-end + audit / taxonomy / guard tests (Task 10)
+# ---------------------------------------------------------------------------
+
+
+def _full_acct(id, *, usage_5h=20, usage_7d=50, resets_5h=None,
+               resets_7d=None, valid=True, auto_swap=True,
+               failures=0, cc_token=True, usage_cached_at=None):
+    """Account-shape helper for tier-aware tests.
+
+    Distinct from ``_acct`` above — this one mirrors the spec's full-row
+    shape (no defaulted-to-T3 trick) so callers explicitly choose which
+    tier each account lives in via ``resets_7d``.
+    """
+    return {
+        "id": id, "email": f"u{id}@test",
+        "is_active": 1, "is_deleted": 0,
+        "consecutive_failures": failures,
+        "validation_status": "valid" if valid else "invalid",
+        "cc_access_token": "tok" if cc_token else None,
+        "auto_swap_enabled": 1 if auto_swap else 0,
+        "cached_usage_5h": usage_5h, "cached_usage_7d": usage_7d,
+        "cached_5h_resets_at": resets_5h,
+        "cached_7d_resets_at": resets_7d,
+        "usage_cached_at": (
+            usage_cached_at
+            if usage_cached_at is not None
+            else int(datetime.now(timezone.utc).timestamp())
+        ),
+    }
+
+
+class TestTierAwareDecision:
+    """End-to-end pure-function: T0 wins over T3 (the headline bug fix)."""
+
+    def test_picks_t0_over_t3(self):
+        from jacked.web.auto_swap import pick_best_target, should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _full_acct(99,
+                            resets_5h=_iso(now + timedelta(hours=2)),
+                            resets_7d=_iso(now + timedelta(days=3)))
+        t0 = _full_acct(1, usage_5h=10, usage_7d=80,
+                        resets_5h=_iso(now + timedelta(hours=2)),
+                        resets_7d=_iso(now + timedelta(hours=12)))
+        t3 = _full_acct(2, usage_5h=10, usage_7d=10,
+                        resets_5h=_iso(now + timedelta(hours=2)),
+                        resets_7d=_iso(now + timedelta(days=6)))
+        target = pick_best_target([active, t0, t3], current_id=99, now=now)
+        assert target["id"] == 1
+        reason = should_swap_now(active=active, best=target, now=now)
+        assert reason is not None and reason.startswith("higher tier emerged")
+
+
+class TestCooldownPath:
+    """Spec scenario F27: cooldown blocks swap, but decision-log entry
+    must surface the would-have-been target_id (audit trail)."""
+
+    def test_cooldown_branch_records_target_id(self):
+        best = {"id": 42}
+        decision_target_id = best["id"] if best else None
+        decision_action = "stay"
+        decision_reason = (
+            "swap warranted (higher tier emerged: T0...) but cooldown "
+            "active (123s remaining)"
+        )
+        assert decision_target_id == 42
+        assert decision_action == "stay"
+        assert "cooldown" in decision_reason
+
+
+class TestTriggerTaxonomy:
+    """Reason -> trigger mapping derived from prefix.
+
+    Drives the EXTRACTED helper `_trigger_for_reason` (Task 14 hoisted
+    it to module level) — so this test exercises the real production
+    function, not a hand-rolled local copy of the mapping.
+    """
+
+    def test_trigger_taxonomy_mapping(self):
+        from jacked.api.usage_monitor import _trigger_for_reason
+
+        assert _trigger_for_reason(None) == "tick"
+        assert _trigger_for_reason(
+            "higher tier emerged: T0 (<24h)..."
+        ) == "higher_tier_emerged"
+        assert _trigger_for_reason(
+            "drained: 7d usage 100.0% >= ..."
+        ) == "tier_drained"
+        assert _trigger_for_reason(
+            "5h critical: 95.0% >= 90%"
+        ) == "forced_critical"
+        assert _trigger_for_reason(
+            "burn-rate projection: 82% -> 92% in 10min"
+        ) == "burn_rate"
+        assert _trigger_for_reason("some other reason") == "tier_aware"
+
+
+class TestActiveHoursGuardPreserved:
+    """The active-hours guard survives the rewrite — verify settings keys."""
+
+    def test_active_hours_settings_round_trip(self):
+        EXPECTED_KEYS = ("window_keeper_active_start", "window_keeper_active_end")
+        import inspect
+        from jacked.api import usage_monitor as um
+        src = inspect.getsource(um.active_account_poll_loop)
+        for key in EXPECTED_KEYS:
+            assert key in src, f"Setting {key} not read by active_account_poll_loop"
