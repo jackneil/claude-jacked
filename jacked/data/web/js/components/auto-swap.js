@@ -335,6 +335,14 @@ function renderDecisionLogTable(entries) {
         '</tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
+const TIER_LABELS = {
+    0: 'T0 (<24h)',
+    1: 'T1 (24-48h)',
+    2: 'T2 (48h-4d)',
+    3: 'T3 (4-7d)',
+    4: 'T?',
+};
+
 function buildDecisionDetailHtml(d, detailId) {
     const parts = [];
 
@@ -351,34 +359,41 @@ function buildDecisionDetailHtml(d, detailId) {
         );
     }
 
-    // Suppression info
-    if (d.suppression) {
-        parts.push(
-            '<div class="mb-2"><span class="text-yellow-400">Suppression:</span> ' +
-            escapeHtml(d.suppression.type || '?') +
-            (d.suppression.usage_7d != null ? ' (7d=' + escapeHtml(String(d.suppression.usage_7d)) + '%)' : '') +
-            '</div>'
-        );
-    }
-
     // Candidates table
     if (d.candidates && d.candidates.length > 0) {
         let table = '<div class="mb-2"><span class="text-slate-400">Candidates evaluated:</span></div>' +
             '<table class="w-full text-[10px] mb-2"><thead><tr class="text-slate-500">' +
-            '<th class="text-left pr-2">Account</th><th class="pr-2 text-right">7d</th>' +
-            '<th class="pr-2 text-right">Deficit</th><th class="pr-2 text-right">Windows</th>' +
-            '<th class="pr-2">Tier</th><th>Pass</th></tr></thead><tbody>';
+            '<th class="text-left pr-2">Account</th>' +
+            '<th class="pr-2 text-right">5h</th>' +
+            '<th class="pr-2 text-right">7d</th>' +
+            '<th class="pr-2">Tier</th>' +
+            '<th class="pr-2 text-right">Target</th>' +
+            '<th class="pr-2 text-right">Deficit</th>' +
+            '<th class="pr-2 text-center">Best</th>' +
+            '</tr></thead><tbody>';
 
         d.candidates.forEach(function(c) {
-            const pass = c.passes ? '\u2705' : '\u274c';
-            const rowCls = c.passes ? 'text-teal-300' : 'text-slate-500';
+            const isBest = c.is_best === true;
+            const rowCls = isBest ? 'text-teal-300' : 'text-slate-400';
+            const tierLabel = TIER_LABELS[c.tier] != null ? TIER_LABELS[c.tier] : '\u2014';
+            const fivehStr = c['5h'] != null ? Number(c['5h']).toFixed(1) + '%' : '\u2014';
+            const sevendStr = c['7d'] != null ? Number(c['7d']).toFixed(1) + '%' : '\u2014';
+            const targetStr = c.target_7d != null ? Number(c.target_7d).toFixed(1) + '%' : '\u2014';
+            let deficitStr = '\u2014';
+            if (c.deficit != null) {
+                const deficit = Number(c.deficit);
+                deficitStr = (deficit >= 0 ? '+' : '') + deficit.toFixed(1) + '%';
+            }
+            const bestStr = isBest ? '\u2713' : '';
             table += '<tr class="' + rowCls + '">' +
                 '<td class="pr-2">' + escapeHtml(c.label || c.email || '?') + '</td>' +
-                '<td class="pr-2 text-right">' + escapeHtml(String(c['7d'] != null ? c['7d'] : '?')) + '%</td>' +
-                '<td class="pr-2 text-right">' + escapeHtml(String(c.deficit != null ? c.deficit : '?')) + '%</td>' +
-                '<td class="pr-2 text-right">' + escapeHtml(String(c.windows_remaining != null ? c.windows_remaining : '?')) + '</td>' +
-                '<td class="pr-2">' + escapeHtml(c.urgency_tier || c.skip_reason || '\u2014') + '</td>' +
-                '<td>' + pass + '</td></tr>';
+                '<td class="pr-2 text-right">' + escapeHtml(fivehStr) + '</td>' +
+                '<td class="pr-2 text-right">' + escapeHtml(sevendStr) + '</td>' +
+                '<td class="pr-2">' + escapeHtml(tierLabel) + '</td>' +
+                '<td class="pr-2 text-right">' + escapeHtml(targetStr) + '</td>' +
+                '<td class="pr-2 text-right">' + escapeHtml(deficitStr) + '</td>' +
+                '<td class="pr-2 text-center text-teal-300">' + bestStr + '</td>' +
+                '</tr>';
         });
         table += '</tbody></table>';
         parts.push(table);
@@ -388,7 +403,6 @@ function buildDecisionDetailHtml(d, detailId) {
     parts.push(
         '<div class="text-slate-500">should_swap=' +
         escapeHtml(String(d.should_swap)) +
-        ' escape=' + escapeHtml(String(d.escape_override)) +
         ' cooldown=' + escapeHtml(String(d.cooldown_active)) +
         '</div>'
     );
@@ -463,6 +477,25 @@ function renderExhaustionBanner() {
             </div>
         </div>
     `;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-swap stall banner (silent-stall watchdog)
+// ---------------------------------------------------------------------------
+
+function showStallBanner(data) {
+    const banner = document.getElementById('auto-swap-stall-banner');
+    if (!banner) return;
+    const ageMin = Math.round((data.last_fetch_age_seconds || 0) / 60);
+    banner.classList.remove('hidden');
+    const textEl = banner.querySelector('.stall-text');
+    if (textEl) {
+        textEl.textContent = (
+            `Auto-swap stalled: ${data.consecutive_ticks} consecutive ticks ` +
+            `with no eligible candidate. Active account data is ${ageMin} ` +
+            `min old. Try refreshing usage manually.`
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

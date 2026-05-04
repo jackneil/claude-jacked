@@ -81,6 +81,13 @@
         </div>
     </main>
 
+    <!-- Auto-swap stall watchdog banner (hidden by default; shown by showStallBanner) -->
+    <div id="auto-swap-stall-banner" class="hidden fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-red-900/95 border border-red-700 rounded-lg px-5 py-3 shadow-lg max-w-lg flex items-center gap-3">
+        <svg class="w-5 h-5 shrink-0 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        <span class="stall-text text-sm text-red-100"></span>
+        <button class="text-red-400 hover:text-white text-lg leading-none ml-auto" onclick="document.getElementById('auto-swap-stall-banner').classList.add('hidden')" aria-label="Dismiss">&times;</button>
+    </div>
+
     <!-- Toast container for notifications -->
     <div id="toast-container" class="fixed bottom-2 right-2 md:bottom-4 md:right-4 left-2 md:left-auto flex flex-col gap-2 z-50 max-w-[calc(100vw-1rem)] md:max-w-sm"></div>
 

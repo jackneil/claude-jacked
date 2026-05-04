@@ -490,6 +490,15 @@ jackedWS.on('all_accounts_exhausted', (msg) => {
     if (typeof renderExhaustionBanner === 'function') renderExhaustionBanner();
 });
 
+jackedWS.on('auto_swap_stall', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof showStallBanner === 'function') {
+        showStallBanner(data);
+    } else {
+        console.warn('Auto-swap stall detected', data);
+    }
+});
+
 jackedWS.on('usage_poll_updated', (msg) => {
     var d = msg.payload || msg;
     if (!d.account_id || !d.account_data) return;
