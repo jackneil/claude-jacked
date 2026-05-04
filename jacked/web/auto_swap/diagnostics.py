@@ -7,6 +7,13 @@ from datetime import datetime, timezone
 
 from jacked.web.auto_swap.burn import compute_effective_working_hours
 
+from .tiers import (
+    TIER_EXCLUDED,
+    target_7d,
+    tier_for,
+    white_bar,
+)
+
 
 def tier_label(account: dict) -> str:
     """Return a human-readable tier label like '(tier 20x)' or ''."""
@@ -75,69 +82,62 @@ def compute_7d_deficit(
     account: dict,
     active_start: str = "06:00",
     active_end: str = "23:00",
+    now: datetime | None = None,
 ) -> dict | None:
-    """Compute 7-day utilization deficit for an account.
+    """Diagnostic dict for 7d utilization status of an account.
 
-    Returns dict with deficit, effective_hours_remaining,
-    effective_windows_remaining, unused_7d. Or None if insufficient data.
+    Returns dict with: tier, target_7d, deficit_vs_tier_target,
+    white_bar, hours_to_expiry, unused_7d, plus legacy fields
+    (deficit, effective_hours_remaining, effective_windows_remaining)
+    for callers that haven't migrated yet.
 
-    Deficit > 0 means behind schedule (underutilized, wasting capacity).
+    None when 7d data missing or window expired.
     """
-    resets_at_str = account.get("cached_7d_resets_at")
-    usage_7d = account.get("cached_usage_7d")
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
 
-    if resets_at_str is None or usage_7d is None:
+    tier = tier_for(account, now=now)
+    if tier == TIER_EXCLUDED:
         return None
 
+    resets_at_str = account.get("cached_7d_resets_at")
+    usage_7d = account.get("cached_usage_7d")
+    if resets_at_str is None or usage_7d is None:
+        return None
     try:
-        resets_at_utc = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
-        if resets_at_utc.tzinfo is None:
-            resets_at_utc = resets_at_utc.replace(tzinfo=timezone.utc)
+        resets_at = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
+        if resets_at.tzinfo is None:
+            resets_at = resets_at.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None
 
-    now_utc = datetime.now(timezone.utc)
-    if resets_at_utc <= now_utc:
-        return None  # window already expired
+    hours_to_expiry = (resets_at - now).total_seconds() / 3600.0
+    wb = white_bar(account, now=now)
+    target = target_7d(account, now=now)
+    deficit_vs_target_val = (target - usage_7d) if target is not None else 0.0
+    deficit_vs_white_bar = (wb * 100.0 - usage_7d) if wb is not None else 0.0
 
-    # Convert to local time for working-hours calculation.
-    # Uses rough offset: diff between datetime.now() (local naive) and
-    # datetime.now(timezone.utc) stripped of tzinfo. Avoids pytz/zoneinfo.
+    # Legacy (effective working hours) — kept for analytics/backcompat.
     from datetime import timedelta as _td
-
     now_local = datetime.now()
-    now_utc_naive = now_utc.replace(tzinfo=None)
+    now_utc_naive = now.replace(tzinfo=None)
     utc_offset_seconds = (now_utc_naive - now_local).total_seconds()
-    # Convert resets_at to local by subtracting the UTC offset
-    resets_local = resets_at_utc.replace(tzinfo=None) - _td(
-        seconds=utc_offset_seconds
-    )
-    window_start_local = resets_local - _td(days=7)
-
-    # Elapsed and total working hours
-    elapsed_hours = compute_effective_working_hours(
-        window_start_local, now_local, active_start, active_end,
-    )
-    total_hours = compute_effective_working_hours(
-        window_start_local, resets_local, active_start, active_end,
-    )
-
-    if total_hours <= 0:
-        return None
-
-    elapsed_fraction = min(elapsed_hours / total_hours, 1.0)
-    expected_usage = elapsed_fraction * 100.0
-    deficit = expected_usage - usage_7d
-
-    # Remaining capacity
+    resets_local = resets_at.replace(tzinfo=None) - _td(seconds=utc_offset_seconds)
     remaining_hours = compute_effective_working_hours(
         now_local, resets_local, active_start, active_end,
     )
     remaining_windows = remaining_hours / 5.0
 
     return {
-        "deficit": deficit,
+        "tier": tier,
+        "target_7d": target,
+        "deficit_vs_tier_target": deficit_vs_target_val,
+        "white_bar": wb,
+        "hours_to_expiry": hours_to_expiry,
+        "unused_7d": 100.0 - usage_7d,
+        # Legacy fields (callers in flight migration)
+        "deficit": deficit_vs_white_bar,
         "effective_hours_remaining": remaining_hours,
         "effective_windows_remaining": remaining_windows,
-        "unused_7d": 100.0 - usage_7d,
     }

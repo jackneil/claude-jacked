@@ -971,3 +971,23 @@ class TestBurstPattern:
         reason = should_swap_now(active=active, best=target, now=now)
         assert reason is not None
         assert "tier" in reason.lower() or "T0" in reason
+
+
+class TestCompute7dDeficitNewShape:
+    def test_returns_tier_and_target_fields(self):
+        from jacked.web.auto_swap import compute_7d_deficit
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, usage_7d=70, resets_7d=_iso(now + timedelta(hours=36)))
+        result = compute_7d_deficit(acct, now=now)
+        assert result is not None
+        assert "tier" in result
+        assert result["tier"] == 1
+        assert "target_7d" in result
+        assert result["target_7d"] == 90.0
+        assert "deficit_vs_tier_target" in result
+        assert result["deficit_vs_tier_target"] == 20.0
+        assert "white_bar" in result
+        assert "hours_to_expiry" in result
+        # Backwards-compat aliases retained:
+        assert "deficit" in result
+        assert "unused_7d" in result
