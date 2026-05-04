@@ -32,6 +32,76 @@
 
 ---
 
+## Task 0: Pre-split `auto_swap.py` into focused submodules (preparation)
+
+`auto_swap.py` is currently 620 lines (over the 500-line guardrail in `JACKED_GUARDRAILS.md`). Tasks 1–7 ADD ~280 lines and Task 8 deletes ~190 — peak mid-execution would be ~700–900 lines in one file. Splitting first means every subsequent commit lands in clean, sub-300-line files and ruff/CI guardrails never need waivers.
+
+**Files:**
+- Create: `jacked/web/auto_swap/__init__.py`, `tiers.py`, `selection.py`, `burn.py`, `diagnostics.py`
+- Modify: imports in `jacked/api/usage_monitor.py`, `jacked/web/auth.py`, any other auto_swap importer
+- Delete: original `jacked/web/auto_swap.py` after content moves
+
+- [ ] **Step 0.1: Convert `auto_swap.py` to a package**
+
+```bash
+mkdir -p jacked/web/auto_swap
+git mv jacked/web/auto_swap.py jacked/web/auto_swap/_legacy.py
+```
+
+- [ ] **Step 0.2: Create `burn.py`**
+
+`jacked/web/auto_swap/burn.py` contains: `BurnRate`, `update_burn_rate`, `_resets_within`, `RESET_SUPPRESS_MINUTES`, `compute_burn_per_window`, `has_viable_headroom`, `compute_effective_working_hours`. Move from `_legacy.py`. Add module docstring + ruff-friendly imports.
+
+- [ ] **Step 0.3: Create `diagnostics.py`**
+
+`jacked/web/auto_swap/diagnostics.py` contains: `format_account_label`, `tier_label`, `tier_critical_threshold`. (`compute_7d_deficit` will be refactored later in Task 11; for Task 0 we simply move the existing implementation.)
+
+- [ ] **Step 0.4: Create `tiers.py` (initially empty besides imports)**
+
+`jacked/web/auto_swap/tiers.py` is the future home of `tier_for`, `white_bar`, `target_7d`, `deficit_vs_target`, `_resolve_now`, and the `TIER_*` / `_TIER_*` / `T1_TARGET` / `T2_LEAD` constants. For now, write the module with just the imports/docstring; functions land in Tasks 1-4.
+
+```python
+"""Tier classification, white-bar progress, and tier-based usage targets.
+
+See docs/architecture/auto-swap-system.md for the algorithm overview.
+"""
+from __future__ import annotations
+from datetime import datetime, timedelta, timezone
+```
+
+- [ ] **Step 0.5: Create `selection.py` (initially with current `should_swap` + old `pick_best_target`)**
+
+Move the current (pre-redesign) `should_swap` and `pick_best_target` and `score_candidate` into `jacked/web/auto_swap/selection.py`. They'll be replaced in Tasks 5-6 + 8 — putting them here keeps imports working until then.
+
+- [ ] **Step 0.6: Create `__init__.py` re-exports**
+
+Same content as Task 13 Step 13.6 (re-export everything for backwards-compat). Create now so existing imports `from jacked.web.auto_swap import X` continue to resolve.
+
+- [ ] **Step 0.7: Delete `_legacy.py`**
+
+```bash
+rm jacked/web/auto_swap/_legacy.py
+```
+
+- [ ] **Step 0.8: Verify imports + tests still pass**
+
+Run: `uv run python -m pytest tests/unit/test_auto_swap.py tests/unit/test_usage_monitor.py -v`
+Expected: all green (we only moved code, didn't change behavior).
+
+Run: `wc -l jacked/web/auto_swap/*.py`
+Expected: every file under 300 lines.
+
+- [ ] **Step 0.9: Commit**
+
+```bash
+git add jacked/web/auto_swap/
+git commit -m "refactor(auto_swap): split into tiers/selection/burn/diagnostics submodules"
+```
+
+> **For Tasks 1-12 below:** wherever a step says "In `jacked/web/auto_swap.py`...", read it as "in the appropriate submodule under `jacked/web/auto_swap/`" — typically `tiers.py` for tier helpers, `selection.py` for `pick_best_target` / `should_swap_now`, etc. Imports in tests should remain `from jacked.web.auto_swap import X` (the package's `__init__.py` re-exports the public API).
+
+---
+
 ## Task 1: Tier classification (`tier_for`)
 
 **Files:**
@@ -1100,6 +1170,57 @@ class TestShouldSwapNow:
         assert reason is not None
         assert "higher tier" in reason.lower()
 
+    def test_t3_above_floor_with_no_best_does_not_drain(self):
+        # CRITICAL regression: T2/T3 targets are FLOORS, not drain-to goals.
+        # An active T3 above its rising white_bar floor with NO candidate
+        # must NOT trigger DRAINED. Otherwise the loop would broadcast
+        # all_accounts_exhausted on every tick whenever a T3 active is
+        # above the floor — a misleading critical alert.
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        # T3 account near end of window, well above its white_bar floor.
+        # white_bar(6d to expiry) = 1/7 ≈ 14.3% → T3 target ≈ 14.3%.
+        # Active at 30% (above target by 15.7%).
+        active = _acct(1, usage_5h=20, usage_7d=30,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=6)))  # T3
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None, (
+            f"T3 above floor with no candidate must not drain; got: {reason}"
+        )
+
+    def test_t2_above_floor_with_no_best_does_not_drain(self):
+        # Same principle for T2.
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=80,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))  # T2
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None
+
+    def test_t0_at_100_drains_even_without_best(self):
+        # T0 IS a drain-to goal: hitting 100% is "done".
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=100,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=12)))  # T0
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("drained:")
+
+    def test_t1_at_target_drains_even_without_best(self):
+        # T1 IS a drain-to goal: hitting 90% is "done".
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=90,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=36)))  # T1
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("drained:")
+
     def test_reason_prefixes_match_constants(self):
         # Critical: usage_monitor parses these prefixes to map into the
         # decision-log trigger taxonomy. Lock the contract.
@@ -1244,13 +1365,20 @@ def should_swap_now(
         # through to the remaining checks. Without a usable target it is
         # rare for those to fire, but we keep the path explicit.
 
-    # 2. Active drained vs its tier target
-    target = target_7d(active, now=now)
-    if target is not None and usage_7d >= target:
-        return (
-            f"{REASON_PREFIX_DRAINED} 7d usage {usage_7d:.1f}% >= "
-            f"tier target {target:.1f}%"
-        )
+    # 2. Active drained vs its tier target — ONLY for T0/T1 (drain-to goals).
+    # T2/T3 targets are floors (rising white-bar baseline) — being above
+    # the floor is the *desired* state, not "drained". Per spec:
+    # "T0/T1 targets are drain-to goals. T2/T3 targets are floors —
+    # depart only if a candidate with deficit exists; otherwise stay."
+    # Firing DRAINED for T2/T3 every tick would broadcast misleading
+    # all_accounts_exhausted alerts when no swap is actually warranted.
+    if active_tier in (TIER_T0, TIER_T1):
+        target = target_7d(active, now=now)
+        if target is not None and usage_7d >= target:
+            return (
+                f"{REASON_PREFIX_DRAINED} 7d usage {usage_7d:.1f}% >= "
+                f"tier target {target:.1f}%"
+            )
 
     # 3. 5h critical (suppressed if reset imminent)
     if usage_5h >= critical_5h and not suppress_5h:
@@ -1480,8 +1608,9 @@ def reset_locks() -> None:
     _sweep_wake = asyncio.Event()
     _last_observed_tiers.clear()
     _emerged_target_streak.clear()
-    global _consecutive_no_best_ticks
+    global _consecutive_no_best_ticks, _last_stall_warning
     _consecutive_no_best_ticks = 0
+    _last_stall_warning = 0.0
 ```
 
 - [ ] **Step 9.3: Update imports**
@@ -1634,7 +1763,19 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                     "is_best": (best is not None and cand["id"] == best["id"]),
                 })
 
-            # Refresh hysteresis state from this tick's observations
+            # Refresh hysteresis state from this tick's observations,
+            # AND prune entries for accounts no longer present.
+            # (Without pruning, a deleted/deactivated account leaks an
+            # entry forever — `db.list_accounts(include_inactive=False)`
+            # filters them out of `accounts`, so they never reappear in
+            # this loop. Same risk for `_emerged_target_streak`.)
+            live_ids = {a["id"] for a in accounts if a["id"] != active_acct_id}
+            for stale_id in list(_last_observed_tiers.keys()):
+                if stale_id not in live_ids:
+                    _last_observed_tiers.pop(stale_id, None)
+            for stale_id in list(_emerged_target_streak.keys()):
+                if stale_id not in live_ids:
+                    _emerged_target_streak.pop(stale_id, None)
             for cand in accounts:
                 if cand["id"] == active_acct_id:
                     continue
@@ -1669,7 +1810,9 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
 
             if reason is None:
                 # Stay path (no departure trigger fired or emergence
-                # awaiting persistence)
+                # awaiting persistence). When a runner-up exists, surface
+                # its id so the audit trail / dashboard show "we considered
+                # account X but stayed because it's same/lower tier".
                 _decision_action = "stay"
                 if best is None:
                     _decision_reason = (
@@ -1677,6 +1820,7 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                         f"(tier {_tier_label(active_acct).strip() or 'unset'})"
                     )
                 else:
+                    _decision_target_id = best["id"]
                     best_tier = tier_for(
                         best, now=now_utc,
                         prev_tier=_last_observed_tiers.get(best["id"]),
@@ -1767,17 +1911,41 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                 _decision_reason = reason
 
             # ---- Silent-stall watchdog ------------------------------------
-            # Detect when the loop is ticking but never producing a swap
-            # AND the active account's data is stale AND there are
-            # candidates that could reveal a target if their data refreshed.
-            if _decision_action == "stay" and best is None:
+            # Trips when the loop is unable to make progress. Three
+            # qualifying patterns (any one increments the counter):
+            #
+            #  (a) Multi-account stale: stay+no-best+stale active data
+            #      AND ≥1 other account exists. The user should see a
+            #      candidate but doesn't (likely candidate fetches
+            #      failing or all are validation_status=invalid).
+            #
+            #  (b) Single-account stuck: only one account exists AND
+            #      it has hit a forced-out reason (drained/critical/
+            #      burn-rate) but `best is None` because no other
+            #      account is available. User has no working rotation.
+            #
+            #  (c) DRAINED with no candidate: any reason fires + no
+            #      eligible target exists. The user wanted to leave
+            #      this account but can't — needs operator attention.
+            #
+            # All three patterns produce action=stay, so the gate is
+            # `decision_action == "stay"` plus the trigger condition.
+            if _decision_action == "stay":
                 cached_at = active_acct.get("usage_cached_at") or 0
                 age_seconds = int(time.time()) - int(cached_at)
                 stale = age_seconds > _STALL_USAGE_STALENESS_SECONDS
                 has_other_accounts = sum(
                     1 for a in accounts if a["id"] != active_acct_id
                 ) > 0
-                if stale and has_other_accounts:
+                # Did a real departure trigger fire even though we stayed?
+                forced_out_reason = reason is not None  # may be None if cooldown blocked
+                pattern_a = best is None and stale and has_other_accounts
+                pattern_b = (
+                    not has_other_accounts
+                    and forced_out_reason
+                )
+                pattern_c = best is None and forced_out_reason
+                if pattern_a or pattern_b or pattern_c:
                     _consecutive_no_best_ticks += 1
                 else:
                     _consecutive_no_best_ticks = 0
@@ -2016,64 +2184,133 @@ class TestTierAwareDecision:
 class TestEmergencePersistence:
     """Spec scenario F26 + pre-mortem F2: anti-flap on tier jitter.
 
-    The new flow requires a candidate to remain a higher-tier `best` for
-    `_EMERGENCE_PERSISTENCE_TICKS` consecutive ticks before swapping.
-    Tests that the streak counter behaves and clears on reset.
+    These tests drive the EXTRACTED helper from Task 14
+    (`_apply_emergence_persistence`) — they exercise real production
+    code, NOT a hand-rolled local copy of the logic. If the helper
+    logic regresses (e.g. a refactor inverts the comparison), these
+    tests fail.
     """
 
-    def test_streak_increments_then_swaps(self, monkeypatch):
-        from jacked.api import usage_monitor as um
-        um._emerged_target_streak.clear()
-        target_id = 7
-
-        # Simulate two ticks where same target is best (T0 emerged)
-        # Tick 1
-        um._emerged_target_streak[target_id] = (
-            um._emerged_target_streak.get(target_id, 0) + 1
+    def test_first_emerge_suppressed(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak: dict[int, int] = {}
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2",
+            best_id=7,
+            streak=streak,
+            persistence_ticks=2,
         )
-        assert um._emerged_target_streak[target_id] == 1
-        assert um._emerged_target_streak[target_id] < um._EMERGENCE_PERSISTENCE_TICKS  # suppress
-        # Tick 2
-        um._emerged_target_streak[target_id] = (
-            um._emerged_target_streak.get(target_id, 0) + 1
-        )
-        assert um._emerged_target_streak[target_id] == 2
-        assert um._emerged_target_streak[target_id] >= um._EMERGENCE_PERSISTENCE_TICKS  # fire
+        assert result is None  # suppressed first tick
+        assert streak == {7: 1}
 
-    def test_streak_resets_when_target_changes(self):
-        from jacked.api import usage_monitor as um
-        um._emerged_target_streak.clear()
-        # Tick 1: target A
-        um._emerged_target_streak[1] = 1
-        # Tick 2: target B (different) — production code clears prior keys
-        new_id = 2
-        new_streak = um._emerged_target_streak.get(new_id, 0) + 1
-        um._emerged_target_streak[new_id] = new_streak
-        for stale_id in list(um._emerged_target_streak.keys()):
-            if stale_id != new_id:
-                del um._emerged_target_streak[stale_id]
-        assert 1 not in um._emerged_target_streak
-        assert um._emerged_target_streak[new_id] == 1
+    def test_second_emerge_fires(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {7: 1}
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2",
+            best_id=7,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert result is not None  # streak met threshold
+        assert result.startswith("higher tier emerged")
+        assert streak == {7: 2}
+
+    def test_target_change_resets_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {1: 5}  # was building toward swap on account 1
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2",
+            best_id=2,  # different account
+            streak=streak,
+            persistence_ticks=2,
+        )
+        # Streak rebuilds for new id; old id pruned.
+        assert 1 not in streak
+        assert streak[2] == 1
+        assert result is None  # first tick of new streak
+
+    def test_non_emerge_reason_clears_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {7: 1}
+        result = _apply_emergence_persistence(
+            reason="drained: 7d usage 100% >= 100%",
+            best_id=7,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert result.startswith("drained")  # passes through
+        assert streak == {}  # cleared
+
+    def test_none_reason_clears_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {7: 1}
+        result = _apply_emergence_persistence(
+            reason=None, best_id=7, streak=streak, persistence_ticks=2,
+        )
+        assert result is None
+        assert streak == {}
 
 
 class TestSilentStallWatchdog:
-    """Pre-mortem F3: detect "loop ticking but never produces a target"."""
+    """Pre-mortem F3: detect "loop ticking but never produces a target".
 
-    def test_counter_increments_on_no_best_with_stale_active(self):
-        from jacked.api import usage_monitor as um
-        um._consecutive_no_best_ticks = 0
-        # Simulate the bookkeeping the new flow does:
-        #   stale=True, has_other_accounts=True, decision=stay, best=None
-        for _ in range(10):
-            um._consecutive_no_best_ticks += 1
-        assert um._consecutive_no_best_ticks >= um._STALL_TICK_THRESHOLD
+    Drives the EXTRACTED helper from Task 14 (`_evaluate_stall`).
+    """
 
-    def test_counter_resets_when_best_appears(self):
-        from jacked.api import usage_monitor as um
-        um._consecutive_no_best_ticks = 5
-        # Best appeared (or non-stay action) -> reset
-        um._consecutive_no_best_ticks = 0
-        assert um._consecutive_no_best_ticks == 0
+    def test_pattern_a_multi_account_stale(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        # decision_action=stay, best=None, stale=True, has_others=True
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=2000,  # >1800
+            has_other_accounts=True, reason=None,
+            staleness_threshold=1800,
+        )
+        assert bumped is True
+
+    def test_pattern_b_single_account_forced_out(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=False,
+            reason="drained: 7d at 100%",
+            staleness_threshold=1800,
+        )
+        assert bumped is True
+
+    def test_pattern_c_drained_no_candidate(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True,
+            reason="drained: 7d at 100%",
+            staleness_threshold=1800,
+        )
+        assert bumped is True
+
+    def test_no_increment_on_swap(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="swap", best={"id": 1},
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True, reason="anything",
+            staleness_threshold=1800,
+        )
+        assert bumped is False
+
+    def test_no_increment_on_healthy_stay(self):
+        # Active is fine, no candidate has deficit, fresh data.
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True, reason=None,
+            staleness_threshold=1800,
+        )
+        assert bumped is False
 
 
 class TestCooldownPath:
@@ -2343,15 +2580,58 @@ Edit `jacked/data/web/js/components/auto-swap.js`. Where the candidate row curre
 
 Remove the rendering blocks for top-level `escape_override`, `suppression`, and `proactive_target_id` — they no longer appear. The `cooldown_active` field still applies and stays.
 
-- [ ] **Step 12.6.3: Smoke-check in browser**
+- [ ] **Step 12.6.3: Add `auto_swap_stall` WS handler in `websocket.js`**
 
-User runs `jacked webux` from a separate terminal (per project memory: never auto-start the server). Verify the decision log renders the new columns without console errors.
+The new flow's silent-stall watchdog (Task 9 Step 9.4) broadcasts an
+`auto_swap_stall` event over WebSocket when the loop has been stuck
+≥10 ticks with stale data and no eligible candidate. Without a UI
+handler, the watchdog logs ERROR locally to a void.
 
-- [ ] **Step 12.6.4: Commit**
+In `jacked/data/web/js/websocket.js`, find the existing handler for
+`all_accounts_exhausted` (around lines 487-491) and add a parallel
+handler immediately after:
+
+```javascript
+case 'auto_swap_stall': {
+    if (typeof showStallBanner === 'function') {
+        showStallBanner(data);
+    } else {
+        console.warn('Auto-swap stall detected', data);
+    }
+    break;
+}
+```
+
+In `jacked/data/web/js/components/auto-swap.js`, add the corresponding
+banner renderer:
+
+```javascript
+function showStallBanner(data) {
+    const banner = document.getElementById('auto-swap-stall-banner');
+    if (!banner) return;
+    const ageMin = Math.round((data.last_fetch_age_seconds || 0) / 60);
+    banner.classList.remove('hidden');
+    banner.querySelector('.stall-text').textContent = (
+        `Auto-swap stalled: ${data.consecutive_ticks} consecutive ticks ` +
+        `with no eligible candidate. Active account data is ${ageMin} ` +
+        `min old. Try refreshing usage manually.`
+    );
+}
+```
+
+In `jacked/data/web/index.html` (or the auto-swap-related template),
+add a hidden banner element where the existing `all_accounts_exhausted`
+banner lives — same structure, different id `auto-swap-stall-banner`.
+
+- [ ] **Step 12.6.4: Smoke-check in browser**
+
+User runs `jacked webux` from a separate terminal (per project memory: never auto-start the server). Verify the decision log renders the new columns without console errors. To exercise the stall banner, set every candidate's `validation_status="invalid"` via the dashboard or DB and let the loop tick 10+ times — banner should appear.
+
+- [ ] **Step 12.6.5: Commit**
 
 ```bash
-git add jacked/data/web/js/components/auto-swap.js
-git commit -m "feat(ui): tier/target_7d/deficit/is_best columns in decision log"
+git add jacked/data/web/js/components/auto-swap.js jacked/data/web/js/websocket.js jacked/data/web/index.html
+git commit -m "feat(ui): tier columns + auto_swap_stall banner"
 ```
 
 ---
@@ -2402,116 +2682,30 @@ git commit -m "docs: mark 2026-04-03 7d-capacity spec as superseded"
 
 ---
 
-## Task 13: Split `auto_swap.py` into focused submodules
+## Task 13: File-size sanity check (Task 0 already split the package)
 
-**Files:**
-- Create: `jacked/web/auto_swap/__init__.py`, `tiers.py`, `selection.py`, `burn.py`, `diagnostics.py`
-- Modify: imports in `jacked/api/usage_monitor.py`, `jacked/web/auth.py` (any other auto_swap importer)
-- Delete: original `jacked/web/auto_swap.py` after content moves
+Task 0 split `auto_swap.py` into submodules before TDD started. After all
+algorithmic work lands, verify each submodule remains within the
+guardrail. If any submodule has bloated past 300 lines (target), split
+further at this point.
 
-The single-file `auto_swap.py` is at 620 lines and violates the project guardrail (500 hard max in `JACKED_GUARDRAILS.md`). After the algorithmic work lands, split into a package.
-
-- [ ] **Step 13.1: Convert `auto_swap.py` to a package**
-
-```bash
-mkdir -p jacked/web/auto_swap
-mv jacked/web/auto_swap.py jacked/web/auto_swap/_legacy.py  # temp
-```
-
-- [ ] **Step 13.2: Create `tiers.py`**
-
-`jacked/web/auto_swap/tiers.py` contains: `TIER_T0..TIER_EXCLUDED`, `_TIER_BOUNDARIES_HOURS`, `_TIER_HYSTERESIS_MIN`, `_TIER_NAMES`, `T1_TARGET`, `T2_LEAD`, `_resolve_now`, `tier_for`, `white_bar`, `target_7d`, `deficit_vs_target`. Move from `_legacy.py`.
-
-- [ ] **Step 13.3: Create `burn.py`**
-
-`jacked/web/auto_swap/burn.py` contains: `BurnRate`, `update_burn_rate`, `_resets_within`, `RESET_SUPPRESS_MINUTES`, `compute_burn_per_window`, `has_viable_headroom`, `compute_effective_working_hours`. Move from `_legacy.py`.
-
-- [ ] **Step 13.4: Create `selection.py`**
-
-`jacked/web/auto_swap/selection.py` contains: `_FIVE_H_HEADROOM_LIMIT`, `_FIVE_H_HEADROOM_RESET_MIN`, `_has_5h_headroom`, `_SortKey`, `pick_best_target`, `should_swap_now`, `REASON_PREFIX_*` constants. Imports tier helpers from `.tiers` and burn helpers from `.burn`. Move from `_legacy.py`.
-
-- [ ] **Step 13.5: Create `diagnostics.py`**
-
-`jacked/web/auto_swap/diagnostics.py` contains: `compute_7d_deficit`, `format_account_label`, `tier_label`, `tier_critical_threshold`. Move from `_legacy.py`.
-
-- [ ] **Step 13.6: Create `__init__.py` re-exports**
-
-`jacked/web/auto_swap/__init__.py`:
-
-```python
-"""Auto-swap decision engine — facade re-exporting public API.
-
-See docs/architecture/auto-swap-system.md for module responsibilities.
-"""
-from .burn import (
-    BurnRate,
-    RESET_SUPPRESS_MINUTES,
-    _resets_within,
-    compute_burn_per_window,
-    compute_effective_working_hours,
-    has_viable_headroom,
-    update_burn_rate,
-)
-from .diagnostics import (
-    compute_7d_deficit,
-    format_account_label,
-    tier_critical_threshold,
-    tier_label,
-)
-from .selection import (
-    REASON_PREFIX_BURN_RATE,
-    REASON_PREFIX_DRAINED,
-    REASON_PREFIX_FIVE_H,
-    REASON_PREFIX_HIGHER_TIER,
-    _has_5h_headroom,
-    pick_best_target,
-    should_swap_now,
-)
-from .tiers import (
-    TIER_EXCLUDED,
-    TIER_T0,
-    TIER_T1,
-    TIER_T2,
-    TIER_T3,
-    deficit_vs_target,
-    target_7d,
-    tier_for,
-    white_bar,
-)
-
-__all__ = [
-    "BurnRate", "RESET_SUPPRESS_MINUTES", "_resets_within",
-    "compute_burn_per_window", "compute_effective_working_hours",
-    "has_viable_headroom", "update_burn_rate",
-    "compute_7d_deficit", "format_account_label",
-    "tier_critical_threshold", "tier_label",
-    "REASON_PREFIX_BURN_RATE", "REASON_PREFIX_DRAINED",
-    "REASON_PREFIX_FIVE_H", "REASON_PREFIX_HIGHER_TIER",
-    "_has_5h_headroom", "pick_best_target", "should_swap_now",
-    "TIER_EXCLUDED", "TIER_T0", "TIER_T1", "TIER_T2", "TIER_T3",
-    "deficit_vs_target", "target_7d", "tier_for", "white_bar",
-]
-```
-
-- [ ] **Step 13.7: Delete `_legacy.py`**
-
-```bash
-rm jacked/web/auto_swap/_legacy.py
-```
-
-- [ ] **Step 13.8: Verify**
-
-Run: `uv run python -m pytest tests/unit/test_auto_swap.py tests/unit/test_usage_monitor.py -v`
-Expected: all green. Imports from `jacked.web.auto_swap` resolve via the new `__init__.py` facade.
+- [ ] **Step 13.1: Verify submodule sizes**
 
 Run: `wc -l jacked/web/auto_swap/*.py`
 Expected: every file under 300 lines (target) and well under 500 (hard max).
 
-- [ ] **Step 13.9: Commit**
+If `selection.py` is over (likely — it holds both `pick_best_target` and `should_swap_now` plus the `_SortKey` dataclass), split into `selection.py` (just `pick_best_target` + `_SortKey` + `_has_5h_headroom`) and `departure.py` (`should_swap_now` + REASON_PREFIX_* constants). Update `__init__.py` re-exports.
+
+- [ ] **Step 13.2: Run tests after any further split**
+
+Run: `uv run python -m pytest tests/unit/test_auto_swap.py tests/unit/test_usage_monitor.py -v`
+Expected: all green.
+
+- [ ] **Step 13.3: Commit if a split was performed**
 
 ```bash
 git add jacked/web/auto_swap/
-git commit -m "refactor(auto_swap): split monolithic file into tiers/selection/burn/diagnostics"
+git commit -m "refactor(auto_swap): split selection.py — extract departure logic"
 ```
 
 ---
@@ -2521,65 +2715,170 @@ git commit -m "refactor(auto_swap): split monolithic file into tiers/selection/b
 **Files:**
 - Modify: `jacked/api/usage_monitor.py`
 
-The `active_account_poll_loop` is currently 720 lines (way over the 50-line function guardrail). Extract:
+The `active_account_poll_loop` is currently 720 lines (way over the
+50-line function guardrail). Extract pure-function helpers so we can
+unit-test the state machine directly (replacing the
+"tests-against-themselves" pattern in TestEmergencePersistence /
+TestSilentStallWatchdog).
 
-- [ ] **Step 14.1: Extract `_decide_swap_action`**
+- [ ] **Step 14.1: Extract `_apply_emergence_persistence`**
 
-Pull the whole reason-classification + action-selection branch (from Step 9.4's "if reason is None" through "execute swap" inclusive) into a helper:
-
-```python
-async def _decide_swap_action(
-    db, app, active_acct, accounts, best, reason, *,
-    active_acct_id, usage_5h, usage_7d, active_start, active_end,
-    ws_registry,
-) -> tuple[str, int | None, str]:
-    """Return (action, target_id, reason_text)."""
-    ...  # body of the if/elif chain from Step 9.4
-```
-
-The loop calls this and unpacks the return tuple.
-
-- [ ] **Step 14.2: Extract `_run_silent_stall_watchdog`**
-
-Pull the watchdog branch (from "Silent-stall watchdog" comment through the broadcast block) into:
+Module-level, near the existing `_trigger_for_reason`:
 
 ```python
-async def _run_silent_stall_watchdog(
-    decision_action, best, active_acct, active_acct_id, ws_registry,
-) -> None:
-    """Update _consecutive_no_best_ticks; emit error+broadcast if stalled."""
-    ...
+def _apply_emergence_persistence(
+    reason: str | None,
+    best_id: int | None,
+    streak: dict[int, int],
+    persistence_ticks: int,
+) -> str | None:
+    """Gate "higher tier emerged" reasons behind a multi-tick streak.
+
+    Anti-jitter: a candidate must remain the best ``persistence_ticks``
+    times in a row before the swap actually fires. Mutates ``streak``
+    in place — increments the count for ``best_id``, prunes any other
+    keys, or clears entirely on non-emerge / None reason.
+
+    Returns the original ``reason`` when persistence is met (let the
+    swap fire), or None to suppress this tick.
+    """
+    from jacked.web.auto_swap import REASON_PREFIX_HIGHER_TIER
+    if reason is None or not reason.startswith(REASON_PREFIX_HIGHER_TIER):
+        streak.clear()
+        return reason
+    if best_id is None:
+        streak.clear()
+        return None
+    streak[best_id] = streak.get(best_id, 0) + 1
+    for stale_id in list(streak.keys()):
+        if stale_id != best_id:
+            del streak[stale_id]
+    if streak[best_id] < persistence_ticks:
+        return None
+    return reason
 ```
 
-- [ ] **Step 14.3: Extract `_record_tick_decision`**
+- [ ] **Step 14.2: Extract `_evaluate_stall`**
 
-Pull the final decision-log block + WS broadcast into:
+Module-level:
 
 ```python
-def _record_tick_decision(
-    db, app, active_acct, *,
-    active_acct_id, usage_5h, usage_7d, decision_action,
-    decision_target_id, decision_reason, candidate_summaries,
-    suppression, ws_registry,
-) -> None:
-    ...
+def _evaluate_stall(
+    *,
+    decision_action: str,
+    best: dict | None,
+    usage_cached_at_age_seconds: int,
+    has_other_accounts: bool,
+    reason: str | None,
+    staleness_threshold: int,
+) -> bool:
+    """Return True if this tick qualifies as a stall pattern.
+
+    Three patterns trigger a bump (any one):
+      (a) Multi-account stale: stay+no-best+stale active+has others
+      (b) Single-account forced-out: only one account, departure reason fired
+      (c) Drained-no-candidate: any reason fired but no eligible target
+
+    Returns False otherwise (caller resets the counter).
+    """
+    if decision_action != "stay":
+        return False
+    stale = usage_cached_at_age_seconds > staleness_threshold
+    forced_out = reason is not None
+    pattern_a = best is None and stale and has_other_accounts
+    pattern_b = not has_other_accounts and forced_out
+    pattern_c = best is None and forced_out
+    return pattern_a or pattern_b or pattern_c
 ```
 
-- [ ] **Step 14.4: Verify loop body now ~50 lines of orchestration**
+- [ ] **Step 14.3: Extract `_trigger_for_reason` to module level**
+
+The closure inside the loop (Step 9.4) now lifts to module level so
+both the loop body and any future callers reuse it:
+
+```python
+def _trigger_for_reason(reason: str | None) -> str:
+    """Map a should_swap_now reason-string to a decision-log trigger
+    taxonomy value. Stable contract — see spec
+    docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md.
+    """
+    from jacked.web.auto_swap import (
+        REASON_PREFIX_HIGHER_TIER,
+        REASON_PREFIX_DRAINED,
+        REASON_PREFIX_FIVE_H,
+        REASON_PREFIX_BURN_RATE,
+    )
+    if reason is None:
+        return "tick"
+    if reason.startswith(REASON_PREFIX_HIGHER_TIER):
+        return "higher_tier_emerged"
+    if reason.startswith(REASON_PREFIX_DRAINED):
+        return "tier_drained"
+    if reason.startswith(REASON_PREFIX_FIVE_H):
+        return "forced_critical"
+    if reason.startswith(REASON_PREFIX_BURN_RATE):
+        return "burn_rate"
+    return "tier_aware"
+```
+
+Replace the inline closure in Step 9.4's body with calls to this
+module-level function.
+
+- [ ] **Step 14.4: Replace the loop's emergence + stall logic with helper calls**
+
+In `active_account_poll_loop`, replace the inlined emergence-streak
+logic with:
+
+```python
+reason = _apply_emergence_persistence(
+    reason=reason,
+    best_id=best["id"] if best else None,
+    streak=_emerged_target_streak,
+    persistence_ticks=_EMERGENCE_PERSISTENCE_TICKS,
+)
+```
+
+And replace the inlined stall logic with:
+
+```python
+cached_at = active_acct.get("usage_cached_at") or 0
+age_seconds = int(time.time()) - int(cached_at)
+has_other_accounts = sum(
+    1 for a in accounts if a["id"] != active_acct_id
+) > 0
+if _evaluate_stall(
+    decision_action=_decision_action, best=best,
+    usage_cached_at_age_seconds=age_seconds,
+    has_other_accounts=has_other_accounts,
+    reason=reason,
+    staleness_threshold=_STALL_USAGE_STALENESS_SECONDS,
+):
+    _consecutive_no_best_ticks += 1
+else:
+    _consecutive_no_best_ticks = 0
+```
+
+- [ ] **Step 14.5: (Optional) Extract `_decide_swap_action`**
+
+If the loop body is still over ~150 lines after the above, extract the
+if/elif/else action-selection chain. Otherwise skip — the helpers
+above already deliver most of the readability benefit.
+
+- [ ] **Step 14.6: Verify loop body shrinks**
 
 Run: `awk '/async def active_account_poll_loop/,/async def full_sweep_loop/' jacked/api/usage_monitor.py | wc -l`
-Expected: under ~150 lines (loop body + retained settings/fetch code). Original was 720+.
+Expected: under ~200 lines (orchestration + settings/fetch + helper calls). Original was 720+.
 
-- [ ] **Step 14.5: Run all tests**
+- [ ] **Step 14.7: Run all tests**
 
 Run: `uv run python -m pytest -v`
-Expected: all green.
+Expected: all green. The helper extraction means TestEmergencePersistence and TestSilentStallWatchdog now exercise real production code paths.
 
-- [ ] **Step 14.6: Commit**
+- [ ] **Step 14.8: Commit**
 
 ```bash
 git add jacked/api/usage_monitor.py
-git commit -m "refactor(usage_monitor): extract decision/watchdog/log helpers"
+git commit -m "refactor(usage_monitor): extract emergence/stall/trigger helpers"
 ```
 
 ---
