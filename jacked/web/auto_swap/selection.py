@@ -1,169 +1,31 @@
-"""Auto-swap decision engine — pure functions, NO I/O.
-
-All side effects (DB reads, HTTP calls, account switching) belong in the
-caller.  This module only answers: *should* we swap, *to whom*, and tracks
-burn-rate state.
-"""
+"""Selection rule and departure decision (legacy implementation; rewritten in later tasks)."""
 
 from __future__ import annotations
 
-import re
+import logging
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import logging
+from jacked.web.auto_swap.burn import (
+    BurnRate,
+    RESET_SUPPRESS_MINUTES,
+    _resets_within,
+    compute_burn_per_window,
+    has_viable_headroom,
+)
+from jacked.web.auto_swap.diagnostics import (
+    compute_7d_deficit,
+    tier_critical_threshold,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Constants
 # ---------------------------------------------------------------------------
 
-@dataclass
-class BurnRate:
-    rate_5h_per_min: float = 0.0
-    last_check_5h: float = 0.0
-    rate_7d_per_min: float = 0.0
-    last_check_7d: float = 0.0
-    last_check_time: float = field(default_factory=time.time)
-
-
-def tier_label(account: dict) -> str:
-    """Return a human-readable tier label like '(tier 20x)' or ''."""
-    tier = (account.get("rate_limit_tier") or "").lower()
-    match = re.search(r"(\d+)x", tier)
-    return f" (tier {match.group(1)}x)" if match else ""
-
-
-def format_account_label(account: dict) -> str:
-    """Human-readable account label for swap notifications and logs.
-
-    Format: [Label — ] email [(org)]
-    - Personal orgs (ending "'s Organization") show as "(personal)"
-    - Real org names shown as-is: "(Hank.ai)"
-    - Custom display_name prepended only if it differs from the default
-      (default = first name matching email prefix, or generic names)
-    """
-    email = account.get("email") or "unknown"
-    org_name = account.get("organization_name") or ""
-    display_name = (account.get("display_name") or "").strip()
-
-    # Build org suffix
-    org_suffix = ""
-    if org_name:
-        if org_name.endswith("\u2019s Organization") or org_name.endswith("'s Organization"):
-            org_suffix = " (personal)"
-        else:
-            org_suffix = f" ({org_name})"
-
-    # Check if display_name is custom (not the Anthropic default)
-    label_prefix = ""
-    if display_name:
-        # Default display_name is typically the first name from the email
-        # e.g. "Jack" for jack.neil@hank.ai. Don't show these.
-        email_prefix = email.split("@")[0].split(".")[0].lower()
-        if display_name.lower() != email_prefix and display_name.lower() != "user":
-            label_prefix = f"{display_name} \u2014 "
-
-    return f"{label_prefix}{email}{org_suffix}"
-
-
-def tier_critical_threshold(account: dict) -> float:
-    """Compute the auto-swap critical threshold based on account tier.
-
-    Higher-tier accounts can sustain usage longer before needing a swap.
-    Known tiers from Anthropic: default_claude_max_20x, default_claude_max_5x.
-    Test fixtures use t1/t2 which are not real tiers — they fall to the
-    subscription_type fallback.
-    """
-    tier = (account.get("rate_limit_tier") or "").lower()
-    match = re.search(r"(\d+)x", tier)
-    if match:
-        multiplier = int(match.group(1))
-        if multiplier >= 20:
-            return 95.0
-        if multiplier >= 5:
-            return 90.0
-    # Fallback: subscription_type when tier is missing or unrecognized
-    sub = (account.get("subscription_type") or "").lower()
-    if sub == "max":
-        return 90.0  # max without tier info — conservative
-    return 80.0  # pro, free, or unknown
-
-
-# ---------------------------------------------------------------------------
-# Window-reset awareness
-# ---------------------------------------------------------------------------
-
-RESET_SUPPRESS_MINUTES = 10
 SUPPRESS_OVERRIDE_SCORE = 100
-
-
-def _resets_within(resets_at: str | None, minutes: float) -> bool:
-    """Return True if the window resets within the given number of minutes.
-
-    Returns False for: None, past timestamps, parsing errors.
-    Assumes system clock is NTP-synchronized within ~1 minute.
-    """
-    if resets_at is None:
-        return False
-    try:
-        reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        if reset_dt <= now:
-            return False
-        remaining = (reset_dt - now).total_seconds() / 60.0
-        return remaining <= minutes
-    except (ValueError, TypeError):
-        return False
-
-
-# ---------------------------------------------------------------------------
-# compute_effective_working_hours
-# ---------------------------------------------------------------------------
-
-def compute_effective_working_hours(
-    start_dt: datetime,
-    end_dt: datetime,
-    active_start: str = "06:00",
-    active_end: str = "23:00",
-) -> float:
-    """Count working hours between two LOCAL datetimes, excluding overnight.
-
-    Only counts hours within [active_start, active_end) each day.
-    Both start_dt and end_dt must be in local time.
-    """
-    if end_dt <= start_dt:
-        return 0.0
-
-    from datetime import timedelta
-
-    s_h, s_m = map(int, active_start.split(":"))
-    e_h, e_m = map(int, active_end.split(":"))
-    active_hours_per_day = (e_h * 60 + e_m - s_h * 60 - s_m) / 60.0
-
-    if active_hours_per_day <= 0:
-        return 0.0
-
-    total = 0.0
-    current_day = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_day = end_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-
-    while current_day < end_day:
-        day_active_start = current_day.replace(hour=s_h, minute=s_m)
-        day_active_end = current_day.replace(hour=e_h, minute=e_m)
-
-        effective_start = max(start_dt, day_active_start)
-        effective_end = min(end_dt, day_active_end)
-
-        if effective_end > effective_start:
-            total += (effective_end - effective_start).total_seconds() / 3600.0
-
-        current_day += timedelta(days=1)
-
-    return total
 
 
 # ---------------------------------------------------------------------------
@@ -176,38 +38,6 @@ URGENCY_HOURS = 24.0  # accounts behind schedule with fewer effective hours rema
 MIN_PROACTIVE_MINUTES = 30  # don't proactively swap if fewer than this many
                              # working minutes remain today — not worth opening
                              # a 5h window for a few minutes of use
-
-
-def compute_burn_per_window(active_start: str = "06:00", active_end: str = "23:00") -> float:
-    """Max 7d capacity (%) that can be burned in one 5h window.
-
-    Depends on active hours: more working hours/day = more windows/week
-    = less burn per window.
-    """
-    s_h, s_m = map(int, active_start.split(":"))
-    e_h, e_m = map(int, active_end.split(":"))
-    working_hours_per_day = (e_h * 60 + e_m - s_h * 60 - s_m) / 60.0
-    if working_hours_per_day <= 0:
-        return 0.0
-    windows_per_week = 7.0 * working_hours_per_day / 5.0
-    return 100.0 / windows_per_week
-
-
-def has_viable_headroom(
-    account: dict,
-    active_start: str = "06:00",
-    active_end: str = "23:00",
-) -> bool:
-    """Check if an account has enough 7d headroom to survive one 5h window.
-
-    Returns False if unused 7d capacity < burn_per_window. Swapping to
-    an account that can't even fill one window is pointless and risks
-    immediate exhaustion.
-    """
-    usage_7d = account.get("cached_usage_7d") or 0
-    unused = 100.0 - usage_7d
-    burn = compute_burn_per_window(active_start, active_end)
-    return unused >= burn
 
 
 def compute_urgency_threshold(
@@ -235,78 +65,6 @@ def compute_urgency_threshold(
     if effective_windows_remaining < 5.0:
         return burn * 2.0
     return PROACTIVE_SWAP_THRESHOLD
-
-
-def compute_7d_deficit(
-    account: dict,
-    active_start: str = "06:00",
-    active_end: str = "23:00",
-) -> dict | None:
-    """Compute 7-day utilization deficit for an account.
-
-    Returns dict with deficit, effective_hours_remaining,
-    effective_windows_remaining, unused_7d. Or None if insufficient data.
-
-    Deficit > 0 means behind schedule (underutilized, wasting capacity).
-    """
-    resets_at_str = account.get("cached_7d_resets_at")
-    usage_7d = account.get("cached_usage_7d")
-
-    if resets_at_str is None or usage_7d is None:
-        return None
-
-    try:
-        resets_at_utc = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
-        if resets_at_utc.tzinfo is None:
-            resets_at_utc = resets_at_utc.replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return None
-
-    now_utc = datetime.now(timezone.utc)
-    if resets_at_utc <= now_utc:
-        return None  # window already expired
-
-    # Convert to local time for working-hours calculation.
-    # Uses rough offset: diff between datetime.now() (local naive) and
-    # datetime.now(timezone.utc) stripped of tzinfo. Avoids pytz/zoneinfo.
-    from datetime import timedelta as _td
-
-    now_local = datetime.now()
-    now_utc_naive = now_utc.replace(tzinfo=None)
-    utc_offset_seconds = (now_utc_naive - now_local).total_seconds()
-    # Convert resets_at to local by subtracting the UTC offset
-    resets_local = resets_at_utc.replace(tzinfo=None) - _td(
-        seconds=utc_offset_seconds
-    )
-    window_start_local = resets_local - _td(days=7)
-
-    # Elapsed and total working hours
-    elapsed_hours = compute_effective_working_hours(
-        window_start_local, now_local, active_start, active_end,
-    )
-    total_hours = compute_effective_working_hours(
-        window_start_local, resets_local, active_start, active_end,
-    )
-
-    if total_hours <= 0:
-        return None
-
-    elapsed_fraction = min(elapsed_hours / total_hours, 1.0)
-    expected_usage = elapsed_fraction * 100.0
-    deficit = expected_usage - usage_7d
-
-    # Remaining capacity
-    remaining_hours = compute_effective_working_hours(
-        now_local, resets_local, active_start, active_end,
-    )
-    remaining_windows = remaining_hours / 5.0
-
-    return {
-        "deficit": deficit,
-        "effective_hours_remaining": remaining_hours,
-        "effective_windows_remaining": remaining_windows,
-        "unused_7d": 100.0 - usage_7d,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -568,53 +326,3 @@ def pick_best_target(
             )
 
     return candidates[0]
-
-
-# ---------------------------------------------------------------------------
-# update_burn_rate
-# ---------------------------------------------------------------------------
-
-def update_burn_rate(
-    rates: dict[int, BurnRate],
-    account_id: int,
-    current_5h: float,
-    current_7d: float,
-) -> BurnRate:
-    """Update (or initialise) the burn-rate entry for *account_id*.
-
-    On first observation the rate is set to 0 — we do NOT compute a delta
-    from 0 -> current because that would cause a false spike after restart.
-    """
-    now = time.time()
-
-    prev = rates.get(account_id)
-    if prev is None:
-        # First observation — seed with current values, zero rate.
-        br = BurnRate(
-            rate_5h_per_min=0.0,
-            last_check_5h=current_5h,
-            rate_7d_per_min=0.0,
-            last_check_7d=current_7d,
-            last_check_time=now,
-        )
-        rates[account_id] = br
-        return br
-
-    elapsed_min = (now - prev.last_check_time) / 60.0
-    if elapsed_min <= 0:
-        # Clock skew guard — keep previous rates.
-        prev.last_check_5h = current_5h
-        prev.last_check_7d = current_7d
-        prev.last_check_time = now
-        return prev
-
-    rate_5h = max(0.0, (current_5h - prev.last_check_5h) / elapsed_min)
-    rate_7d = max(0.0, (current_7d - prev.last_check_7d) / elapsed_min)
-
-    prev.rate_5h_per_min = rate_5h
-    prev.last_check_5h = current_5h
-    prev.rate_7d_per_min = rate_7d
-    prev.last_check_7d = current_7d
-    prev.last_check_time = now
-
-    return prev
