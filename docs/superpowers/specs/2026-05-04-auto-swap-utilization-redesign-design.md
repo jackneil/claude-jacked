@@ -166,6 +166,60 @@ swap loops (e.g. flapping data, race with manual intervention). The
 new departure rule should make hitting cooldown rare; if it triggers,
 log it as a warning.
 
+### Anti-Jitter Hardening (added 2026-05-04 post-DCR)
+
+Cooldown alone is not sufficient when the *data* itself jitters. Anthropic's
+API can return `cached_7d_resets_at` values that drift by ±30s tick-to-tick
+(clock-skew, backend re-anchoring). At a tier boundary (24h or 48h), this
+drift flips an account between adjacent tiers each tick, which would cause
+the higher-tier-emerged rule to fire repeatedly. Three layers defend
+against this:
+
+1. **Tier hysteresis (`tier_for(account, prev_tier=...)`).** When transitioning
+   *toward* a more-urgent tier (T1→T0, T2→T1, etc.), require the account
+   to be at least `_TIER_HYSTERESIS_MIN = 5` minutes past the boundary
+   before flipping. Movement *away* from urgency (T0→T1, T1→T2) is not
+   damped. State held in module-level
+   `_last_observed_tiers: dict[int, int]` in `usage_monitor.py`, refreshed
+   each tick from observations and pruned of dead account ids.
+
+2. **Emergence persistence (`_apply_emergence_persistence`).** A
+   "higher tier emerged" reason from `should_swap_now` does not act
+   immediately. The candidate must remain the best target for
+   `_EMERGENCE_PERSISTENCE_TICKS = 2` consecutive ticks first.
+   State held in `_emerged_target_streak: dict[int, int]`. Other
+   reasons (`drained`, `5h critical`, `burn-rate`) fire immediately —
+   only the emergence path is gated, because only that path is
+   susceptible to single-tick boundary jitter.
+
+3. **Silent-stall watchdog.** A counter `_consecutive_no_best_ticks`
+   tracks ticks where the loop is stuck (three patterns: multi-account
+   stale, single-account forced-out, drained-no-candidate). At 10
+   consecutive stuck ticks, escalate to `logger.error` and broadcast an
+   `auto_swap_stall` WS event so the dashboard can surface the stuck
+   state. Threshold cooldown: `_STALL_WARNING_COOLDOWN_SECONDS = 1800`
+   (30 min) between repeat warnings.
+
+All three pieces of state are cleared by `reset_locks` on lifespan
+restart so a tray restart starts with a fresh observation.
+
+### Trigger Taxonomy
+
+The decision-log `trigger` field uses one of:
+- `tier_drained` — active hit T0/T1 drain-to target
+- `higher_tier_emerged` — candidate with strictly lower tier index
+  emerged AND emergence persistence streak met
+- `forced_critical` — active 5h ≥ critical (and 5h reset NOT imminent)
+- `burn_rate` — burn-rate projection crosses critical within window
+- `tier_aware` — catch-all (rare)
+- `tick` — `_decision_action == "stay"`
+
+Mapping is computed in `_trigger_for_reason(reason)` from the prefix of
+`should_swap_now`'s reason string (constants: `REASON_PREFIX_HIGHER_TIER`,
+`REASON_PREFIX_DRAINED`, `REASON_PREFIX_FIVE_H`, `REASON_PREFIX_BURN_RATE`).
+Reason-string prefixes are part of the public contract — do not change
+without updating both the helper and consumers.
+
 ## Functions to add / replace in `jacked/web/auto_swap.py`
 
 ### Replace

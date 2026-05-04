@@ -108,16 +108,35 @@ git commit -m "refactor(auto_swap): split into tiers/selection/burn/diagnostics 
 - Modify: `jacked/web/auto_swap.py` (add new function near top, after imports)
 - Modify: `tests/unit/test_auto_swap.py` (add new test class)
 
-- [ ] **Step 1.1: Write failing tests**
+- [ ] **Step 1.1: Update top-of-file imports + write failing tests**
 
-Append at the bottom of `tests/unit/test_auto_swap.py`:
+First, add `datetime`/`timedelta`/`timezone` to the existing top-of-file import block in `tests/unit/test_auto_swap.py` (currently `import time`/`import pytest`). Find:
+
+```python
+"""Tests for the auto-swap decision engine (pure functions, no I/O)."""
+
+import time
+
+import pytest
+```
+
+Replace with:
+
+```python
+"""Tests for the auto-swap decision engine (pure functions, no I/O)."""
+
+import time
+from datetime import datetime, timedelta, timezone
+
+import pytest
+```
+
+Then append the new tests at the bottom of the file (no mid-file imports — all imports stay at the top to satisfy ruff E402):
 
 ```python
 # ---------------------------------------------------------------------------
 # tier_for — deadline tier classification (T0-T3, 4=excluded)
 # ---------------------------------------------------------------------------
-
-from datetime import datetime, timedelta, timezone
 
 
 def _iso(dt: datetime) -> str:
@@ -222,7 +241,9 @@ Expected: 9 errors of `ImportError: cannot import name 'tier_for'`.
 
 - [ ] **Step 1.3: Implement `tier_for`**
 
-In `jacked/web/auto_swap.py`, just below the existing `tier_critical_threshold` function (around line 94), add:
+> **Submodule path:** `jacked/web/auto_swap/tiers.py` (after Task 0).
+
+In `jacked/web/auto_swap/tiers.py` (or `jacked/web/auto_swap.py` if Task 0 has not been performed), add:
 
 ```python
 # ---------------------------------------------------------------------------
@@ -395,7 +416,9 @@ Expected: 6 errors of `ImportError: cannot import name 'white_bar'`.
 
 - [ ] **Step 2.3: Implement `white_bar`**
 
-In `jacked/web/auto_swap.py`, immediately after `tier_for`:
+> **Submodule path:** `jacked/web/auto_swap/tiers.py`.
+
+In `jacked/web/auto_swap/tiers.py`, immediately after `tier_for`:
 
 ```python
 def white_bar(account: dict, now: datetime | None = None) -> float | None:
@@ -529,7 +552,9 @@ Expected: 7 errors `ImportError: cannot import name 'target_7d'`.
 
 - [ ] **Step 3.3: Implement `target_7d`**
 
-In `jacked/web/auto_swap.py`, immediately after `white_bar`:
+> **Submodule path:** `jacked/web/auto_swap/tiers.py`.
+
+In `jacked/web/auto_swap/tiers.py`, immediately after `white_bar`:
 
 ```python
 # Tier targets — see spec 2026-05-04-auto-swap-utilization-redesign-design.md
@@ -643,7 +668,9 @@ Expected: 7 errors of `ImportError: cannot import name 'deficit_vs_target'`.
 
 - [ ] **Step 4.3: Implement `deficit_vs_target`**
 
-In `jacked/web/auto_swap.py`, immediately after `target_7d`:
+> **Submodule path:** `jacked/web/auto_swap/tiers.py`.
+
+In `jacked/web/auto_swap/tiers.py`, immediately after `target_7d`:
 
 ```python
 def deficit_vs_target(account: dict, now: datetime | None = None) -> float | None:
@@ -823,7 +850,9 @@ Expected: 10 failures — selection currently uses `score_candidate` weighting, 
 
 - [ ] **Step 5.3: Add module-level `_has_5h_headroom` helper + sort key dataclass**
 
-In `jacked/web/auto_swap.py`, add (above `pick_best_target`):
+> **Submodule path:** `jacked/web/auto_swap/selection.py`.
+
+In `jacked/web/auto_swap/selection.py`, add (above `pick_best_target`):
 
 ```python
 from dataclasses import dataclass
@@ -864,7 +893,9 @@ class _SortKey:
 
 - [ ] **Step 5.4: Rewrite `pick_best_target`**
 
-In `jacked/web/auto_swap.py`, replace the existing `pick_best_target` function (currently around lines 508-570) with:
+> **Submodule path:** `jacked/web/auto_swap/selection.py`. After Task 0, the legacy `pick_best_target` lives there too — replace its body in place.
+
+In `jacked/web/auto_swap/selection.py`, replace the existing `pick_best_target` function with:
 
 ```python
 def pick_best_target(
@@ -1273,7 +1304,9 @@ Expected: 9 errors of `ImportError: cannot import name 'should_swap_now'`.
 
 - [ ] **Step 6.3: Implement `should_swap_now`**
 
-In `jacked/web/auto_swap.py`, immediately after `pick_best_target`:
+> **Submodule path:** `jacked/web/auto_swap/selection.py`.
+
+In `jacked/web/auto_swap/selection.py`, immediately after `pick_best_target`:
 
 ```python
 _TIER_NAMES = {
@@ -1512,11 +1545,15 @@ Note the locations. Expected callers in:
 
 - [ ] **Step 8.2: Delete `score_candidate` from `auto_swap.py`**
 
-In `jacked/web/auto_swap.py`, delete the entire `score_candidate` function (currently around lines 412-501) including its section header comment block.
+> **Submodule path:** `jacked/web/auto_swap/selection.py` (where Task 0 placed it).
+
+In `jacked/web/auto_swap/selection.py`, delete the entire `score_candidate` function including its section header comment block.
 
 - [ ] **Step 8.3: Delete `compute_urgency_threshold` from `auto_swap.py`**
 
-In `jacked/web/auto_swap.py`, delete the entire `compute_urgency_threshold` function (currently around lines 213-237). Also delete the now-orphaned constant `URGENCY_HOURS` (line ~174) — the new selection rule does not need it. Keep `PROACTIVE_SWAP_THRESHOLD` and `MIN_PROACTIVE_MINUTES` for now; they may be referenced by usage_monitor temporarily and we'll remove orphans in Task 9.
+> **Submodule path:** `jacked/web/auto_swap/selection.py` (or wherever Task 0 placed `compute_urgency_threshold` — likely co-located with the legacy `pick_best_target`).
+
+In the appropriate submodule, delete the entire `compute_urgency_threshold` function. Also delete the now-orphaned constant `URGENCY_HOURS` — the new selection rule does not need it. Keep `PROACTIVE_SWAP_THRESHOLD` and `MIN_PROACTIVE_MINUTES` for now; they may be referenced by usage_monitor temporarily and we'll remove orphans in Task 9.
 
 - [ ] **Step 8.4: Strip dead-code references from existing tests**
 
@@ -1809,10 +1846,13 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
             global _last_stall_warning
 
             if reason is None:
-                # Stay path (no departure trigger fired or emergence
-                # awaiting persistence). When a runner-up exists, surface
-                # its id so the audit trail / dashboard show "we considered
-                # account X but stayed because it's same/lower tier".
+                # Stay path. Three sub-cases — distinguish them in the
+                # audit log so operators can tell "no candidate had
+                # deficit", "best is same/lower tier", and "emergence
+                # suppressed pending confirmation". Mislabeling
+                # emergence-suppression as "same/lower tier" would make
+                # genuine T0 emergences look like the algorithm is
+                # ignoring them.
                 _decision_action = "stay"
                 if best is None:
                     _decision_reason = (
@@ -1821,14 +1861,28 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                     )
                 else:
                     _decision_target_id = best["id"]
+                    active_tier_now = tier_for(
+                        active_acct, now=now_utc,
+                    )
                     best_tier = tier_for(
                         best, now=now_utc,
                         prev_tier=_last_observed_tiers.get(best["id"]),
                     )
-                    _decision_reason = (
-                        f"stay: best is same/lower tier "
-                        f"(best id={best['id']} tier={best_tier})"
-                    )
+                    streak = _emerged_target_streak.get(best["id"], 0)
+                    if (best_tier < active_tier_now
+                            and best_tier != TIER_EXCLUDED
+                            and streak > 0):
+                        _decision_reason = (
+                            f"stay: emergence streak "
+                            f"{streak}/{_EMERGENCE_PERSISTENCE_TICKS}, "
+                            f"awaiting confirmation "
+                            f"(best id={best['id']} tier={best_tier})"
+                        )
+                    else:
+                        _decision_reason = (
+                            f"stay: best is same/lower tier "
+                            f"(best id={best['id']} tier={best_tier})"
+                        )
             elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
                 # Cooldown blocks a real departure trigger. Surface the
                 # would-have-been target so the audit trail is complete.
@@ -1938,7 +1992,11 @@ In `jacked/api/usage_monitor.py::active_account_poll_loop`, find the block start
                     1 for a in accounts if a["id"] != active_acct_id
                 ) > 0
                 # Did a real departure trigger fire even though we stayed?
-                forced_out_reason = reason is not None  # may be None if cooldown blocked
+                # `reason` reflects should_swap_now's verdict AS POSSIBLY
+                # MUTATED by emergence persistence (which may set it to
+                # None to defer a higher-tier swap until streak met).
+                # Cooldown does NOT mutate reason — only persistence does.
+                forced_out_reason = reason is not None
                 pattern_a = best is None and stale and has_other_accounts
                 pattern_b = (
                     not has_other_accounts
@@ -2433,7 +2491,9 @@ Expected: failures (missing keys).
 
 - [ ] **Step 11.3: Refactor `compute_7d_deficit`**
 
-In `jacked/web/auto_swap.py`, replace the body of `compute_7d_deficit` with:
+> **Submodule path:** `jacked/web/auto_swap/diagnostics.py`.
+
+In `jacked/web/auto_swap/diagnostics.py`, replace the body of `compute_7d_deficit` with:
 
 ```python
 def compute_7d_deficit(
@@ -2893,8 +2953,12 @@ Final pre-merge checklist:
 - [ ] `grep -rn "score_candidate\|compute_urgency_threshold\|PROACTIVE_SWAP_THRESHOLD\|MIN_PROACTIVE_MINUTES\|SUPPRESS_OVERRIDE_SCORE\|URGENCY_HOURS" jacked tests` returns nothing
 - [ ] `grep -rn "from jacked.web.auto_swap import.*should_swap\b" jacked tests` returns nothing (only `should_swap_now` remains)
 - [ ] `wc -l jacked/web/auto_swap/*.py` — every submodule under 500 lines (after Task 13)
-- [ ] `awk '/async def active_account_poll_loop/,/async def full_sweep_loop/' jacked/api/usage_monitor.py | wc -l` — under ~150 lines (after Task 14)
-- [ ] Manually: user starts `jacked webux` in a separate terminal (project memory: never auto-start), sets up two test accounts with staggered 7d windows, observes the decision log shows tier-aware reasons (`higher_tier_emerged`, `tier_drained`, etc.) and candidate columns render `tier`/`target_7d`/`deficit`.
+- [ ] `awk '/async def active_account_poll_loop/,/async def full_sweep_loop/' jacked/api/usage_monitor.py | wc -l` — under ~200 lines (after Task 14)
+- [ ] `grep -q "auto_swap_stall" jacked/data/web/js/websocket.js` — WS handler is wired
+- [ ] `grep -q "showStallBanner" jacked/data/web/js/components/auto-swap.js` — stall banner renderer present
+- [ ] `grep -q "auto-swap-stall-banner" jacked/data/web/index.html` — banner element exists
+- [ ] `grep -q "is_best" jacked/data/web/js/components/auto-swap.js` — new candidate field rendered
+- [ ] Manually: user starts `jacked webux` in a separate terminal (project memory: never auto-start), sets up two test accounts with staggered 7d windows, observes the decision log shows tier-aware reasons (`higher_tier_emerged`, `tier_drained`, etc.) and candidate columns render `tier`/`target_7d`/`deficit`. To exercise stall banner, set every candidate's `validation_status="invalid"` via the dashboard or DB and let the loop tick 10+ times — banner should appear.
 
 ## Out of Scope (separate work)
 
