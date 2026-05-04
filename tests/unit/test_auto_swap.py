@@ -1602,3 +1602,50 @@ class TestShouldSwapNow:
         r = should_swap_now(active=active, best=None, burn_rate=br,
                             check_interval_min=5, now=now)
         assert r.startswith(REASON_PREFIX_BURN_RATE), r
+
+
+class TestBurstPattern:
+    """Spec scenarios G28-G29 — real-life patterns."""
+
+    def test_burst_drains_t0_then_t1_then_t3(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 8, 17, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=2)))
+        a1 = _acct(1, usage_5h=10, usage_7d=30,
+                   resets_7d=_iso(now + timedelta(hours=11)))
+        a2 = _acct(2, usage_5h=10, usage_7d=30,
+                   resets_7d=_iso(now + timedelta(hours=35)))
+        # a3 is T3 (6d to expiry) — white_bar ~14.3% with 1 day elapsed.
+        # usage_7d=5 keeps it BELOW the T3 floor so it has a positive
+        # deficit and remains an eligible candidate per the strict
+        # selection rule (deficit > 0).
+        a3 = _acct(3, usage_5h=10, usage_7d=5,
+                   resets_7d=_iso(now + timedelta(days=6)))
+
+        target = pick_best_target([active, a1, a2, a3],
+                                  current_id=99, now=now)
+        assert target["id"] == 1
+
+        a1["cached_usage_7d"] = 100
+        target = pick_best_target([active, a1, a2, a3],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+        a2["cached_usage_7d"] = 90
+        target = pick_best_target([active, a1, a2, a3],
+                                  current_id=99, now=now)
+        assert target["id"] == 3
+
+    def test_higher_tier_emergence_mid_window(self):
+        from jacked.web.auto_swap import pick_best_target, should_swap_now
+        now = datetime(2026, 5, 8, 17, 0, tzinfo=timezone.utc)
+        active = _acct(99, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        a1 = _acct(1, usage_5h=10, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=20)))
+        target = pick_best_target([active, a1], current_id=99, now=now)
+        assert target["id"] == 1
+        reason = should_swap_now(active=active, best=target, now=now)
+        assert reason is not None
+        assert "tier" in reason.lower() or "T0" in reason
