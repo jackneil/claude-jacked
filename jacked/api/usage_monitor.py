@@ -120,6 +120,90 @@ def _setting_str(db, key: str, default: str) -> str:
     return val if val is not None else default
 
 
+def _apply_emergence_persistence(
+    reason: str | None,
+    best_id: int | None,
+    streak: dict[int, int],
+    persistence_ticks: int,
+) -> str | None:
+    """Gate "higher tier emerged" reasons behind a multi-tick streak.
+
+    Anti-jitter: a candidate must remain the best ``persistence_ticks``
+    times in a row before the swap actually fires. Mutates ``streak``
+    in place — increments the count for ``best_id``, prunes any other
+    keys, or clears entirely on non-emerge / None reason.
+
+    Returns the original ``reason`` when persistence is met (let the
+    swap fire), or None to suppress this tick.
+    """
+    from jacked.web.auto_swap import REASON_PREFIX_HIGHER_TIER
+    if reason is None or not reason.startswith(REASON_PREFIX_HIGHER_TIER):
+        streak.clear()
+        return reason
+    if best_id is None:
+        streak.clear()
+        return None
+    streak[best_id] = streak.get(best_id, 0) + 1
+    for stale_id in list(streak.keys()):
+        if stale_id != best_id:
+            del streak[stale_id]
+    if streak[best_id] < persistence_ticks:
+        return None
+    return reason
+
+
+def _evaluate_stall(
+    *,
+    decision_action: str,
+    best: dict | None,
+    usage_cached_at_age_seconds: int,
+    has_other_accounts: bool,
+    reason: str | None,
+    staleness_threshold: int,
+) -> bool:
+    """Return True if this tick qualifies as a stall pattern.
+
+    Three patterns trigger a bump (any one):
+      (a) Multi-account stale: stay+no-best+stale active+has others
+      (b) Single-account forced-out: only one account, departure reason fired
+      (c) Drained-no-candidate: any reason fired but no eligible target
+
+    Returns False otherwise (caller resets the counter).
+    """
+    if decision_action != "stay":
+        return False
+    stale = usage_cached_at_age_seconds > staleness_threshold
+    forced_out = reason is not None
+    pattern_a = best is None and stale and has_other_accounts
+    pattern_b = not has_other_accounts and forced_out
+    pattern_c = best is None and forced_out
+    return pattern_a or pattern_b or pattern_c
+
+
+def _trigger_for_reason(reason: str | None) -> str:
+    """Map a should_swap_now reason-string to a decision-log trigger
+    taxonomy value. Stable contract — see spec
+    docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md.
+    """
+    from jacked.web.auto_swap import (
+        REASON_PREFIX_HIGHER_TIER,
+        REASON_PREFIX_DRAINED,
+        REASON_PREFIX_FIVE_H,
+        REASON_PREFIX_BURN_RATE,
+    )
+    if reason is None:
+        return "tick"
+    if reason.startswith(REASON_PREFIX_HIGHER_TIER):
+        return "higher_tier_emerged"
+    if reason.startswith(REASON_PREFIX_DRAINED):
+        return "tier_drained"
+    if reason.startswith(REASON_PREFIX_FIVE_H):
+        return "forced_critical"
+    if reason.startswith(REASON_PREFIX_BURN_RATE):
+        return "burn_rate"
+    return "tier_aware"
+
+
 # -----------------------------------------------------------------------
 # Loop 1 — Active account poll (60s)
 # -----------------------------------------------------------------------
@@ -412,10 +496,6 @@ async def active_account_poll_loop(app):
                 target_7d,
                 deficit_vs_target,
                 format_account_label,
-                REASON_PREFIX_HIGHER_TIER,
-                REASON_PREFIX_DRAINED,
-                REASON_PREFIX_FIVE_H,
-                REASON_PREFIX_BURN_RATE,
                 TIER_EXCLUDED,
             )
 
@@ -579,24 +659,12 @@ async def active_account_poll_loop(app):
             )
 
             # ---- Anti-jitter persistence on higher-tier emergence ----
-            emergence_reason = (
-                reason is not None
-                and reason.startswith(REASON_PREFIX_HIGHER_TIER)
+            reason = _apply_emergence_persistence(
+                reason=reason,
+                best_id=best["id"] if best else None,
+                streak=_emerged_target_streak,
+                persistence_ticks=_EMERGENCE_PERSISTENCE_TICKS,
             )
-            if emergence_reason and best is not None:
-                streak = _emerged_target_streak.get(best["id"], 0) + 1
-                _emerged_target_streak[best["id"]] = streak
-                for stale_id in list(_emerged_target_streak.keys()):
-                    if stale_id != best["id"]:
-                        del _emerged_target_streak[stale_id]
-                if streak < _EMERGENCE_PERSISTENCE_TICKS:
-                    logger.debug(
-                        "Suppressing emergence swap to %d — streak %d/%d",
-                        best["id"], streak, _EMERGENCE_PERSISTENCE_TICKS,
-                    )
-                    reason = None
-            else:
-                _emerged_target_streak.clear()
 
             # Build candidate summaries for decision log
             _candidate_summaries = []
@@ -648,20 +716,6 @@ async def active_account_poll_loop(app):
                     _last_observed_tiers[cand["id"]] = cand_tier
 
             ws_registry = getattr(app.state, "ws_registry", None)
-
-            # Reason-prefix → trigger taxonomy mapping
-            def _trigger_for_reason(r: str | None) -> str:
-                if r is None:
-                    return "tick"
-                if r.startswith(REASON_PREFIX_HIGHER_TIER):
-                    return "higher_tier_emerged"
-                if r.startswith(REASON_PREFIX_DRAINED):
-                    return "tier_drained"
-                if r.startswith(REASON_PREFIX_FIVE_H):
-                    return "forced_critical"
-                if r.startswith(REASON_PREFIX_BURN_RATE):
-                    return "burn_rate"
-                return "tier_aware"
 
             global _last_exhaustion_warning, _consecutive_no_best_ticks
             global _last_stall_warning
@@ -762,47 +816,48 @@ async def active_account_poll_loop(app):
                     ws_registry=ws_registry,
                 )
                 _emerged_target_streak.clear()
-                _last_observed_tiers.pop(active_acct_id, None)
+                # active is never inserted into _last_observed_tiers
+                # (only non-active candidates are) so we only need to
+                # clear the new-target's entry post-swap.
                 _last_observed_tiers.pop(best["id"], None)
                 _decision_action = "swap"
                 _decision_target_id = best["id"]
                 _decision_reason = reason
 
             # ---- Silent-stall watchdog ------------------------------------
-            if _decision_action == "stay":
-                cached_at = active_acct.get("usage_cached_at") or 0
-                age_seconds = int(time.time()) - int(cached_at)
-                stale = age_seconds > _STALL_USAGE_STALENESS_SECONDS
-                has_other_accounts = sum(
-                    1 for a in accounts if a["id"] != active_acct_id
-                ) > 0
-                # `reason` reflects should_swap_now's verdict AS POSSIBLY
-                # MUTATED by emergence persistence (which may set it to
-                # None to defer a higher-tier swap until streak met).
-                # Cooldown does NOT mutate reason — only persistence does.
-                forced_out_reason = reason is not None
-                pattern_a = best is None and stale and has_other_accounts
-                pattern_b = (
-                    not has_other_accounts
-                    and forced_out_reason
-                )
-                pattern_c = best is None and forced_out_reason
-                if pattern_a or pattern_b or pattern_c:
-                    _consecutive_no_best_ticks += 1
-                else:
-                    _consecutive_no_best_ticks = 0
+            # `reason` reflects should_swap_now's verdict AS POSSIBLY
+            # MUTATED by emergence persistence (which may set it to
+            # None to defer a higher-tier swap until streak met).
+            # Cooldown does NOT mutate reason — only persistence does.
+            cached_at = active_acct.get("usage_cached_at") or 0
+            age_seconds = int(time.time()) - int(cached_at)
+            has_other_accounts = sum(
+                1 for a in accounts if a["id"] != active_acct_id
+            ) > 0
+            if _evaluate_stall(
+                decision_action=_decision_action, best=best,
+                usage_cached_at_age_seconds=age_seconds,
+                has_other_accounts=has_other_accounts,
+                reason=reason,
+                staleness_threshold=_STALL_USAGE_STALENESS_SECONDS,
+            ):
+                _consecutive_no_best_ticks += 1
             else:
                 _consecutive_no_best_ticks = 0
 
             if _consecutive_no_best_ticks >= _STALL_TICK_THRESHOLD:
                 now_ts = time.time()
                 if now_ts - _last_stall_warning > _STALL_WARNING_COOLDOWN_SECONDS:
+                    last_fetch_age = (
+                        int(time.time())
+                        - int(active_acct.get("usage_cached_at") or 0)
+                    )
                     logger.error(
                         "Auto-swap stalled: %d consecutive ticks with no "
                         "candidate and stale active-account data "
                         "(active=%d, last_fetch=%ss ago)",
                         _consecutive_no_best_ticks, active_acct_id,
-                        int(time.time()) - int(active_acct.get("usage_cached_at") or 0),
+                        last_fetch_age,
                     )
                     _last_stall_warning = now_ts
                     if ws_registry:
@@ -811,9 +866,7 @@ async def active_account_poll_loop(app):
                             {
                                 "active_account_id": active_acct_id,
                                 "consecutive_ticks": _consecutive_no_best_ticks,
-                                "last_fetch_age_seconds": (
-                                    int(time.time()) - int(active_acct.get("usage_cached_at") or 0)
-                                ),
+                                "last_fetch_age_seconds": last_fetch_age,
                             },
                         )
 

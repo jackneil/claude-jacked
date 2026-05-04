@@ -1077,3 +1077,130 @@ class TestBurnRateDecay:
                 )
 
         asyncio.run(_run())
+
+
+class TestEmergencePersistence:
+    """Spec scenario F26 + pre-mortem F2: anti-flap on tier jitter.
+
+    Drives the EXTRACTED helper `_apply_emergence_persistence` —
+    these tests exercise real production code, NOT a hand-rolled
+    local copy of the logic.
+    """
+
+    def test_first_emerge_suppressed(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak: dict[int, int] = {}
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2",
+            best_id=7,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert result is None
+        assert streak == {7: 1}
+
+    def test_second_emerge_fires(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {7: 1}
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2",
+            best_id=7,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert result is not None
+        assert result.startswith("higher tier emerged")
+        assert streak == {7: 2}
+
+    def test_target_change_resets_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {1: 5}
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2",
+            best_id=2,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert 1 not in streak
+        assert streak[2] == 1
+        assert result is None
+
+    def test_non_emerge_reason_clears_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {7: 1}
+        result = _apply_emergence_persistence(
+            reason="drained: 7d usage 100% >= 100%",
+            best_id=7,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert result.startswith("drained")
+        assert streak == {}
+
+    def test_none_reason_clears_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {7: 1}
+        result = _apply_emergence_persistence(
+            reason=None, best_id=7, streak=streak, persistence_ticks=2,
+        )
+        assert result is None
+        assert streak == {}
+
+
+class TestSilentStallWatchdog:
+    """Pre-mortem F3: detect "loop ticking but never produces a target".
+
+    Drives the EXTRACTED helper `_evaluate_stall`.
+    """
+
+    def test_pattern_a_multi_account_stale(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=2000,
+            has_other_accounts=True, reason=None,
+            staleness_threshold=1800,
+        )
+        assert bumped is True
+
+    def test_pattern_b_single_account_forced_out(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=False,
+            reason="drained: 7d at 100%",
+            staleness_threshold=1800,
+        )
+        assert bumped is True
+
+    def test_pattern_c_drained_no_candidate(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True,
+            reason="drained: 7d at 100%",
+            staleness_threshold=1800,
+        )
+        assert bumped is True
+
+    def test_no_increment_on_swap(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="swap", best={"id": 1},
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True, reason="anything",
+            staleness_threshold=1800,
+        )
+        assert bumped is False
+
+    def test_no_increment_on_healthy_stay(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay", best=None,
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True, reason=None,
+            staleness_threshold=1800,
+        )
+        assert bumped is False
