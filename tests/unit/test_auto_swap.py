@@ -1,6 +1,7 @@
 """Tests for the auto-swap decision engine (pure functions, no I/O)."""
 
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -1015,3 +1016,94 @@ class TestFormatAccountLabel:
         """Empty string display_name is treated as no label."""
         acct = {"email": "jack@test.com", "organization_name": "Acme Corp", "display_name": ""}
         assert format_account_label(acct) == "jack@test.com (Acme Corp)"
+
+
+def _iso(dt: datetime) -> str:
+    """Format datetime as ISO with Z suffix (matches Anthropic API)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# tier_for — deadline tier classification (T0-T3, 4=excluded)
+# ---------------------------------------------------------------------------
+
+
+class TestTierFor:
+    def test_t0_under_24h(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=12)))
+        assert tier_for(acct, now=now) == 0
+
+    def test_t1_24_to_48h(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=36)))
+        assert tier_for(acct, now=now) == 1
+
+    def test_t2_48h_to_4d(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=3)))
+        assert tier_for(acct, now=now) == 2
+
+    def test_t3_4d_to_7d(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=6)))
+        assert tier_for(acct, now=now) == 3
+
+    def test_excluded_when_expired(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now - timedelta(hours=1)))
+        assert tier_for(acct, now=now) == 4
+
+    def test_excluded_when_resets_at_missing(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=None)
+        assert tier_for(acct, now=now) == 4
+
+    def test_boundary_exactly_24h(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=24)))
+        assert tier_for(acct, now=now) == 1
+
+    def test_boundary_exactly_48h(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=48)))
+        assert tier_for(acct, now=now) == 2
+
+    def test_boundary_exactly_4d(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=4)))
+        assert tier_for(acct, now=now) == 3
+
+    def test_hysteresis_dampens_t1_to_t0_jitter(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=59)))
+        assert tier_for(acct, now=now, prev_tier=1) == 1
+
+    def test_hysteresis_allows_clean_t1_to_t0_after_margin(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=54)))
+        assert tier_for(acct, now=now, prev_tier=1) == 0
+
+    def test_hysteresis_does_not_block_movement_toward_less_urgent(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=24, seconds=10)))
+        assert tier_for(acct, now=now, prev_tier=0) == 1
+
+    def test_hysteresis_no_prev_means_no_dampening(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=59)))
+        assert tier_for(acct, now=now) == 0
+        assert tier_for(acct, now=now, prev_tier=None) == 0

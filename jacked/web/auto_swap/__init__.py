@@ -27,6 +27,14 @@ from .selection import (
     score_candidate,
     should_swap,
 )
+from .tiers import (
+    TIER_EXCLUDED,
+    TIER_T0,
+    TIER_T1,
+    TIER_T2,
+    TIER_T3,
+    tier_for,
+)
 
 __all__ = [
     "BurnRate", "RESET_SUPPRESS_MINUTES", "_resets_within",
@@ -38,4 +46,6 @@ __all__ = [
     "compute_urgency_threshold",
     "SUPPRESS_OVERRIDE_SCORE", "PROACTIVE_SWAP_THRESHOLD",
     "URGENCY_HOURS", "MIN_PROACTIVE_MINUTES",
+    "TIER_T0", "TIER_T1", "TIER_T2", "TIER_T3", "TIER_EXCLUDED",
+    "tier_for",
 ]
