@@ -227,6 +227,61 @@ class ServiceRunner:
                 time.sleep(0.3)
         return False
 
+    def _wait_for_port_free(self, timeout: float = 10.0) -> bool:
+        """Poll until the port is available for binding (old server fully released).
+
+        After uvicorn's thread joins, the OS socket may still be in TIME_WAIT
+        for a few seconds. Binding too early raises OSError: Address already
+        in use. We bind+close a probe socket with SO_REUSEADDR to prove the
+        port is genuinely free.
+        """
+        import socket
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, self.port))
+                sock.close()
+                return True
+            except OSError:
+                sock.close()
+                time.sleep(0.2)
+        return False
+
+    def _shutdown_uvicorn(self) -> None:
+        """Stop uvicorn with graceful-then-force fallback.
+
+        uvicorn's ``should_exit`` only triggers shutdown between requests
+        and waits for active connections (notably WebSockets) to close on
+        their own. Dashboard tabs hold WS subscribers open indefinitely,
+        which means a graceful shutdown can hang past any reasonable
+        timeout. After 3s of grace we set ``force_exit = True`` so uvicorn
+        cancels the lifespan + drops connections; after another 5s we
+        give up on the join (the thread is daemon and the OS will reap
+        it when the new server binds).
+        """
+        if self._uvicorn_server is None:
+            return
+        self._uvicorn_server.should_exit = True
+        if self._uvicorn_thread is None:
+            return
+        self._uvicorn_thread.join(timeout=3)
+        if self._uvicorn_thread.is_alive():
+            logger.info(
+                "Uvicorn graceful shutdown timed out — forcing exit "
+                "(active WebSockets or in-flight requests)"
+            )
+            self._uvicorn_server.force_exit = True
+            self._uvicorn_thread.join(timeout=5)
+            if self._uvicorn_thread.is_alive():
+                logger.warning(
+                    "Uvicorn thread still alive after force_exit — "
+                    "proceeding anyway; OS will reap the daemon thread"
+                )
+
     def _on_open_dashboard(self):
         webbrowser.open(f"http://{self.host}:{self.port}")
 
@@ -236,22 +291,45 @@ class ServiceRunner:
         try:
             if self._icon:
                 self._icon.icon = create_icon_image("starting")
-            if self._uvicorn_server is not None:
-                self._uvicorn_server.should_exit = True
-            if self._uvicorn_thread:
-                self._uvicorn_thread.join(timeout=5)
-            try:
-                self._uvicorn_thread = self._start_uvicorn()
-                if self._wait_for_ready():
-                    if self._icon:
-                        self._icon.icon = create_icon_image("running")
-                else:
-                    if self._icon:
-                        self._icon.icon = create_icon_image("stopped")
-            except Exception:
-                logger.exception("Restart failed")
+
+            self._shutdown_uvicorn()
+
+            if not self._wait_for_port_free(timeout=10):
+                logger.error(
+                    "Port %d did not free up after uvicorn shutdown — "
+                    "another process may be using it. Aborting restart.",
+                    self.port,
+                )
                 if self._icon:
                     self._icon.icon = create_icon_image("stopped")
+                return
+
+            # Retry the bind+ready cycle in case of transient failures
+            # (e.g. lifespan startup hiccup).
+            last_err: Exception | None = None
+            for attempt in range(3):
+                try:
+                    self._uvicorn_thread = self._start_uvicorn()
+                    if self._wait_for_ready(timeout=15):
+                        if self._icon:
+                            self._icon.icon = create_icon_image("running")
+                        return
+                    logger.warning(
+                        "Restart attempt %d: server did not become ready "
+                        "within timeout", attempt + 1,
+                    )
+                    self._shutdown_uvicorn()
+                    self._wait_for_port_free(timeout=5)
+                except Exception as exc:
+                    last_err = exc
+                    logger.exception(
+                        "Restart attempt %d raised; will retry", attempt + 1,
+                    )
+                    self._shutdown_uvicorn()
+                    self._wait_for_port_free(timeout=5)
+            logger.error("Restart failed after 3 attempts: %s", last_err)
+            if self._icon:
+                self._icon.icon = create_icon_image("stopped")
         finally:
             self._lifecycle_lock.release()
 

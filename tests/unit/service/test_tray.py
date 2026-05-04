@@ -106,10 +106,73 @@ class TestServiceRunner:
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
         runner._icon = MagicMock()
-        with patch.object(runner, "_start_uvicorn", side_effect=OSError("port in use")):
+        with (
+            patch.object(runner, "_wait_for_port_free", return_value=True),
+            patch.object(runner, "_start_uvicorn", side_effect=OSError("port in use")),
+            patch.object(runner, "_shutdown_uvicorn"),
+        ):
             runner._on_restart()  # should not raise
         # Icon should show stopped state on failure
         assert runner._icon.icon is not None
+
+    def test_on_restart_aborts_when_port_does_not_free(self):
+        """If the old uvicorn won't release the port, abort cleanly
+        rather than hanging or repeatedly failing to bind."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        runner._icon = MagicMock()
+        with (
+            patch.object(runner, "_shutdown_uvicorn"),
+            patch.object(runner, "_wait_for_port_free", return_value=False),
+            patch.object(runner, "_start_uvicorn") as start,
+        ):
+            runner._on_restart()
+        start.assert_not_called()  # never even tried to bind
+        assert runner._icon.icon is not None  # stopped icon shown
+
+    def test_on_restart_retries_on_transient_failure(self):
+        """A first-attempt OSError should not give up — try again up to
+        3 times before declaring failure."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        runner._icon = MagicMock()
+        # First two attempts raise; third attempt succeeds.
+        side_effects = [OSError("address in use"), OSError("address in use"),
+                        MagicMock()]
+        with (
+            patch.object(runner, "_shutdown_uvicorn"),
+            patch.object(runner, "_wait_for_port_free", return_value=True),
+            patch.object(runner, "_start_uvicorn", side_effect=side_effects) as start,
+            patch.object(runner, "_wait_for_ready", return_value=True),
+        ):
+            runner._on_restart()
+        assert start.call_count == 3
+
+    def test_shutdown_uvicorn_force_exits_on_graceful_timeout(self):
+        """When `should_exit` doesn't release the thread within the
+        graceful window, set `force_exit` to drop active connections.
+        This is the core fix for "WebSockets keep restart hanging"."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        # Mock server + thread that simulates graceful shutdown hanging
+        # (thread stays alive after first join), then exits after force.
+        mock_server = MagicMock()
+        mock_thread = MagicMock()
+        # Simulate: first join returns with thread still alive,
+        # second join (after force_exit) returns with thread dead.
+        mock_thread.is_alive.side_effect = [True, False]
+        runner._uvicorn_server = mock_server
+        runner._uvicorn_thread = mock_thread
+
+        runner._shutdown_uvicorn()
+
+        # Verified the canonical shutdown sequence:
+        assert mock_server.should_exit is True  # graceful first
+        assert mock_server.force_exit is True   # then force
+        assert mock_thread.join.call_count == 2  # tried both
 
 
 class TestCheckDeps:
