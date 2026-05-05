@@ -343,6 +343,14 @@ const TIER_LABELS = {
     4: 'T?',
 };
 
+const TIER_TOOLTIPS = {
+    0: 'Tier 0: 7d window expires in under 24 hours. Drain to 100% — capacity not used will be lost.',
+    1: 'Tier 1: 7d window expires in 24-48 hours. Drive to 90% (10% buffer for last-day work).',
+    2: 'Tier 2: 7d window expires in 2-4 days. Stay slightly ahead of the white bar (week-elapsed line).',
+    3: 'Tier 3: 7d window expires in 4-7 days. Don\'t exceed the white bar — save capacity for later.',
+    4: 'No 7d data, or window already expired — excluded from selection.',
+};
+
 function buildDecisionDetailHtml(d, detailId) {
     const parts = [];
 
@@ -389,7 +397,9 @@ function buildDecisionDetailHtml(d, detailId) {
                 '<td class="pr-2">' + escapeHtml(c.label || c.email || '?') + '</td>' +
                 '<td class="pr-2 text-right">' + escapeHtml(fivehStr) + '</td>' +
                 '<td class="pr-2 text-right">' + escapeHtml(sevendStr) + '</td>' +
-                '<td class="pr-2">' + escapeHtml(tierLabel) + '</td>' +
+                '<td class="pr-2"><span title="' +
+                escapeHtml(TIER_TOOLTIPS[c.tier] || '') +
+                '" class="cursor-help">' + escapeHtml(tierLabel) + '</span></td>' +
                 '<td class="pr-2 text-right">' + escapeHtml(targetStr) + '</td>' +
                 '<td class="pr-2 text-right">' + escapeHtml(deficitStr) + '</td>' +
                 '<td class="pr-2 text-center text-teal-300">' + bestStr + '</td>' +
@@ -490,12 +500,29 @@ function showStallBanner(data) {
     banner.classList.remove('hidden');
     const textEl = banner.querySelector('.stall-text');
     if (textEl) {
-        textEl.textContent = (
-            `Auto-swap stalled: ${data.consecutive_ticks} consecutive ticks ` +
-            `with no eligible candidate. Active account data is ${ageMin} ` +
-            `min old. Try refreshing usage manually.`
-        );
+        // Pattern (d): a candidate exists every tick but the same-tier
+        // rule keeps the loop on stay. Surface that distinct case.
+        if (data.best_account_id != null && data.best_deficit != null) {
+            const def = Number(data.best_deficit).toFixed(1);
+            textEl.textContent = (
+                `Auto-swap holding on same-tier candidate: account ` +
+                `${data.best_account_id} is ${def}% behind tier target ` +
+                `but rules say stay (${data.consecutive_ticks} ticks).`
+            );
+        } else {
+            textEl.textContent = (
+                `Auto-swap stalled: ${data.consecutive_ticks} consecutive ` +
+                `ticks with no eligible candidate. Active account data is ` +
+                `${ageMin} min old. Try refreshing usage manually.`
+            );
+        }
     }
+}
+
+function hideStallBanner(_data) {
+    const banner = document.getElementById('auto-swap-stall-banner');
+    if (!banner) return;
+    banner.classList.add('hidden');
 }
 
 // ---------------------------------------------------------------------------

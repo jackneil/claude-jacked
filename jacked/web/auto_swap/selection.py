@@ -13,15 +13,16 @@ from jacked.web.auto_swap.burn import (
     has_viable_headroom,
 )
 from jacked.web.auto_swap.tiers import (
+    T1_TARGET,
     TIER_EXCLUDED,
     TIER_T0,
     TIER_T1,
     TIER_T2,
     TIER_T3,
+    _resolve_now,
     deficit_vs_target,
     target_7d,
     tier_for,
-    _resolve_now,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,12 +206,16 @@ def should_swap_now(
     critical_5h: float = 90,
     warning_5h: float = 80,
     now: datetime | None = None,
+    prev_tiers: dict[int, int] | None = None,
 ) -> str | None:
     """Return a reason string if the algorithm should swap off ``active``,
     or None to stay.
 
-    Departure rules (any one triggers swap; see spec
-    docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md):
+    Departure rules — DO NOT REORDER. Rule 1 is the ONLY rule that
+    overrides 5h-reset suppression and the ONLY rule gated by
+    emergence persistence in the caller. Reordering breaks both
+    invariants. See spec
+    docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md.
 
     1. Higher-tier candidate emerged: ``best`` exists with strictly
        lower tier_index than ``active``. (T0 emerged while on T2/T3
@@ -233,21 +238,37 @@ def should_swap_now(
     constants — callers (usage_monitor) parse these prefixes to derive
     the decision-log ``trigger`` taxonomy.
 
+    ``prev_tiers``: optional {account_id: last_observed_tier} map. When
+    provided, BOTH active and best run their tier classification with
+    hysteresis (5-min margin past the boundary before transitioning to
+    a more-urgent tier). Without this, Anthropic API timestamp jitter
+    at the 24h/48h tier boundaries flickers the active account between
+    tiers each tick — when active flickers from T2 down to T1, a T1
+    candidate is no longer "higher tier", `should_swap_now` returns
+    None, and emergence-persistence in the caller clears the streak.
+    Net effect: a guaranteed swap takes 6+ minutes instead of 2 ticks.
+    See `tests/unit/test_auto_swap.py::TestActiveTierHysteresis`.
+
     NOTE: ``check_interval_min`` is the poll interval in MINUTES, not
     seconds. Caller computes from the DB setting `usage_check_interval`
     (which is in seconds) by dividing by 60.
     """
     now = _resolve_now(now)
+    prev_tiers = prev_tiers or {}
     usage_5h = active.get("cached_usage_5h") or 0
     usage_7d = active.get("cached_usage_7d") or 0
-    active_tier = tier_for(active, now=now)
+    active_tier = tier_for(
+        active, now=now, prev_tier=prev_tiers.get(active.get("id")),
+    )
     suppress_5h = _resets_within_at(
         active.get("cached_5h_resets_at"), RESET_SUPPRESS_MINUTES, now,
     )
 
     # 1. Higher-tier candidate (overrides 5h reset suppression)
     if best is not None:
-        best_tier = tier_for(best, now=now)
+        best_tier = tier_for(
+            best, now=now, prev_tier=prev_tiers.get(best.get("id")),
+        )
         active_rank = active_tier if active_tier != TIER_EXCLUDED else TIER_T3 + 1
         if best_tier < active_rank and best_tier != TIER_EXCLUDED:
             return (
@@ -260,9 +281,12 @@ def should_swap_now(
             return None
 
     # 2. Active drained vs tier target — ONLY for T0/T1 (drain-to goals).
+    # Use the hysteresis-aware ``active_tier`` directly (not target_7d's
+    # internal tier_for call) so the drained gate stays consistent with
+    # rule 1's tier comparison. T0 target = 100, T1 target = T1_TARGET.
     if active_tier in (TIER_T0, TIER_T1):
-        target = target_7d(active, now=now)
-        if target is not None and usage_7d >= target:
+        target = 100.0 if active_tier == TIER_T0 else T1_TARGET
+        if usage_7d >= target:
             return (
                 f"{REASON_PREFIX_DRAINED} 7d usage {usage_7d:.1f}% >= "
                 f"tier target {target:.1f}%"

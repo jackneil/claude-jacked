@@ -28,6 +28,8 @@ from .selection import (
     should_swap_now,
 )
 from .tiers import (
+    T1_TARGET,
+    T2_LEAD,
     TIER_EXCLUDED,
     TIER_T0,
     TIER_T1,
@@ -51,5 +53,6 @@ __all__ = [
     "REASON_PREFIX_FIVE_H", "REASON_PREFIX_BURN_RATE",
     "REASON_PREFIX_NO_DATA",
     "TIER_T0", "TIER_T1", "TIER_T2", "TIER_T3", "TIER_EXCLUDED",
+    "T1_TARGET", "T2_LEAD",
     "tier_for", "white_bar", "target_7d", "deficit_vs_target",
 ]

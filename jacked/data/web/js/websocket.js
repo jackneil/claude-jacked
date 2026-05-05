@@ -499,6 +499,22 @@ jackedWS.on('auto_swap_stall', (msg) => {
     }
 });
 
+jackedWS.on('auto_swap_stall_clear', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof hideStallBanner === 'function') {
+        hideStallBanner(data);
+    }
+});
+
+jackedWS.on('auto_swap_failed', (msg) => {
+    const data = msg.payload || msg;
+    console.warn('Auto-swap commit failed:', data);
+    if (typeof toast === 'function') {
+        toast(`Auto-swap to account ${data.to_account_id} failed: ${data.failure || 'unknown'}`,
+              'error');
+    }
+});
+
 jackedWS.on('usage_poll_updated', (msg) => {
     var d = msg.payload || msg;
     if (!d.account_id || !d.account_data) return;

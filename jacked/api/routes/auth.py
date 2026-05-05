@@ -1011,6 +1011,19 @@ async def use_account(account_id: int, request: Request):
         display_name=account.get("display_name"),
     )
 
+    # Sync DB active_account_id setting — keeps the launch-time Layer-2
+    # fallback (jacked/launch.py) consistent with the credential file.
+    # Without this, every manual switch leaves the DB stale, so a
+    # cred-file recovery picks the wrong account.
+    try:
+        db.set_setting("active_account_id", account_id)
+    except Exception:
+        logger.exception(
+            "Failed to sync active_account_id setting after manual "
+            "switch (account=%d) — credential file is authoritative",
+            account_id,
+        )
+
     try:
         from jacked.web.auto_swap import format_account_label
         prev_acct = db.get_account(outgoing_id) if outgoing_id else None

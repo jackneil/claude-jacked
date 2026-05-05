@@ -1234,6 +1234,209 @@ class TestSilentStallWatchdog:
         )
         assert bumped is False
 
+    def test_pattern_d_same_tier_stay_with_meaningful_deficit(self):
+        """User-observed bug: same-tier candidate sits behind tier target
+        for hours, watchdog never trips. Pattern (d) catches it."""
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay",
+            best={"id": 1},
+            usage_cached_at_age_seconds=10,  # fresh, not stale
+            has_other_accounts=True,
+            reason=None,  # same-tier-never-overrides → no reason
+            staleness_threshold=1800,
+            best_deficit=22.5,  # well above default 15% threshold
+        )
+        assert bumped is True
+
+    def test_pattern_d_below_threshold_does_not_fire(self):
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay",
+            best={"id": 1},
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True,
+            reason=None,
+            staleness_threshold=1800,
+            best_deficit=5.0,  # within tolerance
+        )
+        assert bumped is False
+
+    def test_pattern_d_no_deficit_provided_does_not_fire(self):
+        # Backwards compat: callers that don't provide best_deficit
+        # don't accidentally trip the new pattern.
+        from jacked.api.usage_monitor import _evaluate_stall
+        bumped = _evaluate_stall(
+            decision_action="stay",
+            best={"id": 1},
+            usage_cached_at_age_seconds=10,
+            has_other_accounts=True,
+            reason=None,
+            staleness_threshold=1800,
+        )
+        assert bumped is False
+
+
+class TestEmergencePersistenceTransientPreservation:
+    """User-observed bug: a single tick where best=None (transient
+    candidate-fetch hiccup) used to clear the streak, restarting the
+    2-minute clock. New behavior: preserve streak when both reason
+    and best_id are None — only explicit non-emerge reasons clear it."""
+
+    def test_streak_preserved_on_transient_no_best(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {7: 1}
+        result = _apply_emergence_persistence(
+            reason=None, best_id=None,
+            streak=streak, persistence_ticks=2,
+        )
+        assert result is None
+        assert streak == {7: 1}  # PRESERVED across the transient tick
+
+    def test_streak_resumes_after_transient(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        # Tick 1: emergence, streak[7] = 1.
+        streak: dict[int, int] = {}
+        _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2", best_id=7,
+            streak=streak, persistence_ticks=2,
+        )
+        assert streak == {7: 1}
+        # Tick 2: transient (best=None, reason=None). Streak preserved.
+        _apply_emergence_persistence(
+            reason=None, best_id=None,
+            streak=streak, persistence_ticks=2,
+        )
+        assert streak == {7: 1}
+        # Tick 3: emergence resumes. Streak fires.
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2", best_id=7,
+            streak=streak, persistence_ticks=2,
+        )
+        assert result is not None
+        assert result.startswith("higher tier emerged")
+        assert streak == {7: 2}
+
+
+class TestExecuteSwapAtomicity:
+    """`_execute_swap` must:
+    - Sync DB active_account_id setting after credential write succeeds
+    - Skip the WS `auto_swap_triggered` broadcast on credential failure
+    - Emit `auto_swap_failed` instead so dashboard isn't misled
+    - Return False on credential failure so caller can choose retry vs swap
+    """
+
+    def test_swap_syncs_db_setting_on_success(self, monkeypatch):
+        import asyncio
+        from jacked.api import usage_monitor as um
+
+        captured = {}
+
+        class FakeDB:
+            def record_swap(self, **kwargs):
+                captured["record_swap"] = kwargs
+
+            def set_setting(self, key, value):
+                captured.setdefault("settings", {})[key] = value
+
+        # Stub the credential helpers + lock
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_lock():
+            yield True
+
+        def fake_sync(account_id, target, email=None):
+            captured["sync_called_with"] = account_id
+
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.acquire_claude_lock", fake_lock,
+        )
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.sync_credential_to_all_stores",
+            fake_sync,
+        )
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.invalidate_live_cred_cache",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.reconcile_credentials_from_live_store",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+
+        async def _run():
+            return await um._execute_swap(
+                FakeDB(),
+                active_acct_id=99,
+                active_acct={"id": 99, "email": "old@test"},
+                target={"id": 7, "email": "new@test"},
+                reason="higher tier emerged: T0 vs T2",
+                trigger="higher_tier_emerged",
+                usage_5h=20, usage_7d=50,
+                active_start="06:00", active_end="23:00",
+                ws_registry=None,
+            )
+
+        ok = asyncio.run(_run())
+        assert ok is True
+        assert captured["settings"]["active_account_id"] == 7
+
+    def test_swap_skips_db_setting_on_lock_fail(self, monkeypatch):
+        import asyncio
+        from jacked.api import usage_monitor as um
+
+        captured = {}
+
+        class FakeDB:
+            def record_swap(self, **kwargs):
+                captured["record_swap"] = kwargs
+
+            def set_setting(self, key, value):
+                captured.setdefault("settings", {})[key] = value
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_locked_out():
+            yield False  # lock not acquired
+
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.acquire_claude_lock", fake_locked_out,
+        )
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.sync_credential_to_all_stores",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.invalidate_live_cred_cache",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "jacked.api.credential_helpers.reconcile_credentials_from_live_store",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+
+        async def _run():
+            return await um._execute_swap(
+                FakeDB(),
+                active_acct_id=99,
+                active_acct={"id": 99, "email": "old@test"},
+                target={"id": 7, "email": "new@test"},
+                reason="higher tier emerged",
+                trigger="higher_tier_emerged",
+                usage_5h=20, usage_7d=50,
+                active_start="06:00", active_end="23:00",
+                ws_registry=None,
+            )
+
+        ok = asyncio.run(_run())
+        assert ok is False
+        # DB setting NOT updated when credentials didn't commit.
+        assert "settings" not in captured
+
 
 # ---------------------------------------------------------------------------
 # Tier-aware end-to-end + audit / taxonomy / guard tests (Task 10)

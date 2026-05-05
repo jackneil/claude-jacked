@@ -926,6 +926,75 @@ class TestShouldSwapNow:
         assert r.startswith(REASON_PREFIX_BURN_RATE), r
 
 
+class TestActiveTierHysteresis:
+    """Regression tests for the user-observed 6-min swap delay.
+
+    Without ``prev_tiers``, jitter at the 24h/48h boundary flickered the
+    active account's tier each tick, breaking the higher-tier-emerged
+    rule and clearing the emergence streak. With prev_tiers, the active
+    account is held at its hysteresis-aware tier so the swap fires.
+    """
+
+    def test_active_t2_jitters_to_t1_without_prev_tiers_breaks_rule_1(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        # Active sits 1 minute past the 48h boundary (raw = T1).
+        active = _acct(99, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=47, minutes=59)))
+        best = _acct(1, usage_5h=10, usage_7d=30,
+                     resets_7d=_iso(now + timedelta(hours=36)))  # also T1
+        # No prev_tiers: active classified as T1, best classified as T1.
+        # best_tier (1) is NOT < active_rank (1) → no rule 1 fire.
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is None  # the buggy outcome we're guarding against
+
+    def test_active_t2_jitters_to_t1_WITH_prev_tiers_holds_t2(self):
+        from jacked.web.auto_swap import should_swap_now, TIER_T1, TIER_T2
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=47, minutes=59)))
+        best = _acct(1, usage_5h=10, usage_7d=30,
+                     resets_7d=_iso(now + timedelta(hours=36)))
+        # With prev_tiers={99: T2}, hysteresis holds active at T2 even
+        # though instant says T1. best (T1) < active (T2) → swap fires.
+        prev_tiers = {99: TIER_T2, 1: TIER_T1}
+        reason = should_swap_now(
+            active=active, best=best, now=now,
+            prev_tiers=prev_tiers,
+        )
+        assert reason is not None
+        assert reason.startswith("higher tier emerged")
+
+
+class TestSelectionDrainedT0T1Only:
+    """Drained gate must check active_tier (with hysteresis-aware
+    consistency), not target_7d's internal recomputation."""
+
+    def test_t0_active_drained_uses_constant_100(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=100,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=12)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("drained:")
+        assert "100.0%" in reason  # target = 100, not white-bar-derived
+
+    def test_t1_active_drained_uses_t1_target(self):
+        from jacked.web.auto_swap import should_swap_now, T1_TARGET
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=90,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=36)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("drained:")
+        assert f"{T1_TARGET}" in reason  # target = 90.0
+
+
 class TestBurstPattern:
     """Spec scenarios G28-G29 — real-life patterns."""
 

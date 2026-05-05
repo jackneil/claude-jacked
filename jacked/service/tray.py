@@ -277,24 +277,46 @@ class ServiceRunner:
         cancels the lifespan + drops connections; after another 5s we
         give up on the join (the thread is daemon and the OS will reap
         it when the new server binds).
+
+        Logs include the active WS client count + actual elapsed time so
+        operators reading ``~/.claude/jacked-tray.log`` can tell whether
+        the force-exit was needed because of dashboard tabs (typical) or
+        a hung lifespan (rare).
         """
         if self._uvicorn_server is None:
             return
+        # Snapshot client count before shutdown for the log line.
+        ws_client_count = 0
+        try:
+            app = getattr(self._uvicorn_server.config, "loaded_app", None)
+            ws_registry = getattr(getattr(app, "state", None), "ws_registry", None)
+            if ws_registry is not None:
+                ws_client_count = getattr(ws_registry, "client_count", 0)
+                if callable(ws_client_count):
+                    ws_client_count = ws_client_count()
+        except Exception:
+            pass
+
+        graceful_start = time.monotonic()
         self._uvicorn_server.should_exit = True
         if self._uvicorn_thread is None:
             return
         self._uvicorn_thread.join(timeout=3)
+        graceful_elapsed = time.monotonic() - graceful_start
         if self._uvicorn_thread.is_alive():
             logger.info(
-                "Uvicorn graceful shutdown timed out — forcing exit "
-                "(active WebSockets or in-flight requests)"
+                "Uvicorn graceful shutdown timed out after %.1fs (ws_clients=%d) "
+                "— forcing exit",
+                graceful_elapsed, ws_client_count,
             )
             self._uvicorn_server.force_exit = True
             self._uvicorn_thread.join(timeout=5)
             if self._uvicorn_thread.is_alive():
                 logger.warning(
-                    "Uvicorn thread still alive after force_exit — "
-                    "proceeding anyway; OS will reap the daemon thread"
+                    "Uvicorn thread still alive after force_exit "
+                    "(total elapsed %.1fs, ws_clients=%d) — proceeding "
+                    "anyway; OS will reap the daemon thread",
+                    time.monotonic() - graceful_start, ws_client_count,
                 )
 
     def _on_open_dashboard(self):
@@ -348,6 +370,11 @@ class ServiceRunner:
                     self._uvicorn_thread = self._start_uvicorn()
                     if self._wait_for_ready(timeout=15):
                         self._started_at = time.time()
+                        logger.info(
+                            "Service ready after restart "
+                            "(pid=%d, port=%d, attempt=%d)",
+                            os.getpid(), self.port, attempt + 1,
+                        )
                         if self._icon:
                             self._icon.icon = create_icon_image("running")
                             self._icon.update_menu()
@@ -370,6 +397,16 @@ class ServiceRunner:
                 self._icon.icon = create_icon_image("stopped")
         finally:
             self._lifecycle_lock.release()
+            # Re-check stop signal in case Ctrl+C / Stop fired during
+            # the restart and was rejected by acquire(blocking=False).
+            # Without this, the user expects shutdown but gets a
+            # successful restart with no feedback.
+            if self._stop_event.is_set():
+                logger.info(
+                    "Stop signal fired during restart — honoring after "
+                    "restart completes"
+                )
+                self._on_stop()
 
     def _request_stop(self):
         """Signal-safe stop request — only sets flags, no locks or I/O."""
@@ -733,6 +770,10 @@ class ServiceRunner:
         self._uvicorn_thread = self._start_uvicorn()
         if self._wait_for_ready():
             self._started_at = time.time()
+            logger.info(
+                "Service ready (pid=%d, port=%d, autostart=%s)",
+                os.getpid(), self.port, self._autostart_enabled,
+            )
             icon.icon = create_icon_image("running")
         else:
             icon.icon = create_icon_image("stopped")
