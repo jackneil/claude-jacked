@@ -79,9 +79,19 @@ def is_process_alive(pid: int) -> bool:
 
 
 def is_port_available(host: str, port: int) -> bool:
-    """Check if a TCP port is available for binding."""
+    """Check if a TCP port is available for binding.
+
+    Uses SO_REUSEADDR so a port in TIME_WAIT (recently-closed by a
+    previous server) probes as available — matching what uvicorn
+    actually does when binding (it sets reuse_address=True on POSIX).
+    Without this, ``is_port_available`` returned False for ~30s after
+    a tray restart even though the new server would bind cleanly,
+    causing the auto-updater to abort with "port could not be freed"
+    and leave the service down.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
         return True
     except OSError:
