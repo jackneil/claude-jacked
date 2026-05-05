@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -106,6 +107,7 @@ def build_menu(
     on_check_for_updates=None,
     last_check_text_fn=None,
     check_in_progress_fn=None,
+    started_at_text_fn=None,
 ) -> "pystray.Menu":
     """Build the tray right-click menu.
 
@@ -140,6 +142,14 @@ def build_menu(
     items = [
         pystray.MenuItem("JACKED", None, enabled=False),
         pystray.MenuItem(f"Running on :{port}", None, enabled=False),
+    ]
+    if started_at_text_fn is not None:
+        items.append(
+            pystray.MenuItem(
+                lambda _: started_at_text_fn(), None, enabled=False,
+            )
+        )
+    items.extend([
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open Dashboard", on_open_dashboard),
         pystray.Menu.SEPARATOR,
@@ -153,7 +163,7 @@ def build_menu(
         ),
         pystray.Menu.SEPARATOR,
         version_item,
-    ]
+    ])
     if last_check_text_fn is not None:
         items.append(
             pystray.MenuItem(lambda _: last_check_text_fn(), None, enabled=False)
@@ -193,6 +203,11 @@ class ServiceRunner:
         # are muted.
         self._last_check_at: float | None = None
         self._version_check_in_progress: bool = False
+        # Wall-clock timestamp when the current uvicorn thread became ready
+        # (passed _wait_for_ready). Used by the tray menu so users can verify
+        # a Restart click actually took effect — the timestamp shifts on
+        # every successful start/restart.
+        self._started_at: float | None = None
 
     def _start_uvicorn(self) -> threading.Thread:
         """Start uvicorn in a daemon thread."""
@@ -285,6 +300,27 @@ class ServiceRunner:
     def _on_open_dashboard(self):
         webbrowser.open(f"http://{self.host}:{self.port}")
 
+    def _started_text(self) -> str:
+        """Format the "Started ..." menu label.
+
+        Re-evaluated each time the tray menu opens, so the relative-uptime
+        portion stays fresh without manual refresh.
+        """
+        if self._started_at is None:
+            return "Started: —"
+        local = time.localtime(self._started_at)
+        clock = time.strftime("%H:%M:%S", local)
+        elapsed = max(0, int(time.time() - self._started_at))
+        if elapsed < 60:
+            rel = f"{elapsed}s ago"
+        elif elapsed < 3600:
+            rel = f"{elapsed // 60}m {elapsed % 60}s ago"
+        elif elapsed < 86400:
+            rel = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m ago"
+        else:
+            rel = f"{elapsed // 86400}d {(elapsed % 86400) // 3600}h ago"
+        return f"Started {clock} ({rel})"
+
     def _on_restart(self):
         if not self._lifecycle_lock.acquire(blocking=False):
             return  # Already restarting or stopping
@@ -311,8 +347,10 @@ class ServiceRunner:
                 try:
                     self._uvicorn_thread = self._start_uvicorn()
                     if self._wait_for_ready(timeout=15):
+                        self._started_at = time.time()
                         if self._icon:
                             self._icon.icon = create_icon_image("running")
+                            self._icon.update_menu()
                         return
                     logger.warning(
                         "Restart attempt %d: server did not become ready "
@@ -694,6 +732,7 @@ class ServiceRunner:
         ).start()
         self._uvicorn_thread = self._start_uvicorn()
         if self._wait_for_ready():
+            self._started_at = time.time()
             icon.icon = create_icon_image("running")
         else:
             icon.icon = create_icon_image("stopped")
@@ -792,6 +831,7 @@ class ServiceRunner:
             on_check_for_updates=self._on_check_for_updates,
             last_check_text_fn=self._last_check_menu_text,
             check_in_progress_fn=lambda: self._version_check_in_progress,
+            started_at_text_fn=self._started_text,
         )
 
         self._icon = pystray.Icon(

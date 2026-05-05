@@ -175,6 +175,56 @@ class TestServiceRunner:
         assert mock_thread.join.call_count == 2  # tried both
 
 
+class TestStartedTimestamp:
+    """Verify the menu shows when the service actually became ready."""
+
+    def test_started_text_default_em_dash(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        assert runner._started_at is None
+        assert runner._started_text() == "Started: —"
+
+    def test_started_text_seconds_resolution(self):
+        _skip_if_no_tray()
+        import time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._started_at = time.time() - 5  # 5s ago
+        text = runner._started_text()
+        assert text.startswith("Started ")
+        assert "5s ago" in text
+
+    def test_started_text_minutes_and_seconds(self):
+        _skip_if_no_tray()
+        import time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._started_at = time.time() - 125  # 2m 5s ago
+        text = runner._started_text()
+        assert "2m" in text and "5s ago" in text
+
+    def test_restart_updates_started_at(self):
+        """Headline behavior: clicking Restart shifts the timestamp so
+        the user can verify the click took effect."""
+        _skip_if_no_tray()
+        import time
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        runner._icon = MagicMock()
+        old_started = time.time() - 3600  # an hour ago
+        runner._started_at = old_started
+        with (
+            patch.object(runner, "_shutdown_uvicorn"),
+            patch.object(runner, "_wait_for_port_free", return_value=True),
+            patch.object(runner, "_start_uvicorn", return_value=MagicMock()),
+            patch.object(runner, "_wait_for_ready", return_value=True),
+        ):
+            runner._on_restart()
+        assert runner._started_at is not None
+        assert runner._started_at > old_started  # actually moved
+
+
 class TestCheckDeps:
     """Tests for dependency checking."""
 
