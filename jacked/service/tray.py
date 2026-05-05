@@ -775,6 +775,15 @@ class ServiceRunner:
                 os.getpid(), self.port, self._autostart_enabled,
             )
             icon.icon = create_icon_image("running")
+            # Force a menu rebuild so the dynamic "Started ..." item
+            # picks up the just-set timestamp on first open. Without
+            # this, pystray's macOS backend can show "Started: —"
+            # because the menu was constructed before _setup populated
+            # the field.
+            try:
+                icon.update_menu()
+            except Exception:
+                logger.debug("update_menu after start failed", exc_info=True)
         else:
             icon.icon = create_icon_image("stopped")
             remove_pid(PID_FILE)
