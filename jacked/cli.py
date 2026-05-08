@@ -2453,7 +2453,7 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
 @click.option(
     "--no-security",
     is_flag=True,
-    help="Skip security gatekeeper hook (installed by default)",
+    help="Skip installing the security gatekeeper hook (hook is installed but disabled by default)",
 )
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
 @click.option(
@@ -2466,8 +2466,11 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
     """Auto-install skill, agents, commands, and optional hooks.
 
     Base install: agents, commands, behavioral rules, /jacked skill,
-    and the security gatekeeper (auto-approves safe Bash commands).
-    Use --no-security to skip the gatekeeper.
+    and the security gatekeeper hook (installed disabled — Claude Code's
+    auto permission mode handles approvals natively; turn the gatekeeper on
+    from the dashboard at Settings > Gatekeeper when you want LLM-evaluated
+    interception layered on top).
+    Use --no-security to skip installing the gatekeeper hook entirely.
     Use --search to add session indexing (requires qdrant-client).
     """
     import json
@@ -2619,9 +2622,17 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
     if sounds:
         _install_sound_hooks(existing, settings_path)
 
-    # Install security gatekeeper (default — skip with --no-security)
+    # Install security gatekeeper (default — skip with --no-security).
+    # Hook is wired up but the runtime config defaults to enabled=False so
+    # Claude Code's auto permission mode handles approvals until the user
+    # explicitly turns the gatekeeper on from the dashboard.
     if install_security:
         _install_security_hook(existing, settings_path)
+        console.print(
+            "[dim]    Gatekeeper is installed disabled by default. "
+            "Toggle it on from Settings > Gatekeeper in the dashboard if you want "
+            "LLM-evaluated interception on top of Claude Code's auto mode.[/dim]"
+        )
         # Auto-run static permission audit
         console.print("")
         audit_results = _scan_permission_rules()

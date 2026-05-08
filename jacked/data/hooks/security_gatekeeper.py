@@ -1066,7 +1066,7 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
 
     >>> config = _read_gatekeeper_config(Path("/nonexistent/path.db"))
     >>> config["enabled"]
-    True
+    False
     >>> config["model_short"]
     'haiku'
     >>> config["eval_method"]
@@ -1074,8 +1074,11 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     """
     import sqlite3 as _sqlite3
 
+    # Default off: Claude Code's auto permission mode handles approvals natively.
+    # Users turn the gatekeeper on from the dashboard (Settings > Gatekeeper) when
+    # they want LLM-evaluated interception layered on top.
     defaults = {
-        "enabled": True,
+        "enabled": False,
         "model": MODEL_MAP["haiku"],
         "model_short": "haiku",
         "eval_method": "api_first",
@@ -1119,14 +1122,14 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     if method in ("api_first", "cli_first", "api_only", "cli_only"):
         defaults["eval_method"] = method
 
-    # Parse enabled flag — json.loads returns Python bool singleton,
-    # so `is not False` is an identity check (correct for True/False literals).
+    # Parse enabled flag — only honor an explicit JSON `true`. Anything else
+    # (false, missing, malformed) leaves the off-by-default in place.
     enabled_raw = rows.get("gatekeeper.enabled", "")
     if enabled_raw:
         try:
-            defaults["enabled"] = json.loads(enabled_raw) is not False
+            defaults["enabled"] = json.loads(enabled_raw) is True
         except (ValueError, TypeError):
-            pass  # Keep default True
+            pass  # Keep default False
 
     # Parse api_key
     key_raw = rows.get("gatekeeper.api_key", "")

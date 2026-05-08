@@ -8,7 +8,7 @@
 
 ## What You Get
 
-- **Stop clicking "approve" on every terminal command** — Claude Code asks permission for every bash command it runs. The security gatekeeper handles the safe ones automatically, so you only get interrupted when something is actually risky.
+- **LLM-evaluated security interception, opt-in** — Claude Code now ships an auto permission mode that handles approvals natively, so the security gatekeeper installs **disabled by default**. Turn it on from the dashboard (Settings > Gatekeeper) when you want a Haiku-backed second layer reviewing every tool call on top of Claude Code's auto mode.
 - **Catch bugs before they ship** — `/dcr` spawns parallel reviewers across 11 lenses (security, performance, logic, observability, data integrity, and more) in recursive waves until everything passes clean. 10 built-in agents, always available.
 - **Find any past conversation** — Search your Claude history by describing what you were working on. Works across machines, works across teammates. *(requires [search] extra)*
 - **Manage everything from a web dashboard** — Toggle features on and off, configure the security system, monitor decisions, track usage — all from your browser. No config files, no terminal commands.
@@ -69,14 +69,15 @@ Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 23 com
 # Add session search (needs Qdrant Cloud ~$30/mo)
 uv tool install "claude-jacked[search]" --force && jacked install --force
 
-# Add security gatekeeper (auto-approves safe bash commands, included in base install)
-jacked install --force --security
+# Security gatekeeper hook is installed by default but starts disabled —
+# enable it from the dashboard (Settings > Gatekeeper) when you want LLM-evaluated
+# interception layered on top of Claude Code's auto permission mode.
 
 # Add the background service + system tray icon (auto-start on login)
 uv tool install "claude-jacked[tray]" --force && jacked service install && jacked service start
 
 # Everything (base + search + tray)
-uv tool install "claude-jacked[all]" --force && jacked install --force --security
+uv tool install "claude-jacked[all]" --force && jacked install --force
 ```
 
 ---
@@ -170,7 +171,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
 | **Team Sharing** | Search your teammates' sessions (with their permission) |
 
-### Security Gatekeeper (activate with `jacked install --security`)
+### Security Gatekeeper (installed disabled — enable from Settings > Gatekeeper)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -385,7 +386,7 @@ Upgrading later is one command: `jacked upgrade` (from the terminal) or click th
 Extras:
 - `uv tool install "claude-jacked[search]" --force` — adds Qdrant-backed semantic session search (requires Qdrant Cloud).
 - `uv tool install "claude-jacked[all]" --force` — tray + search together.
-- `jacked install --force --security` — turns on the smart security gatekeeper (auto-approves safe bash, blocks dangerous patterns).
+- The security gatekeeper hook is installed by default but starts **disabled** — Claude Code's auto permission mode handles approvals natively. Turn the gatekeeper on from the dashboard (Settings > Gatekeeper) when you want LLM-evaluated interception layered on top.
 
 Requirements: Python 3.10+ (uv will fetch one for you if your system doesn't have a compatible version — you don't need to install Python separately).
 
@@ -424,7 +425,9 @@ If you're running the background service, you can also click **Update to vX.Y.Z 
 
 ## Security Gatekeeper
 
-The security gatekeeper intercepts **all tool calls** Claude makes — bash commands, file reads/writes, web access, and MCP tools — and decides whether to auto-approve, block, or ask you. Each tool type gets the appropriate level of scrutiny. Most decisions resolve in under 2 milliseconds.
+> **Disabled by default.** Claude Code's auto permission mode now handles approvals natively, so the gatekeeper installs but starts off. Turn it on from the dashboard at **Settings > Gatekeeper** when you want LLM-evaluated interception layered on top of auto mode (or set `gatekeeper.enabled` to `true` in the SQLite settings table). Everything described below applies once you've enabled it.
+
+When enabled, the security gatekeeper intercepts **all tool calls** Claude makes — bash commands, file reads/writes, web access, and MCP tools — and decides whether to auto-approve, block, or ask you. Each tool type gets the appropriate level of scrutiny. Most decisions resolve in under 2 milliseconds.
 
 ### How It Works
 

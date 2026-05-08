@@ -2955,20 +2955,20 @@ class TestReadGatekeeperConfig:
 
     # --- enabled flag tests ---
 
-    def test_enabled_true_when_no_db(self, tmp_path):
-        """Enabled defaults to True when DB doesn't exist."""
+    def test_enabled_false_when_no_db(self, tmp_path):
+        """Enabled defaults to False when DB doesn't exist (Claude Code auto mode handles approvals)."""
         fake_db = tmp_path / "nonexistent.db"
         config = gk._read_gatekeeper_config(db_path=fake_db)
-        assert config["enabled"] is True
+        assert config["enabled"] is False
 
-    def test_enabled_true_when_key_missing(self, tmp_path):
-        """Enabled defaults to True when gatekeeper.enabled key not in DB."""
+    def test_enabled_false_when_key_missing(self, tmp_path):
+        """Enabled defaults to False when gatekeeper.enabled key not in DB."""
         db_path = self._make_db(tmp_path, {"gatekeeper.model": "haiku"})
         config = gk._read_gatekeeper_config(db_path=db_path)
-        assert config["enabled"] is True
+        assert config["enabled"] is False
 
     def test_enabled_true_when_flag_true(self, tmp_path):
-        """Enabled is True when DB flag is true."""
+        """Enabled is True when DB flag is explicitly true (user opted in via dashboard)."""
         db_path = self._make_db(tmp_path, {"gatekeeper.enabled": True})
         config = gk._read_gatekeeper_config(db_path=db_path)
         assert config["enabled"] is True
@@ -2979,21 +2979,21 @@ class TestReadGatekeeperConfig:
         config = gk._read_gatekeeper_config(db_path=db_path)
         assert config["enabled"] is False
 
-    def test_enabled_true_when_empty_db(self, tmp_path):
-        """Enabled defaults to True when DB has no rows."""
+    def test_enabled_false_when_empty_db(self, tmp_path):
+        """Enabled defaults to False when DB has no rows."""
         db_path = self._make_db(tmp_path)
         config = gk._read_gatekeeper_config(db_path=db_path)
-        assert config["enabled"] is True
+        assert config["enabled"] is False
 
-    def test_enabled_true_when_corrupted_db(self, tmp_path):
-        """Enabled defaults to True when DB is corrupted (fail-open)."""
+    def test_enabled_false_when_corrupted_db(self, tmp_path):
+        """Enabled defaults to False when DB is corrupted — fail-closed lets Claude Code's auto mode take over."""
         db_path = tmp_path / "jacked.db"
         db_path.write_text("not a database")
         config = gk._read_gatekeeper_config(db_path=db_path)
-        assert config["enabled"] is True
+        assert config["enabled"] is False
 
-    def test_enabled_true_when_corrupt_value(self, tmp_path):
-        """Enabled defaults to True when value is not valid JSON."""
+    def test_enabled_false_when_corrupt_value(self, tmp_path):
+        """Enabled defaults to False when value is not valid JSON."""
         db_path = self._make_db(tmp_path)
         # Write a raw non-JSON value directly
         conn = sqlite3.connect(str(db_path))
@@ -3004,7 +3004,7 @@ class TestReadGatekeeperConfig:
         conn.commit()
         conn.close()
         config = gk._read_gatekeeper_config(db_path=db_path)
-        assert config["enabled"] is True
+        assert config["enabled"] is False
 
 
 # ---------------------------------------------------------------------------
