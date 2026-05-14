@@ -1063,8 +1063,107 @@ async def active_account_poll_loop(app):
             )
         _last_tick_at = now_tick
 
+        # External heartbeat — consumed by active_poll_watchdog_loop. Written
+        # on every iteration (including ticks that bailed early via continue)
+        # so a stuck or never-scheduled task is detectable. Monotonic clock
+        # is immune to wall-clock skew.
+        try:
+            app.state.active_poll_last_tick_at = time.monotonic()
+        except Exception:
+            # app.state vanishing means we're in lifespan teardown; let the
+            # natural cancellation finish the loop on the next await.
+            pass
+
         logger.debug("Active poll: tier=%s interval=%.0fs", _poll_tier, _poll_interval)
         await asyncio.sleep(_poll_interval)
+
+
+# -----------------------------------------------------------------------
+# Loop 1b — Watchdog for active_account_poll_loop
+# -----------------------------------------------------------------------
+
+# The active poll task can be silently dead-on-arrival under a specific
+# race observed in production on 2026-05-10: tray force-exits uvicorn,
+# lifespan creates a new task, but the task never gets its first slice
+# of CPU. No exception fires, no log. Heartbeat-based detection is the
+# only reliable signal.
+_WATCHDOG_INTERVAL_SECONDS = 60
+_HEARTBEAT_STALE_SECONDS = 300  # 5min — 5x default 60s interval, 1x worst-case 300s
+_RESPAWN_COOLDOWN_SECONDS = 30  # prevent thrash if respawned task also dies fast
+
+
+def _respawn_active_poll(app) -> bool:
+    """Cancel any stale active_poll_task and start a fresh one.
+
+    Returns True if a new task was created. Idempotent — safe to call
+    when the existing task is healthy (it gets cancelled and replaced;
+    the new task picks up the next tick).
+    """
+    old_task = getattr(app.state, "active_poll_task", None)
+    if old_task is not None and not old_task.done():
+        try:
+            old_task.cancel()
+        except Exception:
+            logger.warning("Failed to cancel stale active_poll_task", exc_info=True)
+    try:
+        new_task = asyncio.create_task(active_account_poll_loop(app))
+    except Exception:
+        logger.error("Failed to respawn active_poll_task", exc_info=True)
+        return False
+    app.state.active_poll_task = new_task
+    # Seed heartbeat so the watchdog grants the new task a full interval
+    # to tick before declaring it stale again.
+    app.state.active_poll_last_tick_at = time.monotonic()
+    app.state.active_poll_last_respawn_at = time.monotonic()
+    return True
+
+
+async def active_poll_watchdog_loop(app):
+    """Detect and recover from a silently-dead active_account_poll_loop.
+
+    Checks ``app.state.active_poll_last_tick_at`` every minute. If the
+    heartbeat is stale (no tick for > 5min) OR the task object is done()
+    when it shouldn't be, respawn it via ``_respawn_active_poll``.
+
+    Never crashes — exceptions are caught and logged per tick so the
+    watchdog itself doesn't become the dead loop it was built to detect.
+    """
+    # Grace period: lifespan may still be wiring app.state. Skip first check.
+    await asyncio.sleep(_WATCHDOG_INTERVAL_SECONDS)
+
+    while True:
+        try:
+            now = time.monotonic()
+            last_tick = getattr(app.state, "active_poll_last_tick_at", None)
+            last_respawn = getattr(app.state, "active_poll_last_respawn_at", 0.0)
+            task = getattr(app.state, "active_poll_task", None)
+
+            # Cooldown: if we just respawned, give the new task a full
+            # cycle before considering another respawn.
+            if last_respawn and (now - last_respawn) < _RESPAWN_COOLDOWN_SECONDS:
+                await asyncio.sleep(_WATCHDOG_INTERVAL_SECONDS)
+                continue
+
+            stale = last_tick is None or (now - last_tick) > _HEARTBEAT_STALE_SECONDS
+            task_dead = task is not None and task.done()
+
+            if stale or task_dead:
+                logger.error(
+                    "active_poll_watchdog: detected dead task — "
+                    "heartbeat_age=%s done=%s — respawning",
+                    f"{int(now - last_tick)}s" if last_tick else "never",
+                    task_dead,
+                )
+                if _respawn_active_poll(app):
+                    logger.info("active_poll_watchdog: respawn succeeded")
+
+        except asyncio.CancelledError:
+            logger.info("Active poll watchdog cancelled — shutting down")
+            raise
+        except Exception:
+            logger.warning("active_poll_watchdog error", exc_info=True)
+
+        await asyncio.sleep(_WATCHDOG_INTERVAL_SECONDS)
 
 
 # -----------------------------------------------------------------------

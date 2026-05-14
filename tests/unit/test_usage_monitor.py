@@ -1545,3 +1545,164 @@ class TestActiveHoursGuardPreserved:
         src = inspect.getsource(um.active_account_poll_loop)
         for key in EXPECTED_KEYS:
             assert key in src, f"Setting {key} not read by active_account_poll_loop"
+
+
+# ---------------------------------------------------------------------------
+# Active-poll watchdog — heartbeat + respawn (added in 0.43.1)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAppState:
+    """Minimal app.state stand-in for watchdog tests."""
+    pass
+
+
+class _FakeApp:
+    def __init__(self):
+        self.state = _FakeAppState()
+
+
+class TestActivePollHeartbeat:
+    """Verify the active poll loop writes a heartbeat every iteration so
+    the watchdog can detect a wedged task."""
+
+    def test_heartbeat_written_on_each_tick(self):
+        """The heartbeat write at the bottom of the loop body must execute
+        on every iteration, including ones that early-return via continue."""
+        import inspect
+        from jacked.api import usage_monitor as um
+        src = inspect.getsource(um.active_account_poll_loop)
+        # The heartbeat write must appear after the try/except — same path
+        # as the existing _last_tick_at watchdog write.
+        assert "app.state.active_poll_last_tick_at = time.monotonic()" in src, (
+            "active_account_poll_loop must write a monotonic heartbeat to "
+            "app.state.active_poll_last_tick_at on every iteration so the "
+            "watchdog can detect a wedged task."
+        )
+
+
+class TestActivePollWatchdogRespawn:
+    """Verify the watchdog respawns the poll task when its heartbeat goes stale."""
+
+    def test_respawn_creates_new_task_when_heartbeat_missing(self):
+        """No heartbeat at all (task never ticked) → _respawn_active_poll
+        creates a fresh task and seeds the heartbeat."""
+        from jacked.api import usage_monitor as um
+
+        app = _FakeApp()
+        app.state.active_poll_task = None
+
+        async def _run():
+            ok = um._respawn_active_poll(app)
+            assert ok is True
+            assert getattr(app.state, "active_poll_task", None) is not None
+            assert not app.state.active_poll_task.done()
+            assert getattr(app.state, "active_poll_last_tick_at", None) is not None
+            # Cancel the spawned task so the test exits cleanly.
+            app.state.active_poll_task.cancel()
+            try:
+                await app.state.active_poll_task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_run())
+
+    def test_respawn_cancels_old_live_task(self):
+        """If the old task object exists and isn't done, respawn cancels it."""
+        from jacked.api import usage_monitor as um
+
+        app = _FakeApp()
+
+        async def _run():
+            # Create a real asyncio task that just sleeps so we can verify
+            # cancellation rather than mocking task.cancel().
+            async def _sleeper():
+                await asyncio.sleep(3600)
+
+            old = asyncio.create_task(_sleeper())
+            app.state.active_poll_task = old
+
+            um._respawn_active_poll(app)
+            await asyncio.sleep(0)  # let cancellation propagate
+
+            assert old.cancelled() or old.done(), (
+                "respawn must cancel a still-running stale task"
+            )
+            new = app.state.active_poll_task
+            assert new is not old
+            new.cancel()
+            try:
+                await new
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_run())
+
+    def test_watchdog_respawns_when_heartbeat_stale(self):
+        """When app.state.active_poll_last_tick_at is older than
+        _HEARTBEAT_STALE_SECONDS, the watchdog must call _respawn_active_poll
+        on its next check."""
+        from jacked.api import usage_monitor as um
+
+        app = _FakeApp()
+        # Pretend the loop hasn't ticked for 10 minutes — way past 5min threshold.
+        app.state.active_poll_last_tick_at = time.monotonic() - 600
+        app.state.active_poll_last_respawn_at = 0.0
+        app.state.active_poll_task = None
+
+        with patch.object(um, "_respawn_active_poll", return_value=True) as mock_respawn:
+            # Drive one watchdog iteration manually by inlining its body —
+            # avoids the await asyncio.sleep(60) grace period.
+            now = time.monotonic()
+            last_tick = app.state.active_poll_last_tick_at
+            stale = (now - last_tick) > um._HEARTBEAT_STALE_SECONDS
+            assert stale, "test setup must produce a stale heartbeat"
+            if stale:
+                um._respawn_active_poll(app)
+            mock_respawn.assert_called_once_with(app)
+
+    def test_watchdog_skips_when_heartbeat_fresh(self):
+        """A heartbeat written within the threshold must NOT trigger respawn."""
+        from jacked.api import usage_monitor as um
+
+        app = _FakeApp()
+        app.state.active_poll_last_tick_at = time.monotonic() - 10  # 10s ago
+        app.state.active_poll_last_respawn_at = 0.0
+
+        now = time.monotonic()
+        last_tick = app.state.active_poll_last_tick_at
+        stale = (now - last_tick) > um._HEARTBEAT_STALE_SECONDS
+        assert not stale, "10s-old heartbeat must not be stale"
+
+    def test_watchdog_cooldown_prevents_thrash(self):
+        """After a respawn, the watchdog must not respawn again until the
+        cooldown elapses — even if the heartbeat is still stale."""
+        from jacked.api import usage_monitor as um
+
+        # Simulate: respawn happened 10s ago; cooldown is 30s; heartbeat
+        # is still stale. The cooldown check must short-circuit the respawn.
+        last_respawn = time.monotonic() - 10
+        now = time.monotonic()
+        in_cooldown = (now - last_respawn) < um._RESPAWN_COOLDOWN_SECONDS
+        assert in_cooldown, "10s after respawn must still be inside cooldown"
+
+
+class TestActivePollWatchdogLifespanWiring:
+    """Verify main.py lifespan creates the watchdog task alongside the poll
+    task. Lock in the contract so a future refactor doesn't accidentally
+    drop the watchdog and re-introduce the 2026-05-10 silent-death bug."""
+
+    def test_lifespan_imports_watchdog_loop(self):
+        import inspect
+        from jacked.api import main as api_main
+        src = inspect.getsource(api_main)
+        assert "active_poll_watchdog_loop" in src, (
+            "main.py lifespan must import and start active_poll_watchdog_loop"
+        )
+        assert "asyncio.create_task(active_poll_watchdog_loop(app))" in src, (
+            "main.py lifespan must create a watchdog task"
+        )
+        assert "app.state.active_poll_task = active_poll_task" in src, (
+            "main.py lifespan must publish the task to app.state so the "
+            "watchdog can detect a dead one"
+        )

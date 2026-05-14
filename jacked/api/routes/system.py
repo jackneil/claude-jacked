@@ -139,6 +139,51 @@ async def health_check(request: Request):
     return HealthResponse(status="ok", db=db is not None)
 
 
+@router.get("/admin/debug/tasks")
+async def debug_tasks(request: Request):
+    """Dump every asyncio task on the running event loop.
+
+    Diagnostic-only — returns each task's name, done state, and the
+    file:line of its current frame so a wedged task can be pinpointed
+    without attaching a debugger. The dashboard binds to 127.0.0.1, so
+    no auth is layered here.
+    """
+    import time as _time
+    out = []
+    for t in asyncio.all_tasks():
+        coro = t.get_coro()
+        frame = getattr(coro, "cr_frame", None)
+        location = None
+        if frame is not None:
+            location = (
+                f"{frame.f_code.co_filename}:{frame.f_lineno} "
+                f"in {frame.f_code.co_name}"
+            )
+        try:
+            cancelled = t.cancelled()
+        except Exception:
+            cancelled = None
+        out.append({
+            "name": t.get_name(),
+            "done": t.done(),
+            "cancelled": cancelled,
+            "coro_name": getattr(coro, "__qualname__", repr(coro)),
+            "location": location,
+        })
+
+    # Heartbeat snapshot for the active poll loop — pairs with the task
+    # list so the caller can correlate "is the task object alive" with
+    # "is the task body actually ticking".
+    last_tick = getattr(request.app.state, "active_poll_last_tick_at", None)
+    heartbeat = {
+        "active_poll_last_tick_at_monotonic": last_tick,
+        "active_poll_heartbeat_age_seconds": (
+            _time.monotonic() - last_tick if last_tick is not None else None
+        ),
+    }
+    return {"count": len(out), "tasks": out, "heartbeat": heartbeat}
+
+
 def _version_response(result: dict | None) -> "VersionResponse":
     """Build VersionResponse from check_version_cached result."""
     from datetime import datetime, timezone

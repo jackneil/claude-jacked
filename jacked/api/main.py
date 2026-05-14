@@ -20,7 +20,11 @@ from jacked.api.watchers import (
     process_alive_sweeper_loop,
     session_accounts_watch_loop,
 )
-from jacked.api.usage_monitor import active_account_poll_loop, full_sweep_loop
+from jacked.api.usage_monitor import (
+    active_account_poll_loop,
+    active_poll_watchdog_loop,
+    full_sweep_loop,
+)
 from jacked.api.log_capture import server_log_buffer
 from jacked.api.websocket import WebSocketRegistry
 
@@ -243,6 +247,13 @@ async def lifespan(app: FastAPI):
     sweeper_task = asyncio.create_task(process_alive_sweeper_loop(app))
     heal_task = asyncio.create_task(_heal_sweep_loop())
     active_poll_task = asyncio.create_task(active_account_poll_loop(app))
+    # Expose poll-loop liveness state for the watchdog. The watchdog
+    # respawns the task if heartbeat goes stale — see the 2026-05-10
+    # silent-task-death incident for why this exists.
+    app.state.active_poll_task = active_poll_task
+    app.state.active_poll_last_tick_at = time.monotonic()
+    app.state.active_poll_last_respawn_at = 0.0
+    active_poll_watchdog_task = asyncio.create_task(active_poll_watchdog_loop(app))
     full_sweep_task = asyncio.create_task(full_sweep_loop(app))
     stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
     logger.info("Started background token refresh (every 30min)")
@@ -251,6 +262,7 @@ async def lifespan(app: FastAPI):
     logger.info("Started process-alive sweeper (every 60s)")
     logger.info("Started heal sweep (every 5min)")
     logger.info("Started active account poll loop (60s)")
+    logger.info("Started active poll watchdog (every 60s)")
     logger.info("Started full sweep loop")
     logger.info("Started stuck-checking watchdog (every 60s)")
 
@@ -267,8 +279,17 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: cancel background tasks
-    tasks_to_cancel = [refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task, active_poll_task, full_sweep_task, stuck_checking_task]
+    # Shutdown: cancel background tasks. Use the CURRENT active_poll_task
+    # from app.state — the watchdog may have respawned it during the run,
+    # so the local `active_poll_task` reference can be stale.
+    tasks_to_cancel = [
+        refresh_task, session_watch_task, logs_watch_task, sweeper_task,
+        heal_task,
+        getattr(app.state, "active_poll_task", active_poll_task),
+        active_poll_watchdog_task,
+        full_sweep_task,
+        stuck_checking_task,
+    ]
     if analytics_scan_task is not None:
         tasks_to_cancel.append(analytics_scan_task)
     if analytics_monitor_task is not None:
