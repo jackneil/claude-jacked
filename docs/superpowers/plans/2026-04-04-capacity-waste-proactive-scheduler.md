@@ -353,7 +353,7 @@ Add to `tests/unit/test_auto_swap.py` in the `TestComputeUrgencyThreshold` class
         import time as _time
 
         acct = {
-            "email": "jack@jackmd.com",
+            "email": "user3@example.com",
             "cached_usage_7d": 86.0,
             "cached_7d_resets_at": (
                 datetime.now(timezone.utc) + timedelta(hours=5, minutes=42)

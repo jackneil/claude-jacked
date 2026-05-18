@@ -6,7 +6,7 @@
 
 ## Problem
 
-On 2026-04-19, `jack@jackmd.com` (account 1) was stuck in the dashboard showing
+On 2026-04-19, `user3@example.com` (account 1) was stuck in the dashboard showing
 "Checking usage…" for ~14 hours. Investigation revealed three independent
 failure modes that together produced the stuck state:
 

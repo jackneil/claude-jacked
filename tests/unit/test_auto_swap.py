@@ -299,25 +299,25 @@ class TestHasViableHeadroom:
 class TestFormatAccountLabel:
     def test_personal_org(self):
         """Personal org (ends with 's Organization') shows as (personal)."""
-        acct = {"email": "jack@jackmd.com", "organization_name": "jack@jackmd.com's Organization", "display_name": "Jack"}
-        assert format_account_label(acct) == "jack@jackmd.com (personal)"
+        acct = {"email": "user3@example.com", "organization_name": "user3@example.com's Organization", "display_name": "User3"}
+        assert format_account_label(acct) == "user3@example.com (personal)"
 
     def test_real_org(self):
         """Real org name is shown in parens."""
-        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Jack"}
-        assert format_account_label(acct) == "jack.neil@hank.ai (Hank.ai)"
+        acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "User1"}
+        assert format_account_label(acct) == "user1@example.com (Acme)"
 
     def test_custom_label_prepended(self):
         """User-set display_name that differs from default is prepended."""
-        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Hank Team"}
-        assert format_account_label(acct) == "Hank Team — jack.neil@hank.ai (Hank.ai)"
+        acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "Acme Team"}
+        assert format_account_label(acct) == "Acme Team — user1@example.com (Acme)"
 
     def test_default_display_name_not_shown(self):
         """Default display_name (just first name) is NOT prepended."""
-        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Jack"}
+        acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "User1"}
         result = format_account_label(acct)
-        assert not result.startswith("Jack —")
-        assert result == "jack.neil@hank.ai (Hank.ai)"
+        assert not result.startswith("User1 —")
+        assert result == "user1@example.com (Acme)"
 
     def test_no_org_name(self):
         """Missing org_name shows just email."""

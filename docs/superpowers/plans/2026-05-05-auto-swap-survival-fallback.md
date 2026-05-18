@@ -449,7 +449,7 @@ class TestLoopSurvivalFallback:
 
     def _build_user_scenario_accounts(self, now):
         # Reconstruct the user-reported bug:
-        # active id=1 jack@jackmd.com  T1 5h=94 7d=85
+        # active id=1 user3@example.com  T1 5h=94 7d=85
         # cand   id=3 jackusc@gmail   T2 5h=12 7d=62 (ahead of floor)
         # cand   id=2 jack.neil       T3 5h=98 (saturated)
         # cand   id=7 jack.neil hank  T2 5h=100 (saturated)

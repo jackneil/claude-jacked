@@ -27,7 +27,7 @@ def format_account_label(account: dict) -> str:
 
     Format: [Label — ] email [(org)]
     - Personal orgs (ending "'s Organization") show as "(personal)"
-    - Real org names shown as-is: "(Hank.ai)"
+    - Real org names shown as-is: "(Acme)"
     - Custom display_name prepended only if it differs from the default
       (default = first name matching email prefix, or generic names)
     """
@@ -47,7 +47,7 @@ def format_account_label(account: dict) -> str:
     label_prefix = ""
     if display_name:
         # Default display_name is typically the first name from the email
-        # e.g. "Jack" for jack.neil@hank.ai. Don't show these.
+        # e.g. "Jack" for user1@example.com. Don't show these.
         email_prefix = email.split("@")[0].split(".")[0].lower()
         if display_name.lower() != email_prefix and display_name.lower() != "user":
             label_prefix = f"{display_name} \u2014 "

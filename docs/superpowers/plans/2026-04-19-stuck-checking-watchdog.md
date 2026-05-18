@@ -1336,7 +1336,7 @@ gh release create v0.41.23 --title "v0.41.23 — stuck-checking watchdog + sweep
 ## Fix: validation_status='checking' no longer stuck indefinitely
 
 ### The bug
-On 2026-04-19, jack@jackmd.com was stuck "Checking usage…" for ~14 hours.
+On 2026-04-19, user3@example.com was stuck "Checking usage…" for ~14 hours.
 `validate_account()` writes `validation_status="checking"` before the network
 call; if the coroutine is abandoned (server restart, cancellation, orphan
 task from bulk-lock force-reset), the DB row stays 'checking' forever.

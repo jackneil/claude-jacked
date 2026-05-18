@@ -209,7 +209,7 @@ function renderAutoSwapPanel() {
  * Format an account label from swap log entry fields.
  * @param {Object} entry - swap log entry
  * @param {string} prefix - 'from' or 'to'
- * @returns {string} formatted label like "jack@test.com (Hank.ai)"
+ * @returns {string} formatted label like "jack@test.com (Acme)"
  */
 function formatAccountLabel(entry, prefix) {
     const email = entry[prefix + '_email'] || '\u2014';

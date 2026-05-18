@@ -19,7 +19,7 @@ The 5h and 7d windows don't line up. An account can have:
 The window keeper only checks the 5h window, so it never pings this account. The new 7d window stays "un-started" — it only begins counting once the user happens to use the account. Meanwhile, the cached usage data is stale (shows the old 7d usage from before the reset), so the proactive scheduler can't tell that there's fresh capacity to burn.
 
 Concrete example from live data:
-- jack@jackmd.com: 5h active until 22:00 UTC, 7d reset 2.1 hours ago, cached data still shows old 7d usage
+- user3@example.com: 5h active until 22:00 UTC, 7d reset 2.1 hours ago, cached data still shows old 7d usage
 - `needs_ping` returns False (5h still active)
 - Window keeper never pings
 - New 7d window doesn't start until the user happens to make a call

@@ -20,7 +20,7 @@ The email+org fallback from `~/.claude.json` works identically on all platforms 
 
 ### Multi-Org Edge Case
 
-The user has two accounts with the same email (`jack.neil@hank.ai`) but different organizations. The email fallback must match on both `emailAddress` AND `organizationUuid` to avoid ambiguity. `~/.claude.json` contains both fields.
+The user has two accounts with the same email (`user1@example.com`) but different organizations. The email fallback must match on both `emailAddress` AND `organizationUuid` to avoid ambiguity. `~/.claude.json` contains both fields.
 
 ---
 

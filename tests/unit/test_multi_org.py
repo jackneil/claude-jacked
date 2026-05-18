@@ -56,12 +56,12 @@ class TestCreateAccountOrgUniqueness:
                 access_token="at2",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             assert a1["id"] != a2["id"]
             assert a1["organization_uuid"] == ""
             assert a2["organization_uuid"] == "org-123"
-            assert a2["organization_name"] == "Hank.ai"
+            assert a2["organization_name"] == "Acme"
         finally:
             db.close()
 
@@ -74,14 +74,14 @@ class TestCreateAccountOrgUniqueness:
                 access_token="at_old",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             a2 = db.create_account(
                 email="jack@x.com",
                 access_token="at_new",
                 expires_at=int(time.time()) + 7200,
                 organization_uuid="org-123",
-                organization_name="Hank.ai Updated",
+                organization_name="Acme Updated",
             )
             assert a1["id"] == a2["id"]
             assert a2["access_token"] == "at_new"
@@ -152,7 +152,7 @@ class TestGetAccountByEmailAmbiguity:
                 access_token="at2",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             result = db.get_account_by_email("jack@x.com", organization_uuid="org-123")
             assert result is not None
@@ -391,7 +391,7 @@ class TestMigrationIdempotency:
                 access_token="at1",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             acct_id = acct["id"]
 
@@ -512,11 +512,11 @@ class TestFreshDBWithOrg:
                 access_token="at1",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-hank-uuid",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             assert acct["email"] == "jack@hank.ai"
             assert acct["organization_uuid"] == "org-hank-uuid"
-            assert acct["organization_name"] == "Hank.ai"
+            assert acct["organization_name"] == "Acme"
             assert acct["id"] > 0
         finally:
             db.close()
@@ -629,14 +629,14 @@ class TestUpdateClaudeConfigOrg:
                 update_claude_config_email(
                     "jack@x.com",
                     organization_uuid="org-123",
-                    organization_name="Hank.ai",
+                    organization_name="Acme",
                 )
 
             config = json.loads(
                 (tmp_path / ".claude.json").read_text(encoding="utf-8")
             )
             assert config["oauthAccount"]["organizationUuid"] == "org-123"
-            assert config["oauthAccount"]["organizationName"] == "Hank.ai"
+            assert config["oauthAccount"]["organizationName"] == "Acme"
 
     def test_clears_org_for_personal(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
@@ -679,7 +679,7 @@ class TestSeedOauthAccountOrg:
         account = {
             "email": "jack@x.com",
             "organization_uuid": "org-123",
-            "organization_name": "Hank.ai",
+            "organization_name": "Acme",
         }
         _seed_oauth_account(config_dir, account)
 
@@ -688,7 +688,7 @@ class TestSeedOauthAccountOrg:
         )
         assert data["oauthAccount"]["emailAddress"] == "jack@x.com"
         assert data["oauthAccount"]["organizationUuid"] == "org-123"
-        assert data["oauthAccount"]["organizationName"] == "Hank.ai"
+        assert data["oauthAccount"]["organizationName"] == "Acme"
 
     def test_updates_org_on_existing_account(self, tmp_path):
         from jacked.launch import _seed_oauth_account

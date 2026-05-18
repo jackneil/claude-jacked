@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make swap notifications, swap history, and reason strings show which org an account belongs to so duplicate emails (e.g. two `jack.neil@hank.ai` accounts) are distinguishable.
+**Goal:** Make swap notifications, swap history, and reason strings show which org an account belongs to so duplicate emails (e.g. two `user1@example.com` accounts) are distinguishable.
 
-**Architecture:** One Python helper `format_account_label(account)` in `auto_swap.py` produces a human-readable label like `jack.neil@hank.ai (Hank.ai)`. A JS equivalent `formatAccountLabel(entry, prefix)` does the same client-side for the swap history table. The WebSocket payloads get `from_label`/`to_label` fields, and the `list_swaps` DB query gets extended to JOIN org/display_name data.
+**Architecture:** One Python helper `format_account_label(account)` in `auto_swap.py` produces a human-readable label like `user1@example.com (Acme)`. A JS equivalent `formatAccountLabel(entry, prefix)` does the same client-side for the swap history table. The WebSocket payloads get `from_label`/`to_label` fields, and the `list_swaps` DB query gets extended to JOIN org/display_name data.
 
 **Tech Stack:** Python, JavaScript, SQLite
 
@@ -60,25 +60,25 @@ Then add at the end of the file:
 class TestFormatAccountLabel:
     def test_personal_org(self):
         """Personal org (ends with 's Organization') shows as (personal)."""
-        acct = {"email": "jack@jackmd.com", "organization_name": "jack@jackmd.com's Organization", "display_name": "Jack"}
-        assert format_account_label(acct) == "jack@jackmd.com (personal)"
+        acct = {"email": "user3@example.com", "organization_name": "user3@example.com's Organization", "display_name": "Jack"}
+        assert format_account_label(acct) == "user3@example.com (personal)"
 
     def test_real_org(self):
         """Real org name is shown in parens."""
-        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Jack"}
-        assert format_account_label(acct) == "jack.neil@hank.ai (Hank.ai)"
+        acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "Jack"}
+        assert format_account_label(acct) == "user1@example.com (Acme)"
 
     def test_custom_label_prepended(self):
         """User-set display_name that differs from default is prepended."""
-        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Hank Team"}
-        assert format_account_label(acct) == "Hank Team — jack.neil@hank.ai (Hank.ai)"
+        acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "Acme Team"}
+        assert format_account_label(acct) == "Acme Team — user1@example.com (Acme)"
 
     def test_default_display_name_not_shown(self):
         """Default display_name (just first name) is NOT prepended."""
-        acct = {"email": "jack.neil@hank.ai", "organization_name": "Hank.ai", "display_name": "Jack"}
+        acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "Jack"}
         result = format_account_label(acct)
         assert not result.startswith("Jack —")
-        assert result == "jack.neil@hank.ai (Hank.ai)"
+        assert result == "user1@example.com (Acme)"
 
     def test_no_org_name(self):
         """Missing org_name shows just email."""
@@ -116,7 +116,7 @@ def format_account_label(account: dict) -> str:
 
     Format: [Label — ] email [(org)]
     - Personal orgs (ending "'s Organization") show as "(personal)"
-    - Real org names shown as-is: "(Hank.ai)"
+    - Real org names shown as-is: "(Acme)"
     - Custom display_name prepended only if it differs from the default
       (default = first name matching email prefix, or generic names)
     """
@@ -136,7 +136,7 @@ def format_account_label(account: dict) -> str:
     label_prefix = ""
     if display_name:
         # Default display_name is typically the first name from the email
-        # e.g. "Jack" for jack.neil@hank.ai. Don't show these.
+        # e.g. "Jack" for user1@example.com. Don't show these.
         email_prefix = email.split("@")[0].split(".")[0].lower()
         if display_name.lower() != email_prefix and display_name.lower() != "user":
             label_prefix = f"{display_name} — "
@@ -384,7 +384,7 @@ In `jacked/data/web/js/components/auto-swap.js`, add before the `renderSwapLogTa
  * Format an account label from swap log entry fields.
  * @param {Object} entry - swap log entry
  * @param {string} prefix - 'from' or 'to'
- * @returns {string} formatted label like "jack@test.com (Hank.ai)"
+ * @returns {string} formatted label like "jack@test.com (Acme)"
  */
 function formatAccountLabel(entry, prefix) {
     const email = entry[prefix + '_email'] || '\u2014';
@@ -431,7 +431,7 @@ To:
 - [ ] **Step 4: Manual test**
 
 Open the dashboard in a browser, verify:
-1. The swap history table shows org info (e.g. `jack.neil@hank.ai (Hank.ai)`)
+1. The swap history table shows org info (e.g. `user1@example.com (Acme)`)
 2. If a swap fires, the toast banner shows the org-aware label
 
 - [ ] **Step 5: Commit**
