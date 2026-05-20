@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plan — pre-flight /simple/ agreement check</title>
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="ready-for-dc-review">
+<meta name="jacked:branch" content="master">
+<meta name="jacked:date" content="2026-05-20">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --danger:#b32424; --danger-bg:#fbe9e7; --ok:#1f7a3f; --ok-bg:#e8f4ec; --border:#d8d4cc; --code-bg:#f3efe8; --radius:6px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --danger:#ea7670; --danger-bg:#3a1f1c; --ok:#6acd8e; --ok-bg:#1c3327; --border:#2e2e2e; --code-bg:#232323; } }
+  *{box-sizing:border-box}
+  body{font-family:var(--sans);font-size:16px;line-height:1.6;color:var(--fg);background:var(--bg);margin:0;padding:2rem 1rem}
+  .wrap{max-width:920px;margin:0 auto}
+  h1{font-size:2rem;margin:0 0 .25rem}
+  h2{font-size:1.4rem;margin:2.5rem 0 .75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}
+  h3{font-size:1.1rem;margin:1.5rem 0 .5rem;color:var(--fg-muted)}
+  code{font-family:var(--mono);font-size:.92em;background:var(--code-bg);padding:.12em .35em;border-radius:3px}
+  pre{font-family:var(--mono);font-size:.85rem;background:var(--code-bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;overflow-x:auto;line-height:1.45}
+  pre code{background:transparent;padding:0}
+  table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--bg-card);border-radius:var(--radius);overflow:hidden}
+  th,td{text-align:left;padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+  th{background:var(--code-bg);font-weight:600;font-size:.9rem}
+  tr:last-child td{border-bottom:none}
+  aside.callout{margin:1rem 0;padding:.9rem 1.1rem;border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}
+  aside.callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  ul.tasks{list-style:none;padding-left:0}
+  ul.tasks li{padding:.25rem 0;display:flex;align-items:flex-start;gap:.6rem}
+  ul.tasks input[type="checkbox"]{margin-top:.4rem}
+  .meta{display:flex;flex-wrap:wrap;gap:.5rem 1rem;margin:.5rem 0 2rem;padding:.75rem 1rem;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
+  .meta .kv{display:flex;gap:.35rem}
+  .meta .k{color:var(--fg-muted)}
+  .meta .v{font-family:var(--mono)}
+  .badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.8rem;font-weight:500}
+  .badge.info{background:var(--accent-bg);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Plan — pre-flight <code>/simple/</code> agreement check</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">ready-for-dc-review</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-05-20</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">master</span></div>
+  <div class="kv"><span class="k">Spec:</span><span class="v"><code>docs/superpowers/specs/2026-05-20-update-ux-pre-flight-simple-index.html</code></span></div>
+</div>
+
+<aside class="callout">
+<strong>For agentic workers:</strong> REQUIRED SUB-SKILL: <code>superpowers:subagent-driven-development</code> (recommended) or <code>superpowers:executing-plans</code>. TDD per task — test first, run-fail, implement, run-pass, commit.
+</aside>
+
+<h2>Goal</h2>
+<p>
+Make the tray's "Update available" promise truthful: only surface a new version when uv can actually install it. Probe both <code>/pypi/json</code> AND <code>/simple/</code> in <code>version_check.py</code>, treat the lesser as the installable latest.
+</p>
+
+<h2>Architecture</h2>
+<p>
+Add one function (<code>get_latest_from_simple_index</code>) that queries <code>/simple/&lt;pkg&gt;/</code> via PEP 691 JSON. Modify <code>check_version_cached</code> to consult both endpoints. <code>outdated</code> only fires when both agree. Cache schema bumps to store both versions. Tray UI surface unchanged.
+</p>
+
+<h2>Tech stack</h2>
+<ul>
+  <li>Python 3.10+, <code>urllib.request</code> (no new deps)</li>
+  <li>pytest with <code>unittest.mock</code>; existing <code>tests/unit/test_version_check.py</code> patterns</li>
+  <li>Tests run via <code>uv run python -m pytest</code></li>
+</ul>
+
+<h2>File map</h2>
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/version_check.py</code></td><td>Add filename regex + <code>_parse_version_tuple</code> helper + <code>get_latest_from_simple_index</code>; modify <code>check_version_cached</code> to consume both endpoints + new cache schema</td></tr>
+    <tr><td><code>tests/unit/test_version_check.py</code></td><td>9 new tests (per spec)</td></tr>
+    <tr><td><code>jacked/__init__.py</code></td><td>Version bump 0.45.3 → 0.45.4</td></tr>
+  </tbody>
+</table>
+
+<h2>Tasks</h2>
+
+<h3>Task 1: Extract <code>_parse_version_tuple</code> helper</h3>
+<p>The existing <code>is_newer</code> has a nested <code>parse</code> closure. Extract it as a module-level helper so it can be reused by the new max-version logic.</p>
+<p><strong>Files:</strong></p>
+<ul><li>Modify: <code>jacked/version_check.py</code></li><li>Test: <code>tests/unit/test_version_check.py</code></li></ul>
+
+<ul class="tasks">
+<li><input type="checkbox" disabled> 1.1 — Write failing test:
+<pre><code># tests/unit/test_version_check.py — add to top of file or appropriate class
+from jacked.version_check import _parse_version_tuple
+
+def test_parse_version_tuple_basic():
+    assert _parse_version_tuple("0.45.3") == (0, 45, 3)
+
+def test_parse_version_tuple_strips_local():
+    assert _parse_version_tuple("0.45.3+local.dev") == (0, 45, 3)
+
+def test_parse_version_tuple_strips_dash_suffix():
+    assert _parse_version_tuple("0.45.3-beta") == (0, 45, 3)
+
+def test_parse_version_tuple_stops_at_non_numeric():
+    assert _parse_version_tuple("0.45.3.dev1") == (0, 45, 3)
+
+def test_parse_version_tuple_unparseable_returns_empty():
+    assert _parse_version_tuple("xyz") == ()
+</code></pre></li>
+
+<li><input type="checkbox" disabled> 1.2 — Run: <code>uv run python -m pytest tests/unit/test_version_check.py -k _parse_version_tuple -v</code> — expect ImportError / 5 failures.</li>
+
+<li><input type="checkbox" disabled> 1.3 — Implement in <code>jacked/version_check.py</code> (insert above <code>is_newer</code>):
+<pre><code>def _parse_version_tuple(v: str) -> tuple:
+    """Parse a PEP 440-ish version string into a tuple of leading numeric parts.
+
+    >>> _parse_version_tuple("0.45.3")
+    (0, 45, 3)
+    >>> _parse_version_tuple("0.45.3+local")
+    (0, 45, 3)
+    >>> _parse_version_tuple("0.45.3-beta")
+    (0, 45, 3)
+    >>> _parse_version_tuple("0.45.3.dev1")
+    (0, 45, 3)
+    >>> _parse_version_tuple("xyz")
+    ()
+    """
+    v = v.split("+")[0].split("-")[0]
+    parts = []
+    for x in v.split("."):
+        try:
+            parts.append(int(x))
+        except ValueError:
+            break
+    return tuple(parts)
+</code></pre>
+Then refactor <code>is_newer</code> to delegate to it:
+<pre><code>def is_newer(latest: str, current: str) -> bool:
+    """True if latest &gt; current using tuple comparison. No packaging dependency."""
+    try:
+        p_latest, p_current = _parse_version_tuple(latest), _parse_version_tuple(current)
+        if not p_latest or not p_current:
+            return False
+        return p_latest &gt; p_current
+    except (ValueError, AttributeError):
+        return False
+</code></pre></li>
+
+<li><input type="checkbox" disabled> 1.4 — Run: <code>uv run python -m pytest tests/unit/test_version_check.py -v</code> — all _parse_version_tuple tests pass, existing is_newer tests still pass.</li>
+
+<li><input type="checkbox" disabled> 1.5 — Commit:
+<pre><code>git add jacked/version_check.py tests/unit/test_version_check.py
+git commit -m "refactor(version_check): extract _parse_version_tuple helper
+
+Preparing for get_latest_from_simple_index which needs to pick the max
+version from a list of filenames — same parser is_newer uses."</code></pre></li>
+</ul>
+
+<h3>Task 2: Add <code>get_latest_from_simple_index</code></h3>
+<p><strong>Files:</strong> <code>jacked/version_check.py</code>, <code>tests/unit/test_version_check.py</code></p>
+
+<ul class="tasks">
+<li><input type="checkbox" disabled> 2.1 — Write failing tests:
+<pre><code># tests/unit/test_version_check.py
+from unittest.mock import patch, MagicMock
+import json as _json
+from jacked.version_check import get_latest_from_simple_index
+
+# Real-shaped PEP 691 JSON fixture (trimmed)
+SIMPLE_FIXTURE = {
+    "name": "claude-jacked",
+    "files": [
+        {"filename": "claude_jacked-0.45.0-py3-none-any.whl", "url": "..."},
+        {"filename": "claude_jacked-0.45.0.tar.gz", "url": "..."},
+        {"filename": "claude_jacked-0.45.1-py3-none-any.whl", "url": "..."},
+        {"filename": "claude_jacked-0.45.2-py3-none-any.whl", "url": "..."},
+        {"filename": "claude_jacked-0.45.3-py3-none-any.whl", "url": "..."},
+    ],
+}
+
+def _mock_urlopen_response(payload):
+    """Build a context-manager-compatible urlopen mock returning JSON bytes."""
+    resp = MagicMock()
+    resp.read.return_value = _json.dumps(payload).encode("utf-8")
+    cm = MagicMock()
+    cm.__enter__.return_value = resp
+    cm.__exit__.return_value = False
+    return cm
+
+def test_get_latest_from_simple_parses_pep691():
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen_response(SIMPLE_FIXTURE)):
+        assert get_latest_from_simple_index("claude-jacked") == "0.45.3"
+
+def test_get_latest_from_simple_picks_max_not_first():
+    """Files listed in arbitrary order — must pick semver max."""
+    shuffled = {"name": "claude-jacked", "files": [
+        {"filename": "claude_jacked-0.10.0-py3-none-any.whl"},
+        {"filename": "claude_jacked-0.45.3-py3-none-any.whl"},
+        {"filename": "claude_jacked-0.45.0-py3-none-any.whl"},
+        {"filename": "claude_jacked-0.9.0-py3-none-any.whl"},
+    ]}
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen_response(shuffled)):
+        assert get_latest_from_simple_index("claude-jacked") == "0.45.3"
+
+def test_get_latest_from_simple_handles_network_error():
+    with patch("urllib.request.urlopen", side_effect=OSError("boom")):
+        assert get_latest_from_simple_index("claude-jacked") is None
+
+def test_get_latest_from_simple_handles_bad_json():
+    resp = MagicMock(); resp.read.return_value = b"not json {{"
+    cm = MagicMock(); cm.__enter__.return_value = resp; cm.__exit__.return_value = False
+    with patch("urllib.request.urlopen", return_value=cm):
+        assert get_latest_from_simple_index("claude-jacked") is None
+
+def test_get_latest_from_simple_empty_files_returns_none():
+    with patch("urllib.request.urlopen",
+               return_value=_mock_urlopen_response({"name": "claude-jacked", "files": []})):
+        assert get_latest_from_simple_index("claude-jacked") is None
+
+def test_get_latest_from_simple_returns_exact_version_string():
+    """Regression: regex must capture ONLY the version, not '-py3-none-any' tail.
+    Without this assertion the bug stays silent because parse_version_tuple
+    recovers a clean tuple."""
+    payload = {"name": "claude-jacked", "files": [
+        {"filename": "claude_jacked-0.45.3-py3-none-any.whl"},
+        {"filename": "claude_jacked-0.45.3.tar.gz"},
+    ]}
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen_response(payload)):
+        result = get_latest_from_simple_index("claude-jacked")
+    assert result == "0.45.3", f"Expected exact '0.45.3', got {result!r}"
+
+def test_get_latest_from_simple_skips_yanked():
+    """Yanked releases must NOT be advertised as available — uv refuses them."""
+    payload = {"name": "claude-jacked", "files": [
+        {"filename": "claude_jacked-0.45.0-py3-none-any.whl", "yanked": False},
+        {"filename": "claude_jacked-0.45.3-py3-none-any.whl", "yanked": True},
+        {"filename": "claude_jacked-0.45.3.tar.gz", "yanked": "broken release"},
+        {"filename": "claude_jacked-0.45.2-py3-none-any.whl", "yanked": False},
+    ]}
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen_response(payload)):
+        assert get_latest_from_simple_index("claude-jacked") == "0.45.2"
+</code></pre></li>
+
+<li><input type="checkbox" disabled> 2.2 — Run: <code>uv run python -m pytest tests/unit/test_version_check.py -k get_latest_from_simple -v</code> — expect 5 failures (ImportError or function not defined).</li>
+
+<li><input type="checkbox" disabled> 2.3 — Implement in <code>jacked/version_check.py</code>. Add the regex at module top alongside other constants:
+<pre><code>import re
+
+# Matches both wheel and sdist filenames:
+#   claude_jacked-0.45.3-py3-none-any.whl
+#   claude_jacked-0.45.3.tar.gz
+# PEP 503 normalizes the package name to lowercase + underscores in filenames.
+_VERSION_FROM_FILENAME = re.compile(
+    r"^[\w.]+?-(\d+(?:\.\d+)*(?:(?:a|b|rc|\.?dev|\.?post)\d+)?)"
+    r"(?:-py|\.tar\.gz|\.zip|\.whl)"
+)
+# Captures ONLY the version segment, stopping at "-py..." for wheels or the
+# archive suffix for sdists. Without the tight terminator, `-py3-none-any` would
+# bleed into the capture group and the cache would store strings like
+# "0.45.3-py3-none" instead of "0.45.3".
+</code></pre>
+Then add the function below <code>get_latest_pypi_version</code>:
+<pre><code>def get_latest_from_simple_index(package: str = "claude-jacked", timeout: float = 3.0) -&gt; str | None:
+    """Query the PEP 691 JSON variant of /simple/&lt;package&gt;/. Returns max non-yanked version or None.
+
+    This is THE SAME index uv reads. A version's presence here guarantees
+    `uv tool install --refresh` can resolve to it.
+    """
+    try:
+        url = f"https://pypi.org/simple/{package}/"
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        versions = set()
+        for entry in data.get("files", []):
+            if not isinstance(entry, dict):
+                continue
+            # Skip yanked releases — uv won't install them, so we shouldn't
+            # advertise them as "available". PEP 691: yanked is either bool
+            # or non-empty string (reason); falsy means not yanked.
+            if entry.get("yanked"):
+                continue
+            fn = entry.get("filename", "")
+            m = _VERSION_FROM_FILENAME.match(fn)
+            if m:
+                versions.add(m.group(1))
+        if not versions:
+            return None
+        return max(versions, key=_parse_version_tuple)
+    except Exception:
+        return None
+</code></pre></li>
+
+<li><input type="checkbox" disabled> 2.4 — Run: <code>uv run python -m pytest tests/unit/test_version_check.py -k get_latest_from_simple -v</code> — all 5 pass.</li>
+
+<li><input type="checkbox" disabled> 2.5 — Commit:
+<pre><code>git add jacked/version_check.py tests/unit/test_version_check.py
+git commit -m "feat(version_check): probe /simple/ index via PEP 691 JSON
+
+Adds get_latest_from_simple_index() which reads the same PyPI index uv
+consumes. Foundation for the pre-flight agreement check next commit."</code></pre></li>
+</ul>
+
+<h3>Task 3: Modify <code>check_version_cached</code> to consult both endpoints</h3>
+<p><strong>Files:</strong> <code>jacked/version_check.py</code>, <code>tests/unit/test_version_check.py</code></p>
+
+<ul class="tasks">
+<li><input type="checkbox" disabled> 3.1 — Read the current <code>check_version_cached</code> in full to understand the cache-read shortcut, the network-probe block, and the cache-write block. Identify the lines around <code>get_latest_pypi_version()</code> and the dict written to cache.</li>
+
+<li><input type="checkbox" disabled> 3.2 — Write failing tests:
+<pre><code># tests/unit/test_version_check.py
+import time
+from jacked.version_check import check_version_cached, VERSION_CACHE
+
+def _isolate_cache(tmp_path, monkeypatch):
+    """Point VERSION_CACHE to a tmp file for the duration of the test."""
+    cache = tmp_path / "vcache.json"
+    monkeypatch.setattr("jacked.version_check.VERSION_CACHE", cache)
+    return cache
+
+def test_outdated_false_when_simple_lags_pypi(tmp_path, monkeypatch):
+    """Regression: v0.45.2 -&gt; v0.45.3 propagation lag must NOT show outdated=True."""
+    _isolate_cache(tmp_path, monkeypatch)
+    with patch("jacked.version_check.get_latest_pypi_version", return_value="0.45.3"), \
+         patch("jacked.version_check.get_latest_from_simple_index", return_value="0.45.2"):
+        result = check_version_cached("0.45.2", force=True)
+    assert result is not None
+    assert result["outdated"] is False
+    assert result["installable_latest"] == "0.45.2"
+    assert result["pypi_latest"] == "0.45.3"
+    assert result["simple_latest"] == "0.45.2"
+
+def test_outdated_true_when_both_endpoints_agree(tmp_path, monkeypatch):
+    _isolate_cache(tmp_path, monkeypatch)
+    with patch("jacked.version_check.get_latest_pypi_version", return_value="0.45.3"), \
+         patch("jacked.version_check.get_latest_from_simple_index", return_value="0.45.3"):
+        result = check_version_cached("0.45.2", force=True)
+    assert result["outdated"] is True
+    assert result["installable_latest"] == "0.45.3"
+
+def test_outdated_false_when_simple_unreachable(tmp_path, monkeypatch):
+    _isolate_cache(tmp_path, monkeypatch)
+    with patch("jacked.version_check.get_latest_pypi_version", return_value="0.45.3"), \
+         patch("jacked.version_check.get_latest_from_simple_index", return_value=None):
+        result = check_version_cached("0.45.2", force=True)
+    assert result["outdated"] is False
+
+def test_outdated_false_when_pypi_unreachable(tmp_path, monkeypatch):
+    _isolate_cache(tmp_path, monkeypatch)
+    with patch("jacked.version_check.get_latest_pypi_version", return_value=None), \
+         patch("jacked.version_check.get_latest_from_simple_index", return_value="0.45.3"):
+        result = check_version_cached("0.45.2", force=True)
+    assert result["outdated"] is False
+
+def test_outdated_false_when_simple_returns_garbage_version(tmp_path, monkeypatch):
+    """Defensive: if /simple/ probe somehow returns an unparseable string,
+    fall back to outdated=false instead of caching garbage as installable_latest."""
+    _isolate_cache(tmp_path, monkeypatch)
+    with patch("jacked.version_check.get_latest_pypi_version", return_value="0.45.3"), \
+         patch("jacked.version_check.get_latest_from_simple_index", return_value="garbage-version-string"):
+        result = check_version_cached("0.45.2", force=True)
+    assert result["outdated"] is False
+    assert result["installable_latest"] == "0.45.2"  # current_version, not garbage
+
+def test_old_cache_schema_triggers_refetch(tmp_path, monkeypatch):
+    """Old cache file only had 'latest' key. New schema needs pypi_latest+simple_latest.
+    Reader must treat the old format as a cache miss and re-probe."""
+    import json as _json
+    cache = _isolate_cache(tmp_path, monkeypatch)
+    cache.write_text(_json.dumps({
+        "latest": "0.45.3",
+        "checked_at": time.time(),  # fresh — would normally short-circuit
+    }))
+    with patch("jacked.version_check.get_latest_pypi_version", return_value="0.45.3") as p_pypi, \
+         patch("jacked.version_check.get_latest_from_simple_index", return_value="0.45.3") as p_simple:
+        result = check_version_cached("0.45.2", force=False)
+    # Must have re-probed both endpoints despite fresh cache
+    assert p_pypi.called and p_simple.called
+    assert result["installable_latest"] == "0.45.3"
+</code></pre></li>
+
+<li><input type="checkbox" disabled> 3.3 — Run: <code>uv run python -m pytest tests/unit/test_version_check.py -k "outdated_ or old_cache_schema" -v</code> — expect 5 failures.</li>
+
+<li><input type="checkbox" disabled> 3.4 — Modify <code>check_version_cached</code> in <code>jacked/version_check.py</code>. Final shape:
+<pre><code>def check_version_cached(current_version: str, force: bool = False) -&gt; dict | None:
+    """Check PyPI with 24h cache. Returns dict with keys:
+       latest (alias for installable_latest, kept for back-compat),
+       installable_latest, pypi_latest, simple_latest, outdated, checked_at, next_check_at.
+
+    Both /pypi/json and /simple/ are probed; outdated is true only when the LESSER
+    of the two (== what uv would actually install) is newer than current_version.
+    This eliminates phantom 'Update available' badges when PyPI's /simple/ index
+    is still propagating a newly-published release.
+    """
+    try:
+        now = time.time()
+
+        if not force:
+            try:
+                if VERSION_CACHE.exists():
+                    cache = json.loads(VERSION_CACHE.read_text(encoding="utf-8"))
+                    checked_at = cache.get("checked_at", 0)
+                    age = now - checked_at
+                    if 0 &lt;= age &lt; CACHE_TTL:
+                        # New-schema cache hit
+                        installable = cache.get("installable_latest")
+                        if installable:
+                            return {
+                                "latest": installable,                     # back-compat alias
+                                "installable_latest": installable,
+                                "pypi_latest": cache.get("pypi_latest"),
+                                "simple_latest": cache.get("simple_latest"),
+                                "outdated": is_newer(installable, current_version),
+                                "ahead": is_newer(current_version, installable),
+                                "checked_at": checked_at,
+                                "next_check_at": checked_at + CACHE_TTL,
+                            }
+                        # Old schema (just 'latest') — treat as miss, re-fetch
+            except Exception:
+                pass
+
+        pypi_latest = get_latest_pypi_version()
+        simple_latest = get_latest_from_simple_index()
+
+        # Conservative: if either probe failed OR returned an unparseable
+        # version (defensive — PyPI shouldn't ever do this, but a corrupted
+        # cache/proxy could), do not surface an update.
+        if not pypi_latest or not simple_latest:
+            installable = current_version
+        else:
+            p_pypi = _parse_version_tuple(pypi_latest)
+            p_simple = _parse_version_tuple(simple_latest)
+            if not p_pypi or not p_simple:
+                installable = current_version
+            else:
+                # The LESSER of the two — what uv would actually resolve to.
+                installable = pypi_latest if p_pypi &lt;= p_simple else simple_latest
+
+        outdated = is_newer(installable, current_version)
+
+        cache_data = {
+            "checked_at": now,
+            "pypi_latest": pypi_latest,
+            "simple_latest": simple_latest,
+            "installable_latest": installable,
+            "latest": installable,          # back-compat for downgrade to pre-v0.45.4
+            "current": current_version,
+            "outdated": outdated,
+        }
+        # Atomic write — tempfile + os.replace — preserves the crash-safety
+        # guarantee the prior implementation had. Half-written cache files
+        # otherwise survive Ctrl-C / OOM during write and silently break
+        # subsequent reads.
+        try:
+            import tempfile, os
+            VERSION_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=str(VERSION_CACHE.parent),
+                                            prefix=".vcache-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(cache_data, fh)
+                os.replace(tmp_path, VERSION_CACHE)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            pass
+
+        return {
+            "latest": installable,
+            "installable_latest": installable,
+            "pypi_latest": pypi_latest,
+            "simple_latest": simple_latest,
+            "outdated": outdated,
+            "ahead": is_newer(current_version, installable),
+            "checked_at": now,
+            "next_check_at": now + CACHE_TTL,
+        }
+    except Exception:
+        return None
+</code></pre>
+
+The min-via-tuple-compare line is the single source of truth for picking the installable version. Empty-tuple parses sort smallest (handled by the fallthrough when either probe is None).</li>
+
+<li><input type="checkbox" disabled> 3.5 — Run: <code>uv run python -m pytest tests/unit/test_version_check.py -v</code> — all new tests pass + every prior test still passes.</li>
+
+<li><input type="checkbox" disabled> 3.6 — Commit:
+<pre><code>git add jacked/version_check.py tests/unit/test_version_check.py
+git commit -m "fix(version_check): require /pypi/json AND /simple/ to agree before flagging outdated
+
+Closes the 'phantom Update available' UX bug: when a new release lands on
+/pypi/json (instant) but /simple/ is still propagating (seconds to minutes
+of Fastly cache lag), the tray would show an Update button that uv can't
+actually install — leading to 'Update complete — now v0.45.2' when the
+user clicked Update expecting 0.45.3.
+
+Now: outdated=true only when the LESSER of the two endpoints (== what uv
+will resolve to) is newer than the installed version. If either endpoint
+fails, default to outdated=false (conservative — never surface a phantom).
+
+Cache schema gained pypi_latest + simple_latest + installable_latest.
+Old-schema cache files trigger a re-fetch on first read.
+
+Refs: docs/superpowers/specs/2026-05-20-update-ux-pre-flight-simple-index.html"</code></pre></li>
+</ul>
+
+<h3>Task 4: Bump version, commit, push, release</h3>
+
+<ul class="tasks">
+<li><input type="checkbox" disabled> 4.1 — Edit <code>jacked/__init__.py</code>: <code>__version__ = "0.45.4"</code></li>
+<li><input type="checkbox" disabled> 4.2 — Run full test suite: <code>uv run python -m pytest tests/unit/test_version_check.py -v</code> — all pass.</li>
+<li><input type="checkbox" disabled> 4.3 — Commit + tag:
+<pre><code>git add jacked/__init__.py
+git commit -m "chore: bump version to 0.45.4"
+git tag v0.45.4
+git push origin master --tags</code></pre></li>
+<li><input type="checkbox" disabled> 4.4 — Create GitHub release with release notes describing the phantom-update fix.</li>
+<li><input type="checkbox" disabled> 4.5 — Wait for /simple/ index to surface v0.45.4: <code>until curl -s https://pypi.org/simple/claude-jacked/ | grep -q "claude_jacked-0.45.4"; do sleep 5; done</code></li>
+<li><input type="checkbox" disabled> 4.6 — Bust the 24h version cache so the tray re-polls fresh: <code>rm ~/.claude/jacked-version-cache.json</code></li>
+<li><input type="checkbox" disabled> 4.7 — Try the tray "Update" from v0.45.3 → v0.45.4. Verify it lands on v0.45.4 cleanly. (Manual verification step.)</li>
+</ul>
+
+<h2>Test plan</h2>
+<ul>
+  <li><code>uv run python -m pytest tests/unit/test_version_check.py -v</code> — must show all new tests pass + existing tests unaffected</li>
+  <li><code>uv run python -m pytest -q --tb=line</code> — full suite; 5 pre-existing analytics/dual_token failures remain (unrelated)</li>
+  <li>Manual: trigger tray "Update" v0.45.3 → v0.45.4 after PyPI <code>/simple/</code> propagates; verify the actual landed version matches the advertised target</li>
+</ul>
+
+<h2>Risks &amp; mitigations</h2>
+<table>
+  <thead><tr><th>Risk</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>PEP 691 JSON not enabled at PyPI for some mirror</td><td>Falls into the network-error path → returns None → outdated=false. Conservative.</td></tr>
+    <tr><td>Filename regex misses an exotic distribution format</td><td>Versions parsed from filenames — if regex misses ALL files, returns None → outdated=false.</td></tr>
+    <tr><td>min() of two version strings — wrong if one parses to empty tuple</td><td>Use <code>_parse_version_tuple</code> consistently; empty tuple sorts as the smallest, so an unparseable side never wins as "max" and the lesser of (parseable, empty) is empty → installable=current → outdated=false.</td></tr>
+    <tr><td>Old cache invalidation churns through one extra PyPI fetch per user on upgrade</td><td>Acceptable — happens once per user; no operational issue. PyPI tolerates this easily.</td></tr>
+    <tr><td>Discovery slower by ~100-200ms (one extra HTTP call)</td><td>Cache absorbs all but first poll. First poll runs in tray's background thread.</td></tr>
+  </tbody>
+</table>
+
+<h2>Open questions</h2>
+<ul>
+  <li>Should the cache TTL be shortened (e.g. to 1h) when we detect a propagation gap? <strong>Plan answer: no</strong> — out of scope. 24h cache + manual "Check for updates" is sufficient.</li>
+  <li>Should we add a post-flight verification (compare expected target vs installed version after upgrade)? <strong>Plan answer: defer</strong> — pre-flight should be sufficient; revisit only if a real propagation race between Check and Install is observed in the wild.</li>
+</ul>
+
+</div>
+</body>
+</html>
