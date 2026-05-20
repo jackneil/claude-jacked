@@ -102,6 +102,37 @@ class TestRunUpdate:
         content = (tmp_path / "recovery.txt").read_text()
         assert "uv tool install" in content
 
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_finally_guard_kicks_service_when_upgrade_phase_bails_early(
+        self, mock_popen, mock_run, mock_find, mock_method, mock_gate, tmp_path, monkeypatch,
+    ):
+        """When the upgrade phase exits early (e.g. install --force fails),
+        the finally-guard MUST attempt native_restart so the tray comes back.
+        Regression test for the SameFileError-leaves-tray-dead bug (v0.45.0)."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
+        # First subprocess.run (uv tool install) succeeds; second (jacked install) fails.
+        mock_run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=1)]
+
+        # Track whether native_restart was called from the finally-guard.
+        with patch("jacked.service.platform.native_restart", return_value=(True, "test-kickstart")) as mock_restart, \
+             patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        # Two subprocess.run calls happened (uv + jacked install), and neither
+        # success-path restart nor Popen fallback ran (install bailed first).
+        # The finally-guard SHOULD have called native_restart exactly once.
+        assert mock_restart.called, \
+            "Finally-guard must call native_restart when upgrade bails early"
+        # Log should record the guard firing.
+        assert "Final guard" in (tmp_path / "update.log").read_text()
+
     # Removed in 0.41.19: pip installs are refused by the gate, not auto-upgraded.
 
 

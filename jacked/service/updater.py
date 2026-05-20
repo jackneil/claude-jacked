@@ -187,6 +187,10 @@ def run_update(
         except Exception:
             logger.exception("end_phase failed: %s", phase)
 
+    # Set to True by any restart path (success or fallback) so the
+    # finally-guard skips a duplicate restart.
+    _restart_attempted = [False]
+
     try:
         # Phase: waiting_for_parent
         _begin("waiting_for_parent")
@@ -367,9 +371,11 @@ def run_update(
         if ens_ok:
             if ens_state == "just_installed":
                 log(f"Native lifecycle freshly installed (RunAtLoad booted service): {ens_reason}")
+                _restart_attempted[0] = True
             else:
                 # already_installed → atomic kickstart
                 native_ok, native_reason = native_restart()
+                _restart_attempted[0] = True
                 if native_ok:
                     log(f"Native lifecycle restart: {native_reason}")
                 else:
@@ -378,6 +384,7 @@ def run_update(
         else:
             log(f"Native lifecycle unavailable ({ens_reason}); manual spawn")
             _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
+            _restart_attempted[0] = True
         _end("starting_service", "ok")
 
         # Phase: verifying_service
@@ -430,6 +437,20 @@ def run_update(
                 "  jacked service start\n"
             )
     finally:
+        # Best-effort recovery: ensure the service comes back up even when an
+        # upgrade phase bailed early via `return`. Previously a SameFileError
+        # in `jacked install --force` (or any other failure path) left the
+        # tray permanently dead — the parent process had already exited and
+        # nothing kicked launchd back into life. Skip when the success path
+        # already attempted a restart (avoids duplicate launchctl calls).
+        if not _restart_attempted[0]:
+            try:
+                from jacked.service.platform import native_restart
+                log("Final guard: no restart attempted by upgrade flow — kickstart")
+                ok, reason = native_restart()
+                log(f"Final guard: native_restart {'OK' if ok else 'FAILED'} ({reason})")
+            except Exception:
+                logger.exception("Final-guard native_restart raised")
         log_fh.close()
 
 
