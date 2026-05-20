@@ -102,6 +102,60 @@ A lockfile that doesn't pin hashes lets a network MITM swap content for the same
 ```
 
 ```bash
+# Stricter check: verify EVERY package in uv.lock has at least one hash.
+# A single un-hashed package means an attacker can swap content for that one dep without detection.
+[ -f uv.lock ] && uv run python -c "
+import re, sys
+content = open('uv.lock').read()
+packages = re.findall(r'\[\[package\]\]\nname = \"([^\"]+)\"\nversion = \"([^\"]+)\"', content)
+sections = content.split('[[package]]')[1:]
+unhashed = []
+for sec, (name, version) in zip(sections, packages):
+    if 'hash = \"sha256:' not in sec and 'hash = \"sha512:' not in sec:
+        # source = workspace deps don't need hashes (local path)
+        if 'source = { virtual' in sec or 'source = { editable' in sec:
+            continue
+        unhashed.append(f'{name}=={version}')
+print(f'Packages in lockfile: {len(packages)}')
+print(f'Unhashed (registry) packages: {len(unhashed)}')
+if unhashed:
+    print('CRITICAL - unhashed:', ', '.join(unhashed[:10]))
+    sys.exit(1)
+" 2>&1
+```
+
+```bash
+# Loose-range scan in pyproject.toml — flag prod deps with no upper bound (a poisoned
+# vMAX published tomorrow would be accepted on next resolve, even though uv.lock is fine today).
+[ -f pyproject.toml ] && uv run python -c "
+import tomllib
+data = tomllib.loads(open('pyproject.toml','rb').read().decode())
+deps = data.get('project', {}).get('dependencies', [])
+loose = []
+for d in deps:
+    # Match >= without a corresponding < / != / == upper bound
+    if '>=' in d and not any(op in d for op in ['<', '!=', '==', ',']):
+        loose.append(d)
+    elif d.endswith('*') or '~=' not in d and '==' not in d and '<' not in d and '>=' not in d:
+        # bare 'foo' or 'foo*' — no constraint at all
+        if not any(c in d for c in '<>=!~'):
+            loose.append(d)
+print(f'Prod deps with no upper-bound: {len(loose)}/{len(deps)}')
+for d in loose: print(' -', d)
+" 2>&1
+```
+
+```bash
+# Cooldown enforcement — does the codebase use --exclude-newer (uv) or minimumReleaseAge (npm) somewhere?
+# This is the cheapest defense against smash-and-grab attacks (axios 1.14.1, Shai-Hulud).
+grep -rE "exclude-newer|uploaded-prior-to|minimumReleaseAge|min-release-age" . \
+  --include="*.toml" --include="*.yml" --include="*.yaml" --include="*.in" \
+  --include=".npmrc" --include="Makefile" --include="*.sh" \
+  --exclude-dir=node_modules --exclude-dir=.venv \
+  2>/dev/null | head -10 || echo "MISSING: no dependency cooldown configured (recommend 7-day cooldown for prod resolves)"
+```
+
+```bash
 # pip-tools / requirements.txt: hashes must be present
 [ -f requirements.txt ] && grep -c "^--hash=" requirements.txt 2>/dev/null
 [ -f requirements.txt ] && head -5 requirements.txt 2>/dev/null
@@ -116,10 +170,15 @@ Flag as **CRITICAL**:
 - Project has `pyproject.toml` or `requirements.in` but no lockfile committed
 - `requirements.txt` exists without `--hash=` lines (silent verification bypass — one unhashed line disables hash checking for ALL packages)
 - Lockfile committed but CI install doesn't use `--frozen` / `--require-hashes`
+- **Per-package transitive verification**: even ONE package in `uv.lock` without a hash is CRITICAL — an attacker can swap content for that one transitive dep without detection
 
 Flag as **HIGH**:
 - Lockfile is more than 6 months older than the most-recent commit (likely stale)
 - `pip install` without `--only-binary=:all:` for production deps (allows arbitrary `setup.py` execution)
+- **Loose upper-bound ranges in pyproject.toml prod deps** — `requests>=2.31` with no upper-bound means a poisoned `requests@99.0.0` published tomorrow is accepted on the next fresh `uv sync` (your lockfile protects YOUR build but downstream consumers and dev re-resolves are exposed). Flag any `>=` without a paired `<` / `!=` / `==` constraint for production deps.
+- **No cooldown configured** — no `--exclude-newer=DATE` / `--uploaded-prior-to` (uv/pip) or `minimumReleaseAge` (npm/pnpm/yarn) anywhere in pyproject/configs/scripts. Cooldown is the single cheapest defense against smash-and-grab attacks; recommend 7 days minimum for prod resolves.
+
+Note on transitive pinning: the lockfile IS the transitive-pin defense for YOUR build (every direct + transitive dep gets exact version + hash). But it does not bind downstream consumers — they resolve against your `pyproject.toml` ranges. So both controls matter: lockfile pinning for your own reproducibility, AND tight version ranges for downstream consumer safety.
 
 ### Node
 
