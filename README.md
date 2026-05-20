@@ -61,7 +61,7 @@ Add to your team's Claude Code environment — no Python install needed:
 /plugin install jacked@jacked-marketplace
 ```
 
-Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 23 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 24 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
 
 **Want more?** Add optional extras:
 
@@ -153,7 +153,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **23 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **24 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -589,6 +589,7 @@ Type these directly in Claude Code:
 | `/land-and-deploy` | **Land & Deploy** — Merges PR, waits for CI/deploy, runs canary verification, offers revert |
 | `/browser-reset` | **Browser Reset** — Diagnoses and fixes stuck browser MCP connections |
 | `/docs-sync` | **Docs Sync** — Diffs branch against base, maps code changes to affected docs, spawns parallel update agents |
+| `/lockdown` | **Supply-Chain Lockdown** — Audits repo against supply-chain attacks (lockfile integrity, CVE/malware scan, Actions SHA-pinning, provenance, secrets), HIPAA mapping for PHI repos. `fix` mode auto-hardens low-risk items; `baseline` installs ongoing CI monitoring |
 
 ### Smart Reviewers
 
@@ -793,7 +794,7 @@ jacked service status              # Show PID, port, uptime, autostart state
 # Slash Commands
 # /dc /dcr /docs-sync /pr /learn /redo /techdebt /audit-rules /qa /ux
 # /swarm /swarm-research /release /whats-next /jacked-setup
-# /freeze /unfreeze /cso /retro /canary /benchmark
+# /freeze /unfreeze /cso /lockdown /retro /canary /benchmark
 # /land-and-deploy /browser-reset
 ```
 
