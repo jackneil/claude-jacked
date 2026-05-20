@@ -30,7 +30,7 @@ dependencies = [
     "uvicorn[standard]>=0.20,<1",
     "httpx>=0.24,<1",
     "aiohttp>=3.9,<4",
-    "packaging>=23.0,<26",
+    "packaging>=23.0,<27",
     "anthropic>=0.40,<1",
 ]
 
