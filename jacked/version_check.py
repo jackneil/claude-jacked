@@ -26,6 +26,30 @@ def get_latest_pypi_version(package: str = "claude-jacked", timeout: float = 3.0
         return None
 
 
+def _parse_version_tuple(v: str) -> tuple:
+    """Parse a PEP 440-ish version string into a tuple of leading numeric parts.
+
+    >>> _parse_version_tuple("0.45.3")
+    (0, 45, 3)
+    >>> _parse_version_tuple("0.45.3+local")
+    (0, 45, 3)
+    >>> _parse_version_tuple("0.45.3-beta")
+    (0, 45, 3)
+    >>> _parse_version_tuple("0.45.3.dev1")
+    (0, 45, 3)
+    >>> _parse_version_tuple("xyz")
+    ()
+    """
+    v = v.split("+")[0].split("-")[0]
+    parts = []
+    for x in v.split("."):
+        try:
+            parts.append(int(x))
+        except ValueError:
+            break
+    return tuple(parts)
+
+
 def is_newer(latest: str, current: str) -> bool:
     """True if latest > current using tuple comparison. No packaging dependency.
 
@@ -45,18 +69,7 @@ def is_newer(latest: str, current: str) -> bool:
     True
     """
     try:
-        def parse(v: str) -> tuple:
-            # Strip +local/-beta suffixes, then take leading numeric parts only
-            # "0.3.11.dev1" → (0, 3, 11), "0.3.11+local" → (0, 3, 11)
-            v = v.split("+")[0].split("-")[0]
-            parts = []
-            for x in v.split("."):
-                try:
-                    parts.append(int(x))
-                except ValueError:
-                    break  # Stop at first non-numeric part (e.g. "dev1", "rc1")
-            return tuple(parts)
-        p_latest, p_current = parse(latest), parse(current)
+        p_latest, p_current = _parse_version_tuple(latest), _parse_version_tuple(current)
         if not p_latest or not p_current:
             return False  # Unparseable version — don't nag
         return p_latest > p_current

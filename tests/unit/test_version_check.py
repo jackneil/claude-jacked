@@ -7,6 +7,25 @@ from unittest.mock import patch, MagicMock
 from jacked import version_check as vc
 
 
+class TestParseVersionTuple:
+    """Tests for _parse_version_tuple() module-level helper."""
+
+    def test_parse_version_tuple_basic(self):
+        assert vc._parse_version_tuple("0.45.3") == (0, 45, 3)
+
+    def test_parse_version_tuple_strips_local(self):
+        assert vc._parse_version_tuple("0.45.3+local.dev") == (0, 45, 3)
+
+    def test_parse_version_tuple_strips_dash_suffix(self):
+        assert vc._parse_version_tuple("0.45.3-beta") == (0, 45, 3)
+
+    def test_parse_version_tuple_stops_at_non_numeric(self):
+        assert vc._parse_version_tuple("0.45.3.dev1") == (0, 45, 3)
+
+    def test_parse_version_tuple_unparseable_returns_empty(self):
+        assert vc._parse_version_tuple("xyz") == ()
+
+
 class TestIsNewer:
     """Tests for is_newer() version comparison."""
 
