@@ -62,6 +62,10 @@ class TestUpgradeCommand:
         assert "tool" in cmd and "install" in cmd
         assert "claude-jacked[tray]" in cmd
         assert "--force" in cmd
+        # --refresh bypasses uv's package-index cache so a `--force` reinstall
+        # actually picks up newly-published versions (tray "Update" silently
+        # no-op'd between releases without this flag).
+        assert "--refresh" in cmd
 
     def test_pipx_method_uses_pipx_install_force(self):
         with patch("jacked.install_method.detect_install_method", return_value="pipx"):
@@ -89,7 +93,7 @@ class TestUpgradeCommandLabel:
     def test_uv_label_is_readable(self):
         with patch("jacked.install_method.detect_install_method", return_value="uv"):
             label = upgrade_command_label(extras="tray")
-        assert 'uv tool install "claude-jacked[tray]" --force' == label
+        assert 'uv tool install "claude-jacked[tray]" --force --refresh' == label
 
     def test_pipx_label_is_readable(self):
         with patch("jacked.install_method.detect_install_method", return_value="pipx"):

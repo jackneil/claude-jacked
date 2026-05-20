@@ -159,7 +159,11 @@ def upgrade_command(extras: str = "tray") -> list[str]:
     """
     method = detect_install_method()
     if method == "uv":
-        return ["uv", "tool", "install", f"claude-jacked[{extras}]", "--force"]
+        # `--refresh` is critical: without it uv may return cached package
+        # metadata and a `--force` reinstall stays on the cached version even
+        # when a newer one was just published. That made the tray "Update"
+        # button silently no-op when run within uv's cache TTL of a release.
+        return ["uv", "tool", "install", f"claude-jacked[{extras}]", "--force", "--refresh"]
     if method == "pipx":
         return [
             "pipx", "install", f"claude-jacked[{extras}]",
@@ -178,7 +182,7 @@ def upgrade_command_label(extras: str = "tray") -> str:
     """
     method = detect_install_method()
     if method == "uv":
-        return f'uv tool install "claude-jacked[{extras}]" --force'
+        return f'uv tool install "claude-jacked[{extras}]" --force --refresh'
     if method == "pipx":
         return f'pipx install "claude-jacked[{extras}]" --force'
     raise ValueError(
