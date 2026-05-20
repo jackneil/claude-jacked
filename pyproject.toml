@@ -23,39 +23,39 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "click>=8.0.0",
-    "python-dotenv>=1.0.0",
-    "rich>=13.0.0",
-    "fastapi>=0.100",
-    "uvicorn[standard]>=0.20",
-    "httpx>=0.24",
-    "aiohttp>=3.9.0",
-    "packaging>=23.0",
-    "anthropic>=0.40.0",
+    "click>=8.0,<9",
+    "python-dotenv>=1.2.2,<2",
+    "rich>=13.0,<16",
+    "fastapi>=0.100,<1",
+    "uvicorn[standard]>=0.20,<1",
+    "httpx>=0.24,<1",
+    "aiohttp>=3.9,<4",
+    "packaging>=23.0,<26",
+    "anthropic>=0.40,<1",
 ]
 
 [project.optional-dependencies]
 search = [
-    "qdrant-client>=1.7.0",
+    "qdrant-client>=1.7,<2",
 ]
 security = []  # backwards compat — anthropic is now a core dependency
 web = []
 tray = [
-    "pystray>=0.19",
-    "Pillow>=9.0",
+    "pystray>=0.19,<1",
+    "Pillow>=9.0,<13",
 ]
 all = [
-    "qdrant-client>=1.7.0",
-    "pystray>=0.19",
-    "Pillow>=9.0",
+    "qdrant-client>=1.7,<2",
+    "pystray>=0.19,<1",
+    "Pillow>=9.0,<13",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "qdrant-client>=1.7.0",
-    "websockets>=12.0",
+    "pytest>=9.0.3,<10",
+    "pytest-cov>=4.0,<8",
+    "qdrant-client>=1.7,<2",
+    "websockets>=12.0,<17",
 ]
 
 [project.scripts]
@@ -75,3 +75,10 @@ packages = ["jacked"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+# Supply-chain hardening: uv resolves only versions uploaded before this date.
+# Defends against smash-and-grab attacks (axios 1.14.1, Shai-Hulud, etc.) — gives
+# the community time to flag a poisoned release before it lands in our build.
+# Bump as part of intentional dep refreshes (≥ 7 days ago is the minimum standard).
+[tool.uv]
+exclude-newer = "2026-05-13T00:00:00Z"
