@@ -125,16 +125,18 @@ def is_newer(latest: str, current: str) -> bool:
 
 
 def check_version_cached(current_version: str, force: bool = False) -> dict | None:
-    """Check PyPI with 24h cache. Returns {"latest", "outdated", "checked_at", "next_check_at"} or None.
+    """Check PyPI with 24h cache. Returns dict with keys:
+       latest (alias for installable_latest, kept for back-compat),
+       installable_latest, pypi_latest, simple_latest, outdated, checked_at, next_check_at.
 
-    >>> result = check_version_cached.__doc__  # doctest placeholder
-    >>> isinstance(result, str)
-    True
+    Both /pypi/json and /simple/ are probed; outdated is true only when the LESSER
+    of the two (== what uv would actually install) is newer than current_version.
+    This eliminates phantom 'Update available' badges when PyPI's /simple/ index
+    is still propagating a newly-published release.
     """
     try:
         now = time.time()
 
-        # Read cache (corrupt cache falls through to PyPI check)
         if not force:
             try:
                 if VERSION_CACHE.exists():
@@ -142,48 +144,82 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
                     checked_at = cache.get("checked_at", 0)
                     age = now - checked_at
                     if 0 <= age < CACHE_TTL:
-                        latest = cache.get("latest", "")
-                        if latest:
+                        # New-schema cache hit
+                        installable = cache.get("installable_latest")
+                        if installable:
                             return {
-                                "latest": latest,
-                                "outdated": is_newer(latest, current_version),
-                                "ahead": is_newer(current_version, latest),
+                                "latest": installable,                     # back-compat alias
+                                "installable_latest": installable,
+                                "pypi_latest": cache.get("pypi_latest"),
+                                "simple_latest": cache.get("simple_latest"),
+                                "outdated": is_newer(installable, current_version),
+                                "ahead": is_newer(current_version, installable),
                                 "checked_at": checked_at,
                                 "next_check_at": checked_at + CACHE_TTL,
                             }
-                        return None
-            except (json.JSONDecodeError, KeyError, TypeError):
-                pass  # Corrupt cache — fall through to PyPI
+                        # Old schema (just 'latest') — treat as miss, re-fetch
+            except Exception:
+                pass
 
-        # Cache stale, missing, corrupt, or force refresh — hit PyPI
-        latest = get_latest_pypi_version()
-        if latest is None:
-            return None
+        pypi_latest = get_latest_pypi_version()
+        simple_latest = get_latest_from_simple_index()
 
-        # Write cache atomically (temp file + replace)
-        import tempfile
-        import os
-        VERSION_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        cache_data = json.dumps({"checked_at": now, "latest": latest})
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=VERSION_CACHE.parent, suffix=".tmp")
+        # Conservative: if either probe failed OR returned an unparseable
+        # version (defensive — PyPI shouldn't ever do this, but a corrupted
+        # cache/proxy could), do not surface an update.
+        if not pypi_latest or not simple_latest:
+            installable = current_version
+        else:
+            p_pypi = _parse_version_tuple(pypi_latest)
+            p_simple = _parse_version_tuple(simple_latest)
+            if not p_pypi or not p_simple:
+                installable = current_version
+            else:
+                # The LESSER of the two — what uv would actually resolve to.
+                installable = pypi_latest if p_pypi <= p_simple else simple_latest
+
+        outdated = is_newer(installable, current_version)
+
+        cache_data = {
+            "checked_at": now,
+            "pypi_latest": pypi_latest,
+            "simple_latest": simple_latest,
+            "installable_latest": installable,
+            "latest": installable,          # back-compat for downgrade to pre-v0.45.4
+            "current": current_version,
+            "outdated": outdated,
+        }
+        # Atomic write — tempfile + os.replace — preserves the crash-safety
+        # guarantee the prior implementation had. Half-written cache files
+        # otherwise survive Ctrl-C / OOM during write and silently break
+        # subsequent reads.
         try:
-            os.write(tmp_fd, cache_data.encode("utf-8"))
-            os.close(tmp_fd)
-            os.replace(tmp_path, str(VERSION_CACHE))
+            import tempfile
+            import os
+            VERSION_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(VERSION_CACHE.parent), prefix=".vcache-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(cache_data, fh)
+                os.replace(tmp_path, VERSION_CACHE)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception:
-            try:
-                os.close(tmp_fd)
-            except Exception:
-                pass
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            pass
 
         return {
-            "latest": latest,
-            "outdated": is_newer(latest, current_version),
-            "ahead": is_newer(current_version, latest),
+            "latest": installable,
+            "installable_latest": installable,
+            "pypi_latest": pypi_latest,
+            "simple_latest": simple_latest,
+            "outdated": outdated,
+            "ahead": is_newer(current_version, installable),
             "checked_at": now,
             "next_check_at": now + CACHE_TTL,
         }
