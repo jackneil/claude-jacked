@@ -8,6 +8,9 @@ from pathlib import Path
 
 VERSION_CACHE = Path.home() / ".claude" / "jacked-version-cache.json"
 CACHE_TTL = 86400  # 24 hours — tray menu has "Check for updates" for on-demand refresh
+CACHE_TTL_PROBE_FAILURE = 3600  # 1 hour — retry sooner after a transient PyPI/network failure
+                                # so the user isn't stuck "no updates available" for a full day
+                                # after a Fastly hiccup. /dc finding #2 on the v0.45.4 review.
 
 # Matches both wheel and sdist filenames:
 #   claude_jacked-0.45.3-py3-none-any.whl
@@ -143,19 +146,24 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
                     cache = json.loads(VERSION_CACHE.read_text(encoding="utf-8"))
                     checked_at = cache.get("checked_at", 0)
                     age = now - checked_at
-                    if 0 <= age < CACHE_TTL:
+                    # Cached probe-failures (either endpoint null) expire faster
+                    # so we retry within an hour, not a day.
+                    cached_pypi = cache.get("pypi_latest")
+                    cached_simple = cache.get("simple_latest")
+                    cache_ttl = CACHE_TTL if (cached_pypi and cached_simple) else CACHE_TTL_PROBE_FAILURE
+                    if 0 <= age < cache_ttl:
                         # New-schema cache hit
                         installable = cache.get("installable_latest")
                         if installable:
                             return {
                                 "latest": installable,                     # back-compat alias
                                 "installable_latest": installable,
-                                "pypi_latest": cache.get("pypi_latest"),
-                                "simple_latest": cache.get("simple_latest"),
+                                "pypi_latest": cached_pypi,
+                                "simple_latest": cached_simple,
                                 "outdated": is_newer(installable, current_version),
                                 "ahead": is_newer(current_version, installable),
                                 "checked_at": checked_at,
-                                "next_check_at": checked_at + CACHE_TTL,
+                                "next_check_at": checked_at + cache_ttl,
                             }
                         # Old schema (just 'latest') — treat as miss, re-fetch
             except Exception:
@@ -189,6 +197,10 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
             "current": current_version,
             "outdated": outdated,
         }
+        # Shorter TTL when a probe failed — bounce back faster after transient
+        # network/PyPI issues instead of pretending we know for 24 hours.
+        effective_ttl = CACHE_TTL if (pypi_latest and simple_latest) else CACHE_TTL_PROBE_FAILURE
+
         # Atomic write — tempfile + os.replace — preserves the crash-safety
         # guarantee the prior implementation had. Half-written cache files
         # otherwise survive Ctrl-C / OOM during write and silently break
@@ -221,7 +233,7 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
             "outdated": outdated,
             "ahead": is_newer(current_version, installable),
             "checked_at": now,
-            "next_check_at": now + CACHE_TTL,
+            "next_check_at": now + effective_ttl,
         }
     except Exception:
         return None

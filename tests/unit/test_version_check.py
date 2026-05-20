@@ -673,6 +673,47 @@ class TestCheckVersionCachedDualEndpoint:
         assert result["outdated"] is False
         assert result["installable_latest"] == "0.45.2"  # current_version, not garbage
 
+    def test_probe_failure_uses_short_ttl(self, tmp_path, monkeypatch):
+        """When either PyPI probe fails, next_check_at must be ~1h out (not 24h)
+        so a transient outage doesn't lock the tray into 'no updates' for a day."""
+        self._isolate_cache(tmp_path, monkeypatch)
+        with patch(
+            "jacked.version_check.get_latest_pypi_version", return_value="0.45.3"
+        ), patch(
+            "jacked.version_check.get_latest_from_simple_index", return_value=None
+        ):
+            result = vc.check_version_cached("0.45.2", force=True)
+        # Window between checked_at and next_check_at should equal the
+        # probe-failure TTL (3600s), not the success TTL (86400s).
+        window = result["next_check_at"] - result["checked_at"]
+        assert window == vc.CACHE_TTL_PROBE_FAILURE
+        assert window < vc.CACHE_TTL
+
+    def test_probe_failure_cache_expires_at_short_ttl(self, tmp_path, monkeypatch):
+        """A cached entry recorded during a probe failure must also EXPIRE at
+        the short TTL — otherwise the read path would honor it for 24h even
+        though we wrote next_check_at=1h."""
+        cache = self._isolate_cache(tmp_path, monkeypatch)
+        # Write a "probe failed" cache from 90 minutes ago (older than 1h, younger than 24h).
+        cache.write_text(json.dumps({
+            "checked_at": time.time() - 5400,   # 90 min ago
+            "pypi_latest": None,                 # ← failure marker
+            "simple_latest": "0.45.3",
+            "installable_latest": "0.45.2",
+            "current": "0.45.2",
+            "outdated": False,
+        }))
+        with patch(
+            "jacked.version_check.get_latest_pypi_version", return_value="0.45.4"
+        ) as p_pypi, patch(
+            "jacked.version_check.get_latest_from_simple_index", return_value="0.45.4"
+        ) as p_simple:
+            result = vc.check_version_cached("0.45.2", force=False)
+        # Must have re-probed (cache was stale per short TTL) and now sees 0.45.4
+        assert p_pypi.called and p_simple.called
+        assert result["installable_latest"] == "0.45.4"
+        assert result["outdated"] is True
+
     def test_old_cache_schema_triggers_refetch(self, tmp_path, monkeypatch):
         """Old cache file only had 'latest' key. New schema needs pypi_latest+simple_latest.
         Reader must treat the old format as a cache miss and re-probe."""
