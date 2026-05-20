@@ -1,12 +1,26 @@
 """Version checking against PyPI."""
 
 import json
+import re
 import time
 import urllib.request
 from pathlib import Path
 
 VERSION_CACHE = Path.home() / ".claude" / "jacked-version-cache.json"
 CACHE_TTL = 86400  # 24 hours — tray menu has "Check for updates" for on-demand refresh
+
+# Matches both wheel and sdist filenames:
+#   claude_jacked-0.45.3-py3-none-any.whl
+#   claude_jacked-0.45.3.tar.gz
+# PEP 503 normalizes the package name to lowercase + underscores in filenames.
+_VERSION_FROM_FILENAME = re.compile(
+    r"^[\w.]+?-(\d+(?:\.\d+)*(?:(?:a|b|rc|\.?dev|\.?post)\d+)?)"
+    r"(?:-py|\.tar\.gz|\.zip|\.whl)"
+)
+# Captures ONLY the version segment, stopping at "-py..." for wheels or the
+# archive suffix for sdists. Without the tight terminator, `-py3-none-any` would
+# bleed into the capture group and the cache would store strings like
+# "0.45.3-py3-none" instead of "0.45.3".
 
 
 def get_latest_pypi_version(package: str = "claude-jacked", timeout: float = 3.0) -> str | None:
@@ -22,6 +36,39 @@ def get_latest_pypi_version(package: str = "claude-jacked", timeout: float = 3.0
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
             return data.get("info", {}).get("version")
+    except Exception:
+        return None
+
+
+def get_latest_from_simple_index(package: str = "claude-jacked", timeout: float = 3.0) -> str | None:
+    """Query the PEP 691 JSON variant of /simple/<package>/. Returns max non-yanked version or None.
+
+    This is THE SAME index uv reads. A version's presence here guarantees
+    `uv tool install --refresh` can resolve to it.
+    """
+    try:
+        url = f"https://pypi.org/simple/{package}/"
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        versions = set()
+        for entry in data.get("files", []):
+            if not isinstance(entry, dict):
+                continue
+            # Skip yanked releases — uv won't install them, so we shouldn't
+            # advertise them as "available". PEP 691: yanked is either bool
+            # or non-empty string (reason); falsy means not yanked.
+            if entry.get("yanked"):
+                continue
+            fn = entry.get("filename", "")
+            m = _VERSION_FROM_FILENAME.match(fn)
+            if m:
+                versions.add(m.group(1))
+        if not versions:
+            return None
+        return max(versions, key=_parse_version_tuple)
     except Exception:
         return None
 

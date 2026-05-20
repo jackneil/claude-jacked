@@ -220,6 +220,113 @@ class TestGetLatestPypiVersion:
         assert result is None
 
 
+class TestGetLatestFromSimpleIndex:
+    """Tests for get_latest_from_simple_index() with mocked network."""
+
+    # Real-shaped PEP 691 JSON fixture (trimmed)
+    SIMPLE_FIXTURE = {
+        "name": "claude-jacked",
+        "files": [
+            {"filename": "claude_jacked-0.45.0-py3-none-any.whl", "url": "..."},
+            {"filename": "claude_jacked-0.45.0.tar.gz", "url": "..."},
+            {"filename": "claude_jacked-0.45.1-py3-none-any.whl", "url": "..."},
+            {"filename": "claude_jacked-0.45.2-py3-none-any.whl", "url": "..."},
+            {"filename": "claude_jacked-0.45.3-py3-none-any.whl", "url": "..."},
+        ],
+    }
+
+    @staticmethod
+    def _mock_urlopen_response(payload):
+        """Build a context-manager-compatible urlopen mock returning JSON bytes."""
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(payload).encode("utf-8")
+        cm = MagicMock()
+        cm.__enter__.return_value = resp
+        cm.__exit__.return_value = False
+        return cm
+
+    def test_get_latest_from_simple_parses_pep691(self):
+        with patch(
+            "urllib.request.urlopen",
+            return_value=self._mock_urlopen_response(self.SIMPLE_FIXTURE),
+        ):
+            assert vc.get_latest_from_simple_index("claude-jacked") == "0.45.3"
+
+    def test_get_latest_from_simple_picks_max_not_first(self):
+        """Files listed in arbitrary order — must pick semver max."""
+        shuffled = {
+            "name": "claude-jacked",
+            "files": [
+                {"filename": "claude_jacked-0.10.0-py3-none-any.whl"},
+                {"filename": "claude_jacked-0.45.3-py3-none-any.whl"},
+                {"filename": "claude_jacked-0.45.0-py3-none-any.whl"},
+                {"filename": "claude_jacked-0.9.0-py3-none-any.whl"},
+            ],
+        }
+        with patch(
+            "urllib.request.urlopen",
+            return_value=self._mock_urlopen_response(shuffled),
+        ):
+            assert vc.get_latest_from_simple_index("claude-jacked") == "0.45.3"
+
+    def test_get_latest_from_simple_handles_network_error(self):
+        with patch("urllib.request.urlopen", side_effect=OSError("boom")):
+            assert vc.get_latest_from_simple_index("claude-jacked") is None
+
+    def test_get_latest_from_simple_handles_bad_json(self):
+        resp = MagicMock()
+        resp.read.return_value = b"not json {{"
+        cm = MagicMock()
+        cm.__enter__.return_value = resp
+        cm.__exit__.return_value = False
+        with patch("urllib.request.urlopen", return_value=cm):
+            assert vc.get_latest_from_simple_index("claude-jacked") is None
+
+    def test_get_latest_from_simple_empty_files_returns_none(self):
+        with patch(
+            "urllib.request.urlopen",
+            return_value=self._mock_urlopen_response(
+                {"name": "claude-jacked", "files": []}
+            ),
+        ):
+            assert vc.get_latest_from_simple_index("claude-jacked") is None
+
+    def test_get_latest_from_simple_returns_exact_version_string(self):
+        """Regression: regex must capture ONLY the version, not '-py3-none-any' tail.
+        Without this assertion the bug stays silent because parse_version_tuple
+        recovers a clean tuple."""
+        payload = {
+            "name": "claude-jacked",
+            "files": [
+                {"filename": "claude_jacked-0.45.3-py3-none-any.whl"},
+                {"filename": "claude_jacked-0.45.3.tar.gz"},
+            ],
+        }
+        with patch(
+            "urllib.request.urlopen",
+            return_value=self._mock_urlopen_response(payload),
+        ):
+            result = vc.get_latest_from_simple_index("claude-jacked")
+        assert result == "0.45.3", f"Expected exact '0.45.3', got {result!r}"
+
+    def test_get_latest_from_simple_skips_yanked(self):
+        """Yanked releases must NOT be advertised as available — uv refuses them."""
+        payload = {
+            "name": "claude-jacked",
+            "files": [
+                {"filename": "claude_jacked-0.45.0-py3-none-any.whl", "yanked": False},
+                {"filename": "claude_jacked-0.45.3-py3-none-any.whl", "yanked": True},
+                {"filename": "claude_jacked-0.45.3.tar.gz", "yanked": "broken release"},
+                {"filename": "claude_jacked-0.45.2-py3-none-any.whl", "yanked": False},
+            ],
+        }
+        with patch(
+            "urllib.request.urlopen",
+            return_value=self._mock_urlopen_response(payload),
+        ):
+            assert vc.get_latest_from_simple_index("claude-jacked") == "0.45.2"
+
+
 class TestCheckVersionCached:
     """Tests for check_version_cached() with mocked cache and network."""
 
