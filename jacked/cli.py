@@ -2551,7 +2551,12 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
             skill_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy(skill_md, skill_dir / "SKILL.md")
+            dst = skill_dir / "SKILL.md"
+            # Use _link_or_copy (symlink in editable mode, copy otherwise).
+            # Plain shutil.copy raises SameFileError if dst is already a
+            # symlink pointing to src — broke the tray-triggered upgrade
+            # flow when a manual symlink from dev/testing was present.
+            _link_or_copy(skill_md, dst)
             skill_count += 1
     if skill_count > 0:
         console.print(f"[green][OK][/green] Installed {skill_count} skills")
