@@ -1,0 +1,12 @@
+# gitleaks allowlist — suppresses known-false-positive matches.
+# Each entry must reference a real, audited string (not a wildcard).
+
+[allowlist]
+description = "False positives from doc / test fixtures"
+paths = [
+  '''design/guardrails_and_lint_gate\.md''',  # design doc references signal token JACKED_LINTED=1
+  '''tests/unit/test_security_gatekeeper\.py''',  # docstring assertions, no real credentials
+]
+regexes = [
+  '''JACKED_LINTED=1''',  # signal token, not a secret — used by gatekeeper lint-gate
+]

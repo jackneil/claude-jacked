@@ -1,0 +1,27 @@
+# Dependabot config with 7-day cooldown.
+# Cooldown is the cheapest defense against smash-and-grab attacks (axios 1.14.1, Shai-Hulud, etc.) —
+# delays accepting newly-published versions long enough for the community to flag them.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-patch-days: 3
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(actions)"
+      include: "scope"
