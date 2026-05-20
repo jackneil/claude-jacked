@@ -2618,6 +2618,23 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
     else:
         console.print("[dim][-][/dim] No lenses found to install")
 
+    # Install HTML artifact templates (scaffolds for plans, specs, research,
+    # checkpoints). The format preference rule in jacked_behaviors.md points
+    # Claude here as the starting point for any human-consumed artifact.
+    templates_src = pkg_root / "templates"
+    templates_dst = home / ".claude" / "jacked-templates"
+    tpl_count, tpl_skipped, tpl_method = _install_asset_dir(
+        templates_src, templates_dst, "template", glob_pattern="*.html", force=force
+    )
+    if templates_src.exists():
+        method_label = f" ({tpl_method})" if tpl_method and editable else ""
+        msg = f"[green][OK][/green] Installed {tpl_count} HTML templates{method_label}"
+        if tpl_skipped:
+            msg += f" ({tpl_skipped} unchanged)"
+        console.print(msg)
+    else:
+        console.print("[dim][-][/dim] No HTML templates found to install")
+
     # Install sound hooks if requested
     if sounds:
         _install_sound_hooks(existing, settings_path)
@@ -3148,6 +3165,24 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
             console.print("[yellow][-][/yellow] No jacked lenses found")
     else:
         console.print("[yellow][-][/yellow] Lenses directory not found")
+
+    # Remove only jacked-installed HTML templates (preserve any user-added files)
+    templates_src = pkg_root / "templates"
+    templates_dst = home / ".claude" / "jacked-templates"
+    if templates_src.exists() and templates_dst.exists():
+        tpl_count = 0
+        for tpl_file in templates_src.glob("*.html"):
+            dst_file = templates_dst / tpl_file.name
+            if dst_file.exists() or dst_file.is_symlink():
+                dst_file.unlink()
+                tpl_count += 1
+        if tpl_count > 0:
+            console.print(f"[green][OK][/green] Removed {tpl_count} HTML templates")
+        # Drop the dir only if it's now empty so user-added templates survive.
+        try:
+            templates_dst.rmdir()
+        except OSError:
+            pass
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(

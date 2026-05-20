@@ -82,9 +82,9 @@ Before spawning any reviewer, discover and read project convention files. Use Gl
 - `.editorconfig`, `biome.json`, `.eslintrc*`, `.prettierrc*`, `ruff.toml`
 
 **Design docs and ADRs:**
-- `docs/`, `design/`, `doc/`, `architecture/` directories — scan for `*.md` files
+- `docs/`, `design/`, `doc/`, `architecture/` directories — scan for `*.md` AND `*.html` files (plans/specs may be either format)
 - `adr/`, `adrs/`, `decisions/`, `architecture-decisions/` directories
-- `docs/plans/`, `RFC*.md`, `DESIGN*.md`, `ARCHITECTURE*.md`
+- `docs/plans/`, `docs/superpowers/plans/`, `RFC*.md`, `RFC*.html`, `DESIGN*.md`, `DESIGN*.html`, `ARCHITECTURE*.md`, `ARCHITECTURE*.html`
 
 Read everything found. Include the contents as a `## PROJECT CONTEXT` section in every reviewer prompt. For the Guardrails lens, the reviewer must cite specific rule violations with the rule text and file:line of the violation.
 
@@ -252,7 +252,7 @@ Do NOT fix code directly. Instead, follow this pipeline:
 
 7a. **Document all findings** — Compile a structured summary of every CRITICAL and MEDIUM issue from both the main reviewer and pre-mortem analyst. Include file:line references, severity, and a one-line description of each. LOW issues are listed but marked as non-blocking.
 
-7b. **Create a fix plan** — Invoke the `superpowers:writing-plans` skill, passing the documented findings as the spec. The plan should turn each CRITICAL/MEDIUM finding into a concrete task with tests and code. Save to `docs/superpowers/plans/YYYY-MM-DD-<feature>-fixes.md`.
+7b. **Create a fix plan** — Invoke the `superpowers:writing-plans` skill, passing the documented findings as the spec. The plan should turn each CRITICAL/MEDIUM finding into a concrete task with tests and code. **Save as HTML, not Markdown.** Start from `~/.claude/jacked-templates/plan-template.html` and write to `docs/superpowers/plans/YYYY-MM-DD-<feature>-fixes.html`. Explicitly tell the sub-skill: "Output the plan as HTML using the jacked template — do not produce Markdown."
 
 7c. **Review the fix plan** — Re-enter this skill's PLANNING PHASE review: spawn a double-check-reviewer with planning-phase instructions to review the fix plan. If the plan review finds issues, fix the plan and re-review until the plan passes clean.
 

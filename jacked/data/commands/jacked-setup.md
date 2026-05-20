@@ -97,7 +97,7 @@ Run additional analysis based on the target(s) being generated.
 # Planning artifacts
 ls ROADMAP.md IMPLEMENTATION_STATUS.md TODO.md BACKLOG.md FEEDBACK_BACKLOG.md 2>/dev/null
 ls -d docs docs/plans docs/specs design .claude/plans 2>/dev/null
-find docs design .claude/plans -name "*.md" -maxdepth 2 2>/dev/null | head -20
+find docs design .claude/plans \( -name "*.md" -o -name "*.html" \) -maxdepth 2 2>/dev/null | head -20
 ```
 
 ```bash
@@ -191,7 +191,7 @@ ls CLAUDE.md .claude/CLAUDE.md GUARDRAILS.md JACKED_GUARDRAILS.md CONTRIBUTING.m
 
 ```bash
 # Design docs
-find docs design .claude/plans -name "*.md" -maxdepth 2 2>/dev/null | head -10
+find docs design .claude/plans \( -name "*.md" -o -name "*.html" \) -maxdepth 2 2>/dev/null | head -10
 ```
 
 From these results, determine default lens weights:

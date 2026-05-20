@@ -19,4 +19,6 @@
 - Before and after performance-sensitive changes, suggest /benchmark for regression detection.
 - When browser MCP tools are failing or stuck, suggest /browser-reset to diagnose and fix the connection.
 - After a PR is approved and CI passes, suggest /land-and-deploy for the full merge-deploy-verify pipeline.
+- **Artifact format — default HTML**: when writing plans, specs, research notes, checkpoints, or design docs *for human consumption*, write `.html`, not `.md`. Copy `~/.claude/jacked-templates/plan-template.html` as the starting point — embedded CSS, Mermaid.js diagrams (with offline fallback), dark mode, and print styles. HTML renders in a browser; Markdown opened locally is a wall of text.
+- **Artifact format — Markdown exceptions**: only these filenames stay Markdown. (1) GitHub-rendered: `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE.md`, files under `_wiki/`. (2) Claude-instruction files Claude reads at session boot: `CLAUDE.md`, `AGENTS.md`, `lessons.md`, `MEMORY.md`. (3) Any downstream tool that *requires* Markdown input (static-site generator, linter). If the file you're writing isn't on this list, write HTML — "it's short" or "no diagrams needed" is NOT a valid override.
 # end-jacked-behaviors

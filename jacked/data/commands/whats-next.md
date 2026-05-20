@@ -27,11 +27,11 @@ If no `## Repo Config` section is present, run all discovery steps normally.
 ```bash
 CHECKPOINT_DIR=".claude/checkpoints"
 if [ -d "$CHECKPOINT_DIR" ]; then
-  ls -1t "$CHECKPOINT_DIR"/*.md 2>/dev/null | head -5
+  ls -1t "$CHECKPOINT_DIR"/*.html "$CHECKPOINT_DIR"/*.md 2>/dev/null | head -5
 fi
 ```
 
-If any checkpoint files exist, read their frontmatter. If one or more have `status: in-progress`, note the most recent one — it becomes **Option 0** in the recommendations (Step 6).
+If any checkpoint files exist, read their status. For HTML checkpoints, parse `<meta name="jacked:status" content="...">`. For legacy Markdown checkpoints, parse the YAML `status:` frontmatter. If one or more have `in-progress` status, note the most recent one — it becomes **Option 0** in the recommendations (Step 6).
 
 If multiple in-progress checkpoints exist, note the count for the recommendation display.
 
@@ -65,7 +65,7 @@ Check for common planning files:
 ```bash
 ls ROADMAP.md IMPLEMENTATION_STATUS.md TODO.md BACKLOG.md FEEDBACK_BACKLOG.md GUARDRAILS.md 2>/dev/null
 ls docs/ docs/plans/ docs/specs/ design/ .claude/plans/ 2>/dev/null
-find docs design .claude/plans -name "*.md" 2>/dev/null | head -20
+find docs design .claude/plans \( -name "*.md" -o -name "*.html" \) 2>/dev/null | head -20
 ```
 
 **Context budget:** Read at most 10 files, at most 200 lines each. Prioritize:

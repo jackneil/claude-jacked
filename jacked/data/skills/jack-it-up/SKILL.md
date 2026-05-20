@@ -92,7 +92,13 @@ This is informational only — it doesn't block or change the brainstorm flow. I
 
 Turn the brainstorm output into a concrete, task-by-task implementation plan with complete code, exact file paths, test commands, and commit messages. No placeholders. No "TBD."
 
-Output: A plan document saved to `docs/superpowers/plans/`.
+**Output format: HTML, not Markdown.** When you invoke `superpowers:writing-plans`, **explicitly instruct the sub-skill in its prompt**:
+
+> "Write this plan as HTML using the template at `~/.claude/jacked-templates/plan-template.html`. Output `.html`, not `.md`. Save to `docs/superpowers/plans/{YYYY-MM-DD}-{slug}.html`. Do not produce Markdown."
+
+The sub-skill's default is Markdown — without this explicit override, you'll get `.md`. The template has placeholders for goal, architecture (Mermaid diagrams), file structure, tasks (as `<ul class="tasks">` checklists), and open questions.
+
+Why HTML: plans are artifacts the human re-reads during execution. Markdown opened locally is a wall of text. HTML renders diagrams, styles tables and code, supports print/PDF. These files never go to GitHub's web UI, so Markdown's only advantage doesn't apply.
 
 ### Phase 3: Review the Plan
 

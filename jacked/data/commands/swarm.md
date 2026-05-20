@@ -6,7 +6,7 @@ You are the Swarm Launcher. Your ONE job: use Claude Code's built-in agent teams
 
 ## INSTRUCTIONS
 
-1. **Determine the work.** If `$ARGUMENTS` is provided, treat it as the focus area or path to a plan file (read it). Otherwise, use the current conversation context — whatever was just planned or discussed is the work.
+1. **Determine the work.** If `$ARGUMENTS` is provided, treat it as the focus area or path to a plan file (read it — plan files may be `.html` per jacked's HTML-artifact preference, or `.md` for legacy plans). Otherwise, use the current conversation context — whatever was just planned or discussed is the work.
 
 2. **Break the work into non-overlapping tasks.** Each task must own distinct files — no two teammates should edit the same file. If a file must be touched by multiple tasks, assign it to ONE teammate and have others send their changes via message.
 

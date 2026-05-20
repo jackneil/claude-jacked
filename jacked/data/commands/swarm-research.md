@@ -287,6 +287,10 @@ Present the complete result:
 
 Do NOT auto-transition to implementation. The user decides what to do next.
 
+### Persisting the recommendation
+
+If the user wants to save the swarm output as a referenceable artifact, write it as **HTML**, not Markdown. Copy `~/.claude/jacked-templates/plan-template.html` to `docs/superpowers/specs/{YYYY-MM-DD}-{slug}.html` and fill it in. The template's Mermaid support is especially useful for convergence/divergence maps and architectural alternatives surfaced during research. Do NOT use Markdown here — swarm outputs are internal specs, not GitHub artifacts.
+
 ## HARD RULES
 
 - All Phase 1 agents spawn in ONE message (parallel Agent tool calls).

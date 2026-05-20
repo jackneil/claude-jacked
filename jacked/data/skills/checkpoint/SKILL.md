@@ -68,97 +68,113 @@ If the user provided a title, use it. Otherwise infer one from the work.
 
 ### Step 4: Write research files (if needed)
 
-For research topics with substantial findings (multiple sources, detailed analysis), create separate files:
+For research topics with substantial findings (multiple sources, detailed analysis), create separate files. **Use HTML** so they open cleanly in a browser, render diagrams, and look like documentation instead of raw text:
 
 ```bash
 mkdir -p .claude/research
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+cp ~/.claude/jacked-templates/plan-template.html ".claude/research/${TIMESTAMP}-{topic-slug}.html"
 ```
 
-Write to `.claude/research/{TIMESTAMP}-{topic-slug}.md`:
+Then edit the copy. Fill the `<meta>` tags and replace `{{PLACEHOLDERS}}`:
 
-```markdown
----
-topic: {topic title}
-sources:
-  - {url1}
-  - {url2}
-date: {YYYY-MM-DD}
-checkpoint: {checkpoint-slug}
----
+```html
+<title>{Topic Title}</title>
+<meta name="jacked:type" content="research">
+<meta name="jacked:status" content="complete">
+<meta name="jacked:date" content="{YYYY-MM-DD}">
+<meta name="jacked:checkpoint" content="{checkpoint-slug}">
 
-# {Topic Title}
+<h1>{Topic Title}</h1>
 
-## Findings
+<div class="meta">
+  <div class="kv"><span class="k">Sources:</span><span class="v">{url1}, {url2}</span></div>
+  <div class="kv"><span class="k">Checkpoint:</span><span class="v">{checkpoint-slug}</span></div>
+</div>
 
-{Distilled research — key patterns, comparisons, recommendations.
-Not a copy of the web page, but the actionable knowledge extracted.}
+<h2>Findings</h2>
+<p>{Distilled research — key patterns, comparisons, recommendations.
+Not a copy of the web page, but the actionable knowledge extracted.}</p>
 
-## Source Notes
-
-{Per-source: what was useful, what wasn't, key quotes or data points.}
+<h2>Source Notes</h2>
+<table>
+  <thead><tr><th>Source</th><th>What was useful</th><th>Key quotes / data</th></tr></thead>
+  <tbody>
+    <tr><td>{url}</td><td>{notes}</td><td>{excerpts}</td></tr>
+  </tbody>
+</table>
 ```
 
-The `checkpoint` field is for human reference only — not consumed programmatically.
+The `jacked:checkpoint` meta tag is for human reference only — not consumed programmatically.
 
-### Step 5: Write checkpoint file (atomic)
+### Step 5: Write checkpoint file (atomic, HTML)
+
+Checkpoints are written as HTML so a future you can open them in a browser, see diagrams of the in-progress branch state, and skim the rendered TOC. They're still small enough that Claude can read them when resuming.
 
 ```bash
 CHECKPOINT_DIR=".claude/checkpoints"
 mkdir -p "$CHECKPOINT_DIR"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-TMPFILE=$(mktemp "${CHECKPOINT_DIR}/.tmp.XXXXXX")
+TMPFILE=$(mktemp "${CHECKPOINT_DIR}/.tmp.XXXXXX.html")
+cp ~/.claude/jacked-templates/plan-template.html "$TMPFILE"
 ```
 
-Write to the temp file, then rename:
+Then edit the temp file. The metadata that used to live in YAML frontmatter goes into HTML `<meta>` tags so it stays machine-introspectable; everything else becomes proper HTML sections:
 
-```markdown
----
-status: in-progress
-branch: {branch}
-timestamp: {ISO-8601}
-releases: [{list of versions released this session, if any}]
-plans_in_progress:
-  - {path to active plan file, if any}
-research_files:
-  - {path to research file, if any}
-active_lenses: [{lens stems, if any}]
----
+```html
+<title>Checkpoint: {title}</title>
+<meta name="jacked:type" content="checkpoint">
+<meta name="jacked:status" content="in-progress">
+<meta name="jacked:branch" content="{branch}">
+<meta name="jacked:timestamp" content="{ISO-8601}">
+<meta name="jacked:releases" content="{comma-separated versions released this session, if any}">
+<meta name="jacked:plans_in_progress" content="{semicolon-separated paths to active plan files}">
+<meta name="jacked:research_files" content="{semicolon-separated paths to research files}">
+<meta name="jacked:active_lenses" content="{comma-separated lens stems}">
 
-# Checkpoint: {title}
+<h1>Checkpoint: {title}</h1>
 
-## What We're Working On
-{content}
+<h2 id="working-on">What We're Working On</h2>
+<p>{content}</p>
 
-## Accomplished This Session
-{content}
+<h2 id="accomplished">Accomplished This Session</h2>
+<ul><li>{content}</li></ul>
 
-## Decisions Made
-{content}
+<h2 id="decisions">Decisions Made</h2>
+<ul><li>{content — include the WHY for each decision}</li></ul>
 
-## Session Context
-{content}
+<h2 id="context">Session Context</h2>
+<p>{content}</p>
 
-## Research & References
-{content}
+<h2 id="research">Research &amp; References</h2>
+<ul><li><a href="{relative path to .html research file}">{topic}</a></li></ul>
 
-## Remaining Work
-{content}
+<h2 id="remaining">Remaining Work</h2>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> {task}</li>
+</ul>
 
-## Current State
-{content}
+<h2 id="state">Current State</h2>
+<p>{content}</p>
 
-## Gotchas & Notes
-{content}
+<h2 id="gotchas">Gotchas &amp; Notes</h2>
+<aside class="callout warn">{content}</aside>
 
-## Key Files
-{content — each line: `- path/to/file — description`}
+<h2 id="key-files">Key Files</h2>
+<table>
+  <thead><tr><th>File</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>path/to/file</code></td><td>{description}</td></tr>
+  </tbody>
+</table>
 ```
 
 Rename temp file to final path:
 ```bash
-mv "$TMPFILE" "${CHECKPOINT_DIR}/${TIMESTAMP}-{slug}.md"
+mv "$TMPFILE" "${CHECKPOINT_DIR}/${TIMESTAMP}-{slug}.html"
 ```
+
+> **Migration note**: existing `.md` checkpoints from before 0.43.2 still load fine on `/checkpoint resume`. Leave them as-is; only new checkpoints are HTML.
 
 ### Step 6: Display confirmation
 
@@ -181,13 +197,14 @@ When the user runs `/checkpoint resume` or `/checkpoint resume {slug}`:
 ```bash
 CHECKPOINT_DIR=".claude/checkpoints"
 if [ -d "$CHECKPOINT_DIR" ]; then
-  ls -1t "$CHECKPOINT_DIR"/*.md 2>/dev/null | head -10
+  # Glob both .html (current) and .md (pre-0.43.2 legacy) so old checkpoints still resume.
+  ls -1t "$CHECKPOINT_DIR"/*.html "$CHECKPOINT_DIR"/*.md 2>/dev/null | head -10
 else
   echo "NO_CHECKPOINTS"
 fi
 ```
 
-If no slug specified, find the most recent file with `status: in-progress` in frontmatter. If a slug is given, find the file matching `*-{slug}.md`.
+If no slug specified, find the most recent file with `in-progress` status. For HTML checkpoints, status lives in `<meta name="jacked:status" content="in-progress">`. For legacy Markdown checkpoints, it's in the YAML `status:` field. If a slug is given, match the file `*-{slug}.html` first, then `*-{slug}.md`.
 
 ### Step 2: Branch check
 
@@ -195,7 +212,7 @@ If no slug specified, find the most recent file with `status: in-progress` in fr
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 ```
 
-If the checkpoint's `branch:` field differs from the current branch, warn:
+Read the branch from the checkpoint — for HTML checkpoints, `<meta name="jacked:branch" content="...">`; for legacy Markdown checkpoints, the YAML `branch:` field. If it differs from the current branch, warn:
 
 > "Checkpoint was created on branch **{branch}** but you are on **{current_branch}**. Context may not apply. Continue anyway?"
 
@@ -205,9 +222,9 @@ Do NOT auto-switch branches.
 
 Read files in priority order. Track total lines loaded.
 
-1. Files from `plans_in_progress` frontmatter (highest priority — defines remaining work)
-2. Files from `research_files` frontmatter (decision context)
-3. Files from Key Files section body (each line: `- path/to/file — description`, extract path before em-dash)
+1. Files from `plans_in_progress` (HTML: `<meta name="jacked:plans_in_progress" content="path1;path2">`; legacy MD: YAML `plans_in_progress` frontmatter) — highest priority, defines remaining work
+2. Files from `research_files` (HTML: `<meta name="jacked:research_files">`; legacy MD: YAML `research_files` frontmatter) — decision context
+3. Files from the Key Files section body (each row: `<code>path/to/file</code> — description` in HTML, or `- path/to/file — description` in MD)
 
 For each file:
 - If it doesn't exist: warn "Referenced file {path} no longer exists (may have been renamed/deleted since checkpoint)" and continue
@@ -241,9 +258,9 @@ CHECKPOINT_DIR=".claude/checkpoints"
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 ```
 
-Find the most recent in-progress checkpoint on the current branch. If none found on current branch, show all in-progress checkpoints and ask which to complete.
+Find the most recent in-progress checkpoint on the current branch (HTML or legacy MD). If none found on current branch, show all in-progress checkpoints and ask which to complete.
 
-Update the checkpoint file's frontmatter: change `status: in-progress` to `status: completed`.
+Update the checkpoint file's status. For HTML: change `<meta name="jacked:status" content="in-progress">` to `content="completed"`. For legacy MD: change the YAML `status: in-progress` to `status: completed`.
 
 ```
 CHECKPOINT COMPLETED
@@ -259,12 +276,12 @@ When the user runs `/checkpoint list`:
 
 ```bash
 CHECKPOINT_DIR=".claude/checkpoints"
-ls -1t "$CHECKPOINT_DIR"/*.md 2>/dev/null | while read f; do
+ls -1t "$CHECKPOINT_DIR"/*.html "$CHECKPOINT_DIR"/*.md 2>/dev/null | while read f; do
   echo "$(basename "$f")"
 done
 ```
 
-Read frontmatter from each to show a table:
+Read metadata from each to show a table. For `.html`, parse the `<meta name="jacked:*">` tags. For legacy `.md`, parse the YAML frontmatter block:
 
 ```
 CHECKPOINTS

@@ -174,3 +174,9 @@ After injection, summarize:
 - Local sessions can be resumed natively with `claude --resume` for the best experience
 - Remote sessions are retrieved and injected as context (works but Claude won't have internal memory state)
 - Use `jacked cleardb` to wipe your data before re-indexing with a new schema
+
+## Artifact Format Preference
+
+When you write any artifact during a `/jacked`-driven follow-up — a continuation plan, a research note distilled from past sessions, an exported summary — write it as **HTML**, not Markdown. The file is for the user to open in a browser, scan diagrams, and re-read later. Copy `~/.claude/jacked-templates/plan-template.html` as a starting point.
+
+Markdown is reserved for the explicit exceptions: GitHub-rendered files (`README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE.md`, files under `_wiki/`) and Claude-instruction files Claude reads at session boot (`CLAUDE.md`, `AGENTS.md`, `lessons.md`, `MEMORY.md`). See `~/.claude/jacked-reference.md` § Artifact Format Preference for the canonical rule.
