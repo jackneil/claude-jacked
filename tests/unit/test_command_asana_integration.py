@@ -51,12 +51,11 @@ def test_engine_step_5_acknowledges_asana(whats_next_engine: str) -> None:
 
 
 def test_engine_evidence_line_example_includes_asana(whats_next_engine: str) -> None:
-    """Step 6's Evidence-line examples must show an Asana format so
-    Opus emits the metadata consistently."""
-    start = whats_next_engine.index("## Step 6: Present Recommendations")
-    after = whats_next_engine.find("\n## ", start + 1)
-    section = whats_next_engine[start:after if after != -1 else None]
-    assert "Asana" in section
+    """Step 6's Evidence-line example must show an Asana token so
+    Opus emits the metadata consistently. We assert the literal example
+    string rather than slicing Step 6 because Step 6 contains a fenced
+    code block whose own `##` headers confuse naive section locators."""
+    assert "Asana 1200012345 in Engineering Backlog" in whats_next_engine
 
 
 def test_setup_probes_for_asana_access(jacked_setup: str) -> None:
