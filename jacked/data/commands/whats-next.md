@@ -107,7 +107,7 @@ Read the `## Asana Integration` section of the repo config (in `## Repo Config` 
 - The `Access` field is `none` (Asana not enabled for this repo — print one info line: `Asana: not configured — run /jacked-setup whats-next to enable` and continue).
 - The configured access method fails when probed (e.g. MCP tool unavailable, CLI binary missing, PAT env var unset). In that case print: `Asana: not reachable (<reason>), skipping` and continue with the rest of /whats-next.
 
-Otherwise, fetch open tasks for the cached `User GID` across the listed workspaces and (if specified) the listed `Projects`. Pull these fields for each task: title, notes (truncated to the first ~500 characters), due date, project name, section name, the priority custom field value (if a `Priority Field` is configured), and the task URL.
+Otherwise, fetch open tasks for the `User GID` from the `## Asana Integration` config across the listed workspaces and (if specified) the listed `Projects`. Pull these fields for each task: title, notes (truncated to the first ~500 characters), due date, project name, section name, the priority custom field value (if a `Priority Field` is configured), and the task URL.
 
 For each task, judge two things — using your reading of the task content, not a scoring formula:
 

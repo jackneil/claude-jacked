@@ -125,12 +125,12 @@ grep -r "__version__" --include="*.py" -l 2>/dev/null | head -3
    ```bash
    if [ -n "$ASANA_PERSONAL_ACCESS_TOKEN" ] || [ -n "$ASANA_TOKEN" ]; then
      TOKEN="${ASANA_PERSONAL_ACCESS_TOKEN:-$ASANA_TOKEN}"
-     curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" https://app.asana.com/api/1.0/users/me
+     curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" https://app.asana.com/api/1.0/users/me
    else
      echo "NO_TOKEN"
    fi
    ```
-   If the response code is `200`, record `Access: rest-pat` and proceed to discovery.
+   If the response code is `200`, record `Access: rest-pat` and proceed to discovery. If the code is `401`, the token is set but invalid or expired — tell the user their `ASANA_PERSONAL_ACCESS_TOKEN` is rejected and they should refresh it at https://app.asana.com/0/my-apps, rather than printing the generic "not configured" install hint. For any other non-200 code (or no response), fall through to the next method.
 
 4. **None**: if all three probes fail, record `Access: none`. Skip discovery and write the install-hint variant of the `## Asana Integration` block (see standalone template below).
 
@@ -142,8 +142,6 @@ Using whichever access method won, perform these reads:
 - List the projects the user belongs to in each workspace. Show the count (`Found M project(s) across N workspace(s)`).
 - Ask one question: *"Track tasks across all M projects, or pick specific projects? [all/pick]"*. Default `all` if the user just hits enter. If `pick`, list projects and accept a comma-separated selection.
 - Sniff one or two selected projects' `custom_fields` for a name matching `Priority`, `Status`, `Tier`, `P0`, `P1`. If found, record the field GID and its enum values list. Do NOT pre-bake a values-to-tier mapping — Opus maps at runtime.
-
-Cache the user GID and workspace list in `.claude/cache/asana-meta.json` with a 7-day TTL — runtime should not re-query these unless the cache is stale.
 
 Infer **lifecycle stage** using these signals:
 
