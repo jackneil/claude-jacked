@@ -572,7 +572,7 @@ Type these directly in Claude Code:
 | `/swarm-research` | **Divergent Research** — Spawns 2-5 independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate |
 | `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
 | `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
-| `/whats-next` | **Roadmap Advisor** — Analyzes plans, issues, commits, and lifecycle stage to recommend highest-yield next work |
+| `/whats-next` | **Roadmap Advisor** — Analyzes plans, GitHub issues, code TODOs, commits, and (when configured) assigned Asana tasks; ranks all sources together using lifecycle-weighted tiers |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
 | `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
 | `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
@@ -610,6 +610,10 @@ Use the double-check reviewer to review what we just built
 ### QA Browser Testing
 
 The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.
+
+### Asana in `/whats-next`
+
+When Asana is reachable, `/whats-next` blends your assigned tasks into the same tier-ranked recommendation list as GitHub issues and code TODOs. Run `/jacked-setup whats-next` once per repo to probe for access (Asana MCP plugin, a local `asana` CLI, or `ASANA_PERSONAL_ACCESS_TOKEN`) and write a `## Asana Integration` block into the standalone command. Tasks that touch the current repo — by GitHub URL, repo basename, file/module mention, or project name resemblance — get ranked alongside the rest using the same Tier 1-5 framework. Asana origin appears on the Evidence line; it does not grant a tier bonus.
 
 ---
 
