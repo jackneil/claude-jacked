@@ -106,6 +106,45 @@ grep -r "version" pyproject.toml package.json Cargo.toml go.mod setup.py 2>/dev/
 grep -r "__version__" --include="*.py" -l 2>/dev/null | head -3
 ```
 
+**Asana access probe** — try three methods in order, stop at the first that succeeds:
+
+1. **MCP**: check if the Asana plugin is installed and its tools are reachable.
+   ```bash
+   ls -d ~/.claude/plugins/marketplaces/*/external_plugins/asana 2>/dev/null && echo "ASANA_PLUGIN_PRESENT" || echo "ASANA_PLUGIN_ABSENT"
+   ```
+   If `ASANA_PLUGIN_PRESENT`, try invoking the `mcp__claude_ai_Asana__*` toolset. If a tool call succeeds (any read-only one, e.g. listing the current user), record `Access: mcp` and proceed to discovery.
+
+2. **CLI**: probe for a local Asana CLI binary.
+   ```bash
+   command -v asana >/dev/null 2>&1 && asana --version 2>/dev/null
+   command -v asana-cli >/dev/null 2>&1 && asana-cli --version 2>/dev/null
+   ```
+   If either responds, record `Access: cli` (and the binary name) and proceed to discovery.
+
+3. **REST + PAT**: probe for a personal access token in the environment.
+   ```bash
+   if [ -n "$ASANA_PERSONAL_ACCESS_TOKEN" ] || [ -n "$ASANA_TOKEN" ]; then
+     TOKEN="${ASANA_PERSONAL_ACCESS_TOKEN:-$ASANA_TOKEN}"
+     curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" https://app.asana.com/api/1.0/users/me
+   else
+     echo "NO_TOKEN"
+   fi
+   ```
+   If the response code is `200`, record `Access: rest-pat` and proceed to discovery.
+
+4. **None**: if all three probes fail, record `Access: none`. Skip discovery and write the install-hint variant of the `## Asana Integration` block (see standalone template below).
+
+**Asana zero-touch discovery** (only if access succeeded):
+
+Using whichever access method won, perform these reads:
+- `users/me` — cache the GID and friendly name.
+- List the user's workspaces. Show the count to the user (`Found N workspace(s)`).
+- List the projects the user belongs to in each workspace. Show the count (`Found M project(s) across N workspace(s)`).
+- Ask one question: *"Track tasks across all M projects, or pick specific projects? [all/pick]"*. Default `all` if the user just hits enter. If `pick`, list projects and accept a comma-separated selection.
+- Sniff one or two selected projects' `custom_fields` for a name matching `Priority`, `Status`, `Tier`, `P0`, `P1`. If found, record the field GID and its enum values list. Do NOT pre-bake a values-to-tier mapping — Opus maps at runtime.
+
+Cache the user GID and workspace list in `.claude/cache/asana-meta.json` with a 7-day TTL — runtime should not re-query these unless the cache is stale.
+
 Infer **lifecycle stage** using these signals:
 
 | Stage | Signals |
@@ -333,6 +372,24 @@ Include: <file extensions for detected languages>
 
 ## Tier Weights
 Emphasize: <tier guidance based on lifecycle>
+
+## Asana Integration
+
+<If Access succeeded, emit this block populated:>
+- **Access**: <mcp|cli|rest-pat>
+- **User GID**: <user gid> — <user name>
+- **Workspaces**:
+  - <workspace gid> — <workspace name>
+- **Projects**: <all | list of `- <project gid> — <project name>`>
+- **Priority Field**:
+  - GID: <field gid>
+  - Name: <field name>
+  - Values: <comma-separated enum value names>
+  (Omit the Priority Field block if no matching field was sniffed.)
+
+<If Access is `none`, emit this block instead — install hint only:>
+- **Access**: none
+- **To enable**: `/plugin install asana` (recommended) — or set `ASANA_PERSONAL_ACCESS_TOKEN` from https://app.asana.com/0/my-apps — or install asana CLI. Then re-run `/jacked-setup whats-next`.
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
