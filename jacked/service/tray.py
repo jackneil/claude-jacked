@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 import webbrowser
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 

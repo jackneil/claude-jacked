@@ -7,6 +7,7 @@ retrieving Claude Code sessions.
 
 import os
 import shutil
+import subprocess
 import sys
 import logging
 from pathlib import Path
@@ -800,7 +801,6 @@ def upgrade(extras: str, skip_service: bool):
     a running .exe, so we have to step out of the way. This process
     exits cleanly and the helper takes over.
     """
-    import subprocess
     from jacked import __version__
     from jacked.findbin import find_bin
     from jacked.install_method import (
@@ -968,7 +968,6 @@ def _spawn_windows_upgrade_helper(
       5. Append progress to ~/.claude/jacked-update.log.
     """
     import os
-    import shlex
     import subprocess
     import tempfile
     from jacked.service import CLAUDE_DIR
@@ -2920,8 +2919,8 @@ def doctor():
         if plist.exists():
             console.print(f"[bold]Launchd plist:[/bold] [green]OK[/green] ({plist})")
         else:
-            console.print(f"[bold]Launchd plist:[/bold] [yellow]MISSING[/yellow]")
-            console.print(f"  Recovery: [cyan]jacked service install[/cyan]")
+            console.print("[bold]Launchd plist:[/bold] [yellow]MISSING[/yellow]")
+            console.print("  Recovery: [cyan]jacked service install[/cyan]")
     elif sys.platform.startswith("linux"):
         from jacked.service.platform import _get_systemd_user_unit_path
         unit = _get_systemd_user_unit_path()
@@ -2948,7 +2947,7 @@ def doctor():
             f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
             f"(port {DEFAULT_PORT} free)"
         )
-        console.print(f"  Recovery: [cyan]jacked service start[/cyan]")
+        console.print("  Recovery: [cyan]jacked service start[/cyan]")
         if pid_info and not pid_alive:
             console.print(
                 f"  [dim]Stale PID file at {PID_FILE} "
@@ -3407,7 +3406,7 @@ def profiles_import(path: str):
             profiles_dir=profiles_dir,
             backup_dir=backup_dir,
         )
-        console.print(f"[green][OK][/green] Profile imported!")
+        console.print("[green][OK][/green] Profile imported!")
         console.print(f"[dim]Backup saved to: {backup_path}[/dim]")
     except Exception as e:
         console.print(f"[red]Import failed: {e}[/red]")

@@ -1,8 +1,6 @@
 """Tests for the /accounts/{id}/use endpoint (dashboard account switching)."""
 
 import json
-import tempfile
-from pathlib import Path
 from unittest import mock
 
 import pytest

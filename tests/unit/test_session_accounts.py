@@ -1125,7 +1125,7 @@ def test_close_dead_sessions():
 # ------------------------------------------------------------------
 
 from unittest import mock  # noqa: E402
-from jacked.api.watchers import _any_claude_process_alive, process_alive_sweeper_loop  # noqa: E402
+from jacked.api.watchers import _any_claude_process_alive  # noqa: E402
 
 
 def test_any_claude_process_alive_true():
@@ -1155,7 +1155,6 @@ def test_any_claude_process_alive_exception():
 
     >>> # Can't doctest process detection
     """
-    import subprocess
     with mock.patch(
         "jacked.api.watchers.subprocess.run",
         side_effect=OSError("pgrep not found"),

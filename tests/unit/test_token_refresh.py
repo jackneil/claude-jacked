@@ -12,7 +12,6 @@ import sqlite3
 import time
 from pathlib import Path
 
-import pytest
 
 from jacked.web.database import Database
 
@@ -43,7 +42,7 @@ def _make_db(tmp_path: Path) -> Database:
 class TestCircuitBreakerMigration:
     def test_columns_exist_in_schema(self, tmp_path):
         """refresh_last_failed_at and refresh_failure_type columns exist after DB init."""
-        db = _make_db(tmp_path)
+        _db = _make_db(tmp_path)
         conn = sqlite3.connect(str(tmp_path / "test.db"))
         cursor = conn.execute("PRAGMA table_info(accounts)")
         col_names = {row[1] for row in cursor.fetchall()}

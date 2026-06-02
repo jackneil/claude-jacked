@@ -1,7 +1,6 @@
 """Tests for editable-install detection and the can_auto_upgrade() gate."""
 
 import sys
-from pathlib import Path
 from unittest.mock import patch
 
 from jacked.install_method import (

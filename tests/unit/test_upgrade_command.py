@@ -36,9 +36,7 @@ class TestUpgradeRefusal:
 
 
 
-import sys
 from unittest.mock import patch, MagicMock
-from click.testing import CliRunner
 
 
 class TestUpgradeCommand:

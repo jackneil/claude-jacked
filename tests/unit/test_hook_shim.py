@@ -11,7 +11,7 @@ class TestHookShim:
         mock_module = MagicMock()
         mock_module.main = MagicMock()
         with patch("importlib.import_module", return_value=mock_module) as mock_import:
-            result = runner.invoke(main, ["_hook", "security_gatekeeper"], input="{}")
+            _result = runner.invoke(main, ["_hook", "security_gatekeeper"], input="{}")
         mock_import.assert_called_once_with("jacked.data.hooks.security_gatekeeper")
         mock_module.main.assert_called_once()
 

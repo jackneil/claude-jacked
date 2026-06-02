@@ -9,7 +9,6 @@ import json
 import os
 import time
 
-import pytest
 
 from jacked.web.analytics_db import AnalyticsDB
 from jacked.web.analytics_scanner import (

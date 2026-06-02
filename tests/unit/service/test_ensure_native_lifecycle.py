@@ -1,7 +1,6 @@
 """Tests for ensure_native_lifecycle() — exercises the real install_autostart
 path (writes a plist to a tmp location).  No fake_run lambdas that synthesize
 the plist — those give false positives (/dc round-1 CRITICAL)."""
-import subprocess
 import sys
 from unittest.mock import MagicMock, patch
 

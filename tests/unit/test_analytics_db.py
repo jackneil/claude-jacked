@@ -5,7 +5,6 @@ purge, scan state CRUD, flags lifecycle, settings get/set, and cost estimation.
 """
 
 import os
-import tempfile
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -365,7 +364,7 @@ class TestFlags:
 
     def test_insert_with_detail(self):
         db = _make_db()
-        fid = db.insert_flag("anomaly", "critical", "s1", "p1", "Unusual pattern",
+        _fid = db.insert_flag("anomaly", "critical", "s1", "p1", "Unusual pattern",
                              detail="Details here")
         flags = db.get_active_flags()
         assert flags[0]["detail"] == "Details here"

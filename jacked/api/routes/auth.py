@@ -21,7 +21,6 @@ from pydantic import BaseModel, Field
 from jacked.web.auth import (
     fetch_usage,
     refresh_account_token,
-    should_refresh,
     validate_account,
 )
 from jacked.web.oauth import OAuthFlow, get_flow

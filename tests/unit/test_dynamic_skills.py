@@ -1,8 +1,6 @@
 """Unit tests for dynamic skill discovery and toggle helpers."""
 
 import asyncio
-import json
-from pathlib import Path
 from unittest import mock
 
 import pytest

@@ -1,7 +1,6 @@
 """Tests for jacked.profiles — core profile logic."""
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,9 +10,7 @@ from jacked import __version__
 from jacked.profiles import (
     BACKUP_DIR_NAME,
     PROFILE_DIR_NAME,
-    GatekeeperConfig,
     ProfileSchema,
-    RulesSchema,
     _create_backup,
     _name_to_filename,
     delete_profile,
@@ -465,7 +462,7 @@ class TestBackupRestore:
         db = _make_db()
         settings = _make_settings()
 
-        b1 = _create_backup(db, settings, backup_dir)
+        _b1 = _create_backup(db, settings, backup_dir)
         b2 = _create_backup(db, {"permissions": {"allow": ["X"]}}, backup_dir)
 
         latest = get_latest_backup(backup_dir)

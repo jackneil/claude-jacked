@@ -21,7 +21,6 @@ from jacked.web.auto_swap.tiers import (
     TIER_T3,
     _resolve_now,
     deficit_vs_target,
-    target_7d,
     tier_for,
 )
 

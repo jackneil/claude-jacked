@@ -6,7 +6,6 @@ detect_anomalies orchestrator, and auto_resolve_flags.
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from jacked.web.analytics_db import AnalyticsDB
 from jacked.web.analytics_anomalies import (
@@ -240,7 +239,7 @@ class TestCostOutlierDetector:
 
         # 6 messages but all within 2 minutes
         now = datetime.now(timezone.utc)
-        msgs = []
+        _msgs = []
         db.insert_messages([{
             "id": f"quick_{i}",
             "session_id": "quick_session",
@@ -359,7 +358,7 @@ class TestDetectAnomalies:
         _insert_session(db, "boom", "proj1", msgs)
 
         # First run
-        first = detect_anomalies(db, session_ids=["boom"])
+        _first = detect_anomalies(db, session_ids=["boom"])
         # Second run -- should skip existing
         second = detect_anomalies(db, session_ids=["boom"])
         assert len(second) == 0

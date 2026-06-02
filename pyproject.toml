@@ -82,3 +82,11 @@ python_files = ["test_*.py"]
 # Bump as part of intentional dep refreshes (≥ 7 days ago is the minimum standard).
 [tool.uv]
 exclude-newer = "2026-05-13T00:00:00Z"
+
+# The repo had no ruff config, so the pre-push hook was linting under bare ruff
+# defaults. The CLI/script paths intentionally use post-sys.path imports (E402),
+# compact single-line statements (E701/E702), and lambda assignments (E731).
+# Ignore those style rules; ALL pyflakes (F) stay active so genuinely dead or
+# broken code (unused imports/vars, undefined names) still fails the gate.
+[tool.ruff.lint]
+ignore = ["E402", "E701", "E702", "E731"]
