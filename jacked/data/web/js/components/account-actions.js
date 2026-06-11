@@ -53,7 +53,10 @@ function _stopCheckCountdown() {
 
 let _autoRefreshCountdown = 0;
 let _lastAutoRefreshAt = null; // Date.now() of last COMPLETED auto-refresh; null = no prior refresh or stopped
-const _singleRefreshInFlight = new Set(); // tracks accountIds with pending single-refresh
+const _singleRefreshInFlight = new Map(); // accountId -> Date.now() when the refresh started
+// Backstop: entries older than this are treated as stale (orphaned by a refresh whose
+// finally never ran) so the user isn't locked out of refreshing that account forever.
+const _SINGLE_REFRESH_STALE_MS = 240000;
 // Shared via window.jackedState so websocket.js can check it without cross-file globals
 if (window.jackedState) window.jackedState._usageRefreshInProgress = false;
 const _refreshSvg = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>';
@@ -488,7 +491,9 @@ async function _triggerUsageRefresh() {
         const ss = window.jackedState.swapSettings || {};
         const activeId = window.jackedState.activeCredentialAccountId;
         const skipParam = (ss.auto_swap_enabled && activeId) ? '?skip_account=' + activeId : '';
-        const result = await api.post('/api/auth/accounts/refresh-all-usage' + skipParam);
+        // Bulk refresh runs ~2s per account server-side — needs more headroom than the
+        // default 60s API timeout when many accounts are configured.
+        const result = await api.post('/api/auth/accounts/refresh-all-usage' + skipParam, undefined, { timeout: 300000 });
         if (result.refreshed === 0 && result.failed === 0) {
             showToast('No active accounts to refresh', 'warning');
         } else if (result.failed > 0) {
@@ -543,20 +548,28 @@ async function _triggerSingleUsageRefresh(accountId) {
         showToast('Bulk refresh in progress — please wait', 'warning', 2000);
         return;
     }
-    if (_singleRefreshInFlight.has(accountId)) return;
+    const startedAt = _singleRefreshInFlight.get(accountId);
+    if (startedAt !== undefined) {
+        if (Date.now() - startedAt < _SINGLE_REFRESH_STALE_MS) {
+            showToast('Refresh already running for this account', 'warning', 2000);
+            return;
+        }
+        _singleRefreshInFlight.delete(accountId);
+    }
 
     const card = document.querySelector('[data-account-id="' + accountId + '"]');
     if (!card) return;
 
-    _singleRefreshInFlight.add(accountId);
+    const startStamp = Date.now();
+    _singleRefreshInFlight.set(accountId, startStamp);
     card.classList.remove('usage-done', 'usage-failed');
     card.classList.add('usage-checking');
     if (typeof _usageInjectOverlay === 'function') {
         _usageInjectOverlay(card, 'checking', 'Checking usage\u2026');
     }
-    // Watchdog: if the fetch hangs or WS events never clear the class, this
-    // returns the card to idle after _CHECKING_TIMEOUT_MS so the user can
-    // click refresh again. The fetch() in api.post has no timeout.
+    // Watchdog: if WS events never clear the class, this returns the card to
+    // idle after _CHECKING_TIMEOUT_MS so the user can click refresh again.
+    // (api.post itself times out after 60s, but WS-driven classes can still leak.)
     if (typeof _armCheckingWatchdog === 'function') _armCheckingWatchdog(accountId);
 
     try {
@@ -597,7 +610,11 @@ async function _triggerSingleUsageRefresh(accountId) {
         }
         showToast('Refresh failed: ' + e.message, 'error');
     } finally {
-        _singleRefreshInFlight.delete(accountId);
+        // Only clear our own entry — a stale-superseded call settling late must not
+        // delete the timestamp of the refresh that replaced it.
+        if (_singleRefreshInFlight.get(accountId) === startStamp) {
+            _singleRefreshInFlight.delete(accountId);
+        }
     }
 }
 

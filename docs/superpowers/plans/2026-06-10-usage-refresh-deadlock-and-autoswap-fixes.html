@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Usage-Refresh Deadlock &amp; Auto-Swap Fixes</title>
+
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="complete">
+<meta name="jacked:branch" content="master">
+<meta name="jacked:date" content="2026-06-10">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Usage-Refresh Deadlock &amp; Auto-Swap Fixes</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge ok">complete</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-06-10</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">master</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">plan (implementation record)</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#problem">Problem</a></li>
+    <li><a href="#root-cause">Root Cause &amp; Evidence Chain</a></li>
+    <li><a href="#fixes">Fix Inventory</a></li>
+    <li><a href="#tests">Test Strategy</a></li>
+    <li><a href="#rollout">Rollout Notes</a></li>
+  </ol>
+</nav>
+
+<h2 id="problem">Problem</h2>
+<p><strong>Stuck server.</strong> A usage refresh could wedge the entire server until
+restart: account rows froze at "checking", the single-account refresh
+endpoints never returned, and the background token-refresh and heal sweeps
+silently died. The dashboard's refresh buttons locked out forever because the
+frontend fetch had no timeout either.</p>
+<p><strong>Auto-swap shortfalls.</strong> Independently, the swap algorithm was
+stranding capacity (an active T0 with a long runway blocked an earlier-expiring
+T0; the fixed T1 target of 90 stranded the buffer when expiry landed outside
+working hours; the burn-floor check stranded the final slice of every account)
+and churning (id-keyed emergence streaks reset each other; asymmetric hysteresis
+fired premature drains; failed swaps retried every tick; manual switches were
+silently reverted within minutes). The decision log recorded every blocked swap
+as a generic <code>tick</code>, making any of this invisible.</p>
+
+<h2 id="root-cause">Root Cause &amp; Evidence Chain</h2>
+<p>Verified against the code, reproduced in <code>tests/unit/test_refresh_deadlock.py</code>:</p>
+<ol>
+  <li><code>_refresh_token_flow(PRIMARY)</code> in <code>jacked/web/auth.py</code> ran the
+      post-refresh <code>fetch_profile</code> <em>while still holding</em> the per-account
+      primary refresh lock.</li>
+  <li><code>fetch_profile</code>'s 401 recovery path re-enters
+      <code>_refresh_token_flow</code> on the <em>same</em> non-reentrant
+      <code>asyncio.Lock</code> — the coroutine awaited its own lock: self-deadlock,
+      lock never released.</li>
+  <li>Compounding: <code>refresh_all_expiring_tokens</code> and
+      <code>heal_invalid_accounts</code> wrapped <code>refresh_account_token</code> in
+      <code>async with lock:</code> — the flow acquires that same lock internally, so
+      those paths self-deadlocked even without the profile-fetch trigger.</li>
+  <li>The lock acquire was unbounded, so every later refresh / 401-recovery /
+      validate path for that account suspended forever behind the wedged holder.</li>
+  <li><code>main.py</code>'s <code>_token_refresh_loop</code> and
+      <code>_heal_sweep_loop</code> awaited the wedged pass with no timeout — both
+      loops dead until server restart.</li>
+  <li>HTTP routes (<code>/refresh-usage</code>, <code>/refresh-token</code>,
+      <code>/validate</code>) awaited the same wedged coroutines unbounded — endless
+      "checking" spinner; the frontend <code>fetch()</code> had no timeout, so its
+      in-flight flags (<code>_singleRefreshInFlight</code>,
+      <code>_usageRefreshInProgress</code>) stuck until page reload.</li>
+</ol>
+
+<div class="diagram">
+  <pre class="mermaid">
+flowchart TD
+    A[refresh_account_token] --> B[_refresh_token_flow PRIMARY<br/>acquires per-account lock]
+    B --> C[token exchange OK]
+    C --> D[fetch_profile<br/>WHILE HOLDING LOCK]
+    D -->|401| E[recovery: re-enter<br/>_refresh_token_flow]
+    E -->|acquire same<br/>non-reentrant lock| B
+    E -. wedged forever .-> F[every later refresh /<br/>heal / validate for this<br/>account blocks unbounded]
+    F --> G[main.py sweep loops +<br/>HTTP routes await forever]
+  </pre>
+  <pre class="mermaid-source">
+flowchart TD
+    A[refresh_account_token] --> B[_refresh_token_flow PRIMARY<br/>acquires per-account lock]
+    B --> C[token exchange OK]
+    C --> D[fetch_profile<br/>WHILE HOLDING LOCK]
+    D -->|401| E[recovery: re-enter<br/>_refresh_token_flow]
+    E -->|acquire same<br/>non-reentrant lock| B
+    E -. wedged forever .-> F[every later refresh /<br/>heal / validate for this<br/>account blocks unbounded]
+    F --> G[main.py sweep loops +<br/>HTTP routes await forever]
+  </pre>
+</div>
+
+<aside class="callout danger">
+  <strong>Invariant (now stated in <code>docs/architecture/auto-swap-system.md</code>):</strong>
+  per-account refresh locking lives SOLELY in <code>_refresh_token_flow</code>, with a
+  bounded 60s acquire. Callers must NEVER hold the per-account refresh lock around
+  <code>refresh_account_token</code> — peek with <code>lock.locked()</code> for a
+  fast-skip, never hold.
+</aside>
+
+<h2 id="fixes">Fix Inventory</h2>
+
+<h3>Bundle A — Deadlock / stuck server</h3>
+<table>
+  <thead><tr><th>Fix</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Lock ownership consolidated into <code>_refresh_token_flow</code>; bounded acquire <code>wait_for(lock.acquire(), 60)</code> → <code>lock_timeout</code> error instead of eternal suspension; explicit <code>try/finally lock.release()</code>.</td><td><code>jacked/web/auth.py</code></td></tr>
+    <tr><td>Post-refresh <code>fetch_profile</code> moved OUTSIDE the lock (step 4l) — its 401 path re-enters the flow on the same lock (the root cause).</td><td><code>jacked/web/auth.py</code></td></tr>
+    <tr><td><code>refresh_all_expiring_tokens</code>: <code>lock.locked()</code> peek for fast-skip only; per-account <code>wait_for(60)</code>; exceptions counted as failed, never propagate.</td><td><code>jacked/web/auth.py</code></td></tr>
+    <tr><td><code>heal_invalid_accounts</code>: calls <code>_refresh_token_flow(PRIMARY)</code> directly (flow owns locking; also fixes the phantom heal where <code>should_refresh</code> reported success without exchanging); heal validation bounded 60s.</td><td><code>jacked/web/auth.py</code></td></tr>
+    <tr><td>Sweep loops self-heal: <code>asyncio.wait_for(..., SWEEP_PASS_TIMEOUT=600)</code> around each refresh/heal pass — cancellation releases any held lock; loop continues next interval.</td><td><code>jacked/api/main.py</code></td></tr>
+    <tr><td>Route-level bounds → deterministic 504 (<code>REFRESH_TIMEOUT</code>/<code>VALIDATE_TIMEOUT</code>): refresh-token 45s, refresh-usage 60s (also resets <code>validation_status</code> to "unknown" so the row leaves "checking"), validate 60s. Bulk-refresh 429 envelope standardized; <code>_bulk_refresh_acquired_at</code> reset in <code>finally</code>.</td><td><code>jacked/api/routes/auth.py</code></td></tr>
+    <tr><td>Poll-loop fetch bounds: active <code>fetch_usage</code> 50s (tick continues on cached data), candidate fetches 30s + catch-all, prime fetches 30s; single-account installs no longer re-prime forever (<code>attempted == 0</code> counts as done).</td><td><code>jacked/api/usage_monitor.py</code></td></tr>
+    <tr><td>Frontend: <code>AbortController</code> default 60s API timeout (300s for bulk refresh); <code>_singleRefreshInFlight</code> is now a Map with a 240s stale backstop so an orphaned refresh can't lock out the button forever.</td><td><code>jacked/data/web/js/app.js</code>, <code>account-actions.js</code></td></tr>
+  </tbody>
+</table>
+
+<h3>Bundle B — Churn</h3>
+<table>
+  <thead><tr><th>Fix</th><th>Detail</th></tr></thead>
+  <tbody>
+    <tr><td>Min-residency 900s</td><td>Proactive departures (emerged / intra-tier / burn-rate) blocked until the active account has held the slot 900s since the last committed swap or manual switch. Drained + 5h-critical are forced departures — exempt. Trigger: <code>residency_blocked</code>.</td></tr>
+    <tr><td>Manual-switch protection</td><td><code>use_account</code> calls <code>note_external_swap()</code> (arms cooldown + residency, clears emergence streak) and pauses the sweep 15 min — auto-swap can no longer silently revert the user's choice.</td></tr>
+    <tr><td><code>RESET_SUPPRESS_MINUTES</code> = 30</td><td>Shared with selection's <code>_FIVE_H_HEADROOM_RESET_MIN</code>. Invariant: lookahead &lt;= suppression, else an account admitted on an imminent 5h reset is immediately ejected by 5h-critical (deterministic ping-pong).</td></tr>
+    <tr><td>Symmetric tier hysteresis</td><td>Single-step less-urgent flips (T0→T1) now damped within 5 min of the boundary — refetch noise fired a premature <code>drained</code> (target 100→90) plus pull-back swap. Multi-step jumps flip immediately (genuine window reset).</td></tr>
+    <tr><td>Tier-keyed emergence persistence</td><td><code>_emerged_tier_streak</code> keyed by TIER, not account id — two near-tied same-tier candidates alternating as best reset each other's id-keyed streak forever. Fast path: a &gt;=2-tier gap (T0 best vs T2+ active) skips persistence.</td></tr>
+    <tr><td>Swap-failure backoff</td><td>Failed credential writes retry on exponential backoff (60s × 2^(n−1), cap 600s) instead of every tick; burn-rate state preserved on failure; committed swap resets the count.</td></tr>
+    <tr><td>Burn-rate decay ungated</td><td>Decays after 5+ unchanged ticks at ANY usage level — the below-warning gate froze the rate exactly when the user went idle at &gt;=80%, firing spurious burn-rate swaps.</td></tr>
+  </tbody>
+</table>
+
+<h3>Bundle C — Utilization</h3>
+<table>
+  <thead><tr><th>Fix</th><th>Detail</th></tr></thead>
+  <tbody>
+    <tr><td>Quiet-hours executor guard REMOVED</td><td>Swaps execute 24/7. A credential swap costs nothing while idle and pre-positions the fleet for morning — 5h windows open on the first API call, not on credential placement. Dead <code>active_start</code>/<code>active_end</code> params dropped from <code>_execute_swap</code>.</td></tr>
+    <tr><td>Intra-T0 preemption (rule 1b)</td><td>An earlier-expiring T0 candidate with deficit &gt;= 5% and loss-rate &gt;= 1.5× the active T0's preempts it. The largest stranding mechanism observed; margin gates prevent ping-pong. Trigger: <code>intra_tier_preempted</code>.</td></tr>
+    <tr><td>Deadline-aware T1 target</td><td><code>max(90, 100 − min(10, achievable_final_day_burn))</code> — a fixed 90 strands the buffer when expiry lands outside working hours (e.g. 03:00 local). Floor 90.</td></tr>
+    <tr><td>T0 headroom-floor bypass</td><td>T0 candidates with deficit &gt;= 1 skip <code>has_viable_headroom</code> — drain-to-100 must not strand the final slice below the ~4.2% burn-per-window floor.</td></tr>
+    <tr><td>Stale-saturation recovery</td><td><code>_has_5h_headroom</code> treats a PAST 5h reset as headroom; <code>_candidate_staleness_override</code> forces a refetch on past-reset-with-saturated-cache or a 7d window reset — removes the 5-10 min blind spot right after a reset.</td></tr>
+    <tr><td>T0 poll clamp</td><td>Interval &lt;=90s whenever an eligible non-active T0 with deficit exists; &lt;=60s when a saturated T0's 5h reset lands within the next interval (be on time for the reset).</td></tr>
+    <tr><td>Damped-tier deficit + numeric sort</td><td>Selection computes deficit against the hysteresis-damped tier via <code>target_for_tier</code> (a held-at-T1 account is admitted with T1's target, never T0's); <code>_SortKey</code> uses UTC-epoch reset times (lex string sort diverges chronologically for mixed ISO formats).</td></tr>
+  </tbody>
+</table>
+
+<h3>Bundle D — Observability</h3>
+<table>
+  <thead><tr><th>Fix</th><th>Detail</th></tr></thead>
+  <tbody>
+    <tr><td>Trigger taxonomy extended</td><td>Stay causes are now first-class: <code>tick</code>, <code>emergence_pending</code>, <code>residency_blocked</code>, <code>cooldown_blocked</code>, <code>no_target</code>, <code>swap_aborted</code>; swaps add <code>intra_tier_preempted</code>. Trigger set explicitly by the branch taken (<code>_decision_trigger</code>), not re-derived by parsing the reason string.</td></tr>
+    <tr><td>Swap audit trail</td><td><code>swap_log</code> gains <code>status</code> (<code>pending</code> → <code>committed</code>/<code>failed</code>; written pending BEFORE the credential write) and <code>residency_seconds</code>; auto-migrated. <code>/swap-log</code> returns <code>{"swaps": [...], "swaps_last_24h": N}</code> (committed-only count).</td></tr>
+    <tr><td>Drain advisor</td><td><code>expiring_with_stranded_capacity</code> WS event for T0 accounts projected to strand &gt;2% (<code>stranding_estimate = max(0, deficit − achievable_burn)</code>); per-account 30-min cooldown. <strong>Advisor only — explicitly NO auto-burn worker:</strong> routing real work toward the expiring account beats burning quota on no-ops.</td></tr>
+    <tr><td>Stall pattern (d) demoted</td><td>Same-tier-stay-with-deficit is intended behavior per spec — paging it at ERROR trains operators to ignore the watchdog. Now <code>same_tier_deficit_advisory</code> (INFO + WS, 30-min cooldown, T0/T1 candidates &gt;=15% behind target only).</td></tr>
+    <tr><td>Candidate summaries</td><td>Decision-log candidates include <code>stranding</code> and compute target/deficit against the damped tier — the log matches what selection actually evaluated.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="tests">Test Strategy</h2>
+<p>New test files:</p>
+<ul>
+  <li><code>tests/unit/test_refresh_deadlock.py</code> — sweep and heal complete without deadlock (timeout-bounded), phantom-heal regression, bounded lock acquire returns <code>lock_timeout</code>, profile-fetch 401 re-entry does not deadlock, lock released after flow.</li>
+  <li><code>tests/unit/test_swap_log.py</code> — record/update status, residency, legacy-table migration, trailing-24h committed count, endpoint payload shape.</li>
+  <li><code>tests/unit/api/test_routes_auth_timeouts.py</code> — 504s with codes, status reset on usage timeout, 429 envelope, <code>acquired_at</code> reset.</li>
+</ul>
+<p>Extended: <code>test_auto_swap.py</code> (target_for_tier, deadline-aware T1, damped-deficit admission, chronological sort, intra-T0 preemption, reset-suppress invariant, achievable_burn/stranding_estimate), <code>test_usage_monitor.py</code> (residency gate, failure backoff, taxonomy branches, fast-path emergence, tier-keyed persistence, same-tier advisory, execute-swap atomicity/residency, priming, active fetch timeout), <code>test_use_account.py</code> (manual switch arms pause + residency), <code>test_token_refresh.py</code>.</p>
+<pre><code>uv run python -m pytest tests/unit/test_refresh_deadlock.py tests/unit/test_swap_log.py \
+  tests/unit/api/test_routes_auth_timeouts.py tests/unit/test_auto_swap.py \
+  tests/unit/test_usage_monitor.py tests/unit/test_token_refresh.py \
+  tests/unit/test_use_account.py -q</code></pre>
+
+<h2 id="rollout">Rollout Notes</h2>
+<ul>
+  <li><strong>Restart the server after install.</strong> The deadlock fix only takes
+      effect in a fresh process — a currently-wedged server stays wedged until
+      restarted. The <code>swap_log</code> column migration runs automatically at
+      startup.</li>
+  <li><strong>Watch the <code>swaps_last_24h</code> counter</strong> (in
+      <code>GET /api/settings/swap-log</code>). Expect a modest increase from 24/7
+      execution + intra-T0 preemption; min-residency, cooldown, and failure backoff
+      should keep it in the single digits. A sustained high count means ping-pong —
+      read the decision log triggers.</li>
+  <li>In steady state the logs should NOT contain
+      <code>"could not acquire ... refresh lock"</code> or
+      <code>"pass exceeded ... cancelled"</code> — those lines now mean a new wedge
+      is being contained rather than freezing the server.</li>
+</ul>
+
+<hr>
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a>
+  HTML artifact template. Edit freely.
+</p>
+
+</div>
+
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+  } catch (err) {
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>

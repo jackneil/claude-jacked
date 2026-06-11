@@ -24,7 +24,12 @@ class BurnRate:
 # Window-reset awareness
 # ---------------------------------------------------------------------------
 
-RESET_SUPPRESS_MINUTES = 10
+# INVARIANT: selection's imminent-reset lookahead (_FIVE_H_HEADROOM_RESET_MIN)
+# must be <= this suppression window. An account admitted because its 5h reset
+# is N minutes out must keep 5h-critical suppressed for those N minutes after
+# the swap, else should_swap_now's 5h-critical rule ejects it immediately
+# (deterministic ping-pong).
+RESET_SUPPRESS_MINUTES = 30
 
 
 def _resets_within(resets_at: str | None, minutes: float) -> bool:

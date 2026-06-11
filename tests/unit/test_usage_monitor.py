@@ -111,6 +111,35 @@ def _sleep_canceller(max_sleeps=5):
     return _sleep
 
 
+@pytest.fixture(autouse=True)
+def _reset_monitor_state():
+    """Reset usage_monitor module-level state before every test.
+
+    The loop accumulates cross-tick state (burn rates, cooldowns, failure
+    backoff, tier streaks, advisor cooldowns); leaking it across tests
+    makes outcomes order-dependent. ``_initial_fetch_done`` is set True so
+    loop tests skip the priming block — the priming tests set it False
+    explicitly.
+    """
+    import jacked.api.usage_monitor as mod
+    mod._burn_rates.clear()
+    mod._burn_rate_unchanged_ticks.clear()
+    mod._last_swap_time = 0.0
+    mod._last_committed_swap_time = 0.0
+    mod._swap_failure_count = 0
+    mod._last_swap_failure_at = 0.0
+    mod._last_exhaustion_warning = 0.0
+    mod._consecutive_no_best_ticks = 0
+    mod._last_stall_warning = 0.0
+    mod._same_tier_advisory_last = 0.0
+    mod._drain_advisor_last_sent.clear()
+    mod._emerged_tier_streak["tier"] = None
+    mod._emerged_tier_streak["count"] = 0
+    mod._last_observed_tiers.clear()
+    mod._initial_fetch_done = True
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Setting helpers (sync -- no event loop needed)
 # ---------------------------------------------------------------------------
@@ -1039,24 +1068,25 @@ class TestBurnRateDecay:
 
         asyncio.run(_run())
 
-    def test_no_decay_above_warning_threshold(self):
-        """Usage at or above warning threshold -> no burn-rate decay applied."""
+    def test_decay_applies_at_high_usage(self):
+        """Decay is ungated: unchanged usage at/above the warning threshold
+        still decays the rate — unchanged usage is direct evidence burn
+        stopped; a frozen rate fires spurious burn-rate swaps after the
+        user goes idle at >=80%."""
         import jacked.api.usage_monitor as mod
         from jacked.web.auto_swap import BurnRate
-        mod._burn_rates.clear()
-        mod._burn_rate_unchanged_ticks.clear()
-        mod._last_swap_time = 0.0
 
-        # Pre-seed with many unchanged ticks
+        # Pre-seed with 4 ticks already counted — next tick is the 5th
         mod._burn_rates[1] = BurnRate(
             rate_5h_per_min=1.0,
             last_check_5h=85.0,
             rate_7d_per_min=1.0,
             last_check_7d=50.0,
         )
-        mod._burn_rate_unchanged_ticks[1] = 10  # well above the 5-tick threshold
+        mod._burn_rate_unchanged_ticks[1] = 4
 
-        # Account at 85% — above 80% warning, may trigger swap
+        # Single account at 85% — above 80% warning, no swap target so
+        # burn-rate state survives the tick regardless of the reason.
         accounts = [
             _acct(1, usage_5h=85, usage_7d=50),
         ]
@@ -1074,7 +1104,7 @@ class TestBurnRateDecay:
             with (
                 patch(
                     "jacked.api.usage_monitor.asyncio.sleep",
-                    side_effect=_sleep_canceller(max_sleeps=1),
+                    side_effect=_sleep_canceller(max_sleeps=0),
                 ),
                 patch(
                     "jacked.api.usage_monitor._read_active_account_id",
@@ -1089,21 +1119,16 @@ class TestBurnRateDecay:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ),
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
 
-            # At 85% usage the account may trigger a swap and pop the burn rate.
-            # Only assert the rate is undecayed if the entry still exists.
             br = mod._burn_rates.get(1)
-            if br is not None:
-                assert br.rate_5h_per_min >= 1.0, (
-                    f"Expected rate_5h_per_min undecayed (>= 1.0), "
-                    f"got {br.rate_5h_per_min}"
-                )
+            assert br is not None, "Burn rate entry should survive a no-target tick"
+            assert abs(br.rate_5h_per_min - 0.8) < 0.01, (
+                f"Expected rate_5h_per_min ~0.8 after high-usage decay, "
+                f"got {br.rate_5h_per_min}"
+            )
 
         asyncio.run(_run())
 
@@ -1113,67 +1138,107 @@ class TestEmergencePersistence:
 
     Drives the EXTRACTED helper `_apply_emergence_persistence` —
     these tests exercise real production code, NOT a hand-rolled
-    local copy of the logic.
+    local copy of the logic. Streak state is TIER-keyed:
+    {"tier": int | None, "count": int}.
     """
 
     def test_first_emerge_suppressed(self):
         from jacked.api.usage_monitor import _apply_emergence_persistence
-        streak: dict[int, int] = {}
+        streak = {"tier": None, "count": 0}
         result = _apply_emergence_persistence(
             reason="higher tier emerged: T0 vs T2",
-            best_id=7,
+            best_tier=0,
             streak=streak,
             persistence_ticks=2,
         )
         assert result is None
-        assert streak == {7: 1}
+        assert streak == {"tier": 0, "count": 1}
 
     def test_second_emerge_fires(self):
         from jacked.api.usage_monitor import _apply_emergence_persistence
-        streak = {7: 1}
+        streak = {"tier": 0, "count": 1}
         result = _apply_emergence_persistence(
             reason="higher tier emerged: T0 vs T2",
-            best_id=7,
+            best_tier=0,
             streak=streak,
             persistence_ticks=2,
         )
         assert result is not None
         assert result.startswith("higher tier emerged")
-        assert streak == {7: 2}
+        assert streak == {"tier": 0, "count": 2}
 
-    def test_target_change_resets_streak(self):
+    def test_alternating_best_ids_same_tier_reach_threshold(self):
+        """The headline fix: two near-tied candidates alternating as best
+        must NOT reset each other's streak — the streak is keyed by tier,
+        so any account in the emerged tier counts toward the threshold."""
         from jacked.api.usage_monitor import _apply_emergence_persistence
-        streak = {1: 5}
-        result = _apply_emergence_persistence(
+        streak = {"tier": None, "count": 0}
+        # Tick 1: account A is best (tier 0).
+        r1 = _apply_emergence_persistence(
             reason="higher tier emerged: T0 vs T2",
-            best_id=2,
+            best_tier=0, streak=streak, persistence_ticks=2,
+        )
+        assert r1 is None
+        # Tick 2: account B is best — same tier 0. Streak continues.
+        r2 = _apply_emergence_persistence(
+            reason="higher tier emerged: T0 vs T2",
+            best_tier=0, streak=streak, persistence_ticks=2,
+        )
+        assert r2 is not None
+        assert streak == {"tier": 0, "count": 2}
+
+    def test_tier_change_resets_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {"tier": 0, "count": 5}
+        result = _apply_emergence_persistence(
+            reason="higher tier emerged: T1 vs T2",
+            best_tier=1,
             streak=streak,
             persistence_ticks=2,
         )
-        assert 1 not in streak
-        assert streak[2] == 1
+        assert streak == {"tier": 1, "count": 1}
         assert result is None
+
+    def test_intra_tier_reason_increments_streak(self):
+        from jacked.api.usage_monitor import _apply_emergence_persistence
+        streak = {"tier": None, "count": 0}
+        result = _apply_emergence_persistence(
+            reason="intra-tier preemption: T0 candidate losing 20.0% in 4.0h",
+            best_tier=0,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert result is None
+        assert streak == {"tier": 0, "count": 1}
+        result = _apply_emergence_persistence(
+            reason="intra-tier preemption: T0 candidate losing 20.0% in 4.0h",
+            best_tier=0,
+            streak=streak,
+            persistence_ticks=2,
+        )
+        assert result is not None
+        assert result.startswith("intra-tier preemption:")
 
     def test_non_emerge_reason_clears_streak(self):
         from jacked.api.usage_monitor import _apply_emergence_persistence
-        streak = {7: 1}
+        streak = {"tier": 0, "count": 1}
         result = _apply_emergence_persistence(
             reason="drained: 7d usage 100% >= 100%",
-            best_id=7,
+            best_tier=0,
             streak=streak,
             persistence_ticks=2,
         )
         assert result.startswith("drained")
-        assert streak == {}
+        assert streak == {"tier": None, "count": 0}
 
     def test_none_reason_clears_streak(self):
         from jacked.api.usage_monitor import _apply_emergence_persistence
-        streak = {7: 1}
+        streak = {"tier": 0, "count": 1}
         result = _apply_emergence_persistence(
-            reason=None, best_id=7, streak=streak, persistence_ticks=2,
+            reason=None, best_tier=0, streak=streak, persistence_ticks=2,
         )
         assert result is None
-        assert streak == {}
+        assert streak == {"tier": None, "count": 0}
 
 
 class TestSilentStallWatchdog:
@@ -1234,9 +1299,10 @@ class TestSilentStallWatchdog:
         )
         assert bumped is False
 
-    def test_pattern_d_same_tier_stay_with_meaningful_deficit(self):
-        """User-observed bug: same-tier candidate sits behind tier target
-        for hours, watchdog never trips. Pattern (d) catches it."""
+    def test_same_tier_stay_with_deficit_is_not_a_stall(self):
+        """Pattern (d) was split OUT of the stall path: same-tier-stay
+        with a candidate deficit is intended behavior per spec — it gets
+        the `same_tier_deficit_advisory` instead of an ERROR stall."""
         from jacked.api.usage_monitor import _evaluate_stall
         bumped = _evaluate_stall(
             decision_action="stay",
@@ -1245,197 +1311,267 @@ class TestSilentStallWatchdog:
             has_other_accounts=True,
             reason=None,  # same-tier-never-overrides → no reason
             staleness_threshold=1800,
-            best_deficit=22.5,  # well above default 15% threshold
-        )
-        assert bumped is True
-
-    def test_pattern_d_below_threshold_does_not_fire(self):
-        from jacked.api.usage_monitor import _evaluate_stall
-        bumped = _evaluate_stall(
-            decision_action="stay",
-            best={"id": 1},
-            usage_cached_at_age_seconds=10,
-            has_other_accounts=True,
-            reason=None,
-            staleness_threshold=1800,
-            best_deficit=5.0,  # within tolerance
         )
         assert bumped is False
 
-    def test_pattern_d_no_deficit_provided_does_not_fire(self):
-        # Backwards compat: callers that don't provide best_deficit
-        # don't accidentally trip the new pattern.
-        from jacked.api.usage_monitor import _evaluate_stall
-        bumped = _evaluate_stall(
+
+class TestSameTierDeficitAdvisory:
+    """Item 13: pattern (d) became an advisory gated on harvestable tiers.
+
+    Drives the EXTRACTED helper `_same_tier_advisory_applies`; the 30-min
+    cooldown lives in the loop (module `_same_tier_advisory_last`).
+    """
+
+    def _applies(self, **overrides):
+        from jacked.api.usage_monitor import _same_tier_advisory_applies
+        kwargs = dict(
             decision_action="stay",
             best={"id": 1},
-            usage_cached_at_age_seconds=10,
-            has_other_accounts=True,
             reason=None,
-            staleness_threshold=1800,
+            best_deficit=22.5,
+            best_tier=0,
         )
-        assert bumped is False
+        kwargs.update(overrides)
+        return _same_tier_advisory_applies(**kwargs)
+
+    def test_fires_for_t0_candidate(self):
+        assert self._applies(best_tier=0) is True
+
+    def test_fires_for_t1_candidate(self):
+        assert self._applies(best_tier=1) is True
+
+    def test_t2_candidate_does_not_fire(self):
+        # T2/T3 targets are floors, not drain-to goals — not actionable.
+        assert self._applies(best_tier=2) is False
+        assert self._applies(best_tier=3) is False
+
+    def test_below_threshold_does_not_fire(self):
+        assert self._applies(best_deficit=5.0) is False
+
+    def test_no_deficit_does_not_fire(self):
+        assert self._applies(best_deficit=None) is False
+
+    def test_reason_present_does_not_fire(self):
+        assert self._applies(reason="drained: 7d at 100%") is False
+
+    def test_swap_action_does_not_fire(self):
+        assert self._applies(decision_action="swap") is False
+
+    def test_no_best_does_not_fire(self):
+        assert self._applies(best=None) is False
 
 
 class TestEmergencePersistenceTransientPreservation:
     """User-observed bug: a single tick where best=None (transient
     candidate-fetch hiccup) used to clear the streak, restarting the
     2-minute clock. New behavior: preserve streak when both reason
-    and best_id are None — only explicit non-emerge reasons clear it."""
+    and best_tier are None — only explicit non-emerge reasons clear it."""
 
     def test_streak_preserved_on_transient_no_best(self):
         from jacked.api.usage_monitor import _apply_emergence_persistence
-        streak = {7: 1}
+        streak = {"tier": 0, "count": 1}
         result = _apply_emergence_persistence(
-            reason=None, best_id=None,
+            reason=None, best_tier=None,
             streak=streak, persistence_ticks=2,
         )
         assert result is None
-        assert streak == {7: 1}  # PRESERVED across the transient tick
+        assert streak == {"tier": 0, "count": 1}  # PRESERVED across the transient tick
 
     def test_streak_resumes_after_transient(self):
         from jacked.api.usage_monitor import _apply_emergence_persistence
-        # Tick 1: emergence, streak[7] = 1.
-        streak: dict[int, int] = {}
+        # Tick 1: emergence, streak tier 0 count 1.
+        streak = {"tier": None, "count": 0}
         _apply_emergence_persistence(
-            reason="higher tier emerged: T0 vs T2", best_id=7,
+            reason="higher tier emerged: T0 vs T2", best_tier=0,
             streak=streak, persistence_ticks=2,
         )
-        assert streak == {7: 1}
+        assert streak == {"tier": 0, "count": 1}
         # Tick 2: transient (best=None, reason=None). Streak preserved.
         _apply_emergence_persistence(
-            reason=None, best_id=None,
+            reason=None, best_tier=None,
             streak=streak, persistence_ticks=2,
         )
-        assert streak == {7: 1}
+        assert streak == {"tier": 0, "count": 1}
         # Tick 3: emergence resumes. Streak fires.
         result = _apply_emergence_persistence(
-            reason="higher tier emerged: T0 vs T2", best_id=7,
+            reason="higher tier emerged: T0 vs T2", best_tier=0,
             streak=streak, persistence_ticks=2,
         )
         assert result is not None
         assert result.startswith("higher tier emerged")
-        assert streak == {7: 2}
+        assert streak == {"tier": 0, "count": 2}
+
+
+class _SwapFakeDB:
+    """Minimal DB stand-in for _execute_swap tests."""
+
+    def __init__(self, captured):
+        self.captured = captured
+
+    def record_swap(self, **kwargs):
+        self.captured["record_swap"] = kwargs
+        return 41
+
+    def update_swap_status(self, swap_id, status):
+        self.captured.setdefault("status_updates", []).append((swap_id, status))
+
+    def set_setting(self, key, value):
+        self.captured.setdefault("settings", {})[key] = value
+
+
+def _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_lock():
+        yield lock_acquired
+
+    def fake_sync(account_id, target, email=None):
+        captured["sync_called_with"] = account_id
+
+    monkeypatch.setattr(
+        "jacked.api.credential_helpers.acquire_claude_lock", fake_lock,
+    )
+    monkeypatch.setattr(
+        "jacked.api.credential_helpers.sync_credential_to_all_stores",
+        fake_sync,
+    )
+    monkeypatch.setattr(
+        "jacked.api.credential_helpers.invalidate_live_cred_cache",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "jacked.api.credential_helpers.reconcile_credentials_from_live_store",
+        lambda *a, **kw: None,
+    )
+
+
+def _run_execute_swap(captured, reason="higher tier emerged: T0 vs T2",
+                      trigger="higher_tier_emerged"):
+    from jacked.api import usage_monitor as um
+
+    async def _run():
+        return await um._execute_swap(
+            _SwapFakeDB(captured),
+            active_acct_id=99,
+            active_acct={"id": 99, "email": "old@test"},
+            target={"id": 7, "email": "new@test"},
+            reason=reason,
+            trigger=trigger,
+            usage_5h=20, usage_7d=50,
+            ws_registry=None,
+        )
+
+    return asyncio.run(_run())
 
 
 class TestExecuteSwapAtomicity:
     """`_execute_swap` must:
+    - Record the swap as 'pending' first, then resolve to 'committed'/'failed'
     - Sync DB active_account_id setting after credential write succeeds
     - Skip the WS `auto_swap_triggered` broadcast on credential failure
-    - Emit `auto_swap_failed` instead so dashboard isn't misled
-    - Return False on credential failure so caller can choose retry vs swap
+    - Arm the exponential failure backoff on credential failure
+    - Record residency_seconds relative to the previous committed swap
     """
 
     def test_swap_syncs_db_setting_on_success(self, monkeypatch):
-        import asyncio
         from jacked.api import usage_monitor as um
 
         captured = {}
-
-        class FakeDB:
-            def record_swap(self, **kwargs):
-                captured["record_swap"] = kwargs
-
-            def set_setting(self, key, value):
-                captured.setdefault("settings", {})[key] = value
-
-        # Stub the credential helpers + lock
-        from contextlib import contextmanager
-
-        @contextmanager
-        def fake_lock():
-            yield True
-
-        def fake_sync(account_id, target, email=None):
-            captured["sync_called_with"] = account_id
-
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.acquire_claude_lock", fake_lock,
-        )
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.sync_credential_to_all_stores",
-            fake_sync,
-        )
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.invalidate_live_cred_cache",
-            lambda: None,
-        )
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.reconcile_credentials_from_live_store",
-            lambda *a, **kw: None,
-        )
+        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
 
-        async def _run():
-            return await um._execute_swap(
-                FakeDB(),
-                active_acct_id=99,
-                active_acct={"id": 99, "email": "old@test"},
-                target={"id": 7, "email": "new@test"},
-                reason="higher tier emerged: T0 vs T2",
-                trigger="higher_tier_emerged",
-                usage_5h=20, usage_7d=50,
-                active_start="06:00", active_end="23:00",
-                ws_registry=None,
-            )
-
-        ok = asyncio.run(_run())
+        ok = _run_execute_swap(captured)
         assert ok is True
         assert captured["settings"]["active_account_id"] == 7
+        assert captured["record_swap"]["status"] == "pending"
+        assert captured["status_updates"] == [(41, "committed")]
 
-    def test_swap_skips_db_setting_on_lock_fail(self, monkeypatch):
-        import asyncio
+    def test_success_sets_committed_time_and_resets_backoff(self, monkeypatch):
         from jacked.api import usage_monitor as um
 
         captured = {}
+        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+        um._swap_failure_count = 3
+        um._last_swap_failure_at = time.time()
 
-        class FakeDB:
-            def record_swap(self, **kwargs):
-                captured["record_swap"] = kwargs
+        ok = _run_execute_swap(captured)
+        assert ok is True
+        assert um._swap_failure_count == 0
+        assert um._last_committed_swap_time > 0
 
-            def set_setting(self, key, value):
-                captured.setdefault("settings", {})[key] = value
+    def test_residency_seconds_recorded_from_previous_commit(self, monkeypatch):
+        from jacked.api import usage_monitor as um
 
-        from contextlib import contextmanager
+        captured = {}
+        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+        um._last_committed_swap_time = time.time() - 1234
 
-        @contextmanager
-        def fake_locked_out():
-            yield False  # lock not acquired
+        ok = _run_execute_swap(captured)
+        assert ok is True
+        residency = captured["record_swap"]["residency_seconds"]
+        assert residency is not None
+        assert 1230 <= residency <= 1240
 
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.acquire_claude_lock", fake_locked_out,
-        )
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.sync_credential_to_all_stores",
-            lambda *a, **k: None,
-        )
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.invalidate_live_cred_cache",
-            lambda: None,
-        )
-        monkeypatch.setattr(
-            "jacked.api.credential_helpers.reconcile_credentials_from_live_store",
-            lambda *a, **kw: None,
-        )
+    def test_residency_seconds_none_without_previous_commit(self, monkeypatch):
+        from jacked.api import usage_monitor as um
+
+        captured = {}
+        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
 
-        async def _run():
-            return await um._execute_swap(
-                FakeDB(),
-                active_acct_id=99,
-                active_acct={"id": 99, "email": "old@test"},
-                target={"id": 7, "email": "new@test"},
-                reason="higher tier emerged",
-                trigger="higher_tier_emerged",
-                usage_5h=20, usage_7d=50,
-                active_start="06:00", active_end="23:00",
-                ws_registry=None,
-            )
+        ok = _run_execute_swap(captured)
+        assert ok is True
+        assert captured["record_swap"]["residency_seconds"] is None
 
-        ok = asyncio.run(_run())
+    def test_swap_skips_db_setting_on_lock_fail(self, monkeypatch):
+        from jacked.api import usage_monitor as um
+
+        captured = {}
+        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=False)
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+
+        ok = _run_execute_swap(captured)
         assert ok is False
         # DB setting NOT updated when credentials didn't commit.
         assert "settings" not in captured
+        assert captured["record_swap"]["status"] == "pending"
+        assert captured["status_updates"] == [(41, "failed")]
+
+    def test_lock_fail_arms_failure_backoff(self, monkeypatch):
+        from jacked.api import usage_monitor as um
+
+        captured = {}
+        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=False)
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+
+        ok = _run_execute_swap(captured)
+        assert ok is False
+        assert um._swap_failure_count == 1
+        assert um._last_swap_failure_at > 0
+        # Cooldown un-armed: failed-attempt retry pacing is governed by
+        # the failure backoff, not _SWAP_COOLDOWN_SECONDS.
+        assert um._last_swap_time == 0.0
+        assert um._swap_backoff_remaining() > 0
+
+    def test_lock_fail_preserves_burn_rate_state(self, monkeypatch):
+        from jacked.api import usage_monitor as um
+        from jacked.web.auto_swap import BurnRate
+
+        captured = {}
+        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=False)
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+        um._burn_rates[99] = BurnRate(rate_5h_per_min=0.5, last_check_5h=20.0)
+        um._burn_rate_unchanged_ticks[99] = 3
+
+        ok = _run_execute_swap(captured)
+        assert ok is False
+        assert 99 in um._burn_rates, (
+            "failed swap must not destroy the active account's burn-rate state"
+        )
+        assert um._burn_rate_unchanged_ticks.get(99) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1523,6 +1659,9 @@ class TestTriggerTaxonomy:
         assert _trigger_for_reason(
             "higher tier emerged: T0 (<24h)..."
         ) == "higher_tier_emerged"
+        assert _trigger_for_reason(
+            "intra-tier preemption: T0 candidate losing 20.0% in 4.0h"
+        ) == "intra_tier_preempted"
         assert _trigger_for_reason(
             "drained: 7d usage 100.0% >= ..."
         ) == "tier_drained"
@@ -1706,3 +1845,644 @@ class TestActivePollWatchdogLifespanWiring:
             "main.py lifespan must publish the task to app.state so the "
             "watchdog can detect a dead one"
         )
+
+
+# ---------------------------------------------------------------------------
+# Loop-tick helpers for the residency/backoff/taxonomy tests below
+# ---------------------------------------------------------------------------
+
+
+def _run_one_tick(app, max_sleeps=0, read_active=1, fetch_side_effect=None):
+    """Run the active poll loop until the sleep-canceller fires; returns
+    the sync_credential_to_all_stores mock for call assertions."""
+
+    async def _run():
+        fetch_kwargs = {"return_value": {"_cached": True}}
+        if fetch_side_effect is not None:
+            fetch_kwargs = {"side_effect": fetch_side_effect}
+        with (
+            patch(
+                "jacked.api.usage_monitor.asyncio.sleep",
+                side_effect=_sleep_canceller(max_sleeps=max_sleeps),
+            ),
+            patch(
+                "jacked.api.usage_monitor._read_active_account_id",
+                return_value=read_active,
+            ),
+            patch(
+                "jacked.web.auth.fetch_usage",
+                new_callable=AsyncMock,
+                **fetch_kwargs,
+            ),
+            patch(
+                "jacked.api.credential_helpers.read_fresh_active_token",
+                return_value="tok",
+            ),
+            patch(
+                "jacked.api.credential_helpers.sync_credential_to_all_stores",
+            ) as mock_sync,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await active_account_poll_loop(app)
+            return mock_sync
+
+    return asyncio.run(_run())
+
+
+def _decision_triggers(db):
+    return [c.kwargs.get("trigger") for c in db.record_decision.call_args_list]
+
+
+def _decision_reasons(db):
+    return [c.kwargs.get("reason") for c in db.record_decision.call_args_list]
+
+
+def _decision_actions(db):
+    return [c.kwargs.get("action") for c in db.record_decision.call_args_list]
+
+
+def _swap_settings():
+    return {
+        "auto_swap_enabled": "true",
+        "usage_check_interval": "300",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Min-residency gate (item 6)
+# ---------------------------------------------------------------------------
+
+
+class TestResidencyGate:
+    def test_proactive_swap_blocked_within_residency(self):
+        """Higher-tier emergence within 900s of the last committed swap →
+        stay with trigger 'residency_blocked', no swap."""
+        import jacked.api.usage_monitor as mod
+        mod._last_committed_swap_time = time.time() - 100
+
+        accounts = [
+            _acct(1, usage_5h=10, usage_7d=50),  # active, T3
+            _acct(2, usage_5h=10, usage_7d=50,
+                  cached_7d_resets_at=_t0_resets_at()),  # T0 candidate
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        mock_sync.assert_not_called()
+        db.record_swap.assert_not_called()
+        assert "residency_blocked" in _decision_triggers(db)
+        assert "swap" not in _decision_actions(db)
+        assert any(
+            "residency" in (r or "") for r in _decision_reasons(db)
+        )
+
+    def test_forced_critical_exempt_from_residency(self):
+        """5h-critical is a forced departure — swaps even within the
+        residency window."""
+        import jacked.api.usage_monitor as mod
+        mod._last_committed_swap_time = time.time() - 100
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
+            _acct(2, usage_5h=20, usage_7d=10),  # good target
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        assert mock_sync.call_count >= 1
+        assert mock_sync.call_args[0][0] == 2
+
+    def test_proactive_swap_allowed_after_residency_elapsed(self):
+        import jacked.api.usage_monitor as mod
+        mod._last_committed_swap_time = (
+            time.time() - mod._MIN_RESIDENCY_SECONDS - 10
+        )
+
+        accounts = [
+            _acct(1, usage_5h=10, usage_7d=50),  # active, T3
+            _acct(2, usage_5h=10, usage_7d=50,
+                  cached_7d_resets_at=_t0_resets_at()),  # T0 candidate
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        # Fast-path emergence (T0 vs T3) + residency elapsed → swap fires.
+        assert mock_sync.call_count >= 1
+        assert mock_sync.call_args[0][0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Exponential failure backoff (item 5)
+# ---------------------------------------------------------------------------
+
+
+class TestFailureBackoff:
+    def test_backoff_window_math(self):
+        import jacked.api.usage_monitor as mod
+
+        mod._swap_failure_count = 0
+        assert mod._swap_backoff_remaining() == 0.0
+
+        mod._swap_failure_count = 1
+        mod._last_swap_failure_at = time.time() - 30
+        remaining = mod._swap_backoff_remaining()
+        assert 25 < remaining <= 30  # 60s window
+
+        mod._swap_failure_count = 2
+        mod._last_swap_failure_at = time.time() - 30
+        remaining = mod._swap_backoff_remaining()
+        assert 85 < remaining <= 90  # 120s window
+
+        mod._swap_failure_count = 10
+        mod._last_swap_failure_at = time.time()
+        remaining = mod._swap_backoff_remaining()
+        assert 595 < remaining <= 600  # capped at 600s
+
+        mod._swap_failure_count = 1
+        mod._last_swap_failure_at = time.time() - 120
+        assert mod._swap_backoff_remaining() == 0.0  # window elapsed
+
+    def test_swap_skipped_during_backoff(self):
+        import jacked.api.usage_monitor as mod
+        mod._swap_failure_count = 1
+        mod._last_swap_failure_at = time.time()
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
+            _acct(2, usage_5h=20, usage_7d=10),  # good target
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        mock_sync.assert_not_called()
+        db.record_swap.assert_not_called()
+        assert "swap_aborted" in _decision_triggers(db)
+        assert any("backoff" in (r or "") for r in _decision_reasons(db))
+
+    def test_swap_proceeds_after_backoff_expires(self):
+        import jacked.api.usage_monitor as mod
+        mod._swap_failure_count = 1
+        mod._last_swap_failure_at = time.time() - 61  # 60s window elapsed
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),
+            _acct(2, usage_5h=20, usage_7d=10),
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        assert mock_sync.call_count >= 1
+        assert mock_sync.call_args[0][0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Decision-log trigger taxonomy per branch (item 12)
+# ---------------------------------------------------------------------------
+
+
+class TestTriggerTaxonomyBranches:
+    def test_tick_trigger_on_healthy_stay(self):
+        accounts = [_acct(1, usage_5h=30, usage_7d=50)]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        _run_one_tick(app)
+        assert _decision_triggers(db) == ["tick"]
+        assert _decision_actions(db) == ["stay"]
+
+    def test_cooldown_blocked_trigger(self):
+        import jacked.api.usage_monitor as mod
+        mod._last_swap_time = time.time()
+
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),
+            _acct(2, usage_5h=20, usage_7d=10),
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        mock_sync.assert_not_called()
+        assert "cooldown_blocked" in _decision_triggers(db)
+
+    def test_no_target_trigger(self):
+        accounts = [_acct(1, usage_5h=95, usage_7d=50)]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        _run_one_tick(app)
+        assert "no_target" in _decision_triggers(db)
+
+    def test_emergence_pending_trigger(self):
+        """One-tier gap (T1 best vs T2 active) requires persistence —
+        first tick stays with trigger 'emergence_pending'."""
+        import jacked.api.usage_monitor as mod
+        now = datetime.now(timezone.utc)
+        accounts = [
+            _acct(1, usage_5h=10, usage_7d=50,
+                  cached_7d_resets_at=_iso(now + timedelta(hours=72))),  # T2
+            _acct(2, usage_5h=10, usage_7d=50,
+                  cached_7d_resets_at=_iso(now + timedelta(hours=36))),  # T1
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        mock_sync.assert_not_called()
+        assert "emergence_pending" in _decision_triggers(db)
+        assert mod._emerged_tier_streak == {"tier": 1, "count": 1}
+
+    def test_committed_swap_records_reason_trigger(self):
+        accounts = [
+            _acct(1, usage_5h=95, usage_7d=50),
+            _acct(2, usage_5h=20, usage_7d=10),
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        assert mock_sync.call_count >= 1
+        triggers = _decision_triggers(db)
+        actions = _decision_actions(db)
+        assert "forced_critical" in triggers
+        assert actions[triggers.index("forced_critical")] == "swap"
+
+
+# ---------------------------------------------------------------------------
+# Fast-path unambiguous emergence (item 9)
+# ---------------------------------------------------------------------------
+
+
+class TestFastPathEmergence:
+    def test_t0_vs_t2plus_swaps_without_persistence(self):
+        """A >=2-tier gap (T0 best vs T3 active) cannot be boundary jitter
+        — the swap fires on the FIRST tick, skipping the streak."""
+        accounts = [
+            _acct(1, usage_5h=10, usage_7d=50),  # active, T3 default
+            _acct(2, usage_5h=10, usage_7d=50,
+                  cached_7d_resets_at=_t0_resets_at()),  # T0 candidate
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        assert mock_sync.call_count >= 1
+        assert mock_sync.call_args[0][0] == 2
+        swap_kwargs = db.record_swap.call_args[1]
+        assert swap_kwargs["trigger"] == "higher_tier_emerged"
+        assert "higher_tier_emerged" in _decision_triggers(db)
+
+    def test_one_tier_gap_still_requires_persistence(self):
+        now = datetime.now(timezone.utc)
+        accounts = [
+            _acct(1, usage_5h=10, usage_7d=50,
+                  cached_7d_resets_at=_iso(now + timedelta(hours=72))),  # T2
+            _acct(2, usage_5h=10, usage_7d=50,
+                  cached_7d_resets_at=_iso(now + timedelta(hours=36))),  # T1
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+        mock_sync.assert_not_called()
+        db.record_swap.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Priming (item 2) + active-fetch timeout (item 1)
+# ---------------------------------------------------------------------------
+
+
+class TestPriming:
+    def test_single_account_install_marks_priming_done(self):
+        """Nothing to prime (attempted == 0) must set _initial_fetch_done —
+        previously the priming block re-ran every tick forever."""
+        import jacked.api.usage_monitor as mod
+        mod._initial_fetch_done = False
+
+        accounts = [_acct(1, usage_5h=30)]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        _run_one_tick(app)
+        assert mod._initial_fetch_done is True
+
+    def test_all_prime_fetches_failing_retries_next_tick(self):
+        import jacked.api.usage_monitor as mod
+        mod._initial_fetch_done = False
+
+        accounts = [
+            _acct(1, usage_5h=30),
+            _acct(2, usage_5h=30),
+        ]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        _run_one_tick(app, max_sleeps=1, fetch_side_effect=Exception("boom"))
+        assert mod._initial_fetch_done is False
+
+
+class TestActiveFetchTimeout:
+    def test_tick_continues_on_active_fetch_timeout(self):
+        """A hung/timed-out active fetch must not abort the tick — the
+        decision still gets recorded from cached data."""
+        accounts = [_acct(1, usage_5h=30, usage_7d=50)]
+        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        _run_one_tick(app, fetch_side_effect=asyncio.TimeoutError())
+        assert db.record_decision.call_count >= 1
+        assert "tick" in _decision_triggers(db)
+
+
+# ---------------------------------------------------------------------------
+# Candidate staleness override (item 3)
+# ---------------------------------------------------------------------------
+
+
+class TestCandidateStalenessOverride:
+    def test_override_on_past_5h_reset_with_saturated_cache(self):
+        from jacked.api.usage_monitor import _candidate_staleness_override
+        now = datetime.now(timezone.utc)
+        acct = _acct(2, usage_5h=95, resets_at=_iso(now - timedelta(minutes=10)))
+        assert _candidate_staleness_override(acct) is True
+
+    def test_no_override_on_future_5h_reset(self):
+        from jacked.api.usage_monitor import _candidate_staleness_override
+        now = datetime.now(timezone.utc)
+        acct = _acct(2, usage_5h=95, resets_at=_iso(now + timedelta(hours=1)))
+        assert _candidate_staleness_override(acct) is False
+
+    def test_no_override_below_saturation(self):
+        from jacked.api.usage_monitor import _candidate_staleness_override
+        now = datetime.now(timezone.utc)
+        acct = _acct(2, usage_5h=50, resets_at=_iso(now - timedelta(minutes=10)))
+        assert _candidate_staleness_override(acct) is False
+
+    def test_override_on_7d_window_reset(self):
+        from jacked.api.usage_monitor import _candidate_staleness_override
+        now = datetime.now(timezone.utc)
+        acct = _acct(
+            2, usage_5h=10,
+            cached_7d_resets_at=_iso(now - timedelta(hours=2)),
+            usage_cached_at=int((now - timedelta(hours=3)).timestamp()),
+        )
+        assert _candidate_staleness_override(acct) is True
+
+    def test_fetch_forced_despite_fresh_cache(self):
+        """Override ignores _CANDIDATE_STALENESS_SECONDS: a candidate with
+        a fresh cache but a past 5h reset at >=90% gets re-fetched."""
+        from jacked.api import usage_monitor as um
+        now = datetime.now(timezone.utc)
+        active = _acct(1, usage_5h=30)
+        stale_5h = _acct(
+            2, usage_5h=95,
+            resets_at=_iso(now - timedelta(minutes=5)),
+            usage_cached_at=int(now.timestamp()),  # cache is "fresh"
+        )
+        db = _make_db(accounts=[active, stale_5h])
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                ) as mock_fetch,
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                await um._fetch_candidate_usage([active, stale_5h], 1, db)
+                mock_fetch.assert_called_once()
+                assert mock_fetch.call_args[0][0] == 2
+
+        asyncio.run(_run())
+
+    def test_bad_candidate_does_not_stall_pass(self):
+        """One candidate fetch raising must not prevent the next fetch."""
+        from jacked.api import usage_monitor as um
+        now = datetime.now(timezone.utc)
+        old_cache = int((now - timedelta(hours=1)).timestamp())
+        active = _acct(1, usage_5h=30)
+        c2 = _acct(2, usage_5h=10, usage_cached_at=old_cache)
+        c3 = _acct(3, usage_5h=10, usage_cached_at=old_cache)
+        db = _make_db(accounts=[active, c2, c3])
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    side_effect=[Exception("boom"), {"_cached": False}],
+                ) as mock_fetch,
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                await um._fetch_candidate_usage([active, c2, c3], 1, db)
+                assert mock_fetch.call_count == 2
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Drain advisor (item 11)
+# ---------------------------------------------------------------------------
+
+
+class TestDrainAdvisor:
+    def _t0_stranded_acct(self, id=1):
+        now = datetime.now(timezone.utc)
+        # T0 (12h out) at 50% 7d → deficit 50, achievable <= ~10% →
+        # stranding >= ~40% regardless of local wall-clock time.
+        return _acct(
+            id, usage_5h=10, usage_7d=50,
+            cached_7d_resets_at=_iso(now + timedelta(hours=12)),
+        )
+
+    def test_advisor_broadcasts_for_stranded_t0(self):
+        from jacked.api import usage_monitor as um
+        now = datetime.now(timezone.utc)
+        acct = self._t0_stranded_acct()
+        ws = AsyncMock()
+
+        asyncio.run(um._drain_advisor_tick(
+            [acct], now, "06:00", "23:00", ws, {},
+        ))
+        assert ws.broadcast.call_count == 1
+        event, payload = ws.broadcast.call_args[0]
+        assert event == "expiring_with_stranded_capacity"
+        assert payload["account_id"] == 1
+        assert payload["stranding"] > 2.0
+        assert payload["deficit"] == 50.0
+        assert payload["resets_at"] == acct["cached_7d_resets_at"]
+
+    def test_advisor_cooldown_suppresses_repeat(self):
+        from jacked.api import usage_monitor as um
+        now = datetime.now(timezone.utc)
+        acct = self._t0_stranded_acct()
+        ws = AsyncMock()
+
+        asyncio.run(um._drain_advisor_tick(
+            [acct], now, "06:00", "23:00", ws, {},
+        ))
+        asyncio.run(um._drain_advisor_tick(
+            [acct], now, "06:00", "23:00", ws, {},
+        ))
+        assert ws.broadcast.call_count == 1  # second tick within cooldown
+
+        # Expire the cooldown — advisor fires again.
+        um._drain_advisor_last_sent[1] = (
+            time.time() - um._DRAIN_ADVISOR_COOLDOWN_SECONDS - 100
+        )
+        asyncio.run(um._drain_advisor_tick(
+            [acct], now, "06:00", "23:00", ws, {},
+        ))
+        assert ws.broadcast.call_count == 2
+
+    def test_non_t0_account_not_advised(self):
+        from jacked.api import usage_monitor as um
+        now = datetime.now(timezone.utc)
+        acct = _acct(1, usage_5h=10, usage_7d=10)  # T3 default
+        ws = AsyncMock()
+
+        asyncio.run(um._drain_advisor_tick(
+            [acct], now, "06:00", "23:00", ws, {},
+        ))
+        ws.broadcast.assert_not_called()
+
+    def test_low_stranding_not_advised(self):
+        from jacked.api import usage_monitor as um
+        now = datetime.now(timezone.utc)
+        acct = _acct(
+            1, usage_5h=10, usage_7d=99,  # deficit 1 → stranding <= 1
+            cached_7d_resets_at=_iso(now + timedelta(hours=12)),
+        )
+        ws = AsyncMock()
+
+        asyncio.run(um._drain_advisor_tick(
+            [acct], now, "06:00", "23:00", ws, {},
+        ))
+        ws.broadcast.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Poll-interval clamp (item 10)
+# ---------------------------------------------------------------------------
+
+
+class TestPollIntervalClamp:
+    def test_clamps_to_90_with_t0_deficit_candidate(self):
+        from jacked.api.usage_monitor import _clamp_poll_interval
+        now = datetime.now(timezone.utc)
+        active = _acct(1, usage_5h=30, usage_7d=50)
+        t0 = _acct(2, usage_5h=10, usage_7d=50,
+                   cached_7d_resets_at=_t0_resets_at())
+        out = _clamp_poll_interval(
+            300.0, [active, t0], 1, now, "06:00", "23:00", {},
+        )
+        assert out == 90.0
+
+    def test_clamps_to_60_when_saturated_t0_reset_imminent(self):
+        from jacked.api.usage_monitor import _clamp_poll_interval
+        now = datetime.now(timezone.utc)
+        active = _acct(1, usage_5h=30, usage_7d=50)
+        t0 = _acct(
+            2, usage_5h=95, usage_7d=50,
+            resets_at=_iso(now + timedelta(seconds=45)),
+            cached_7d_resets_at=_t0_resets_at(),
+        )
+        out = _clamp_poll_interval(
+            300.0, [active, t0], 1, now, "06:00", "23:00", {},
+        )
+        assert out == 60.0
+
+    def test_no_clamp_without_t0_candidate(self):
+        from jacked.api.usage_monitor import _clamp_poll_interval
+        now = datetime.now(timezone.utc)
+        active = _acct(1, usage_5h=30, usage_7d=50)
+        t3 = _acct(2, usage_5h=10, usage_7d=10)  # T3 default
+        out = _clamp_poll_interval(
+            300.0, [active, t3], 1, now, "06:00", "23:00", {},
+        )
+        assert out == 300.0
+
+    def test_no_clamp_when_t0_has_no_deficit(self):
+        from jacked.api.usage_monitor import _clamp_poll_interval
+        now = datetime.now(timezone.utc)
+        active = _acct(1, usage_5h=30, usage_7d=50)
+        t0_full = _acct(2, usage_5h=10, usage_7d=100,
+                        cached_7d_resets_at=_t0_resets_at())
+        out = _clamp_poll_interval(
+            300.0, [active, t0_full], 1, now, "06:00", "23:00", {},
+        )
+        assert out == 300.0
+
+    def test_active_account_does_not_clamp(self):
+        from jacked.api.usage_monitor import _clamp_poll_interval
+        now = datetime.now(timezone.utc)
+        active_t0 = _acct(1, usage_5h=10, usage_7d=50,
+                          cached_7d_resets_at=_t0_resets_at())
+        out = _clamp_poll_interval(
+            300.0, [active_t0], 1, now, "06:00", "23:00", {},
+        )
+        assert out == 300.0
+
+    def test_ineligible_t0_does_not_clamp(self):
+        from jacked.api.usage_monitor import _clamp_poll_interval
+        now = datetime.now(timezone.utc)
+        active = _acct(1, usage_5h=30, usage_7d=50)
+        disabled_t0 = _acct(2, usage_5h=10, usage_7d=50, auto_swap=False,
+                            cached_7d_resets_at=_t0_resets_at())
+        out = _clamp_poll_interval(
+            300.0, [active, disabled_t0], 1, now, "06:00", "23:00", {},
+        )
+        assert out == 300.0
+
+
+# ---------------------------------------------------------------------------
+# note_external_swap (item 15) + reset_locks new state (item 16)
+# ---------------------------------------------------------------------------
+
+
+class TestNoteExternalSwap:
+    def test_sets_cooldowns_and_clears_streak(self):
+        from jacked.api import usage_monitor as um
+        um._emerged_tier_streak["tier"] = 0
+        um._emerged_tier_streak["count"] = 2
+
+        before = time.time()
+        um.note_external_swap()
+        assert um._last_swap_time >= before
+        assert um._last_committed_swap_time >= before
+        assert um._emerged_tier_streak == {"tier": None, "count": 0}
+
+
+class TestResetLocksState:
+    def test_reset_locks_clears_new_module_state(self):
+        from jacked.api import usage_monitor as um
+        um._swap_failure_count = 3
+        um._last_swap_failure_at = 123.0
+        um._last_committed_swap_time = 456.0
+        um._same_tier_advisory_last = 789.0
+        um._drain_advisor_last_sent[1] = 42.0
+        um._emerged_tier_streak["tier"] = 2
+        um._emerged_tier_streak["count"] = 9
+        um._last_observed_tiers[1] = 2
+
+        um.reset_locks()
+
+        assert um._swap_failure_count == 0
+        assert um._last_swap_failure_at == 0.0
+        assert um._last_committed_swap_time == 0.0
+        assert um._same_tier_advisory_last == 0.0
+        assert um._drain_advisor_last_sent == {}
+        assert um._emerged_tier_streak == {"tier": None, "count": 0}
+        assert um._last_observed_tiers == {}

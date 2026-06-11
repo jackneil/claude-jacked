@@ -5,10 +5,14 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from jacked.web.auto_swap.burn import compute_effective_working_hours
+from jacked.web.auto_swap.burn import (
+    compute_burn_per_window,
+    compute_effective_working_hours,
+)
 
 from .tiers import (
     TIER_EXCLUDED,
+    deficit_vs_target,
     target_7d,
     tier_for,
     white_bar,
@@ -78,6 +82,66 @@ def tier_critical_threshold(account: dict) -> float:
     return 80.0  # pro, free, or unknown
 
 
+def achievable_burn(
+    account: dict,
+    now: datetime | None = None,
+    active_start: str = "06:00",
+    active_end: str = "23:00",
+) -> float | None:
+    """Max 7d capacity (%) still burnable before this account's 7d expiry.
+
+    Remaining effective working hours (local time, within active hours)
+    between now and expiry, in 5h windows, times burn-per-window. 0.0 when
+    already expired; None when cached_7d_resets_at is missing or
+    unparseable.
+    """
+    resets_at_str = account.get("cached_7d_resets_at")
+    if resets_at_str is None:
+        return None
+    try:
+        resets_at = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
+        if resets_at.tzinfo is None:
+            resets_at = resets_at.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    # astimezone() (not wall-clock offset math) so a frozen ``now``
+    # converts to local time deterministically.
+    now_local = now.astimezone().replace(tzinfo=None)
+    expiry_local = resets_at.astimezone().replace(tzinfo=None)
+    remaining_hours = compute_effective_working_hours(
+        now_local, expiry_local, active_start, active_end,
+    )
+    return (remaining_hours / 5.0) * compute_burn_per_window(
+        active_start, active_end,
+    )
+
+
+def stranding_estimate(
+    account: dict,
+    now: datetime | None = None,
+    active_start: str = "06:00",
+    active_end: str = "23:00",
+) -> float | None:
+    """Projected 7d capacity (%) that will expire unused.
+
+    max(0, deficit_vs_target - achievable_burn): the part of the deficit
+    the remaining working hours can no longer absorb. None when either
+    the deficit or the achievable burn is unavailable.
+    """
+    deficit = deficit_vs_target(
+        account, now=now, active_start=active_start, active_end=active_end,
+    )
+    burn = achievable_burn(
+        account, now=now, active_start=active_start, active_end=active_end,
+    )
+    if deficit is None or burn is None:
+        return None
+    return max(0.0, deficit - burn)
+
+
 def compute_7d_deficit(
     account: dict,
     active_start: str = "06:00",
@@ -114,7 +178,7 @@ def compute_7d_deficit(
 
     hours_to_expiry = (resets_at - now).total_seconds() / 3600.0
     wb = white_bar(account, now=now)
-    target = target_7d(account, now=now)
+    target = target_7d(account, now, active_start, active_end)
     deficit_vs_target_val = (target - usage_7d) if target is not None else 0.0
     deficit_vs_white_bar = (wb * 100.0 - usage_7d) if wb is not None else 0.0
 

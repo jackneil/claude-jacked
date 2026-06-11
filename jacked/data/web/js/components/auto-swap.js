@@ -20,11 +20,25 @@ async function loadAutoSwapSettings() {
 async function loadSwapLog() {
     try {
         const data = await api.get('/api/settings/swap-log?limit=20');
-        return Array.isArray(data) ? data : [];
+        // Legacy shape: bare array. Current shape: {swaps, swaps_last_24h}.
+        if (Array.isArray(data)) return data;
+        const swaps = Array.isArray(data && data.swaps) ? data.swaps : [];
+        if (data && typeof data.swaps_last_24h === 'number') {
+            window.jackedState.swapsLast24h = data.swaps_last_24h;
+            updateSwapCounter();
+        }
+        return swaps;
     } catch (e) {
         console.error('Failed to load swap log:', e);
         return [];
     }
+}
+
+function updateSwapCounter() {
+    const el = document.getElementById('auto-swap-24h-counter');
+    if (!el) return;
+    const n = window.jackedState.swapsLast24h;
+    el.textContent = n == null ? '' : `${n} swaps / 24h`;
 }
 
 async function loadDecisionLog(showAll) {
@@ -54,6 +68,7 @@ function renderAutoSwapPanel() {
 
     // Compute pause status
     let pauseLabel = '';
+    let pausedUntilTime = '';
     let isPaused = false;
     if (pausedUntil) {
         const pauseEnd = new Date(pausedUntil);
@@ -61,12 +76,23 @@ function renderAutoSwapPanel() {
         const remainMs = pauseEnd.getTime() - nowMs;
         if (remainMs > 0) {
             isPaused = true;
+            pausedUntilTime = pauseEnd.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             const remainMin = Math.ceil(remainMs / 60000);
             pauseLabel = remainMin >= 60
                 ? `${Math.floor(remainMin / 60)}h ${remainMin % 60}m`
                 : `${remainMin}m`;
         }
     }
+
+    // UI-initiated pauses are tracked in _uiPauseUntil this session; any
+    // other pause came from the backend's 15-min post-manual-switch hold.
+    const isManualSwitchPause = isPaused && window.jackedState._uiPauseUntil !== pausedUntil;
+    const pausedNotice = isPaused
+        ? `<div class="text-xs text-amber-400">Auto-swap paused until ${escapeHtml(pausedUntilTime)}${isManualSwitchPause ? ' (manual switch)' : ''}</div>`
+        : '';
+
+    const swapsLast24h = window.jackedState.swapsLast24h;
+    const counterText = swapsLast24h == null ? '' : `${swapsLast24h} swaps / 24h`;
 
     const wkEnabled = s.window_keeper_enabled || false;
     const activeStart = s.window_keeper_active_start || '06:00';
@@ -98,12 +124,16 @@ function renderAutoSwapPanel() {
                             <div class="space-y-4">
                                 <!-- Enable toggle -->
                                 <div class="flex items-center justify-between">
-                                    <span class="text-slate-400 text-sm">Enable Auto-Swap</span>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-slate-400 text-sm">Enable Auto-Swap</span>
+                                        <span id="auto-swap-24h-counter" class="text-xs text-slate-500">${escapeHtml(counterText)}</span>
+                                    </div>
                                     <label class="toggle-switch">
                                         <input type="checkbox" id="chk-auto-swap" ${autoSwapEnabled ? 'checked' : ''}>
                                         <span class="toggle-slider"></span>
                                     </label>
                                 </div>
+                                ${pausedNotice}
 
                                 <!-- Pause / Snooze -->
                                 <div class="flex items-center justify-between">
@@ -240,6 +270,32 @@ function formatAccountLabel(entry, prefix) {
 // Swap log table
 // ---------------------------------------------------------------------------
 
+// Residency below this is flagged red -- matches the backend's 15-min
+// post-manual-switch hold (auto_swap_paused_until).
+const RESIDENCY_WARN_SECONDS = 900;
+
+function formatResidency(seconds) {
+    if (seconds == null || !isFinite(seconds) || seconds < 0) return '\u2014';
+    const s = Math.floor(seconds);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s % 60}s`;
+    return `${s % 60}s`;
+}
+
+function renderSwapStatusBadge(status) {
+    // Pre-migration rows have no status -- they were committed swaps.
+    const st = status || 'committed';
+    if (st === 'failed') {
+        return '<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-900/50 text-red-300">failed</span>';
+    }
+    if (st === 'pending') {
+        return '<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-700/50 text-slate-400">pending</span>';
+    }
+    return '<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-teal-900/50 text-teal-300">committed</span>';
+}
+
 function renderSwapLogTable(entries) {
     if (!entries || entries.length === 0) {
         return '<div class="text-xs text-slate-500">No recent swaps</div>';
@@ -252,10 +308,16 @@ function renderSwapLogTable(entries) {
         const from = escapeHtml(formatAccountLabel(e, 'from'));
         const to = escapeHtml(formatAccountLabel(e, 'to'));
         const reason = escapeHtml(e.reason || '\u2014');
+        const statusBadge = renderSwapStatusBadge(e.status);
+        const res = e.residency_seconds;
+        const residencyCls = (res != null && res < RESIDENCY_WARN_SECONDS) ? 'text-red-400' : 'text-slate-400';
+        const residency = escapeHtml(formatResidency(res));
         return `
             <tr class="border-t border-slate-700/30">
                 <td class="py-1.5 pr-3 text-xs text-slate-400 whitespace-nowrap">${ts}</td>
                 <td class="py-1.5 pr-3 text-xs text-slate-300 whitespace-nowrap">${from} \u2192 ${to}</td>
+                <td class="py-1.5 pr-3 text-xs whitespace-nowrap">${statusBadge}</td>
+                <td class="py-1.5 pr-3 text-xs ${residencyCls} whitespace-nowrap">${residency}</td>
                 <td class="py-1.5 text-xs text-slate-500">${reason}</td>
             </tr>
         `;
@@ -267,6 +329,8 @@ function renderSwapLogTable(entries) {
                 <tr class="text-left">
                     <th class="pb-1 pr-3 text-xs text-slate-500 font-medium">Time</th>
                     <th class="pb-1 pr-3 text-xs text-slate-500 font-medium">Swap</th>
+                    <th class="pb-1 pr-3 text-xs text-slate-500 font-medium">Status</th>
+                    <th class="pb-1 pr-3 text-xs text-slate-500 font-medium">Residency</th>
                     <th class="pb-1 text-xs text-slate-500 font-medium">Reason</th>
                 </tr>
             </thead>
@@ -526,6 +590,111 @@ function hideStallBanner(_data) {
 }
 
 // ---------------------------------------------------------------------------
+// Drain-advisor banner (expiring account with stranded 7d capacity)
+// ---------------------------------------------------------------------------
+
+// Mirrors the backend's _DRAIN_ADVISOR_STRANDING_THRESHOLD: a newer event
+// at or below this means the account is draining fine again.
+const DRAIN_ADVISOR_CLEAR_THRESHOLD = 2;
+const _drainAdvisorResetTimers = {};  // accountId -> setTimeout id
+
+function _formatTimeUntil(iso) {
+    if (!iso) return 'soon';
+    const ms = new Date(iso).getTime() - Date.now();
+    if (!isFinite(ms) || ms <= 0) return 'soon';
+    const min = Math.ceil(ms / 60000);
+    if (min >= 1440) return `in ${Math.floor(min / 1440)}d ${Math.floor((min % 1440) / 60)}h`;
+    if (min >= 60) return `in ${Math.floor(min / 60)}h ${min % 60}m`;
+    return `in ${min}m`;
+}
+
+function handleDrainAdvisorEvent(data) {
+    if (!data || data.account_id == null) return;
+    const id = data.account_id;
+    if (data.stranding != null && Number(data.stranding) <= DRAIN_ADVISOR_CLEAR_THRESHOLD) {
+        clearDrainAdvisor(id);
+        return;
+    }
+    showDrainAdvisorBanner(data);
+    // Stranded capacity is moot once the 7d window rolls -- auto-clear then.
+    if (_drainAdvisorResetTimers[id] !== undefined) {
+        clearTimeout(_drainAdvisorResetTimers[id]);
+        delete _drainAdvisorResetTimers[id];
+    }
+    if (data.resets_at) {
+        const delay = new Date(data.resets_at).getTime() - Date.now();
+        if (isFinite(delay) && delay > 0) {
+            _drainAdvisorResetTimers[id] = setTimeout(() => clearDrainAdvisor(id), delay);
+        }
+    }
+}
+
+function showDrainAdvisorBanner(data) {
+    const existing = document.getElementById('drain-advisor-banner');
+    if (existing) existing.remove();
+    const banner = document.createElement('div');
+    banner.id = 'drain-advisor-banner';
+    banner.dataset.accountId = String(data.account_id);
+    // top-16 sits below the fixed stall banner (top-4) so the red stall
+    // state is never obscured by an advisory.
+    banner.className = 'fixed top-16 left-1/2 -translate-x-1/2 z-50 bg-amber-900/95 border border-amber-600 rounded-lg px-5 py-3 shadow-lg max-w-lg flex items-center gap-3';
+    // Info icon built via DOM API (same pattern as _usageCreateIcon).
+    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    icon.setAttribute('class', 'w-5 h-5 shrink-0 text-amber-400');
+    icon.setAttribute('fill', 'none');
+    icon.setAttribute('stroke', 'currentColor');
+    icon.setAttribute('viewBox', '0 0 24 24');
+    icon.setAttribute('aria-hidden', 'true');
+    const iconPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    iconPath.setAttribute('stroke-linecap', 'round');
+    iconPath.setAttribute('stroke-linejoin', 'round');
+    iconPath.setAttribute('stroke-width', '2');
+    iconPath.setAttribute('d', 'M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z');
+    icon.appendChild(iconPath);
+    banner.appendChild(icon);
+    const text = document.createElement('span');
+    text.className = 'text-sm text-amber-100';
+    const label = data.label || data.email || `account ${data.account_id}`;
+    const stranding = data.stranding != null ? Math.round(Number(data.stranding)) : '?';
+    text.textContent = `Account ${label} expires ${_formatTimeUntil(data.resets_at)} ` +
+        `with ~${stranding}% capacity that won't be drained at current pace — ` +
+        `route work there now`;
+    const close = document.createElement('button');
+    close.className = 'text-amber-400 hover:text-white text-lg leading-none ml-auto';
+    close.textContent = '×';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.onclick = function() { banner.remove(); };
+    banner.appendChild(text);
+    banner.appendChild(close);
+    document.body.appendChild(banner);
+}
+
+function clearDrainAdvisor(accountId) {
+    if (_drainAdvisorResetTimers[accountId] !== undefined) {
+        clearTimeout(_drainAdvisorResetTimers[accountId]);
+        delete _drainAdvisorResetTimers[accountId];
+    }
+    const banner = document.getElementById('drain-advisor-banner');
+    if (banner && banner.dataset.accountId === String(accountId)) banner.remove();
+}
+
+// ---------------------------------------------------------------------------
+// Same-tier deficit advisory (informational -- intended-behavior stay)
+// ---------------------------------------------------------------------------
+
+function showSameTierAdvisory(data) {
+    if (typeof showToast !== 'function' || !data) return;
+    const tier = data.best_tier != null ? `T${data.best_tier}` : 'same-tier';
+    const deficit = data.best_deficit != null ? `${Number(data.best_deficit).toFixed(1)}%` : '?%';
+    const acct = data.best_account_id != null ? data.best_account_id : '?';
+    showToast(
+        `Same-tier advisory: account ${acct} (${tier}) is ${deficit} behind its ` +
+        `tier target — staying on the active account by design`,
+        'info', 8000
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Event binding
 // ---------------------------------------------------------------------------
 
@@ -553,6 +722,7 @@ function bindAutoSwapEvents() {
             try {
                 const res = await api.post(`/api/settings/swap-pause?minutes=${minutes}`);
                 window.jackedState.swapSettings.auto_swap_paused_until = res.paused_until;
+                window.jackedState._uiPauseUntil = res.paused_until;
                 showToast(`Auto-swap paused for ${minutes} min`, 'success', 3000);
                 if (typeof renderPage === 'function') renderPage();
             } catch (e) {
@@ -566,6 +736,7 @@ function bindAutoSwapEvents() {
             try {
                 await api.post('/api/settings/swap-resume');
                 window.jackedState.swapSettings.auto_swap_paused_until = null;
+                window.jackedState._uiPauseUntil = null;
                 showToast('Auto-swap resumed', 'success', 2000);
                 if (typeof renderPage === 'function') renderPage();
             } catch (e) {

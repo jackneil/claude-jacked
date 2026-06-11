@@ -159,11 +159,14 @@ async def resume_auto_swap(request: Request):
 
 @router.get("/swap-log")
 async def get_swap_log(request: Request, limit: int = Query(default=50, ge=1, le=500)):
-    """Get recent swap events."""
+    """Get recent swap events (with status/residency) plus trailing-24h committed count."""
     db = _get_db(request)
     if db is None:
-        return []
-    return db.list_swaps(limit=limit)
+        return {"swaps": [], "swaps_last_24h": 0}
+    return {
+        "swaps": db.list_swaps(limit=limit),
+        "swaps_last_24h": db.swaps_last_24h(committed_only=True),
+    }
 
 
 @router.get("/decision-log")

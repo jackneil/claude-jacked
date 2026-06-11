@@ -29,6 +29,38 @@ _EXHAUSTION_COOLDOWN_SECONDS = 1800  # 30 minutes
 _last_swap_time: float = 0.0
 _SWAP_COOLDOWN_SECONDS = 300  # 5 minutes between swaps to prevent ping-ponging
 
+# Wall-clock time of the last COMMITTED swap (credential write succeeded)
+# or manual switch (see note_external_swap). Feeds the min-residency gate
+# and the residency_seconds audit column on swap_log rows.
+_last_committed_swap_time: float = 0.0
+# Proactive reasons (higher-tier / intra-tier / burn-rate) must let the
+# active account settle this long before another departure. Forced
+# departures (drained, 5h critical) are exempt.
+_MIN_RESIDENCY_SECONDS = 900
+
+# Exponential backoff for failed swap attempts (credential write
+# failures; TOCTOU aborts bail before the attempt is recorded). Window:
+# base * 2**(count-1), capped. Replaces the old retry-next-tick behavior;
+# the regular swap cooldown only governs committed swaps.
+_swap_failure_count: int = 0
+_last_swap_failure_at: float = 0.0
+_SWAP_FAILURE_BACKOFF_BASE_SECONDS = 60.0
+_SWAP_FAILURE_BACKOFF_CAP_SECONDS = 600.0
+
+# Drain advisor: per-account cooldown for 'expiring_with_stranded_capacity'
+# broadcasts. Advisor only — no auto-burn worker; routing real work beats
+# burning quota on no-ops.
+_drain_advisor_last_sent: dict[int, float] = {}
+_DRAIN_ADVISOR_COOLDOWN_SECONDS = 1800
+_DRAIN_ADVISOR_STRANDING_THRESHOLD = 2.0
+
+# Same-tier-deficit advisory (split out of stall pattern d): per spec,
+# same-tier-never-overrides is intended behavior, so it must not page at
+# ERROR — it gets its own INFO + WS advisory with an independent cooldown.
+_same_tier_advisory_last: float = 0.0
+_SAME_TIER_ADVISORY_COOLDOWN_SECONDS = 1800
+_SAME_TIER_DEFICIT_THRESHOLD = 15.0
+
 # Track consecutive unchanged ticks per account for burn-rate decay.
 _burn_rate_unchanged_ticks: dict[int, int] = {}
 _initial_fetch_done = False
@@ -41,10 +73,12 @@ _sweep_wake: asyncio.Event = asyncio.Event()
 # cleared when an account is removed or a swap occurs to/from it.
 _last_observed_tiers: dict[int, int] = {}
 
-# Anti-jitter: require the same higher-tier target to persist across
-# ``_EMERGENCE_PERSISTENCE_TICKS`` consecutive ticks before swapping.
-# Maps target account id -> consecutive-tick count.
-_emerged_target_streak: dict[int, int] = {}
+# Anti-jitter: require an emerged TIER (higher-tier or intra-tier reason)
+# to persist across ``_EMERGENCE_PERSISTENCE_TICKS`` consecutive ticks
+# before swapping. Keyed by tier rather than account id — two near-tied
+# candidates in the same tier alternating as best must not reset each
+# other's streak. Shape: {"tier": int | None, "count": int}.
+_emerged_tier_streak: dict = {"tier": None, "count": 0}
 _EMERGENCE_PERSISTENCE_TICKS = 2
 
 # Silent-stall watchdog state.
@@ -74,10 +108,51 @@ def reset_locks() -> None:
     global _sweep_wake
     _sweep_wake = asyncio.Event()
     _last_observed_tiers.clear()
-    _emerged_target_streak.clear()
+    _emerged_tier_streak["tier"] = None
+    _emerged_tier_streak["count"] = 0
     global _consecutive_no_best_ticks, _last_stall_warning
     _consecutive_no_best_ticks = 0
     _last_stall_warning = 0.0
+    global _swap_failure_count, _last_swap_failure_at
+    global _last_committed_swap_time, _same_tier_advisory_last
+    _swap_failure_count = 0
+    _last_swap_failure_at = 0.0
+    _last_committed_swap_time = 0.0
+    _same_tier_advisory_last = 0.0
+    _drain_advisor_last_sent.clear()
+
+
+def note_external_swap() -> None:
+    """Record a credential switch performed OUTSIDE the auto-swap loop
+    (manual switch in routes/auth.py).
+
+    Arms the swap cooldown and the min-residency clock, and clears the
+    emergence streak so the loop re-observes from scratch instead of
+    immediately swapping away from the account the user just chose.
+    """
+    global _last_swap_time, _last_committed_swap_time
+    now_ts = time.time()
+    _last_swap_time = now_ts
+    _last_committed_swap_time = now_ts
+    _emerged_tier_streak["tier"] = None
+    _emerged_tier_streak["count"] = 0
+
+
+def _swap_backoff_remaining(now: float | None = None) -> float:
+    """Seconds remaining in the exponential failure-backoff window.
+
+    0.0 when no failures are recorded or the window has elapsed.
+    Window: ``_SWAP_FAILURE_BACKOFF_BASE_SECONDS * 2**(count-1)``, capped
+    at ``_SWAP_FAILURE_BACKOFF_CAP_SECONDS``.
+    """
+    if _swap_failure_count <= 0:
+        return 0.0
+    window = min(
+        _SWAP_FAILURE_BACKOFF_CAP_SECONDS,
+        _SWAP_FAILURE_BACKOFF_BASE_SECONDS * (2 ** (_swap_failure_count - 1)),
+    )
+    elapsed = (now if now is not None else time.time()) - _last_swap_failure_at
+    return max(0.0, window - elapsed)
 
 
 def _read_active_account_id() -> int | None:
@@ -122,59 +197,70 @@ def _setting_str(db, key: str, default: str) -> str:
 
 def _apply_emergence_persistence(
     reason: str | None,
-    best_id: int | None,
-    streak: dict[int, int],
+    best_tier: int | None,
+    streak: dict,
     persistence_ticks: int,
 ) -> str | None:
-    """Gate "higher tier emerged" reasons behind a multi-tick streak.
+    """Gate emerge reasons (higher-tier or intra-tier) behind a multi-tick
+    streak keyed by the BEST candidate's TIER, not its account id.
 
-    Anti-jitter: a candidate must remain the best ``persistence_ticks``
-    times in a row before the swap actually fires. Mutates ``streak``
-    in place — increments the count for ``best_id``, prunes any other
-    keys, preserves on transient absence, or clears entirely on
-    explicit non-emerge reason.
+    Anti-jitter: the emerged tier must remain the best's tier
+    ``persistence_ticks`` times in a row before the swap actually fires.
+    Tier-keyed because two near-tied candidates in the same tier
+    alternating as best would reset each other's id-keyed streak forever.
+    Mutates ``streak`` ({"tier": int | None, "count": int}) in place.
 
     Streak handling rules:
 
-    - ``reason`` starts with ``REASON_PREFIX_HIGHER_TIER`` and ``best_id``
-      is set: increment streak for ``best_id``, prune other keys.
-      Return reason if streak met threshold, else None.
-    - ``reason`` is None and ``best_id`` is None (transient absence,
+    - ``reason`` starts with ``REASON_PREFIX_HIGHER_TIER`` or
+      ``REASON_PREFIX_INTRA_TIER`` and ``best_tier`` is set: increment the
+      count when ``best_tier`` equals the tracked tier (regardless of which
+      account is best), else restart the streak at 1 for the new tier.
+      Return reason if the count met the threshold, else None.
+    - ``reason`` is None and ``best_tier`` is None (transient absence,
       e.g. _fetch_candidate_usage hiccup): PRESERVE the streak. A
       single-tick candidate fetch glitch should not reset the 2-minute
-      clock. Next tick with the same best will resume incrementing.
+      clock. Next tick with the same emerged tier resumes incrementing.
       Return None.
-    - ``reason`` is set but does NOT start with the higher-tier prefix
-      (drained / 5h critical / burn-rate): clear streak (different
-      decision path now). Return reason.
-    - ``reason`` is None but emergence-prefix detection happened with
-      best_id missing: shouldn't normally occur because `should_swap_now`
-      only emits the higher-tier reason when best is non-None. Defensive
-      clear + return None.
+    - ``reason`` is set but is NOT an emerge reason (drained / 5h critical
+      / burn-rate), or is None with a classified candidate present: clear
+      the streak (different decision path now). Return reason.
+    - emerge ``reason`` with ``best_tier`` missing: shouldn't normally
+      occur because `should_swap_now` only emits emerge reasons when best
+      is non-None. Defensive clear + return None.
 
     Returns the original ``reason`` when persistence is met (let the
     swap fire), or None to suppress this tick.
     """
-    from jacked.web.auto_swap import REASON_PREFIX_HIGHER_TIER
+    from jacked.web.auto_swap import (
+        REASON_PREFIX_HIGHER_TIER,
+        REASON_PREFIX_INTRA_TIER,
+    )
 
-    if reason is None and best_id is None:
+    if reason is None and best_tier is None:
         # Transient: no candidate, no swap reason. Preserve streak so a
         # single-tick fetch glitch doesn't restart the persistence clock.
         return None
-    if reason is None or not reason.startswith(REASON_PREFIX_HIGHER_TIER):
+    is_emerge = reason is not None and reason.startswith(
+        (REASON_PREFIX_HIGHER_TIER, REASON_PREFIX_INTRA_TIER),
+    )
+    if not is_emerge:
         # Explicit non-emerge outcome — drained/critical/burn-rate fired
         # OR active was decisively classified as no-swap-needed. Clear.
-        streak.clear()
+        streak["tier"] = None
+        streak["count"] = 0
         return reason
-    if best_id is None:
-        # Defensive: should not happen (rule 1 requires best != None).
-        streak.clear()
+    if best_tier is None:
+        # Defensive: should not happen (emerge reasons require best != None).
+        streak["tier"] = None
+        streak["count"] = 0
         return None
-    streak[best_id] = streak.get(best_id, 0) + 1
-    for stale_id in list(streak.keys()):
-        if stale_id != best_id:
-            del streak[stale_id]
-    if streak[best_id] < persistence_ticks:
+    if streak["tier"] == best_tier:
+        streak["count"] += 1
+    else:
+        streak["tier"] = best_tier
+        streak["count"] = 1
+    if streak["count"] < persistence_ticks:
         return None
     return reason
 
@@ -187,26 +273,18 @@ def _evaluate_stall(
     has_other_accounts: bool,
     reason: str | None,
     staleness_threshold: int,
-    best_deficit: float | None = None,
-    same_tier_stay_threshold: float = 15.0,
 ) -> bool:
     """Return True if this tick qualifies as a stall pattern.
 
-    Four patterns trigger a bump (any one):
+    Three patterns trigger a bump (any one):
       (a) Multi-account stale: stay+no-best+stale active+has others
       (b) Single-account forced-out: only one account, departure reason fired
       (c) Drained-no-candidate: any reason fired but no eligible target
-      (d) Same-tier-stay-with-meaningful-deficit: a candidate exists every
-          tick but the spec's "same-tier-never-overrides" rule keeps the
-          loop on stay forever even though the candidate is materially
-          behind tier target. Without this pattern, a T2 active sitting on
-          the same tier as a T2 candidate with 25% deficit looks identical
-          to "healthy steady state" — invisible to operators.
-          Threshold: candidate must be at least
-          ``same_tier_stay_threshold`` percent behind its tier target.
-          Caller is responsible for the time-window — the watchdog
-          `_STALL_TICK_THRESHOLD` already gates how long this can fire
-          before the user-visible alert.
+
+    Same-tier-stay-with-deficit (the old pattern d) is NOT a stall — per
+    spec, same-tier-never-overrides is intended behavior, so flagging it
+    at ERROR trains the operator to ignore the watchdog. It lives in the
+    separate ``_same_tier_advisory_applies`` advisory path instead.
 
     Returns False otherwise (caller resets the counter).
     """
@@ -217,13 +295,38 @@ def _evaluate_stall(
     pattern_a = best is None and stale and has_other_accounts
     pattern_b = not has_other_accounts and forced_out
     pattern_c = best is None and forced_out
-    pattern_d = (
-        best is not None
+    return pattern_a or pattern_b or pattern_c
+
+
+def _same_tier_advisory_applies(
+    *,
+    decision_action: str,
+    best: dict | None,
+    reason: str | None,
+    best_deficit: float | None,
+    best_tier: int | None,
+    threshold: float = _SAME_TIER_DEFICIT_THRESHOLD,
+) -> bool:
+    """Advisory condition (split from stall pattern d): a candidate exists
+    but same-tier-never-overrides keeps the loop on stay even though the
+    candidate is materially behind its tier target.
+
+    Gated on the candidate tier being T0 or T1 — those are harvestable
+    drain-to targets; T2/T3 targets are floors, so sitting behind them is
+    not actionable. With intra-T0 preemption implemented, T0-vs-T0 cases
+    may legitimately swap; this advisory covers the remaining
+    same-tier-stay cases. Caller applies the 30-min cooldown.
+    """
+    from jacked.web.auto_swap import TIER_T0, TIER_T1
+
+    return (
+        decision_action == "stay"
+        and best is not None
         and reason is None
         and best_deficit is not None
-        and best_deficit >= same_tier_stay_threshold
+        and best_deficit >= threshold
+        and best_tier in (TIER_T0, TIER_T1)
     )
-    return pattern_a or pattern_b or pattern_c or pattern_d
 
 
 def _trigger_for_reason(reason: str | None) -> str:
@@ -233,6 +336,7 @@ def _trigger_for_reason(reason: str | None) -> str:
     """
     from jacked.web.auto_swap import (
         REASON_PREFIX_HIGHER_TIER,
+        REASON_PREFIX_INTRA_TIER,
         REASON_PREFIX_DRAINED,
         REASON_PREFIX_FIVE_H,
         REASON_PREFIX_BURN_RATE,
@@ -241,6 +345,8 @@ def _trigger_for_reason(reason: str | None) -> str:
         return "tick"
     if reason.startswith(REASON_PREFIX_HIGHER_TIER):
         return "higher_tier_emerged"
+    if reason.startswith(REASON_PREFIX_INTRA_TIER):
+        return "intra_tier_preempted"
     if reason.startswith(REASON_PREFIX_DRAINED):
         return "tier_drained"
     if reason.startswith(REASON_PREFIX_FIVE_H):
@@ -292,15 +398,126 @@ def _compute_poll_interval(
         return 60.0, "unknown"
 
 
+def _clamp_poll_interval(
+    interval: float,
+    accounts: list[dict],
+    active_acct_id: int,
+    now: datetime,
+    active_start: str,
+    active_end: str,
+    prev_tiers: dict[int, int],
+) -> float:
+    """Clamp the adaptive poll interval when a T0 candidate is in play.
+
+    - <= 90s whenever any otherwise-eligible NON-active account is TIER_T0
+      with positive deficit — a draining deadline must not wait out a 5-min
+      idle interval.
+    - <= 60s when such a T0 candidate's 5h window is saturated
+      (>= ``_FIVE_H_HEADROOM_LIMIT``) and its 5h reset lands within the
+      next poll interval — event-driven re-entry approximation: be on time
+      for the reset instead of discovering it up to a full interval late.
+      (The literal "excluded by _has_5h_headroom" condition is
+      unsatisfiable here: headroom already admits accounts within
+      RESET_SUPPRESS_MINUTES of reset, which dwarfs any poll interval.)
+    """
+    from jacked.web.auto_swap import (
+        TIER_T0,
+        target_for_tier,
+        tier_for,
+    )
+    from jacked.web.auto_swap.selection import _FIVE_H_HEADROOM_LIMIT
+
+    clamped = interval
+    saturated_5h: list[dict] = []
+    for a in accounts:
+        if a["id"] == active_acct_id:
+            continue
+        if a.get("is_active") == 0 or a.get("is_deleted") == 1:
+            continue
+        if (a.get("consecutive_failures") or 0) >= 3:
+            continue
+        if a.get("validation_status") == "invalid":
+            continue
+        if a.get("cc_access_token") is None:
+            continue
+        if a.get("auto_swap_enabled") == 0:
+            continue
+        tier = tier_for(a, now=now, prev_tier=prev_tiers.get(a["id"]))
+        if tier != TIER_T0:
+            continue
+        target = target_for_tier(tier, a, now, active_start, active_end)
+        usage_7d = a.get("cached_usage_7d")
+        if target is None or usage_7d is None:
+            continue
+        if target - usage_7d <= 0:
+            continue
+        clamped = min(clamped, 90.0)
+        if (a.get("cached_usage_5h") or 0) >= _FIVE_H_HEADROOM_LIMIT:
+            saturated_5h.append(a)
+
+    for a in saturated_5h:
+        resets_at = a.get("cached_5h_resets_at")
+        if not resets_at:
+            continue
+        try:
+            reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+            if reset_dt.tzinfo is None:
+                reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        remaining = (reset_dt - now).total_seconds()
+        if 0 < remaining <= clamped:
+            clamped = min(clamped, 60.0)
+            break
+
+    return clamped
+
+
 _CANDIDATE_STALENESS_SECONDS = 600  # 10 minutes — non-active accounts rarely change
+_CANDIDATE_FETCH_TIMEOUT_SECONDS = 30
+
+
+def _candidate_staleness_override(acct: dict) -> bool:
+    """True when a candidate's cached snapshot is provably stale and must
+    be re-fetched regardless of ``_CANDIDATE_STALENESS_SECONDS``.
+
+    Two conditions (either suffices):
+    - cached 5h usage >= 90 but the 5h reset is already in the past —
+      the saturation is stale; the account may now be the most usable
+      candidate. Removes the 5-10 min blind spot right after a window
+      reset, exactly when an account becomes most useful.
+    - ``needs_7d_ping`` says the 7d window reset but the cache predates
+      the reset (a fresh 7d window means a fresh tier classification).
+    """
+    from jacked.web.window_keeper import needs_7d_ping
+
+    if (acct.get("cached_usage_5h") or 0) >= 90:
+        resets_at = acct.get("cached_5h_resets_at")
+        if resets_at:
+            try:
+                reset_dt = datetime.fromisoformat(
+                    resets_at.replace("Z", "+00:00"),
+                )
+                if reset_dt.tzinfo is None:
+                    reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+                if reset_dt <= datetime.now(timezone.utc):
+                    return True
+            except (ValueError, TypeError):
+                pass
+    return needs_7d_ping(
+        acct.get("cached_7d_resets_at"), acct.get("usage_cached_at"),
+    )
 
 
 async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> list:
     """Fetch fresh usage for non-active candidate accounts with stale data.
 
     Only fetches accounts whose usage_cached_at is older than
-    _CANDIDATE_STALENESS_SECONDS. Non-active accounts rarely change,
-    so there's no need to hit the API every tick.
+    _CANDIDATE_STALENESS_SECONDS — unless ``_candidate_staleness_override``
+    forces a refresh (past 5h reset with saturated cache, or 7d window
+    reset). Non-active accounts rarely change, so there's no need to hit
+    the API every tick. Each fetch is bounded by a 30s timeout and a
+    catch-all so one bad candidate can't stall the pass.
     Returns the refreshed accounts list from DB.
     """
     from jacked.web.auth import fetch_usage
@@ -313,16 +530,98 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
         if acct.get("validation_status") == "invalid":
             continue  # Don't waste API calls on invalid accounts
         cached_at = acct.get("usage_cached_at")
-        if cached_at and (now - int(cached_at)) < _CANDIDATE_STALENESS_SECONDS:
+        if (
+            cached_at
+            and (now - int(cached_at)) < _CANDIDATE_STALENESS_SECONDS
+            and not _candidate_staleness_override(acct)
+        ):
             continue  # data is fresh enough
-        await fetch_usage(acct["id"], db)
-        fetched += 1
+        try:
+            await asyncio.wait_for(
+                fetch_usage(acct["id"], db),
+                timeout=_CANDIDATE_FETCH_TIMEOUT_SECONDS,
+            )
+            fetched += 1
+        except Exception:
+            logger.warning(
+                "Candidate usage: fetch for account %d failed or timed "
+                "out — skipping this tick", acct["id"],
+            )
         await asyncio.sleep(1)
 
     if fetched:
         logger.debug("Candidate usage: refreshed %d stale accounts", fetched)
 
     return db.list_accounts(include_inactive=False)
+
+
+async def _drain_advisor_tick(
+    accounts: list[dict],
+    now_utc: datetime,
+    active_start: str,
+    active_end: str,
+    ws_registry,
+    prev_tiers: dict[int, int],
+) -> None:
+    """Broadcast 'expiring_with_stranded_capacity' for every T0 account
+    (including the active one) projected to strand more than
+    ``_DRAIN_ADVISOR_STRANDING_THRESHOLD`` percent of 7d capacity.
+
+    Per-account 30-min cooldown via ``_drain_advisor_last_sent``.
+    Advisor only by design — no auto-burn worker; routing real work beats
+    burning quota on no-ops.
+    """
+    from jacked.web.auto_swap import (
+        TIER_T0,
+        achievable_burn,
+        deficit_vs_target,
+        format_account_label,
+        stranding_estimate,
+        tier_for,
+    )
+
+    now_ts = time.time()
+    for acct in accounts:
+        tier = tier_for(acct, now=now_utc, prev_tier=prev_tiers.get(acct["id"]))
+        if tier != TIER_T0:
+            continue
+        stranding = stranding_estimate(
+            acct, now_utc, active_start, active_end,
+        )
+        if stranding is None or stranding <= _DRAIN_ADVISOR_STRANDING_THRESHOLD:
+            continue
+        last_sent = _drain_advisor_last_sent.get(acct["id"], 0.0)
+        if now_ts - last_sent < _DRAIN_ADVISOR_COOLDOWN_SECONDS:
+            continue
+        _drain_advisor_last_sent[acct["id"]] = now_ts
+        deficit = deficit_vs_target(
+            acct, now=now_utc, active_start=active_start, active_end=active_end,
+        )
+        achievable = achievable_burn(
+            acct, now_utc, active_start, active_end,
+        )
+        logger.info(
+            "Drain advisor: account %d (%s) expires with ~%.1f%% stranded "
+            "capacity (deficit=%.1f%%, achievable=%.1f%%, resets_at=%s)",
+            acct["id"], acct.get("email", "?"), stranding,
+            deficit or 0.0, achievable or 0.0,
+            acct.get("cached_7d_resets_at"),
+        )
+        if ws_registry:
+            await ws_registry.broadcast(
+                "expiring_with_stranded_capacity",
+                {
+                    "account_id": acct["id"],
+                    "email": acct.get("email", ""),
+                    "label": format_account_label(acct),
+                    "deficit": round(deficit, 1) if deficit is not None else None,
+                    "achievable": (
+                        round(achievable, 1) if achievable is not None else None
+                    ),
+                    "stranding": round(stranding, 1),
+                    "resets_at": acct.get("cached_7d_resets_at"),
+                },
+            )
 
 
 def _build_tick_detail(
@@ -361,6 +660,36 @@ def _build_tick_detail(
     return detail
 
 
+def _write_swap_credentials(active_acct_id: int, target: dict, db) -> bool:
+    """Reconcile outgoing + write incoming credentials. Returns True when
+    the credential write committed.
+
+    SYNC by design — must run via ``asyncio.to_thread``:
+    ``acquire_claude_lock`` does time.sleep retries (~7.5s worst case) and
+    the credential stores shell out to keychain subprocesses; running this
+    on the event loop freezes every other coroutine for the duration.
+    """
+    from jacked.api.credential_helpers import (
+        acquire_claude_lock,
+        reconcile_credentials_from_live_store,
+        sync_credential_to_all_stores,
+    )
+
+    reconcile_credentials_from_live_store(active_acct_id, db)
+    with acquire_claude_lock() as locked:
+        if not locked:
+            logger.warning(
+                "Swap: could not acquire lock for credential write "
+                "(account %d -> %d)", active_acct_id, target["id"],
+            )
+            return False
+        sync_credential_to_all_stores(
+            target["id"], target,
+            email=target.get("email"),
+        )
+        return True
+
+
 async def _execute_swap(
     db,
     active_acct_id: int,
@@ -370,28 +699,25 @@ async def _execute_swap(
     trigger: str,
     usage_5h: float | None,
     usage_7d: float | None,
-    active_start: str,
-    active_end: str,
     ws_registry=None,
 ) -> bool:
     """Execute a swap. Returns True if credential write succeeded.
 
     Canonical ordering:
     1. TOCTOU guard
-    2. Record swap + arm cooldown (audit trail survives credential failure)
-    3. Reconcile outgoing credentials
-    4. Write incoming credentials under cross-process lock
-    5. Clean up burn-rate state
-    6. Broadcast via WebSocket
+    2. Record swap as 'pending' + arm cooldown (audit trail survives
+       credential failure)
+    3. Credential write off the event loop (reconcile outgoing + write
+       incoming under cross-process lock, via asyncio.to_thread)
+    4. Resolve the pending row to 'committed'/'failed'; on success clean
+       up burn-rate state, reset failure backoff, record residency; on
+       failure arm the exponential failure backoff
+    5. Broadcast via WebSocket
     """
-    global _last_swap_time
+    global _last_swap_time, _last_committed_swap_time
+    global _swap_failure_count, _last_swap_failure_at
 
-    from jacked.api.credential_helpers import (
-        acquire_claude_lock,
-        invalidate_live_cred_cache,
-        reconcile_credentials_from_live_store,
-        sync_credential_to_all_stores,
-    )
+    from jacked.api.credential_helpers import invalidate_live_cred_cache
     from jacked.web.auto_swap import format_account_label
 
     # 1. TOCTOU guard
@@ -403,9 +729,15 @@ async def _execute_swap(
         )
         return False
 
-    # 2. Record swap + arm cooldown BEFORE credential write
+    # 2. Record swap (pending) + arm cooldown BEFORE credential write.
+    # residency_seconds = how long the outgoing account held the active
+    # slot — known at record time, immutable across the status update.
     _last_swap_time = time.time()
-    db.record_swap(
+    residency_seconds = (
+        int(time.time() - _last_committed_swap_time)
+        if _last_committed_swap_time > 0 else None
+    )
+    swap_id = db.record_swap(
         from_account_id=active_acct_id,
         to_account_id=target["id"],
         reason=reason,
@@ -414,43 +746,42 @@ async def _execute_swap(
         from_7d=usage_7d,
         to_5h=target.get("cached_usage_5h"),
         to_7d=target.get("cached_usage_7d"),
+        status="pending",
+        residency_seconds=residency_seconds,
     )
 
-    # 3. Reconcile outgoing credentials
-    reconcile_credentials_from_live_store(active_acct_id, db)
+    # 3. Credential write OFF the event loop — acquire_claude_lock sleeps
+    # and the stores spawn keychain subprocesses (~7.5s worst case).
+    credential_ok = await asyncio.to_thread(
+        _write_swap_credentials, active_acct_id, target, db,
+    )
 
-    # 4. Write incoming credentials under cross-process lock
-    credential_ok = False
-    with acquire_claude_lock() as locked:
-        if locked:
-            sync_credential_to_all_stores(
-                target["id"], target,
-                email=target.get("email"),
-            )
-            credential_ok = True
-        else:
-            logger.warning(
-                "Swap: could not acquire lock for credential write "
-                "(account %d -> %d)", active_acct_id, target["id"],
-            )
-
-    # 5. Invalidate live credential cache (new account is active now)
-    invalidate_live_cred_cache()
-
-    # 6. Clean up burn-rate state
-    _burn_rates.pop(active_acct_id, None)
-    _burn_rate_unchanged_ticks.pop(active_acct_id, None)
-    _burn_rates.pop(target["id"], None)
-    _burn_rate_unchanged_ticks.pop(target["id"], None)
-
-    # 7. Sync DB active_account_id setting + broadcast WS event ONLY when
-    # credentials actually committed. The DB setting is the launch-time
-    # Layer-2 fallback (see jacked/launch.py); leaving it stale across
-    # auto-swaps means a credential-file recovery uses an out-of-date
-    # account. Without gating the broadcast on credential_ok, dashboards
-    # would display "swap completed" even when the filesystem still
-    # belongs to the old account — a misleading audit signal.
+    # 4. Resolve pending row + sync DB active_account_id setting +
+    # broadcast WS event ONLY when credentials actually committed. The DB
+    # setting is the launch-time Layer-2 fallback (see jacked/launch.py);
+    # leaving it stale across auto-swaps means a credential-file recovery
+    # uses an out-of-date account. Without gating the broadcast on
+    # credential_ok, dashboards would display "swap completed" even when
+    # the filesystem still belongs to the old account — a misleading
+    # audit signal.
     if credential_ok:
+        try:
+            db.update_swap_status(swap_id, "committed")
+        except Exception:
+            logger.exception(
+                "Failed to mark swap %s committed — credentials are "
+                "written; the row stays 'pending'", swap_id,
+            )
+        _last_committed_swap_time = time.time()
+        _swap_failure_count = 0
+        # Invalidate live credential cache (new account is active now) and
+        # clean up burn-rate state — ONLY on success; a failed attempt
+        # must not destroy the active account's burn-rate history.
+        invalidate_live_cred_cache()
+        _burn_rates.pop(active_acct_id, None)
+        _burn_rate_unchanged_ticks.pop(active_acct_id, None)
+        _burn_rates.pop(target["id"], None)
+        _burn_rate_unchanged_ticks.pop(target["id"], None)
         try:
             db.set_setting("active_account_id", target["id"])
         except Exception:
@@ -474,15 +805,23 @@ async def _execute_swap(
                 },
             )
     else:
-        # Step 2 already wrote a record_swap row; without an audit-trail
-        # success column on the table, the row falsely implies success.
-        # Surface the failure to operators via WS + log so the dashboard
-        # can show a different state and the on-call can grep for it.
-        _last_swap_time = 0.0  # reset cooldown so next tick retries
+        try:
+            db.update_swap_status(swap_id, "failed")
+        except Exception:
+            logger.exception(
+                "Failed to mark swap %s failed — row stays 'pending'",
+                swap_id,
+            )
+        # Arm the exponential failure backoff; retry pacing for failed
+        # attempts is governed by _swap_backoff_remaining, so un-arm the
+        # committed-swap cooldown (it would mask the 60/120/240s windows).
+        _swap_failure_count += 1
+        _last_swap_failure_at = time.time()
+        _last_swap_time = 0.0
         logger.warning(
-            "Swap recorded but credential write failed — will retry next "
-            "tick (account %d -> %d)",
-            active_acct_id, target["id"],
+            "Swap recorded but credential write failed — retry gated by "
+            "failure backoff, attempt %d (account %d -> %d)",
+            _swap_failure_count, active_acct_id, target["id"],
         )
         if ws_registry:
             await ws_registry.broadcast(
@@ -555,6 +894,7 @@ async def active_account_poll_loop(app):
             active_end = _setting_str(db, "window_keeper_active_end", "23:00")
 
             _decision_action = "stay"
+            _decision_trigger = "tick"
             _decision_target_id = None
             _decision_reason = None
             _candidate_summaries = None
@@ -570,9 +910,15 @@ async def active_account_poll_loop(app):
                 tier_critical_threshold,
                 tier_label as _tier_label,
                 tier_for,
-                target_7d,
+                target_for_tier,
                 deficit_vs_target,
+                stranding_estimate,
                 format_account_label,
+                REASON_PREFIX_HIGHER_TIER,
+                REASON_PREFIX_INTRA_TIER,
+                REASON_PREFIX_BURN_RATE,
+                TIER_T0,
+                TIER_T2,
                 TIER_EXCLUDED,
             )
 
@@ -590,23 +936,40 @@ async def active_account_poll_loop(app):
                 logger.info("Auto-swap: priming usage data for all accounts")
                 all_accts = db.list_accounts(include_inactive=False)
                 primed = 0
+                attempted = 0
                 for a in all_accts:
                     if a["id"] != active_acct_id:
+                        attempted += 1
                         try:
-                            await _prime_fetch(a["id"], db)
+                            await asyncio.wait_for(
+                                _prime_fetch(a["id"], db), timeout=30,
+                            )
                             primed += 1
                         except Exception:
                             logger.debug("Prime fetch failed for account %d", a["id"])
                         await asyncio.sleep(1)
-                if primed > 0:
+                # Nothing to prime (single-account install) counts as done —
+                # otherwise this block re-runs every tick forever.
+                if attempted == 0 or primed > 0:
                     _initial_fetch_done = True
-                    logger.info("Auto-swap: primed %d/%d accounts", primed, len(all_accts) - 1)
+                    logger.info(
+                        "Auto-swap: primed %d/%d accounts", primed, attempted,
+                    )
 
             # -- Fetch usage (fresh token, bypasses cache) ---------------
             effective_token = read_fresh_active_token(active_acct_id)
-            await fetch_usage(
-                active_acct_id, db, access_token=effective_token,
-            )
+            try:
+                await asyncio.wait_for(
+                    fetch_usage(
+                        active_acct_id, db, access_token=effective_token,
+                    ),
+                    timeout=50,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Active poll: fetch_usage for account %d exceeded 50s "
+                    "— continuing tick with cached data", active_acct_id,
+                )
 
             # -- Read active account data from DB ------------------------
             accounts = db.list_accounts(include_inactive=False)
@@ -629,6 +992,11 @@ async def active_account_poll_loop(app):
             # and can count down accurately instead of guessing.
             _poll_interval, _poll_tier = _compute_poll_interval(
                 active_acct_id, db, _burn_rates,
+            )
+            _poll_interval = _clamp_poll_interval(
+                _poll_interval, accounts, active_acct_id,
+                datetime.now(timezone.utc), active_start, active_end,
+                _last_observed_tiers,
             )
 
             # Push fresh usage data to connected dashboards so the
@@ -675,8 +1043,11 @@ async def active_account_poll_loop(app):
                 # Usage unchanged — track consecutive ticks
                 ticks = _burn_rate_unchanged_ticks.get(active_acct_id, 0) + 1
                 _burn_rate_unchanged_ticks[active_acct_id] = ticks
-                # Decay after 5+ unchanged ticks, but only when below warning
-                if ticks >= 5 and current_5h_val < warning_5h:
+                # Decay after 5+ unchanged ticks at ANY usage level —
+                # unchanged usage is direct evidence burn stopped; a
+                # frozen rate fires spurious burn-rate swaps after the
+                # user goes idle at >=80%.
+                if ticks >= 5:
                     prev.rate_5h_per_min *= 0.8
                     prev.rate_7d_per_min *= 0.8
                     if prev.rate_5h_per_min < 0.001:
@@ -734,17 +1105,44 @@ async def active_account_poll_loop(app):
                 warning_5h=warning_5h,
                 now=now_utc,
                 prev_tiers=_last_observed_tiers,
+                active_start=active_start,
+                active_end=active_end,
             )
 
-            # ---- Anti-jitter persistence on higher-tier emergence ----
-            reason = _apply_emergence_persistence(
-                reason=reason,
-                best_id=best["id"] if best else None,
-                streak=_emerged_target_streak,
-                persistence_ticks=_EMERGENCE_PERSISTENCE_TICKS,
+            # ---- Anti-jitter persistence on emerged tiers ----
+            # Hysteresis-damped tiers — must match what should_swap_now
+            # evaluated (see TestActiveTierHysteresis in test_auto_swap).
+            best_tier_damped = (
+                tier_for(
+                    best, now=now_utc,
+                    prev_tier=_last_observed_tiers.get(best["id"]),
+                )
+                if best is not None else None
             )
+            active_tier_damped = tier_for(
+                active_acct, now=now_utc,
+                prev_tier=_last_observed_tiers.get(active_acct_id),
+            )
+            _is_emerge_reason = reason is not None and reason.startswith(
+                (REASON_PREFIX_HIGHER_TIER, REASON_PREFIX_INTRA_TIER),
+            )
+            if (_is_emerge_reason and best_tier_damped == TIER_T0
+                    and active_tier_damped >= TIER_T2):
+                # Fast path: a >=2-tier gap (T0 best vs T2+/unclassified
+                # active) cannot be boundary jitter — skip the persistence
+                # requirement entirely.
+                pass
+            else:
+                reason = _apply_emergence_persistence(
+                    reason=reason,
+                    best_tier=best_tier_damped,
+                    streak=_emerged_tier_streak,
+                    persistence_ticks=_EMERGENCE_PERSISTENCE_TICKS,
+                )
 
-            # Build candidate summaries for decision log
+            # Build candidate summaries for decision log. Target/deficit
+            # computed against the DAMPED tier (target_for_tier) so the
+            # log matches what selection actually evaluated.
             _candidate_summaries = []
             for cand in accounts:
                 if cand["id"] == active_acct_id:
@@ -753,8 +1151,18 @@ async def active_account_poll_loop(app):
                     cand, now=now_utc,
                     prev_tier=_last_observed_tiers.get(cand["id"]),
                 )
-                cand_target = target_7d(cand, now=now_utc)
-                cand_deficit = deficit_vs_target(cand, now=now_utc)
+                cand_target = target_for_tier(
+                    cand_tier, cand, now_utc, active_start, active_end,
+                )
+                cand_usage_7d = cand.get("cached_usage_7d")
+                cand_deficit = (
+                    cand_target - cand_usage_7d
+                    if cand_target is not None and cand_usage_7d is not None
+                    else None
+                )
+                cand_stranding = stranding_estimate(
+                    cand, now_utc, active_start, active_end,
+                )
                 _candidate_summaries.append({
                     "id": cand["id"],
                     "email": cand.get("email", ""),
@@ -769,6 +1177,10 @@ async def active_account_poll_loop(app):
                     "deficit": (
                         round(cand_deficit, 1)
                         if cand_deficit is not None else None
+                    ),
+                    "stranding": (
+                        round(cand_stranding, 1)
+                        if cand_stranding is not None else None
                     ),
                     "is_best": (best is not None and cand["id"] == best["id"]),
                 })
@@ -785,9 +1197,9 @@ async def active_account_poll_loop(app):
             for stale_id in list(_last_observed_tiers.keys()):
                 if stale_id not in live_ids:
                     _last_observed_tiers.pop(stale_id, None)
-            for stale_id in list(_emerged_target_streak.keys()):
+            for stale_id in list(_drain_advisor_last_sent.keys()):
                 if stale_id not in live_ids:
-                    _emerged_target_streak.pop(stale_id, None)
+                    _drain_advisor_last_sent.pop(stale_id, None)
             for cand in accounts:
                 cand_tier = tier_for(
                     cand, now=now_utc,
@@ -801,39 +1213,77 @@ async def active_account_poll_loop(app):
             ws_registry = getattr(app.state, "ws_registry", None)
 
             global _last_exhaustion_warning, _consecutive_no_best_ticks
-            global _last_stall_warning
+            global _last_stall_warning, _same_tier_advisory_last
+            global _last_committed_swap_time
+
+            # Drain advisor — purely informational; never affects the
+            # decision below, so a failure must not abort the tick.
+            try:
+                await _drain_advisor_tick(
+                    accounts, now_utc, active_start, active_end,
+                    ws_registry, _last_observed_tiers,
+                )
+            except Exception:
+                logger.debug("Drain advisor failed", exc_info=True)
+
+            _residency_elapsed = time.time() - _last_committed_swap_time
+            _residency_gated = reason is not None and reason.startswith((
+                REASON_PREFIX_HIGHER_TIER,
+                REASON_PREFIX_INTRA_TIER,
+                REASON_PREFIX_BURN_RATE,
+            ))
 
             if reason is None:
                 _decision_action = "stay"
                 if best is None:
+                    _decision_trigger = "tick"
                     _decision_reason = (
                         f"stay: no candidate has deficit "
                         f"(tier {_tier_label(active_acct).strip() or 'unset'})"
                     )
                 else:
                     _decision_target_id = best["id"]
-                    active_tier_now = tier_for(active_acct, now=now_utc)
-                    best_tier = tier_for(
-                        best, now=now_utc,
-                        prev_tier=_last_observed_tiers.get(best["id"]),
+                    # Tier-keyed streak: count applies to ANY account in
+                    # the tracked tier. count > 0 here means persistence
+                    # suppressed an emerge reason this very tick (the
+                    # helper clears the streak on decisive non-emerge).
+                    streak_count = (
+                        _emerged_tier_streak["count"]
+                        if _emerged_tier_streak["tier"] == best_tier_damped
+                        else 0
                     )
-                    streak = _emerged_target_streak.get(best["id"], 0)
-                    if (best_tier < active_tier_now
-                            and best_tier != TIER_EXCLUDED
-                            and streak > 0):
+                    if (best_tier_damped != TIER_EXCLUDED
+                            and streak_count > 0):
+                        _decision_trigger = "emergence_pending"
                         _decision_reason = (
                             f"stay: emergence streak "
-                            f"{streak}/{_EMERGENCE_PERSISTENCE_TICKS}, "
+                            f"{streak_count}/{_EMERGENCE_PERSISTENCE_TICKS}, "
                             f"awaiting confirmation "
-                            f"(best id={best['id']} tier={best_tier})"
+                            f"(best id={best['id']} tier={best_tier_damped} "
+                            f"vs active tier={active_tier_damped})"
                         )
                     else:
+                        _decision_trigger = "tick"
                         _decision_reason = (
                             f"stay: best is same/lower tier "
-                            f"(best id={best['id']} tier={best_tier})"
+                            f"(best id={best['id']} tier={best_tier_damped})"
                         )
+            elif _residency_gated and _residency_elapsed < _MIN_RESIDENCY_SECONDS:
+                # Min-residency gate: proactive departures must let the
+                # active account settle. Drained / 5h-critical reasons are
+                # forced departures and bypass this gate.
+                _decision_action = "stay"
+                _decision_trigger = "residency_blocked"
+                _decision_target_id = best["id"] if best else None
+                _decision_reason = (
+                    f"swap warranted ({reason}) but minimum residency "
+                    f"active "
+                    f"({_MIN_RESIDENCY_SECONDS - _residency_elapsed:.0f}s remaining)"
+                )
+                logger.debug("Active poll: %s", _decision_reason)
             elif (time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS:
                 _decision_action = "stay"
+                _decision_trigger = "cooldown_blocked"
                 _decision_target_id = best["id"] if best else None
                 _decision_reason = (
                     f"swap warranted ({reason}) but cooldown active "
@@ -842,6 +1292,7 @@ async def active_account_poll_loop(app):
                 logger.debug("Active poll: %s", _decision_reason)
             elif best is None:
                 _decision_action = "stay"
+                _decision_trigger = "no_target"
                 _decision_reason = (
                     f"swap warranted ({reason}) but no eligible target"
                 )
@@ -882,6 +1333,16 @@ async def active_account_poll_loop(app):
                             ),
                         },
                     )
+            elif (_backoff_remaining := _swap_backoff_remaining()) > 0:
+                _decision_action = "stay"
+                _decision_trigger = "swap_aborted"
+                _decision_target_id = best["id"]
+                _decision_reason = (
+                    f"swap warranted ({reason}) but failure backoff "
+                    f"active ({_backoff_remaining:.0f}s remaining after "
+                    f"{_swap_failure_count} failed attempt(s))"
+                )
+                logger.debug("Active poll: %s", _decision_reason)
             else:
                 trigger = _trigger_for_reason(reason)
                 logger.info(
@@ -895,11 +1356,11 @@ async def active_account_poll_loop(app):
                     db, active_acct_id, active_acct, best,
                     reason=reason, trigger=trigger,
                     usage_5h=usage_5h, usage_7d=usage_7d,
-                    active_start=active_start, active_end=active_end,
                     ws_registry=ws_registry,
                 )
                 if swap_committed:
-                    _emerged_target_streak.clear()
+                    _emerged_tier_streak["tier"] = None
+                    _emerged_tier_streak["count"] = 0
                     # Clear hysteresis state for both swap participants —
                     # the new active needs a fresh tier observation, and
                     # the prior active will be re-observed as a candidate
@@ -908,15 +1369,17 @@ async def active_account_poll_loop(app):
                     _last_observed_tiers.pop(best["id"], None)
                     _last_observed_tiers.pop(active_acct_id, None)
                     _decision_action = "swap"
+                    _decision_trigger = trigger
                     _decision_target_id = best["id"]
                     _decision_reason = reason
                 else:
                     # TOCTOU mismatch or credential lock failure. Don't
-                    # clear streak/hysteresis — next tick will retry.
-                    # Decision log records the attempt and the failure
-                    # so operators see "we tried" rather than silent
-                    # state-corruption.
+                    # clear streak/hysteresis — retry pacing is governed
+                    # by the failure backoff. Decision log records the
+                    # attempt and the failure so operators see "we tried"
+                    # rather than silent state-corruption.
                     _decision_action = "stay"
+                    _decision_trigger = "swap_aborted"
                     _decision_target_id = best["id"]
                     _decision_reason = (
                         f"swap aborted (credential write or TOCTOU failed): {reason}"
@@ -932,13 +1395,12 @@ async def active_account_poll_loop(app):
             has_other_accounts = sum(
                 1 for a in accounts if a["id"] != active_acct_id
             ) > 0
-            # Pattern (d): same-tier-stay with meaningful deficit.
-            # Surface the candidate's deficit so the watchdog can detect
-            # "best exists every tick but never qualifies for departure"
-            # — the silent-failure mode the user reported during DCR.
             best_deficit_val = None
             if best is not None:
-                _bd = deficit_vs_target(best, now=now_utc)
+                _bd = deficit_vs_target(
+                    best, now=now_utc,
+                    active_start=active_start, active_end=active_end,
+                )
                 if _bd is not None:
                     best_deficit_val = _bd
             stalled_this_tick = _evaluate_stall(
@@ -947,8 +1409,38 @@ async def active_account_poll_loop(app):
                 has_other_accounts=has_other_accounts,
                 reason=reason,
                 staleness_threshold=_STALL_USAGE_STALENESS_SECONDS,
-                best_deficit=best_deficit_val,
             )
+
+            # Same-tier-deficit advisory (split from stall pattern d):
+            # intended-behavior stays must not page at ERROR. T0/T1
+            # candidates only — those are harvestable drain-to targets.
+            if _same_tier_advisory_applies(
+                decision_action=_decision_action, best=best,
+                reason=reason, best_deficit=best_deficit_val,
+                best_tier=best_tier_damped,
+            ):
+                now_ts = time.time()
+                if (now_ts - _same_tier_advisory_last
+                        > _SAME_TIER_ADVISORY_COOLDOWN_SECONDS):
+                    _same_tier_advisory_last = now_ts
+                    logger.info(
+                        "Same-tier deficit advisory: best id=%s "
+                        "(tier=%s) is %.1f%% behind its tier target but "
+                        "same-tier-never-overrides keeps the loop on "
+                        "stay (active=%d)",
+                        best["id"], best_tier_damped, best_deficit_val,
+                        active_acct_id,
+                    )
+                    if ws_registry:
+                        await ws_registry.broadcast(
+                            "same_tier_deficit_advisory",
+                            {
+                                "active_account_id": active_acct_id,
+                                "best_account_id": best["id"],
+                                "best_tier": best_tier_damped,
+                                "best_deficit": round(best_deficit_val, 1),
+                            },
+                        )
             was_stalled = _consecutive_no_best_ticks >= _STALL_TICK_THRESHOLD
             if stalled_this_tick:
                 _consecutive_no_best_ticks += 1
@@ -1013,7 +1505,7 @@ async def active_account_poll_loop(app):
                     decision_id = db.record_decision(
                         account_id=active_acct_id,
                         action=_decision_action,
-                        trigger=_trigger_for_reason(_decision_reason),
+                        trigger=_decision_trigger,
                         target_id=_decision_target_id,
                         reason=_decision_reason or "no trigger",
                         detail=_tick_detail,
@@ -1028,7 +1520,7 @@ async def active_account_poll_loop(app):
                                     "email": active_acct.get("email", ""),
                                     "label": format_account_label(active_acct),
                                     "action": _decision_action,
-                                    "trigger": _trigger_for_reason(_decision_reason),
+                                    "trigger": _decision_trigger,
                                     "reason": _decision_reason or "no trigger",
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "detail": _tick_detail,

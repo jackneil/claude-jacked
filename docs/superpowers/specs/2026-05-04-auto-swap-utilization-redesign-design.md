@@ -1,8 +1,67 @@
 # Auto-Swap Algorithm Redesign — Deadline-Aware 7d Utilization
 
 **Date:** 2026-05-04
-**Status:** Approved (post-brainstorm)
+**Status:** Approved (post-brainstorm) — amended 2026-06-10
 **Replaces decisioning portion of:** `2026-04-03-7d-capacity-scheduler-design.md`, `2026-04-03-unified-swap-decision-design.md`
+
+## Changelog
+
+- **2026-06-10** — Amendments from the deadlock/utilization pass (see plan
+  `docs/superpowers/plans/2026-06-10-usage-refresh-deadlock-and-autoswap-fixes.html`
+  and the updated `docs/architecture/auto-swap-system.md`, which is the
+  authoritative current-state description):
+  - **Active-hours executor guard REMOVED** (§ "Active hours guard" below
+    is dead). Swaps execute 24/7: a credential swap costs nothing while
+    idle and pre-positions the fleet for morning — 5h windows open on the
+    first API call, not on credential placement. The dead
+    `active_start`/`active_end` params were dropped from `_execute_swap`.
+  - **`RESET_SUPPRESS_MINUTES` raised 10 → 30** and shared with
+    selection's imminent-reset lookahead (`_FIVE_H_HEADROOM_RESET_MIN =
+    RESET_SUPPRESS_MINUTES`). Invariant: lookahead <= suppression,
+    otherwise an account admitted on an imminent reset is immediately
+    ejected by the 5h-critical rule (deterministic ping-pong).
+  - **Min-residency gate:** proactive departures (higher-tier emerged /
+    intra-tier / burn-rate) blocked until the active account has held the
+    slot 900s (`_MIN_RESIDENCY_SECONDS`); drained and 5h-critical are
+    forced departures and exempt. Manual switches arm the clock
+    (`note_external_swap`) plus a 15-min sweep pause.
+  - **New departure rule 1b — intra-T0 preemption:** an earlier-expiring
+    T0 candidate with deficit >= 5% and loss-rate
+    (`deficit / hours_to_expiry`) >= 1.5x the active T0's preempts it.
+    Relaxes this spec's "same-tier never overrides" for the T0-vs-T0
+    case, which was the largest observed stranding mechanism.
+  - **Deadline-aware T1 target:** `max(90, 100 - min(10,
+    achievable_final_day_burn))` (`_t1_deadline_target`); a fixed 90
+    strands the buffer when expiry lands outside working hours. Floor 90.
+  - **T0 viable-headroom bypass:** T0 candidates with deficit >= 1 skip
+    the `has_viable_headroom` burn-floor check — drain-to-100 must not
+    strand the final slice below the per-window floor (~4.2%).
+  - **Symmetric tier hysteresis:** single-step less-urgent flips (e.g.
+    T0→T1) are now also damped within `_TIER_HYSTERESIS_MIN` of the
+    boundary (refetch noise fires a premature `drained` + pull-back);
+    multi-step jumps flip immediately (genuine window reset).
+  - **Trigger taxonomy extended** with stay-cause triggers:
+    `cooldown_blocked`, `residency_blocked`, `no_target`, `swap_aborted`,
+    `emergence_pending`, plus swap trigger `intra_tier_preempted`. `tick`
+    is now strictly "plain stay".
+  - **Swap audit:** `swap_log.status` (`pending`/`committed`/`failed`) +
+    `residency_seconds`; `/swap-log` returns `swaps_last_24h`
+    (committed-only). Failed credential writes are paced by exponential
+    backoff (60s base, x2, cap 600s) instead of retry-next-tick.
+  - **Drain advisor:** `expiring_with_stranded_capacity` WS event for T0
+    accounts projected to strand >2% (`stranding_estimate`). Advisor
+    ONLY — explicitly no auto-burn worker; routing real work beats
+    burning quota on no-ops.
+  - **Stall pattern (d) demoted** to `same_tier_deficit_advisory` (INFO +
+    WS, 30-min cooldown, T0/T1 candidates only) — same-tier-stay is
+    intended behavior per this spec and must not page at ERROR.
+  - **Burn-rate decay ungated:** decays after 5+ unchanged ticks at ANY
+    usage level (the below-warning gate froze rates exactly when the
+    user went idle at >=80%, firing spurious burn-rate swaps).
+  - **Emergence persistence keyed by tier** (`_emerged_tier_streak`),
+    not account id — near-tied same-tier candidates alternating as best
+    reset each other's id-keyed streak forever. Fast path: a >=2-tier
+    gap (T0 best vs T2+ active) skips persistence.
 
 ## Problem
 
@@ -151,13 +210,20 @@ This is the anti-flap rule: ride out the 5h window.
 
 ### Active hours guard (when do we *act*?)
 
-Outside active hours (before `window_keeper_active_start` or after
-`window_keeper_active_end`), the swap *executor* does not run, even if
-the rules above say swap. This survives unchanged from the current
-implementation. Rationale: a swap during sleep wastes a 5h window opening.
+> **REMOVED 2026-06-10.** This section no longer reflects the design.
+> The premise was wrong: 5h windows open on the *first API call*, not on
+> credential placement, so a sleep-time swap wastes nothing — it costs
+> nothing while idle and pre-positions the fleet for morning. The
+> executor now runs 24/7; the dead `active_start`/`active_end` params
+> were dropped from `_execute_swap`. Active hours still feed the
+> burn-floor math (`has_viable_headroom`), the deadline-aware T1 target,
+> `achievable_burn`/`stranding_estimate`, and the window keeper's ping
+> schedule — they just no longer gate execution.
 
-The decision is still *recorded* (so the log shows "would swap, but
-quiet hours"), but no credential write happens.
+Original (superseded) text: outside active hours (before
+`window_keeper_active_start` or after `window_keeper_active_end`), the
+swap *executor* does not run, even if the rules above say swap.
+Rationale was: a swap during sleep wastes a 5h window opening.
 
 ### Cooldown (residual)
 
@@ -182,6 +248,8 @@ against this:
    damped. State held in module-level
    `_last_observed_tiers: dict[int, int]` in `usage_monitor.py`, refreshed
    each tick from observations and pruned of dead account ids.
+   *(Amended 2026-06-10: damping is now symmetric for single-step
+   less-urgent flips — see Changelog.)*
 
 2. **Emergence persistence (`_apply_emergence_persistence`).** A
    "higher tier emerged" reason from `should_swap_now` does not act
@@ -191,6 +259,9 @@ against this:
    reasons (`drained`, `5h critical`, `burn-rate`) fire immediately —
    only the emergence path is gated, because only that path is
    susceptible to single-tick boundary jitter.
+   *(Amended 2026-06-10: streak is now keyed by TIER
+   (`_emerged_tier_streak`), also gates intra-tier preemption, and a
+   >=2-tier gap skips persistence — see Changelog.)*
 
 3. **Silent-stall watchdog.** A counter `_consecutive_no_best_ticks`
    tracks ticks where the loop is stuck (three patterns: multi-account
@@ -203,22 +274,36 @@ against this:
 All three pieces of state are cleared by `reset_locks` on lifespan
 restart so a tray restart starts with a fresh observation.
 
-### Trigger Taxonomy
+### Trigger Taxonomy (extended 2026-06-10)
 
 The decision-log `trigger` field uses one of:
 - `tier_drained` — active hit T0/T1 drain-to target
 - `higher_tier_emerged` — candidate with strictly lower tier index
   emerged AND emergence persistence streak met
+- `intra_tier_preempted` — rule 1b intra-T0 preemption fired
+  (added 2026-06-10)
 - `forced_critical` — active 5h ≥ critical (and 5h reset NOT imminent)
 - `burn_rate` — burn-rate projection crosses critical within window
 - `tier_aware` — catch-all (rare)
-- `tick` — `_decision_action == "stay"`
+- `tick` — plain stay, nothing fired
+- `emergence_pending` — emerge reason suppressed by the persistence
+  streak this tick (added 2026-06-10)
+- `residency_blocked` — proactive reason blocked by min-residency
+  (added 2026-06-10)
+- `cooldown_blocked` — reason blocked by post-swap cooldown
+  (added 2026-06-10)
+- `no_target` — reason fired but no eligible target (added 2026-06-10)
+- `swap_aborted` — failure backoff active, or the swap attempt failed
+  (TOCTOU / credential write) (added 2026-06-10)
 
-Mapping is computed in `_trigger_for_reason(reason)` from the prefix of
-`should_swap_now`'s reason string (constants: `REASON_PREFIX_HIGHER_TIER`,
-`REASON_PREFIX_DRAINED`, `REASON_PREFIX_FIVE_H`, `REASON_PREFIX_BURN_RATE`).
-Reason-string prefixes are part of the public contract — do not change
-without updating both the helper and consumers.
+Swap triggers are computed in `_trigger_for_reason(reason)` from the
+prefix of `should_swap_now`'s reason string (constants:
+`REASON_PREFIX_HIGHER_TIER`, `REASON_PREFIX_INTRA_TIER`,
+`REASON_PREFIX_DRAINED`, `REASON_PREFIX_FIVE_H`,
+`REASON_PREFIX_BURN_RATE`); stay-cause triggers are set explicitly by
+the gate that blocked the swap. Reason-string prefixes are part of the
+public contract — do not change without updating both the helper and
+consumers.
 
 ## Functions to add / replace in `jacked/web/auto_swap.py`
 

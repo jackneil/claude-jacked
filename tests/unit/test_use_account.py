@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +11,23 @@ from fastapi.testclient import TestClient
 
 from jacked.api.routes.auth import router
 from jacked.web.database import Database
+
+
+@pytest.fixture(autouse=True)
+def _restore_usage_monitor_swap_state():
+    """Successful /use calls invoke usage_monitor.note_external_swap(),
+    which arms module-level cooldown/residency clocks.  Restore them so
+    these tests don't leak swap state into other test files."""
+    from jacked.api import usage_monitor as um
+    saved = (
+        um._last_swap_time,
+        um._last_committed_swap_time,
+        dict(um._emerged_tier_streak),
+    )
+    yield
+    um._last_swap_time, um._last_committed_swap_time = saved[0], saved[1]
+    um._emerged_tier_streak.clear()
+    um._emerged_tier_streak.update(saved[2])
 
 
 @pytest.fixture
@@ -113,6 +131,112 @@ def test_use_account_success(client, tmp_path):
     mock_sync.assert_called_once()
     assert mock_sync.call_args.args[0] == 1  # account_id
     assert mock_sync.call_args.args[1]["email"] == "alice@test.com"
+
+
+def test_use_account_arms_auto_swap_pause(client, db):
+    """Successful manual switch notifies the usage monitor (cooldown +
+    residency + streak reset) and pauses auto-swap for 15 minutes so the
+    loop cannot silently revert the user's choice."""
+    before = datetime.now(timezone.utc)
+    with mock.patch(
+        "jacked.api.credential_helpers.sync_credential_to_all_stores"
+    ), mock.patch(
+        "jacked.api.usage_monitor._read_active_account_id", return_value=None
+    ), mock.patch(
+        "jacked.api.usage_monitor.note_external_swap"
+    ) as mock_note:
+        resp = client.post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 200
+    mock_note.assert_called_once_with()
+
+    paused = db.get_setting("auto_swap_paused_until")
+    assert paused, "manual switch must set auto_swap_paused_until"
+    paused_dt = datetime.fromisoformat(paused)
+    assert paused_dt.tzinfo is not None, "pause timestamp must be tz-aware UTC"
+    delta = paused_dt - before
+    assert timedelta(minutes=14, seconds=50) <= delta <= timedelta(minutes=15, seconds=30), (
+        f"expected ~15min pause, got {delta}"
+    )
+
+
+def test_use_account_does_not_shorten_longer_pause(client, db):
+    """A manual switch must never shorten an explicit user-set pause —
+    POST /api/settings/swap-pause supports up to 1440 minutes; the 15-min
+    residency pause may only ever EXTEND the active pause."""
+    existing = (datetime.now(timezone.utc) + timedelta(minutes=60)).isoformat()
+    db.set_setting("auto_swap_paused_until", existing)
+
+    with mock.patch(
+        "jacked.api.credential_helpers.sync_credential_to_all_stores"
+    ), mock.patch(
+        "jacked.api.usage_monitor._read_active_account_id", return_value=None
+    ), mock.patch(
+        "jacked.api.usage_monitor.note_external_swap"
+    ):
+        resp = client.post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 200
+    assert db.get_setting("auto_swap_paused_until") == existing, (
+        "manual switch must not shorten an active longer pause"
+    )
+
+
+def test_use_account_extends_shorter_pause(client, db):
+    """A manual switch extends a shorter active pause out to ~15 minutes."""
+    db.set_setting(
+        "auto_swap_paused_until",
+        (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+    )
+    before = datetime.now(timezone.utc)
+
+    with mock.patch(
+        "jacked.api.credential_helpers.sync_credential_to_all_stores"
+    ), mock.patch(
+        "jacked.api.usage_monitor._read_active_account_id", return_value=None
+    ), mock.patch(
+        "jacked.api.usage_monitor.note_external_swap"
+    ):
+        resp = client.post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 200
+    paused_dt = datetime.fromisoformat(db.get_setting("auto_swap_paused_until"))
+    delta = paused_dt - before
+    assert timedelta(minutes=14, seconds=50) <= delta <= timedelta(minutes=15, seconds=30), (
+        f"expected pause extended to ~15min, got {delta}"
+    )
+
+
+def test_use_account_overwrites_unparseable_pause(client, db):
+    """Garbage in the pause setting (the sweep loop ignores it anyway) is
+    replaced by the standard 15-minute pause, not preserved."""
+    db.set_setting("auto_swap_paused_until", "not-a-timestamp")
+    before = datetime.now(timezone.utc)
+
+    with mock.patch(
+        "jacked.api.credential_helpers.sync_credential_to_all_stores"
+    ), mock.patch(
+        "jacked.api.usage_monitor._read_active_account_id", return_value=None
+    ), mock.patch(
+        "jacked.api.usage_monitor.note_external_swap"
+    ):
+        resp = client.post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 200
+    paused_dt = datetime.fromisoformat(db.get_setting("auto_swap_paused_until"))
+    delta = paused_dt - before
+    assert timedelta(minutes=14) <= delta <= timedelta(minutes=16)
+
+
+def test_use_account_rejected_does_not_arm_pause(client, db):
+    """A rejected switch (disabled account) must NOT pause auto-swap or
+    note an external swap — nothing was actually switched."""
+    with mock.patch("jacked.api.usage_monitor.note_external_swap") as mock_note:
+        resp = client.post("/api/auth/accounts/2/use")
+
+    assert resp.status_code == 400
+    mock_note.assert_not_called()
+    assert not db.get_setting("auto_swap_paused_until")
 
 
 def test_use_account_not_found(client):

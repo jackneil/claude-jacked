@@ -32,12 +32,18 @@ def _ts(hours_ago=0, days_ago=0):
 
 
 def _insert_session(db, session_id, project_hash, messages):
-    """Helper: insert a batch of messages for a session."""
+    """Helper: insert a batch of messages for a session.
+
+    Timestamps are relative to now (1 minute apart, starting 2 hours ago)
+    so they stay inside the detectors' 7-day rolling window and sessions
+    with 6+ messages clear the 5-minute duration gate.
+    """
+    base = datetime.now(timezone.utc) - timedelta(hours=2)
     db.insert_messages([{
         "id": f"{session_id}_{i}",
         "session_id": session_id,
         "project_hash": project_hash,
-        "timestamp": f"2026-04-07T{12 + i // 60:02d}:{i % 60:02d}:00Z",
+        "timestamp": (base + timedelta(minutes=i)).isoformat(),
         "model": m.get("model", "claude-opus-4-6"),
         "input_tokens": m.get("input", 100),
         "output_tokens": m.get("output", 500),

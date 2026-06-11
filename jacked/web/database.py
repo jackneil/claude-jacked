@@ -357,7 +357,9 @@ CREATE TABLE IF NOT EXISTS swap_log (
     from_5h_usage REAL,
     from_7d_usage REAL,
     to_5h_usage REAL,
-    to_7d_usage REAL
+    to_7d_usage REAL,
+    status TEXT NOT NULL DEFAULT 'committed',
+    residency_seconds INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS decision_log (
@@ -667,6 +669,22 @@ class Database:
                     )
                 except sqlite3.OperationalError:
                     pass
+            # Migration: add swap outcome tracking to swap_log.
+            # status distinguishes committed swaps from pending/failed attempts;
+            # residency_seconds is how long the outgoing account was active.
+            cursor = conn.execute("PRAGMA table_info(swap_log)")
+            swap_cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_def in [
+                ("status", "TEXT NOT NULL DEFAULT 'committed'"),
+                ("residency_seconds", "INTEGER"),
+            ]:
+                if col_name not in swap_cols:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE swap_log ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
             # Indexes (after migrations so new columns exist)
             conn.executescript(INDEXES_SQL)
             # Migration: rebuild idx_sa_active to cover last_activity_at
@@ -2633,18 +2651,47 @@ class Database:
     # ==================================================================
 
     def record_swap(self, from_account_id, to_account_id, reason, trigger,
-                    from_5h=None, from_7d=None, to_5h=None, to_7d=None):
-        """Record an account swap event."""
+                    from_5h=None, from_7d=None, to_5h=None, to_7d=None,
+                    status="committed", residency_seconds=None):
+        """Record an account swap event. Returns the inserted row ID."""
         with self._writer() as conn:
             cursor = conn.execute(
                 """INSERT INTO swap_log
                    (from_account_id, to_account_id, reason, trigger,
-                    from_5h_usage, from_7d_usage, to_5h_usage, to_7d_usage)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    from_5h_usage, from_7d_usage, to_5h_usage, to_7d_usage,
+                    status, residency_seconds)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (from_account_id, to_account_id, reason, trigger,
-                 from_5h, from_7d, to_5h, to_7d),
+                 from_5h, from_7d, to_5h, to_7d,
+                 status, residency_seconds),
             )
             return cursor.lastrowid
+
+    def update_swap_status(self, swap_id: int, status: str) -> None:
+        """Update the status of a swap_log row (e.g. 'pending' -> 'committed'/'failed')."""
+        with self._writer() as conn:
+            conn.execute(
+                "UPDATE swap_log SET status = ? WHERE id = ?",
+                (status, swap_id),
+            )
+
+    def swaps_last_24h(self, committed_only: bool = True) -> int:
+        """Count swap events in the trailing 24 hours.
+
+        >>> db = Database(":memory:")
+        >>> db.swaps_last_24h()
+        0
+        """
+        # Cutoff uses the same strftime format as the column DEFAULT so the
+        # lexicographic comparison is exact (datetime('now') lacks 'T'/'Z').
+        query = (
+            "SELECT COUNT(*) FROM swap_log "
+            "WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours')"
+        )
+        if committed_only:
+            query += " AND status = 'committed'"
+        with self._reader() as conn:
+            return conn.execute(query).fetchone()[0]
 
     def list_swaps(self, limit=50):
         """List recent swap events with account emails and org info."""

@@ -10,7 +10,7 @@ import json
 import logging
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +44,21 @@ _BULK_REFRESH_STALE_AFTER = 180.0  # 4 accts * ~20s worst case + slack
 # Happy path is 1-2s; 10s is plenty of slack for a slow Anthropic refresh.
 # If refresh takes >10s something's wrong upstream — waiting longer doesn't help.
 _BULK_PER_ACCOUNT_TIMEOUT = 10.0
+# Route-level upper bounds for single-account endpoints so a wedged upstream
+# call can't hold the HTTP request open indefinitely — the client gets a
+# deterministic 504 instead of a spinner. Looser than the bulk per-account
+# timeout because these are user-initiated one-offs that may ride out a
+# lock-recovery inside web/auth.py.
+_SINGLE_USAGE_TIMEOUT = 60.0
+_TOKEN_REFRESH_TIMEOUT = 45.0
+_VALIDATE_TIMEOUT = 60.0
+
+
+def _gateway_timeout(message: str, code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        content={"error": {"message": message, "code": code}},
+    )
 
 
 def reset_locks() -> None:
@@ -600,7 +615,20 @@ async def refresh_token(account_id: int, request: Request):
             error="API key account — no refresh needed (valid for ~1 year)",
         )
 
-    success = await refresh_account_token(account_id, db)
+    try:
+        success = await asyncio.wait_for(
+            refresh_account_token(account_id, db),
+            timeout=_TOKEN_REFRESH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "refresh_token: account %d refresh_account_token exceeded %.0fs — returning 504",
+            account_id, _TOKEN_REFRESH_TIMEOUT,
+        )
+        return _gateway_timeout(
+            "Token refresh timed out — server may be recovering a wedged refresh",
+            "REFRESH_TIMEOUT",
+        )
     if success:
         return RefreshResponse(success=True)
 
@@ -634,7 +662,32 @@ async def refresh_usage(account_id: int, request: Request):
     # access_token to fetch_usage() bypasses its cache freshness guard (auth.py:339).
     db_token = account.get("access_token")
     effective_token = fresh_token if (fresh_token and fresh_token != db_token) else None
-    usage_data = await fetch_usage(account_id, db, access_token=effective_token, manual=True)
+    try:
+        usage_data = await asyncio.wait_for(
+            fetch_usage(account_id, db, access_token=effective_token, manual=True),
+            timeout=_SINGLE_USAGE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "refresh_usage: account %d fetch_usage exceeded %.0fs — "
+            "returning 504 and resetting validation_status",
+            account_id, _SINGLE_USAGE_TIMEOUT,
+        )
+        # Mirror the bulk route's timeout handling: record the error and
+        # reset validation_status in the same call so the row doesn't sit
+        # at 'checking' waiting for the watchdog's next 60s tick.
+        db.update_account(
+            account_id,
+            validation_status="unknown",
+            last_error=(
+                f"Usage fetch timed out after {int(_SINGLE_USAGE_TIMEOUT)}s"
+            ),
+            last_error_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return _gateway_timeout(
+            "Usage fetch timed out — server may be recovering a wedged refresh",
+            "REFRESH_TIMEOUT",
+        )
 
     if isinstance(usage_data, dict) and usage_data.get("_backed_off"):
         return JSONResponse(
@@ -710,7 +763,12 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
         else:
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content={"detail": "Usage refresh already in progress"},
+                content={
+                    "error": {
+                        "message": "Usage refresh already in progress",
+                        "code": "REFRESH_IN_PROGRESS",
+                    }
+                },
             )
 
     async with _bulk_refresh_lock:
@@ -874,9 +932,11 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
             # Only clear the slot if we still own it.  A force-reset during
             # our long-running loop may have replaced _bulk_refresh_task
             # with a newer holder — clearing it would wipe the new holder's
-            # state (/dc PM2/Q2 fix).
+            # state (/dc PM2/Q2 fix).  Resetting acquired_at alongside the
+            # task keeps the staleness clock from counting a finished run.
             if _bulk_refresh_task is my_task:
                 _bulk_refresh_task = None
+                _bulk_refresh_acquired_at = 0.0
 
 
 @router.post("/accounts/{account_id}/validate", response_model=ValidateResponse)
@@ -890,7 +950,20 @@ async def validate_token(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    result = await validate_account(account_id, db)
+    try:
+        result = await asyncio.wait_for(
+            validate_account(account_id, db),
+            timeout=_VALIDATE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "validate_token: account %d validate_account exceeded %.0fs — returning 504",
+            account_id, _VALIDATE_TIMEOUT,
+        )
+        return _gateway_timeout(
+            "Validation timed out — server may be recovering a wedged refresh",
+            "VALIDATE_TIMEOUT",
+        )
     return ValidateResponse(
         valid=result["valid"],
         error=result.get("error"),
@@ -1024,6 +1097,39 @@ async def use_account(account_id: int, request: Request):
             account_id,
         )
 
+    # Give the manual choice residency: without this, the auto-swap loop
+    # can silently revert a user-chosen account within ~2-5 minutes.
+    # note_external_swap() arms the monitor's cooldown + min-residency
+    # clocks and clears the emergence streak; the pause setting holds the
+    # sweep loop off entirely for at least 15 minutes.
+    try:
+        from jacked.api import usage_monitor  # local import: avoids cycle
+
+        usage_monitor.note_external_swap()
+        pause_dt = datetime.now(timezone.utc) + timedelta(minutes=15)
+        # Only ever EXTEND an active pause — the user may have set a
+        # longer explicit pause (POST /api/settings/swap-pause, up to
+        # 1440 min); a manual switch must never silently shorten it.
+        existing = db.get_setting("auto_swap_paused_until") or ""
+        if existing:
+            try:
+                existing_dt = datetime.fromisoformat(
+                    existing.replace("Z", "+00:00"),
+                )
+                if existing_dt > pause_dt:
+                    pause_dt = existing_dt
+            except (ValueError, TypeError):
+                # Unparseable/naive timestamp (the sweep loop ignores
+                # these anyway) — overwrite with the 15-minute pause.
+                pass
+        db.set_setting("auto_swap_paused_until", pause_dt.isoformat())
+    except Exception:
+        logger.exception(
+            "Failed to arm auto-swap pause after manual switch "
+            "(account=%d) — auto-swap may revert the user's choice",
+            account_id,
+        )
+
     try:
         from jacked.web.auto_swap import format_account_label
         prev_acct = db.get_account(outgoing_id) if outgoing_id else None
@@ -1068,7 +1174,6 @@ async def use_account(account_id: int, request: Request):
         # Broadcast decision log entry
         ws_registry = getattr(request.app.state, "ws_registry", None)
         if ws_registry and decision_id:
-            from datetime import datetime, timezone
             try:
                 await ws_registry.broadcast(
                     "decision_log_entry",

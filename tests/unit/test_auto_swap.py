@@ -271,23 +271,47 @@ class TestHasViableHeadroom:
         acct = {"cached_usage_7d": 93.0}
         assert has_viable_headroom(acct, active_start="09:00", active_end="17:00") is False
 
-    def test_pick_best_target_excludes_near_exhausted(self):
-        """pick_best_target should NOT return an account at 98% 7d even via urgency."""
-        from datetime import datetime, timezone, timedelta
-        import time as _time
-
+    def test_t0_with_deficit_bypasses_burn_floor(self):
+        """T0 drains to 100: 98% used (deficit 2 >= 1) is admitted even
+        though unused 2% < burn_per_window — the floor would permanently
+        strand the final slice of every account."""
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
         accounts = [
             _acct(1, usage_5h=90),
-            _acct(2, usage_5h=0, usage_7d=98),
+            _acct(2, usage_5h=0, usage_7d=98,
+                  resets_7d=_iso(now + timedelta(hours=2))),
         ]
-        accounts[1]["cached_7d_resets_at"] = (
-            datetime.now(timezone.utc) + timedelta(hours=2)
-        ).isoformat()
-        accounts[1]["usage_cached_at"] = int(_time.time()) - 60
-
         result = pick_best_target(
             accounts, current_id=1,
-            active_start="06:00", active_end="23:00",
+            active_start="06:00", active_end="23:00", now=now,
+        )
+        assert result is not None
+        assert result["id"] == 2
+
+    def test_t0_bypass_requires_deficit_of_at_least_1(self):
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        accounts = [
+            _acct(1, usage_5h=90),
+            _acct(2, usage_5h=0, usage_7d=99.5,
+                  resets_7d=_iso(now + timedelta(hours=2))),
+        ]
+        result = pick_best_target(
+            accounts, current_id=1,
+            active_start="06:00", active_end="23:00", now=now,
+        )
+        assert result is None
+
+    def test_non_t0_near_exhausted_still_excluded(self):
+        """T1 with a positive deficit but unused < burn floor stays out."""
+        expiry = _local_utc(2026, 5, 6, 3, 0)  # 03:00 local -> T1 target 100
+        now = expiry - timedelta(hours=36)
+        accounts = [
+            _acct(1, usage_5h=90),
+            _acct(2, usage_5h=0, usage_7d=96.5, resets_7d=_iso(expiry)),
+        ]
+        result = pick_best_target(
+            accounts, current_id=1,
+            active_start="06:00", active_end="23:00", now=now,
         )
         assert result is None
 
@@ -343,6 +367,16 @@ class TestFormatAccountLabel:
 def _iso(dt: datetime) -> str:
     """Format datetime as ISO with Z suffix (matches Anthropic API)."""
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _local_utc(*args) -> datetime:
+    """UTC-aware instant for a naive LOCAL (system tz) wall-clock time.
+
+    Deadline-aware T1 targets depend on the expiry's LOCAL calendar day,
+    so tests must construct expiries in local terms to stay deterministic
+    across machine timezones.
+    """
+    return datetime(*args).astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -417,11 +451,27 @@ class TestTierFor:
         acct = _acct(1, resets_7d=_iso(now + timedelta(hours=23, minutes=54)))
         assert tier_for(acct, now=now, prev_tier=1) == 0
 
-    def test_hysteresis_does_not_block_movement_toward_less_urgent(self):
+    def test_hysteresis_damps_single_step_less_urgent_flip(self):
         from jacked.web.auto_swap import tier_for
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=24, seconds=10)))
+        # 2 min past the 24h boundary on the less-urgent side: refetch
+        # noise on cached_7d_resets_at, not real movement — hold T0.
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=24, minutes=2)))
+        assert tier_for(acct, now=now, prev_tier=0) == 0
+
+    def test_hysteresis_releases_less_urgent_flip_after_margin(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=24, minutes=6)))
         assert tier_for(acct, now=now, prev_tier=0) == 1
+
+    def test_multi_step_less_urgent_flip_is_immediate(self):
+        from jacked.web.auto_swap import tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        # T0 -> T2 is a genuine window reset, not jitter — flips at once
+        # even within 5 min of the 48h boundary.
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=48, minutes=2)))
+        assert tier_for(acct, now=now, prev_tier=0) == 2
 
     def test_hysteresis_no_prev_means_no_dampening(self):
         from jacked.web.auto_swap import tier_for
@@ -481,10 +531,13 @@ class TestTarget7d:
         acct = _acct(1, resets_7d=_iso(now + timedelta(hours=12)))
         assert target_7d(acct, now=now) == 100.0
 
-    def test_t1_target_is_90(self):
+    def test_t1_target_floors_at_90(self):
         from jacked.web.auto_swap import target_7d
-        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=36)))
+        # 23:00 local expiry: full 17h working day -> achievable burn is
+        # capped at 10% -> floor target 90.
+        expiry = _local_utc(2026, 5, 6, 23, 0)
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, resets_7d=_iso(expiry))
         assert target_7d(acct, now=now) == 90.0
 
     def test_t2_target_is_white_bar_plus_5(self):
@@ -530,8 +583,9 @@ class TestDeficitVsTarget:
 
     def test_t1_at_70_has_20_deficit(self):
         from jacked.web.auto_swap import deficit_vs_target
-        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-        acct = _acct(1, usage_7d=70, resets_7d=_iso(now + timedelta(hours=36)))
+        expiry = _local_utc(2026, 5, 6, 23, 0)  # floor target 90
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, usage_7d=70, resets_7d=_iso(expiry))
         assert deficit_vs_target(acct, now=now) == 20.0
 
     def test_t2_at_white_bar_minus_3_has_8_deficit(self):
@@ -552,8 +606,9 @@ class TestDeficitVsTarget:
 
     def test_negative_deficit_when_above_target(self):
         from jacked.web.auto_swap import deficit_vs_target
-        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-        acct = _acct(1, usage_7d=95, resets_7d=_iso(now + timedelta(hours=36)))
+        expiry = _local_utc(2026, 5, 6, 23, 0)  # floor target 90
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, usage_7d=95, resets_7d=_iso(expiry))
         assert deficit_vs_target(acct, now=now) == -5.0
 
     def test_returns_none_when_no_data(self):
@@ -635,12 +690,12 @@ class TestPickBestTargetTierStrict:
 
     def test_no_candidate_when_all_at_target(self):
         from jacked.web.auto_swap import pick_best_target
-        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        t1_expiry = _local_utc(2026, 5, 6, 23, 0)  # T1 floor target 90
+        now = t1_expiry - timedelta(hours=36)
         active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
         t0_done = _acct(1, usage_7d=100,
                         resets_7d=_iso(now + timedelta(hours=12)))
-        t1_done = _acct(2, usage_7d=90,
-                        resets_7d=_iso(now + timedelta(hours=36)))
+        t1_done = _acct(2, usage_7d=90, resets_7d=_iso(t1_expiry))
         target = pick_best_target([active, t0_done, t1_done],
                                   current_id=99, now=now)
         assert target is None
@@ -722,6 +777,35 @@ class TestHas5hHeadroom:
             "cached_5h_resets_at": _iso(future),
         }) is False
 
+    def test_past_reset_treated_as_headroom(self):
+        """A PAST cached_5h_resets_at means the window already flipped —
+        the >=90 cached usage is stale, not a reason to exclude."""
+        from jacked.web.auto_swap import _has_5h_headroom
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": _iso(now - timedelta(minutes=10)),
+        }, now=now) is True
+
+    def test_now_aware_distant_reset_excluded(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        assert _has_5h_headroom({
+            "cached_usage_5h": 95,
+            "cached_5h_resets_at": _iso(now + timedelta(hours=2)),
+        }, now=now) is False
+
+    def test_pick_best_target_admits_past_reset_candidate(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        stale = _acct(1, usage_5h=95, usage_7d=50,
+                      resets_5h=_iso(now - timedelta(minutes=5)),
+                      resets_7d=_iso(now + timedelta(hours=12)))
+        target = pick_best_target([active, stale], current_id=99, now=now)
+        assert target is not None
+        assert target["id"] == 1
+
 
 class TestShouldSwapNow:
     """Spec scenarios D17-D23 — departure rule."""
@@ -793,6 +877,27 @@ class TestShouldSwapNow:
         reason = should_swap_now(active=active, best=best, now=now)
         assert reason is None
 
+    def test_5h_critical_suppressed_within_30_min_window(self):
+        """RESET_SUPPRESS_MINUTES is 30: a reset 25 min out still
+        suppresses (would have fired under the old 10-min window)."""
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(minutes=25)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is None
+
+    def test_5h_critical_fires_beyond_suppression_window(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(minutes=40)),
+                       resets_7d=_iso(now + timedelta(days=3)))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("5h critical:")
+
     def test_swap_when_5h_imminent_but_higher_tier_emerged(self):
         from jacked.web.auto_swap import should_swap_now
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
@@ -837,6 +942,19 @@ class TestShouldSwapNow:
         reason = should_swap_now(active=active, best=None, now=now)
         assert reason is None
 
+    def test_active_excluded_5h_critical_reaches_rule_3(self):
+        """An active with no 7d data must still get 5h-critical
+        exhaustion alerting — TIER_EXCLUDED no longer short-circuits
+        rules 3-4 when best is None."""
+        from jacked.web.auto_swap import should_swap_now, REASON_PREFIX_FIVE_H
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=None)
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith(REASON_PREFIX_FIVE_H)
+
     def test_active_excluded_with_best_means_swap(self):
         from jacked.web.auto_swap import should_swap_now
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
@@ -879,10 +997,26 @@ class TestShouldSwapNow:
 
     def test_t1_at_target_drains_even_without_best(self):
         from jacked.web.auto_swap import should_swap_now
-        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        expiry = _local_utc(2026, 5, 6, 23, 0)  # T1 floor target 90
+        now = expiry - timedelta(hours=36)
         active = _acct(1, usage_5h=20, usage_7d=90,
                        resets_5h=_iso(now + timedelta(hours=2)),
-                       resets_7d=_iso(now + timedelta(hours=36)))
+                       resets_7d=_iso(expiry))
+        reason = should_swap_now(active=active, best=None, now=now)
+        assert reason is not None
+        assert reason.startswith("drained:")
+
+    def test_t1_drained_gate_is_deadline_aware(self):
+        """A 15:00-local expiry leaves ~7.6% achievable on the final day,
+        so the T1 target is ~92.4 — 91% is NOT drained, 93% is."""
+        from jacked.web.auto_swap import should_swap_now
+        expiry = _local_utc(2026, 5, 6, 15, 0)
+        now = expiry - timedelta(hours=36)
+        active = _acct(1, usage_5h=20, usage_7d=91,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(expiry))
+        assert should_swap_now(active=active, best=None, now=now) is None
+        active["cached_usage_7d"] = 93
         reason = should_swap_now(active=active, best=None, now=now)
         assert reason is not None
         assert reason.startswith("drained:")
@@ -985,10 +1119,11 @@ class TestSelectionDrainedT0T1Only:
 
     def test_t1_active_drained_uses_t1_target(self):
         from jacked.web.auto_swap import should_swap_now, T1_TARGET
-        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        expiry = _local_utc(2026, 5, 6, 23, 0)  # T1 floor target 90
+        now = expiry - timedelta(hours=36)
         active = _acct(1, usage_5h=20, usage_7d=90,
                        resets_5h=_iso(now + timedelta(hours=2)),
-                       resets_7d=_iso(now + timedelta(hours=36)))
+                       resets_7d=_iso(expiry))
         reason = should_swap_now(active=active, best=None, now=now)
         assert reason is not None
         assert reason.startswith("drained:")
@@ -1000,12 +1135,12 @@ class TestBurstPattern:
 
     def test_burst_drains_t0_then_t1_then_t3(self):
         from jacked.web.auto_swap import pick_best_target
-        now = datetime(2026, 5, 8, 17, 0, tzinfo=timezone.utc)
+        a2_expiry = _local_utc(2026, 5, 10, 23, 0)  # T1 floor target 90
+        now = a2_expiry - timedelta(hours=35)
         active = _acct(99, resets_7d=_iso(now + timedelta(days=2)))
         a1 = _acct(1, usage_5h=10, usage_7d=30,
                    resets_7d=_iso(now + timedelta(hours=11)))
-        a2 = _acct(2, usage_5h=10, usage_7d=30,
-                   resets_7d=_iso(now + timedelta(hours=35)))
+        a2 = _acct(2, usage_5h=10, usage_7d=30, resets_7d=_iso(a2_expiry))
         # a3 is T3 (6d to expiry) — white_bar ~14.3% with 1 day elapsed.
         # usage_7d=5 keeps it BELOW the T3 floor so it has a positive
         # deficit and remains an eligible candidate per the strict
@@ -1045,8 +1180,9 @@ class TestBurstPattern:
 class TestCompute7dDeficitNewShape:
     def test_returns_tier_and_target_fields(self):
         from jacked.web.auto_swap import compute_7d_deficit
-        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-        acct = _acct(1, usage_7d=70, resets_7d=_iso(now + timedelta(hours=36)))
+        expiry = _local_utc(2026, 5, 6, 23, 0)  # T1 floor target 90
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, usage_7d=70, resets_7d=_iso(expiry))
         result = compute_7d_deficit(acct, now=now)
         assert result is not None
         assert "tier" in result
@@ -1060,3 +1196,301 @@ class TestCompute7dDeficitNewShape:
         # Backwards-compat aliases retained:
         assert "deficit" in result
         assert "unused_7d" in result
+
+
+# ---------------------------------------------------------------------------
+# target_for_tier — damped-tier-aware targets
+# ---------------------------------------------------------------------------
+
+
+class TestTargetForTier:
+    def test_t0_is_100(self):
+        from jacked.web.auto_swap import TIER_T0, target_for_tier
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=12)))
+        assert target_for_tier(TIER_T0, acct, now) == 100.0
+
+    def test_t2_is_white_bar_plus_lead(self):
+        from jacked.web.auto_swap import TIER_T2, target_for_tier, white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=3)))
+        wb = white_bar(acct, now=now) * 100
+        assert abs(target_for_tier(TIER_T2, acct, now) - (wb + 5.0)) < 1e-6
+
+    def test_t3_is_white_bar(self):
+        from jacked.web.auto_swap import TIER_T3, target_for_tier, white_bar
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=6)))
+        wb = white_bar(acct, now=now) * 100
+        assert abs(target_for_tier(TIER_T3, acct, now) - wb) < 1e-6
+
+    def test_excluded_is_none(self):
+        from jacked.web.auto_swap import TIER_EXCLUDED, target_for_tier
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        assert target_for_tier(TIER_EXCLUDED, _acct(1), now) is None
+
+    def test_damped_tier_wins_over_instant_tier(self):
+        """An account held at T1 by hysteresis must be priced with T1's
+        target, not the instantaneous T0's 100."""
+        from jacked.web.auto_swap import TIER_T1, target_for_tier
+        expiry = _local_utc(2026, 5, 6, 23, 0)
+        now = expiry - timedelta(hours=23, minutes=58)  # instant says T0
+        acct = _acct(1, resets_7d=_iso(expiry))
+        assert target_for_tier(TIER_T1, acct, now) == 90.0
+
+    def test_target_7d_delegates_to_target_for_tier(self):
+        from jacked.web.auto_swap import target_7d, target_for_tier, tier_for
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        for hours in (12, 36, 72, 144):
+            acct = _acct(1, resets_7d=_iso(now + timedelta(hours=hours)))
+            tier = tier_for(acct, now=now)
+            assert target_7d(acct, now=now) == target_for_tier(tier, acct, now)
+
+
+class TestDeadlineAwareT1Target:
+    """T1 target = 100 minus what the expiry day's working hours can still
+    burn, floored at T1_TARGET. Expiry outside working hours reclaims the
+    buffer that a fixed 90 would strand."""
+
+    def test_overnight_expiry_drains_to_100(self):
+        from jacked.web.auto_swap import target_7d
+        expiry = _local_utc(2026, 5, 6, 3, 0)  # 03:00 local: 0 working hours
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, resets_7d=_iso(expiry))
+        assert target_7d(acct, now=now) == 100.0
+
+    def test_midafternoon_expiry_partial_buffer(self):
+        from jacked.web.auto_swap import target_7d
+        expiry = _local_utc(2026, 5, 6, 15, 0)  # 9 working hours that day
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, resets_7d=_iso(expiry))
+        # 9h / 5h windows * (500/119)%/window = 7.563% achievable
+        expected = 100.0 - (9 / 5) * (500 / 119)
+        assert target_7d(acct, now=now) == pytest.approx(expected)
+
+    def test_late_evening_expiry_floors_at_90(self):
+        from jacked.web.auto_swap import T1_TARGET, target_7d
+        expiry = _local_utc(2026, 5, 6, 23, 0)  # full 17h working day
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, resets_7d=_iso(expiry))
+        assert target_7d(acct, now=now) == T1_TARGET
+
+    def test_custom_active_hours_change_target(self):
+        from jacked.web.auto_swap import target_7d
+        expiry = _local_utc(2026, 5, 6, 13, 0)
+        now = expiry - timedelta(hours=36)
+        acct = _acct(1, resets_7d=_iso(expiry))
+        # 09:00-17:00: 4 working hours before expiry, burn/window =
+        # 100/11.2 -> achievable = 0.8 * 8.93 = 7.14 -> target 92.86
+        expected = 100.0 - (4 / 5) * (100 / 11.2)
+        result = target_7d(acct, now=now,
+                           active_start="09:00", active_end="17:00")
+        assert result == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# pick_best_target — damped-tier deficit (hysteresis admit consistency)
+# ---------------------------------------------------------------------------
+
+
+class TestPickBestTargetDampedDeficit:
+    def test_hysteresis_held_t1_admitted_with_t1_target(self):
+        """An account instantaneously T0 but damped to T1 must be priced
+        with T1's target: at 95% vs a floor-90 target it is NOT a
+        candidate. Without the hold it IS (T0 target 100, deficit 5)."""
+        from jacked.web.auto_swap import TIER_T1, pick_best_target
+        expiry = _local_utc(2026, 5, 6, 23, 0)
+        now = expiry - timedelta(hours=23, minutes=58)  # 2 min into T0
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        held = _acct(1, usage_7d=95, resets_7d=_iso(expiry))
+        target = pick_best_target([active, held], current_id=99, now=now,
+                                  prev_tiers={1: TIER_T1})
+        assert target is None
+        target = pick_best_target([active, held], current_id=99, now=now)
+        assert target is not None
+        assert target["id"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _SortKey — chronological ordering across timestamp formats
+# ---------------------------------------------------------------------------
+
+
+class TestSortKeyChronological:
+    def test_mixed_timestamp_formats_sort_chronologically(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        # Lexicographically "2026-05-04T18:00:00Z" sorts BEFORE
+        # "2026-05-05T01:00:00+09:00" even though the latter is 16:00 UTC
+        # — two hours EARLIER. The epoch key must pick the earlier one.
+        later = _acct(1, usage_7d=50)
+        later["cached_7d_resets_at"] = "2026-05-04T18:00:00Z"
+        earlier = _acct(2, usage_7d=50)
+        earlier["cached_7d_resets_at"] = "2026-05-05T01:00:00+09:00"
+        target = pick_best_target([active, later, earlier],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
+    def test_epoch_or_inf_fallback(self):
+        from jacked.web.auto_swap.selection import _epoch_or_inf
+        assert _epoch_or_inf(None) == float("inf")
+        assert _epoch_or_inf("") == float("inf")
+        assert _epoch_or_inf("not-a-date") == float("inf")
+        assert _epoch_or_inf("2026-05-04T18:00:00Z") < float("inf")
+
+
+# ---------------------------------------------------------------------------
+# should_swap_now rule 1b — intra-T0 preemption
+# ---------------------------------------------------------------------------
+
+
+class TestIntraT0Preemption:
+    """Strict tier inequality alone lets an active T0 with a long runway
+    block a T0 candidate expiring in hours — the largest stranding
+    mechanism found. Margin gates prevent ping-pong."""
+
+    def test_fires_for_faster_losing_earlier_t0(self):
+        from jacked.web.auto_swap import (
+            REASON_PREFIX_INTRA_TIER,
+            should_swap_now,
+        )
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=80,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=20)))  # 1.0%/h
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(hours=6)))  # 8.3%/h
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+        assert reason.startswith(REASON_PREFIX_INTRA_TIER)
+
+    def test_does_not_fire_below_loss_rate_margin(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=50,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=20)))  # 2.5%/h
+        best = _acct(2, usage_5h=10, usage_7d=40,
+                     resets_7d=_iso(now + timedelta(hours=18)))  # 3.33 < 3.75
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is None
+
+    def test_does_not_fire_below_deficit_floor(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=80,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=20)))  # 1.0%/h
+        best = _acct(2, usage_5h=10, usage_7d=96,
+                     resets_7d=_iso(now + timedelta(hours=2)))  # deficit 4 < 5
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is None
+
+    def test_does_not_fire_when_best_expires_later(self):
+        from jacked.web.auto_swap import should_swap_now
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=20, usage_7d=80,
+                       resets_5h=_iso(now + timedelta(hours=2)),
+                       resets_7d=_iso(now + timedelta(hours=6)))
+        best = _acct(2, usage_5h=10, usage_7d=10,
+                     resets_7d=_iso(now + timedelta(hours=20)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is None
+
+    def test_overrides_5h_reset_suppression(self):
+        """Part of rule 1 — fires even while an imminent 5h reset
+        suppresses the critical rule."""
+        from jacked.web.auto_swap import (
+            REASON_PREFIX_INTRA_TIER,
+            should_swap_now,
+        )
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(1, usage_5h=95, usage_7d=80,
+                       resets_5h=_iso(now + timedelta(minutes=8)),
+                       resets_7d=_iso(now + timedelta(hours=20)))
+        best = _acct(2, usage_5h=10, usage_7d=50,
+                     resets_7d=_iso(now + timedelta(hours=6)))
+        reason = should_swap_now(active=active, best=best, now=now)
+        assert reason is not None
+        assert reason.startswith(REASON_PREFIX_INTRA_TIER)
+
+
+# ---------------------------------------------------------------------------
+# Reset-suppression invariant
+# ---------------------------------------------------------------------------
+
+
+class TestResetSuppressInvariant:
+    def test_headroom_lookahead_within_suppression_window(self):
+        """Selection's imminent-reset lookahead must be <= the 5h-critical
+        suppression window, else accounts admitted via that branch are
+        immediately ejected by rule 3 (deterministic ping-pong)."""
+        from jacked.web.auto_swap import RESET_SUPPRESS_MINUTES
+        from jacked.web.auto_swap.selection import _FIVE_H_HEADROOM_RESET_MIN
+        assert RESET_SUPPRESS_MINUTES == 30
+        assert _FIVE_H_HEADROOM_RESET_MIN <= RESET_SUPPRESS_MINUTES
+
+
+# ---------------------------------------------------------------------------
+# achievable_burn / stranding_estimate diagnostics
+# ---------------------------------------------------------------------------
+
+
+class TestAchievableBurn:
+    def test_remaining_working_hours_convert_to_burn(self):
+        from jacked.web.auto_swap import achievable_burn
+        now = _local_utc(2026, 5, 4, 6, 0)       # 06:00 local
+        expiry = _local_utc(2026, 5, 4, 16, 0)   # 16:00 local -> 10h working
+        acct = _acct(1, resets_7d=_iso(expiry))
+        # 10h / 5h windows * (500/119)%/window
+        assert achievable_burn(acct, now=now) == pytest.approx(2 * 500 / 119)
+
+    def test_zero_when_expired(self):
+        from jacked.web.auto_swap import achievable_burn
+        now = _local_utc(2026, 5, 4, 12, 0)
+        acct = _acct(1, resets_7d=_iso(now - timedelta(hours=1)))
+        assert achievable_burn(acct, now=now) == 0.0
+
+    def test_none_when_no_reset_data(self):
+        from jacked.web.auto_swap import achievable_burn
+        assert achievable_burn(_acct(1, resets_7d=None)) is None
+
+    def test_custom_active_hours(self):
+        from jacked.web.auto_swap import achievable_burn
+        now = _local_utc(2026, 5, 4, 9, 0)
+        expiry = _local_utc(2026, 5, 4, 17, 0)
+        acct = _acct(1, resets_7d=_iso(expiry))
+        # 8 working hours, burn/window = 100/11.2
+        result = achievable_burn(acct, now=now,
+                                 active_start="09:00", active_end="17:00")
+        assert result == pytest.approx((8 / 5) * (100 / 11.2))
+
+
+class TestStrandingEstimate:
+    def test_deficit_beyond_achievable_burn_is_stranded(self):
+        from jacked.web.auto_swap import stranding_estimate
+        now = _local_utc(2026, 5, 4, 6, 0)
+        expiry = _local_utc(2026, 5, 4, 16, 0)  # T0, 10 working hours left
+        acct = _acct(1, usage_7d=70, resets_7d=_iso(expiry))
+        # deficit 30 (T0 target 100) minus 8.4% achievable
+        assert stranding_estimate(acct, now=now) == pytest.approx(
+            30.0 - 2 * 500 / 119)
+
+    def test_zero_when_deficit_recoverable(self):
+        from jacked.web.auto_swap import stranding_estimate
+        now = _local_utc(2026, 5, 4, 6, 0)
+        expiry = _local_utc(2026, 5, 4, 16, 0)
+        acct = _acct(1, usage_7d=99, resets_7d=_iso(expiry))
+        assert stranding_estimate(acct, now=now) == 0.0
+
+    def test_none_when_usage_missing(self):
+        from jacked.web.auto_swap import stranding_estimate
+        now = _local_utc(2026, 5, 4, 6, 0)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(hours=10)))
+        acct["cached_usage_7d"] = None
+        assert stranding_estimate(acct, now=now) is None
+
+    def test_none_when_no_reset_data(self):
+        from jacked.web.auto_swap import stranding_estimate
+        assert stranding_estimate(_acct(1, resets_7d=None)) is None

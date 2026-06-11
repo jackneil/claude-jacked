@@ -221,7 +221,7 @@ class TestHealLoop:
         """heal_invalid_accounts clears CB state before attempting recovery."""
         import asyncio
         from unittest.mock import patch, AsyncMock
-        from jacked.web.auth import heal_invalid_accounts
+        from jacked.web.auth import TokenExchangeResult, heal_invalid_accounts
 
         db = Database(str(tmp_path / "test.db"))
         acct = db.create_account("heal@test.com", "tok", int(time.time()) + 3600,
@@ -231,10 +231,11 @@ class TestHealLoop:
                           refresh_last_failed_at=int(time.time()),
                           refresh_failure_type="invalid_grant")
 
-        # Mock refresh to succeed; mock Database() to return our test db
+        # Mock the token exchange to succeed; mock Database() to return our test db
+        mock_result = TokenExchangeResult(success=True, access_token="new-at")
         with patch("jacked.web.auth.Database", return_value=db), \
-             patch("jacked.web.auth.refresh_account_token",
-                   new_callable=AsyncMock, return_value=True):
+             patch("jacked.web.auth._refresh_token_flow",
+                   new_callable=AsyncMock, return_value=mock_result):
             result = asyncio.run(heal_invalid_accounts())
 
         assert result["healed"] == 1
@@ -247,7 +248,7 @@ class TestHealLoop:
         """Heal loop should attempt refresh even if token hasn't expired (no should_refresh gate)."""
         import asyncio
         from unittest.mock import patch, AsyncMock
-        from jacked.web.auth import heal_invalid_accounts
+        from jacked.web.auth import TokenExchangeResult, heal_invalid_accounts
 
         db = Database(str(tmp_path / "test.db"))
         # Token expires in 1 hour - should_refresh would return False
@@ -255,13 +256,14 @@ class TestHealLoop:
                                  refresh_token="rt-test")
         db.update_account(acct["id"], validation_status="invalid")
 
-        mock_refresh = AsyncMock(return_value=True)
+        mock_flow = AsyncMock(
+            return_value=TokenExchangeResult(success=True, access_token="new-at"))
         with patch("jacked.web.auth.Database", return_value=db), \
-             patch("jacked.web.auth.refresh_account_token", mock_refresh):
+             patch("jacked.web.auth._refresh_token_flow", mock_flow):
             asyncio.run(heal_invalid_accounts())
 
-        # Should have attempted refresh even though token isn't near expiry
-        mock_refresh.assert_called_once()
+        # Should have attempted a real exchange even though token isn't near expiry
+        mock_flow.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

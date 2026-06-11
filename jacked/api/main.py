@@ -42,6 +42,7 @@ WEB_DIR = Path(__file__).parent.parent / "data" / "web"
 TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes
 WS_KEEPALIVE_INTERVAL = 30  # seconds between WebSocket pings
 HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
+SWEEP_PASS_TIMEOUT = 600  # hard cap on a single refresh/heal pass
 LOG_FILE_MAX_BYTES = 5_000_000  # 5 MB
 LOG_FILE_BACKUP_COUNT = 3
 
@@ -66,7 +67,10 @@ async def _token_refresh_loop():
         try:
             from jacked.web.auth import refresh_all_expiring_tokens
 
-            result = await refresh_all_expiring_tokens(buffer_seconds=14400)
+            result = await asyncio.wait_for(
+                refresh_all_expiring_tokens(buffer_seconds=14400),
+                timeout=SWEEP_PASS_TIMEOUT,
+            )
             if result["refreshed"] > 0 or result["failed"] > 0:
                 logger.info(
                     "Token refresh: checked=%d, refreshed=%d, failed=%d",
@@ -74,6 +78,15 @@ async def _token_refresh_loop():
                     result["refreshed"],
                     result["failed"],
                 )
+        except asyncio.TimeoutError:
+            # wait_for cancels the pass; an in-flight token exchange is
+            # shielded inside _refresh_token_flow and finishes in the
+            # background (persisting any rotated token and releasing its
+            # per-account lock) — the loop self-heals from a wedged pass.
+            logger.error(
+                "Token refresh pass exceeded %ds and was cancelled",
+                SWEEP_PASS_TIMEOUT,
+            )
         except Exception as e:
             logger.warning("Token refresh loop error: %s", e)
 
@@ -85,7 +98,15 @@ async def _heal_sweep_loop():
         try:
             from jacked.web.auth import heal_invalid_accounts
 
-            await heal_invalid_accounts()
+            await asyncio.wait_for(heal_invalid_accounts(), timeout=SWEEP_PASS_TIMEOUT)
+        except asyncio.TimeoutError:
+            # wait_for cancels the pass; an in-flight token exchange is
+            # shielded inside _refresh_token_flow and finishes in the
+            # background (persisting any rotated token and releasing its
+            # per-account lock) — the loop self-heals from a wedged pass.
+            logger.error(
+                "Heal sweep exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT,
+            )
         except Exception as e:
             logger.warning("Heal sweep error: %s", e)
 

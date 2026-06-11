@@ -506,12 +506,26 @@ jackedWS.on('auto_swap_stall_clear', (msg) => {
     }
 });
 
+jackedWS.on('expiring_with_stranded_capacity', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof handleDrainAdvisorEvent === 'function') {
+        handleDrainAdvisorEvent(data);
+    } else {
+        console.warn('Stranded-capacity advisory (no handler loaded)', data);
+    }
+});
+
+jackedWS.on('same_tier_deficit_advisory', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof showSameTierAdvisory === 'function') showSameTierAdvisory(data);
+});
+
 jackedWS.on('auto_swap_failed', (msg) => {
     const data = msg.payload || msg;
     console.warn('Auto-swap commit failed:', data);
-    if (typeof toast === 'function') {
-        toast(`Auto-swap to account ${data.to_account_id} failed: ${data.failure || 'unknown'}`,
-              'error');
+    if (typeof showToast === 'function') {
+        showToast(`Auto-swap to account ${data.to_account_id} failed: ${data.failure || 'unknown'}`,
+                  'error');
     }
 });
 
