@@ -134,9 +134,10 @@ if (TARGET.endsWith('websocket.js')) {
 def _run_js(tmp_path, snippet, js_file=AUTO_SWAP_JS):
     program = _HARNESS.replace("__TARGET__", json.dumps(str(js_file))) + "\n" + snippet
     script = tmp_path / "harness.js"
-    script.write_text(program)
+    script.write_text(program, encoding="utf-8")
     proc = subprocess.run(
-        ["node", str(script)], capture_output=True, text=True, timeout=30
+        ["node", str(script)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
     )
     assert proc.returncode == 0, f"node failed:\nstderr={proc.stderr}\nstdout={proc.stdout}"
     lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]

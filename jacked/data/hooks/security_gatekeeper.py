@@ -17,6 +17,7 @@ Output format (PreToolUse):
 
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -1684,20 +1685,23 @@ def _check_file_tool_permissions(tool_name: str, file_path: str) -> tuple[bool, 
     >>> _check_file_tool_permissions("Read", "/home/user/test.py")
     (False, None)
     """
-    # Normalize to collapse .. traversal and redundant separators
-    file_path = os.path.normpath(file_path)
+    # Normalize to forward slashes + collapse .. traversal so matching is
+    # separator-agnostic. Windows paths use \, but Claude permission patterns
+    # are written with / — os.path.normpath yields \ on Windows and breaks both
+    # the exact compare and the `pfx + "/"` prefix test.
+    file_path = posixpath.normpath(file_path.replace("\\", "/"))
     patterns = _load_tool_permissions(tool_name)
     for pat in patterns:
         inner = pat[len(tool_name) + 1 :]  # strip 'Read('
         if inner.endswith(")"):
             inner = inner[:-1]
         if inner.endswith(":*"):
-            pfx = os.path.normpath(inner[:-2])
-            if not pfx:
+            pfx = posixpath.normpath(inner[:-2].replace("\\", "/"))
+            if not pfx or pfx == ".":
                 continue  # reject empty prefix (e.g. "Read(:*)")
             if file_path == pfx or file_path.startswith(pfx + "/"):
                 return (True, pat)
-        elif inner == file_path:
+        elif posixpath.normpath(inner.replace("\\", "/")) == file_path:
             return (True, pat)
     if bool(patterns) and any(p == tool_name for p in patterns):
         return (True, tool_name)
@@ -1774,8 +1778,11 @@ def _handle_file_tool_inner(
             try:
                 _frozen_dir = _freeze_path.read_text().strip()
                 if _frozen_dir:
-                    _resolved_file = str(Path(file_path).resolve())
-                    _frozen_resolved = str(Path(_frozen_dir).resolve())
+                    # Forward-slash normalize so the boundary holds on Windows,
+                    # where Path.resolve() yields backslash paths but the prefix
+                    # test below appends "/".
+                    _resolved_file = str(Path(file_path).resolve()).replace("\\", "/")
+                    _frozen_resolved = str(Path(_frozen_dir).resolve()).replace("\\", "/")
                     if (
                         _resolved_file != _frozen_resolved
                         and not _resolved_file.startswith(_frozen_resolved + "/")
