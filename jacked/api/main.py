@@ -20,10 +20,21 @@ from jacked.api.watchers import (
     process_alive_sweeper_loop,
     session_accounts_watch_loop,
 )
+from jacked.api.usage_monitor import (
+    active_account_poll_loop,
+    active_poll_watchdog_loop,
+    full_sweep_loop,
+)
 from jacked.api.log_capture import server_log_buffer
 from jacked.api.websocket import WebSocketRegistry
 
 logger = logging.getLogger(__name__)
+
+# Monotonic counter of completed lifespan startups in this process.
+# Bumped on each lifespan entry so on-call can distinguish "first
+# startup" from "N-th tray restart" in logs that share the same PID
+# (the tray restarts uvicorn in a new thread without forking).
+_lifespan_startup_count: int = 0
 
 # Static web files shipped with the package
 WEB_DIR = Path(__file__).parent.parent / "data" / "web"
@@ -31,6 +42,7 @@ WEB_DIR = Path(__file__).parent.parent / "data" / "web"
 TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes
 WS_KEEPALIVE_INTERVAL = 30  # seconds between WebSocket pings
 HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
+SWEEP_PASS_TIMEOUT = 600  # hard cap on a single refresh/heal pass
 LOG_FILE_MAX_BYTES = 5_000_000  # 5 MB
 LOG_FILE_BACKUP_COUNT = 3
 
@@ -55,7 +67,10 @@ async def _token_refresh_loop():
         try:
             from jacked.web.auth import refresh_all_expiring_tokens
 
-            result = await refresh_all_expiring_tokens(buffer_seconds=14400)
+            result = await asyncio.wait_for(
+                refresh_all_expiring_tokens(buffer_seconds=14400),
+                timeout=SWEEP_PASS_TIMEOUT,
+            )
             if result["refreshed"] > 0 or result["failed"] > 0:
                 logger.info(
                     "Token refresh: checked=%d, refreshed=%d, failed=%d",
@@ -63,6 +78,15 @@ async def _token_refresh_loop():
                     result["refreshed"],
                     result["failed"],
                 )
+        except asyncio.TimeoutError:
+            # wait_for cancels the pass; an in-flight token exchange is
+            # shielded inside _refresh_token_flow and finishes in the
+            # background (persisting any rotated token and releasing its
+            # per-account lock) — the loop self-heals from a wedged pass.
+            logger.error(
+                "Token refresh pass exceeded %ds and was cancelled",
+                SWEEP_PASS_TIMEOUT,
+            )
         except Exception as e:
             logger.warning("Token refresh loop error: %s", e)
 
@@ -74,14 +98,116 @@ async def _heal_sweep_loop():
         try:
             from jacked.web.auth import heal_invalid_accounts
 
-            await heal_invalid_accounts()
+            await asyncio.wait_for(heal_invalid_accounts(), timeout=SWEEP_PASS_TIMEOUT)
+        except asyncio.TimeoutError:
+            # wait_for cancels the pass; an in-flight token exchange is
+            # shielded inside _refresh_token_flow and finishes in the
+            # background (persisting any rotated token and releasing its
+            # per-account lock) — the loop self-heals from a wedged pass.
+            logger.error(
+                "Heal sweep exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT,
+            )
         except Exception as e:
             logger.warning("Heal sweep error: %s", e)
+
+
+async def _stuck_checking_watchdog_loop(app):
+    """Reset stuck validation_status='checking' rows every 60s.
+
+    See 0.41.23 spec (docs/superpowers/specs/2026-04-19-stuck-checking-
+    watchdog-design.md) for the failure mode this defends against.
+    """
+    from jacked.web.auth import reset_stale_checking_accounts
+
+    interval = 60
+    while True:
+        try:
+            db = getattr(app.state, "db", None)
+            if db is not None:
+                count = await reset_stale_checking_accounts(db, threshold_seconds=120)
+                if count > 0:
+                    logger.info(
+                        "Stuck-checking watchdog reset %d account(s)", count,
+                    )
+        except asyncio.CancelledError:
+            logger.info("Stuck-checking watchdog cancelled — shutting down")
+            raise
+        except Exception:
+            logger.warning("Stuck-checking watchdog error", exc_info=True)
+        await asyncio.sleep(interval)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
+    # Rebind every module-level asyncio.Lock / Event to this event loop.
+    # The tray restarts uvicorn in a fresh thread (new loop) while this
+    # process keeps the old modules imported, so primitives from the
+    # previous loop would otherwise raise "bound to a different event
+    # loop" on the next acquire and callers would accumulate as phantom
+    # waiters. Each module is reset independently — one failure should
+    # not skip the rest, and the traceback must be preserved so on-call
+    # can identify which module went sideways.
+    #
+    # Contract for any new module that owns a module-level asyncio.Lock
+    # / Event / Semaphore / Condition: expose ``reset_locks()`` and add
+    # the module to this tuple. ``tests/unit/api/test_reset_locks.py``
+    # enforces this at CI time.
+    global _lifespan_startup_count
+    _lifespan_startup_count += 1
+    startup_n = _lifespan_startup_count
+
+    # Per-module import: one broken module (e.g. syntax error in a fresh
+    # refactor) should not wedge the reset for the other seven.
+    _module_specs: tuple[str, ...] = (
+        "jacked.api.routes.auth",
+        "jacked.web.auth",
+        "jacked.api.routes.features",
+        "jacked.api.routes.permissions",
+        "jacked.api.routes.profiles",
+        "jacked.api.routes.system",
+        "jacked.api.usage_monitor",
+        "jacked.web.oauth",
+    )
+    modules_to_reset: list = []
+    import_failed: list[str] = []
+    import importlib
+    for mod_path in _module_specs:
+        try:
+            modules_to_reset.append(importlib.import_module(mod_path))
+        except Exception:
+            import_failed.append(mod_path)
+            logger.exception("Failed to import %s for lock reset", mod_path)
+
+    reset_ok: list[str] = []
+    reset_failed: list[str] = []
+    for mod in modules_to_reset:
+        name = getattr(mod, "__name__", repr(mod))
+        reset = getattr(mod, "reset_locks", None)
+        if not callable(reset):
+            continue
+        try:
+            reset()
+            reset_ok.append(name)
+        except Exception:
+            reset_failed.append(name)
+            logger.exception("reset_locks failed for %s", name)
+
+    if not modules_to_reset:
+        logger.error(
+            "Lifespan lock reset #%d SKIPPED (pid=%d) — every lock-owning "
+            "module failed to import: %s",
+            startup_n, os.getpid(), import_failed,
+        )
+    else:
+        logger.info(
+            "Lifespan lock reset #%d (pid=%d): ok=%d failed=%d imports_failed=%d modules=%s",
+            startup_n, os.getpid(), len(reset_ok), len(reset_failed),
+            len(import_failed), reset_ok,
+        )
+    if reset_failed:
+        logger.error("Lock reset failures in: %s", reset_failed)
+
     try:
         from jacked.web.database import Database
 
@@ -141,16 +267,55 @@ async def lifespan(app: FastAPI):
     logs_watch_task = asyncio.create_task(logs_watch_loop(app))
     sweeper_task = asyncio.create_task(process_alive_sweeper_loop(app))
     heal_task = asyncio.create_task(_heal_sweep_loop())
+    active_poll_task = asyncio.create_task(active_account_poll_loop(app))
+    # Expose poll-loop liveness state for the watchdog. The watchdog
+    # respawns the task if heartbeat goes stale — see the 2026-05-10
+    # silent-task-death incident for why this exists.
+    app.state.active_poll_task = active_poll_task
+    app.state.active_poll_last_tick_at = time.monotonic()
+    app.state.active_poll_last_respawn_at = 0.0
+    active_poll_watchdog_task = asyncio.create_task(active_poll_watchdog_loop(app))
+    full_sweep_task = asyncio.create_task(full_sweep_loop(app))
+    stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started logs watcher (every 3s)")
     logger.info("Started process-alive sweeper (every 60s)")
     logger.info("Started heal sweep (every 5min)")
+    logger.info("Started active account poll loop (60s)")
+    logger.info("Started active poll watchdog (every 60s)")
+    logger.info("Started full sweep loop")
+    logger.info("Started stuck-checking watchdog (every 60s)")
+
+    # Start analytics scanner + live monitor
+    analytics_scan_task = None
+    analytics_monitor_task = None
+    try:
+        from jacked.web.analytics_monitor import initial_scan_loop, live_monitor_loop
+        analytics_scan_task = asyncio.create_task(initial_scan_loop(app))
+        analytics_monitor_task = asyncio.create_task(live_monitor_loop(app))
+        logger.info("Started analytics scanner + live monitor")
+    except Exception as e:
+        logger.warning("Analytics module unavailable: %s", e)
 
     yield
 
-    # Shutdown: cancel background tasks
-    for task in (refresh_task, session_watch_task, logs_watch_task, sweeper_task, heal_task):
+    # Shutdown: cancel background tasks. Use the CURRENT active_poll_task
+    # from app.state — the watchdog may have respawned it during the run,
+    # so the local `active_poll_task` reference can be stale.
+    tasks_to_cancel = [
+        refresh_task, session_watch_task, logs_watch_task, sweeper_task,
+        heal_task,
+        getattr(app.state, "active_poll_task", active_poll_task),
+        active_poll_watchdog_task,
+        full_sweep_task,
+        stuck_checking_task,
+    ]
+    if analytics_scan_task is not None:
+        tasks_to_cancel.append(analytics_scan_task)
+    if analytics_monitor_task is not None:
+        tasks_to_cancel.append(analytics_monitor_task)
+    for task in tasks_to_cancel:
         task.cancel()
         try:
             await task
@@ -274,7 +439,12 @@ async def websocket_endpoint(ws: WebSocket):
 # --- Include route modules ---
 
 from jacked.api.routes import system, analytics, features, logs, permissions, profiles  # noqa: E402
+from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
 
+# Swap settings router MUST be registered before system router —
+# system.py has a catch-all PUT /settings/{key} that would steal
+# the swap-settings routes otherwise.
+app.include_router(swap_settings_router, prefix="/api/settings", tags=["settings"])
 app.include_router(system.router, prefix="/api", tags=["system"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(features.router, prefix="/api", tags=["features"])
@@ -297,6 +467,16 @@ if WEB_DIR.exists():
     _css_dir = WEB_DIR / "css"
     _js_dir = WEB_DIR / "js"
     _assets_dir = WEB_DIR / "assets"
+
+    # Middleware: prevent browser caching of static assets so code changes
+    # take effect without hard refresh after jacked install + server restart.
+    @app.middleware("http")
+    async def no_cache_static(request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path.startswith(("/js/", "/css/")):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
 
     if _css_dir.exists():
         app.mount("/css", StaticFiles(directory=_css_dir), name="css")
@@ -330,7 +510,10 @@ if WEB_DIR.exists():
 
         index_path = WEB_DIR / "index.html"
         if index_path.exists():
-            return FileResponse(index_path)
+            return FileResponse(
+                index_path,
+                headers={"Cache-Control": "no-cache, must-revalidate"},
+            )
 
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -56,12 +56,12 @@ class TestCreateAccountOrgUniqueness:
                 access_token="at2",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             assert a1["id"] != a2["id"]
             assert a1["organization_uuid"] == ""
             assert a2["organization_uuid"] == "org-123"
-            assert a2["organization_name"] == "Hank.ai"
+            assert a2["organization_name"] == "Acme"
         finally:
             db.close()
 
@@ -74,14 +74,14 @@ class TestCreateAccountOrgUniqueness:
                 access_token="at_old",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             a2 = db.create_account(
                 email="jack@x.com",
                 access_token="at_new",
                 expires_at=int(time.time()) + 7200,
                 organization_uuid="org-123",
-                organization_name="Hank.ai Updated",
+                organization_name="Acme Updated",
             )
             assert a1["id"] == a2["id"]
             assert a2["access_token"] == "at_new"
@@ -152,7 +152,7 @@ class TestGetAccountByEmailAmbiguity:
                 access_token="at2",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             result = db.get_account_by_email("jack@x.com", organization_uuid="org-123")
             assert result is not None
@@ -391,7 +391,7 @@ class TestMigrationIdempotency:
                 access_token="at1",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-123",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             acct_id = acct["id"]
 
@@ -512,11 +512,11 @@ class TestFreshDBWithOrg:
                 access_token="at1",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-hank-uuid",
-                organization_name="Hank.ai",
+                organization_name="Acme",
             )
             assert acct["email"] == "jack@hank.ai"
             assert acct["organization_uuid"] == "org-hank-uuid"
-            assert acct["organization_name"] == "Hank.ai"
+            assert acct["organization_name"] == "Acme"
             assert acct["id"] > 0
         finally:
             db.close()
@@ -629,14 +629,14 @@ class TestUpdateClaudeConfigOrg:
                 update_claude_config_email(
                     "jack@x.com",
                     organization_uuid="org-123",
-                    organization_name="Hank.ai",
+                    organization_name="Acme",
                 )
 
             config = json.loads(
                 (tmp_path / ".claude.json").read_text(encoding="utf-8")
             )
             assert config["oauthAccount"]["organizationUuid"] == "org-123"
-            assert config["oauthAccount"]["organizationName"] == "Hank.ai"
+            assert config["oauthAccount"]["organizationName"] == "Acme"
 
     def test_clears_org_for_personal(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
@@ -679,7 +679,7 @@ class TestSeedOauthAccountOrg:
         account = {
             "email": "jack@x.com",
             "organization_uuid": "org-123",
-            "organization_name": "Hank.ai",
+            "organization_name": "Acme",
         }
         _seed_oauth_account(config_dir, account)
 
@@ -688,7 +688,7 @@ class TestSeedOauthAccountOrg:
         )
         assert data["oauthAccount"]["emailAddress"] == "jack@x.com"
         assert data["oauthAccount"]["organizationUuid"] == "org-123"
-        assert data["oauthAccount"]["organizationName"] == "Hank.ai"
+        assert data["oauthAccount"]["organizationName"] == "Acme"
 
     def test_updates_org_on_existing_account(self, tmp_path):
         from jacked.launch import _seed_oauth_account
@@ -739,3 +739,69 @@ class TestSeedOauthAccountOrg:
         )
         assert "organizationUuid" not in data["oauthAccount"]
         assert "organizationName" not in data["oauthAccount"]
+
+
+# ---------------------------------------------------------------------------
+# Re-auth with wrong org redirects to correct account
+# ---------------------------------------------------------------------------
+
+
+class TestReauthWrongOrgRedirect:
+    """When re-auth returns a different org that already has an active account,
+    update THAT account's tokens instead of crashing with UNIQUE constraint."""
+
+    def test_reauth_different_org_updates_matching_account(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        try:
+            # Two accounts, same email, different orgs
+            acct_personal = db.create_account(
+                email="jack@test.com",
+                access_token="at_personal",
+                expires_at=int(time.time()) + 3600,
+                organization_uuid="org-personal",
+                organization_name="Personal",
+            )
+            acct_work = db.create_account(
+                email="jack@test.com",
+                access_token="at_work_old",
+                expires_at=int(time.time()) + 3600,
+                organization_uuid="org-work",
+                organization_name="Work Inc",
+            )
+
+            personal_id = acct_personal["id"]
+            work_id = acct_work["id"]
+
+            # Simulate re-auth on personal account but user picks work org.
+            # The _store_account flow should detect the mismatch and update
+            # the work account instead of the personal one.
+            from jacked.web.oauth import OAuthFlow
+            flow = OAuthFlow(db, target_account_id=personal_id)
+
+            # Mock the OAuth flow internals to simulate callback with work org
+            tokens = {
+                "access_token": "at_work_fresh",
+                "refresh_token": "rt_work_fresh",
+                "email": "jack@test.com",
+                "organization_uuid": "org-work",
+                "organization_name": "Work Inc",
+            }
+            profile = {
+                "account": {"email_address": "jack@test.com", "display_name": "Jack"},
+                "organization": {"organization_type": "max"},
+            }
+            usage = {}
+
+            # This should NOT raise IntegrityError
+            account = flow._store_account(tokens, profile, usage)
+
+            # The WORK account should have been updated (not personal)
+            assert account["id"] == work_id
+            assert account["access_token"] == "at_work_fresh"
+
+            # Personal account should be unchanged
+            personal = db.get_account(personal_id)
+            assert personal["access_token"] == "at_personal"
+            assert personal["organization_uuid"] == "org-personal"
+        finally:
+            db.close()

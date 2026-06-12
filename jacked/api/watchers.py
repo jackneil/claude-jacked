@@ -218,6 +218,14 @@ def _any_claude_process_alive() -> bool:
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process with the given PID is alive.
 
+    Delegates to jacked.service.process.is_process_alive which uses the
+    correct cross-platform mechanism — `os.kill(pid, 0)` on POSIX, and
+    `OpenProcess` + `WaitForSingleObject` via ctypes on Windows. The
+    previous implementation called `os.kill(pid, 0)` unconditionally,
+    which on Windows surfaced CPython SystemError ("returned a result
+    with an exception set") for exited PIDs. That error slipped past
+    the `except OSError:` below because SystemError isn't an OSError.
+
     >>> _is_pid_alive(1)  # init/launchd is always alive
     True
     >>> _is_pid_alive(999999999)
@@ -226,14 +234,12 @@ def _is_pid_alive(pid: int) -> bool:
     if pid is None or pid <= 0:
         return False
     try:
-        os.kill(pid, 0)  # signal 0 = check existence, don't kill
+        from jacked.service.process import is_process_alive
+        return is_process_alive(pid)
+    except Exception:
+        # Fail-safe: if liveness can't be determined, assume alive so we
+        # never incorrectly close a live user's session.
         return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # process exists but we can't signal it
-    except OSError:
-        return False
 
 
 async def process_alive_sweeper_loop(app, interval: int = 60):

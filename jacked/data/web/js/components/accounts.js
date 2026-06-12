@@ -77,12 +77,38 @@ function getPriorityBadge(priority) {
  * NOTE: data-cache-age is a DOM contract — queried by _usageUpdateCardDOM (websocket.js)
  * for surgical updates during usage refresh. Do not rename without updating consumers.
  */
-function renderCacheAge(usageCachedAt) {
+function renderCacheAge(usageCachedAt, acctId) {
     if (usageCachedAt === null || usageCachedAt === undefined) {
         return '<span class="text-xs text-slate-500" data-cache-age>Usage: never fetched</span>';
     }
     const ago = timeAgoFromUnix(usageCachedAt);
-    return `<span class="text-xs text-slate-500" data-cache-age>Usage updated ${escapeHtml(ago)}</span>`;
+    let checkHtml = '';
+    const ss = window.jackedState.swapSettings || {};
+    if (ss.auto_swap_enabled && acctId === window.jackedState.activeCredentialAccountId) {
+        var acctArr = window.jackedState.accounts || [];
+        var acctObj = acctArr.find(function(a) { return a.id === acctId; });
+        var ageS = Math.floor(Date.now() / 1000) - usageCachedAt;
+        var pollInterval = 300;
+        if (acctObj) {
+            var u5 = acctObj.cached_usage_5h || 0;
+            if (u5 > 85) pollInterval = 65;
+            else if (u5 > 70) pollInterval = 90;
+            else if (u5 > 50) pollInterval = 150;
+            else pollInterval = 300;
+        }
+        var rem = Math.max(0, pollInterval - ageS);
+        var label = rem > 0 ? escapeHtml(rem + 's') : 'checking\u2026';
+        var tierLabel = '';
+        if (acctObj) {
+            var u5 = acctObj.cached_usage_5h || 0;
+            if (u5 > 85) tierLabel = ' (critical)';
+            else if (u5 > 70) tierLabel = ' (warning)';
+            else if (u5 > 50) tierLabel = ' (normal)';
+            else tierLabel = ' (idle)';
+        }
+        checkHtml = ' \u00b7 <span class="text-teal-500" data-next-check data-cached-at="' + usageCachedAt + '">' + label + escapeHtml(tierLabel) + '</span>';
+    }
+    return '<span class="text-xs text-slate-500" data-cache-age>Usage updated ' + escapeHtml(ago) + checkHtml + '</span>';
 }
 
 /**
@@ -174,20 +200,21 @@ function renderActionButtons(acct) {
     const status = getAccountStatus(acct);
     const isActiveInCC = window.jackedState.activeCredentialAccountId === acct.id;
 
-    // Set Active / Active badge (left side, primary action)
+    // "Use Account" button or "Active" badge.
+    // Show on all enabled accounts — backend validates and returns clear
+    // error messages for cc-missing, invalid, etc.
     let setActiveHtml = '';
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
-    } else if (status === 'valid' || status === 'warning' || status === 'cc-missing' || status === 'unknown') {
-        setActiveHtml = `<button class="btn-set-active text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Set Active</button>`;
+    } else if (acct.is_active) {
+        setActiveHtml = `<button class="btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 border border-teal-600/30 rounded font-medium transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Use Account</button>`;
     }
 
-    // Copy launch command button
-    const copyCmd = `jacked claude ${acct.id}`;
-    const copyHtml = `<button class="btn-copy-cmd text-xs px-3 py-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded transition-colors" data-cmd="${escapeHtml(copyCmd)}" title="Copy launch command">
-        <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
-        ${escapeHtml(copyCmd)}
-    </button>`;
+    // Copy launch command — hidden now that dashboard switching works.
+    // Kept commented for future use (per-account isolated sessions).
+    // const copyCmd = `jacked claude ${acct.id}`;
+    // const copyHtml = `<button class="btn-copy-cmd ...">...</button>`;
+    const copyHtml = '';
 
     // Re-auth button (if invalid/expired) — pills also handle this, keep for backward compat
     const showReauth = status === 'invalid' || status === 'expired';
@@ -195,8 +222,6 @@ function renderActionButtons(acct) {
     if (showReauth) {
         reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
     }
-
-    // CC auth now handled by pill click handler — no standalone button
 
     // Toggle active/disabled
     const toggleLabel = acct.is_active ? 'Disable' : 'Enable';
@@ -247,7 +272,7 @@ function renderAccountCard(acct, idx, total) {
     const elapsed7d = computeElapsedFraction7d(acct.cached_7d_resets_at);
     const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, elapsed5h, '5h limit');
     const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, elapsed7d, '7d limit');
-    const cacheAgeHtml = renderCacheAge(acct.usage_cached_at);
+    const cacheAgeHtml = renderCacheAge(acct.usage_cached_at, acct.id);
 
     // Priority reorder buttons
     const upDisabled = idx === 0 ? 'disabled' : '';
@@ -351,7 +376,7 @@ function renderAccounts(accounts) {
                 <div class="flex items-start justify-between">
                     <div>
                         <strong class="text-slate-200">Per-account sessions</strong> &mdash;
-                        Use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch Claude Code with isolated credentials per account.
+                        Click <strong>Use Account</strong> to switch all sessions, or use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch with isolated credentials.
                         Supports pass-through args: <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude 2 --resume</code>
                     </div>
                     <button id="btn-dismiss-tip" class="text-slate-500 hover:text-slate-300 ml-3 shrink-0 text-lg leading-none" title="Dismiss">&times;</button>
@@ -384,6 +409,7 @@ function renderAccounts(accounts) {
                     </button>
                 </div>
             </div>
+            ${typeof renderAutoSwapPanel === 'function' ? renderAutoSwapPanel() : ''}
             ${tipHtml}
             ${bannerHtml}
             <div id="oauth-flow-status"></div>
@@ -391,6 +417,20 @@ function renderAccounts(accounts) {
             ${typeof renderSessionLookupResult === 'function' ? renderSessionLookupResult() : ''}
             <div id="accounts-list" class="flex flex-col gap-3">
                 ${cardsHtml}
+            </div>
+
+            <div class="mt-6 bg-slate-800 border border-slate-700 rounded-lg p-4">
+                <h3 class="text-sm font-medium text-slate-300 mb-3">Swap History</h3>
+                <div id="swap-history-container">
+                    <div class="text-xs text-slate-500">Loading...</div>
+                </div>
+            </div>
+
+            <div class="mt-6 bg-slate-800 border border-slate-700 rounded-lg p-4">
+                <h3 class="text-sm font-medium text-slate-300 mb-3">Decision Log</h3>
+                <div id="decision-log-container" data-show-all="false">
+                    <div class="text-xs text-slate-500">Loading...</div>
+                </div>
             </div>
         </div>
     `;

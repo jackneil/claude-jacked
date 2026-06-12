@@ -1,5 +1,5 @@
 ---
-description: "Distill a lesson from this conversation into a CLAUDE.md rule. Use after corrections, mistakes, or when you want to codify a preference. Unlike native Auto-Memory (implicit, automatic), /learn produces version-controlled rules in CLAUDE.md that are shareable via git and follow a structured graduation path (lessons.md -> CLAUDE.md)."
+description: Use after corrections, mistakes, or when the user wants to codify a preference into a permanent CLAUDE.md rule.
 ---
 
 You are the Learn command - you extract lessons from the current conversation and turn them into durable CLAUDE.md rules that prevent the same mistake twice.

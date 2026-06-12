@@ -10,10 +10,11 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -29,8 +30,80 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Server-side guard: only one bulk usage refresh at a time.
+# Server-side guard: only one bulk usage refresh at a time. We track when the
+# lock was acquired so a stuck holder doesn't wedge all future refreshes
+# behind a 409. If the holder has been in there longer than the stale-watchdog
+# threshold we treat the lock as orphaned and allow a fresh attempt.
 _bulk_refresh_lock = asyncio.Lock()
+_bulk_refresh_acquired_at: float = 0.0
+# 0.41.23: track the task holding the lock so the stale-lock guard can
+# cancel it before swapping in a fresh lock.
+_bulk_refresh_task: "asyncio.Task | None" = None
+_BULK_REFRESH_STALE_AFTER = 180.0  # generous: a concurrent pass worst-cases at ~_BULK_PER_ACCOUNT_TIMEOUT
+# 0.41.25: max seconds per account in bulk refresh before declaring it hung.
+# Happy path is 1-2s; 10s is plenty of slack for a slow Anthropic refresh.
+# If refresh takes >10s something's wrong upstream — waiting longer doesn't help.
+_BULK_PER_ACCOUNT_TIMEOUT = 10.0
+# Accounts fetch concurrently — each uses its own OAuth token, and Anthropic's
+# usage-API limit is per-account/per-token, so cross-account parallelism is
+# safe. The cap exists only to bound simultaneous outbound sockets and
+# OAuth-refresh fan-out on the rare all-accounts-401 path.
+_BULK_MAX_CONCURRENCY = 8
+# Route-level upper bounds for single-account endpoints so a wedged upstream
+# call can't hold the HTTP request open indefinitely — the client gets a
+# deterministic 504 instead of a spinner. Looser than the bulk per-account
+# timeout because these are user-initiated one-offs that may ride out a
+# lock-recovery inside web/auth.py.
+_SINGLE_USAGE_TIMEOUT = 60.0
+_TOKEN_REFRESH_TIMEOUT = 45.0
+_VALIDATE_TIMEOUT = 60.0
+
+# Pass-throttle for bulk refresh: if a new bulk request arrives within this
+# many seconds of the previous pass COMPLETION, serve current DB values
+# without touching the Anthropic API. A runaway client loop (2026-06
+# incident: a dashboard tab drove back-to-back bulk passes at ~25
+# fetches/min for hours) then only ever hits the DB.
+_BULK_PASS_MIN_INTERVAL = 30.0
+_last_bulk_completed_at: float = 0.0
+
+
+def _gateway_timeout(message: str, code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        content={"error": {"message": message, "code": code}},
+    )
+
+
+def reset_locks() -> None:
+    """Rebind module-level locks to the current event loop.
+
+    The tray can restart uvicorn in a new thread (see service/tray.py
+    _on_restart). The new thread runs a new event loop, but this module
+    stays imported, so the old asyncio.Lock is still bound to the dead
+    loop. Any acquire on the new loop raises
+    "bound to a different event loop" and callers pile up as waiters.
+    Called from the FastAPI lifespan on startup so each loop gets a
+    fresh lock.
+
+    If the old lock appears held here, it means a previous-loop task
+    was still in flight when the tray restart landed — the new lock
+    won't serialize against it. We log loudly so post-mortem can spot
+    the window. The old task's writes are on the old (dying) loop and
+    will complete or cancel on their own.
+    """
+    global _bulk_refresh_lock, _bulk_refresh_acquired_at, _bulk_refresh_task
+    global _last_bulk_completed_at
+    if _bulk_refresh_lock.locked():
+        logger.warning(
+            "reset_locks: bulk_refresh_lock was held at rebind "
+            "(previous-loop task still in flight); new lock will not "
+            "serialize against it"
+        )
+    _bulk_refresh_lock = asyncio.Lock()
+    _bulk_refresh_acquired_at = 0.0
+    _bulk_refresh_task = None
+    _last_bulk_completed_at = 0.0
+
 
 # --- Pydantic v2 request/response models ---
 
@@ -143,6 +216,10 @@ class UsageRefreshResponse(BaseModel):
 class BulkUsageRefreshResponse(BaseModel):
     refreshed: int
     failed: int
+    # Number of accounts served from the DB by the pass-throttle (the
+    # request arrived within _BULK_PASS_MIN_INTERVAL of the previous
+    # pass's completion). 0 for a real API pass.
+    throttled: int = 0
     results: list[dict] = []
 
 
@@ -263,9 +340,44 @@ def _not_found(detail: str):
     )
 
 
-def _account_to_response(row: dict) -> AccountResponse:
+_active_account_cache: dict = {"id": None, "expires_at": 0.0}
+
+
+def _get_active_account_id_cached() -> int | None:
+    """Get active account ID from credential file, cached 30s."""
+    if time.time() < _active_account_cache["expires_at"]:
+        return _active_account_cache["id"]
+    try:
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+        if cred_path.exists():
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+            _active_account_cache["id"] = data.get("_jackedAccountId")
+            _active_account_cache["expires_at"] = time.time() + 30.0
+            return _active_account_cache["id"]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _account_to_response(row: dict, db=None) -> AccountResponse:
     """Convert a DB account row to an API response with computed fields."""
     now = int(time.time())
+
+    # On-demand credential reconciliation for active account
+    # If CC tokens are missing/expired, try importing from live store
+    if db is not None:
+        _active_id = _get_active_account_id_cached()
+        if row["id"] == _active_id and (
+            row.get("cc_refresh_token") is None
+            or (row.get("cc_expires_at") or 0) < now
+        ):
+            try:
+                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                reconcile_credentials_from_live_store(row["id"], db)
+                row = db.get_account(row["id"]) or row  # Re-read after reconciliation
+            except Exception:
+                pass
+
     # Build response without access_token or refresh_token (never expose)
     return AccountResponse(
         id=row["id"],
@@ -301,6 +413,7 @@ def _account_to_response(row: dict) -> AccountResponse:
             row.get("cc_access_token") is not None
             and row.get("cc_refresh_token") is None
             and now >= (row.get("cc_expires_at") or 0)
+            and not bool(row.get("refresh_token"))
         ),
         has_refresh_token=bool(row.get("refresh_token")),
         has_cc_refresh_token=bool(row.get("cc_refresh_token")),
@@ -395,7 +508,7 @@ async def list_accounts(request: Request, include_inactive: bool = False):
         return _db_unavailable()
 
     rows = db.list_accounts(include_inactive=include_inactive)
-    return [_account_to_response(row) for row in rows]
+    return [_account_to_response(row, db=db) for row in rows]
 
 
 @router.patch("/accounts/{account_id}")
@@ -521,7 +634,20 @@ async def refresh_token(account_id: int, request: Request):
             error="API key account — no refresh needed (valid for ~1 year)",
         )
 
-    success = await refresh_account_token(account_id, db)
+    try:
+        success = await asyncio.wait_for(
+            refresh_account_token(account_id, db),
+            timeout=_TOKEN_REFRESH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "refresh_token: account %d refresh_account_token exceeded %.0fs — returning 504",
+            account_id, _TOKEN_REFRESH_TIMEOUT,
+        )
+        return _gateway_timeout(
+            "Token refresh timed out — server may be recovering a wedged refresh",
+            "REFRESH_TIMEOUT",
+        )
     if success:
         return RefreshResponse(success=True)
 
@@ -548,7 +674,45 @@ async def refresh_usage(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    usage_data = await fetch_usage(account_id, db)
+    from jacked.api.credential_helpers import read_fresh_active_token
+
+    fresh_token = read_fresh_active_token(account_id)
+    # Only pass fresh_token when it differs from DB token — passing a non-None
+    # access_token to fetch_usage() bypasses its cache freshness guard (auth.py:339).
+    db_token = account.get("access_token")
+    effective_token = fresh_token if (fresh_token and fresh_token != db_token) else None
+    try:
+        usage_data = await asyncio.wait_for(
+            fetch_usage(account_id, db, access_token=effective_token, manual=True),
+            timeout=_SINGLE_USAGE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "refresh_usage: account %d fetch_usage exceeded %.0fs — "
+            "returning 504 and resetting validation_status",
+            account_id, _SINGLE_USAGE_TIMEOUT,
+        )
+        # Mirror the bulk route's timeout handling: record the error and
+        # reset validation_status in the same call so the row doesn't sit
+        # at 'checking' waiting for the watchdog's next 60s tick.
+        db.update_account(
+            account_id,
+            validation_status="unknown",
+            last_error=(
+                f"Usage fetch timed out after {int(_SINGLE_USAGE_TIMEOUT)}s"
+            ),
+            last_error_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return _gateway_timeout(
+            "Usage fetch timed out — server may be recovering a wedged refresh",
+            "REFRESH_TIMEOUT",
+        )
+
+    if isinstance(usage_data, dict) and usage_data.get("_backed_off"):
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"error": {"message": "Usage API rate limited — try again shortly", "code": "RATE_LIMITED"}},
+        )
 
     if usage_data is None:
         return JSONResponse(
@@ -572,116 +736,289 @@ async def refresh_usage(account_id: int, request: Request):
 
 
 @router.post("/accounts/refresh-all-usage", response_model=BulkUsageRefreshResponse)
-async def refresh_all_usage(request: Request):
-    """Refresh usage cache for all active accounts.
+async def refresh_all_usage(request: Request, skip_account: Optional[int] = Query(None)):
+    """Refresh usage cache for all active accounts, concurrently.
 
-    Paces requests with a 2-second delay between accounts to avoid
-    Anthropic API rate limits (429).  Sends per-account progress via
-    WebSocket so the frontend can animate individual cards.
+    Accounts are fetched in parallel (bounded by _BULK_MAX_CONCURRENCY).
+    Anthropic's usage-API rate limit is per-account/per-token, so
+    cross-account concurrency doesn't approach it — only repeated hits
+    on the SAME account do, and fetch_usage's per-account floors guard
+    that. Sends per-account progress via WebSocket so the frontend can
+    animate individual cards; `progress` counts completions.
     """
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
 
-    # Only one bulk refresh at a time (across tabs / auto-refresh overlap)
-    if _bulk_refresh_lock.locked():
-        return JSONResponse(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": "Usage refresh already in progress"},
+    # Only one bulk refresh at a time (across tabs / auto-refresh overlap).
+    # If a prior holder has been inside the lock longer than the stale
+    # threshold, assume it's orphaned and force-reset — we'd rather
+    # double-fetch than be permanently wedged at 409.
+    #
+    # This runtime watchdog complements the lifespan-level reset_locks()
+    # above: reset_locks handles *cross-loop* staleness at startup (tray
+    # restart installs a fresh loop); this block handles *in-loop* hangs
+    # at runtime (a coroutine stuck on a pathological Anthropic response).
+    # Both are needed.
+    global _bulk_refresh_lock, _bulk_refresh_acquired_at, _bulk_refresh_task
+    global _last_bulk_completed_at
+
+    # Pass-throttle: a pass that completed within the last
+    # _BULK_PASS_MIN_INTERVAL seconds means every account's cache is at
+    # most ~30s-plus-pass-length old — serve straight from the DB with no
+    # Anthropic calls. WS broadcasts are skipped entirely (rather than
+    # sending a total=0 usage_refresh_started) so other tabs never enter a
+    # "refreshing" state that no progress/done events would ever resolve;
+    # the requester gets its data in the HTTP response.
+    since_last = time.time() - _last_bulk_completed_at
+    if _last_bulk_completed_at and since_last < _BULK_PASS_MIN_INTERVAL:
+        accounts = db.list_accounts(include_inactive=False)
+        results = [
+            {
+                "account_id": acct["id"],
+                "email": acct["email"],
+                "success": True,
+                "throttled": True,
+                "cached_usage_5h": acct.get("cached_usage_5h"),
+                "cached_usage_7d": acct.get("cached_usage_7d"),
+            }
+            for acct in accounts
+        ]
+        logger.info(
+            "Bulk usage refresh throttled: previous pass completed %.1fs ago "
+            "(< %.0fs) — returning DB values for %d account(s)",
+            since_last, _BULK_PASS_MIN_INTERVAL, len(results),
+        )
+        return BulkUsageRefreshResponse(
+            refreshed=len(results),
+            failed=0,
+            throttled=len(results),
+            results=results,
         )
 
-    async with _bulk_refresh_lock:
-        accounts = db.list_accounts(include_inactive=False)
-        refreshed = 0
-        failed = 0
-        results = []
-        ws_registry = getattr(request.app.state, "ws_registry", None)
-        total = len(accounts)
-
-        # Notify frontend: full queue so cards can show "Waiting..." immediately
-        if ws_registry:
-            await ws_registry.broadcast(
-                "usage_refresh_started",
-                {"account_ids": [a["id"] for a in accounts], "total": total},
+    if _bulk_refresh_lock.locked():
+        held_for = time.time() - _bulk_refresh_acquired_at if _bulk_refresh_acquired_at else 0
+        if held_for > _BULK_REFRESH_STALE_AFTER:
+            logger.warning(
+                "Bulk refresh lock held %ds (> %ds) — forcing reset",
+                int(held_for), int(_BULK_REFRESH_STALE_AFTER),
+            )
+            orphan = _bulk_refresh_task
+            if orphan is not None and not orphan.done():
+                orphan.cancel()
+                # Fire-and-forget: do NOT await the orphan.  The event
+                # loop delivers the cancel on its next tick.  Awaiting
+                # here would re-raise CancelledError in a way that's
+                # impossible to distinguish portably from "we were
+                # cancelled ourselves" on Python 3.10 (no
+                # Task.cancelling()).  The orphan was hung >180s already
+                # — its cancellation-time DB writes are no less suspect
+                # with a 2s wait than without one.
+            _bulk_refresh_lock = asyncio.Lock()
+            _bulk_refresh_acquired_at = 0.0
+            _bulk_refresh_task = None
+        else:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={
+                    "error": {
+                        "message": "Usage refresh already in progress",
+                        "code": "REFRESH_IN_PROGRESS",
+                    }
+                },
             )
 
-        for i, acct in enumerate(accounts):
-            if i > 0:
-                await asyncio.sleep(2.0)  # Rate-limit pacing
+    async with _bulk_refresh_lock:
+        _bulk_refresh_acquired_at = time.time()
+        my_task = asyncio.current_task()
+        _bulk_refresh_task = my_task
+        try:
+            accounts = db.list_accounts(include_inactive=False)
+            ws_registry = getattr(request.app.state, "ws_registry", None)
+            total = len(accounts)
 
-            # Notify frontend: this account is being checked
-            if ws_registry:
-                await ws_registry.broadcast(
-                    "usage_refresh_progress",
-                    {"account_id": acct["id"], "status": "checking",
-                     "progress": i + 1, "total": total},
-                )
+            # Read active account ID once from file — avoids per-iteration keychain
+            # subprocess calls.  File-only is acceptable because
+            # sync_credential_to_all_stores() writes both file and keychain
+            # atomically, so they should always agree on _jackedAccountId.
+            from jacked.api.credential_helpers import read_fresh_active_token
+            active_acct_id = None
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
+                    active_acct_id = cred_data.get("_jackedAccountId")
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-            usage_data = await fetch_usage(acct["id"], db)
-
-            # Cache hits return {"_cached": True} — read stored values from DB
-            is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
-            if is_cached:
-                usage_data = None  # Treat as skip — use DB values below
-
-            if usage_data is not None:
-                refreshed += 1
-                five_hour = usage_data.get("five_hour", {})
-                seven_day = usage_data.get("seven_day", {})
-                results.append(
-                    {
-                        "account_id": acct["id"],
-                        "email": acct["email"],
-                        "success": True,
-                        "cached_usage_5h": five_hour.get("utilization"),
-                        "cached_usage_7d": seven_day.get("utilization"),
-                    }
-                )
-            elif is_cached:
-                # Cache hit — report existing DB values, count as success
-                refreshed += 1
-                results.append(
-                    {
-                        "account_id": acct["id"],
-                        "email": acct["email"],
-                        "success": True,
-                        "cached_usage_5h": acct.get("cached_usage_5h"),
-                        "cached_usage_7d": acct.get("cached_usage_7d"),
-                    }
+            if active_acct_id is not None:
+                logger.debug(
+                    "Bulk refresh: active account from credential file = %s",
+                    active_acct_id,
                 )
             else:
-                failed += 1
-                updated_acct = db.get_account(acct["id"])
-                results.append(
-                    {
+                logger.debug(
+                    "Bulk refresh: no _jackedAccountId in credential file — "
+                    "all accounts will use DB tokens"
+                )
+
+            # Notify frontend: full queue so cards can show "Waiting..." immediately
+            if ws_registry:
+                await ws_registry.broadcast(
+                    "usage_refresh_started",
+                    {"account_ids": [a["id"] for a in accounts], "total": total},
+                )
+
+            targets = [
+                acct for acct in accounts
+                if not (skip_account is not None and acct["id"] == skip_account)
+            ]
+            sem = asyncio.Semaphore(_BULK_MAX_CONCURRENCY)
+            completed = {"n": 0}  # mutable closure counter; event loop is single-threaded
+
+            async def _refresh_one(acct: dict) -> dict:
+                async with sem:
+                    # No progress/total on checking events — under concurrency
+                    # the completed-count is 0 for the whole first batch and
+                    # the frontend would flash "Refreshing 0/N". The button
+                    # label only updates on integer progress, so omitting it
+                    # leaves the click-time "Refreshing..." text in place.
+                    if ws_registry:
+                        await ws_registry.broadcast(
+                            "usage_refresh_progress",
+                            {"account_id": acct["id"], "status": "checking"},
+                        )
+
+                    effective_token = None
+                    if acct["id"] == active_acct_id:
+                        fresh_token = read_fresh_active_token(acct["id"])
+                        db_token = acct.get("access_token")
+                        if fresh_token and fresh_token != db_token:
+                            effective_token = fresh_token
+                    try:
+                        usage_data = await asyncio.wait_for(
+                            fetch_usage(acct["id"], db, access_token=effective_token, manual=True),
+                            timeout=_BULK_PER_ACCOUNT_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Bulk refresh: account %d fetch_usage exceeded %.0fs — "
+                            "marking failed and resetting validation_status",
+                            acct["id"], _BULK_PER_ACCOUNT_TIMEOUT,
+                        )
+                        timeout_error = (
+                            f"Usage fetch timed out after {int(_BULK_PER_ACCOUNT_TIMEOUT)}s "
+                            f"during bulk refresh"
+                        )
+                        # Reset validation_status in the same call that records
+                        # the error so the row doesn't sit at 'checking' waiting
+                        # for the watchdog's next 60s tick (PM3 fix).
+                        db.update_account(
+                            acct["id"],
+                            validation_status="unknown",
+                            last_error=timeout_error,
+                            last_error_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        usage_data = None
+
+                    # Cache hits return {"_cached": True} — read stored values from DB
+                    is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
+                    if is_cached:
+                        usage_data = None  # Treat as skip — use DB values below
+
+                    is_backed_off = isinstance(usage_data, dict) and usage_data.get("_backed_off")
+                    if is_backed_off:
+                        usage_data = None
+
+                    if usage_data is not None:
+                        five_hour = usage_data.get("five_hour", {})
+                        seven_day = usage_data.get("seven_day", {})
+                        row = {
+                            "account_id": acct["id"],
+                            "email": acct["email"],
+                            "success": True,
+                            "cached_usage_5h": five_hour.get("utilization"),
+                            "cached_usage_7d": seven_day.get("utilization"),
+                        }
+                    elif is_cached:
+                        # Cache hit — report existing DB values, count as success
+                        row = {
+                            "account_id": acct["id"],
+                            "email": acct["email"],
+                            "success": True,
+                            "cached_usage_5h": acct.get("cached_usage_5h"),
+                            "cached_usage_7d": acct.get("cached_usage_7d"),
+                        }
+                    else:
+                        updated_acct = db.get_account(acct["id"])
+                        row = {
+                            "account_id": acct["id"],
+                            "email": acct["email"],
+                            "success": False,
+                            "error": updated_acct.get("last_error") if updated_acct else None,
+                        }
+
+                    completed["n"] += 1
+                    # Notify frontend: done or failed (include account data for immediate UI update)
+                    progress_status = "failed" if (not is_cached and usage_data is None) else "done"
+                    if ws_registry:
+                        updated_row = db.get_account(acct["id"])
+                        acct_payload = (
+                            _account_to_response(updated_row).model_dump()
+                            if updated_row else None
+                        )
+                        await ws_registry.broadcast(
+                            "usage_refresh_progress",
+                            {"account_id": acct["id"],
+                             "status": progress_status,
+                             "progress": completed["n"], "total": total,
+                             "account_data": acct_payload},
+                        )
+                    return row
+
+            async def _refresh_one_guarded(acct: dict) -> dict:
+                # A DB/validation error for ONE account must not propagate out
+                # of the gather — that would release the bulk lock while the
+                # sibling coroutines are still in flight, breaking the
+                # one-pass-at-a-time invariant for any immediate retry.
+                try:
+                    return await _refresh_one(acct)
+                except Exception as exc:
+                    logger.exception(
+                        "Bulk refresh: unexpected error for account %d", acct["id"],
+                    )
+                    completed["n"] += 1
+                    return {
                         "account_id": acct["id"],
                         "email": acct["email"],
                         "success": False,
-                        "error": updated_acct.get("last_error") if updated_acct else None,
+                        "error": f"internal error during refresh: {exc}",
                     }
-                )
 
-            # Notify frontend: done or failed (include account data for immediate UI update)
-            progress_status = "failed" if (not is_cached and usage_data is None) else "done"
-            if ws_registry:
-                updated_row = db.get_account(acct["id"])
-                acct_payload = (
-                    _account_to_response(updated_row).model_dump()
-                    if updated_row else None
-                )
-                await ws_registry.broadcast(
-                    "usage_refresh_progress",
-                    {"account_id": acct["id"],
-                     "status": progress_status,
-                     "progress": i + 1, "total": total,
-                     "account_data": acct_payload},
-                )
+            results = list(await asyncio.gather(
+                *(_refresh_one_guarded(a) for a in targets)
+            ))
+            refreshed = sum(1 for r in results if r["success"])
+            failed = sum(1 for r in results if not r["success"])
 
-        return BulkUsageRefreshResponse(
-            refreshed=refreshed,
-            failed=failed,
-            results=results,
-        )
+            # Stamp completion only on a normally finished pass — a
+            # cancelled/raised pass must not arm the throttle and mask a
+            # legitimate retry.
+            _last_bulk_completed_at = time.time()
+            return BulkUsageRefreshResponse(
+                refreshed=refreshed,
+                failed=failed,
+                results=results,
+            )
+        finally:
+            # Only clear the slot if we still own it.  A force-reset during
+            # our long-running loop may have replaced _bulk_refresh_task
+            # with a newer holder — clearing it would wipe the new holder's
+            # state (/dc PM2/Q2 fix).  Resetting acquired_at alongside the
+            # task keeps the staleness clock from counting a finished run.
+            if _bulk_refresh_task is my_task:
+                _bulk_refresh_task = None
+                _bulk_refresh_acquired_at = 0.0
 
 
 @router.post("/accounts/{account_id}/validate", response_model=ValidateResponse)
@@ -695,7 +1032,20 @@ async def validate_token(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    result = await validate_account(account_id, db)
+    try:
+        result = await asyncio.wait_for(
+            validate_account(account_id, db),
+            timeout=_VALIDATE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "validate_token: account %d validate_account exceeded %.0fs — returning 504",
+            account_id, _VALIDATE_TIMEOUT,
+        )
+        return _gateway_timeout(
+            "Validation timed out — server may be recovering a wedged refresh",
+            "VALIDATE_TIMEOUT",
+        )
     return ValidateResponse(
         valid=result["valid"],
         error=result.get("error"),
@@ -717,14 +1067,10 @@ async def start_cc_auth(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    from jacked.web.oauth import OAuthFlow, _active_flows
+    from jacked.web.oauth import OAuthFlow
 
-    # Dedup: if a CC flow for this account is already active, return it
-    # Snapshot with list() — _active_flows may be mutated by concurrent coroutines
-    for fid, existing in list(_active_flows.items()):
-        if existing.purpose == "claude_code" and existing._target_account_id == account_id:
-            return {"flow_id": fid, "auth_url": "", "status": "pending"}
-
+    # Always start a fresh flow — every click opens a new browser window.
+    # Old flows timeout after 2 minutes and clean up automatically.
     flow = OAuthFlow(db, purpose="claude_code", target_account_id=account_id)
     result = await flow.start()
     return result
@@ -735,10 +1081,15 @@ async def start_cc_auth(account_id: int, request: Request):
 
 @router.post("/accounts/{account_id}/use", response_model=UseAccountResponse)
 async def use_account(account_id: int, request: Request):
-    """Write account credentials to Claude Code's credential stores.
+    """Switch all Claude Code sessions to this account's credentials.
 
-    Overwrites ~/.claude/.credentials.json, macOS Keychain, and ~/.claude.json
-    so the next Claude Code session starts with this account's tokens.
+    Writes the account's tokens to all credential stores (global
+    .credentials.json, macOS Keychain, ~/.claude.json).  Claude Code
+    v2.1.81+ dynamically re-reads credentials, so running sessions
+    pick up the new account without logging out.
+
+    Rejects disabled accounts, accounts with invalid validation status,
+    and accounts without CC tokens (which would be un-refreshable).
     """
     db = _get_db(request)
     if db is None:
@@ -748,20 +1099,19 @@ async def use_account(account_id: int, request: Request):
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    if not account["is_active"]:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "error": {"message": "Account is disabled", "code": "ACCOUNT_DISABLED"}
-            },
-        )
+    # Defense-in-depth: get_account() already filters is_deleted=0,
+    # but guard here in case that query changes in the future.
+    if account.get("is_deleted"):
+        return _not_found(f"No account with id={account_id}")
 
-    access_token = account.get("access_token", "")
-    if not access_token or not access_token.strip():
+    if not account.get("is_active"):
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
-                "error": {"message": "Account has no access token", "code": "NO_TOKEN"}
+                "error": {
+                    "message": "Account is disabled — enable it first",
+                    "code": "ACCOUNT_DISABLED",
+                }
             },
         )
 
@@ -770,42 +1120,190 @@ async def use_account(account_id: int, request: Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
                 "error": {
-                    "message": "Token is invalid — re-authenticate first",
-                    "code": "TOKEN_INVALID",
+                    "message": "Account has invalid credentials — re-auth first",
+                    "code": "ACCOUNT_INVALID",
                 }
             },
         )
 
-    # Refresh token if near-expiry before writing
-    if account.get("refresh_token") and should_refresh(account):
-        refreshed = await refresh_account_token(account_id, db)
-        if refreshed:
-            account = db.get_account(account_id)
-            if not account:
-                return _not_found(f"No account with id={account_id}")
-        else:
-            logger.warning(
-                "Token refresh failed for account %d before /use — "
-                "proceeding with current token",
-                account_id,
-            )
+    if not account.get("cc_access_token"):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": (
+                        "Account has no CC tokens — authorize Claude Code "
+                        "tokens first (credentials without a refresh token "
+                        "would expire in ~8 hours with no way to renew)"
+                    ),
+                    "code": "CC_TOKEN_MISSING",
+                }
+            },
+        )
 
-    # Write to all credential stores in one call
+    # Reconcile outgoing account's credentials before writing new ones —
+    # captures any token rotation by Claude Code during the outgoing session.
+    from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+    from jacked.api.usage_monitor import _read_active_account_id
+    outgoing_id = _read_active_account_id()
+    if outgoing_id and outgoing_id != account_id:
+        reconcile_credentials_from_live_store(outgoing_id, db)
+
+    # SAFETY: This is a user-initiated, one-shot credential write — NOT a
+    # background loop.  The design spec (2026-03-24-kill-background-credential-
+    # writes-design.md) prohibits credential file writes from background loops
+    # (_token_refresh_loop, _heal_sweep_loop) because they caused session
+    # logouts.  This endpoint is safe because: (1) it is user-initiated,
+    # (2) it runs once per click, and (3) Claude Code v2.1.81+ handles
+    # credential file changes gracefully.  Do NOT copy this pattern into
+    # refresh_account_token() or any background loop.
     from jacked.api.credential_helpers import sync_credential_to_all_stores
 
-    sync_credential_to_all_stores(account_id, account)
+    sync_credential_to_all_stores(
+        account_id,
+        account,
+        email=account.get("email"),
+        display_name=account.get("display_name"),
+    )
 
-    # Persist in DB — immune to Claude Code overwriting credential files
-    db.set_setting("active_account_id", str(account_id))
+    # Sync DB active_account_id setting — keeps the launch-time Layer-2
+    # fallback (jacked/launch.py) consistent with the credential file.
+    # Without this, every manual switch leaves the DB stale, so a
+    # cred-file recovery picks the wrong account.
+    try:
+        db.set_setting("active_account_id", account_id)
+    except Exception:
+        logger.exception(
+            "Failed to sync active_account_id setting after manual "
+            "switch (account=%d) — credential file is authoritative",
+            account_id,
+        )
 
-    return UseAccountResponse(status="ok", email=account["email"])
+    # Give the manual choice residency: without this, the auto-swap loop
+    # can silently revert a user-chosen account within ~2-5 minutes.
+    # note_external_swap() arms the monitor's cooldown + min-residency
+    # clocks and clears the emergence streak; the pause setting holds the
+    # sweep loop off entirely for at least 15 minutes.
+    try:
+        from jacked.api import usage_monitor  # local import: avoids cycle
+
+        usage_monitor.note_external_swap()
+        pause_dt = datetime.now(timezone.utc) + timedelta(minutes=15)
+        # Only ever EXTEND an active pause — the user may have set a
+        # longer explicit pause (POST /api/settings/swap-pause, up to
+        # 1440 min); a manual switch must never silently shorten it.
+        existing = db.get_setting("auto_swap_paused_until") or ""
+        if existing:
+            try:
+                existing_dt = datetime.fromisoformat(
+                    existing.replace("Z", "+00:00"),
+                )
+                if existing_dt > pause_dt:
+                    pause_dt = existing_dt
+            except (ValueError, TypeError):
+                # Unparseable/naive timestamp (the sweep loop ignores
+                # these anyway) — overwrite with the 15-minute pause.
+                pass
+        db.set_setting("auto_swap_paused_until", pause_dt.isoformat())
+    except Exception:
+        logger.exception(
+            "Failed to arm auto-swap pause after manual switch "
+            "(account=%d) — auto-swap may revert the user's choice",
+            account_id,
+        )
+
+    try:
+        from jacked.web.auto_swap import format_account_label
+        prev_acct = db.get_account(outgoing_id) if outgoing_id else None
+        reason = f"user switched to {format_account_label(account)}"
+
+        # Record in swap_log so it appears in swap history
+        db.record_swap(
+            from_account_id=outgoing_id,
+            to_account_id=account_id,
+            reason=reason,
+            trigger="manual",
+            from_5h=prev_acct.get("cached_usage_5h") if prev_acct else None,
+            from_7d=prev_acct.get("cached_usage_7d") if prev_acct else None,
+            to_5h=account.get("cached_usage_5h"),
+            to_7d=account.get("cached_usage_7d"),
+        )
+
+        # Record in decision_log with full detail
+        _manual_detail = {
+            "source": "dashboard",
+            "previous_account_id": outgoing_id,
+            "active": {
+                "id": account_id,
+                "email": account.get("email", ""),
+                "label": format_account_label(account),
+            },
+            "previous": {
+                "id": outgoing_id,
+                "email": prev_acct.get("email", "") if prev_acct else "",
+                "label": format_account_label(prev_acct) if prev_acct else "",
+            } if outgoing_id else None,
+        }
+        decision_id = db.record_decision(
+            account_id=account_id,
+            action="manual_switch",
+            trigger="manual",
+            target_id=account_id,
+            reason=reason,
+            detail=_manual_detail,
+        )
+
+        # Broadcast decision log entry
+        ws_registry = getattr(request.app.state, "ws_registry", None)
+        if ws_registry and decision_id:
+            try:
+                await ws_registry.broadcast(
+                    "decision_log_entry",
+                    {
+                        "id": decision_id,
+                        "account_id": account_id,
+                        "email": account.get("email", ""),
+                        "label": format_account_label(account),
+                        "action": "manual_switch",
+                        "trigger": "manual",
+                        "reason": reason,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "detail": _manual_detail,
+                    },
+                )
+            except Exception:
+                logger.debug("Decision log WS broadcast failed", exc_info=True)
+
+        # Broadcast via WebSocket so dashboard updates live
+        ws_registry = getattr(request.app.state, "ws_registry", None)
+        if ws_registry:
+            await ws_registry.broadcast(
+                "auto_swap_triggered",
+                {
+                    "from_account_id": outgoing_id,
+                    "to_account_id": account_id,
+                    "from_email": prev_acct.get("email", "") if prev_acct else "",
+                    "to_email": account.get("email", ""),
+                    "from_label": format_account_label(prev_acct) if prev_acct else "",
+                    "to_label": format_account_label(account),
+                    "reason": reason,
+                },
+            )
+    except Exception:
+        pass
+
+    return UseAccountResponse(
+        status="active",
+        email=account.get("email", ""),
+    )
 
 
 @router.get("/active-credential", response_model=ActiveCredentialResponse)
 async def get_active_credential(request: Request):
     """Read credential file/keychain and match to a jacked account.
 
-    Simple 2-layer matching: stamp, then access_token.
+    3-layer matching: (1) _jackedAccountId stamp, (2) refresh/access
+    token match, (3) email+org from ~/.claude.json.
     """
     db = _get_db(request)
     if db is None:
@@ -828,33 +1326,90 @@ async def get_active_credential(request: Request):
         if platform_data:
             cred_data = platform_data
 
-    if not cred_data:
-        return ActiveCredentialResponse()
-
-    # Layer 1: _jackedAccountId stamp
-    jacked_id = cred_data.get("_jackedAccountId")
-    if jacked_id is not None:
-        account = db.get_account(jacked_id)
-        if account and not account.get("is_deleted"):
-            return ActiveCredentialResponse(
-                account_id=account["id"], email=account["email"]
-            )
-
-    # Layer 2: Exact token match (CC token takes precedence over primary)
-    access_token = cred_data.get("claudeAiOauth", {}).get("accessToken")
-    if access_token:
-        accounts = db.list_accounts(include_inactive=True)
-        for acct in accounts:
-            if acct.get("is_deleted"):
-                continue
-            if acct.get("cc_access_token") == access_token:
+    if cred_data:
+        # Layer 1: _jackedAccountId stamp
+        jacked_id = cred_data.get("_jackedAccountId")
+        if jacked_id is not None:
+            account = db.get_account(jacked_id)
+            if account and not account.get("is_deleted"):
                 return ActiveCredentialResponse(
-                    account_id=acct["id"], email=acct["email"]
+                    account_id=account["id"], email=account["email"]
                 )
-            if acct.get("access_token") == access_token:
-                return ActiveCredentialResponse(
-                    account_id=acct["id"], email=acct["email"]
-                )
+
+        # Layer 2: Token match — try refresh token first (more stable than
+        # access token because it only rotates on explicit refresh, not every
+        # API call), then fall back to access token match.
+        oauth_data = cred_data.get("claudeAiOauth", {})
+        refresh_token = oauth_data.get("refreshToken")
+        access_token = oauth_data.get("accessToken")
+
+        if refresh_token or access_token:
+            accounts = db.list_accounts(include_inactive=True)
+            # Pass 1: refresh token match (most stable after dashboard switch)
+            if refresh_token:
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if acct.get("cc_refresh_token") == refresh_token:
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+            # Pass 2: access token match (works briefly before CC refreshes)
+            if access_token:
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if acct.get("cc_access_token") == access_token:
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+                    if acct.get("access_token") == access_token:
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+
+    # Layer 3: Email + org match from ~/.claude.json
+    #
+    # On macOS, .credentials.json may not exist (Claude Code uses keychain
+    # exclusively).  The keychain may lack the _jackedAccountId stamp
+    # (accounts predating the dashboard-switching feature).  Token match
+    # fails because Claude Code refreshes tokens independently.
+    #
+    # ~/.claude.json is maintained by Claude Code on ALL platforms and
+    # always has oauthAccount.emailAddress + organizationUuid after login.
+    # It is NOT overwritten during token refresh — only during login/logout.
+    claude_config = Path.home() / ".claude.json"
+    if claude_config.exists() and not claude_config.is_symlink():
+        try:
+            config = json.loads(claude_config.read_text(encoding="utf-8"))
+            oauth_acct = config.get("oauthAccount", {})
+            config_email = oauth_acct.get("emailAddress")
+            config_org = oauth_acct.get("organizationUuid") or ""
+            if config_email:
+                accounts = db.list_accounts(include_inactive=True)
+                # Prefer email+org match (disambiguates same-email multi-org).
+                # Normalize org to "" because DB uses "" for personal accounts
+                # while ~/.claude.json uses null (Python None).
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if (
+                        acct.get("email", "").lower() == config_email.lower()
+                        and (acct.get("organization_uuid") or "") == config_org
+                    ):
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+                # Fall back to email-only match (org may be None for personal accounts)
+                for acct in accounts:
+                    if acct.get("is_deleted"):
+                        continue
+                    if acct.get("email", "").lower() == config_email.lower():
+                        return ActiveCredentialResponse(
+                            account_id=acct["id"], email=acct["email"]
+                        )
+        except (json.JSONDecodeError, OSError):
+            pass
 
     return ActiveCredentialResponse()
 

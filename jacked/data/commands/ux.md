@@ -1,5 +1,5 @@
 ---
-description: "Parallel browser-based UX checks — spawns focused agents to test different UX aspects on affected pages simultaneously"
+description: Use when UI changes span multiple components or pages, layout or navigation changed, a new user-facing feature was added, or comprehensive UX validation is needed.
 ---
 
 ## Config Override
@@ -520,6 +520,24 @@ For each expected entry point page:
 - [ ] Does the browser Back button work correctly (no broken history stack)?
 - [ ] After completing the primary action, where does the user land? Is it the right place?
 - [ ] Are there cross-links to related features that naturally follow from using this one?
+
+### Accessibility Lens (if available)
+
+Check if an accessibility specialist lens is installed:
+
+```bash
+ls ~/.claude/lenses/accessibility.md .claude/lenses/accessibility.md 2>/dev/null | head -1
+```
+
+If found, read it and incorporate its "What to check" items into your testing checklist. These are **additive** — they don't replace your existing QA checks. Focus on items that can be verified visually or via browser DevTools:
+
+- Color contrast (use DevTools accessibility panel or Lighthouse)
+- Keyboard navigation (tab through the page, verify focus indicators)
+- Semantic HTML (inspect elements — buttons should be `<button>`, not `<div>`)
+- Form labels (each input has a visible, associated `<label>`)
+- Focus management after interactions (modal open/close, route changes)
+
+Skip items that require specialized tooling (screen reader testing, automated WCAG scanners) unless the user specifically requests them.
 
 ## REPORT FORMAT
 

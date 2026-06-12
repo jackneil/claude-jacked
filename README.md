@@ -8,8 +8,8 @@
 
 ## What You Get
 
-- **Stop clicking "approve" on every terminal command** — Claude Code asks permission for every bash command it runs. The security gatekeeper handles the safe ones automatically, so you only get interrupted when something is actually risky.
-- **Catch bugs before they ship** — Automatic code quality checks review your work for security holes, complexity, missing error handling, and test gaps. 10 built-in reviewers, always watching.
+- **LLM-evaluated security interception, opt-in** — Claude Code now ships an auto permission mode that handles approvals natively, so the security gatekeeper installs **disabled by default**. Turn it on from the dashboard (Settings > Gatekeeper) when you want a Haiku-backed second layer reviewing every tool call on top of Claude Code's auto mode.
+- **Catch bugs before they ship** — `/dcr` spawns parallel reviewers across 11 lenses (security, performance, logic, observability, data integrity, and more) in recursive waves until everything passes clean. 10 built-in agents, always available.
 - **Find any past conversation** — Search your Claude history by describing what you were working on. Works across machines, works across teammates. *(requires [search] extra)*
 - **Manage everything from a web dashboard** — Toggle features on and off, configure the security system, monitor decisions, track usage — all from your browser. No config files, no terminal commands.
 
@@ -52,17 +52,32 @@ jacked webux              # opens your dashboard at localhost:8321
 
 > **Don't have uv?** Install it first: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Mac/Linux) or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
 
+### Option 3: Install as a Plugin (Teams)
+
+Add to your team's Claude Code environment — no Python install needed:
+
+```bash
+/plugin marketplace add jackneil/claude-jacked
+/plugin install jacked@jacked-marketplace
+```
+
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 24 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
+
 **Want more?** Add optional extras:
 
 ```bash
 # Add session search (needs Qdrant Cloud ~$30/mo)
 uv tool install "claude-jacked[search]" --force && jacked install --force
 
-# Add security gatekeeper (auto-approves safe bash commands, included in base install)
-jacked install --force --security
+# Security gatekeeper hook is installed by default but starts disabled —
+# enable it from the dashboard (Settings > Gatekeeper) when you want LLM-evaluated
+# interception layered on top of Claude Code's auto permission mode.
 
-# Everything (base + search)
-uv tool install "claude-jacked[all]" --force && jacked install --force --security
+# Add the background service + system tray icon (auto-start on login)
+uv tool install "claude-jacked[tray]" --force && jacked service install && jacked service start
+
+# Everything (base + search + tray)
+uv tool install "claude-jacked[all]" --force && jacked install --force
 ```
 
 ---
@@ -73,7 +88,7 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 ### Toggle Features On and Off
 
-Enable or disable any of the 10 built-in code reviewers and 7 slash commands with one click. Each card shows what it does so you know what you're turning on.
+Enable or disable any of the 10 built-in code reviewers and 23 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
 ![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
 
@@ -100,7 +115,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable slash commands (`/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`).
+**Commands** — Enable or disable any of the 23 slash commands.
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
 
@@ -118,6 +133,8 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 - [What's Included](#whats-included)
 - [Web Dashboard](#web-dashboard)
+- [Background Service and Tray Icon](#background-service-and-tray-icon)
+- [Upgrading](#upgrading)
 - [Security Gatekeeper](#security-gatekeeper)
 - [Session Search](#session-search)
 - [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
@@ -136,7 +153,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **7 Slash Commands** | `/dc`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa` |
+| **24 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -154,7 +171,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
 | **Team Sharing** | Search your teammates' sessions (with their permission) |
 
-### Security Gatekeeper (activate with `jacked install --security`)
+### Security Gatekeeper (installed disabled — enable from Settings > Gatekeeper)
 
 | Feature | What It Does |
 |---------|--------------|
@@ -162,6 +179,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | **Tool Registry** | Per-tool enable/disable toggles from the dashboard (Bash, Read, Edit, Write, Grep, Glob, Web, MCP) |
 | **Shell Injection Defense** | Detects shell operators (`&&`, `|`, `;`, `>`, `` ` ``, `$()`) to prevent chaining attacks |
 | **Path Safety** | Blocks access to sensitive files (`.env`, `.ssh/`, credentials) across all file tools |
+| **Freeze Boundary** | `/freeze <path>` restricts Edit/Write operations to one directory — prevents accidental scope creep during focused work |
 | **File Context Analysis** | Reads referenced scripts and evaluates what code actually does |
 | **Command Categories** | Configurable per-category behavior (allow/ask/evaluate) for network, packages, git, docker, etc. |
 | **Customizable Prompt** | Tune the safety evaluation via the dashboard or `~/.claude/gatekeeper-prompt.txt` |
@@ -185,9 +203,231 @@ The dashboard is a local web app that runs on your machine. All data stays in `~
 
 ---
 
+## Background Service and Tray Icon
+
+Here's the deal: if you don't want to remember to run `jacked webux` every time, run it as a background service instead. You get a purple "J" in the macOS menu bar (or Windows system tray) that stays out of your way until you need it.
+
+### Install
+
+```bash
+uv tool install "claude-jacked[tray]" --force   # add pystray + Pillow
+jacked install --force                          # wire up hooks
+jacked service install                          # configure auto-start on login
+jacked service start                            # start it now
+```
+
+The `[tray]` extra is required — it pulls in `pystray` and `Pillow` for the icon rendering.
+
+### What You Get
+
+- **Purple "J" in your menu bar / system tray** — always-on dashboard, one click away.
+- **Right-click menu:** Open Dashboard, Restart, Stop, Start on Login toggle, current version label (e.g. `v0.41.2 -> v0.42.0 (update)` when outdated), and **Check for updates...** to force a fresh PyPI poll on demand.
+- **Auto-start on login** — `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/ai.hank.jacked.plist`) or a Windows startup VBS script. Service runs on reboot too.
+- **Crash recovery, not nag-ware** — KeepAlive is scoped to `SuccessfulExit=false`, so a clean stop from the tray or CLI *won't* trigger a respawn. Only actual crashes come back.
+- **One-click upgrades** — when a newer version hits PyPI, the version item flips to a clickable `v{current} -> v{latest} (update)`. Click it and jacked runs the full upgrade sequence (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced mid-update.
+- **CLI equivalent** — `jacked upgrade` does the same three-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
+- **Recovery file** — if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
+
+### Commands
+
+```bash
+jacked service install     # configure auto-start on login (launchd / Startup folder)
+jacked service uninstall   # remove auto-start config
+jacked service start       # start the service with tray icon (foreground — blocks)
+jacked service stop        # stop the running service
+jacked service restart     # stop + detached start (returns immediately)
+jacked service restart --foreground   # same but runs in foreground like service start
+jacked service status      # show PID, port, uptime, autostart state
+```
+
+### Troubleshooting
+
+If the tray icon disappears, won't come back, or claims the port is in use, work through these in order:
+
+```bash
+# 1. What's holding port 8321?
+lsof -i :8321 -sTCP:LISTEN            # macOS / Linux
+netstat -ano | findstr :8321          # Windows
+
+# 2. On macOS, stop launchd's KeepAlive loop so it doesn't fight you:
+launchctl unload ~/Library/LaunchAgents/ai.hank.jacked.plist
+
+# 3. Kill whatever's on the port (use the PID from step 1):
+kill -9 <PID>                         # POSIX
+taskkill /PID <PID> /F                # Windows
+
+# 4. Clear stale PID file:
+rm -f ~/.claude/jacked-service.pid    # POSIX
+del %USERPROFILE%\.claude\jacked-service.pid   # Windows
+
+# 5. Wait a couple seconds, then confirm the port is free:
+lsof -i :8321 -sTCP:LISTEN   # should print nothing
+
+# 6. Start fresh:
+jacked service start
+```
+
+Common issues:
+
+- **Tray icon never appears after install** — you didn't install the `[tray]` extra. Run `uv tool install "claude-jacked[tray]" --force && jacked service start`.
+- **Tray shows a wrong version** — the menu anchors on the running process's `__version__`, so if it shows "v0.41.2" and you just upgraded, the running process is stale. The tray is still the *old* binary. Fix: `jacked service stop && jacked service start`, or `jacked service restart`. `Check for updates...` in the menu forces a fresh PyPI poll (useful if only the cached "latest" is stale).
+- **`jacked upgrade` said "Upgrade complete" but the tray is still running the old version** — this was the 0.41.6→0.41.9 bug. `jacked service stop` sends SIGTERM, but pystray on macOS runs the AppKit NSRunLoop on the main thread, which can silently swallow Python signals. The upgrade's port-wait timed out and the detached `service start` hit "port in use." Fixed in 0.41.10+: graceful stop now polls for actual PID death and escalates to SIGKILL if SIGTERM is ignored. Confirm the fix took with `curl -s http://127.0.0.1:8321/api/version` and check the `current` field matches your installed version. If you're stuck on an older upgrade, follow the port-recovery sequence above and then `jacked service start`.
+- **"Port 8321 in use" after `jacked upgrade`** — an old tray didn't fully release the socket. Resolved in 0.41.6+ for service restart, and in 0.41.10+ for the upgrade path specifically (with SIGKILL escalation). Run `jacked upgrade` once more to pick up the fix.
+- **Auto-update ran but tray never came back** — the updater's detached `service start` hit the port race. Fixed in 0.41.4+ and hardened again in 0.41.13 (force-kills stuck parent + port squatter, verifies new service actually binds). If you're still stuck, follow the cleanup steps above, then run `jacked service start`.
+- **Claude Code keeps asking me to log in** — jacked was rotating the active account's CC refresh token out from under Claude Code. Fixed in 0.41.2+. Update and the issue goes away. Architecture doc at `docs/architecture/oauth-and-credential-flows.md` §7.1-7.3 explains the full mechanism.
+- **Auto-update failed** — read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file lists the exact commands to finish the upgrade manually.
+
+Verify what's actually running:
+
+```bash
+# What version is the live tray reporting?
+curl -s http://127.0.0.1:8321/api/version
+# {"current":"0.41.10","latest":"0.41.10","outdated":false,...}
+
+# Which PID owns the port, and when did it start?
+lsof -iTCP:8321 -sTCP:LISTEN                   # macOS / Linux
+ps -p <PID> -o pid,lstart,command               # when did it launch?
+```
+
+If `current` is older than the version your `uv tool list` shows, the running tray predates the install — stop + start it.
+
+### Installing from scratch
+
+We use `uv` for installation — it's a standalone tool from Astral that installs and manages Python CLI apps in isolated venvs. Much faster than pip, handles Python interpreter management, and keeps `claude-jacked` from conflicting with anything else on your system. Follow the steps for your OS.
+
+---
+
+#### macOS
+
+```bash
+# 1. Install uv (skip if you already have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Reload your shell so `uv` is on PATH. Either restart your terminal or:
+source ~/.zshrc   # or ~/.bashrc
+
+# 3. Verify
+uv --version
+
+# 4. Install jacked + tray icon
+uv tool install "claude-jacked[tray]"
+
+# 5. Wire up Claude Code hooks + the launchd auto-start + tray
+jacked install
+jacked service install
+```
+
+Notes:
+- uv's installer adds `~/.local/bin` to your shell rc automatically. If `jacked --version` says "command not found" after step 5, run `uv tool update-shell && source ~/.zshrc` or open a fresh terminal.
+- Auto-start plist goes to `~/Library/LaunchAgents/ai.hank.jacked.plist`. Removes cleanly via `jacked service uninstall`.
+
+---
+
+#### Linux
+
+```bash
+# 1. Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Reload shell
+source ~/.bashrc   # or ~/.zshrc / ~/.profile
+
+# 3. Verify
+uv --version
+
+# 4. Install jacked
+uv tool install "claude-jacked[tray]"
+
+# 5. Wire up Claude Code hooks + start the tray
+jacked install
+jacked service start
+```
+
+Notes:
+- Requires a system tray provider (most desktop environments ship one — GNOME may need the AppIndicator extension; KDE/Cinnamon/XFCE work out of the box). On distros without tray support, uvicorn still runs headless and the dashboard is reachable at `http://localhost:8321` — check `~/.claude/jacked-service.log`.
+- `jacked service install` isn't wired for Linux yet — for boot-time auto-start, add `jacked service start` to your DE's Startup Applications, or drop a systemd user unit yourself (see issue tracker).
+
+---
+
+#### Windows
+
+```powershell
+# 1. Install uv (standalone installer, no Python prerequisite)
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2. Close and reopen your terminal so `uv` is on PATH.
+#    The installer added %USERPROFILE%\.local\bin to User PATH.
+
+# 3. Verify
+uv --version
+
+# 4. Install jacked
+uv tool install "claude-jacked[tray]"
+
+# 5. Wire up Claude Code hooks + Startup-folder auto-start + tray
+jacked install
+jacked service install
+```
+
+Notes:
+- After step 4, `jacked.exe` lives at `%USERPROFILE%\.local\bin\jacked.exe`. uv's installer adds that dir to PATH — if `jacked --version` fails, open a new terminal (PATH changes don't propagate into open ones).
+- `jacked service install` writes a `.vbs` launcher into `shell:startup` (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\jacked.vbs`). It re-runs on login. Remove via `jacked service uninstall`.
+- **PowerShell execution policy warning**: if `irm | iex` is blocked, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` first, or download and run the installer script manually from [astral.sh/uv/install.ps1](https://astral.sh/uv/install.ps1).
+- If the tray icon doesn't appear, the service is still running headless — check `%USERPROFILE%\.claude\jacked-service.log` and hit `http://127.0.0.1:8321` in your browser.
+
+---
+
+#### After install (all platforms)
+
+Dashboard is at `http://localhost:8321`. The tray icon's right-click menu has Open Dashboard, Restart, Stop, Start on Login, version + "Check for updates...", and the clickable "Update to vX.Y.Z ->" item when a newer version hits PyPI.
+
+Upgrading later is one command: `jacked upgrade` (from the terminal) or click the Update line in the tray menu. Both auto-detect that you installed via uv and re-use it. Don't have uv anymore? Reinstall it first: same curl/powershell commands as step 1.
+
+Extras:
+- `uv tool install "claude-jacked[search]" --force` — adds Qdrant-backed semantic session search (requires Qdrant Cloud).
+- `uv tool install "claude-jacked[all]" --force` — tray + search together.
+- The security gatekeeper hook is installed by default but starts **disabled** — Claude Code's auto permission mode handles approvals natively. Turn the gatekeeper on from the dashboard (Settings > Gatekeeper) when you want LLM-evaluated interception layered on top.
+
+Requirements: Python 3.10+ (uv will fetch one for you if your system doesn't have a compatible version — you don't need to install Python separately).
+
+---
+
+## Upgrading
+
+```bash
+jacked upgrade
+```
+
+That's it. One command. Works on macOS, Linux, and Windows. Does all three things `uv tool install --force` alone doesn't do:
+
+1. `uv tool install "claude-jacked[tray]" --force` — new package on disk
+2. `jacked install --force` — migrate `settings.json` hooks to the shim form (`jacked _hook <name>`) so they survive Python version bumps
+3. `jacked service restart` — reload the running service with the new code (only if a service is running)
+
+**Why you need all three:** `uv tool install --force` just drops the new package on disk. The service you already have running is still executing the old version in memory, and your `settings.json` may still have hook paths that point at the old site-packages location (broken if `uv` upgraded Python under you).
+
+### Options
+
+- `jacked upgrade --extras search` — upgrade with the `[search]` extra instead of `[tray]` (Qdrant session search)
+- `jacked upgrade --extras all` — everything
+- `jacked upgrade --skip-service` — just swap the package and migrate settings, don't restart the running service
+
+### Cross-platform notes
+
+- **macOS/Linux:** runs inline. Your terminal shows live output from each step.
+- **Windows:** spawns a detached `cmd.exe` helper and exits immediately. Windows can't overwrite a running `.exe`, so this process has to step out of the way before `uv tool install` replaces `jacked.exe`. The helper waits for this process to exit, then runs the three steps with output appended to `~/.claude/jacked-update.log`. You can `type %USERPROFILE%\.claude\jacked-update.log` to follow along.
+
+### Tray upgrades
+
+If you're running the background service, you can also click **Update to vX.Y.Z ->** in the tray menu when a newer version is available on PyPI. Same three-step sequence, fully detached — survives its own binary being replaced mid-update.
+
+---
+
 ## Security Gatekeeper
 
-The security gatekeeper intercepts **all tool calls** Claude makes — bash commands, file reads/writes, web access, and MCP tools — and decides whether to auto-approve, block, or ask you. Each tool type gets the appropriate level of scrutiny. Most decisions resolve in under 2 milliseconds.
+> **Disabled by default.** Claude Code's auto permission mode now handles approvals natively, so the gatekeeper installs but starts off. Turn it on from the dashboard at **Settings > Gatekeeper** when you want LLM-evaluated interception layered on top of auto mode (or set `gatekeeper.enabled` to `true` in the SQLite settings table). Everything described below applies once you've enabled it.
+
+When enabled, the security gatekeeper intercepts **all tool calls** Claude makes — bash commands, file reads/writes, web access, and MCP tools — and decides whether to auto-approve, block, or ask you. Each tool type gets the appropriate level of scrutiny. Most decisions resolve in under 2 milliseconds.
 
 ### How It Works
 
@@ -327,12 +567,29 @@ Type these directly in Claude Code:
 | Command | What It Does |
 |---------|--------------|
 | `/dc` | **Double-check** — Reviews your recent work for bugs, security issues, and problems |
+| `/dcr` | **Recursive Review** — Spawns parallel reviewers across 11 lenses (security, performance, logic, UX, observability, data integrity, etc.) in waves until all pass clean |
+| `/swarm` | **Swarm** — Parallel implementation across 3-8 coordinated agents with file-level isolation |
+| `/swarm-research` | **Divergent Research** — Spawns 2-5 independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate |
+| `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
+| `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
+| `/whats-next` | **Roadmap Advisor** — Analyzes plans, issues, commits, and lifecycle stage to recommend highest-yield next work |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
+| `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
 | `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
 | `/redo` | **Redo** — Scraps the current approach and re-implements cleanly with full hindsight |
 | `/techdebt` | **Tech Debt** — Scans for TODOs, oversized files, missing tests, dead code |
 | `/audit-rules` | **Audit Rules** — Checks CLAUDE.md for duplicates, contradictions, stale rules |
-| `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome |
+| `/jacked-setup` | **Repo Setup** — Generates repo-specific configs for `/whats-next`, `/qa`, `/ux`, `/dcr`, `/docs-sync` — faster repeat runs |
+| `/freeze` | **Freeze** — Restricts file edits to a single directory, enforced by the security gatekeeper |
+| `/unfreeze` | **Unfreeze** — Removes the edit restriction set by `/freeze` |
+| `/cso` | **Security Audit** — Systematic OWASP Top 10 + STRIDE threat model analysis with confidence-gated findings |
+| `/retro` | **Retrospective** — Git history analysis for contributor metrics, test health, velocity trends |
+| `/canary` | **Canary** — Post-deploy monitoring with baselines, console errors, performance checks |
+| `/benchmark` | **Benchmark** — Performance regression detection via browser Performance API |
+| `/land-and-deploy` | **Land & Deploy** — Merges PR, waits for CI/deploy, runs canary verification, offers revert |
+| `/browser-reset` | **Browser Reset** — Diagnoses and fixes stuck browser MCP connections |
+| `/docs-sync` | **Docs Sync** — Diffs branch against base, maps code changes to affected docs, spawns parallel update agents |
+| `/lockdown` | **Supply-Chain Lockdown** — Audits repo against supply-chain attacks (lockfile integrity, CVE/malware scan, Actions SHA-pinning, provenance, secrets), HIPAA mapping for PHI repos. `fix` mode auto-hardens low-risk items; `baseline` installs ongoing CI monitoring |
 
 ### Smart Reviewers
 
@@ -428,6 +685,36 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.41.25** | **Per-account timeout: 60s → 10s.** Happy-path usage fetch is 1-2s; prior 60s bound made a transient upstream hiccup look like 60s of "stuck" in the UI. 10s is plenty of slack for a slow Anthropic OAuth refresh (whose SLA is well under 30s); if something takes longer, waiting doesn't help — we give up, mark the account failed for this cycle, and retry on the next sweep. Applied to both the bulk refresh (`_BULK_PER_ACCOUNT_TIMEOUT` in `api/routes/auth.py`) and the sweep's internal `fetch_usage` wrap (`api/usage_monitor.py`). |
+| **0.41.24** | **Upgrade + restart hardening.** Stops the whack-a-mole across 0.41.16-23. (1) New `ensure_native_lifecycle()` in `jacked/service/platform.py` calls `install_autostart()` **in-process** (no subprocess, no non-existent `jacked install --tray` flag) to auto-create the launchd plist when missing.  `jacked service restart` + tray Update's `starting_service` phase use it to eliminate the "Port 8321 already in use" race for users who set up jacked via raw `uv tool install` without ever running `jacked service install`.  Returns a state enum so callers skip `launchctl kickstart` when launchd just freshly loaded the plist via `RunAtLoad` (kickstart would race the boot).  Also stops any ad-hoc service holding :8321 before loading the plist so `RunAtLoad` can bind cleanly. (2) Deleted dead `pip` branches from `upgrade_command()` and `upgrade_command_label()` — `can_auto_upgrade()` has refused pip since 0.41.19 so they were unreachable, but the old code (pre-0.41.19) crashed with `No module named pip` in uv venvs.  Both now raise `ValueError` loudly if reached.  `run_update` wraps the call in `try/except ValueError` + writes recovery instead of crashing the detached helper.  `_spawn_windows_tray_updater` now gates on `can_auto_upgrade()` before calling `upgrade_command` (was the one path the CLI gate didn't cover).  Deleted the now-unreferenced `is_user_site_install()`. (3) New `jacked doctor` command: reports version, install method, plist/unit presence, and service health via **PID + HTTP probe** (not just port-in-use — distinguishes healthy, crashed-mid-init, and foreign-process-squatting).  Prints exact recovery commands for every detected issue.  Gives stranded users a clear out without having to remember `uv tool install --force`. |
+| **0.41.23** | **Stuck-checking watchdog + sweep resilience.** On 2026-04-19 `user3@example.com` stayed stuck showing "Checking usage…" in the dashboard for ~14 hours after the overnight bulk refresh hung. Root cause: `validate_account()` writes `validation_status="checking"` before the network call; if the owning coroutine is abandoned (server restart mid-call, asyncio cancellation, orphan task left behind by the 180s stale-lock force-reset), nothing ever resets the DB row — the 0.41.18 120s watchdog only clears the *UI card display*, not the DB. Fixes: (1) new `jacked/web/database.py::reset_stuck_checking()` with an atomic WHERE-guarded UPDATE (`WHERE validation_status='checking' AND ...`) that can't clobber a row a concurrent validator raced back to 'valid'; (2) new background task in lifespan runs every 60s, resets any row stuck in 'checking' for >120s; NULL `updated_at` is treated as "definitely stuck"; (3) bulk `/accounts/refresh-all-usage` wraps each `fetch_usage` in `asyncio.wait_for(60s)` and, on timeout, explicitly writes `validation_status='unknown'` at the same call site so the row doesn't sit at 'checking' waiting for the watchdog's tick; (4) stale-lock force-reset now calls `orphan.cancel()` (fire-and-forget — no await, keeping the code Python 3.10 compatible without 3.11's `Task.cancelling()`); task-slot cleanup uses `if _bulk_refresh_task is my_task` so a late-finishing orphan's finally can't wipe a newer holder's slot; (5) `validate_account` success paths now clear `last_error`/`last_error_at` so a watchdog-reset row doesn't keep the stale "timed out" banner after it validates successfully; (6) `full_sweep_loop` emits `Full-sweep heartbeat: iter=N` at the TOP of every iteration (before any early-return shortcut, so it fires even with `window_keeper_enabled=False`, the default) and bounds its own internal `fetch_usage` in `asyncio.wait_for(60s)`. |
+| **0.41.22** | **`jacked service restart` + tray Update now delegate to the native lifecycle manager.** On macOS, `stop && start` was racing launchd's `KeepAlive` respawn — whoever bound :8321 first won, the loser logged "Port 8321 in use." This is the actual root cause of the "new service did not bind :8321" error users kept hitting on tray-update clicks. Fix: new `jacked/service/platform.py::native_restart()` uses `launchctl kickstart -k gui/<uid>/ai.hank.jacked` on macOS (atomic, no race) and `systemctl --user restart jacked` on Linux (for DIY'd systemd units). Windows has no supervising manager so the existing detached stop+start path stays. Both `jacked service restart` and the updater's `starting_service` phase now try native-restart first and fall back to manual stop+start only when no manager is installed. |
+| **0.41.21** | **Hotfix: macOS users' auto-updates were being refused as "editable".** `detect_install_method()` called `Path(sys.executable).resolve()` which follows symlinks. uv-tool venvs on macOS symlink `bin/python` to the real Python binary (miniconda, pyenv, etc.), and after resolve the path no longer contains `uv/tools/<pkg>/` — so the uv fingerprint failed, fell through the gate, and `jacked upgrade` + the tray Update button refused the install as "editable" (or "pip"). Fix: uv/pipx detection now uses `sys.prefix` (the venv root — immune to symlinks) in addition to the resolved exe path. Any one of the three candidates matching wins. |
+| **0.41.20** | **Post-ship fixes for 0.41.19.** (1) Tray Update click writes a breadcrumb to `~/.claude/jacked-update.log` + `init_status` before spawning, and a new FileHandler routes `jacked` logger output to `~/.claude/jacked-tray.log` — eliminates the "tray dead, no diagnostics" failure where the detached child crashed before its first log line. (2) `run_update` early-returns (uv missing, jacked missing, mark_succeeded raises) now write `overall: failed` with explicit error + recovery so the UI shows the actual problem instead of a 120s stuck banner. (3) `_update_status` CLI shim exits 1 on `ValueError`; Windows batch guards every status write with `if errorlevel 1`. (4) Tray pre-warm + browser-open use literal `127.0.0.1` regardless of `self.host` (host=0.0.0.0 broke Linux clients). (5) New AST-based test enforces phase-name drift across POSIX updater + Windows batch + HTML. |
+| **0.41.19** | **Install-method safety + tray-update progress UI.** `jacked upgrade` and the tray "Update" button now refuse editable (dev-clone) installs and pip installs, with a clear recovery message (`git pull && uv sync` or `uv tool install "claude-jacked[tray]"`) — closes the silent `No module named pip` crash on dev machines. Tray "Update" click now opens a browser progress page at `/update.html` tracking each phase (waiting for parent, installing, migrating settings, freeing port, restarting, verifying) and detects completion via `/api/version`. Cross-platform. Windows batch emits all 6 phases + success terminal via new hidden `jacked _update_status*` CLI shims. Concurrent-writer lock, stale-succeeded auto-expiry, and server-reported mtime for stuck-detection (survives page reload). |
+| **0.41.18** | **Stuck "Checking usage…" self-recovers.** Added a 120s client-side watchdog: when a card receives `usage_refresh_progress status=checking` (or the single-refresh button applies `.usage-checking`) but the matching `done`/`failed` event never arrives — because the WS client was pruned mid-bulk by 0.41.12's slow-client timeout, the tab was backgrounded, a network blip dropped the event, or the fetch itself hung — the card auto-returns to idle after 120s so the user can click refresh again. Watchdog re-arms on every `checking` event, clears on `done`/`failed`/WS-close, and fails silently with a console warn. |
+| **0.41.17** | **README: uv-only install instructions per OS.** Rewrote "Installing from scratch" with explicit macOS / Linux / Windows steps — each includes the uv installer command, shell-reload, PATH verification, and OS-specific auto-start notes. Dropped the pip / pipx options from the docs (the upgrade code still supports them for anyone who used them pre-0.41.17, but uv is now the documented path). Corrected the Linux claim — we don't install systemd units; Linux users need to wire their own auto-start. |
+| **0.41.16** | **Install method auto-detection.** `jacked upgrade` and the tray "Update" button now detect whether jacked was installed via `uv tool install`, `pipx install`, or `pip install [--user]` and call the matching upgrade command. Prior versions hardcoded `uv tool install --force`, which silently failed for pip/pipx users by either erroring out (`uv` not on PATH) or installing the package a second time in the wrong place. New detection logic lives in `jacked/install_method.py` and drives both the inline POSIX upgrade and the Windows cmd.exe batch helper. |
+| **0.41.15** | **Windows: tray-update click now actually works + Ctrl+C stops the service.** (1) Tray-update on Windows was using a Python subprocess to drive `uv tool install --force`, but Windows can't replace `python.exe` while any process holds it open, so the update reliably failed. Now uses the same detached `cmd.exe` batch pattern as `jacked upgrade` — cmd.exe is a system binary we don't own, so it survives whatever uv does. (2) `jacked service start` in a console on Windows ignored Ctrl+C because pystray's native Win32 message pump blocks Python signal delivery. Installed a `SetConsoleCtrlHandler` via ctypes (delivered on a dedicated Windows thread) + SIGINT/SIGBREAK handlers so Ctrl+C, Ctrl+Break, and window-close all trigger a clean stop. |
+| **0.41.14** | **Windows: fixes process-sweeper crash spam.** The session process-alive sweeper and the Claude-lock stale-holder check both called `os.kill(pid, 0)` unconditionally — but Windows Python doesn't treat signal 0 as an existence probe, so exited PIDs raised CPython `SystemError: returned a result with an exception set` (which isn't an `OSError` and slipped past the wrapper). Both paths now delegate to the cross-platform `is_process_alive` helper (ctypes `OpenProcess` + `WaitForSingleObject` on Windows) and fail-safe return True on unexpected errors so live user sessions aren't incorrectly closed. |
+| **0.41.13** | **Tray auto-update actually restarts the tray.** Two fixes: (1) the updater now SIGKILLs the parent tray if pystray doesn't exit on `icon.stop()`, and SIGKILLs whatever is holding port 8321 if it stays bound after the graceful wait. (2) The updater verifies the new service actually bound :8321 before declaring success; if not, writes a recovery file. Also adds a "Last checked: Xm ago" / "Checking PyPI..." line to the tray menu, and disables "Check for updates..." while a check is running — so users with system notifications muted can still see the check happened. |
+| **0.41.12** | **Usage refresh no longer gets wedged** behind a stuck "already in progress" 409. Root cause: `ws.send_text` in the progress broadcaster had no timeout, so a zombie Chrome tab with a backed-up WebSocket could block the broadcast loop — which held `_bulk_refresh_lock` forever. Fix: per-client 5s timeout, parallel sends via `asyncio.gather`, and a 180s stale-lock watchdog that force-resets the lock if some future holder hangs. |
+| **0.41.11** | `jacked service stop` now uses the same graceful-with-SIGKILL-escalation path as restart + upgrade. Recovery from a wedged tray is one command: `jacked service stop`. |
+| **0.41.10** | **Upgrade actually stops the old tray** — `jacked upgrade` and `jacked service restart` now call a new `stop_process_graceful` helper that waits for actual PID death and escalates to `SIGKILL` if the graceful signal is ignored. Fixes the bug where pystray's AppKit runloop on macOS silently swallowed SIGTERM, the upgrade's port-wait timed out, and the detached `service start` hit "port in use" leaving the user on the old binary. README troubleshooting now explains how to confirm the live tray version via `curl http://127.0.0.1:8321/api/version`. |
+| **0.41.0** | **Upgrade-safe hooks** — `jacked install` now writes hooks as `jacked _hook <name>` instead of absolute site-packages paths. Survives `uv tool upgrade` and Python version bumps cleanly. Settings.json writes are atomic with timestamped backups at `~/.claude/settings.json.bak-*`. **Tray auto-update** — tray menu flips to `Update to vX.Y.Z ->` when a newer version is on PyPI; one click runs `uv tool install --force` + `jacked install --force` + service restart in a detached helper that survives its own binary being replaced. Cross-platform. **Recovery file** — if auto-update fails, `~/.claude/jacked-update-failed.txt` explains what to do, and the tray surfaces the warning on next startup. **Windows process-liveness fix** — replaces broken `os.kill(pid, 0)` with `WaitForSingleObject` via ctypes, so `jacked service status` works correctly on Windows. |
+| **0.40.0** | **`jacked service` command group** — run jacked as a background service with a system tray icon. Purple "J" in the macOS menu bar / Windows tray, with a right-click menu for Open Dashboard, Restart, Stop, and Start on Login. `jacked service install/uninstall` configures auto-start on login via launchd plist (macOS) or a Startup folder VBS script (Windows). KeepAlive scoped to `SuccessfulExit=false` — service auto-restarts on crash but not on a clean user stop. Requires the new `[tray]` extra (`uv tool install "claude-jacked[tray]"`) which pulls in pystray + Pillow. |
+| **0.26.0** | **`/docs-sync`** — new skill that diffs branch against base, maps code changes to affected docs (README, wiki, CLAUDE.md), and spawns parallel update agents. New `/jacked-setup docs-sync` target for per-repo configuration with Doc Inventory and Change-to-Doc Map. |
+| **0.25.0** | **8 new commands** from GStack analysis: `/freeze` + `/unfreeze` (edit scope restriction enforced by gatekeeper), `/cso` (OWASP+STRIDE security audit), `/retro` (engineering retrospective), `/canary` (post-deploy monitoring), `/benchmark` (performance regression detection), `/land-and-deploy` (merge-deploy-verify pipeline), `/browser-reset` (fix stuck browser MCPs). **Credential write fix** — server no longer overwrites Claude Code's credential files during background token refresh, fixing session logout bug. |
+| **0.24.0** | **Plugin marketplace** — repo doubles as a Claude Code plugin marketplace for team distribution. Zero file duplication. |
+| **0.23.x** | **`/swarm-research`** — divergent research skill (2-5 parallel agents from different angles, synthesis, devil's advocate). **Observability & Data Integrity lenses** added to DCR (11 lenses total). New wild cards, pre-mortem scenarios, and reviewer personas. |
+| **0.22.0** | **Chrome DevTools MCP** integration for `/qa` and `/ux` browser testing. |
+| **0.21.0** | **One-click upgrade** from the dashboard (upgrade + reinstall + restart). |
+| **0.20.x** | **DCR plan-mode support** — review plan docs while in plan mode. Dynamic skills dashboard. Simplicity & Reuse lens. |
+| **0.19.x** | **`/ux` parallel browser testing** — spawns 2-4 agents testing different UX aspects simultaneously. `/jacked-setup` standalone generation for `/qa`, `/ux`, `/dcr`, `/whats-next`. |
+| **0.18.x** | **`/dcr` recursive review** — parallel waves of focused reviewers with lens pairing, personas, wild cards, and pre-mortem analysis. |
+| **0.17.x** | **`/release` workflow** — bump version, push, CI, GitHub Release, PyPI publish. |
+| **0.16.x** | **`/swarm`** — coordinated parallel implementation across 3-8 agent teammates. |
+| **0.15.x** | **`/whats-next`** — roadmap advisor with lifecycle detection, tier-based prioritization. |
 | **0.9.1** | **Catch-all PreToolUse hook** — intercepts all tools (file tools get path-safety checks, web/MCP tools get auto-approve with logging, Bash keeps full eval chain). Tool registry with per-tool enable/disable. Labeled deny patterns for clearer audit logs. `/qa` command + Stop hook for browser QA. oauthAccount seeding, plugin toggle fix. |
 | **0.9.0** | **Analytics dashboard** with charts, heatmap, and drill-down. **Security profiles** — export, import, and backup gatekeeper configurations. Profile API endpoints + Settings UI panel. |
 | **0.8.0** | **Permissions panel** — manage allowed commands with project-level vs global scope. "Always Allow" from log rows. Method filter on log viewer. |
@@ -496,8 +783,19 @@ jacked webux                       # Open web dashboard
 jacked webux --port 9000           # Custom port
 jacked webux --no-browser          # Server only, no auto-open
 
+# Background Service (requires [tray] extra)
+jacked service install             # Configure auto-start on login
+jacked service uninstall           # Remove auto-start
+jacked service start               # Start service with tray icon
+jacked service stop                # Stop running service
+jacked service restart             # Restart service
+jacked service status              # Show PID, port, uptime, autostart state
+
 # Slash Commands
-# /dc /pr /learn /redo /techdebt /audit-rules /qa
+# /dc /dcr /docs-sync /pr /learn /redo /techdebt /audit-rules /qa /ux
+# /swarm /swarm-research /release /whats-next /jacked-setup
+# /freeze /unfreeze /cso /lockdown /retro /canary /benchmark
+# /land-and-deploy /browser-reset
 ```
 
 </details>

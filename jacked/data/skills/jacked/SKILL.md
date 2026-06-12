@@ -1,11 +1,25 @@
 ---
 name: jacked
-description: Search and load context from past Claude Code sessions. Use when: user mentions a past project like "configurator" or other previous work, asks to continue/resume previous work, says "how did I do X before", references past sessions, or starts work on a feature that may have been done before.
+description: Use when the user mentions a past project like "configurator", asks to continue/resume previous work, says "how did I do X before", references past sessions, or starts work on a feature that may have been done before. Searches and loads context from past Claude Code sessions.
 ---
 
 # Jacked
 
 Search and load context from past Claude Code sessions using semantic search.
+
+## Prerequisites
+
+This skill requires the search extra (`jacked[search]`) and a configured Qdrant instance. **Before doing anything else**, check if search is available:
+
+```bash
+jacked search "test" --limit 1
+```
+
+If this returns an error like `'search' requires the search extra` or fails to connect to Qdrant, **STOP** and tell the user:
+
+> "The /jacked session search feature isn't set up yet. It requires `uv tool install "claude-jacked[search]"` and a Qdrant instance. For now, I can check git history or local session files instead."
+
+Do NOT attempt to install the search extra automatically.
 
 ## Usage
 
@@ -160,3 +174,9 @@ After injection, summarize:
 - Local sessions can be resumed natively with `claude --resume` for the best experience
 - Remote sessions are retrieved and injected as context (works but Claude won't have internal memory state)
 - Use `jacked cleardb` to wipe your data before re-indexing with a new schema
+
+## Artifact Format Preference
+
+When you write any artifact during a `/jacked`-driven follow-up — a continuation plan, a research note distilled from past sessions, an exported summary — write it as **HTML**, not Markdown. The file is for the user to open in a browser, scan diagrams, and re-read later. Copy `~/.claude/jacked-templates/plan-template.html` as a starting point.
+
+Markdown is reserved for the explicit exceptions: GitHub-rendered files (`README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE.md`, files under `_wiki/`) and Claude-instruction files Claude reads at session boot (`CLAUDE.md`, `AGENTS.md`, `lessons.md`, `MEMORY.md`). See `~/.claude/jacked-reference.md` § Artifact Format Preference for the canonical rule.

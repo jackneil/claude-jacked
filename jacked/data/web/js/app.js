@@ -30,13 +30,21 @@ window.jackedState = {
 // ---------------------------------------------------------------------------
 // API Client
 // ---------------------------------------------------------------------------
+// Default per-request timeout. Without one, a hung server route leaves the fetch
+// promise unsettled forever — finally blocks never run and in-flight flags
+// (_usageRefreshInProgress, _singleRefreshInFlight) stick until a page reload.
+const API_DEFAULT_TIMEOUT_MS = 60000;
+
 const api = {
-    async _request(method, path, body) {
+    async _request(method, path, body, { timeout = API_DEFAULT_TIMEOUT_MS } = {}) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
         const opts = {
             method,
             headers: { 'Content-Type': 'application/json' },
             // Bypass browser cache — stale responses after OAuth flows cause UI desync
             cache: 'no-store',
+            signal: controller.signal,
         };
         if (body !== undefined) {
             opts.body = JSON.stringify(body);
@@ -52,15 +60,20 @@ const api = {
             return await res.json();
         } catch (e) {
             if (e instanceof ApiError) throw e;
+            if (e.name === 'AbortError') {
+                throw new ApiError('Request timed out', 0, 'TIMEOUT');
+            }
             throw new ApiError(e.message || 'Network error', 0, 'NETWORK_ERROR');
+        } finally {
+            clearTimeout(timer);
         }
     },
 
-    get(path) { return this._request('GET', path); },
-    post(path, body) { return this._request('POST', path, body); },
-    patch(path, body) { return this._request('PATCH', path, body); },
-    put(path, body) { return this._request('PUT', path, body); },
-    delete(path) { return this._request('DELETE', path); },
+    get(path, options) { return this._request('GET', path, undefined, options); },
+    post(path, body, options) { return this._request('POST', path, body, options); },
+    patch(path, body, options) { return this._request('PATCH', path, body, options); },
+    put(path, body, options) { return this._request('PUT', path, body, options); },
+    delete(path, options) { return this._request('DELETE', path, undefined, options); },
 };
 
 class ApiError extends Error {
@@ -119,6 +132,15 @@ async function renderRoute(route) {
             if (typeof renderAccounts === 'function') {
                 content.innerHTML = renderAccounts(window.jackedState.accounts);
                 if (typeof bindAccountEvents === 'function') bindAccountEvents();
+                if (typeof bindAutoSwapEvents === 'function') bindAutoSwapEvents();
+                // Load swap history
+                if (typeof loadSwapLog === 'function' && typeof renderSwapLogTable === 'function') {
+                    loadSwapLog().then(entries => {
+                        const el = document.getElementById('swap-history-container');
+                        if (el) el.textContent = '', el.appendChild(Object.assign(document.createElement('div'), {innerHTML: renderSwapLogTable(entries)}));
+                    });
+                }
+                if (typeof renderDecisionLog === 'function') renderDecisionLog('decision-log-container');
                 // Auto-validate stale accounts on mount
                 autoValidateStaleAccounts();
             }
@@ -212,6 +234,7 @@ async function loadAllData() {
         loadSettings(),
         loadVersion(),
         typeof loadActiveCredential === 'function' ? loadActiveCredential() : Promise.resolve(),
+        typeof loadAutoSwapSettings === 'function' ? loadAutoSwapSettings() : Promise.resolve(),
     ]);
 }
 
@@ -240,6 +263,15 @@ function rerenderAccountsView() {
 
     content.innerHTML = renderAccounts(window.jackedState.accounts);
     if (typeof bindAccountEvents === 'function') bindAccountEvents();
+    if (typeof bindAutoSwapEvents === 'function') bindAutoSwapEvents();
+    // Refresh swap history (renderSwapLogTable escapeHtml's all user data)
+    if (typeof loadSwapLog === 'function' && typeof renderSwapLogTable === 'function') {
+        loadSwapLog().then(entries => {
+            const el = document.getElementById('swap-history-container');
+            if (el) { el.textContent = ''; const w = document.createElement('div'); w.innerHTML = renderSwapLogTable(entries); el.appendChild(w); }
+        });
+    }
+    if (typeof renderDecisionLog === 'function') renderDecisionLog('decision-log-container');
 
     // Restore expanded details
     expandedDetails.forEach(id => {

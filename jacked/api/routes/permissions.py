@@ -9,16 +9,27 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+# Import the module (not the symbol) so reset_locks() rebinds in features.py
+# are visible at the call site below. `from features import _settings_lock`
+# would snapshot the original Lock at import time and miss every subsequent
+# rebind — silently reintroducing the "bound to a different event loop" bug
+# after the first tray restart. Do NOT auto-tidy this back to a from-import.
+from jacked.api.routes import features as _features_mod
 from jacked.api.routes.features import (
     VALID_PERMISSION_MODES,
     _read_settings_json,
-    _settings_lock,
     _write_settings_json,
 )
 
 router = APIRouter()
 
 _project_settings_lock = asyncio.Lock()
+
+
+def reset_locks() -> None:
+    """Rebind to the current event loop — see routes.auth.reset_locks."""
+    global _project_settings_lock
+    _project_settings_lock = asyncio.Lock()
 
 
 def _read_project_settings(repo_path: str) -> dict:
@@ -264,7 +275,7 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
                 _write_project_settings(str(resolved), settings)
         return {"ok": True, "scope": "project"}
     else:
-        async with _settings_lock:
+        async with _features_mod._settings_lock:
             settings = _read_settings_json()
             if "permissions" not in settings:
                 settings["permissions"] = {}

@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supply-Chain Lockdown — claude-jacked</title>
+
+<meta name="jacked:type" content="lockdown">
+<meta name="jacked:status" content="audit-complete">
+<meta name="jacked:branch" content="master">
+<meta name="jacked:date" content="2026-05-20">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--sans); font-size: 16px; line-height: 1.6; color: var(--fg); background: var(--bg); margin: 0; padding: 2rem 1rem; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin: 0 0 .25rem; line-height: 1.2; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; padding-bottom: .35rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; color: var(--fg-muted); }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+  .meta { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin: .5rem 0 2rem; padding: .75rem 1rem; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); font-size: .9rem; }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+  .badge { display: inline-block; padding: .15rem .6rem; border-radius: 99px; font-size: .8rem; font-weight: 500; line-height: 1.4; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.danger { background: var(--danger-bg); color: var(--danger); }
+  .badge.info { background: var(--accent-bg); color: var(--accent); }
+  nav.toc { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.25rem; margin-bottom: 2rem; box-shadow: var(--shadow); }
+  nav.toc h2 { margin: 0 0 .5rem; font-size: .9rem; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-muted); border: none; padding: 0; }
+  nav.toc ol { margin: 0; padding-left: 1.5rem; }
+  nav.toc li { margin: .15rem 0; }
+  aside.callout { margin: 1rem 0; padding: .9rem 1.1rem; border-left: 4px solid var(--accent); background: var(--accent-bg); border-radius: 0 var(--radius) var(--radius) 0; }
+  aside.callout.warn { border-color: var(--warn); background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok { border-color: var(--ok); background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child { margin-bottom: 0; }
+  code { font-family: var(--mono); font-size: .92em; background: var(--code-bg); padding: .12em .35em; border-radius: 3px; }
+  pre { font-family: var(--mono); font-size: .85rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: .9rem 1rem; overflow-x: auto; line-height: 1.45; }
+  pre code { background: transparent; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; background: var(--bg-card); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
+  th, td { text-align: left; padding: .55rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; font-size: .9rem; }
+  tr:last-child td { border-bottom: none; }
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li { padding: .25rem 0; display: flex; align-items: flex-start; gap: .6rem; }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+  .score-card { display: flex; align-items: center; gap: 2rem; padding: 1.5rem; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); margin: 1rem 0 2rem; }
+  .score-card .num { font-size: 4.5rem; font-weight: 700; line-height: 1; font-family: var(--mono); }
+  .score-card .num.danger { color: var(--danger); }
+  .score-card .num.warn { color: var(--warn); }
+  .score-card .num.ok { color: var(--ok); }
+  .score-card .info { flex: 1; }
+  .score-card .band { font-size: 1.2rem; font-weight: 600; margin-bottom: .25rem; }
+  .score-card .tagline { color: var(--fg-muted); }
+  .finding { border: 1px solid var(--border); border-radius: var(--radius); margin: 1rem 0; background: var(--bg-card); overflow: hidden; box-shadow: var(--shadow); }
+  .finding header { display: flex; align-items: center; gap: .75rem; padding: .65rem 1rem; background: var(--code-bg); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .finding header .id { font-family: var(--mono); font-size: .85rem; color: var(--fg-muted); }
+  .finding header .title { font-weight: 600; flex: 1; }
+  .finding .body { padding: 1rem; }
+  .finding .row { display: grid; grid-template-columns: 110px 1fr; gap: .5rem 1rem; margin: .3rem 0; }
+  .finding .row .lbl { color: var(--fg-muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; padding-top: .15rem; }
+  .hipaa-cell { text-align: center; font-size: .8rem; padding: .2rem .5rem !important; }
+  .hipaa-cell.ok { color: var(--ok); background: var(--ok-bg); }
+  .hipaa-cell.partial { color: var(--warn); background: var(--warn-bg); }
+  .hipaa-cell.missing { color: var(--danger); background: var(--danger-bg); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc, .finding, table, aside.callout, pre { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Supply-Chain Lockdown — claude-jacked</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge danger">significant exposure</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-05-20</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">master</span></div>
+  <div class="kv"><span class="k">Mode:</span><span class="v">audit --paranoid</span></div>
+  <div class="kv"><span class="k">Repo:</span><span class="v">jackneil/claude-jacked</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#summary">Executive Summary</a></li>
+    <li><a href="#score">Score &amp; Posture</a></li>
+    <li><a href="#categories">Category Breakdown</a></li>
+    <li><a href="#ecosystems">Ecosystem Inventory</a></li>
+    <li><a href="#findings">Findings</a></li>
+    <li><a href="#remediation">Remediation Plan</a></li>
+    <li><a href="#manual">Manual Verification</a></li>
+    <li><a href="#hipaa">HIPAA Mapping</a></li>
+    <li><a href="#sources">Sources</a></li>
+  </ol>
+</nav>
+
+<h2 id="summary">Executive Summary</h2>
+<p>
+claude-jacked is published to PyPI, used as a developer-tool dependency, and ships behavioral rules + hooks that Claude Code installs into users' shells.
+That blast radius makes the publish pipeline the highest-value target in this repo. The pipeline currently passes core dependency-integrity checks
+(<code>uv.lock</code> has SHA-256 hashes; <code>pip-audit</code> reports zero vulnerabilities; PyPI Trusted Publishers
+eliminates long-lived <code>PYPI_API_TOKEN</code> exposure), but four high-risk patterns remain:
+</p>
+<ol>
+  <li><strong>Publisher action <code>pypa/gh-action-pypi-publish</code> is tag-pinned, not SHA-pinned</strong> — a tag-mutation attack (tj-actions class) would publish poisoned wheels to PyPI under claude-jacked's name.</li>
+  <li><strong>No <code>step-security/harden-runner</code> egress filtering</strong> — a compromised dep installed during build could exfil to anywhere unobserved.</li>
+  <li><strong>No <code>persist-credentials: false</code> on checkout</strong> — GITHUB_TOKEN persists in <code>.git/config</code> and the artifact upload step uploads <code>dist/</code> only (low actual risk) but the pattern is still wrong.</li>
+  <li><strong>Workflow-level <code>id-token: write</code> is overly broad</strong> — should be on the publish job only, not the build job.</li>
+</ol>
+<p>
+None of these have been exploited here; all are pre-emptive. The audit also flags a number of <em>monitoring</em> gaps
+(Dependabot, SBOM, pre-commit secret scanning, in-CI workflow lint) that have not caused harm but would catch future regressions.
+<code>/lockdown fix</code> can apply most of these as low-risk auto-fixes.
+</p>
+
+<h2 id="score">Score &amp; Posture</h2>
+<div class="score-card">
+  <div class="num danger">27</div>
+  <div class="info">
+    <div class="band"><span class="badge danger">Significant exposure</span></div>
+    <div class="tagline">Publisher pipeline has multiple un-hardened controls. Lockfile + dep CVE state is clean; CI hardening is the gap.</div>
+  </div>
+</div>
+
+<table>
+  <thead><tr><th>Band</th><th>Score</th><th>Posture</th></tr></thead>
+  <tbody>
+    <tr><td><span class="badge ok">Hardened</span></td><td>90–100</td><td>Gold-standard supply-chain hygiene.</td></tr>
+    <tr><td><span class="badge info">Solid baseline</span></td><td>70–89</td><td>Most controls present; minor gaps.</td></tr>
+    <tr><td><span class="badge warn">Critical gaps</span></td><td>50–69</td><td>Important controls missing; address before next release.</td></tr>
+    <tr style="background: var(--danger-bg);"><td><span class="badge danger">Significant exposure</span></td><td>0–49</td><td>Hardening is the next blocker. <strong>← you are here</strong></td></tr>
+  </tbody>
+</table>
+
+<h2 id="categories">Category Breakdown</h2>
+<p>Per-category status — where to focus, vs. the overall number above.</p>
+<table>
+  <thead><tr><th>Category</th><th>Status</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Lockfile integrity</td><td><span class="badge ok">ok</span></td><td><code>uv.lock</code> committed with SHA-256 on 68 packages; <code>uv lock --check</code> reproduces clean</td></tr>
+    <tr><td>Dependency CVEs</td><td><span class="badge ok">ok</span></td><td><code>pip-audit</code> via OSV: <em>no known vulnerabilities</em>; <code>osv-scanner</code> not installed (would be 2nd opinion)</td></tr>
+    <tr><td>Malware / typosquat</td><td><span class="badge warn">warn</span></td><td>Socket CLI not installed; no install-script heuristic findings on this Python-only repo</td></tr>
+    <tr><td>CI/Actions hardening</td><td><span class="badge danger">danger</span></td><td>5 unpinned actions (1 critical: PyPI publisher), excessive workflow permissions, missing persist-credentials, no Harden-Runner. <strong>Primary problem area.</strong></td></tr>
+    <tr><td>Secrets hygiene</td><td><span class="badge ok">ok</span></td><td><code>.gitignore</code> covers all common secret patterns; no hardcoded secrets in tree; gitleaks not installed (would be CI gate)</td></tr>
+    <tr><td>Provenance &amp; signing</td><td><span class="badge warn">warn</span></td><td>PyPI Trusted Publishers (OIDC) active — long-lived tokens eliminated. No SBOM generated per release. No PEP 740 attestations.</td></tr>
+    <tr><td>Container hardening</td><td><span class="badge info">n/a</span></td><td>No Dockerfile</td></tr>
+    <tr><td>Pre-commit + Scorecard</td><td><span class="badge warn">warn</span></td><td>No <code>.pre-commit-config.yaml</code>; OpenSSF Scorecard not running</td></tr>
+  </tbody>
+</table>
+
+<h2 id="ecosystems">Ecosystem Inventory</h2>
+<table>
+  <thead><tr><th>Ecosystem</th><th>Detected</th><th>Scanner</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>Python (uv)</td><td><code>pyproject.toml</code>, <code>uv.lock</code></td><td><code>pip-audit</code> 2.x via OSV</td><td><span class="badge ok">no known CVEs</span></td></tr>
+    <tr><td>Python (uv) — lockfile integrity</td><td><code>uv.lock</code> (68 packages)</td><td><code>uv lock --check</code> + hash count</td><td><span class="badge ok">hashes present</span></td></tr>
+    <tr><td>GitHub Actions</td><td><code>.github/workflows/publish.yml</code></td><td><code>zizmor</code> 1.24.1</td><td><span class="badge danger">5 errors, 1 warning</span></td></tr>
+    <tr><td>Secrets in git</td><td><code>.gitignore</code> coverage</td><td>grep heuristic (gitleaks missing)</td><td><span class="badge ok">.gitignore covers all common patterns</span></td></tr>
+    <tr><td>Node.js</td><td>—</td><td>—</td><td><span class="badge info">not present</span></td></tr>
+    <tr><td>Docker / container</td><td>—</td><td>—</td><td><span class="badge info">not present</span></td></tr>
+    <tr><td>OpenSSF Scorecard</td><td>—</td><td>scorecard CLI missing</td><td><span class="badge warn">not measured</span></td></tr>
+    <tr><td>Socket (malware/typosquat)</td><td>—</td><td>socket CLI missing</td><td><span class="badge warn">not measured</span></td></tr>
+    <tr><td>OSV-Scanner (second opinion)</td><td>—</td><td>osv-scanner missing</td><td><span class="badge warn">not measured</span></td></tr>
+  </tbody>
+</table>
+
+<h2 id="findings">Findings</h2>
+
+<div class="finding">
+  <header>
+    <span class="badge danger">CRITICAL</span>
+    <span class="id">SCSC-001</span>
+    <span class="title">Publisher action <code>pypa/gh-action-pypi-publish@release/v1</code> is not SHA-pinned</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/workflows/publish.yml:51</code></div></div>
+    <div class="row"><div class="lbl">Evidence</div><div><pre><code>uses: pypa/gh-action-pypi-publish@release/v1</code></pre></div></div>
+    <div class="row"><div class="lbl">Risk</div><div>An attacker who compromises the PyPA repo (or its maintainer's GitHub credentials) can force-push <code>release/v1</code> to a malicious commit. Every consumer using this tag would then run attacker code with OIDC <code>id-token</code> permission and direct PyPI publish authority — they could ship a poisoned <code>claude-jacked</code> wheel to PyPI without your knowledge. This is exactly the tj-actions CVE-2025-30066 attack pattern, applied to your release pipeline.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div>Pin to the 40-char commit SHA with the version in a comment. Look up the current SHA: <code>gh api repos/pypa/gh-action-pypi-publish/git/refs/tags/v1.13.0</code>. Replace with: <code>uses: pypa/gh-action-pypi-publish@&lt;sha&gt; # v1.13.0</code>. Set up Dependabot or Renovate with a 7-day cooldown to keep the SHA fresh while still gaining tag-mutation immunity.</div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code> — <code>/lockdown fix</code> can pin via <code>pinact run --min-age 7</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge warn">HIGH</span>
+    <span class="id">SCSC-002</span>
+    <span class="title">First-party Actions (<code>actions/*</code>) not SHA-pinned</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/workflows/publish.yml:15, 18, 31, 45</code></div></div>
+    <div class="row"><div class="lbl">Evidence</div><div><pre><code>uses: actions/checkout@v4
+uses: actions/setup-python@v5
+uses: actions/upload-artifact@v4
+uses: actions/download-artifact@v4</code></pre></div></div>
+    <div class="row"><div class="lbl">Risk</div><div>GitHub-owned actions are lower-risk than third-party but not zero-risk. SHA-pinning is the paranoid-mode standard recommended by GitHub's own org-level "Require actions to be pinned to a full-length commit SHA" policy (GA Aug 2025). Healthcare orgs handling PHI should pin everything.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div>Pin each to a 40-char SHA with a version comment. <code>pinact run</code> will do all four in one pass.</div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge warn">HIGH</span>
+    <span class="id">SCSC-003</span>
+    <span class="title">Workflow-level <code>id-token: write</code> is overly broad</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/workflows/publish.yml:7–9</code></div></div>
+    <div class="row"><div class="lbl">Evidence</div><div><pre><code>permissions:
+  contents: read
+  id-token: write</code></pre></div></div>
+    <div class="row"><div class="lbl">Risk</div><div>The build job does not need <code>id-token: write</code> — only the publish job does. Granting OIDC token-mint capability to a job that runs <code>python -m build</code> means a malicious dep can mint an OIDC token and use it to authenticate to the cloud / PyPI itself. <code>zizmor</code> flagged this as <code>excessive-permissions</code> with high confidence.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div>Move <code>id-token: write</code> to the publish job only:<pre><code>permissions: { contents: read }   # workflow default
+
+jobs:
+  build:
+    permissions: { contents: read }
+    ...
+  publish:
+    permissions: { id-token: write, contents: read }
+    ...</code></pre></div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge warn">HIGH</span>
+    <span class="id">SCSC-004</span>
+    <span class="title">No <code>step-security/harden-runner</code> egress filtering</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/workflows/publish.yml</code> — both jobs</div></div>
+    <div class="row"><div class="lbl">Risk</div><div>A compromised transitive dep installed during <code>python -m build</code> can exfil to any destination — there is no eBPF egress monitor / blocker on the runner. Harden-Runner would have detected the tj-actions, axios, and Shai-Hulud incidents at exfil time.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div>Add as first step of both jobs:<pre><code>- uses: step-security/harden-runner@&lt;sha&gt; # v2.17.0
+  with:
+    egress-policy: audit
+    disable-sudo: true</code></pre>Run in <code>audit</code> mode for a week to discover legitimate endpoints, then flip to <code>block</code> with an explicit <code>allowed-endpoints:</code> list (PyPI mirrors, GitHub API only).</div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code> — audit mode is safe to add unconditionally</div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge warn">HIGH</span>
+    <span class="id">SCSC-005</span>
+    <span class="title"><code>actions/checkout</code> missing <code>persist-credentials: false</code></span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/workflows/publish.yml:15</code></div></div>
+    <div class="row"><div class="lbl">Risk</div><div>Without <code>persist-credentials: false</code>, the <code>GITHUB_TOKEN</code> remains in <code>.git/config</code>. Any later step that uploads the workspace as an artifact (or invokes a third-party action that does so) leaks the token. <code>zizmor</code> labels this <code>artipacked</code>. In this specific workflow only <code>dist/</code> is uploaded, so direct leak risk is low — but the pattern should be eliminated regardless.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div><pre><code>- uses: actions/checkout@&lt;sha&gt; # v4.2.2
+  with:
+    persist-credentials: false</code></pre></div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge info">MEDIUM</span>
+    <span class="id">SCSC-006</span>
+    <span class="title">No SBOM generated per release</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/workflows/publish.yml</code> — no <code>cyclonedx</code> / <code>syft</code> / <code>spdx</code> step</div></div>
+    <div class="row"><div class="lbl">Risk</div><div>Without an SBOM attached to each PyPI release, downstream consumers can't quickly determine whether they're exposed to a newly disclosed CVE in a transitive dep without re-running their own SCA tools. NIST SSDF and the CISA Secure-by-Design pledge both ask for SBOM publication.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div>Add a CycloneDX SBOM step to the build job:<pre><code>- name: Generate SBOM
+  run: |
+    uv tool install cyclonedx-bom
+    cyclonedx-py environment -o sbom.cdx.json
+- uses: actions/upload-artifact@&lt;sha&gt;
+  with: { name: sbom, path: sbom.cdx.json }</code></pre>Attach to the GitHub Release alongside wheels.</div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge info">MEDIUM</span>
+    <span class="id">SCSC-007</span>
+    <span class="title">No Dependabot configuration (with cooldown)</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/dependabot.yml</code> — missing</div></div>
+    <div class="row"><div class="lbl">Risk</div><div>Dep upgrades for security patches are applied ad-hoc rather than via automated PRs. Without a cooldown, you also have no defense against smash-and-grab attacks (axios 1.14.1, Shai-Hulud) — the bad version would be the first one Dependabot proposes within the hour of publish.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div><pre><code># .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule: { interval: "weekly" }
+    cooldown: { default-days: 7, semver-patch-days: 3 }
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly" }
+    cooldown: { default-days: 7 }</code></pre></div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge info">MEDIUM</span>
+    <span class="id">SCSC-008</span>
+    <span class="title">No <code>.pre-commit-config.yaml</code> for secret detection</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div>repo root — missing</div></div>
+    <div class="row"><div class="lbl">Risk</div><div>Secrets that get committed accidentally are detected at PR time only (or, more often, after release when someone scrapes git history). A pre-commit hook stops them at the workstation. <code>pre-commit</code> is already installed in <code>uv tool list</code> — only the config is missing.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div><pre><code># .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks: [{ id: gitleaks }]
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks: [{ id: detect-secrets, args: ['--baseline', '.secrets.baseline'] }]
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks: [{ id: actionlint }]
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.25.2
+    hooks: [{ id: zizmor }]</code></pre>Then: <code>pre-commit install</code> + <code>detect-secrets scan &gt; .secrets.baseline</code>.</div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge info">MEDIUM</span>
+    <span class="id">SCSC-009</span>
+    <span class="title">No CI workflow runs <code>pip-audit</code>, <code>osv-scanner</code>, <code>zizmor</code> on PRs</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Location</div><div><code>.github/workflows/</code> — only <code>publish.yml</code> exists, triggered on release; no PR/push workflow</div></div>
+    <div class="row"><div class="lbl">Risk</div><div>A new vulnerable dep can be merged to <code>master</code> without any automated scanner objecting. The only enforcement happens at release time, which is too late if a security regression made it past code review.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div>Generate <code>.github/workflows/lockdown.yml</code> via <code>/lockdown baseline</code> — runs on every PR + nightly cron and fails on CRITICAL findings.</div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>true</code> — <code>/lockdown baseline</code></div></div>
+  </div>
+</div>
+
+<div class="finding">
+  <header>
+    <span class="badge info">LOW</span>
+    <span class="id">SCSC-010</span>
+    <span class="title">Local scanner tools missing (limits future audit coverage)</span>
+  </header>
+  <div class="body">
+    <div class="row"><div class="lbl">Tools</div><div><code>osv-scanner</code>, <code>gitleaks</code>, <code>socket</code>, <code>scorecard</code>, <code>trivy</code></div></div>
+    <div class="row"><div class="lbl">Risk</div><div>This audit had to fall back to grep heuristics for several phases. A repeat run with these installed will catch more.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div><pre><code>brew install osv-scanner gitleaks trivy
+curl -fsSL https://socket.dev/install.sh | sh
+go install github.com/ossf/scorecard/v5@latest</code></pre></div></div>
+    <div class="row"><div class="lbl">Auto-fixable</div><div><code>false</code> — user installs locally</div></div>
+  </div>
+</div>
+
+<aside class="callout ok">
+  <strong>What's already good:</strong>
+  <ul style="margin:.4rem 0 0 1.2rem;">
+    <li><code>uv.lock</code> committed with SHA-256 hashes on every package (68 packages, all hashed)</li>
+    <li><code>pip-audit</code> reports zero known CVEs in the dep tree</li>
+    <li>PyPI Trusted Publishers configured (<code>id-token: write</code> + no long-lived <code>PYPI_API_TOKEN</code> secret)</li>
+    <li><code>permissions:</code> block exists on the publish workflow (just needs to move <code>id-token</code> to a single job)</li>
+    <li><code>.gitignore</code> covers <code>.env</code>, <code>*.pem</code>, <code>*.key</code>, <code>.npmrc</code>, <code>.pypirc</code>, <code>service-account*</code>, OAuth token files, SQLite DBs</li>
+    <li>Pre-built shims for credential-file leakage in <code>.gitignore</code> (rare; well done)</li>
+    <li>No hardcoded secrets found in current tree</li>
+  </ul>
+</aside>
+
+<h2 id="remediation">Remediation Plan</h2>
+<p>Run <code>/lockdown fix</code> to apply the auto-fixable items below interactively. Each becomes its own commit.</p>
+
+<h3>Auto-fixable (run <code>/lockdown fix</code>)</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> SCSC-001 — pin <code>pypa/gh-action-pypi-publish</code> to SHA</li>
+  <li><input type="checkbox" disabled> SCSC-002 — pin all <code>actions/*</code> uses to SHAs</li>
+  <li><input type="checkbox" disabled> SCSC-003 — move <code>id-token: write</code> to publish job only</li>
+  <li><input type="checkbox" disabled> SCSC-004 — add <code>step-security/harden-runner</code> (audit mode) to both jobs</li>
+  <li><input type="checkbox" disabled> SCSC-005 — add <code>persist-credentials: false</code> to <code>actions/checkout</code></li>
+  <li><input type="checkbox" disabled> SCSC-006 — add CycloneDX SBOM generation to release build</li>
+  <li><input type="checkbox" disabled> SCSC-007 — create <code>.github/dependabot.yml</code> with 7-day cooldown</li>
+  <li><input type="checkbox" disabled> SCSC-008 — create <code>.pre-commit-config.yaml</code> (gitleaks, detect-secrets, actionlint, zizmor)</li>
+</ul>
+
+<h3>Run <code>/lockdown baseline</code></h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> SCSC-009 — generate <code>.github/workflows/lockdown.yml</code> (CI scanner workflow)</li>
+</ul>
+
+<h3>User installs locally</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> SCSC-010 — install <code>osv-scanner</code>, <code>gitleaks</code>, <code>socket</code>, <code>scorecard</code>, <code>trivy</code></li>
+</ul>
+
+<p>Estimated post-fix score: <strong>~92 (Hardened)</strong> — assumes all auto-fixable items applied and <code>baseline</code> workflow added.</p>
+
+<h2 id="manual">Manual Verification (require <code>gh</code> admin scope or human eyes)</h2>
+<ol>
+  <li>GitHub org → <em>Settings → Actions → General</em>: "Workflow permissions" set to <strong>Read repository contents and packages permissions</strong>. Uncheck "Allow GitHub Actions to create and approve pull requests."</li>
+  <li>GitHub org → <em>Settings → Actions → General → Policies</em>: enable <strong>"Require actions to be pinned to a full-length commit SHA"</strong>.</li>
+  <li>GitHub org → <em>Code security</em>: enable <strong>Secret Scanning + Push Protection</strong>.</li>
+  <li>Repo → <em>Settings → Rules → Rulesets</em> for <code>master</code>: require signed commits, PR with 1 reviewer, dismiss stale, required status checks (add the new lockdown workflow once it's running), block force-push, linear history.</li>
+  <li>Repo → <em>Settings → Environments</em>: create a <code>pypi</code> environment with required reviewers. Move the OIDC trust scope onto the environment, not the repo.</li>
+  <li>PyPI maintainer accounts: confirm <strong>FIDO2 hardware-key 2FA</strong> (not TOTP) on all owners. Revoke any long-lived API tokens still present.</li>
+  <li>GitHub maintainer accounts: confirm WebAuthn 2FA enforced org-wide. Audit PATs and shorten lifetimes to ≤ 7 days.</li>
+</ol>
+
+<h2 id="hipaa">HIPAA Mapping</h2>
+<aside class="callout info">
+  <strong>Applicability:</strong> claude-jacked itself does not process PHI — it's a developer tool. But the user maintains other repos that do, and this mapping is the canonical reference for those projects. Each row notes whether the corresponding control is currently met in claude-jacked.
+</aside>
+
+<table>
+  <thead><tr><th>Safeguard</th><th>§</th><th>Supply-chain control</th><th>Status here</th></tr></thead>
+  <tbody>
+    <tr><td>Unique user ID</td><td>164.312(a)(1)</td><td>Per-maintainer PyPI accounts; FIDO2 2FA</td><td class="hipaa-cell partial">manual verify</td></tr>
+    <tr><td>Encryption at rest</td><td>164.312(a)(2)(iv)</td><td>Secret-scanning, .gitignore coverage</td><td class="hipaa-cell ok">covered</td></tr>
+    <tr><td>Audit Controls</td><td>164.312(b)</td><td>Sigstore Rekor transparency log via cosign / SLSA provenance</td><td class="hipaa-cell missing">no SLSA / cosign yet</td></tr>
+    <tr><td>Integrity Controls</td><td>164.312(c)(1)</td><td>Lockfile hash pinning, cosign signature verify at deploy, SBOM attestation</td><td class="hipaa-cell partial">lockfile ok; no SBOM/cosign</td></tr>
+    <tr><td>Authentication</td><td>164.312(d)</td><td>Trusted Publishers OIDC (no long-lived tokens), MFA</td><td class="hipaa-cell ok">Trusted Publishers active</td></tr>
+    <tr><td>Transmission Security</td><td>164.312(e)(1)</td><td>TLS-only registries, signed manifests</td><td class="hipaa-cell ok">PyPI TLS-only</td></tr>
+    <tr><td>Risk Analysis</td><td>164.308(a)(1)(ii)(A)</td><td>Continuous CVE scanning in CI, quarterly Scorecard run</td><td class="hipaa-cell missing">no in-CI scanners yet</td></tr>
+    <tr><td>Workforce termination</td><td>164.308(a)(3)(ii)(C)</td><td>Off-boarding checklist (GitHub/npm/PyPI/cloud revocation)</td><td class="hipaa-cell partial">runbook needed</td></tr>
+    <tr><td>Activity review</td><td>164.308(a)(1)(ii)(D)</td><td>Harden-Runner anomaly alerts to SIEM, monitor cosign verification failures</td><td class="hipaa-cell missing">no harden-runner yet</td></tr>
+    <tr><td>Incident procedures</td><td>164.308(a)(6)</td><td>IR runbook for malicious-dep + credential compromise</td><td class="hipaa-cell missing">runbook needed</td></tr>
+    <tr><td>Contingency plan</td><td>164.308(a)(7)</td><td>Internal mirror / vendored deps; SBOM for blast-radius queries</td><td class="hipaa-cell missing">no SBOM, no mirror</td></tr>
+    <tr><td>Periodic evaluation</td><td>164.308(a)(8)</td><td>Annual third-party pen-test + SLSA self-attestation</td><td class="hipaa-cell partial">internal only today</td></tr>
+  </tbody>
+</table>
+
+<p>
+<strong>4 of 12</strong> HIPAA-relevant safeguards have full supply-chain coverage in this repo; 4 are partial; 4 are missing. Applying the auto-fix plan above moves <em>Risk Analysis</em>, <em>Activity review</em>, and <em>Integrity Controls</em> to "covered" — a 7/12 baseline. The remaining gaps require organizational process (runbooks, off-boarding, external audit), not code changes.
+</p>
+
+<h2 id="sources">Sources</h2>
+<ul>
+  <li>tj-actions CVE-2025-30066 — <a href="https://nvd.nist.gov/vuln/detail/cve-2025-30066">NVD</a>, <a href="https://www.wiz.io/blog/github-action-tj-actions-changed-files-supply-chain-attack-cve-2025-30066">Wiz analysis</a></li>
+  <li>CISA alert (Shai-Hulud, Sept 2025) — <a href="https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem">cisa.gov</a></li>
+  <li>PyPI Shai-Hulud impact — <a href="https://blog.pypi.org/posts/2025-11-26-pypi-and-shai-hulud/">blog.pypi.org</a></li>
+  <li>PyPI Trusted Publishers + PEP 740 attestations — <a href="https://blog.pypi.org/posts/2024-11-14-pypi-now-supports-digital-attestations/">blog.pypi.org</a></li>
+  <li>StepSecurity Harden-Runner — <a href="https://github.com/step-security/harden-runner">github</a></li>
+  <li>zizmor — <a href="https://github.com/zizmorcore/zizmor">github</a></li>
+  <li>SHA-pinning GitHub policy GA — <a href="https://github.blog/changelog/2025-08-15-github-actions-policy-now-supports-blocking-and-sha-pinning-actions/">github changelog</a></li>
+  <li>SLSA L3 with GitHub Artifact Attestations — <a href="https://github.blog/enterprise-software/devsecops/enhance-build-security-and-reach-slsa-level-3-with-github-artifact-attestations/">github blog</a></li>
+  <li>OpenSSF Scorecard — <a href="https://scorecard.dev/">scorecard.dev</a></li>
+  <li>HIPAA Security Rule Technical Safeguards — <a href="https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.312">ecfr 164.312</a></li>
+  <li>xz-utils backdoor timeline (CVE-2024-3094) — <a href="https://research.swtch.com/xz-timeline">research.swtch.com</a></li>
+</ul>
+
+<hr>
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated by <a href="https://github.com/jackneil/claude-jacked"><code>/lockdown</code></a> · 2026-05-20 · re-run with <code>/lockdown audit</code>
+</p>
+
+</div>
+</body>
+</html>

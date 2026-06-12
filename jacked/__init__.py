@@ -2,13 +2,15 @@
 Claude Jacked - Smart reviewers, commands, and session search for Claude Code.
 
 Base install provides agents, commands, behavioral rules, a web dashboard,
-and the security gatekeeper (activate with: jacked install --security).
+and the security gatekeeper hook (installed disabled — Claude Code's auto
+permission mode handles approvals natively; turn the gatekeeper on from
+Settings > Gatekeeper in the dashboard for LLM-evaluated interception).
 Install extras for additional features:
   uv tool install "claude-jacked[search]"    — session search via Qdrant
   uv tool install "claude-jacked[all]"       — everything
 """
 
-__version__ = "0.24.0"
+__version__ = "0.46.2"
 
 
 def _qdrant_available() -> bool:

@@ -23,7 +23,50 @@ Read this when the user asks about jacked features, installation, gatekeeper, lo
 | `~/.claude/gatekeeper-prompt.txt` | Custom gatekeeper LLM prompt (optional, user-created) |
 | `~/.claude/jacked-guardrails/*.md` | Guardrails templates (base + 4 languages) |
 | `~/.claude/jacked-hooks/*.sh` | Git hook templates (installed extensionless) |
+| `~/.claude/jacked-templates/*.html` | HTML scaffolds for human-readable artifacts (plans, specs, research, checkpoints) |
 | `<project>/JACKED_GUARDRAILS.md` | Per-project coding standards (created by `jacked guardrails init`) |
+
+## Artifact Format Preference
+
+When you write a file that a **human will open and read** (plans, specs, research summaries, checkpoints, design docs, internal knowledge artifacts), **prefer HTML over Markdown**. Markdown is only a great choice when something else renders it for the human — GitHub's web UI, a wiki engine, a docs site. When the user opens the file directly from disk, HTML wins on every axis:
+
+| Need | Markdown (opened locally) | HTML |
+|------|---------------------------|------|
+| Headings, sections | Plain text, no styling | Typography, anchored TOC |
+| Diagrams | Stays as `mermaid` source code | Renders via Mermaid.js |
+| Tables | ASCII pipes | Styled, accessible |
+| Code | Backticks | Monospace block with proper background |
+| Dark mode | None | `prefers-color-scheme` adapts |
+| Print / PDF export | Untyped page breaks | Print stylesheet with `break-inside: avoid` |
+
+### Rule
+
+- **HTML (`.html`)** for: `docs/plans/`, `docs/specs/`, `docs/design/`, `docs/superpowers/plans/`, `docs/superpowers/specs/`, `.claude/checkpoints/`, `.claude/research/`, and any other location holding a human-consumed artifact.
+- **Markdown (`.md`)** for: `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE.md`, `_wiki/*.md` (GitHub-rendered), and `CLAUDE.md`, `AGENTS.md`, `lessons.md`, `MEMORY.md` (Claude reads these as instructions at session start — Markdown is the format Claude Code expects there).
+
+### How to write an HTML artifact
+
+Start from the bundled template. The canonical filename is **`plan-template.html`** — it covers all artifact types (plans, specs, research, checkpoints) via the `<meta name="jacked:type">` tag and adaptive sections:
+
+```bash
+cp ~/.claude/jacked-templates/plan-template.html docs/superpowers/plans/$(date +%Y-%m-%d)-{slug}.html
+```
+
+The template includes:
+- Embedded CSS (no external stylesheet — works offline)
+- Mermaid.js via CDN with **automatic fallback** that surfaces diagram source if the CDN is unreachable
+- Dark mode via `prefers-color-scheme`
+- Print stylesheet with sensible page breaks
+- Metadata `<meta>` tags (`jacked:type`, `jacked:status`, `jacked:branch`, `jacked:date`) so artifacts are machine-introspectable
+- Status badges, callouts (info/warn/danger/ok), task checklists, file-structure tables, anchored TOC
+
+Replace `{{PLACEHOLDERS}}`, keep the sections you want, delete the rest. Pure HTML — no preprocessor.
+
+### When to break the rule
+
+You may keep Markdown for an internal artifact **only** when a downstream tool *requires* Markdown input — a static-site generator that ingests `.md`, a linter that scans Markdown for issues, a CI step expecting specific frontmatter. That's the only valid reason.
+
+"It feels short," "no diagrams needed," "it's just notes," or "the user will probably never reopen it" are NOT valid overrides. The template's overhead is one `cp` command; the cost of getting it wrong is a file that's harder to read every time anyone opens it.
 
 ## CLI Commands
 

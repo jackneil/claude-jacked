@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>Jacked Update</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+        body { font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+               max-width: 640px; margin: 2em auto; padding: 0 1em; color: #e5e7eb;
+               background: #0b1020; }
+        h1 { font-size: 1.2em; margin: 0 0 0.5em; }
+        .meta { color: #9ca3af; font-size: 0.85em; margin-bottom: 1.5em; }
+        ol.phases { list-style: none; padding: 0; }
+        li.phase { padding: 0.6em 0.8em; margin: 0.3em 0; border-radius: 6px;
+                   background: #1f2937; display: flex; align-items: center;
+                   gap: 0.7em; }
+        li.phase.ok { background: #064e3b; }
+        li.phase.in_progress { background: #1e3a8a; }
+        li.phase.failed { background: #7f1d1d; }
+        li.phase.pending { opacity: 0.55; }
+        .dot { width: 0.7em; height: 0.7em; border-radius: 50%; display: inline-block; }
+        .dot.ok { background: #10b981; }
+        .dot.in_progress { background: #3b82f6; animation: pulse 1s infinite; }
+        .dot.failed { background: #ef4444; }
+        .dot.pending { background: #6b7280; }
+        @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
+        .banner { padding: 1em; border-radius: 6px; margin: 1.5em 0;
+                  background: #1f2937; display: none; }
+        .banner.succeeded { background: #064e3b; }
+        .banner.failed { background: #7f1d1d; }
+        .banner.stuck { background: #78350f; }
+        a.button { display: inline-block; margin-top: 0.7em;
+                   padding: 0.5em 1em; background: #2563eb; color: #fff;
+                   text-decoration: none; border-radius: 4px; }
+        code { background: #111827; padding: 0.1em 0.4em; border-radius: 3px; }
+        .banner .row { margin-top: 0.4em; }
+    </style>
+</head>
+<body>
+    <h1>Jacked is updating&hellip;</h1>
+    <div class="meta" id="meta">Waiting for first status update&hellip;</div>
+    <ol class="phases" id="phases"></ol>
+    <div id="banner" class="banner"></div>
+
+    <script>
+    // PHASES mirrors jacked/service/update_phases.py — enforced by
+    // tests/unit/service/test_update_phases.py::test_update_html_embeds_all_phase_names.
+    const PHASES = [
+        ["waiting_for_parent", "Waiting for old tray to exit"],
+        ["installing_package", "Installing package"],
+        ["migrating_settings", "Migrating settings"],
+        ["waiting_port_free",  "Waiting for port to free"],
+        ["starting_service",   "Starting new service"],
+        ["verifying_service",  "Verifying new service"],
+    ];
+
+    const state = {
+        startedAt: null,
+        serverMtime: null,
+        targetVersion: null,
+        fromVersion: null,
+        method: null,
+        currentVersion: null,
+        overall: "in_progress",
+        error: null,
+        recovery: null,
+        phases: {},
+        serviceDownSince: null,
+    };
+
+    function clearChildren(el) {
+        while (el.firstChild) el.removeChild(el.firstChild);
+    }
+
+    function makeEl(tag, className, text) {
+        const el = document.createElement(tag);
+        if (className) el.className = className;
+        if (text !== undefined) el.textContent = text;
+        return el;
+    }
+
+    function renderPhases() {
+        const ol = document.getElementById("phases");
+        clearChildren(ol);
+        for (const [name, label] of PHASES) {
+            const entry = state.phases[name] || { status: "pending" };
+            const li = makeEl("li", "phase " + entry.status);
+            li.appendChild(makeEl("span", "dot " + entry.status));
+            li.appendChild(makeEl("span", null, label));
+            ol.appendChild(li);
+        }
+    }
+
+    function renderMeta() {
+        const meta = document.getElementById("meta");
+        if (!state.startedAt) {
+            meta.textContent = "Waiting for first status update\u2026";
+            return;
+        }
+        const elapsed = Math.max(0, Math.round((Date.now() - state.startedAt) / 1000));
+        const target = state.targetVersion && state.targetVersion !== "next"
+            ? "v" + state.targetVersion : "\u2026";
+        const from = state.fromVersion ? "v" + state.fromVersion : "?";
+        let txt = "From " + from + " \u2192 " + target + " \u2022 " + elapsed + "s elapsed";
+        if (state.method) txt += " \u2022 method: " + state.method;
+        meta.textContent = txt;
+    }
+
+    function renderBanner() {
+        const banner = document.getElementById("banner");
+        clearChildren(banner);
+        banner.style.display = "none";
+        banner.className = "banner";
+
+        const targetKnown = state.targetVersion && state.targetVersion !== "next";
+        const done = state.overall === "succeeded" ||
+            (targetKnown && state.currentVersion === state.targetVersion);
+
+        let serverAgeMs = null;
+        if (state.serverMtime) {
+            const t = Date.parse(state.serverMtime);
+            if (!Number.isNaN(t)) serverAgeMs = Date.now() - t;
+        }
+        const stuck = !done && state.overall !== "failed" &&
+            serverAgeMs !== null && serverAgeMs > 120000;
+
+        if (done) {
+            banner.classList.add("succeeded");
+            const v = state.currentVersion || state.targetVersion || "";
+            banner.appendChild(makeEl("div", null, "Update complete \u2014 jacked is now v" + v + "."));
+            const a = makeEl("a", "button", "Open dashboard");
+            a.href = "/";
+            banner.appendChild(a);
+            banner.style.display = "block";
+        } else if (state.overall === "failed") {
+            banner.classList.add("failed");
+            banner.appendChild(makeEl("div", null, "Update failed."));
+            if (state.error) {
+                const row = makeEl("div", "row");
+                row.appendChild(makeEl("b", null, "Error: "));
+                row.appendChild(document.createTextNode(state.error));
+                banner.appendChild(row);
+            }
+            if (state.recovery) {
+                const row = makeEl("div", "row");
+                row.appendChild(makeEl("b", null, "Recovery: "));
+                row.appendChild(makeEl("code", null, state.recovery));
+                banner.appendChild(row);
+            }
+            banner.style.display = "block";
+        } else if (stuck) {
+            banner.classList.add("stuck");
+            banner.appendChild(makeEl("div", null,
+                "Update appears stuck (no progress in >120s). See ~/.claude/jacked-update.log."));
+            const a = makeEl("a", "button", "Try the dashboard anyway");
+            a.href = "/";
+            banner.appendChild(a);
+            banner.style.display = "block";
+        }
+    }
+
+    function render() {
+        renderPhases();
+        renderMeta();
+        renderBanner();
+    }
+
+    async function pollStatus() {
+        try {
+            const r = await fetch("/api/update/status", {cache: "no-store"});
+            if (r.ok) {
+                const body = await r.json();
+                if (body && body.status) {
+                    state.serviceDownSince = null;
+                    state.serverMtime = body.mtime_iso || state.serverMtime;
+                    if (!state.startedAt && body.status.started_at) {
+                        state.startedAt = Date.parse(body.status.started_at);
+                    }
+                    state.targetVersion = body.status.to_version || state.targetVersion;
+                    state.fromVersion = body.status.from_version || state.fromVersion;
+                    state.method = body.status.method || state.method;
+                    state.overall = body.status.overall || state.overall;
+                    state.error = body.status.error;
+                    state.recovery = body.status.recovery;
+                    state.phases = {};
+                    for (const p of body.status.phases || []) {
+                        state.phases[p.name] = p;
+                    }
+                }
+            }
+        } catch (_) {
+            state.serviceDownSince = state.serviceDownSince || Date.now();
+        }
+    }
+
+    async function pollVersion() {
+        try {
+            const r = await fetch("/api/version", {cache: "no-store"});
+            if (r.ok) {
+                const body = await r.json();
+                if (body && typeof body.current === "string") {
+                    state.currentVersion = body.current;
+                }
+                state.serviceDownSince = null;
+            }
+        } catch (_) {
+            state.serviceDownSince = state.serviceDownSince || Date.now();
+        }
+    }
+
+    let pollHandle = null;
+
+    async function tick() {
+        await Promise.all([pollStatus(), pollVersion()]);
+        render();
+        const targetKnown = state.targetVersion && state.targetVersion !== "next";
+        const terminal = state.overall === "succeeded" ||
+            state.overall === "failed" ||
+            (targetKnown && state.currentVersion === state.targetVersion);
+        if (terminal && pollHandle !== null) {
+            clearInterval(pollHandle);
+            pollHandle = null;
+        }
+    }
+
+    tick();
+    pollHandle = setInterval(tick, 1000);
+    </script>
+</body>
+</html>

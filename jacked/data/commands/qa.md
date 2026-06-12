@@ -1,5 +1,5 @@
 ---
-description: "Browser-based QA testing of UI changes from the current session. Pass a URL as argument, or let it auto-detect."
+description: Use when testing UI changes for visual correctness, interactions, console errors, and edge cases. Pass a URL as argument, or let it auto-detect.
 ---
 
 > **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.
@@ -178,6 +178,24 @@ Navigate to the app URL. For each UI area affected by the changes:
 ### Responsive (if applicable)
 - Resize the browser to mobile width (375px) and check layout
 - Resize to tablet width (768px) and check layout
+
+### Accessibility Lens (if available)
+
+Check if an accessibility specialist lens is installed:
+
+```bash
+ls ~/.claude/lenses/accessibility.md .claude/lenses/accessibility.md 2>/dev/null | head -1
+```
+
+If found, read it and incorporate its "What to check" items into your testing checklist. These are **additive** — they don't replace your existing QA checks. Focus on items that can be verified visually or via browser DevTools:
+
+- Color contrast (use DevTools accessibility panel or Lighthouse)
+- Keyboard navigation (tab through the page, verify focus indicators)
+- Semantic HTML (inspect elements — buttons should be `<button>`, not `<div>`)
+- Form labels (each input has a visible, associated `<label>`)
+- Focus management after interactions (modal open/close, route changes)
+
+Skip items that require specialized tooling (screen reader testing, automated WCAG scanners) unless the user specifically requests them.
 
 ## Step 7: Report Findings
 

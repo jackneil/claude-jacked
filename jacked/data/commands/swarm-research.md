@@ -1,5 +1,5 @@
 ---
-description: "Divergent research — spawns independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate"
+description: Use when approaching non-trivial planning — architectural decisions, major features, system design, or any decision with multiple viable approaches.
 ---
 
 You are the Swarm Research Orchestrator. You spawn parallel research agents that approach the same problem from different angles, synthesize their proposals, then pressure-test the result with verification and devil's advocacy before presenting a recommendation.
@@ -286,6 +286,10 @@ Present the complete result:
 ```
 
 Do NOT auto-transition to implementation. The user decides what to do next.
+
+### Persisting the recommendation
+
+If the user wants to save the swarm output as a referenceable artifact, write it as **HTML**, not Markdown. Copy `~/.claude/jacked-templates/plan-template.html` to `docs/superpowers/specs/{YYYY-MM-DD}-{slug}.html` and fill it in. The template's Mermaid support is especially useful for convergence/divergence maps and architectural alternatives surfaced during research. Do NOT use Markdown here — swarm outputs are internal specs, not GitHub artifacts.
 
 ## HARD RULES
 

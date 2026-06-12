@@ -5,9 +5,64 @@
 // Auto-refresh usage state
 // ---------------------------------------------------------------------------
 let _autoRefreshInterval = null;
+let _checkCountdownInterval = null;
+
+function _startCheckCountdown() {
+    if (_checkCountdownInterval) return;
+    _checkCountdownInterval = setInterval(function() {
+        var els = document.querySelectorAll('[data-next-check]');
+        if (els.length === 0) return;
+        var now = Math.floor(Date.now() / 1000);
+        // Read latest usage_cached_at from state — updated in real time
+        // by the usage_poll_updated WebSocket event.
+        var activeId = window.jackedState.activeCredentialAccountId;
+        var accounts = window.jackedState.accounts || [];
+        var activeAcct = accounts.find(function(a) { return a.id === activeId; });
+        var cachedAt = activeAcct ? activeAcct.usage_cached_at : null;
+        // Use backend-provided poll interval and last-poll timestamp
+        // instead of guessing from raw usage thresholds.
+        var pollInterval = activeAcct._poll_interval || 300;
+        var lastPollAt = activeAcct._last_poll_at || cachedAt;
+        if (!lastPollAt) {
+            els.forEach(function(el) {
+                el.textContent = 'starting\u2026';
+            });
+            return;
+        }
+        var rem = Math.max(0, pollInterval - (now - lastPollAt));
+        var tierLabel = activeAcct._poll_tier ? ' (' + activeAcct._poll_tier + ')' : '';
+        els.forEach(function(el) {
+            if (rem > 0) {
+                el.textContent = rem + 's' + tierLabel;
+            } else if (lastPollAt && (now - lastPollAt) > 2 * pollInterval) {
+                el.textContent = 'delayed';
+            } else {
+                el.textContent = 'checking\u2026';
+            }
+            el.setAttribute('data-cached-at', String(lastPollAt));
+        });
+    }, 1000);
+}
+
+function _stopCheckCountdown() {
+    if (_checkCountdownInterval) {
+        clearInterval(_checkCountdownInterval);
+        _checkCountdownInterval = null;
+    }
+}
+
 let _autoRefreshCountdown = 0;
 let _lastAutoRefreshAt = null; // Date.now() of last COMPLETED auto-refresh; null = no prior refresh or stopped
-const _singleRefreshInFlight = new Set(); // tracks accountIds with pending single-refresh
+// Absolute floor for automated bulk refresh passes — matches the smallest dropdown option.
+// No automated path may fire more often than this, no matter what localStorage says
+// (the key is shared across tabs, so another tab can write values under our feet).
+const _AUTO_REFRESH_FLOOR_SECS = 120;
+let _lastBulkStartedAt = null; // Date.now() when the last bulk pass STARTED (any initiator)
+let _rateGuardWarned = false;  // warn once per suppression streak, reset when a pass starts
+const _singleRefreshInFlight = new Map(); // accountId -> Date.now() when the refresh started
+// Backstop: entries older than this are treated as stale (orphaned by a refresh whose
+// finally never ran) so the user isn't locked out of refreshing that account forever.
+const _SINGLE_REFRESH_STALE_MS = 240000;
 // Shared via window.jackedState so websocket.js can check it without cross-file globals
 if (window.jackedState) window.jackedState._usageRefreshInProgress = false;
 const _refreshSvg = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>';
@@ -18,9 +73,12 @@ if (localStorage.getItem('jacked_auto_refresh') === '1' && !localStorage.getItem
 }
 localStorage.removeItem('jacked_auto_refresh');
 
-// Get user's configured auto-refresh interval (seconds), 0 = off
+// Get user's configured auto-refresh interval (seconds), 0 = off.
+// Non-zero values are clamped to the floor at this single choke point so no
+// consumer (tick, success-path reset, carry-over math) can run faster than it.
 function _getAutoRefreshSeconds() {
-    return parseInt(localStorage.getItem('jacked_auto_refresh_interval') || '0', 10) || 0;
+    const secs = parseInt(localStorage.getItem('jacked_auto_refresh_interval') || '0', 10) || 0;
+    return secs <= 0 ? 0 : Math.max(secs, _AUTO_REFRESH_FLOOR_SECS);
 }
 
 // Format countdown: "2:05" for >= 60s, "45s" for < 60s
@@ -226,49 +284,36 @@ function bindAccountEvents() {
         });
     });
 
-    // Set Active buttons
-    document.querySelectorAll('.btn-set-active').forEach(btn => {
+    // "Use Account" button — switches all Claude Code sessions to this account
+    document.querySelectorAll('.btn-use-account').forEach(btn => {
         btn.addEventListener('click', async () => {
             if (window.jackedState._accountActionInFlight) {
                 showToast('Another action is in progress', 'warning', 2000);
                 return;
             }
             const id = btn.dataset.id;
-            const email = btn.dataset.email || 'this account';
-            const result = await Swal.fire({
-                title: 'Switch Active Account?',
-                html: `Set <strong>${escapeHtml(email)}</strong> as Claude Code's active account?<br><br>You'll need to restart Claude Code for this to take effect.`,
-                icon: 'question',
-                showCancelButton: true,
-                confirmButtonText: 'Switch Account',
-                cancelButtonText: 'Cancel',
-                focusCancel: true,
-            });
-            if (!result.isConfirmed) return;
-
-            btn.disabled = true;
-            const originalHtml = btn.innerHTML;
-            btn.innerHTML = '<div class="spinner" style="width:12px;height:12px;border-width:2px"></div>';
+            const email = btn.dataset.email || '';
             window.jackedState._accountActionInFlight = true;
-
+            btn.disabled = true;
+            btn.textContent = 'Switching\u2026';
             try {
                 await api.post(`/api/auth/accounts/${id}/use`);
-                showToast(`Switched to ${email} — restart Claude Code`, 'success');
-                await refreshAndRender();
+                showToast(`Switched to ${email}`, 'success');
+                await loadActiveCredential();
             } catch (e) {
                 showToast(e.message, 'error');
-                btn.disabled = false;
-                btn.innerHTML = originalHtml;
             } finally {
                 window.jackedState._accountActionInFlight = false;
+                await refreshAndRender();
             }
         });
     });
 
-    // Refresh All Usage button
+    // Refresh All Usage button — userInitiated exempts it from the automated
+    // fire-rate guard (the server throttles repeat manual passes gracefully).
     const refreshAllBtn = document.getElementById('btn-refresh-all-usage');
     if (refreshAllBtn) {
-        refreshAllBtn.addEventListener('click', () => _triggerUsageRefresh().catch(() => {}));
+        refreshAllBtn.addEventListener('click', () => _triggerUsageRefresh({ userInitiated: true }).catch(() => {}));
     }
 
     // Per-card refresh usage buttons
@@ -345,6 +390,8 @@ function bindAccountEvents() {
             }
         });
     });
+
+    _startCheckCountdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -424,13 +471,29 @@ function hideDeleteConfirm(accountId) {
 // ---------------------------------------------------------------------------
 // Usage refresh — shared by button click and auto-refresh
 // ---------------------------------------------------------------------------
-async function _triggerUsageRefresh() {
+async function _triggerUsageRefresh(options) {
+    const userInitiated = !!(options && options.userInitiated);
+    // Global fire-rate guard for ALL automated callers (auto-tick, overdue fires,
+    // anything else): never start a bulk pass within the floor of the previous start,
+    // regardless of which timer or tab-state bug got us here. Manual clicks are exempt —
+    // the server throttles repeat passes gracefully with cached results.
+    if (!userInitiated && _lastBulkStartedAt !== null
+            && (Date.now() - _lastBulkStartedAt) < _AUTO_REFRESH_FLOOR_SECS * 1000) {
+        if (!_rateGuardWarned) {
+            _rateGuardWarned = true;
+            console.warn('jacked: automated usage refresh suppressed — previous bulk pass started under '
+                + _AUTO_REFRESH_FLOOR_SECS + 's ago');
+        }
+        return;
+    }
     if (window.jackedState._usageRefreshInProgress) {
         showToast('Usage refresh already in progress', 'warning', 2000);
         return;
     }
     const btn = document.getElementById('btn-refresh-all-usage');
     window.jackedState._usageRefreshInProgress = true;
+    _lastBulkStartedAt = Date.now();
+    _rateGuardWarned = false;
     if (btn) {
         btn.disabled = true;
         _setRefreshBtnText(btn, 'Refreshing...');
@@ -451,7 +514,12 @@ async function _triggerUsageRefresh() {
     }
 
     try {
-        const result = await api.post('/api/auth/accounts/refresh-all-usage');
+        const ss = window.jackedState.swapSettings || {};
+        const activeId = window.jackedState.activeCredentialAccountId;
+        const skipParam = (ss.auto_swap_enabled && activeId) ? '?skip_account=' + activeId : '';
+        // Bulk refresh runs ~2s per account server-side — needs more headroom than the
+        // default 60s API timeout when many accounts are configured.
+        const result = await api.post('/api/auth/accounts/refresh-all-usage' + skipParam, undefined, { timeout: 300000 });
         if (result.refreshed === 0 && result.failed === 0) {
             showToast('No active accounts to refresh', 'warning');
         } else if (result.failed > 0) {
@@ -469,8 +537,16 @@ async function _triggerUsageRefresh() {
             // both reset the countdown, which is correct (a manual refresh acts like an early tick).
             // When auto-refresh is OFF (_autoRefreshInterval is null), we skip this so a manual click
             // doesn't silently start tracking _lastAutoRefreshAt without a timer running.
-            _autoRefreshCountdown = _getAutoRefreshSeconds();
-            _lastAutoRefreshAt = Date.now();
+            const secs = _getAutoRefreshSeconds();
+            if (secs <= 0) {
+                // Interval flipped to OFF mid-pass (the localStorage key is shared across
+                // tabs — another tab's circuit breaker can write '0' under us). Never reset
+                // the countdown to 0: that makes every subsequent 1s tick fire a bulk pass.
+                _autoRefreshCircuitBreak();
+            } else {
+                _autoRefreshCountdown = Math.max(secs, _AUTO_REFRESH_FLOOR_SECS);
+                _lastAutoRefreshAt = Date.now();
+            }
         }
         // Clean up any remaining overlays (e.g., if WS events were missed)
         document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
@@ -487,7 +563,13 @@ async function _triggerUsageRefresh() {
         document.querySelectorAll('[data-account-id].usage-queued, [data-account-id].usage-checking').forEach(
             el => el.classList.remove('usage-queued', 'usage-checking')
         );
-        showToast(e.message, 'error');
+        if (e && e.code === 'REFRESH_IN_PROGRESS') {
+            // Server bulk lock held by another tab (or a manual click there) —
+            // benign contention, not a backend failure. Info, not error.
+            showToast('Another usage refresh is already in progress', 'info', 3000);
+        } else {
+            showToast(e.message, 'error');
+        }
         throw e; // re-throw so callers (e.g., _autoRefreshTick) can react
     } finally {
         window.jackedState._usageRefreshInProgress = false;
@@ -506,20 +588,33 @@ async function _triggerSingleUsageRefresh(accountId) {
         showToast('Bulk refresh in progress — please wait', 'warning', 2000);
         return;
     }
-    if (_singleRefreshInFlight.has(accountId)) return;
+    const startedAt = _singleRefreshInFlight.get(accountId);
+    if (startedAt !== undefined) {
+        if (Date.now() - startedAt < _SINGLE_REFRESH_STALE_MS) {
+            showToast('Refresh already running for this account', 'warning', 2000);
+            return;
+        }
+        _singleRefreshInFlight.delete(accountId);
+    }
 
     const card = document.querySelector('[data-account-id="' + accountId + '"]');
     if (!card) return;
 
-    _singleRefreshInFlight.add(accountId);
+    const startStamp = Date.now();
+    _singleRefreshInFlight.set(accountId, startStamp);
     card.classList.remove('usage-done', 'usage-failed');
     card.classList.add('usage-checking');
     if (typeof _usageInjectOverlay === 'function') {
         _usageInjectOverlay(card, 'checking', 'Checking usage\u2026');
     }
+    // Watchdog: if WS events never clear the class, this returns the card to
+    // idle after _CHECKING_TIMEOUT_MS so the user can click refresh again.
+    // (api.post itself times out after 60s, but WS-driven classes can still leak.)
+    if (typeof _armCheckingWatchdog === 'function') _armCheckingWatchdog(accountId);
 
     try {
         await api.post('/api/auth/accounts/' + accountId + '/refresh-usage');
+        if (typeof _clearCheckingWatchdog === 'function') _clearCheckingWatchdog(accountId);
         if (window.jackedState.activeRoute === 'accounts') {
             await refreshAndRender();
             // Apply success overlay to the newly-rendered card (old DOM node was replaced)
@@ -538,6 +633,7 @@ async function _triggerSingleUsageRefresh(accountId) {
             }
         }
     } catch (e) {
+        if (typeof _clearCheckingWatchdog === 'function') _clearCheckingWatchdog(accountId);
         const current = document.querySelector('[data-account-id="' + accountId + '"]');
         if (current) {
             current.classList.remove('usage-checking');
@@ -554,7 +650,11 @@ async function _triggerSingleUsageRefresh(accountId) {
         }
         showToast('Refresh failed: ' + e.message, 'error');
     } finally {
-        _singleRefreshInFlight.delete(accountId);
+        // Only clear our own entry — a stale-superseded call settling late must not
+        // delete the timestamp of the refresh that replaced it.
+        if (_singleRefreshInFlight.get(accountId) === startStamp) {
+            _singleRefreshInFlight.delete(accountId);
+        }
     }
 }
 
@@ -602,6 +702,7 @@ function _stopAutoRefresh() {
         clearInterval(_autoRefreshInterval);
         _autoRefreshInterval = null;
     }
+    _stopCheckCountdown();
     // Clearing _lastAutoRefreshAt ensures re-enable takes the "fresh start" path in
     // _changeAutoRefreshInterval (null timestamp = no elapsed time to carry over).
     // This applies to both: user selecting "Off" (manual stop) and the error circuit-breaker
@@ -610,13 +711,35 @@ function _stopAutoRefresh() {
     _updateRefreshBtnLabel();
 }
 
-function _changeAutoRefreshInterval(newSecs) {
+// Circuit breaker shared by every auto-refresh failure / zero-interval path:
+// persist OFF, sync the dropdown, and stop this tab's timer.
+function _autoRefreshCircuitBreak() {
+    localStorage.setItem('jacked_auto_refresh_interval', '0');
+    const sel = document.getElementById('sel-auto-refresh');
+    if (sel) sel.value = '0';
+    _stopAutoRefresh();
+}
+
+function _changeAutoRefreshInterval(newSecs, opts) {
+    // Optional one-shot phase offset (storage-listener arms only): tabs armed by
+    // the same localStorage write share a wall-clock phase and fire in the same
+    // ~1s window every cycle, contending for the server bulk lock.
+    const phaseJitterSecs = (opts && opts.phaseJitterSecs) || 0;
     if (_autoRefreshInterval) clearInterval(_autoRefreshInterval);
     _autoRefreshInterval = null;
 
+    // Defense in depth: callers route 0 through _stopAutoRefresh already, but a
+    // 0/negative interval must never arm a timer (countdown 0 = bulk pass every
+    // tick), and nothing may run faster than the floor.
+    if (!newSecs || newSecs <= 0) {
+        _stopAutoRefresh();
+        return;
+    }
+    newSecs = Math.max(newSecs, _AUTO_REFRESH_FLOOR_SECS);
+
     if (!_lastAutoRefreshAt) {
         // Coming from OFF state or cold start — always start fresh, no immediate fire
-        _autoRefreshCountdown = newSecs;
+        _autoRefreshCountdown = newSecs + phaseJitterSecs;
         _lastAutoRefreshAt = Date.now();
         _autoRefreshInterval = setInterval(_autoRefreshTick, 1000);
         _updateRefreshBtnLabel();
@@ -628,8 +751,6 @@ function _changeAutoRefreshInterval(newSecs) {
 
     if (remaining <= 0) {
         // Overdue at new interval — fire immediately if not already refreshing.
-        // Note: .catch(() => {}) is intentional — unlike _autoRefreshTick's circuit-breaker catch,
-        // this is a one-shot user-triggered fire; transient errors should not stop the timer.
         _autoRefreshCountdown = newSecs;
         // IMPORTANT: _autoRefreshInterval MUST be assigned before _triggerUsageRefresh() is called.
         // The success block in _triggerUsageRefresh checks _autoRefreshInterval to decide whether
@@ -640,7 +761,14 @@ function _changeAutoRefreshInterval(newSecs) {
         // completion. If the fire is skipped (in-flight guard), _lastAutoRefreshAt stays at the
         // previous completed-refresh time, which is the correct anchor for elapsed-time calculations.
         if (!window.jackedState._usageRefreshInProgress) {
-            _triggerUsageRefresh().catch(() => {});
+            // Same circuit breaker as _autoRefreshTick — a failed overdue fire must not
+            // leave the timer armed against a broken backend (the old bare .catch let it spin).
+            // REFRESH_IN_PROGRESS is the exception: another tab's pass holds the server bulk
+            // lock — benign contention, skip this cycle (the countdown is already armed above).
+            _triggerUsageRefresh().catch((e) => {
+                if (e && e.code === 'REFRESH_IN_PROGRESS') return;
+                _autoRefreshCircuitBreak();
+            });
         }
     } else {
         // Carry over elapsed time — next tick is sooner than a full new interval
@@ -655,20 +783,38 @@ async function _autoRefreshTick() {
     if (!btn) return;
     if (window.jackedState._usageRefreshInProgress || window.jackedState._accountActionInFlight) return;
 
+    const secs = _getAutoRefreshSeconds();
+    if (secs <= 0) {
+        // localStorage is shared across tabs: another tab's circuit breaker (or the user
+        // there) wrote '0'. Stop OUR timer too — ticking on a 0 interval fires a bulk
+        // pass every second.
+        _autoRefreshCircuitBreak();
+        return;
+    }
+
     _autoRefreshCountdown--;
     if (_autoRefreshCountdown > 0) {
         _updateRefreshBtnLabel();
         return;
     }
 
+    // Pre-arm the next cycle at >= the floor BEFORE firing, so a skipped or failed pass
+    // can't leave the countdown at 0 and refire on the very next tick. The success path
+    // in _triggerUsageRefresh re-resets it anyway.
+    _autoRefreshCountdown = Math.max(secs, _AUTO_REFRESH_FLOOR_SECS);
     try {
         await _triggerUsageRefresh();
     } catch (e) {
+        if (e && e.code === 'REFRESH_IN_PROGRESS') {
+            // Another tab holds the server bulk lock — benign contention, not a
+            // backend failure. The countdown was pre-armed above, so skipping
+            // this cycle is safe. Circuit-breaking here would write '0' to the
+            // SHARED localStorage key and the storage listener would then kill
+            // auto-refresh in EVERY tab.
+            return;
+        }
         showToast('Auto-refresh failed: ' + e.message, 'error');
-        localStorage.setItem('jacked_auto_refresh_interval', '0');
-        const sel = document.getElementById('sel-auto-refresh');
-        if (sel) sel.value = '0';
-        _stopAutoRefresh();
+        _autoRefreshCircuitBreak();
     }
 }
 
@@ -713,6 +859,26 @@ function bindAutoRefreshToggle() {
         }
     });
 }
+
+// Cross-tab sync: 'jacked_auto_refresh_interval' is shared across tabs, and the circuit
+// breaker in one tab writes '0' to it. Without this listener, other tabs keep their timer
+// armed and read the new value on their own schedule — the runaway path in the 2026-06
+// fetch storm (a running timer reading 0 fires a bulk pass on every 1s tick). Re-sync
+// this tab's timer and dropdown whenever the key changes elsewhere.
+window.addEventListener('storage', (e) => {
+    if (!e || e.key !== 'jacked_auto_refresh_interval') return;
+    const secs = _getAutoRefreshSeconds();
+    const sel = document.getElementById('sel-auto-refresh');
+    if (sel) sel.value = String(secs);
+    if (secs <= 0) {
+        _stopAutoRefresh();
+    } else {
+        // De-phase from the tab that wrote the key: arming an identical countdown
+        // at the same wall-clock instant makes both tabs fire together, and the
+        // loser of the server bulk-lock race eats a 429 on every cycle.
+        _changeAutoRefreshInterval(secs, { phaseJitterSecs: Math.floor(Math.random() * 11) });
+    }
+});
 
 // ---------------------------------------------------------------------------
 // Active credential loader

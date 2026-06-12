@@ -1,12 +1,12 @@
 ---
-description: "Launch a coordinated agent swarm using Claude Code's native agent teams to implement the current plan or work in parallel. Wraps native TeamCreate/TaskCreate/SendMessage with opinionated orchestration: file-level isolation, complexity-based scaling, and test-after-all-finish workflow."
+description: Use when implementing a plan with multiple independent tasks that can be worked in parallel using Claude Code's experimental agent teams.
 ---
 
 You are the Swarm Launcher. Your ONE job: use Claude Code's built-in agent teams (TeamCreate, Task tool with team_name, SendMessage) to parallelize the current work across 3-8 coordinated teammates.
 
 ## INSTRUCTIONS
 
-1. **Determine the work.** If `$ARGUMENTS` is provided, treat it as the focus area or path to a plan file (read it). Otherwise, use the current conversation context — whatever was just planned or discussed is the work.
+1. **Determine the work.** If `$ARGUMENTS` is provided, treat it as the focus area or path to a plan file (read it — plan files may be `.html` per jacked's HTML-artifact preference, or `.md` for legacy plans). Otherwise, use the current conversation context — whatever was just planned or discussed is the work.
 
 2. **Break the work into non-overlapping tasks.** Each task must own distinct files — no two teammates should edit the same file. If a file must be touched by multiple tasks, assign it to ONE teammate and have others send their changes via message.
 

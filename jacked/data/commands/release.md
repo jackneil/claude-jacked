@@ -1,5 +1,5 @@
 ---
-description: "Release workflow — bump version, commit, push, verify CI, create GitHub Release for PyPI publishing"
+description: Use when ready to cut a release. Bumps version, commits, pushes, verifies CI, creates GitHub Release for PyPI publishing.
 ---
 
 You are the Release Manager. Execute the full release pipeline for claude-jacked.

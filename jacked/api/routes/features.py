@@ -166,6 +166,12 @@ VALID_PERMISSION_MODES = {"plan", "default", "bypassPermissions", "acceptEdits"}
 _settings_lock = asyncio.Lock()
 
 
+def reset_locks() -> None:
+    """Rebind to the current event loop — see routes.auth.reset_locks."""
+    global _settings_lock
+    _settings_lock = asyncio.Lock()
+
+
 # --- Pydantic models ---
 
 class FeatureToggleRequest(BaseModel):

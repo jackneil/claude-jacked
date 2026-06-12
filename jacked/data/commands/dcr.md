@@ -1,5 +1,5 @@
 ---
-description: "Parallel recursive review — selects relevant lenses, spawns focused reviewers per wave until all selected lenses pass clean"
+description: Use after implementing a feature, fixing a bug, or completing any non-trivial code change. Recursive multi-lens review that continues until all selected lenses pass clean.
 ---
 
 You are the Recursive Double-Check Dispatcher. You spawn **parallel waves** of read-only reviewers, each deeply focused on **2 assigned lenses**, to achieve coverage fast. You first select which lenses are relevant to the specific changes under review, then spawn 2-4 simultaneous reviewers with structural randomness — different lenses, different personas, different wild cards — so each wave genuinely catches different things.
@@ -160,7 +160,7 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
 
 0. **Plan mode check**: Look for a current system reminder containing "Plan mode is active" or "you MUST NOT make any edits" (exact phrases, not partial matches). If found:
    - Set `phase = PLANNING`. Skip step 1.
-   - Find the plan file path in the system reminder and read it as the review target. If no path is found, ask: "What plan doc should I review?"
+   - Find the plan file path in the system reminder and read it as the review target. The file may be `.html` (jacked's preferred format — see `~/.claude/jacked-reference.md` § Artifact Format Preference) or `.md` (legacy plans or external sources). Both are valid review targets. If no path is found, ask: "What plan doc should I review?"
    - **Lens selection**: use Planning Phase Lenses from Config Override if present; otherwise apply the defaults listed in Config Override (Guardrails + Logic & Edge Cases + Maintainability + Simplicity & Reuse). Config Override takes precedence over step 0 defaults.
    - Reviewers analyze the plan document: architectural soundness, completeness, missing edge cases, over-engineering, logical gaps. Reviewers remain READ-ONLY as always.
    - **Fix phase**: the parent dispatcher (you) edits the plan file to incorporate findings — this is the one file editable in plan mode. Do not edit any other files.
@@ -193,10 +193,10 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
     - `.editorconfig`, `biome.json`, `.eslintrc*`, `.prettierrc*`, `ruff.toml`
 
     **Design documents and architectural decisions:**
-    - `docs/`, `design/`, `doc/`, `architecture/` directories — scan for `*.md` files
+    - `docs/`, `design/`, `doc/`, `architecture/` directories — scan for both `*.md` and `*.html` files (jacked plans/specs are HTML)
     - `adr/`, `adrs/`, `decisions/`, `architecture-decisions/` (ADR directories)
-    - `docs/plans/` (plan files from brainstorming sessions)
-    - `RFC*.md`, `DESIGN*.md`, `ARCHITECTURE*.md` in project root
+    - `docs/plans/`, `docs/superpowers/plans/` (plan files from brainstorming sessions — `.html` preferred, `.md` legacy)
+    - `RFC*.md`, `RFC*.html`, `DESIGN*.md`, `DESIGN*.html`, `ARCHITECTURE*.md`, `ARCHITECTURE*.html` in project root
 
     Read everything found. Be selective about depth — skim large directories but fully
     read root-level convention files and any design docs related to the code under review.
@@ -243,6 +243,23 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
     **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum, 2 reviewers).
     Maximum is all 11 (6 reviewers). Use your judgment.
 
+### SPECIALIST LENS DISCOVERY
+
+3d-ii. **Check for installed specialist lenses.**
+
+After selecting built-in lenses, check for specialist lens files:
+
+1. Glob `~/.claude/lenses/*.md` and `.claude/lenses/*.md`. If neither directory exists, skip (lenses are optional).
+2. Parse frontmatter of each file (name, description, triggers).
+3. If both global and project-local have the same filename, project-local wins. Note: "Project lens `{name}.md` overrides global lens."
+4. Match each lens's `triggers` against the domains identified from changed files (the same heuristic used to select built-in lenses above).
+5. If an active checkpoint exists in `.claude/checkpoints/` with `active_lenses` in frontmatter, include those lenses regardless of trigger matching.
+6. **Cap:** include at most 4 specialist lenses. If more match, take the top 4 by trigger specificity (most tags matched). Tiebreaker: alphabetical by filename. List remaining as "also relevant" in the announcement.
+
+Each matched specialist lens is added to the selected lens pool alongside the built-in lenses. When pairing lenses for reviewers, specialist lenses can be paired with built-in lenses or with each other.
+
+Each specialist lens becomes a reviewer instruction: "Additionally review through the **{lens.name}** lens. Use the following checklist and anti-patterns as your guide:\n{full lens file content}"
+
 3e. **Announce selected lenses with reasoning:**
     ```
     **Lenses selected ([N] of 11):**
@@ -257,6 +274,9 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
       ⊘ Simplicity & Reuse — no new logic added, pure config change
       ⊘ Observability & Debuggability — no error handling or async changes
       ⊘ Data Integrity & Schema Safety — no database or schema changes
+    **Specialist lenses:**
+      ✓ Accessibility (specialist) — frontend files changed
+      ⊘ API Ergonomics — no API routes in diff
     ```
 
 ### WAVE 1 — Selected Coverage

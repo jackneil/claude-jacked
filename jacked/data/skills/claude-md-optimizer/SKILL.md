@@ -1,6 +1,6 @@
 ---
 name: claude-md-optimizer
-description: Audit and optimize CLAUDE.md for both quality AND token efficiency. Scores content quality, identifies bloat, extracts reference material to sub-docs, builds doc chains with strong pointers, and enforces a token budget. Use when CLAUDE.md feels too long, when starting a new project, or when you want to ensure Claude Code gets maximum signal per token.
+description: Use when CLAUDE.md feels bloated or too long, when starting a new project, or when optimizing documentation for token efficiency. Audits content quality, extracts reference material to sub-docs, and enforces a token budget.
 ---
 
 # CLAUDE.md Optimizer

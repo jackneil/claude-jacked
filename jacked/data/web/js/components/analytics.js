@@ -6,6 +6,8 @@
 let analyticsRange = '7d';
 const RANGE_OPTIONS = { '24h': 1, '7d': 7, '30d': 30, '90d': 90, '1y': 365 };
 
+let analyticsSubTab = localStorage.getItem('jacked_analytics_subtab') || 'usage';
+
 // --- Collapsed state persistence ---
 
 function _getCollapsed() {
@@ -116,34 +118,117 @@ function _renderKpis(kpi, tokenCosts) {
 // --- Main render ---
 
 function renderAnalytics() {
-    const rangeButtons = Object.keys(RANGE_OPTIONS).map(r => `
-        <button class="analytics-range-btn text-xs px-3 py-1.5 rounded ${analyticsRange === r ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}" data-range="${r}">${r}</button>
+    const tabs = [
+        { id: 'usage', label: 'Token Usage' },
+        { id: 'gatekeeper', label: 'Gatekeeper' },
+    ];
+
+    const tabHtml = tabs.map(t => `
+        <button class="analytics-subtab text-sm px-4 py-2 rounded-lg ${analyticsSubTab === t.id
+            ? 'bg-teal-600/20 text-teal-300 font-medium'
+            : 'text-slate-400 hover:text-white hover:bg-slate-800'}"
+            data-subtab="${t.id}">${t.label}</button>
     `).join('');
 
     return `
         <div class="max-w-6xl">
-            <div class="flex items-center justify-between mb-5">
+            <div class="flex items-center gap-3 mb-5">
                 <h2 class="text-xl font-semibold text-white">Analytics</h2>
-                <div class="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded-lg p-1">
-                    ${rangeButtons}
-                </div>
+                <div class="flex gap-1 bg-slate-800/50 rounded-lg p-1">${tabHtml}</div>
             </div>
-            <div id="analytics-content" class="space-y-2">
-                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)}</div>
-                ${_section('charts', 'Charts', true, _skeleton(250))}
-                ${_section('heatmap', 'Activity Heatmap', false, _skeleton(200))}
-                ${_section('sessions', 'Session Risk', false, _skeleton(150))}
-                ${_section('rules', 'Rule Intelligence', false, _skeleton(150))}
-                ${_section('agents', 'Agents', false, _skeleton(100))}
-                ${_section('hooks', 'Hook Health', false, _skeleton(100))}
-                ${_section('lessons', 'Lessons', false, _skeleton(100))}
-            </div>
+            <div id="analytics-subtab-content"></div>
         </div>`;
 }
 
-// --- Data loading ---
+// --- Sub-tab loading ---
 
-async function loadAnalyticsData() {
+async function loadAnalyticsSubTab() {
+    const container = document.getElementById('analytics-subtab-content');
+    if (!container) return;
+
+    if (analyticsSubTab === 'gatekeeper') {
+        await _loadGatekeeperAnalytics(container);
+    } else if (analyticsSubTab === 'usage') {
+        await _loadUsageAnalytics(container);
+    }
+}
+
+async function _loadUsageAnalytics(container) {
+    const usageTab = localStorage.getItem('jacked_usage_tab') || 'overview';
+
+    const usageTabHtml = [
+        { id: 'overview', label: 'Overview' },
+        { id: 'sessions', label: 'Sessions' },
+        { id: 'trends', label: 'Trends' },
+    ].map(t => `
+        <button class="usage-tab text-xs px-3 py-1.5 rounded ${usageTab === t.id
+            ? 'bg-blue-600 text-white'
+            : 'text-slate-400 hover:text-white'}"
+            data-usage-tab="${t.id}">${t.label}</button>
+    `).join('');
+
+    container.innerHTML = `
+        <div class="flex items-center gap-2 mb-4">
+            <div class="flex gap-1 bg-slate-800 border border-slate-700 rounded-lg p-1">${usageTabHtml}</div>
+            <div id="usage-live-indicator" class="ml-auto"></div>
+        </div>
+        <div id="usage-tab-content"></div>`;
+
+    // Bind tab clicks
+    container.querySelectorAll('.usage-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            localStorage.setItem('jacked_usage_tab', btn.dataset.usageTab);
+            _loadUsageAnalytics(container);
+        });
+    });
+
+    // Load the active sub-tab
+    const tabContent = document.getElementById('usage-tab-content');
+    if (usageTab === 'overview' && typeof renderUsageOverview === 'function') {
+        await renderUsageOverview(tabContent);
+    } else if (usageTab === 'sessions' && typeof renderUsageSessions === 'function') {
+        await renderUsageSessions(tabContent);
+    } else if (usageTab === 'trends' && typeof renderUsageTrends === 'function') {
+        await renderUsageTrends(tabContent);
+    }
+}
+
+// --- Gatekeeper data loading (moved from former loadAnalyticsData) ---
+
+async function _loadGatekeeperAnalytics(container) {
+    const rangeButtons = Object.keys(RANGE_OPTIONS).map(r => `
+        <button class="analytics-range-btn text-xs px-3 py-1.5 rounded ${analyticsRange === r ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}" data-range="${r}">${r}</button>
+    `).join('');
+
+    container.innerHTML = `
+        <div class="flex items-center justify-end mb-4">
+            <div class="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded-lg p-1">
+                ${rangeButtons}
+            </div>
+        </div>
+        <div id="analytics-content" class="space-y-2">
+            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)}</div>
+            ${_section('charts', 'Charts', true, _skeleton(250))}
+            ${_section('heatmap', 'Activity Heatmap', false, _skeleton(200))}
+            ${_section('sessions', 'Session Risk', false, _skeleton(150))}
+            ${_section('rules', 'Rule Intelligence', false, _skeleton(150))}
+            ${_section('agents', 'Agents', false, _skeleton(100))}
+            ${_section('hooks', 'Hook Health', false, _skeleton(100))}
+            ${_section('lessons', 'Lessons', false, _skeleton(100))}
+        </div>`;
+
+    // Bind range buttons inside the gatekeeper sub-tab
+    container.querySelectorAll('.analytics-range-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            analyticsRange = btn.dataset.range;
+            _loadGatekeeperAnalytics(container);
+        });
+    });
+
+    await _loadGatekeeperData();
+}
+
+async function _loadGatekeeperData() {
     const container = document.getElementById('analytics-content');
     if (!container) return;
 
@@ -268,11 +353,13 @@ function renderAnalyticsPlaceholder(title) {
 // --- Bind events ---
 
 function bindAnalyticsEvents() {
-    document.querySelectorAll('.analytics-range-btn').forEach(btn => {
+    // Bind top-level sub-tab clicks (Token Usage | Gatekeeper)
+    document.querySelectorAll('.analytics-subtab').forEach(btn => {
         btn.addEventListener('click', () => {
-            analyticsRange = btn.dataset.range;
+            analyticsSubTab = btn.dataset.subtab;
+            localStorage.setItem('jacked_analytics_subtab', analyticsSubTab);
             renderRoute('analytics');
         });
     });
-    loadAnalyticsData();
+    loadAnalyticsSubTab();
 }

@@ -5,6 +5,8 @@ Provides command-line interface for indexing, searching, and
 retrieving Claude Code sessions.
 """
 
+import os
+import shutil
 import sys
 import logging
 from pathlib import Path
@@ -765,10 +767,386 @@ def check_version():
             f"[yellow]Update available:[/yellow] {__version__} \u2192 {result['latest']}"
         )
         console.print(
-            "Run: [bold]uv tool upgrade claude-jacked[/bold]"
+            "Run: [bold]jacked upgrade[/bold]  (installs, migrates settings, restarts service)"
         )
     else:
         console.print(f"[green]Up to date:[/green] {__version__}")
+
+
+@main.command()
+@click.option(
+    "--extras",
+    default="tray",
+    help="Optional extras to install (tray, search, all). Default: tray.",
+)
+@click.option(
+    "--skip-service",
+    is_flag=True,
+    help="Don't touch the running service — just upgrade the package + migrate settings.",
+)
+def upgrade(extras: str, skip_service: bool):
+    """Upgrade claude-jacked end-to-end.
+
+    Runs all three steps the tray 'Update' button would do:
+      1. uv tool install 'claude-jacked[<extras>]' --force  (new code on disk)
+      2. jacked install --force                              (migrate settings.json)
+      3. jacked service restart                              (reload running service)
+
+    On POSIX (macOS, Linux): runs inline. Inode semantics let us replace
+    ourselves safely while the interpreter keeps running.
+
+    On Windows: spawns a detached cmd.exe helper that waits for this
+    process to exit before running the install. Windows can't overwrite
+    a running .exe, so we have to step out of the way. This process
+    exits cleanly and the helper takes over.
+    """
+    import subprocess
+    from jacked import __version__
+    from jacked.findbin import find_bin
+    from jacked.install_method import (
+        can_auto_upgrade,
+        detect_install_method,
+        upgrade_command,
+        upgrade_command_label,
+    )
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+
+    # Pre-flight: refuse editable / pip installs before touching the service.
+    _ok, _reason = can_auto_upgrade()
+    if not _ok:
+        console.print(f"[red]Cannot auto-upgrade:[/red] {_reason}")
+        sys.exit(2)
+
+    method = detect_install_method()
+    cmd = upgrade_command(extras)
+    label = upgrade_command_label(extras)
+
+    # uv-based flow requires `uv` on PATH; pip/pipx flows don't.
+    if method == "uv":
+        uv = find_bin("uv")
+        if not uv:
+            console.print(
+                "[red]Error:[/red] jacked was installed via `uv tool install` "
+                "but `uv` isn't on PATH. Install it from https://docs.astral.sh/uv/"
+            )
+            sys.exit(1)
+        cmd[0] = uv  # use resolved absolute path
+
+    console.print(
+        f"[bold]Upgrading claude-jacked from v{__version__}...[/bold]  "
+        f"[dim](install method: {method})[/dim]\n"
+    )
+
+    # Windows can't overwrite a running .exe. Spawn a detached cmd.exe that
+    # waits for this process to die, then does the install + migrate + restart.
+    if sys.platform == "win32":
+        _spawn_windows_upgrade_helper(cmd, label, extras, skip_service)
+        return
+
+    # POSIX path: run inline.
+    _run_upgrade_inline(cmd, label, extras, skip_service, PID_FILE, DEFAULT_HOST, DEFAULT_PORT)
+
+
+def _run_upgrade_inline(
+    cmd: list[str], label: str, extras: str, skip_service: bool,
+    pid_file, host: str, port: int,
+):
+    """Inline upgrade for POSIX. Running binary gets replaced safely via inode."""
+    import subprocess
+    from jacked.findbin import find_bin
+    from jacked.service.process import (
+        is_process_alive,
+        read_pid,
+        stop_process_graceful,
+        wait_for_port_free,
+    )
+
+    # Step 1: package upgrade (uv / pipx / pip, auto-detected).
+    console.print(f"[dim]$ {label}[/dim]")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        console.print(
+            f"[red]Package upgrade failed (exit {result.returncode}). Aborting.[/red]"
+        )
+        sys.exit(result.returncode)
+
+    # Re-resolve jacked — path may have changed after --force.
+    jacked = find_bin("jacked")
+    if not jacked:
+        console.print(
+            "[red]`jacked` not found after install.[/red] "
+            "Check your PATH includes `~/.local/bin`."
+        )
+        sys.exit(1)
+
+    # Step 2: migrate settings.json.
+    console.print(f"\n[dim]$ {jacked} install --force[/dim]")
+    result = subprocess.run([jacked, "install", "--force"])
+    if result.returncode != 0:
+        console.print(
+            f"[yellow]`jacked install` exited {result.returncode}.[/yellow] "
+            "Your settings.json may be in a partial state — check ~/.claude/settings.json.bak-*"
+        )
+
+    # Step 3: stop the tray if it's running, then start fresh detached.
+    #
+    # We call stop_process_graceful() directly — not `jacked service stop` —
+    # because the subprocess version sends SIGTERM and returns without
+    # waiting, and pystray's AppKit runloop on macOS can swallow SIGTERM.
+    # The upgrade must not move on until the old PID is actually dead,
+    # otherwise the detached `service start` below hits "port in use" and
+    # the user is left with the pre-upgrade tray still running.
+    if skip_service:
+        console.print("\n[dim]Skipping service restart (--skip-service)[/dim]")
+    else:
+        info = read_pid(pid_file)
+        was_running = bool(info) and is_process_alive(info["pid"])
+        if was_running:
+            console.print(f"\n[dim]$ stopping service (PID {info['pid']})[/dim]")
+            result = stop_process_graceful(pid_file)
+            if not result["died"]:
+                console.print(
+                    f"[red]Could not stop PID {info['pid']} — port {port} may still be in use.[/red]"
+                )
+                console.print(
+                    "[dim]Run manually: "
+                    f"kill -9 {info['pid']}   then:   {jacked} service start[/dim]"
+                )
+                sys.exit(1)
+            if result["killed"]:
+                console.print(
+                    "[yellow]Tray ignored SIGTERM — force-killed.[/yellow]"
+                )
+            # Port can linger a beat after the PID dies (TIME_WAIT-ish).
+            if not wait_for_port_free(host, port, timeout=10.0):
+                console.print(
+                    f"[red]Port {port} still in use after stop — aborting start.[/red]"
+                )
+                console.print(
+                    f"[dim]Investigate with: lsof -iTCP:{port} -sTCP:LISTEN[/dim]"
+                )
+                sys.exit(1)
+
+        # Start detached — the tray must survive this upgrade process exiting.
+        console.print(f"\n[dim]$ {jacked} service start  (detached)[/dim]")
+        from jacked.service import CLAUDE_DIR
+        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = CLAUDE_DIR / "jacked-service.log"
+        try:
+            log_fh = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+            subprocess.Popen(
+                [jacked, "service", "start"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=log_fh,
+                start_new_session=True,
+                close_fds=True,
+            )
+            console.print(f"[dim]Logs: {log_path}[/dim]")
+        except Exception as exc:
+            console.print(f"[yellow]Could not spawn detached service: {exc}[/yellow]")
+            console.print(f"[dim]Run manually: {jacked} service start[/dim]")
+
+    console.print("\n[green][OK][/green] Upgrade complete.")
+
+
+def _spawn_windows_upgrade_helper(
+    cmd: list[str], label: str, extras: str, skip_service: bool,
+):
+    """Windows: spawn a detached cmd.exe helper and exit this process.
+
+    Running jacked.exe can't be overwritten while we're holding it open.
+    The helper is cmd.exe (a system binary we don't own), which stays
+    valid no matter what the upgrade command does to the jacked venv
+    or user site-packages.
+
+    Helper steps:
+      1. Wait for our PID to exit (avoids racing against the .exe lock).
+      2. Run the detected upgrade command (uv / pipx / pip).
+      3. `jacked install --force` (migrate settings.json).
+      4. `jacked service restart` (unless --skip-service).
+      5. Append progress to ~/.claude/jacked-update.log.
+    """
+    import os
+    import shlex
+    import subprocess
+    import tempfile
+    from jacked.service import CLAUDE_DIR
+
+    my_pid = os.getpid()
+    log_path = CLAUDE_DIR / "jacked-update.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Re-quote the upgrade command for cmd.exe. Paths may contain spaces
+    # (uv from AppData, user site-packages python.exe, etc.); every argv
+    # element must be individually quoted to survive cmd's tokenization.
+    upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
+
+    restart_line = (
+        'if "%SKIP_SERVICE%"=="" (\r\n'
+        '    echo [%date% %time%] service restart >> "%LOGFILE%"\r\n'
+        '    jacked service restart >> "%LOGFILE%" 2>&1\r\n'
+        ')\r\n'
+    )
+    batch_body = (
+        '@echo off\r\n'
+        'set LOGFILE=' + str(log_path) + '\r\n'
+        'set SKIP_SERVICE=' + ("1" if skip_service else "") + '\r\n'
+        'echo [%date% %time%] jacked upgrade helper starting (parent PID ' + str(my_pid) + ') >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
+        ':wait\r\n'
+        'tasklist /FI "PID eq ' + str(my_pid) + '" 2>NUL | find "' + str(my_pid) + '" >NUL\r\n'
+        'if not errorlevel 1 (\r\n'
+        '    timeout /t 1 /nobreak >NUL\r\n'
+        '    goto wait\r\n'
+        ')\r\n'
+        'echo [%date% %time%] parent exited, running upgrade command >> "%LOGFILE%"\r\n'
+        + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
+        'if errorlevel 1 (\r\n'
+        '    echo [%date% %time%] ERROR: upgrade command failed >> "%LOGFILE%"\r\n'
+        '    echo Jacked upgrade failed. See %LOGFILE% for details. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    exit /b 1\r\n'
+        ')\r\n'
+        'echo [%date% %time%] running jacked install --force >> "%LOGFILE%"\r\n'
+        'jacked install --force >> "%LOGFILE%" 2>&1\r\n'
+        + restart_line +
+        'echo [%date% %time%] upgrade complete >> "%LOGFILE%"\r\n'
+        '(goto) 2>nul & del "%~f0"\r\n'
+    )
+
+    # Write the batch file to %TEMP% — it deletes itself at the end.
+    fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-upgrade-")
+    try:
+        with os.fdopen(fd, "w", newline="\r\n") as f:
+            f.write(batch_body)
+    except Exception:
+        try:
+            os.unlink(batch_path)
+        except OSError:
+            pass
+        raise
+
+    # Spawn the batch file detached. DETACHED_PROCESS so it survives our exit.
+    DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    subprocess.Popen(
+        ["cmd.exe", "/c", batch_path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=DETACHED_PROCESS,
+        close_fds=True,
+    )
+
+    console.print(
+        "[yellow]Windows upgrade:[/yellow] spawned detached helper. "
+        "This process will now exit so `jacked.exe` can be replaced."
+    )
+    console.print(f"[dim]Watching log: {log_path}[/dim]")
+    console.print(
+        f"The helper will run `{label}` + `jacked install --force`"
+        + ("" if skip_service else " + `jacked service restart`")
+        + " after this process exits."
+    )
+    # Exit immediately so the lock on jacked.exe releases.
+    sys.exit(0)
+
+
+def _valid_hook_names() -> frozenset[str]:
+    """Allowlist of hook names derived from files in data/hooks/.
+
+    Using the filesystem as the single source of truth means adding a
+    new hook doesn't require updating a separate list.
+    """
+    hooks_dir = _get_data_root() / "hooks"
+    if not hooks_dir.exists():
+        return frozenset()
+    return frozenset(
+        p.stem
+        for p in hooks_dir.glob("*.py")
+        if not p.stem.startswith("_")
+    )
+
+
+@main.command(name="_update_status_init", hidden=True)
+@click.argument("from_version")
+@click.argument("to_version")
+@click.argument("method")
+@click.option("--log-path", default=None)
+def _update_status_init_shim(from_version, to_version, method, log_path):
+    """Internal: initialize a fresh update-status file.
+
+    Exit 0 on success, 2 on LockBusy (another updater active).
+    The Windows batch checks errorlevel and aborts on 2.
+    """
+    from jacked.service import update_status as us_mod
+    try:
+        us_mod.init_status(
+            us_mod.UPDATE_STATUS_FILE,
+            from_version=from_version,
+            to_version=to_version,
+            method=method,
+            log_path=log_path,
+        )
+    except us_mod.LockBusy as exc:
+        click.echo(f"[update-status] lock busy: {exc}", err=True)
+        sys.exit(2)
+
+
+@main.command(name="_update_status", hidden=True)
+@click.argument("phase")
+@click.argument("status")
+@click.option("--error", default=None)
+@click.option("--recovery", default=None)
+def _update_status_shim(phase, status, error, recovery):
+    """Internal: write one status transition. `status` is in_progress|ok|failed."""
+    from jacked.service import update_status as us_mod
+    path = us_mod.UPDATE_STATUS_FILE
+    try:
+        if status == "in_progress":
+            us_mod.begin_phase(path, phase)
+        else:
+            us_mod.end_phase(path, phase, status=status, error=error, recovery=recovery)
+    except ValueError as exc:
+        # Exit non-zero so the Windows batch's `if errorlevel 1` check fires
+        # on phase-name drift between the batch and update_phases.PHASES.
+        click.echo(f"[update-status] {exc}", err=True)
+        sys.exit(1)
+
+
+@main.command(name="_update_status_succeed", hidden=True)
+def _update_status_succeed_shim():
+    """Internal: mark overall=succeeded on the update-status file."""
+    from jacked.service import update_status as us_mod
+    us_mod.mark_succeeded(us_mod.UPDATE_STATUS_FILE)
+
+
+@main.command(name="_hook", hidden=True)
+@click.argument("name")
+def _hook_shim(name: str):
+    """Internal: dispatch to a hook handler by name.
+
+    Called by Claude Code hooks via `jacked _hook <name>`. The handler's
+    main() reads hook input from stdin as usual.
+
+    Indirection keeps settings.json paths stable across `uv tool upgrade`.
+    """
+    if name not in _valid_hook_names():
+        click.echo(f"Unknown hook: {name}", err=True)
+        sys.exit(2)
+
+    import importlib
+    try:
+        module = importlib.import_module(f"jacked.data.hooks.{name}")
+    except ImportError as e:
+        click.echo(f"Hook import failed: {name} ({e})", err=True)
+        sys.exit(2)
+
+    if not hasattr(module, "main"):
+        click.echo(f"Hook has no main(): {name}", err=True)
+        sys.exit(2)
+
+    module.main()
 
 
 @main.command()
@@ -899,6 +1277,101 @@ def _is_editable_install() -> bool:
     return (repo_root / ".git").is_dir()
 
 
+# Path markers identifying jacked-managed hook entries in settings.json.
+# Anchored to tokens we actually write — won't match a user's unrelated
+# script that happens to share a hook name.
+_JACKED_HOOK_PATH_MARKERS = (
+    "/site-packages/jacked/data/hooks/",   # normal install
+    "/claude-jacked/jacked/data/hooks/",   # editable clone path
+    "jacked\" _hook ",                      # shim form we write: "<path>/jacked" _hook <name>
+    "-m jacked _hook ",                     # fallback form (dev without PATH shim)
+)
+
+
+def _is_jacked_managed_hook_path(command: str) -> bool:
+    """True if this settings.json command value was installed by jacked.
+
+    Anchored to path substrings we write — won't falsely match a user's
+    own script named security_gatekeeper.py in an unrelated directory.
+    """
+    if not command:
+        return False
+    return any(marker in command for marker in _JACKED_HOOK_PATH_MARKERS)
+
+
+def _build_hook_command(hook_name: str) -> str:
+    """Build the settings.json command for a jacked hook.
+
+    Prefers the `jacked _hook <name>` shim (upgrade-safe via uv's stable
+    binary path). Falls back to `{python} -m jacked _hook <name>` when
+    `jacked` isn't on PATH (dev/editable installs). Never writes a bare
+    site-packages path — that's the stale-path bug this exists to fix.
+    """
+    from jacked.findbin import find_bin
+
+    jacked_bin = find_bin("jacked")
+    if jacked_bin:
+        return f'"{jacked_bin}" _hook {hook_name}'
+
+    # Fallback for dev/editable without the shim on PATH.
+    python_exe = sys.executable or shutil.which("python3") or shutil.which("python")
+    return f'"{python_exe}" -m jacked _hook {hook_name}'
+
+
+def _snapshot_settings(settings_path: Path) -> Path | None:
+    """Copy settings.json to a timestamped backup. Returns backup path or None.
+
+    No-op if source doesn't exist.
+    """
+    import shutil as _shutil
+    import time
+
+    if not settings_path.exists():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = settings_path.parent / f"{settings_path.name}.bak-{stamp}"
+    i = 0
+    while backup.exists():
+        i += 1
+        backup = settings_path.parent / f"{settings_path.name}.bak-{stamp}-{i}"
+    _shutil.copy2(settings_path, backup)
+    return backup
+
+
+def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
+    """Keep only the newest `keep` backups; delete older ones."""
+    backups = sorted(dir_path.glob(f"{prefix}*"))
+    while len(backups) > keep:
+        backups[0].unlink(missing_ok=True)
+        backups = backups[1:]
+
+
+def _write_settings_atomic(settings_path: Path, data: dict) -> None:
+    """Atomically write settings.json via tempfile + os.replace.
+
+    Prevents half-written JSON if the process is killed mid-install.
+    """
+    import json as _json
+    import tempfile
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".settings-",
+        suffix=".tmp",
+        dir=str(settings_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+        os.replace(tmp, settings_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _link_or_copy(src: Path, dst: Path) -> str:
     """Symlink src→dst for editable installs, copy otherwise.
 
@@ -939,6 +1412,65 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     # Last resort: plain copy
     _shutil.copy(src, dst)
     return "copied"
+
+
+def _install_asset_dir(
+    src_dir: Path,
+    dst_dir: Path,
+    asset_label: str,
+    *,
+    glob_pattern: str = "*.md",
+    force: bool = False,
+) -> tuple[int, int, str | None]:
+    """Install assets from src_dir to dst_dir with conflict handling.
+
+    Handles: symlink detection, hardlink detection, content comparison,
+    force overwrite, and interactive conflict prompts.
+
+    Returns (installed_count, skipped_count, link_method).
+    """
+    if not src_dir.exists():
+        return 0, 0, None
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    installed = 0
+    skipped = 0
+    link_method = None
+
+    for src_file in sorted(src_dir.glob(glob_pattern)):
+        dst_file = dst_dir / src_file.name
+
+        # Already a correct symlink — always skip
+        if dst_file.is_symlink() and dst_file.resolve() == src_file.resolve():
+            skipped += 1
+            continue
+
+        # Already a hardlink to same inode — always skip
+        if not dst_file.is_symlink() and dst_file.exists():
+            try:
+                if dst_file.stat().st_ino == src_file.stat().st_ino:
+                    skipped += 1
+                    continue
+            except OSError:
+                pass
+
+        # Existing file with same content — skip unless --force
+        if not force and not dst_file.is_symlink() and dst_file.exists():
+            if src_file.read_text(encoding="utf-8") == dst_file.read_text(
+                encoding="utf-8"
+            ):
+                skipped += 1
+                continue
+            if sys.stdin.isatty() and not click.confirm(
+                f"{asset_label.title()} '{src_file.name}' exists with different content. Overwrite?"
+            ):
+                skipped += 1
+                continue
+
+        link_method = _link_or_copy(src_file, dst_file)
+        installed += 1
+
+    return installed, skipped, link_method
 
 
 def _sound_hook_marker() -> str:
@@ -1303,9 +1835,6 @@ def _install_session_tracker_hook(existing: dict, settings_path: Path):
     is using by reading ~/.claude/.credentials.json at session start and on re-auth.
     The Stop hook fires a throttled heartbeat to keep sessions visible in the dashboard.
     """
-    import json
-    import shutil
-
     marker = _session_tracker_marker()
     script_path = _get_data_root() / "hooks" / "session_account_tracker.py"
 
@@ -1316,28 +1845,35 @@ def _install_session_tracker_hook(existing: dict, settings_path: Path):
         console.print("[yellow]Skipping session tracker installation[/yellow]")
         return
 
-    python_exe = sys.executable
-    if not python_exe or not Path(python_exe).exists():
-        python_exe = shutil.which("python3") or shutil.which("python") or "python"
-
-    python_path = str(Path(python_exe)).replace("\\", "/")
-    script_str = str(script_path).replace("\\", "/")
-    command_str = f"{python_path} {script_str}"
+    command_str = _build_hook_command("session_account_tracker")
 
     modified = False
     for event_name, matcher in SESSION_TRACKER_EVENTS:
         if event_name not in existing["hooks"]:
             existing["hooks"][event_name] = []
 
-        # Find existing hook for this event+matcher
+        # Find existing hook for this event+matcher.
+        # Match jacked-managed entries by anchored path markers OR the new shim form.
         hook_index = None
         needs_upgrade = False
         for i, hook_entry in enumerate(existing["hooks"][event_name]):
-            hook_str = str(hook_entry)
             entry_matcher = hook_entry.get("matcher", "")
-            if entry_matcher == matcher and (
-                marker in hook_str or "session_account_tracker" in hook_str
-            ):
+            if entry_matcher != matcher:
+                continue
+            entry_cmd = ""
+            for h in hook_entry.get("hooks", []):
+                entry_cmd = h.get("command", "")
+                break
+            hook_str = str(hook_entry)
+            is_ours = (
+                marker in hook_str
+                or _is_jacked_managed_hook_path(entry_cmd)
+                or (
+                    "session_account_tracker" in entry_cmd
+                    and _is_jacked_managed_hook_path(entry_cmd)
+                )
+            )
+            if is_ours:
                 hook_index = i
                 for h in hook_entry.get("hooks", []):
                     if h.get("command", "") != command_str:
@@ -1369,8 +1905,7 @@ def _install_session_tracker_hook(existing: dict, settings_path: Path):
         console.print("[yellow][-][/yellow] Session tracker hooks already configured")
         return
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2))
+    _write_settings_atomic(settings_path, existing)
     events_str = ", ".join(e for e, _ in SESSION_TRACKER_EVENTS)
     console.print(f"[green][OK][/green] Installed session tracker for: {events_str}")
 
@@ -1403,6 +1938,24 @@ def _verify_session_tracker_hooks(settings: dict):
             )
 
 
+def _ensure_permission_request_hook(existing: dict, command_str: str):
+    """Ensure the gatekeeper is registered for PermissionRequest events."""
+    if "PermissionRequest" not in existing.get("hooks", {}):
+        existing.setdefault("hooks", {})["PermissionRequest"] = []
+    # Only strip jacked-managed entries — leave user custom hooks alone.
+    existing["hooks"]["PermissionRequest"] = [
+        h for h in existing["hooks"]["PermissionRequest"]
+        if not any(
+            _is_jacked_managed_hook_path(inner.get("command", ""))
+            for inner in h.get("hooks", [])
+        )
+    ]
+    existing["hooks"]["PermissionRequest"].append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command_str, "timeout": 10}],
+    })
+
+
 def _install_security_hook(existing: dict, settings_path: Path):
     """Install a single catch-all security gatekeeper PreToolUse hook.
 
@@ -1411,10 +1964,8 @@ def _install_security_hook(existing: dict, settings_path: Path):
     DB/registry config. Migrates old per-tool entries to catch-all mode.
 
     Handles fresh install, version upgrades, and migration from PermissionRequest.
+    Only rewrites jacked-managed entries — user-custom hooks are left alone.
     """
-    import json
-    import shutil
-
     script_path = _get_data_root() / "hooks" / "security_gatekeeper.py"
 
     if not script_path.exists():
@@ -1424,24 +1975,21 @@ def _install_security_hook(existing: dict, settings_path: Path):
         console.print("[yellow]Skipping security gatekeeper installation[/yellow]")
         return
 
-    # Find python executable — prefer the one running this process
-    python_exe = sys.executable
-    if not python_exe or not Path(python_exe).exists():
-        python_exe = shutil.which("python3") or shutil.which("python") or "python"
+    command_str = _build_hook_command("security_gatekeeper")
 
-    # Use forward slashes for the command (works on Windows too)
-    python_path = str(Path(python_exe)).replace("\\", "/")
-    script_str = str(script_path).replace("\\", "/")
-    command_str = f"{python_path} {script_str}"
+    def _entry_is_jacked_gatekeeper(entry: dict) -> bool:
+        for h in entry.get("hooks", []):
+            cmd = h.get("command", "")
+            if _is_jacked_managed_hook_path(cmd):
+                return True
+        return False
 
-    # Migrate: remove old PermissionRequest hooks
+    # Migrate: remove old jacked-managed PermissionRequest gatekeeper hooks
     if "PermissionRequest" in existing.get("hooks", {}):
         old_hooks = existing["hooks"]["PermissionRequest"]
         before = len(old_hooks)
         existing["hooks"]["PermissionRequest"] = [
-            h
-            for h in old_hooks
-            if "security_gatekeeper" not in str(h)
+            h for h in old_hooks if not _entry_is_jacked_gatekeeper(h)
         ]
         if len(existing["hooks"]["PermissionRequest"]) < before:
             console.print(
@@ -1451,45 +1999,41 @@ def _install_security_hook(existing: dict, settings_path: Path):
     if "PreToolUse" not in existing["hooks"]:
         existing["hooks"]["PreToolUse"] = []
 
-    # Migrate: remove old per-tool gatekeeper entries (non-empty matcher)
+    # Migrate: remove old jacked-managed per-tool gatekeeper entries (non-empty matcher)
     existing["hooks"]["PreToolUse"] = [
         h for h in existing["hooks"]["PreToolUse"]
         if not (
-            "security_gatekeeper" in str(h)
+            _entry_is_jacked_gatekeeper(h)
             and h.get("matcher", "") != ""
         )
     ]
 
-    # Check if catch-all already exists and is up to date
+    # Check if jacked catch-all already exists; upgrade its command if needed.
     for entry in existing["hooks"]["PreToolUse"]:
-        if (
-            entry.get("matcher") == ""
-            and "security_gatekeeper" in str(entry)
-        ):
-            # Update command if python path changed
+        if entry.get("matcher") == "" and _entry_is_jacked_gatekeeper(entry):
             for h in entry.get("hooks", []):
                 if h.get("command", "") != command_str:
                     h["command"] = command_str
-                    settings_path.parent.mkdir(parents=True, exist_ok=True)
-                    settings_path.write_text(json.dumps(existing, indent=2))
-                    console.print(
-                        "[green][OK][/green] Updated security gatekeeper hook (python path changed)"
-                    )
-                    return
+
+            _ensure_permission_request_hook(existing, command_str)
+            _write_settings_atomic(settings_path, existing)
             console.print(
-                "[yellow][-][/yellow] Security gatekeeper hook already configured"
+                "[green][OK][/green] Security gatekeeper hook configured"
             )
             return
 
-    # Add catch-all entry
+    # Add catch-all PreToolUse entry
     existing["hooks"]["PreToolUse"].append({
         "matcher": "",
         "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
     })
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2))
-    console.print("[green][OK][/green] Installed security gatekeeper (catch-all hook)")
+    # Also register as PermissionRequest to auto-approve comment-stripped
+    # commands and provide updatedInput (clean command without # comments).
+    _ensure_permission_request_hook(existing, command_str)
+
+    _write_settings_atomic(settings_path, existing)
+    console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse + PermissionRequest)")
 
     # Clean up stale prompt file from older versions (v0.3.9 and earlier created
     # this automatically, but it goes stale on upgrades and triggers warnings).
@@ -1626,9 +2170,6 @@ def _install_qa_hook(existing: dict, settings_path: Path):
     >>> callable(_install_qa_hook)
     True
     """
-    import json
-    import shutil
-
     script_path = _get_data_root() / "hooks" / "qa_suggest.py"
 
     if not script_path.exists():
@@ -1637,27 +2178,27 @@ def _install_qa_hook(existing: dict, settings_path: Path):
         )
         return
 
-    python_exe = sys.executable
-    if not python_exe or not Path(python_exe).exists():
-        python_exe = shutil.which("python3") or shutil.which("python") or "python"
-
-    python_path = str(Path(python_exe)).replace("\\", "/")
-    script_str = str(script_path).replace("\\", "/")
-    command_str = f"{python_path} {script_str}"
+    command_str = _build_hook_command("qa_suggest")
 
     if "Stop" not in existing["hooks"]:
         existing["hooks"]["Stop"] = []
 
-    # Check if already installed and up to date
+    def _is_jacked_qa_entry(entry: dict) -> bool:
+        for h in entry.get("hooks", []):
+            if _is_jacked_managed_hook_path(h.get("command", "")):
+                if "qa_suggest" in h.get("command", ""):
+                    return True
+        return False
+
+    # Check if already installed; upgrade the command if path changed.
     for entry in existing["hooks"]["Stop"]:
-        if "qa_suggest" in str(entry):
+        if _is_jacked_qa_entry(entry):
             for h in entry.get("hooks", []):
                 if h.get("command", "") != command_str:
                     h["command"] = command_str
-                    settings_path.parent.mkdir(parents=True, exist_ok=True)
-                    settings_path.write_text(json.dumps(existing, indent=2))
+                    _write_settings_atomic(settings_path, existing)
                     console.print(
-                        "[green][OK][/green] Updated QA suggest hook (python path changed)"
+                        "[green][OK][/green] Updated QA suggest hook (path migrated to shim)"
                     )
                     return
             console.print(
@@ -1670,8 +2211,7 @@ def _install_qa_hook(existing: dict, settings_path: Path):
         "hooks": [{"type": "command", "command": command_str, "async": True}],
     })
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2))
+    _write_settings_atomic(settings_path, existing)
     console.print("[green][OK][/green] Installed QA suggest hook (Stop event)")
 
 
@@ -1911,9 +2451,9 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     help="Install session indexing hook (requires [search] extra)",
 )
 @click.option(
-    "--security",
+    "--no-security",
     is_flag=True,
-    help="Install security gatekeeper hook",
+    help="Skip installing the security gatekeeper hook (hook is installed but disabled by default)",
 )
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
 @click.option(
@@ -1922,12 +2462,16 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     is_flag=True,
     help="Overwrite existing agents/commands without prompting",
 )
-def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: bool):
+def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force: bool):
     """Auto-install skill, agents, commands, and optional hooks.
 
-    Base install: agents, commands, behavioral rules, /jacked skill.
+    Base install: agents, commands, behavioral rules, /jacked skill,
+    and the security gatekeeper hook (installed disabled — Claude Code's
+    auto permission mode handles approvals natively; turn the gatekeeper on
+    from the dashboard at Settings > Gatekeeper when you want LLM-evaluated
+    interception layered on top).
+    Use --no-security to skip installing the gatekeeper hook entirely.
     Use --search to add session indexing (requires qdrant-client).
-    Use --security to add security gatekeeper (requires anthropic SDK).
     """
     import json
     import shutil
@@ -1935,23 +2479,18 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     home = Path.home()
     pkg_root = _get_data_root()
 
-    # Auto-detect extras: if the package is installed, enable by default
-    has_qdrant = False
-    try:
-        import qdrant_client  # noqa: F401
-
-        has_qdrant = True
-    except ImportError:
-        pass
-
-    install_search = search or has_qdrant
-    install_security = security
+    install_search = search
+    install_security = not no_security
 
     console.print("[bold]Installing Jacked...[/bold]\n")
 
     # Check for existing settings
     settings_path = home / ".claude" / "settings.json"
     if settings_path.exists():
+        # Snapshot before we mutate — timestamped, keeps last 5.
+        backup = _snapshot_settings(settings_path)
+        if backup:
+            _rotate_backups(settings_path.parent, prefix="settings.json.bak-", keep=5)
         try:
             existing = json.loads(settings_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -2012,7 +2551,12 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
             skill_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy(skill_md, skill_dir / "SKILL.md")
+            dst = skill_dir / "SKILL.md"
+            # Use _link_or_copy (symlink in editable mode, copy otherwise).
+            # Plain shutil.copy raises SameFileError if dst is already a
+            # symlink pointing to src — broke the tray-triggered upgrade
+            # flow when a manual symlink from dev/testing was present.
+            _link_or_copy(skill_md, dst)
             skill_count += 1
     if skill_count > 0:
         console.print(f"[green][OK][/green] Installed {skill_count} skills")
@@ -2037,43 +2581,14 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     editable = _is_editable_install()
     agents_src = pkg_root / "agents"
     agents_dst = home / ".claude" / "agents"
+    agent_count, agent_skipped, agent_method = _install_asset_dir(
+        agents_src, agents_dst, "agent", glob_pattern="*.md", force=force
+    )
     if agents_src.exists():
-        agents_dst.mkdir(parents=True, exist_ok=True)
-        agent_count = 0
-        skipped = 0
-        link_method = None
-        for agent_file in agents_src.glob("*.md"):
-            dst_file = agents_dst / agent_file.name
-            # Already a correct symlink — always skip
-            if dst_file.is_symlink() and dst_file.resolve() == agent_file.resolve():
-                skipped += 1
-                continue
-            # Already a hardlink to same inode — always skip
-            if not dst_file.is_symlink() and dst_file.exists():
-                try:
-                    if dst_file.stat().st_ino == agent_file.stat().st_ino:
-                        skipped += 1
-                        continue
-                except OSError:
-                    pass
-            # Existing file with same content — skip unless --force
-            if not force and not dst_file.is_symlink() and dst_file.exists():
-                if agent_file.read_text(encoding="utf-8") == dst_file.read_text(
-                    encoding="utf-8"
-                ):
-                    skipped += 1
-                    continue
-                if sys.stdin.isatty() and not click.confirm(
-                    f"Agent '{agent_file.name}' exists with different content. Overwrite?"
-                ):
-                    console.print(f"[yellow][-][/yellow] Skipped {agent_file.name}")
-                    continue
-            link_method = _link_or_copy(agent_file, dst_file)
-            agent_count += 1
-        method_label = f" ({link_method})" if link_method and editable else ""
+        method_label = f" ({agent_method})" if agent_method and editable else ""
         msg = f"[green][OK][/green] Installed {agent_count} agents{method_label}"
-        if skipped:
-            msg += f" ({skipped} unchanged)"
+        if agent_skipped:
+            msg += f" ({agent_skipped} unchanged)"
         console.print(msg)
     else:
         console.print("[yellow][-][/yellow] Agents directory not found")
@@ -2081,54 +2596,65 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
     # Install commands (symlink for editable, copy otherwise)
     commands_src = pkg_root / "commands"
     commands_dst = home / ".claude" / "commands"
+    cmd_count, cmd_skipped, cmd_method = _install_asset_dir(
+        commands_src, commands_dst, "command", glob_pattern="*.md", force=force
+    )
     if commands_src.exists():
-        commands_dst.mkdir(parents=True, exist_ok=True)
-        cmd_count = 0
-        skipped = 0
-        link_method = None
-        for cmd_file in commands_src.glob("*.md"):
-            dst_file = commands_dst / cmd_file.name
-            # Already a correct symlink — always skip
-            if dst_file.is_symlink() and dst_file.resolve() == cmd_file.resolve():
-                skipped += 1
-                continue
-            # Already a hardlink to same inode — always skip
-            if not dst_file.is_symlink() and dst_file.exists():
-                try:
-                    if dst_file.stat().st_ino == cmd_file.stat().st_ino:
-                        skipped += 1
-                        continue
-                except OSError:
-                    pass
-            # Existing file with same content — skip unless --force
-            if not force and not dst_file.is_symlink() and dst_file.exists():
-                if cmd_file.read_text(encoding="utf-8") == dst_file.read_text(
-                    encoding="utf-8"
-                ):
-                    skipped += 1
-                    continue
-                if sys.stdin.isatty() and not click.confirm(
-                    f"Command '{cmd_file.name}' exists with different content. Overwrite?"
-                ):
-                    console.print(f"[yellow][-][/yellow] Skipped {cmd_file.name}")
-                    continue
-            link_method = _link_or_copy(cmd_file, dst_file)
-            cmd_count += 1
-        method_label = f" ({link_method})" if link_method and editable else ""
+        method_label = f" ({cmd_method})" if cmd_method and editable else ""
         msg = f"[green][OK][/green] Installed {cmd_count} commands{method_label}"
-        if skipped:
-            msg += f" ({skipped} unchanged)"
+        if cmd_skipped:
+            msg += f" ({cmd_skipped} unchanged)"
         console.print(msg)
     else:
         console.print("[yellow][-][/yellow] Commands directory not found")
+
+    # Install lenses (symlink for editable, copy otherwise)
+    lenses_src = pkg_root / "lenses"
+    lenses_dst = home / ".claude" / "lenses"
+    lens_count, lens_skipped, lens_method = _install_asset_dir(
+        lenses_src, lenses_dst, "lens", glob_pattern="*.md", force=force
+    )
+    if lenses_src.exists():
+        method_label = f" ({lens_method})" if lens_method and editable else ""
+        msg = f"[green][OK][/green] Installed {lens_count} lenses{method_label}"
+        if lens_skipped:
+            msg += f" ({lens_skipped} unchanged)"
+        console.print(msg)
+    else:
+        console.print("[dim][-][/dim] No lenses found to install")
+
+    # Install HTML artifact templates (scaffolds for plans, specs, research,
+    # checkpoints). The format preference rule in jacked_behaviors.md points
+    # Claude here as the starting point for any human-consumed artifact.
+    templates_src = pkg_root / "templates"
+    templates_dst = home / ".claude" / "jacked-templates"
+    tpl_count, tpl_skipped, tpl_method = _install_asset_dir(
+        templates_src, templates_dst, "template", glob_pattern="*.html", force=force
+    )
+    if templates_src.exists():
+        method_label = f" ({tpl_method})" if tpl_method and editable else ""
+        msg = f"[green][OK][/green] Installed {tpl_count} HTML templates{method_label}"
+        if tpl_skipped:
+            msg += f" ({tpl_skipped} unchanged)"
+        console.print(msg)
+    else:
+        console.print("[dim][-][/dim] No HTML templates found to install")
 
     # Install sound hooks if requested
     if sounds:
         _install_sound_hooks(existing, settings_path)
 
-    # Install security gatekeeper — only if --security flag passed
+    # Install security gatekeeper (default — skip with --no-security).
+    # Hook is wired up but the runtime config defaults to enabled=False so
+    # Claude Code's auto permission mode handles approvals until the user
+    # explicitly turns the gatekeeper on from the dashboard.
     if install_security:
         _install_security_hook(existing, settings_path)
+        console.print(
+            "[dim]    Gatekeeper is installed disabled by default. "
+            "Toggle it on from Settings > Gatekeeper in the dashboard if you want "
+            "LLM-evaluated interception on top of Claude Code's auto mode.[/dim]"
+        )
         # Auto-run static permission audit
         console.print("")
         audit_results = _scan_permission_rules()
@@ -2141,13 +2667,14 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
                 for pat, _, prefix, reason in warns:
                     console.print(f"  [red][WARN][/red] {pat} — {reason}")
                 console.print(
-                    "[dim]Run 'jacked gatekeeper audit' for full details[/dim]"
+                    "[dim]Run 'jacked gatekeeper audit' for full details, "
+                    "or 'jacked gatekeeper audit --fix' to prune them interactively.[/dim]"
                 )
             else:
                 console.print("[green][AUDIT] Permission rules look clean[/green]")
     else:
         console.print(
-            "[dim][-][/dim] Skipping security gatekeeper (use --security to enable)"
+            "[dim][-][/dim] Skipping security gatekeeper (remove --no-security to enable)"
         )
 
     # Install session-account tracker hooks (always — lightweight, no deps)
@@ -2247,9 +2774,242 @@ def install(sounds: bool, search: bool, security: bool, no_rules: bool, force: b
             r'  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
         )
         console.print(
-            r'  jacked install --force --security                   # Auto-approve safe Bash commands'
+            r'  jacked install --force                              # Re-install with security gatekeeper (default)'
         )
         console.print(r'  uv tool install "claude-jacked\[all]" --force       # Everything')
+
+    # Check for recommended external tools
+    _recommend_external_tools()
+
+
+def _recommend_external_tools():
+    """Print recommendations for useful external tools and Claude Code plugins."""
+    import json
+    import shutil
+    import sys
+
+    tools = []
+    plugins_needed = []
+
+    # ---------------------------------------------------------------
+    # Claude Code plugins — check which are installed
+    # ---------------------------------------------------------------
+    settings_path = Path.home() / ".claude" / "settings.json"
+    installed_plugins: set[str] = set()
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            installed_plugins = set(settings.get("enabledPlugins", []))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Plugins that jacked's behaviors and skills depend on
+    required_plugins = {
+        "superpowers@claude-plugins-official": "brainstorming, planning, TDD, subagent workflows",
+        "playwright@claude-plugins-official": "/qa and /ux browser testing",
+        "firecrawl@claude-plugins-official": "web search and scraping in skills",
+        "commit-commands@claude-plugins-official": "/commit, /commit-push-pr",
+        "pr-review-toolkit@claude-plugins-official": "/review-pr, code review agents",
+    }
+
+    # Nice-to-have plugins
+    optional_plugins = {
+        "frontend-design@claude-plugins-official": "UI/UX design quality in code review",
+        "code-simplifier@claude-plugins-official": "code simplification agent",
+        "claude-md-management@claude-plugins-official": "CLAUDE.md audit and improvement",
+    }
+
+    for plugin, desc in required_plugins.items():
+        if plugin not in installed_plugins:
+            plugins_needed.append((plugin, desc, True))
+
+    for plugin, desc in optional_plugins.items():
+        if plugin not in installed_plugins:
+            plugins_needed.append((plugin, desc, False))
+
+    if plugins_needed:
+        required = [(p, d) for p, d, r in plugins_needed if r]
+        optional = [(p, d) for p, d, r in plugins_needed if not r]
+
+        if required:
+            console.print("\n[bold]Required Claude Code plugins:[/bold]")
+            console.print("  Enable these in Claude Code settings or via /plugins:")
+            for plugin, desc in required:
+                name = plugin.split("@")[0]
+                console.print(f"    {name:30s} — {desc}")
+
+        if optional:
+            console.print("\n  Optional plugins:")
+            for plugin, desc in optional:
+                name = plugin.split("@")[0]
+                console.print(f"    {name:30s} — {desc}")
+
+    # ---------------------------------------------------------------
+    # External CLI tools
+    # ---------------------------------------------------------------
+    ab = shutil.which("agent-browser")
+    if ab:
+        ab_path = Path(ab).resolve()
+        has_dogfood = False
+        for candidate in [
+            ab_path.parent.parent / "libexec" / "lib" / "node_modules" / "agent-browser" / "skills",
+            ab_path.parent.parent / "lib" / "node_modules" / "agent-browser" / "skills",
+            ab_path.parent / "node_modules" / "agent-browser" / "skills",
+        ]:
+            if (candidate / "dogfood").exists():
+                has_dogfood = True
+                break
+        if not has_dogfood:
+            if sys.platform == "darwin" and shutil.which("brew"):
+                tools.append(
+                    "  brew upgrade agent-browser                            "
+                    "# Update for /dogfood QA skill"
+                )
+            else:
+                tools.append(
+                    "  npm install -g agent-browser@latest                   "
+                    "# Update for /dogfood QA skill"
+                )
+    else:
+        if sys.platform == "darwin" and shutil.which("brew"):
+            tools.append(
+                "  brew install agent-browser                             "
+                "# Browser QA testing (/dogfood skill)"
+            )
+        else:
+            tools.append(
+                "  npm install -g agent-browser                           "
+                "# Browser QA testing (/dogfood skill)"
+            )
+
+    if tools:
+        console.print("\nRecommended tools:")
+        for t in tools:
+            console.print(t)
+
+
+@main.command()
+def doctor():
+    """Diagnose a broken jacked install and print recovery commands.
+
+    Checks version, install method, launchd/systemd plist/unit, and
+    service running state (via PID + HTTP probe, not just port).
+    Prints exact commands to paste for any detected issue.
+
+    Read-only diagnostic — does not attempt any repair.
+    """
+    import httpx as _httpx
+    from jacked import __version__
+    from jacked.install_method import detect_install_method
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service.process import (
+        is_port_available, is_process_alive, read_pid,
+    )
+
+    console.print(f"[bold]Version:[/bold] {__version__}")
+    try:
+        method = detect_install_method()
+    except Exception as exc:
+        method = f"unknown ({exc})"
+    console.print(f"[bold]Install method:[/bold] {method}")
+
+    # Plist/unit check
+    if sys.platform == "darwin":
+        from jacked.service.platform import _get_launchd_plist_path
+        plist = _get_launchd_plist_path()
+        if plist.exists():
+            console.print(f"[bold]Launchd plist:[/bold] [green]OK[/green] ({plist})")
+        else:
+            console.print(f"[bold]Launchd plist:[/bold] [yellow]MISSING[/yellow]")
+            console.print(f"  Recovery: [cyan]jacked service install[/cyan]")
+    elif sys.platform.startswith("linux"):
+        from jacked.service.platform import _get_systemd_user_unit_path
+        unit = _get_systemd_user_unit_path()
+        if unit.exists():
+            console.print(f"[bold]Systemd user unit:[/bold] [green]OK[/green] ({unit})")
+        else:
+            console.print(
+                "[bold]Systemd user unit:[/bold] [yellow]NOT INSTALLED[/yellow]"
+            )
+            console.print("  Linux users configure their own auto-start; see docs.")
+    else:
+        console.print("[bold]Native lifecycle manager:[/bold] [dim]none (Windows)[/dim]")
+
+    # Service health — real probes, not just port availability
+    port_free = is_port_available(DEFAULT_HOST, DEFAULT_PORT)
+    pid_info = read_pid(PID_FILE)
+    pid_alive = (
+        pid_info is not None
+        and is_process_alive(pid_info.get("pid", 0))
+    )
+
+    if port_free:
+        console.print(
+            f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
+            f"(port {DEFAULT_PORT} free)"
+        )
+        console.print(f"  Recovery: [cyan]jacked service start[/cyan]")
+        if pid_info and not pid_alive:
+            console.print(
+                f"  [dim]Stale PID file at {PID_FILE} "
+                f"(pid {pid_info.get('pid')} is dead).[/dim]"
+            )
+    else:
+        # Port held — probe HTTP to distinguish healthy vs crashed-mid-init
+        try:
+            resp = _httpx.get(
+                f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/api/version",
+                timeout=2.0,
+            )
+            if resp.status_code == 200:
+                console.print(
+                    f"[bold]Service:[/bold] [green]HEALTHY[/green] "
+                    f"(port {DEFAULT_PORT}, HTTP 200)"
+                )
+            else:
+                console.print(
+                    f"[bold]Service:[/bold] [yellow]PORT HELD BUT UNHEALTHY[/yellow] "
+                    f"(HTTP {resp.status_code})"
+                )
+                console.print("  Recovery: [cyan]jacked service restart[/cyan]")
+        except Exception as exc:
+            console.print(
+                f"[bold]Service:[/bold] [red]PORT HELD BUT UNREACHABLE[/red] "
+                f"({type(exc).__name__}: {exc})"
+            )
+            if pid_alive:
+                console.print(
+                    f"  PID {pid_info['pid']} is alive but HTTP probe failed — "
+                    f"service may have crashed mid-init."
+                )
+            else:
+                console.print(
+                    f"  Port held by a process that is NOT the jacked service "
+                    f"(our PID file is stale or missing).  "
+                    f"Run [cyan]lsof -iTCP:{DEFAULT_PORT} -sTCP:LISTEN[/cyan] "
+                    "to see the owner."
+                )
+            console.print("  Recovery: [cyan]jacked service restart[/cyan]")
+
+    # Install-method-specific recovery
+    if method == "editable":
+        console.print(
+            "\n[bold yellow]Editable (dev-clone) install detected.[/bold yellow]\n"
+            "  Auto-upgrade disabled.  Upgrade via:\n"
+            "  [cyan]cd <your-repo> && git pull && uv sync[/cyan]"
+        )
+    elif method == "pip":
+        console.print(
+            "\n[bold yellow]pip install detected.[/bold yellow]\n"
+            "  Auto-upgrade disabled.  Migrate to uv with:\n"
+            "  [cyan]uv tool install \"claude-jacked[tray]\" --force[/cyan]"
+        )
+    elif str(method).startswith("unknown"):
+        console.print(
+            "\n[bold red]Could not detect install method.[/bold red]\n"
+            "  Nuclear-option recovery:\n"
+            "  [cyan]uv tool install \"claude-jacked[tray]\" --force[/cyan]"
+        )
 
 
 @main.command()
@@ -2393,6 +3153,41 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
             console.print("[yellow][-][/yellow] No jacked commands found")
     else:
         console.print("[yellow][-][/yellow] Commands directory not found")
+
+    # Remove only jacked-installed lenses (not the whole directory!)
+    lenses_src = pkg_root / "lenses"
+    lenses_dst = home / ".claude" / "lenses"
+    if lenses_src.exists() and lenses_dst.exists():
+        lens_count = 0
+        for lens_file in lenses_src.glob("*.md"):
+            dst_file = lenses_dst / lens_file.name
+            if dst_file.exists() or dst_file.is_symlink():
+                dst_file.unlink()
+                lens_count += 1
+        if lens_count > 0:
+            console.print(f"[green][OK][/green] Removed {lens_count} lenses")
+        else:
+            console.print("[yellow][-][/yellow] No jacked lenses found")
+    else:
+        console.print("[yellow][-][/yellow] Lenses directory not found")
+
+    # Remove only jacked-installed HTML templates (preserve any user-added files)
+    templates_src = pkg_root / "templates"
+    templates_dst = home / ".claude" / "jacked-templates"
+    if templates_src.exists() and templates_dst.exists():
+        tpl_count = 0
+        for tpl_file in templates_src.glob("*.html"):
+            dst_file = templates_dst / tpl_file.name
+            if dst_file.exists() or dst_file.is_symlink():
+                dst_file.unlink()
+                tpl_count += 1
+        if tpl_count > 0:
+            console.print(f"[green][OK][/green] Removed {tpl_count} HTML templates")
+        # Drop the dir only if it's now empty so user-added templates survive.
+        try:
+            templates_dst.rmdir()
+        except OSError:
+            pass
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(
@@ -2642,6 +3437,217 @@ def profiles_delete(name: str, yes: bool):
         console.print(f"[yellow]Profile '{name}' not found[/yellow]")
 
 
+@main.group()
+def service():
+    """Manage the jacked background service (tray icon + auto-start)."""
+    pass
+
+
+@service.command(name="start")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+def service_start(host: str | None, port: int | None):
+    """Start jacked as a background service with system tray icon."""
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service.tray import ServiceRunner
+
+    runner = ServiceRunner(host=host or DEFAULT_HOST, port=port or DEFAULT_PORT)
+    runner.run()
+
+
+@service.command(name="stop")
+def service_stop():
+    """Stop the running jacked service.
+
+    Uses stop_process_graceful which waits for actual PID death and
+    escalates to SIGKILL if SIGTERM is ignored — pystray's AppKit
+    runloop on macOS can silently swallow Python signals.
+    """
+    from jacked.service import PID_FILE
+    from jacked.service.process import stop_process_graceful
+
+    result = stop_process_graceful(PID_FILE)
+    if not result["was_running"]:
+        console.print("[yellow]Service is not running[/yellow]")
+        return
+
+    if not result["died"]:
+        console.print("[red]Could not stop service — still alive after SIGKILL[/red]")
+        sys.exit(1)
+
+    if result["killed"]:
+        console.print("[yellow][OK][/yellow] Service ignored SIGTERM — force-killed")
+    else:
+        console.print("[green][OK][/green] Stopped jacked service")
+
+
+@service.command(name="restart")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+@click.option(
+    "--foreground",
+    is_flag=True,
+    help="Run the new service in the foreground (default: detach and return immediately).",
+)
+def service_restart(host: str | None, port: int | None, foreground: bool):
+    """Restart the jacked service.
+
+    By default, runs the NEW service detached — this command returns
+    immediately and tray logs go to ~/.claude/jacked-service.log. This
+    lets `jacked upgrade` and other automation call us without blocking
+    on the pystray event loop.
+
+    Use --foreground to run interactively (tray logs to your terminal).
+    """
+    from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service.platform import ensure_native_lifecycle, native_restart
+    from jacked.service.process import (
+        stop_process_graceful,
+        wait_for_port_free,
+    )
+
+    the_port = port or DEFAULT_PORT
+    the_host = host or DEFAULT_HOST
+
+    # Preferred path: make sure native lifecycle (launchd plist / systemd
+    # unit) is configured, then delegate.  Skip kickstart when the plist
+    # was just installed — RunAtLoad already started the service fresh
+    # and kickstart would race the boot.
+    # `--foreground` is an explicit debug path — skip native handoff.
+    if not foreground:
+        ok_ens, state, reason_ens = ensure_native_lifecycle()
+        if ok_ens:
+            if state == "just_installed":
+                console.print(f"[green][OK][/green] {reason_ens}")
+                return
+            # already_installed → run native_restart for atomic kickstart
+            ok, reason = native_restart()
+            if ok:
+                console.print(f"[green][OK][/green] {reason}")
+                return
+            console.print(f"[yellow]native_restart failed: {reason}[/yellow]")
+        else:
+            console.print(f"[dim]native lifecycle unavailable: {reason_ens}[/dim]")
+
+    # 1. Stop any running service. stop_process_graceful waits for actual PID
+    # death and escalates to SIGKILL if SIGTERM is ignored (pystray's AppKit
+    # runloop can swallow signals until it yields to Python).
+    result = stop_process_graceful(PID_FILE)
+    if result["was_running"]:
+        if result["killed"]:
+            console.print("[yellow]Tray ignored SIGTERM — force-killed[/yellow]")
+        elif result["died"]:
+            console.print("[dim]Stopped existing service[/dim]")
+        if not result["died"]:
+            console.print("[red]Could not stop existing service — aborting restart[/red]")
+            sys.exit(1)
+        # Port can linger a beat after the PID dies.
+        if not wait_for_port_free(the_host, the_port, timeout=10.0):
+            console.print(f"[red]Port {the_port} still in use — aborting start[/red]")
+            sys.exit(1)
+
+    # 2. Start the new service.
+    if foreground:
+        from jacked.service.tray import ServiceRunner
+        ServiceRunner(host=the_host, port=the_port).run()
+        return
+
+    # Detached — the tray must survive this command returning.
+    import subprocess as _subprocess
+    from jacked.findbin import find_bin
+
+    jacked_bin = find_bin("jacked") or sys.executable
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = CLAUDE_DIR / "jacked-service.log"
+    try:
+        log_fh = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except Exception:
+        log_fh = _subprocess.DEVNULL
+
+    if sys.platform == "win32":
+        creationflags = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+        _subprocess.Popen(
+            [jacked_bin, "service", "start", "--host", the_host, "--port", str(the_port)],
+            stdin=_subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    else:
+        _subprocess.Popen(
+            [jacked_bin, "service", "start", "--host", the_host, "--port", str(the_port)],
+            stdin=_subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    console.print(f"[green][OK][/green] Started jacked service (detached) on :{the_port}")
+    console.print(f"[dim]Logs: {log_path}[/dim]")
+
+
+@service.command(name="status")
+def service_status():
+    """Show whether the jacked service is running."""
+    from jacked.service import PID_FILE
+    from jacked.service.process import read_pid, is_process_alive
+    from jacked.service.platform import detect_autostart
+
+    info = read_pid(PID_FILE)
+    autostart = detect_autostart()
+    autostart_label = "[green]enabled[/green]" if autostart else "[dim]disabled[/dim]"
+
+    if info and is_process_alive(info["pid"]):
+        import time
+        pid_mtime = PID_FILE.stat().st_mtime
+        uptime_secs = time.time() - pid_mtime
+        hours, remainder = divmod(int(uptime_secs), 3600)
+        minutes, _ = divmod(remainder, 60)
+        uptime = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+        console.print("[bold green]Jacked Service: running[/bold green]")
+        console.print(f"  PID:       {info['pid']}")
+        console.print(f"  Port:      {info['port']}")
+        console.print(f"  Uptime:    {uptime}")
+        console.print(f"  Autostart: {autostart_label}")
+        console.print(f"  Dashboard: http://127.0.0.1:{info['port']}")
+    else:
+        console.print("[bold yellow]Jacked Service: stopped[/bold yellow]")
+        console.print(f"  Autostart: {autostart_label}")
+        if info:
+            from jacked.service.process import remove_pid
+            remove_pid(PID_FILE)
+
+
+@service.command(name="install")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+def service_install(host: str | None, port: int | None):
+    """Configure jacked to start automatically on login."""
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service.platform import install_autostart
+
+    result = install_autostart(host or DEFAULT_HOST, port or DEFAULT_PORT)
+    if result.startswith("Could not find"):
+        console.print(f"[red]Error:[/red] {result}")
+    else:
+        console.print(f"[green][OK][/green] {result}")
+
+
+@service.command(name="uninstall")
+def service_uninstall():
+    """Remove jacked auto-start configuration."""
+    from jacked.service.platform import uninstall_autostart
+
+    result = uninstall_autostart()
+    if "not supported" in result.lower() or "not found" in result.lower():
+        console.print(f"[yellow]{result}[/yellow]")
+    else:
+        console.print(f"[green][OK][/green] {result}")
+
+
 HIGH_RISK_PREFIXES = {
     "python": "arbitrary code execution via -c",
     "python3": "arbitrary code execution via -c",
@@ -2777,6 +3783,77 @@ def _scan_permission_rules() -> list[tuple[str, str, str, str]]:
     return results
 
 
+def _settings_files_to_search() -> list[Path]:
+    """All settings.json files where permission rules may live."""
+    return [
+        Path.home() / ".claude" / "settings.json",
+        Path(".claude") / "settings.json",
+        Path(".claude") / "settings.local.json",
+    ]
+
+
+def _remove_permission_patterns(
+    settings_path: Path, patterns_to_remove: set[str]
+) -> tuple[int, list[str]]:
+    """Remove matching Bash permission wildcards from a settings.json file.
+
+    Writes atomically with a timestamped backup. Returns (removed_count,
+    actually_removed_list). No-op if the file doesn't exist.
+    """
+    import json as _json
+
+    if not settings_path.exists():
+        return 0, []
+    try:
+        raw = _json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError):
+        return 0, []
+
+    perms = raw.get("permissions") or {}
+    allow = perms.get("allow") or []
+    if not isinstance(allow, list):
+        return 0, []
+
+    # Snapshot before mutation.
+    try:
+        _snapshot_settings(settings_path)
+        _rotate_backups(settings_path.parent, prefix=f"{settings_path.name}.bak-", keep=5)
+    except Exception:
+        pass
+
+    kept = []
+    removed_list = []
+    for entry in allow:
+        if isinstance(entry, str) and entry in patterns_to_remove:
+            removed_list.append(entry)
+            continue
+        kept.append(entry)
+
+    if not removed_list:
+        return 0, []
+
+    raw.setdefault("permissions", {})["allow"] = kept
+    _write_settings_atomic(settings_path, raw)
+    return len(removed_list), removed_list
+
+
+def _prune_dangerous_permissions(
+    patterns: set[str], interactive: bool = True
+) -> tuple[int, list[tuple[Path, list[str]]]]:
+    """Remove each given pattern from whichever settings.json contains it.
+
+    Returns (total_removed, per-file-results).
+    """
+    per_file: list[tuple[Path, list[str]]] = []
+    total = 0
+    for settings_path in _settings_files_to_search():
+        count, removed = _remove_permission_patterns(settings_path, patterns)
+        if count > 0:
+            per_file.append((settings_path, removed))
+            total += count
+    return total, per_file
+
+
 def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
     """Parse hooks-debug.log for auto-approved PERMS MATCH commands.
 
@@ -2815,7 +3892,18 @@ def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
     help="Also scan recent auto-approved commands via LLM",
 )
 @click.option("--limit", "-n", default=50, help="Number of recent log entries to scan")
-def gatekeeper_audit(scan_log, limit):
+@click.option(
+    "--fix",
+    is_flag=True,
+    help="Interactively remove dangerous permission wildcards. Pairs with --yes for non-interactive prune.",
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="With --fix, remove all dangerous wildcards without confirmation.",
+)
+def gatekeeper_audit(scan_log, limit, fix, yes):
     """Audit permission rules for dangerous wildcards."""
     import os
     import json
@@ -2860,10 +3948,75 @@ def gatekeeper_audit(scan_log, limit):
 
     console.print(f"\n{warn_count} warnings, {info_count} info, {ok_count} OK")
 
-    if warn_count > 0:
+    if warn_count > 0 and not fix:
         console.print(
             "\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]"
         )
+        console.print(
+            "[dim]Run 'jacked gatekeeper audit --fix' to prune them interactively.[/dim]"
+        )
+
+    # --fix: interactive prune of dangerous wildcards
+    if fix:
+        warn_patterns = {pat for pat, level, _, _ in results if level == "WARN"}
+        if not warn_patterns:
+            console.print(
+                "\n[green]Nothing to fix — no dangerous wildcards found.[/green]"
+            )
+        else:
+            console.print("")  # spacer
+            to_remove: set[str] = set()
+
+            if yes:
+                to_remove = set(warn_patterns)
+                console.print(
+                    f"[yellow]--yes: will remove all {len(to_remove)} dangerous wildcard(s).[/yellow]"
+                )
+            else:
+                console.print(
+                    "[bold]For each dangerous wildcard, choose: [y]es remove / [n]o keep / [a]ll remove / [q]uit[/bold]\n"
+                )
+                remove_all = False
+                for pat in sorted(warn_patterns):
+                    if remove_all:
+                        to_remove.add(pat)
+                        continue
+                    choice = click.prompt(
+                        f"Remove {pat}? [y/n/a/q]",
+                        type=click.Choice(["y", "n", "a", "q"], case_sensitive=False),
+                        default="n",
+                        show_default=False,
+                    ).lower()
+                    if choice == "y":
+                        to_remove.add(pat)
+                    elif choice == "a":
+                        to_remove.add(pat)
+                        remove_all = True
+                    elif choice == "q":
+                        break
+
+            if not to_remove:
+                console.print("\n[dim]No changes made.[/dim]")
+            else:
+                total, per_file = _prune_dangerous_permissions(to_remove)
+                if total == 0:
+                    console.print(
+                        "\n[yellow]Selected patterns not found in any settings file — nothing to remove.[/yellow]"
+                    )
+                else:
+                    console.print(
+                        f"\n[green][OK][/green] Removed {total} wildcard(s) across {len(per_file)} file(s):"
+                    )
+                    for settings_path, removed in per_file:
+                        console.print(f"  [dim]{settings_path}[/dim]")
+                        for pat in removed:
+                            console.print(f"    - {pat}")
+                    console.print(
+                        "[dim]Backups saved next to each modified file as <name>.bak-YYYYMMDD-HHMMSS.[/dim]"
+                    )
+                    console.print(
+                        "[dim]Gatekeeper will now evaluate these commands via LLM on each use.[/dim]"
+                    )
 
     # Log scanning
     if scan_log:
@@ -2957,7 +4110,7 @@ If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
                 "[red]anthropic SDK not installed — cannot run LLM audit[/red]"
             )
             console.print(
-                '[dim]Activate it: jacked install --force --security[/dim]'
+                '[dim]Activate it: jacked install --force[/dim]'
             )
         except json.JSONDecodeError:
             console.print(

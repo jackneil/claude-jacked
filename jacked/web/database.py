@@ -68,6 +68,8 @@ class Account(BaseModel):
     cc_access_token: Optional[str] = None
     cc_refresh_token: Optional[str] = None
     cc_expires_at: Optional[int] = None
+    refresh_last_failed_at: Optional[int] = None
+    refresh_failure_type: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -345,6 +347,32 @@ CREATE TABLE IF NOT EXISTS session_accounts (
     UNIQUE(session_id, detected_at)
 );
 
+CREATE TABLE IF NOT EXISTS swap_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    from_account_id INTEGER,
+    to_account_id INTEGER,
+    reason TEXT,
+    trigger TEXT,
+    from_5h_usage REAL,
+    from_7d_usage REAL,
+    to_5h_usage REAL,
+    to_7d_usage REAL,
+    status TEXT NOT NULL DEFAULT 'committed',
+    residency_seconds INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS decision_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    account_id INTEGER,
+    action TEXT NOT NULL,
+    trigger TEXT,
+    target_id INTEGER,
+    reason TEXT,
+    detail TEXT
+);
+
 """
 
 INDEXES_SQL = """
@@ -365,6 +393,9 @@ CREATE INDEX IF NOT EXISTS idx_hook_executions_repo ON hook_executions(repo_path
 CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_account ON session_accounts(account_id);
 CREATE INDEX IF NOT EXISTS idx_sa_active ON session_accounts(ended_at, last_activity_at, detected_at);
+CREATE INDEX IF NOT EXISTS idx_swap_log_ts ON swap_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_decision_log_timestamp ON decision_log(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_log_action ON decision_log(action);
 """
 
 
@@ -611,6 +642,49 @@ class Database:
                 conn.execute("DROP TABLE accounts")
                 conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
                 conn.execute("DROP INDEX IF EXISTS idx_accounts_email")
+            # Migration: add auto_swap_enabled to accounts
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_swap = {row[1] for row in cursor.fetchall()}
+            if "auto_swap_enabled" not in acct_cols_swap:
+                try:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN auto_swap_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            # Migration: add circuit breaker columns to accounts
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_cb = {row[1] for row in cursor.fetchall()}
+            if "refresh_last_failed_at" not in acct_cols_cb:
+                try:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN refresh_last_failed_at INTEGER"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            if "refresh_failure_type" not in acct_cols_cb:
+                try:
+                    conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN refresh_failure_type TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            # Migration: add swap outcome tracking to swap_log.
+            # status distinguishes committed swaps from pending/failed attempts;
+            # residency_seconds is how long the outgoing account was active.
+            cursor = conn.execute("PRAGMA table_info(swap_log)")
+            swap_cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_def in [
+                ("status", "TEXT NOT NULL DEFAULT 'committed'"),
+                ("residency_seconds", "INTEGER"),
+            ]:
+                if col_name not in swap_cols:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE swap_log ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
             # Indexes (after migrations so new columns exist)
             conn.executescript(INDEXES_SQL)
             # Migration: rebuild idx_sa_active to cover last_activity_at
@@ -881,6 +955,8 @@ class Database:
             "cc_refresh_token",
             "cc_expires_at",
             "organization_uuid",
+            "refresh_last_failed_at",
+            "refresh_failure_type",
         }
     )
 
@@ -1160,6 +1236,71 @@ class Database:
                 (now, int(time.time()), now, account_id),
             )
             return cursor.rowcount > 0
+
+    def list_stuck_checking_accounts(self, threshold_seconds: int) -> list[dict]:
+        """Return non-deleted accounts where validation_status='checking'
+        AND (updated_at is NULL OR updated_at older than threshold_seconds).
+
+        NULL updated_at is treated as "definitely stuck" — otherwise
+        strftime('%s', NULL) returns NULL and the row is hidden forever.
+
+        Includes inactive accounts (they can still be stuck and need cleanup).
+
+        >>> db = Database(":memory:")
+        >>> db.list_stuck_checking_accounts(120)
+        []
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM accounts
+                   WHERE validation_status = 'checking'
+                     AND is_deleted = 0
+                     AND (
+                       updated_at IS NULL
+                       OR (strftime('%s','now') - strftime('%s', updated_at)) > ?
+                     )
+                   ORDER BY updated_at ASC""",
+                (threshold_seconds,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def reset_stuck_checking(
+        self,
+        account_id: int,
+        threshold_seconds: int,
+        reason: str,
+    ) -> int:
+        """Atomically reset validation_status='checking' to 'unknown' IFF
+        the row still reads 'checking' AND (updated_at is NULL OR stale
+        past threshold_seconds).
+
+        WHERE guard prevents clobbering a row that a concurrent validator
+        already moved to 'valid' (PM1 TOCTOU fix).
+
+        Returns rowcount (0 if already moved).
+
+        >>> db = Database(":memory:")
+        >>> db.reset_stuck_checking(1, 120, "x")
+        0
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE accounts
+                   SET validation_status = 'unknown',
+                       last_error = ?,
+                       last_error_at = ?,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND validation_status = 'checking'
+                     AND is_deleted = 0
+                     AND (
+                       updated_at IS NULL
+                       OR (strftime('%s','now') - strftime('%s', updated_at)) > ?
+                     )""",
+                (reason, now_iso, now_iso, account_id, threshold_seconds),
+            )
+            return cursor.rowcount
 
     # ==================================================================
     # Installation CRUD
@@ -2504,3 +2645,130 @@ class Database:
                 (limit, offset),
             )
             return {"rows": [dict(row) for row in cursor.fetchall()], "total": total}
+
+    # ==================================================================
+    # Swap Log
+    # ==================================================================
+
+    def record_swap(self, from_account_id, to_account_id, reason, trigger,
+                    from_5h=None, from_7d=None, to_5h=None, to_7d=None,
+                    status="committed", residency_seconds=None):
+        """Record an account swap event. Returns the inserted row ID."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """INSERT INTO swap_log
+                   (from_account_id, to_account_id, reason, trigger,
+                    from_5h_usage, from_7d_usage, to_5h_usage, to_7d_usage,
+                    status, residency_seconds)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (from_account_id, to_account_id, reason, trigger,
+                 from_5h, from_7d, to_5h, to_7d,
+                 status, residency_seconds),
+            )
+            return cursor.lastrowid
+
+    def update_swap_status(self, swap_id: int, status: str) -> None:
+        """Update the status of a swap_log row (e.g. 'pending' -> 'committed'/'failed')."""
+        with self._writer() as conn:
+            conn.execute(
+                "UPDATE swap_log SET status = ? WHERE id = ?",
+                (status, swap_id),
+            )
+
+    def swaps_last_24h(self, committed_only: bool = True) -> int:
+        """Count swap events in the trailing 24 hours.
+
+        >>> db = Database(":memory:")
+        >>> db.swaps_last_24h()
+        0
+        """
+        # Cutoff uses the same strftime format as the column DEFAULT so the
+        # lexicographic comparison is exact (datetime('now') lacks 'T'/'Z').
+        query = (
+            "SELECT COUNT(*) FROM swap_log "
+            "WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours')"
+        )
+        if committed_only:
+            query += " AND status = 'committed'"
+        with self._reader() as conn:
+            return conn.execute(query).fetchone()[0]
+
+    def list_swaps(self, limit=50):
+        """List recent swap events with account emails and org info."""
+        with self._reader() as conn:
+            rows = conn.execute(
+                """SELECT s.*,
+                          fa.email AS from_email,
+                          fa.organization_name AS from_org_name,
+                          fa.display_name AS from_display_name,
+                          ta.email AS to_email,
+                          ta.organization_name AS to_org_name,
+                          ta.display_name AS to_display_name
+                   FROM swap_log s
+                   LEFT JOIN accounts fa ON fa.id = s.from_account_id
+                   LEFT JOIN accounts ta ON ta.id = s.to_account_id
+                   ORDER BY s.timestamp DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def record_decision(
+        self,
+        account_id: int | None,
+        action: str,
+        trigger: str | None = None,
+        target_id: int | None = None,
+        reason: str | None = None,
+        detail: dict | None = None,
+    ) -> int:
+        """Record a swap decision (stay, swap, or manual_switch).
+
+        Returns the inserted row ID.
+        """
+        import json as _json
+        detail_str = _json.dumps(detail) if detail else None
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """INSERT INTO decision_log
+                   (account_id, action, trigger, target_id, reason, detail)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (account_id, action, trigger, target_id, reason, detail_str),
+            )
+            return cursor.lastrowid
+
+    def list_decisions(self, limit: int = 100, actions: list[str] | None = None) -> list[dict]:
+        """List recent decision log entries, newest first."""
+        import json as _json
+        with self._reader() as conn:
+            if actions:
+                placeholders = ",".join("?" for _ in actions)
+                rows = conn.execute(
+                    f"""SELECT * FROM decision_log
+                        WHERE action IN ({placeholders})
+                        ORDER BY timestamp DESC LIMIT ?""",
+                    (*actions, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM decision_log
+                       ORDER BY timestamp DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                if d.get("detail"):
+                    try:
+                        d["detail"] = _json.loads(d["detail"])
+                    except (ValueError, TypeError):
+                        pass
+                result.append(d)
+            return result
+
+    def prune_decision_log(self, days: int = 7):
+        """Delete decision log entries older than the given number of days."""
+        with self._writer() as conn:
+            conn.execute(
+                "DELETE FROM decision_log WHERE timestamp < datetime('now', ?)",
+                (f"-{days} days",),
+            )

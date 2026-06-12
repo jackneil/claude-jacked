@@ -657,7 +657,7 @@ class TestResolveAccount:
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             result = resolve_account(1, db)
         assert result["email"] == "alice@test.com"
 
@@ -665,7 +665,7 @@ class TestResolveAccount:
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             result = resolve_account("2", db)
         assert result["email"] == "bob@test.com"
 
@@ -673,7 +673,7 @@ class TestResolveAccount:
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             result = resolve_account("bob@test.com", db)
         assert result["email"] == "bob@test.com"
 
@@ -688,7 +688,7 @@ class TestResolveAccount:
         cred_file = claude_dir / ".credentials.json"
         cred_file.write_text(json.dumps({"_jackedAccountId": 1}))
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with mock.patch.object(Path, "home", return_value=tmp_path):
                 result = resolve_account(None, db)
         assert result["email"] == "alice@test.com"
@@ -697,7 +697,7 @@ class TestResolveAccount:
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with pytest.raises(click.ClickException, match="not found"):
                 resolve_account(999, db)
 
@@ -706,7 +706,7 @@ class TestResolveAccount:
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with pytest.raises(click.ClickException, match="not found"):
                 resolve_account(3, db)
 
@@ -716,7 +716,7 @@ class TestResolveAccount:
         db.update_account(1, access_token="")
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with pytest.raises(click.ClickException, match="no access token"):
                 resolve_account(1, db)
 
@@ -724,7 +724,7 @@ class TestResolveAccount:
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value=None):
+        with mock.patch("jacked.launch.find_bin", return_value=None):
             with pytest.raises(click.ClickException, match="claude not found"):
                 resolve_account(1, db)
 
@@ -735,7 +735,7 @@ class TestResolveAccount:
         from jacked.launch import resolve_account
 
         # No credential file exists — should fall through to DB setting
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with mock.patch.object(Path, "home", return_value=tmp_path):
                 with mock.patch(
                     "jacked.launch.read_platform_credentials", return_value=None
@@ -749,7 +749,7 @@ class TestResolveAccount:
         from jacked.launch import resolve_account
 
         kc_data = {"_jackedAccountId": 2, "claudeAiOauth": {"accessToken": "x"}}
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with mock.patch.object(Path, "home", return_value=tmp_path):
                 with mock.patch(
                     "jacked.launch.read_platform_credentials", return_value=kc_data
@@ -764,7 +764,7 @@ class TestResolveAccount:
 
         # Keychain has token but no stamp
         kc_data = {"claudeAiOauth": {"accessToken": "bob_access"}}
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with mock.patch.object(Path, "home", return_value=tmp_path):
                 with mock.patch(
                     "jacked.launch.read_platform_credentials", return_value=kc_data
@@ -777,7 +777,7 @@ class TestResolveAccount:
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        with mock.patch("shutil.which", return_value="/usr/local/bin/claude"):
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with mock.patch.object(Path, "home", return_value=tmp_path):
                 with mock.patch(
                     "jacked.launch.read_platform_credentials", return_value=None

@@ -37,12 +37,12 @@ logger = logging.getLogger("jacked.oauth")
 # ---------------------------------------------------------------------------
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-AUTH_URL = "https://claude.ai/oauth/authorize"
+AUTH_URL = "https://claude.com/cai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 API_KEY_URL = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code"
+SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 CALLBACK_PORT_RANGE = range(45100, 45200)
 DEFAULT_TOKEN_TTL_SECONDS = 28800  # 8 hours — default token lifetime from Anthropic
@@ -80,6 +80,27 @@ def generate_pkce() -> tuple[str, str]:
 
 # Global dict of active flows: flow_id -> OAuthFlow
 _active_flows: dict[str, "OAuthFlow"] = {}
+
+
+def reset_locks() -> None:
+    """Clear in-flight OAuth flows on lifespan startup.
+
+    Each OAuthFlow owns an ``asyncio.Event`` bound to the loop that
+    created it (``OAuthFlow.__init__``). When the tray restarts uvicorn
+    in a fresh thread/loop, any mid-OAuth flow's Event is stranded on
+    the dead loop — a later ``await event.wait()`` would raise. Users
+    who clicked Restart mid-OAuth already lost their flow; drop the
+    stale entries so a fresh attempt starts clean. Log the count so
+    on-call can correlate "PKCE callback returned 'flow not found'"
+    complaints with a tray restart.
+    """
+    stranded = len(_active_flows)
+    if stranded:
+        logger.warning(
+            "reset_locks: dropping %d stranded OAuth flow(s) from previous loop: %s",
+            stranded, list(_active_flows.keys()),
+        )
+    _active_flows.clear()
 
 
 def get_flow(flow_id: str) -> Optional["OAuthFlow"]:
@@ -160,8 +181,11 @@ class OAuthFlow:
 
         result: dict = {"status": self._status, "flow_id": self.flow_id}
         if self._result:
-            result["account_id"] = self._result.get("account_id")
+            result["account_id"] = self._result.get("account_id") or self._result.get("id")
             result["email"] = self._result.get("email")
+            result["organization_name"] = self._result.get("organization_name")
+            if self._result.get("_redirected_from"):
+                result["redirected_from_account_id"] = self._result["_redirected_from"]
         if self._error:
             result["error"] = self._error
         if self._cc_flow_id:
@@ -535,15 +559,30 @@ class OAuthFlow:
                     f"target account ({target['email']})"
                 )
 
-            # If org_uuid changed, remove any soft-deleted duplicate that would
-            # collide with UNIQUE(email, organization_uuid). This cleans up ghosts
-            # left by the old bug where re-auth created duplicate accounts.
+            # If org_uuid changed, check if there's already an active account
+            # with the new (email, org_uuid). This happens when the user clicks
+            # re-auth on Account A but authorizes Account B's org on Anthropic's
+            # page. Update Account B instead of crashing with UNIQUE violation.
             old_org_uuid = target.get("organization_uuid", "")
+            actual_target_id = self._target_account_id
             if final_org_uuid != old_org_uuid:
-                self.db.hard_delete_duplicate(email, final_org_uuid)
+                existing = self.db.get_account_by_email(email, final_org_uuid)
+                if existing:
+                    # Redirect: update the matching account, not the target
+                    actual_target_id = existing["id"]
+                    logger.info(
+                        "Re-auth org mismatch: target account %d (org %s) "
+                        "but authorized org %s which matches account %d — "
+                        "updating account %d instead",
+                        self._target_account_id, old_org_uuid,
+                        final_org_uuid, existing["id"], existing["id"],
+                    )
+                else:
+                    # No active account for this org — clean up soft-deleted ghosts
+                    self.db.hard_delete_duplicate(email, final_org_uuid)
 
             self.db.update_account(
-                self._target_account_id,
+                actual_target_id,
                 access_token=tokens["access_token"],
                 refresh_token=tokens.get("refresh_token"),
                 expires_at=expires_at,
@@ -559,7 +598,9 @@ class OAuthFlow:
                 last_validated_at=int(time.time()),
                 last_error=None,
             )
-            account = self.db.get_account(self._target_account_id)
+            account = self.db.get_account(actual_target_id)
+            if actual_target_id != self._target_account_id:
+                account["_redirected_from"] = self._target_account_id
         else:
             # ADD: Normal create_account with email+org upsert
             account = self.db.create_account(

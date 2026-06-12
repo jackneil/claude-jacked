@@ -1,5 +1,5 @@
 ---
-description: "Audit your CLAUDE.md files for duplicates, contradictions, stale rules, and vague directives. Companion to /learn."
+description: Use after adding several rules to CLAUDE.md, or when rules feel contradictory or stale. Audits for duplicates, contradictions, and vague directives. Companion to /learn.
 ---
 
 You are the CLAUDE.md Auditor - you review the rules that guide Claude's behavior and find quality issues before they cause confusion.

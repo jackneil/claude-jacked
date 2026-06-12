@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Design — pre-flight /simple/ agreement check for tray update discovery</title>
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="approved-by-user">
+<meta name="jacked:branch" content="master">
+<meta name="jacked:date" content="2026-05-20">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --danger:#b32424; --danger-bg:#fbe9e7; --ok:#1f7a3f; --ok-bg:#e8f4ec; --border:#d8d4cc; --code-bg:#f3efe8; --radius:6px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --danger:#ea7670; --danger-bg:#3a1f1c; --ok:#6acd8e; --ok-bg:#1c3327; --border:#2e2e2e; --code-bg:#232323; } }
+  *{box-sizing:border-box}
+  body{font-family:var(--sans);font-size:16px;line-height:1.6;color:var(--fg);background:var(--bg);margin:0;padding:2rem 1rem}
+  .wrap{max-width:880px;margin:0 auto}
+  h1{font-size:2rem;margin:0 0 .25rem}
+  h2{font-size:1.4rem;margin:2.5rem 0 .75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}
+  h3{font-size:1.1rem;margin:1.5rem 0 .5rem;color:var(--fg-muted)}
+  code{font-family:var(--mono);font-size:.92em;background:var(--code-bg);padding:.12em .35em;border-radius:3px}
+  pre{font-family:var(--mono);font-size:.85rem;background:var(--code-bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;overflow-x:auto;line-height:1.45}
+  pre code{background:transparent;padding:0}
+  table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--bg-card);border-radius:var(--radius);overflow:hidden}
+  th,td{text-align:left;padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+  th{background:var(--code-bg);font-weight:600;font-size:.9rem}
+  tr:last-child td{border-bottom:none}
+  aside.callout{margin:1rem 0;padding:.9rem 1.1rem;border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}
+  aside.callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .meta{display:flex;flex-wrap:wrap;gap:.5rem 1rem;margin:.5rem 0 2rem;padding:.75rem 1rem;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
+  .meta .kv{display:flex;gap:.35rem}
+  .meta .k{color:var(--fg-muted)}
+  .meta .v{font-family:var(--mono)}
+  .badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.8rem;font-weight:500}
+  .badge.info{background:var(--accent-bg);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Design — pre-flight <code>/simple/</code> agreement check for tray update discovery</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">approved-by-user</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-05-20</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">master</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<h2>Problem</h2>
+<p>
+Tray-triggered "Update" can land at a version different from the one the tray advertised. Surfaced live on the
+v0.45.2 → v0.45.3 upgrade: the tray's "Update available" badge said <code>0.45.3</code>, but after install the message read
+<em>"Update complete — jacked is now v0.45.2"</em>. The user gets a confusing "you clicked install but didn't get what was promised"
+experience and is left wondering whether the update actually worked.
+</p>
+
+<aside class="callout warn">
+<strong>Root cause:</strong> discovery and install consume <em>different</em> PyPI cache layers.
+<ul style="margin:.3rem 0 0 1.2rem;">
+  <li><strong>Discovery</strong>: <code>jacked/version_check.py</code> calls <code>https://pypi.org/pypi/&lt;pkg&gt;/json</code>. Fastly cache layer A. Surfaces a new release within seconds.</li>
+  <li><strong>Install</strong>: <code>uv tool install --refresh</code> calls <code>https://pypi.org/simple/&lt;pkg&gt;/</code>. Fastly cache layer B. Sometimes minutes behind A.</li>
+</ul>
+There's a propagation window where discovery says "available" but install resolves to the previous version.
+</aside>
+
+<h2>Goal</h2>
+<p>
+The tray's "Update available" indicator must be a <strong>truthful promise</strong>: when the user clicks it, the
+target version is guaranteed to be installable. Never show a phantom update.
+</p>
+
+<h2>Non-goals</h2>
+<ul>
+  <li>Speeding up PyPI's <code>/simple/</code> cache propagation (not in our control)</li>
+  <li>Post-install reconciliation / version mismatch detection (separate concern; deferred — pre-flight should be sufficient)</li>
+  <li>Notifying advanced users about a release that has hit <code>/pypi/json</code> but not <code>/simple/</code> (user explicitly opted for silent behavior during the gap)</li>
+  <li>Changing the tray UI surface (callbacks/states stay identical)</li>
+</ul>
+
+<h2>Design</h2>
+
+<h3>New function: <code>get_latest_from_simple_index</code></h3>
+<p>
+Probes <code>https://pypi.org/simple/&lt;package&gt;/</code> using the PEP 691 JSON variant (single Accept header, single small response,
+no HTML parsing required), extracts versions from the <code>files[].filename</code> entries, returns the max via the existing
+tuple-comparison parser.
+</p>
+
+<pre><code>def get_latest_from_simple_index(package: str = "claude-jacked", timeout: float = 3.0) -> str | None:
+    """Query PEP 691 JSON variant of /simple/ index. Returns max version, or None on failure.
+
+    This is THE SAME index uv reads (uv consumes /simple/, not /pypi/json), so a version's
+    presence here guarantees `uv tool install --refresh` will resolve to it.
+    """
+    try:
+        url = f"https://pypi.org/simple/{package}/"
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        versions = set()
+        for entry in data.get("files", []):
+            fn = entry.get("filename", "")
+            # claude_jacked-0.45.3-py3-none-any.whl or claude_jacked-0.45.3.tar.gz
+            m = _VERSION_FROM_FILENAME.search(fn)
+            if m:
+                versions.add(m.group(1))
+        if not versions:
+            return None
+        # Pick max using the existing is_newer tuple-compare parser
+        return max(versions, key=lambda v: _parse_version_tuple(v))
+    except Exception:
+        return None
+</code></pre>
+
+<h3>Modified function: <code>check_version_cached</code></h3>
+<p>
+Reads BOTH endpoints, treats the lesser as the "installable latest". <code>outdated</code> is true only when the installable
+latest is newer than the currently-installed version.
+</p>
+
+<pre><code>def check_version_cached(current_version: str, force: bool = False) -> dict | None:
+    # ... existing cache-read shortcut unchanged ...
+
+    pypi_latest = get_latest_pypi_version()
+    simple_latest = get_latest_from_simple_index()
+
+    # Conservative: if either probe failed, do not surface an update.
+    if not pypi_latest or not simple_latest:
+        installable = current_version
+    else:
+        # The lesser of the two is what uv would actually install.
+        installable = pypi_latest if not is_newer(simple_latest, pypi_latest) else simple_latest
+        # i.e. min(pypi, simple) by version order
+
+    outdated = is_newer(installable, current_version)
+
+    cache.update({
+        "checked_at": now,
+        "pypi_latest": pypi_latest,
+        "simple_latest": simple_latest,
+        "installable_latest": installable,
+        "current": current_version,
+        "outdated": outdated,
+    })
+    # ... persist, return ...
+</code></pre>
+
+<h3>Cache migration</h3>
+<p>
+Old cache schema:
+</p>
+<pre><code>{"latest": "0.45.2", "checked_at": 1747768320}</code></pre>
+<p>
+New schema:
+</p>
+<pre><code>{"pypi_latest": "0.45.3", "simple_latest": "0.45.2", "installable_latest": "0.45.2",
+ "current": "0.45.2", "outdated": false, "checked_at": 1747768320}</code></pre>
+<p>
+Cache reader returns <code>None</code> when it can't find the new fields (treated as "no cache, must re-fetch"). One free
+re-fetch on first run after upgrade; subsequent reads work normally. No explicit migration code needed.
+</p>
+
+<h3>Failure handling</h3>
+<table>
+  <thead><tr><th>Scenario</th><th>Behavior</th></tr></thead>
+  <tbody>
+    <tr><td>Both endpoints OK, both agree</td><td><code>outdated = true</code> if newer than current</td></tr>
+    <tr><td>Both endpoints OK, <code>/pypi/json</code> ahead of <code>/simple/</code></td><td><code>outdated = false</code> (use the lower)</td></tr>
+    <tr><td><code>/simple/</code> unreachable</td><td><code>outdated = false</code> (conservative)</td></tr>
+    <tr><td><code>/pypi/json</code> unreachable</td><td><code>outdated = false</code> (conservative)</td></tr>
+    <tr><td>Both unreachable</td><td><code>outdated = false</code></td></tr>
+    <tr><td><code>/simple/</code> returns empty file list (network ok, but no wheels)</td><td><code>outdated = false</code> (defensive)</td></tr>
+  </tbody>
+</table>
+
+<h3>Tray UI impact</h3>
+<p>
+Zero. The tray reads <code>cache["outdated"]</code> via the existing <code>version_text_fn</code> / <code>version_enabled_fn</code>
+callbacks. The fact that "outdated" is now derived from two endpoints instead of one is opaque to the tray. No new menu items,
+no new visual states.
+</p>
+
+<h2>Tests</h2>
+<table>
+  <thead><tr><th>Test</th><th>Asserts</th></tr></thead>
+  <tbody>
+    <tr><td><code>test_get_latest_from_simple_parses_pep691</code></td><td>given a real-shaped <code>/simple/</code> JSON response, returns the max version</td></tr>
+    <tr><td><code>test_get_latest_from_simple_handles_network_error</code></td><td>returns <code>None</code> on URL error, timeout, JSON decode error</td></tr>
+    <tr><td><code>test_get_latest_from_simple_empty_files_returns_none</code></td><td>defensive — empty files array → None</td></tr>
+    <tr><td><code>test_get_latest_from_simple_picks_max_not_first</code></td><td>multiple versions in files[]; must return the max</td></tr>
+    <tr><td><code>test_outdated_false_when_simple_lags_pypi</code></td><td>regression for v0.45.2→0.45.3 propagation lag</td></tr>
+    <tr><td><code>test_outdated_true_when_both_endpoints_agree</code></td><td>happy path</td></tr>
+    <tr><td><code>test_outdated_false_when_simple_unreachable</code></td><td>conservative behavior on network failure</td></tr>
+    <tr><td><code>test_outdated_false_when_pypi_unreachable</code></td><td>same, other endpoint</td></tr>
+    <tr><td><code>test_old_cache_schema_triggers_refetch</code></td><td>migration — old-format cache returns None / forces re-poll</td></tr>
+  </tbody>
+</table>
+
+<h2>File scope</h2>
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/version_check.py</code></td><td>Add <code>get_latest_from_simple_index</code> + filename regex + tuple parser export; modify <code>check_version_cached</code> to use both endpoints; update cache schema</td></tr>
+    <tr><td><code>tests/unit/test_version_check.py</code></td><td>Add the 9 tests above</td></tr>
+    <tr><td><code>jacked/__init__.py</code></td><td>Bump version to 0.45.4</td></tr>
+  </tbody>
+</table>
+
+<h2>Success criteria</h2>
+<ol>
+  <li>v0.45.4 → v0.45.5-style propagation lag never shows a phantom "Update available" button</li>
+  <li>Once <code>/simple/</code> catches up (typically minutes later), the button appears normally</li>
+  <li>Both happy-path and degraded-network paths covered by tests</li>
+  <li>No tray UI changes; no behavior change for users currently on the latest version</li>
+  <li>Old version cache file is gracefully discarded — no migration script needed</li>
+</ol>
+
+</div>
+</body>
+</html>

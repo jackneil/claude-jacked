@@ -815,7 +815,15 @@ def check_permissions(command: str, cwd: str) -> tuple[bool, str | None]:
     patterns.extend(_load_permissions(project_dir / ".claude" / "settings.local.json"))
 
     cmd_core = _strip_env_prefix(command)
-    candidates = [command, cmd_core] if cmd_core != command else [command]
+    cmd_no_comments = _strip_leading_comments(command).strip()
+    cmd_no_comments_core = _strip_env_prefix(cmd_no_comments)
+    # Build candidate list — deduplicated, original first
+    seen = set()
+    candidates = []
+    for c in [command, cmd_core, cmd_no_comments, cmd_no_comments_core]:
+        if c not in seen:
+            seen.add(c)
+            candidates.append(c)
 
     for pat in patterns:
         prefix, is_wildcard = _parse_bash_pattern(pat)
@@ -851,6 +859,24 @@ def _get_base_command(command: str) -> str:
 def _strip_env_prefix(cmd: str) -> str:
     """Strip leading env var assignments: HOME=/x PATH="/y" cmd → cmd"""
     return ENV_ASSIGN_RE.sub("", cmd).strip()
+
+
+def _strip_leading_comments(cmd: str) -> str:
+    """Strip leading # comment lines from multi-line commands.
+
+    Claude Code now prepends description comments before the actual command:
+        # Click on a source element
+        npx agent-browser --session nav click e106
+
+    Without stripping, permission patterns like Bash(npx agent-browser:*)
+    fail because the command starts with '#', not 'npx'.
+    """
+    lines = cmd.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return "\n".join(lines[i:])
+    return cmd  # all comments — return as-is
 
 
 def _is_pipe_safe(cmd: str) -> bool:
@@ -1040,7 +1066,7 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
 
     >>> config = _read_gatekeeper_config(Path("/nonexistent/path.db"))
     >>> config["enabled"]
-    True
+    False
     >>> config["model_short"]
     'haiku'
     >>> config["eval_method"]
@@ -1048,8 +1074,11 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     """
     import sqlite3 as _sqlite3
 
+    # Default off: Claude Code's auto permission mode handles approvals natively.
+    # Users turn the gatekeeper on from the dashboard (Settings > Gatekeeper) when
+    # they want LLM-evaluated interception layered on top.
     defaults = {
-        "enabled": True,
+        "enabled": False,
         "model": MODEL_MAP["haiku"],
         "model_short": "haiku",
         "eval_method": "api_first",
@@ -1093,14 +1122,14 @@ def _read_gatekeeper_config(db_path: Path | None = None) -> dict:
     if method in ("api_first", "cli_first", "api_only", "cli_only"):
         defaults["eval_method"] = method
 
-    # Parse enabled flag — json.loads returns Python bool singleton,
-    # so `is not False` is an identity check (correct for True/False literals).
+    # Parse enabled flag — only honor an explicit JSON `true`. Anything else
+    # (false, missing, malformed) leaves the off-by-default in place.
     enabled_raw = rows.get("gatekeeper.enabled", "")
     if enabled_raw:
         try:
-            defaults["enabled"] = json.loads(enabled_raw) is not False
+            defaults["enabled"] = json.loads(enabled_raw) is True
         except (ValueError, TypeError):
-            pass  # Keep default True
+            pass  # Keep default False
 
     # Parse api_key
     key_raw = rows.get("gatekeeper.api_key", "")
@@ -1736,6 +1765,43 @@ def _handle_file_tool_inner(
         )
         return
 
+    # Freeze boundary check — block Edit/Write/NotebookEdit outside the frozen directory.
+    # /freeze writes a path to this file; /unfreeze deletes it.
+    # Read-only tools (Read, Grep, Glob) are NOT restricted.
+    if tool_name in ("Edit", "Write", "NotebookEdit"):
+        _freeze_path = Path.home() / ".claude" / "jacked-freeze-dir.txt"
+        if _freeze_path.exists():
+            try:
+                _frozen_dir = _freeze_path.read_text().strip()
+                if _frozen_dir:
+                    _resolved_file = str(Path(file_path).resolve())
+                    _frozen_resolved = str(Path(_frozen_dir).resolve())
+                    if (
+                        _resolved_file != _frozen_resolved
+                        and not _resolved_file.startswith(_frozen_resolved + "/")
+                    ):
+                        elapsed = time.time() - start
+                        log(
+                            f"FREEZE BOUNDARY [{tool_name}]: DENY "
+                            f"{file_path[:100]} — outside frozen dir {_frozen_dir}"
+                        )
+                        _record_decision(
+                            "DENY",
+                            f"[{tool_name}] {file_path[:200]}",
+                            "FREEZE_BOUNDARY",
+                            f"outside frozen dir: {_frozen_dir}",
+                            elapsed * 1000,
+                            session_id,
+                            repo_path,
+                        )
+                        _emit_deny(
+                            f"Freeze boundary: edits restricted to {_frozen_dir} "
+                            f"(run /unfreeze to remove)"
+                        )
+                        return
+            except Exception:
+                pass  # fail-open if freeze file is corrupted
+
     # Step 1: Path safety checks FIRST — security always wins over permissions.
     # Split into three calls (watched → sensitive → outside-project) so that
     # "defer" on outside-project can never bypass sensitive file checks.
@@ -2242,6 +2308,52 @@ def _record_decision(
     _record_hook_execution(elapsed_ms, session_id, repo_path)
 
 
+# --- PermissionRequest handler ---
+
+
+def handle_permission_request(
+    tool_name: str, tool_input: dict, cwd: str
+) -> dict | None:
+    """Handle a PermissionRequest hook event.
+
+    Called when Claude Code is about to show the permission popup.
+    If the (comment-stripped) command matches an allow rule, return
+    an approve decision with the stripped command in updatedInput —
+    this auto-approves AND cleans the command so Claude Code's
+    "Always Allow" prefix suggestions don't include comments.
+
+    Returns the JSON response dict, or None to let the popup show.
+    """
+    if tool_name != "Bash":
+        return None
+
+    command = tool_input.get("command", "")
+    if not command:
+        return None
+
+    # Strip comments and check permissions
+    stripped = _strip_leading_comments(command.strip()).strip()
+    matched, pattern = check_permissions(stripped, cwd)
+    if not matched:
+        # Also try the original (might match without stripping)
+        matched, pattern = check_permissions(command, cwd)
+        if not matched:
+            return None
+
+    log(f"PERMISSION_REQUEST: auto-approving via rule '{pattern}' (comment-stripped)")
+
+    return {
+        "hookSpecificOutput": {
+            "decision": {
+                "behavior": "allow",
+                "updatedInput": {
+                    "command": stripped if stripped != command else command,
+                },
+            },
+        },
+    }
+
+
 # --- Main ---
 
 
@@ -2253,12 +2365,22 @@ def main():
     except Exception:
         sys.exit(0)
 
+    hook_event = hook_input.get("hook_event_name", "PreToolUse")
     tool_name = hook_input.get("tool_name", "Bash")
     tool_input = hook_input.get("tool_input", {})
     cwd = hook_input.get("cwd", "")
     repo_path = str(Path(os.environ.get("CLAUDE_PROJECT_DIR", cwd)).resolve()).replace(
         "\\", "/"
     )
+
+    # PermissionRequest: auto-approve comment-stripped commands that match
+    # allow rules, with updatedInput so Claude Code's "Always Allow" popup
+    # shows the clean command (no # comment prefix).
+    if hook_event == "PermissionRequest":
+        result = handle_permission_request(tool_name, tool_input, cwd)
+        if result:
+            print(json.dumps(result))
+        sys.exit(0)
 
     global _session_tag
     sid = hook_input.get("session_id", "")
@@ -2310,11 +2432,14 @@ def main():
     log(f"EVALUATING: {command[:200]}")
     steps = _Steps(start)
 
-    # Tier 0: Deny check FIRST — security always wins over permissions
-    cmd_stripped = command.strip()
+    # Strip leading # comment lines (Claude Code now prepends descriptions).
+    # Deny checks run on BOTH original and stripped — comments don't make
+    # dangerous commands safe.
+    cmd_raw = command.strip()
+    cmd_stripped = _strip_leading_comments(cmd_raw).strip()
     cmd_core = _strip_env_prefix(cmd_stripped)
     for pattern, label in DENY_PATTERNS:
-        if pattern.search(cmd_stripped) or pattern.search(cmd_core):
+        if pattern.search(cmd_raw) or pattern.search(cmd_stripped) or pattern.search(cmd_core):
             steps.record("deny_pattern", "ask", label)
             elapsed = time.time() - start
             log(f"DENY MATCH ({elapsed:.3f}s)")

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import click
 
+from jacked.findbin import find_bin
 from jacked.api.credential_helpers import (
     _safe_replace,
     build_oauth_data,
@@ -364,17 +365,42 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         if not account:
             raise click.ClickException(f"Account {account_id} disappeared after refresh")
 
-    # Refresh CC token if near-expiry (independent from primary)
+    # Refresh CC token if near-expiry (independent from primary).
+    # Skip refresh if this account is currently the active Claude Code
+    # session — rotating the CC refresh token upstream would invalidate
+    # the token Claude Code's running process holds in memory/Keychain,
+    # forcing a re-login. See docs/architecture/oauth-and-credential-flows.md §7.2.
     if should_refresh_cc(account):
-        from jacked.web.auth import refresh_cc_token
+        from jacked.api.credential_helpers import read_active_account_id
 
-        try:
-            asyncio.run(refresh_cc_token(account_id, db))
-        except Exception as exc:
-            logger.warning("Pre-launch CC token refresh failed: %s", exc)
-        account = db.get_account(account_id)
-        if not account:
-            raise click.ClickException(f"Account {account_id} disappeared after CC refresh")
+        active_id = read_active_account_id()
+
+        if active_id != account_id:
+            from jacked.web.auth import refresh_cc_token
+
+            try:
+                asyncio.run(refresh_cc_token(account_id, db))
+            except Exception as exc:
+                logger.warning("Pre-launch CC token refresh failed: %s", exc)
+            account = db.get_account(account_id)
+            if not account:
+                raise click.ClickException(f"Account {account_id} disappeared after CC refresh")
+        else:
+            # Reconcile live creds into DB before the downstream Keychain
+            # write so we don't roll back Claude Code's fresh token
+            # (architecture doc §7.2 — launch.py:489 stale write gap).
+            try:
+                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                reconcile_credentials_from_live_store(account_id, db)
+                account = db.get_account(account_id) or account
+            except Exception:
+                logger.debug("Pre-launch reconcile failed", exc_info=True)
+            logger.info(
+                "Account %d: skipping pre-launch CC refresh (account is the "
+                "active Claude Code session — Claude Code manages its own "
+                "token rotation).",
+                account_id,
+            )
 
     # Pre-launch CC token warnings
     cc_at = account.get("cc_access_token")
@@ -477,7 +503,7 @@ def resolve_account(account_ref, db: Database) -> dict:
 
     >>> # Tested via test_launch.py
     """
-    if not shutil.which("claude"):
+    if not find_bin("claude"):
         raise click.ClickException(
             "claude not found in PATH. Install with: npm install -g @anthropic-ai/claude-code"
         )

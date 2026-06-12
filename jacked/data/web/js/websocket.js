@@ -5,6 +5,50 @@
  * and typed event dispatch.  Any component can register handlers for
  * specific event types (e.g. "credentials_changed") or "*" for all.
  */
+
+// ---------------------------------------------------------------------------
+// Usage-checking watchdog
+// ---------------------------------------------------------------------------
+// Problem: a card that receives `usage_refresh_progress status=checking` but
+// never receives the matching `done`/`failed` (WS drop, server-side prune from
+// slow-client timeout, tab backgrounded) stays stuck on "Checking usage…"
+// forever. Hard reload alone clears it, but if a bulk is actively re-stamping
+// the card mid-reload the state can re-appear.
+//
+// Fix: arm a per-account setTimeout when we show the checking overlay. If no
+// terminal event arrives within CHECKING_TIMEOUT_MS, force the card back to
+// idle — the user can click refresh again. Both the WS bulk handler and the
+// single-account refresh path use this.
+const _CHECKING_TIMEOUT_MS = 120_000;
+const _checkingWatchdogs = new Map();  // accountId -> setTimeout id
+
+function _armCheckingWatchdog(accountId) {
+    if (!Number.isInteger(accountId)) return;
+    _clearCheckingWatchdog(accountId);  // re-arm resets timer
+    const timerId = setTimeout(() => {
+        _checkingWatchdogs.delete(accountId);
+        const card = document.querySelector('[data-account-id="' + accountId + '"]');
+        if (!card || !card.classList.contains('usage-checking')) return;
+        console.warn('[usage] watchdog cleared stuck checking state for account', accountId);
+        card.classList.remove('usage-checking', 'usage-queued');
+        if (typeof _usageRemoveOverlay === 'function') _usageRemoveOverlay(card);
+    }, _CHECKING_TIMEOUT_MS);
+    _checkingWatchdogs.set(accountId, timerId);
+}
+
+function _clearCheckingWatchdog(accountId) {
+    const existing = _checkingWatchdogs.get(accountId);
+    if (existing !== undefined) {
+        clearTimeout(existing);
+        _checkingWatchdogs.delete(accountId);
+    }
+}
+
+function _clearAllCheckingWatchdogs() {
+    for (const timerId of _checkingWatchdogs.values()) clearTimeout(timerId);
+    _checkingWatchdogs.clear();
+}
+
 const jackedWS = {
     ws: null,
     handlers: {},           // type -> [callback, ...]
@@ -34,6 +78,9 @@ const jackedWS = {
             this.reconnectDelay = 1000;  // Reset backoff on successful connect
             // Stop logs fallback polling now that WS is live
             if (typeof stopLogsFallbackPolling === 'function') stopLogsFallbackPolling();
+            // Fetch fresh account data on reconnect so the countdown
+            // has _last_poll_at from the backend immediately.
+            if (typeof refreshAndRender === 'function') refreshAndRender();
         };
 
         this.ws.onmessage = (event) => {
@@ -73,6 +120,8 @@ const jackedWS = {
                 el => el.classList.remove('usage-checking', 'usage-queued')
             );
             document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
+            // Cancel any pending watchdogs — they'd clobber the fresh render on reconnect.
+            _clearAllCheckingWatchdogs();
             // If upgrade modal is open and WS drops, server is likely restarting — begin health poll
             if (document.getElementById('upgrade-modal') && typeof _startHealthPolling === 'function') {
                 _startHealthPolling();
@@ -299,7 +348,7 @@ function _usageUpdateCardDOM(card, acctData) {
         const cacheSpan = card.querySelector('[data-cache-age]');
         if (cacheSpan) {
             const tempCache = document.createElement('div');
-            tempCache.insertAdjacentHTML('afterbegin', renderCacheAge(acctData.usage_cached_at));
+            tempCache.insertAdjacentHTML('afterbegin', renderCacheAge(acctData.usage_cached_at, acctData.id));
             const newCache = tempCache.firstElementChild;
             if (newCache) cacheSpan.replaceWith(newCache);
         }
@@ -324,6 +373,9 @@ jackedWS.on('usage_refresh_started', (msg) => {
         card.classList.remove('usage-checking', 'usage-done', 'usage-failed');
         card.classList.add('usage-queued');
         _usageInjectOverlay(card, 'queued', 'Waiting\u2026');
+        // Arm watchdog now — queued eventually becomes checking, and without
+        // this a slow-client prune mid-bulk could leave the card stuck.
+        _armCheckingWatchdog(id);
     }
 });
 
@@ -341,7 +393,9 @@ jackedWS.on('usage_refresh_progress', (msg) => {
 
         if (d.status === 'checking') {
             _usageInjectOverlay(card, 'checking', 'Checking usage\u2026');
+            _armCheckingWatchdog(d.account_id);
         } else if (d.status === 'done') {
+            _clearCheckingWatchdog(d.account_id);
             _usageInjectOverlay(card, 'done', 'Updated!');
             // Surgically patch usage data in the card DOM
             if (d.account_data) _usageUpdateCardDOM(card, d.account_data);
@@ -350,6 +404,7 @@ jackedWS.on('usage_refresh_progress', (msg) => {
                 card.classList.remove('usage-done');
             }, _OVERLAY_DONE_MS);
         } else if (d.status === 'failed') {
+            _clearCheckingWatchdog(d.account_id);
             _usageInjectOverlay(card, 'failed', 'Failed');
             setTimeout(() => {
                 _usageRemoveOverlay(card);
@@ -401,12 +456,138 @@ jackedWS.on('upgrade_failed', (msg) => {
     if (typeof _showUpgradeError === 'function') _showUpgradeError(d.error || 'Upgrade failed');
 });
 
+jackedWS.on('auto_swap_triggered', (msg) => {
+    const d = msg.payload || msg;
+    const toLabel = d.to_label || d.to_email || 'another account';
+    const reason = d.reason || '';
+    // Dismiss exhaustion banner — a swap means we found a target
+    window.jackedState._exhaustionData = null;
+    if (typeof renderExhaustionBanner === 'function') renderExhaustionBanner();
+    // Persistent swap banner — dismissible, auto-hides after 5 minutes
+    const existing = document.getElementById('swap-banner');
+    if (existing) existing.remove();
+    const banner = document.createElement('div');
+    banner.id = 'swap-banner';
+    banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-teal-900/95 border border-teal-600 rounded-lg px-5 py-3 shadow-lg max-w-lg flex items-center gap-3';
+    const text = document.createElement('span');
+    text.className = 'text-sm text-teal-100';
+    text.textContent = 'Auto-swapped to ' + toLabel + (reason ? ' \u2014 ' + reason : '');
+    const close = document.createElement('button');
+    close.className = 'text-teal-400 hover:text-white text-lg leading-none ml-auto';
+    close.textContent = '\u00d7';
+    close.onclick = function() { banner.remove(); };
+    banner.appendChild(text);
+    banner.appendChild(close);
+    document.body.appendChild(banner);
+    setTimeout(function() { if (banner.parentNode) banner.remove(); }, 300000);
+    if (typeof loadActiveCredential === 'function') loadActiveCredential();
+    if (typeof refreshAndRender === 'function') refreshAndRender();
+});
+
+jackedWS.on('all_accounts_exhausted', (msg) => {
+    const d = msg.payload || msg;
+    window.jackedState._exhaustionData = d;
+    if (typeof renderExhaustionBanner === 'function') renderExhaustionBanner();
+});
+
+jackedWS.on('auto_swap_stall', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof showStallBanner === 'function') {
+        showStallBanner(data);
+    } else {
+        console.warn('Auto-swap stall detected', data);
+    }
+});
+
+jackedWS.on('auto_swap_stall_clear', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof hideStallBanner === 'function') {
+        hideStallBanner(data);
+    }
+});
+
+jackedWS.on('expiring_with_stranded_capacity', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof handleDrainAdvisorEvent === 'function') {
+        handleDrainAdvisorEvent(data);
+    } else {
+        console.warn('Stranded-capacity advisory (no handler loaded)', data);
+    }
+});
+
+jackedWS.on('same_tier_deficit_advisory', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof showSameTierAdvisory === 'function') showSameTierAdvisory(data);
+});
+
+jackedWS.on('auto_swap_failed', (msg) => {
+    const data = msg.payload || msg;
+    console.warn('Auto-swap commit failed:', data);
+    if (typeof showToast === 'function') {
+        showToast(`Auto-swap to account ${data.to_account_id} failed: ${data.failure || 'unknown'}`,
+                  'error');
+    }
+});
+
+jackedWS.on('usage_poll_updated', (msg) => {
+    var d = msg.payload || msg;
+    if (!d.account_id || !d.account_data) return;
+
+    // Update the account in jackedState so countdown reads fresh data
+    var accounts = window.jackedState.accounts || [];
+    for (var i = 0; i < accounts.length; i++) {
+        if (accounts[i].id === d.account_id) {
+            Object.assign(accounts[i], d.account_data);
+            break;
+        }
+    }
+
+    // Surgically update the card DOM (usage bars + cache age)
+    var card = document.querySelector('[data-account-id="' + d.account_id + '"]');
+    if (card && typeof _usageUpdateCardDOM === 'function') {
+        _usageUpdateCardDOM(card, d.account_data);
+    }
+});
+
 jackedWS.on('sessions_changed', async () => {
     if (typeof loadActiveSessions === 'function') await loadActiveSessions();
     if (typeof loadAccounts === 'function') await loadAccounts();
     // Suppress re-render during bulk usage refresh — refresh handler calls refreshAndRender() itself
     if (window.jackedState && window.jackedState._usageRefreshInProgress) return;
     if (typeof rerenderAccountsView === 'function') rerenderAccountsView();
+});
+
+jackedWS.on('decision_log_entry', (msg) => {
+    const container = document.getElementById('decision-log-container');
+    if (container) {
+        renderDecisionLog('decision-log-container');
+    }
+});
+
+// --- Token usage analytics WS events ---
+
+jackedWS.on('analytics_scan_progress', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof updateAnalyticsScanProgress === 'function') updateAnalyticsScanProgress(d);
+});
+
+jackedWS.on('analytics_scan_complete', () => {
+    if (typeof onAnalyticsScanComplete === 'function') onAnalyticsScanComplete();
+});
+
+jackedWS.on('analytics_live_update', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof onAnalyticsLiveUpdate === 'function') onAnalyticsLiveUpdate(d);
+});
+
+jackedWS.on('analytics_flag_raised', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof onAnalyticsFlagRaised === 'function') onAnalyticsFlagRaised(d);
+});
+
+jackedWS.on('analytics_flag_resolved', (msg) => {
+    const d = msg.payload || msg;
+    if (typeof onAnalyticsFlagResolved === 'function') onAnalyticsFlagResolved(d);
 });
 
 // Adjust polling interval when WebSocket connects (less aggressive polling)

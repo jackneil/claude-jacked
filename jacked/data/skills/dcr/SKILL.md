@@ -1,6 +1,6 @@
 ---
 name: dcr
-description: "Parallel recursive review — selects relevant lenses, spawns focused reviewers per wave until all selected lenses pass clean. Use after implementing a feature, fixing a bug, or completing any non-trivial code change."
+description: Use after implementing a feature, fixing a bug, or completing any non-trivial code change. Recursive multi-lens review that continues until all selected lenses pass clean.
 ---
 
 First, check if a repo-scoped version exists in the current project:

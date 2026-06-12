@@ -4,9 +4,12 @@ All credential writes go through sync_credential_to_all_stores().
 This is the ONLY module that writes to credential stores.
 """
 
+import contextlib
 import json
 import logging
 import os
+import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,104 @@ import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process lock (compatible with Claude Code's proper-lockfile)
+# ---------------------------------------------------------------------------
+
+_LOCK_DIR = str(Path.home() / ".claude.lock")
+_LOCK_MAX_RETRIES = 5
+_LOCK_RETRY_BASE_MS = 1000
+
+
+@contextlib.contextmanager
+def acquire_claude_lock(timeout_retries: int = _LOCK_MAX_RETRIES):
+    """Acquire a cross-process lock compatible with Claude Code's proper-lockfile.
+
+    proper-lockfile creates a {path}.lock directory as its lock. We use
+    os.mkdir (atomic on POSIX) to implement the same protocol.
+
+    Includes stale lock detection: if the lock directory exists but the
+    PID file inside is from a dead process, the lock is removed and retried.
+
+    Usage:
+        with acquire_claude_lock() as locked:
+            if locked:
+                # ... exchange tokens, write credentials ...
+    """
+    lock_path = _LOCK_DIR
+    pid_file = os.path.join(lock_path, "pid")
+    acquired = False
+
+    for attempt in range(timeout_retries):
+        try:
+            os.mkdir(lock_path)
+            try:
+                with open(pid_file, "w") as f:
+                    f.write(str(os.getpid()))
+            except OSError:
+                pass
+            acquired = True
+            break
+        except FileExistsError:
+            # Lock exists — check if it's stale. Uses the cross-platform
+            # is_process_alive (ctypes WaitForSingleObject on Windows)
+            # because os.kill(pid, 0) is not a valid probe on Windows and
+            # can surface CPython SystemError for exited PIDs.
+            from jacked.service.process import is_process_alive
+            holder_pid = None
+            try:
+                with open(pid_file, "r") as f:
+                    holder_pid = int(f.read().strip())
+            except (FileNotFoundError, ValueError):
+                pass
+
+            if holder_pid is None or not is_process_alive(holder_pid):
+                try:
+                    shutil.rmtree(lock_path, ignore_errors=True)
+                    logger.info("Removed stale Claude lock (holder PID gone)")
+                    continue
+                except OSError:
+                    pass
+            # Process exists — lock is valid, fall through to retry/timeout
+
+            if attempt < timeout_retries - 1:
+                wait = (_LOCK_RETRY_BASE_MS + random.randint(0, 1000)) / 1000.0
+                logger.debug("Claude lock held, retrying in %.1fs (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+
+    if not acquired:
+        logger.warning("Failed to acquire Claude lock after %d retries", timeout_retries)
+
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            shutil.rmtree(lock_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Keychain helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_keychain_username() -> str:
+    """Get the system username for keychain account name.
+
+    Claude Code uses process.env.USER || userInfo().username as the
+    keychain account name (-a parameter). We must match this exactly
+    or we write to a different keychain entry.
+    """
+    username = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    if not username:
+        logger.warning(
+            "Neither $USER nor $USERNAME is set — keychain operations will use "
+            "fallback account name 'Claude Code' which may not match Claude Code's "
+            "entry (it uses the system username)"
+        )
+        return "Claude Code"
+    return username
 
 
 def _safe_replace(src: str, dst: str, *, retries: int = 3, delay: float = 0.1):
@@ -141,15 +242,19 @@ def update_claude_config_email(
 def read_platform_credentials() -> dict | None:
     """Read credentials from the platform's native credential store.
 
-    macOS: Keychain ("Claude Code-credentials")
+    macOS: Keychain entry with service "Claude Code-credentials" and
+    account name matching the system username (same as Claude Code).
     Linux/Windows: not yet needed (still use .credentials.json)
 
-    Returns parsed dict (same shape as .credentials.json) or None."""
+    Returns parsed dict (same shape as .credentials.json) or None.
+    """
     if sys.platform != "darwin":
         return None
     try:
+        username = _get_keychain_username()
         result = subprocess.run(
             ["security", "find-generic-password",
+             "-a", username,
              "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=5,
         )
@@ -157,45 +262,273 @@ def read_platform_credentials() -> dict | None:
             return json.loads(result.stdout.strip())
         if result.returncode != 0:
             logger.debug("Keychain read failed: %s", result.stderr.strip())
-    except (json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+    except json.JSONDecodeError as exc:
+        logger.warning("Keychain data is not valid JSON (corrupted?): %s", exc)
+    except (subprocess.SubprocessError, OSError) as exc:
         logger.debug("Keychain read error: %s", exc)
     return None
+
+
+def read_fresh_active_token(account_id: int) -> str | None:
+    """Read the current access token from credential stores for an account.
+
+    After activation, Claude Code refreshes the access token on its own
+    schedule, making the DB copy stale.  This reads the live token from
+    the same stores Claude Code uses (Keychain first, then file).
+
+    Returns the access token string, or None if the stores don't belong
+    to this account or are unreadable.
+    """
+    # Try keychain first (same precedence as Claude Code on macOS)
+    kc_data = read_platform_credentials()
+    if kc_data and kc_data.get("_jackedAccountId") == account_id:
+        token = kc_data.get("claudeAiOauth", {}).get("accessToken")
+        if token:
+            return token
+
+    # Fall back to global .credentials.json
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if cred_path.exists() and not cred_path.is_symlink():
+        try:
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+            if data.get("_jackedAccountId") == account_id:
+                token = data.get("claudeAiOauth", {}).get("accessToken")
+                if token:
+                    return token
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("Credential file read failed for account %d: %s", account_id, exc)
+
+    return None
+
+
+def read_active_account_id() -> int | None:
+    """Return the currently-active jacked account id, or None.
+
+    Consulted by all paths that must NOT rotate the active account's CC
+    refresh token (architecture doc §7.1, §7.2, §7.3 + invariant I2).
+
+    Reads `_jackedAccountId` stamp from Keychain first, then from
+    `~/.claude/.credentials.json`. Returns an `int` for easy `==` comparison
+    against `account["id"]`. Never raises — all errors resolved to None so
+    callers can safely `if read_active_account_id() == account_id: skip`.
+
+    Coerces string values (e.g. hand-edited JSON with "1" instead of 1) to
+    int. Rejects zero and negative values as invalid account ids.
+    """
+    stamp = None
+    try:
+        live = read_platform_credentials()
+        if not live:
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    live = json.loads(cred_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    live = None
+        if isinstance(live, dict):
+            stamp = live.get("_jackedAccountId")
+    except Exception:
+        logger.debug("read_active_account_id failed", exc_info=True)
+        return None
+
+    if stamp is None:
+        return None
+    try:
+        account_id = int(stamp)
+    except (TypeError, ValueError):
+        return None
+    if account_id <= 0:
+        return None
+    return account_id
+
+
+# ---------------------------------------------------------------------------
+# Cache for live credential reads (30s TTL)
+# ---------------------------------------------------------------------------
+
+_live_cred_cache: dict = {"account_id": None, "data": None, "expires_at": 0.0}
+
+
+def _get_cached_live_credentials(account_id: int):
+    """Return cached live credentials if fresh, else None."""
+    if (_live_cred_cache["account_id"] == account_id
+            and time.time() < _live_cred_cache["expires_at"]
+            and _live_cred_cache["data"] is not None):
+        return _live_cred_cache["data"]
+    return None
+
+
+def _cache_live_credentials(account_id: int, data: dict | None):
+    """Cache live credential read for 30 seconds."""
+    _live_cred_cache["account_id"] = account_id
+    _live_cred_cache["data"] = data
+    _live_cred_cache["expires_at"] = time.time() + 30.0
+
+
+def invalidate_live_cred_cache():
+    """Invalidate the cache (call on swap)."""
+    _live_cred_cache["account_id"] = None
+    _live_cred_cache["data"] = None
+    _live_cred_cache["expires_at"] = 0.0
+
+
+def reconcile_credentials_from_live_store(account_id: int, db) -> None:
+    """Read live credentials for the active account and reconcile with DB.
+
+    Before swapping away from an account, check if Claude Code rotated
+    the refresh token during its session. If so, import the fresh token
+    into our DB so we don't lose it.
+
+    Called before sync_credential_to_all_stores() in the swap path and
+    in the use_account endpoint.
+
+    SAFETY: Never imports cc_refresh_token when circuit breaker shows
+    invalid_grant — the live token is Claude Code's active token and
+    importing+exchanging it would destroy CC's session.
+    """
+    # Check cache first to avoid Keychain subprocess calls
+    live = _get_cached_live_credentials(account_id)
+
+    if not live:
+        # Read live credentials (Keychain first, file fallback)
+        live = read_platform_credentials()
+        if not live:
+            # Fall back to .credentials.json
+            cred_path = Path.home() / ".claude" / ".credentials.json"
+            if cred_path.exists() and not cred_path.is_symlink():
+                try:
+                    live = json.loads(cred_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    return
+        # Cache the result (even if None would be returned early below)
+        _cache_live_credentials(account_id, live)
+
+    if not live:
+        return
+
+    # Only reconcile if the credentials belong to the outgoing account
+    if live.get("_jackedAccountId") != account_id:
+        return
+
+    oauth = live.get("claudeAiOauth", {})
+    live_access = oauth.get("accessToken")
+    live_refresh = oauth.get("refreshToken")
+    live_expires = oauth.get("expiresAt")  # milliseconds
+
+    if not live_access:
+        return
+
+    # Read current DB state
+    account = db.get_account(account_id)
+    if not account:
+        return
+
+    db_cc_refresh = account.get("cc_refresh_token")
+
+    updates = {}
+
+    # Always import the latest access token
+    if live_access != account.get("cc_access_token"):
+        updates["cc_access_token"] = live_access
+
+    # Import expiry (convert ms -> seconds)
+    if live_expires:
+        live_expires_s = int(live_expires / 1000) if live_expires > 1e12 else int(live_expires)
+        if live_expires_s != account.get("cc_expires_at"):
+            updates["cc_expires_at"] = live_expires_s
+
+    # Reconcile refresh token — BUT skip if circuit breaker shows invalid_grant
+    # Importing a live CC refresh token during invalid_grant would compete with
+    # Claude Code for the single-use token, destroying CC's session.
+    if live_refresh:
+        account_row = account
+        cb_failure = account_row.get("refresh_failure_type") if account_row else None
+        if cb_failure == "invalid_grant":
+            logger.debug(
+                "Account %d: skipping cc_refresh_token import (invalid_grant active)",
+                account_id,
+            )
+        elif db_cc_refresh is None:
+            # Recovery: our token was cleared but Claude Code has one
+            logger.info(
+                "Account %d: recovering cc_refresh_token from live credentials",
+                account_id,
+            )
+            updates["cc_refresh_token"] = live_refresh
+        elif live_refresh != db_cc_refresh:
+            # Rotation: Claude Code got a new token
+            logger.info(
+                "Account %d: importing rotated cc_refresh_token from live credentials",
+                account_id,
+            )
+            updates["cc_refresh_token"] = live_refresh
+
+    if updates:
+        db.update_account(account_id, **updates)
+        logger.info(
+            "Account %d: reconciled %d credential field(s) from live store",
+            account_id, len(updates),
+        )
+
+
+# Backward-compatible alias
+reconcile_outgoing_credentials = reconcile_credentials_from_live_store
 
 
 def write_platform_credentials(data: dict) -> bool:
     """Write credentials to the platform's native credential store.
 
-    macOS: Keychain ("Claude Code-credentials")
+    macOS: Keychain entry with service "Claude Code-credentials" and
+    account name matching the system username.  Uses -X hex encoding
+    to match Claude Code's format (avoids plaintext in process args,
+    prevents CrowdStrike/process monitor exposure).
+
     Linux/Windows: no-op (they use .credentials.json)
 
     Returns True if written successfully, False otherwise.
 
     >>> write_platform_credentials({}) if sys.platform != "darwin" else True
-    True"""
+    True
+    """
     if sys.platform != "darwin":
         return True  # no-op on non-macOS (file write is sufficient)
     try:
+        username = _get_keychain_username()
         json_data = json.dumps(data, separators=(",", ":"))
-        # Delete existing entry (ignore failure if not found)
-        subprocess.run(
-            ["security", "delete-generic-password",
-             "-s", "Claude Code-credentials"],
-            capture_output=True, timeout=5,
-        )
-        # Add new entry
+        hex_value = json_data.encode("utf-8").hex()
+
+        # Use -U (update-or-insert) with -X (hex value) to match CC's format.
         result = subprocess.run(
             ["security", "add-generic-password",
+             "-U",
+             "-a", username,
              "-s", "Claude Code-credentials",
-             "-a", "Claude Code",
-             "-w", json_data],
+             "-X", hex_value],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
-            logger.warning("Keychain write failed: %s", result.stderr.strip())
+            logger.warning(
+                "Keychain write failed (user=%s, service=Claude Code-credentials): %s",
+                username, result.stderr.strip(),
+            )
             return False
+
+        # Clean up orphan keychain entry from old jacked versions that used
+        # -a "Claude Code" instead of -a $USER.  Runs AFTER successful write
+        # so the user is never left with no entry.  Ignore errors (may not exist).
+        if username != "Claude Code":
+            cleanup = subprocess.run(
+                ["security", "delete-generic-password",
+                 "-a", "Claude Code",
+                 "-s", "Claude Code-credentials"],
+                capture_output=True, timeout=5,
+            )
+            if cleanup.returncode == 0:
+                logger.info("Cleaned up orphan keychain entry (-a 'Claude Code')")
+
         return True
     except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning("Keychain write error: %s", exc)
+        logger.warning("Keychain write error (user=%s): %s", username, exc)
         return False
 
 

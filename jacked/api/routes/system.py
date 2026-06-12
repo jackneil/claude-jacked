@@ -11,6 +11,9 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked.findbin import find_bin
+from jacked.service import update_status as _update_status_mod
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -31,6 +34,7 @@ class VersionResponse(BaseModel):
     ahead: bool = False
     checked_at: Optional[str] = None
     next_check_at: Optional[str] = None
+    update_status_file: Optional[str] = None
 
 
 class InstallationResponse(BaseModel):
@@ -135,6 +139,51 @@ async def health_check(request: Request):
     return HealthResponse(status="ok", db=db is not None)
 
 
+@router.get("/admin/debug/tasks")
+async def debug_tasks(request: Request):
+    """Dump every asyncio task on the running event loop.
+
+    Diagnostic-only — returns each task's name, done state, and the
+    file:line of its current frame so a wedged task can be pinpointed
+    without attaching a debugger. The dashboard binds to 127.0.0.1, so
+    no auth is layered here.
+    """
+    import time as _time
+    out = []
+    for t in asyncio.all_tasks():
+        coro = t.get_coro()
+        frame = getattr(coro, "cr_frame", None)
+        location = None
+        if frame is not None:
+            location = (
+                f"{frame.f_code.co_filename}:{frame.f_lineno} "
+                f"in {frame.f_code.co_name}"
+            )
+        try:
+            cancelled = t.cancelled()
+        except Exception:
+            cancelled = None
+        out.append({
+            "name": t.get_name(),
+            "done": t.done(),
+            "cancelled": cancelled,
+            "coro_name": getattr(coro, "__qualname__", repr(coro)),
+            "location": location,
+        })
+
+    # Heartbeat snapshot for the active poll loop — pairs with the task
+    # list so the caller can correlate "is the task object alive" with
+    # "is the task body actually ticking".
+    last_tick = getattr(request.app.state, "active_poll_last_tick_at", None)
+    heartbeat = {
+        "active_poll_last_tick_at_monotonic": last_tick,
+        "active_poll_heartbeat_age_seconds": (
+            _time.monotonic() - last_tick if last_tick is not None else None
+        ),
+    }
+    return {"count": len(out), "tasks": out, "heartbeat": heartbeat}
+
+
 def _version_response(result: dict | None) -> "VersionResponse":
     """Build VersionResponse from check_version_cached result."""
     from datetime import datetime, timezone
@@ -142,7 +191,10 @@ def _version_response(result: dict | None) -> "VersionResponse":
     from jacked import __version__
 
     if result is None:
-        return VersionResponse(current=__version__)
+        return VersionResponse(
+            current=__version__,
+            update_status_file=str(_update_status_mod.UPDATE_STATUS_FILE),
+        )
 
     checked_iso = None
     next_iso = None
@@ -162,6 +214,7 @@ def _version_response(result: dict | None) -> "VersionResponse":
         ahead=result.get("ahead", False),
         checked_at=checked_iso,
         next_check_at=next_iso,
+        update_status_file=str(_update_status_mod.UPDATE_STATUS_FILE),
     )
 
 
@@ -256,6 +309,20 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
                 },
             )
     return None
+
+
+@router.get("/update/status")
+async def get_update_status():
+    """Return the current update-status JSON + its mtime.
+
+    Used by /update.html (polled every 1s). mtime_iso is server-reported
+    so the client-side stuck-detection doesn't reset on repeated stale reads.
+    Returns {"status": null, "mtime_iso": null} when no update is in flight.
+    """
+    data, mtime_iso = _update_status_mod.read_status_with_mtime(
+        _update_status_mod.UPDATE_STATUS_FILE,
+    )
+    return {"status": data, "mtime_iso": mtime_iso}
 
 
 @router.post("/project/guardrails-init")
@@ -700,6 +767,12 @@ async def installations_overview(request: Request):
 _upgrade_lock = asyncio.Lock()
 
 
+def reset_locks() -> None:
+    """Rebind to the current event loop — see routes.auth.reset_locks."""
+    global _upgrade_lock
+    _upgrade_lock = asyncio.Lock()
+
+
 async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
     if ws_registry:
         try:
@@ -729,14 +802,14 @@ async def _do_upgrade(ws_registry) -> None:
         try:
             await _upgrade_broadcast(ws_registry, "upgrade_started", {})
 
-            uv_bin = shutil.which("uv")
+            uv_bin = find_bin("uv")
             if not uv_bin:
                 raise RuntimeError("uv not found on PATH \u2014 cannot upgrade")
             await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                      {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
             await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
 
-            jacked_bin = shutil.which("jacked")
+            jacked_bin = find_bin("jacked")
             if not jacked_bin:
                 raise RuntimeError("jacked not found on PATH \u2014 cannot reinstall")
             await _upgrade_broadcast(ws_registry, "upgrade_progress",
@@ -1001,7 +1074,7 @@ async def get_gatekeeper_config(request: Request):
     if api_key_source is None and os.environ.get("ANTHROPIC_API_KEY"):
         api_key_source = "env"
 
-    cli_available = shutil.which("claude") is not None
+    cli_available = find_bin("claude") is not None
 
     return {
         "model": model,
@@ -1707,6 +1780,16 @@ _PROTECTED_SETTING_KEYS = {
     "gatekeeper.model",
     "gatekeeper.eval_method",
     "gatekeeper.enabled",
+    "usage_check_interval",
+    "auto_swap_5h_warning",
+    "auto_swap_5h_critical",
+    "auto_swap_7d_threshold",
+    "auto_swap_enabled",
+    "window_keeper_enabled",
+    "window_keeper_active_start",
+    "window_keeper_active_end",
+    "window_keeper_prewake",
+    "auto_swap_paused_until",
 }
 
 

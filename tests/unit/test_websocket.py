@@ -163,3 +163,57 @@ def test_multi_topic_subscription():
 
     _run(r.broadcast("some_other_event"))
     assert ws.send_text.call_count == 2  # Not subscribed to this one
+
+
+def test_slow_client_does_not_block_others():
+    """A hanging send_text must not stall sends to other clients.
+
+    Regression: bulk usage refresh broadcasts progress events while holding
+    _bulk_refresh_lock. A backgrounded Chrome tab with a wedged WS send used
+    to block the broadcast loop indefinitely, wedging all future refreshes
+    behind a 409.
+    """
+    import time
+    from unittest.mock import patch
+
+    r = WebSocketRegistry()
+    slow_ws = _mock_ws()
+    fast_ws = _mock_ws()
+
+    async def _hang_forever(_msg):
+        await asyncio.sleep(300)
+
+    slow_ws.send_text = AsyncMock(side_effect=_hang_forever)
+
+    _run(r.connect(slow_ws))
+    _run(r.connect(fast_ws))
+
+    with patch("jacked.api.websocket._SEND_TIMEOUT_SECONDS", 0.1):
+        t0 = time.monotonic()
+        _run(r.broadcast("usage_refresh_progress"))
+        elapsed = time.monotonic() - t0
+
+    assert elapsed < 2.0, f"broadcast took {elapsed:.2f}s — slow client wedged it"
+    fast_ws.send_text.assert_called_once()
+    assert slow_ws not in r._clients
+    assert fast_ws in r._clients
+
+
+def test_broadcast_prunes_timed_out_client():
+    """Per-client timeout: stuck client is pruned, not retained."""
+    from unittest.mock import patch
+
+    async def _hang(_m):
+        await asyncio.sleep(300)
+
+    r = WebSocketRegistry()
+    stuck_ws = _mock_ws()
+    stuck_ws.send_text = AsyncMock(side_effect=_hang)
+
+    _run(r.connect(stuck_ws))
+    assert r.client_count == 1
+
+    with patch("jacked.api.websocket._SEND_TIMEOUT_SECONDS", 0.05):
+        _run(r.broadcast("x"))
+
+    assert r.client_count == 0

@@ -379,12 +379,13 @@ class TestSyncTokensCAS:
 
 
 class TestResolveAccountCCMatch:
-    @patch("jacked.launch.shutil.which", return_value="/usr/bin/claude")
+    @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
     @patch("jacked.launch.read_platform_credentials")
-    def test_layer4_matches_cc_access_token(self, mock_kc, mock_which, tmp_path):
+    @patch("jacked.launch.Path.home")
+    def test_layer4_matches_cc_access_token(self, mock_home, mock_kc, mock_which, tmp_path):
         """resolve_account Layer 4 matches cc_access_token from Keychain."""
+        mock_home.return_value = tmp_path  # isolate from real credential files
         db = _make_db(tmp_path)
-        # Set CC tokens for account 1
         db.update_account(1, cc_access_token="alice_cc_at")
 
         mock_kc.return_value = {
@@ -395,12 +396,13 @@ class TestResolveAccountCCMatch:
         result = resolve_account(None, db)
         assert result["id"] == 1
 
-    @patch("jacked.launch.shutil.which", return_value="/usr/bin/claude")
+    @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
     @patch("jacked.launch.read_platform_credentials")
-    def test_layer4_cc_takes_precedence_over_primary(self, mock_kc, mock_which, tmp_path):
+    @patch("jacked.launch.Path.home")
+    def test_layer4_cc_takes_precedence_over_primary(self, mock_home, mock_kc, mock_which, tmp_path):
         """CC token match takes precedence over primary token match."""
+        mock_home.return_value = tmp_path  # isolate from real credential files
         db = _make_db(tmp_path)
-        # Set same token as both primary of account 2 and CC of account 1
         db.update_account(1, cc_access_token="shared_token")
         db.update_account(2, access_token="shared_token")
 
@@ -410,7 +412,6 @@ class TestResolveAccountCCMatch:
 
         from jacked.launch import resolve_account
         result = resolve_account(None, db)
-        # CC match (account 1) takes precedence over primary match (account 2)
         assert result["id"] == 1
 
 
@@ -456,10 +457,11 @@ class TestAccountResponseCCFields:
         assert resp.cc_needs_auth is False
 
     def test_cc_needs_auth_no_refresh_and_expired(self, tmp_path):
-        """cc_needs_auth is True when token is expired and no refresh token."""
+        """cc_needs_auth is True when CC token is expired, no CC refresh, AND no primary refresh."""
         db = _make_db(tmp_path)
         db.update_account(1, cc_access_token="cc_at",
-                          cc_expires_at=int(time.time()) - 60)
+                          cc_expires_at=int(time.time()) - 60,
+                          refresh_token=None)
         acct = db.get_account(1)
 
         from jacked.api.routes.auth import _account_to_response
@@ -468,15 +470,27 @@ class TestAccountResponseCCFields:
         assert resp.cc_needs_auth is True
 
     def test_cc_needs_auth_no_refresh_null_expires(self, tmp_path):
-        """cc_needs_auth is True when cc_expires_at is NULL (safe default — treated as expired)."""
+        """cc_needs_auth is True when cc_expires_at is NULL, no CC refresh, AND no primary refresh."""
         db = _make_db(tmp_path)
-        db.update_account(1, cc_access_token="cc_at")
+        db.update_account(1, cc_access_token="cc_at", refresh_token=None)
         acct = db.get_account(1)
 
         from jacked.api.routes.auth import _account_to_response
         resp = _account_to_response(acct)
         assert resp.has_cc_token is True
         assert resp.cc_needs_auth is True
+
+    def test_cc_needs_auth_false_when_primary_refresh_exists(self, tmp_path):
+        """cc_needs_auth is False when CC token expired but primary refresh_token exists (fallback)."""
+        db = _make_db(tmp_path)
+        db.update_account(1, cc_access_token="cc_at",
+                          cc_expires_at=int(time.time()) - 60)
+        acct = db.get_account(1)
+
+        from jacked.api.routes.auth import _account_to_response
+        resp = _account_to_response(acct)
+        assert resp.has_cc_token is True
+        assert resp.cc_needs_auth is False  # primary refresh_token exists as fallback
 
     def test_no_cc_token_fields(self, tmp_path):
         """has_cc_token False when cc_access_token is None."""
@@ -597,8 +611,11 @@ class TestCCInvalidGrantHandling:
     """Verify that CC invalid_grant clears refresh token but preserves access token."""
 
     @patch("jacked.web.auth.httpx.AsyncClient")
-    def test_invalid_grant_clears_refresh_preserves_access(self, mock_client_cls, tmp_path):
-        """invalid_grant clears cc_refresh_token, preserves cc_access_token + cc_expires_at."""
+    @patch("jacked.api.credential_helpers.read_platform_credentials", return_value=None)
+    def test_invalid_grant_clears_refresh_preserves_access(
+        self, mock_read_creds, mock_client_cls, tmp_path
+    ):
+        """invalid_grant clears cc_refresh_token when no live recovery available."""
         db = _make_db(tmp_path)
         expires = int(time.time()) - 100
         db.update_account(
@@ -618,7 +635,9 @@ class TestCCInvalidGrantHandling:
         mock_client.__aexit__ = AsyncMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        result = asyncio.run(refresh_cc_token(1, db))
+        # Also mock the credentials file read to return nothing
+        with patch("pathlib.Path.exists", return_value=False):
+            result = asyncio.run(refresh_cc_token(1, db))
 
         assert result is False
         acct = db.get_account(1)
@@ -1020,6 +1039,7 @@ class TestRefreshCCTokenNon400Errors:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 401
+        mock_resp.json.return_value = {"error": "http_401"}
         mock_client = AsyncMock()
         mock_client.post.return_value = mock_resp
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -1049,6 +1069,7 @@ class TestRefreshCCTokenNon400Errors:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 500
+        mock_resp.json.return_value = {"error": "http_500"}
         mock_client = AsyncMock()
         mock_client.post.return_value = mock_resp
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)

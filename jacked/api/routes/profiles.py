@@ -18,6 +18,12 @@ router = APIRouter()
 
 _profiles_lock = asyncio.Lock()
 
+
+def reset_locks() -> None:
+    """Rebind to the current event loop — see routes.auth.reset_locks."""
+    global _profiles_lock
+    _profiles_lock = asyncio.Lock()
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
