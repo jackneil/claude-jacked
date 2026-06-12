@@ -748,6 +748,92 @@ class TestCompleteAuthPurposeGuard:
         mock_api_key.assert_called_once()
 
 
+class TestAddAccountActivation:
+    """Adding an account must NOT steal the active selection from an existing
+    account. Only the first account (or one added when no valid active account
+    exists) becomes active; re-authing the active account keeps it active.
+    """
+
+    def test_should_become_active_logic(self, tmp_path):
+        from jacked.web.oauth import OAuthFlow
+        db = _make_db(tmp_path)  # alice=1, bob=2; no active setting yet
+        flow = OAuthFlow(db, purpose="primary")
+        alice, bob = db.get_account(1), db.get_account(2)
+
+        # No active account chosen → the next one becomes active.
+        assert flow._should_become_active(alice) is True
+
+        # alice is active → re-auth alice keeps her active; bob must NOT switch.
+        db.set_setting("active_account_id", "1")
+        assert flow._should_become_active(alice) is True
+        assert flow._should_become_active(bob) is False
+
+        # Active points at a deleted/missing account → next becomes active.
+        db.set_setting("active_account_id", "999")
+        assert flow._should_become_active(bob) is True
+
+        # Corrupt setting → treated as no active account.
+        db.set_setting("active_account_id", "not-an-int")
+        assert flow._should_become_active(bob) is True
+
+    @patch("jacked.api.credential_helpers.sync_credential_to_all_stores")
+    def test_second_account_does_not_switch(self, mock_sync, tmp_path):
+        """Adding a new primary account while one is active must NOT switch:
+        no live-store write, active_account_id unchanged."""
+        from jacked.web.oauth import OAuthFlow
+        db = _make_db(tmp_path)  # alice=1, bob=2
+        db.set_setting("active_account_id", "1")  # alice is active
+        flow = OAuthFlow(db, purpose="primary")
+
+        tokens = {
+            "access_token": "carol_at", "refresh_token": "carol_rt",
+            "expires_in": 3600, "scope": "user:profile",
+            "email": "carol@test.com",
+        }
+        profile = {"account": {"email_address": "carol@test.com"}}
+
+        with (
+            patch.object(flow, "_exchange_code", new_callable=AsyncMock, return_value=tokens),
+            patch.object(flow, "_fetch_profile", new_callable=AsyncMock, return_value=profile),
+            patch.object(flow, "_fetch_usage", new_callable=AsyncMock, return_value={}),
+            patch.object(OAuthFlow, "start", new_callable=AsyncMock, return_value={"flow_id": "cc"}),
+        ):
+            asyncio.run(flow._complete_auth("test_code"))
+
+        carol = db.get_account_by_email("carol@test.com")
+        assert carol is not None  # stored...
+        assert db.get_setting("active_account_id") == "1"  # ...but alice still active
+        mock_sync.assert_not_called()  # live credential store untouched
+
+    @patch("jacked.api.credential_helpers.sync_credential_to_all_stores")
+    def test_first_account_becomes_active(self, mock_sync, tmp_path):
+        """The very first account added becomes active (live-store + setting)."""
+        from jacked.web.oauth import OAuthFlow
+        from jacked.web.database import Database
+        db = Database(str(tmp_path / "empty.db"))  # no accounts, no active setting
+        flow = OAuthFlow(db, purpose="primary")
+
+        tokens = {
+            "access_token": "first_at", "refresh_token": "first_rt",
+            "expires_in": 3600, "scope": "user:profile",
+            "email": "first@test.com",
+        }
+        profile = {"account": {"email_address": "first@test.com"}}
+
+        with (
+            patch.object(flow, "_exchange_code", new_callable=AsyncMock, return_value=tokens),
+            patch.object(flow, "_fetch_profile", new_callable=AsyncMock, return_value=profile),
+            patch.object(flow, "_fetch_usage", new_callable=AsyncMock, return_value={}),
+            patch.object(OAuthFlow, "start", new_callable=AsyncMock, return_value={"flow_id": "cc"}),
+        ):
+            asyncio.run(flow._complete_auth("test_code"))
+
+        acct = db.get_account_by_email("first@test.com")
+        assert acct is not None
+        assert db.get_setting("active_account_id") == str(acct["id"])
+        mock_sync.assert_called()  # live store written for the first account
+
+
 class TestCCIdentityValidation:
     """Verify _store_cc_tokens validates email match."""
 
