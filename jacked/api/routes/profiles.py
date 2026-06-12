@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse

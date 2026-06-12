@@ -1,6 +1,6 @@
 """Tests for `jacked upgrade` one-shot upgrade command."""
 
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from click.testing import CliRunner
 
 
@@ -33,12 +33,6 @@ class TestUpgradeRefusal:
         assert "pip" in result.output.lower()
         mock_run.assert_not_called()
         mock_popen.assert_not_called()
-
-
-
-import sys
-from unittest.mock import patch, MagicMock
-from click.testing import CliRunner
 
 
 class TestUpgradeCommand:
@@ -106,10 +100,17 @@ class TestUpgradeCommand:
     # gate now refuses pip and editable installs. See TestUpgradeRefusal
     # below for the current pip-path contract.
 
+    @patch("sys.platform", "darwin")
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
     @patch("subprocess.run")
     def test_upgrade_aborts_if_uv_install_fails(self, mock_run, mock_find, mock_method):
+        """Inline (POSIX) path: a failed `uv install` aborts with exit 1.
+
+        Pinned to darwin because on Windows `jacked upgrade` delegates to a
+        detached cmd.exe helper and returns 0 — the returncode-1 abort lives
+        only in the inline path.
+        """
         from jacked.cli import main
         mock_find.side_effect = lambda name: {"uv": "/fake/uv"}.get(name)
         mock_run.return_value = MagicMock(returncode=1)

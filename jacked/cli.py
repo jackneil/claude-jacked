@@ -7,6 +7,7 @@ retrieving Claude Code sessions.
 
 import os
 import shutil
+import subprocess
 import sys
 import logging
 from pathlib import Path
@@ -744,6 +745,163 @@ def webux(host: str, port: int, no_browser: bool, reload: bool):
     )
 
 
+def _service_http_ok(port: int, timeout: float = 1.0) -> bool:
+    """True if the dashboard answers HTTP on 127.0.0.1:port.
+
+    Always probes loopback, never the bind host — the service may bind
+    0.0.0.0 (unroutable as a client target), but it's always reachable on
+    127.0.0.1 once up. Any HTTP response, including a 4xx/5xx, means the
+    server process is alive; only connection/timeout errors count as down.
+    """
+    import urllib.error as _ue
+    import urllib.request as _ur
+
+    try:
+        with _ur.urlopen(f"http://127.0.0.1:{port}/", timeout=timeout):
+            return True
+    except _ue.HTTPError:
+        return True  # server responded — it's up
+    except Exception:
+        return False
+
+
+def _wait_service_ready(port: int, timeout: float = 15.0) -> bool:
+    """Poll _service_http_ok until the dashboard answers or timeout elapses."""
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if _service_http_ok(port):
+            return True
+        _time.sleep(0.4)
+    return _service_http_ok(port)
+
+
+def _spawn_service_detached(host: str, port: int):
+    """Spawn `jacked service start` detached so it survives the caller exiting.
+
+    Returns the log path the detached service writes to. The child runs the
+    tray icon + uvicorn (ServiceRunner). Windows uses DETACHED_PROCESS;
+    POSIX uses start_new_session. Shared by `jacked start` and
+    `jacked service restart`.
+    """
+    import subprocess as _subprocess
+
+    from jacked.findbin import find_bin
+    from jacked.service import CLAUDE_DIR
+
+    jacked_bin = find_bin("jacked") or sys.executable
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = CLAUDE_DIR / "jacked-service.log"
+    try:
+        log_fh = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except Exception:
+        log_fh = _subprocess.DEVNULL
+
+    cmd = [jacked_bin, "service", "start", "--host", host, "--port", str(port)]
+    if sys.platform == "win32":
+        _subprocess.Popen(
+            cmd,
+            stdin=_subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            creationflags=getattr(_subprocess, "DETACHED_PROCESS", 0x00000008),
+            close_fds=True,
+        )
+    else:
+        _subprocess.Popen(
+            cmd,
+            stdin=_subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+            close_fds=True,
+        )
+    return log_path
+
+
+@main.command(name="start")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+@click.option(
+    "--restart", is_flag=True, help="Force a restart even if already healthy."
+)
+def start(host: str | None, port: int | None, restart: bool):
+    """Make sure the jacked service (dashboard + tray icon) is running.
+
+    Idempotent. If it's already up and answering, this no-ops. If it's
+    dead, crashed, stale, or hung, it (re)starts it DETACHED so it keeps
+    running after this terminal closes. This is the command to run any time
+    the tray disappears or the dashboard stops responding — you don't have
+    to know whether it's down, just run `jacked start`.
+    """
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service.process import (
+        is_port_available,
+        is_process_alive,
+        read_pid,
+        remove_pid,
+        stop_process_graceful,
+        wait_for_port_free,
+    )
+
+    the_host = host or DEFAULT_HOST
+    the_port = port or DEFAULT_PORT
+
+    info = read_pid(PID_FILE)
+    pid_alive = bool(info) and is_process_alive(info["pid"])
+    responding = _service_http_ok(the_port)
+
+    # Already healthy → nothing to do (unless forced).
+    if pid_alive and responding and not restart:
+        console.print(
+            f"[green][OK][/green] jacked already running "
+            f"(PID {info['pid']}, tray + dashboard on :{info['port']})"
+        )
+        console.print(f"[dim]http://127.0.0.1:{info['port']}[/dim]")
+        return
+
+    # Tear down whatever's there if it's stuck, or if a restart was forced.
+    if pid_alive and (restart or not responding):
+        why = (
+            "restart requested"
+            if restart
+            else "process alive but dashboard not answering — restarting"
+        )
+        console.print(f"[dim]{why}...[/dim]")
+        result = stop_process_graceful(PID_FILE)
+        if result["was_running"] and not result["died"]:
+            console.print("[red]Couldn't stop the stuck service. Aborting.[/red]")
+            sys.exit(1)
+        wait_for_port_free(the_host, the_port, timeout=10.0)
+    elif info and not pid_alive:
+        remove_pid(PID_FILE)
+        console.print("[dim]Cleared a stale PID file left by a previous crash[/dim]")
+
+    # Port held by something that isn't us?
+    if not is_port_available(the_host, the_port):
+        console.print(
+            f"[red]Port {the_port} is in use by another process.[/red] "
+            "Free it or pass --port."
+        )
+        sys.exit(1)
+
+    console.print(f"[dim]Starting jacked service (detached) on :{the_port}...[/dim]")
+    log_path = _spawn_service_detached(the_host, the_port)
+
+    if _wait_service_ready(the_port, timeout=15.0):
+        console.print(
+            f"[green][OK][/green] jacked running — tray icon up, "
+            f"dashboard at http://127.0.0.1:{the_port}"
+        )
+    else:
+        console.print(
+            f"[yellow]Started, but :{the_port} didn't answer within 15s.[/yellow]"
+        )
+        console.print(f"[dim]Check {log_path}[/dim]")
+        sys.exit(1)
+
+
 @main.command(name="check-version")
 def check_version():
     """Check if a newer version of claude-jacked is available on PyPI."""
@@ -800,7 +958,6 @@ def upgrade(extras: str, skip_service: bool):
     a running .exe, so we have to step out of the way. This process
     exits cleanly and the helper takes over.
     """
-    import subprocess
     from jacked import __version__
     from jacked.findbin import find_bin
     from jacked.install_method import (
@@ -968,7 +1125,6 @@ def _spawn_windows_upgrade_helper(
       5. Append progress to ~/.claude/jacked-update.log.
     """
     import os
-    import shlex
     import subprocess
     import tempfile
     from jacked.service import CLAUDE_DIR
@@ -2920,8 +3076,8 @@ def doctor():
         if plist.exists():
             console.print(f"[bold]Launchd plist:[/bold] [green]OK[/green] ({plist})")
         else:
-            console.print(f"[bold]Launchd plist:[/bold] [yellow]MISSING[/yellow]")
-            console.print(f"  Recovery: [cyan]jacked service install[/cyan]")
+            console.print("[bold]Launchd plist:[/bold] [yellow]MISSING[/yellow]")
+            console.print("  Recovery: [cyan]jacked service install[/cyan]")
     elif sys.platform.startswith("linux"):
         from jacked.service.platform import _get_systemd_user_unit_path
         unit = _get_systemd_user_unit_path()
@@ -2948,7 +3104,7 @@ def doctor():
             f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
             f"(port {DEFAULT_PORT} free)"
         )
-        console.print(f"  Recovery: [cyan]jacked service start[/cyan]")
+        console.print("  Recovery: [cyan]jacked service start[/cyan]")
         if pid_info and not pid_alive:
             console.print(
                 f"  [dim]Stale PID file at {PID_FILE} "
@@ -3407,7 +3563,7 @@ def profiles_import(path: str):
             profiles_dir=profiles_dir,
             backup_dir=backup_dir,
         )
-        console.print(f"[green][OK][/green] Profile imported!")
+        console.print("[green][OK][/green] Profile imported!")
         console.print(f"[dim]Backup saved to: {backup_path}[/dim]")
     except Exception as e:
         console.print(f"[red]Import failed: {e}[/red]")
@@ -3499,7 +3655,7 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
 
     Use --foreground to run interactively (tray logs to your terminal).
     """
-    from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
     from jacked.service.platform import ensure_native_lifecycle, native_restart
     from jacked.service.process import (
         stop_process_graceful,
@@ -3553,36 +3709,7 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
         return
 
     # Detached — the tray must survive this command returning.
-    import subprocess as _subprocess
-    from jacked.findbin import find_bin
-
-    jacked_bin = find_bin("jacked") or sys.executable
-    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = CLAUDE_DIR / "jacked-service.log"
-    try:
-        log_fh = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
-    except Exception:
-        log_fh = _subprocess.DEVNULL
-
-    if sys.platform == "win32":
-        creationflags = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
-        _subprocess.Popen(
-            [jacked_bin, "service", "start", "--host", the_host, "--port", str(the_port)],
-            stdin=_subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=log_fh,
-            creationflags=creationflags,
-            close_fds=True,
-        )
-    else:
-        _subprocess.Popen(
-            [jacked_bin, "service", "start", "--host", the_host, "--port", str(the_port)],
-            stdin=_subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=log_fh,
-            start_new_session=True,
-            close_fds=True,
-        )
+    log_path = _spawn_service_detached(the_host, the_port)
 
     console.print(f"[green][OK][/green] Started jacked service (detached) on :{the_port}")
     console.print(f"[dim]Logs: {log_path}[/dim]")

@@ -9,7 +9,6 @@ Usage:
 """
 
 import asyncio
-import json
 import sys
 import uuid
 from pathlib import Path
@@ -111,7 +110,7 @@ async def run(url: str):
                 await asyncio.sleep(0.3)  # simulate thinking
                 await ws.send(_assistant_response(user_text))
                 await ws.send(_result_message())
-                print(f"[mock-cli] Sent response + result")
+                print("[mock-cli] Sent response + result")
 
             elif msg_type == "keep_alive":
                 await ws.send(build_ndjson_line({"type": "keep_alive"}))

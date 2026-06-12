@@ -176,7 +176,7 @@ async def _exchange_refresh_token(
             status_code=resp.status_code,
         )
 
-    except Exception as exc:
+    except Exception:
         return TokenExchangeResult(
             success=False,
             error="network_error",

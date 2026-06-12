@@ -5,8 +5,6 @@ without attaching py-spy or a debugger. See the 2026-05-10 incident
 where active_account_poll_loop went silent for 5 days with no signal.
 """
 
-import asyncio
-import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 

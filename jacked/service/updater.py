@@ -13,7 +13,6 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR

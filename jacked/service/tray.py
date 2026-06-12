@@ -7,9 +7,6 @@ import sys
 import threading
 import time
 import webbrowser
-from pathlib import Path
-
-logger = logging.getLogger(__name__)
 
 from jacked import __version__
 from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
@@ -19,6 +16,8 @@ from jacked.service.process import (
     write_pid,
 )
 from jacked.version_check import check_version_cached
+
+logger = logging.getLogger(__name__)
 
 try:
     import pystray
@@ -42,6 +41,43 @@ _ICON_COLORS = {
     "starting": ("#f59e0b", "#d97706"),  # Amber
     "stopped": ("#555555", "#666666"),  # Gray
 }
+
+# Font files to try, in order, for the tray "J" glyph. Bare family names
+# like "Arial" ONLY resolve on macOS — Pillow on Windows/Linux raises
+# OSError('cannot open resource') unless given the actual filename. That
+# was the long-standing Windows bug: the J fell back to the ~10px bitmap
+# default and shrank to an invisible speck in the system tray. DejaVuSans
+# ships bundled inside Pillow, so it's the last truetype attempt.
+_GLYPH_FONT_CANDIDATES = (
+    "arial.ttf",            # Windows (C:\Windows\Fonts), also macOS
+    "Arial.ttf",
+    "Arial",                # macOS family-name resolution
+    "Helvetica.ttc",        # macOS
+    "DejaVuSans-Bold.ttf",  # Linux + Pillow-bundled
+    "DejaVuSans.ttf",
+)
+
+
+def _load_glyph_font(size: int) -> "ImageFont.FreeTypeFont":
+    """Load a scalable TrueType font for the tray glyph at *size* px.
+
+    The font MUST be a real scalable face at the requested size. The legacy
+    argless ``ImageFont.load_default()`` returns a ~10px bitmap font, which
+    downscales to nothing in the tray — the exact reason the "J" was
+    invisible on Windows. We try real font filenames first, then fall back
+    to Pillow's bundled DejaVu at the requested size (Pillow >= 10.1).
+    """
+    for name in _GLYPH_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    # Pillow >= 10.1 honors `size` here and returns a scalable DejaVu face.
+    # Older Pillow ignores it (10px bitmap) — still better than crashing.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def check_tray_deps() -> None:
@@ -78,10 +114,7 @@ def create_icon_image(state: str) -> "Image.Image":
     )
 
     # Draw "J" glyph centered
-    try:
-        font = ImageFont.truetype("Arial", 36)
-    except (OSError, IOError):
-        font = ImageFont.load_default()
+    font = _load_glyph_font(36)
 
     bbox = draw.textbbox((0, 0), "J", font=font)
     tw = bbox[2] - bbox[0]

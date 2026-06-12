@@ -263,6 +263,8 @@ tray = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pillow" },
+    { name = "pystray" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "qdrant-client" },
@@ -291,6 +293,8 @@ provides-extras = ["all", "search", "security", "tray", "web"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "pillow", specifier = ">=9.0,<13" },
+    { name = "pystray", specifier = ">=0.19,<1" },
     { name = "pytest", specifier = ">=9.0.3,<10" },
     { name = "pytest-cov", specifier = ">=4.0,<8" },
     { name = "qdrant-client", specifier = ">=1.7,<2" },

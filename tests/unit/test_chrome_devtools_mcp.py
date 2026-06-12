@@ -3,7 +3,6 @@
 import subprocess
 from unittest import mock
 
-import pytest
 
 from jacked.cli import (
     CHROME_DEVTOOLS_MODES,

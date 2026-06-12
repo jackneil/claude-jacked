@@ -1,7 +1,6 @@
 """Tests for jacked.api.routes.profiles — REST API endpoints."""
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest

@@ -1,7 +1,6 @@
 """Tests for install writing _hook shim form and settings backup."""
 
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 

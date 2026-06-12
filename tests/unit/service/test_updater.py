@@ -703,8 +703,10 @@ class TestWindowsBatchPhases:
             assert "/update.html" in body
         finally:
             import os as _os
-            try: _os.unlink(batch_path)
-            except OSError: pass
+            try:
+                _os.unlink(batch_path)
+            except OSError:
+                pass
 
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe")
@@ -726,8 +728,10 @@ class TestWindowsBatchPhases:
             assert "_update_status_succeed" in body
         finally:
             import os as _os
-            try: _os.unlink(batch_path)
-            except OSError: pass
+            try:
+                _os.unlink(batch_path)
+            except OSError:
+                pass
 
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe")
@@ -748,8 +752,10 @@ class TestWindowsBatchPhases:
             assert "bind :9000" in body
         finally:
             import os as _os
-            try: _os.unlink(mock_popen.call_args[0][0][2])
-            except OSError: pass
+            try:
+                _os.unlink(mock_popen.call_args[0][0][2])
+            except OSError:
+                pass
 
 
 class TestRunUpdateReusesTrayPreInit:
@@ -952,5 +958,7 @@ def test_windows_batch_checks_errorlevel_after_status_writes(
                 break
     finally:
         import os as _os
-        try: _os.unlink(body_path)
-        except OSError: pass
+        try:
+            _os.unlink(body_path)
+        except OSError:
+            pass

@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import shutil
 import sys
 from typing import Any, Literal, Optional
 
@@ -631,7 +630,6 @@ async def installations_overview(request: Request):
     from jacked import __version__
     from jacked.api.routes.features import (
         CLAUDE_DIR,
-        DATA_ROOT,
         _detect_hook_installed,
         _detect_rules_status,
         _get_valid_agent_names,
@@ -1039,7 +1037,6 @@ async def get_gatekeeper_config(request: Request):
     """Gatekeeper LLM config with status info. Never exposes API key."""
     import json
     import os
-    import shutil
 
     db = getattr(request.app.state, "db", None)
 
