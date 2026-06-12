@@ -244,3 +244,134 @@ class TestServiceRestartAutoInstall:
         result = CliRunner().invoke(main, ["service", "restart"])
         assert result.exit_code == 0
         mock_popen.assert_called_once()
+
+
+class TestStartCommand:
+    """`jacked start` — idempotent "make sure it's running" command.
+
+    If the service is healthy it no-ops; if it's dead/stale/hung it
+    (re)starts it detached and verifies it came up. This is the command a
+    user runs when the tray disappears, without needing to know whether
+    the service is actually down.
+    """
+
+    def test_noop_when_already_healthy(self):
+        from jacked.cli import main
+        with (
+            patch("jacked.service.process.read_pid",
+                  return_value={"pid": 4242, "port": 8321}),
+            patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("jacked.cli._service_http_ok", return_value=True),
+            patch("jacked.cli._spawn_service_detached") as spawn,
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code == 0
+        assert "already running" in result.output.lower()
+        spawn.assert_not_called()
+
+    def test_cold_start_when_down(self, tmp_path):
+        from jacked.cli import main
+        with (
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.service.process.is_process_alive", return_value=False),
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.cli._spawn_service_detached",
+                  return_value=tmp_path / "svc.log") as spawn,
+            patch("jacked.cli._wait_service_ready", return_value=True),
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code == 0
+        assert "running" in result.output.lower()
+        spawn.assert_called_once()
+
+    def test_clears_stale_pid_then_starts(self, tmp_path):
+        """A dead PID from a crash must be cleared, then a fresh start spawned."""
+        from jacked.cli import main
+        with (
+            patch("jacked.service.process.read_pid",
+                  return_value={"pid": 99, "port": 8321}),
+            patch("jacked.service.process.is_process_alive", return_value=False),
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch("jacked.service.process.remove_pid") as remove,
+            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.cli._spawn_service_detached",
+                  return_value=tmp_path / "svc.log") as spawn,
+            patch("jacked.cli._wait_service_ready", return_value=True),
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code == 0
+        remove.assert_called_once()
+        spawn.assert_called_once()
+
+    def test_restarts_when_alive_but_not_responding(self, tmp_path):
+        """Process alive but dashboard hung → stop it and restart."""
+        from jacked.cli import main
+        with (
+            patch("jacked.service.process.read_pid",
+                  return_value={"pid": 77, "port": 8321}),
+            patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch("jacked.service.process.stop_process_graceful",
+                  return_value={"was_running": True, "died": True, "killed": False}) as stop,
+            patch("jacked.service.process.wait_for_port_free", return_value=True),
+            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.cli._spawn_service_detached",
+                  return_value=tmp_path / "svc.log") as spawn,
+            patch("jacked.cli._wait_service_ready", return_value=True),
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code == 0
+        stop.assert_called_once()
+        spawn.assert_called_once()
+
+    def test_force_restart_when_healthy(self, tmp_path):
+        """--restart tears down a healthy service and starts fresh."""
+        from jacked.cli import main
+        with (
+            patch("jacked.service.process.read_pid",
+                  return_value={"pid": 77, "port": 8321}),
+            patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch("jacked.service.process.stop_process_graceful",
+                  return_value={"was_running": True, "died": True, "killed": False}) as stop,
+            patch("jacked.service.process.wait_for_port_free", return_value=True),
+            patch("jacked.cli._service_http_ok", return_value=True),
+            patch("jacked.cli._spawn_service_detached",
+                  return_value=tmp_path / "svc.log") as spawn,
+            patch("jacked.cli._wait_service_ready", return_value=True),
+        ):
+            result = CliRunner().invoke(main, ["start", "--restart"])
+        assert result.exit_code == 0
+        stop.assert_called_once()
+        spawn.assert_called_once()
+
+    def test_aborts_when_port_held_by_other(self):
+        """Cold start but the port is squatted by a non-jacked process → abort."""
+        from jacked.cli import main
+        with (
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.service.process.is_process_alive", return_value=False),
+            patch("jacked.service.process.is_port_available", return_value=False),
+            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.cli._spawn_service_detached") as spawn,
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code != 0
+        spawn.assert_not_called()
+
+    def test_exits_nonzero_when_never_ready(self, tmp_path):
+        """Spawned, but the dashboard never answers → non-zero exit + hint."""
+        from jacked.cli import main
+        with (
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.service.process.is_process_alive", return_value=False),
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.cli._spawn_service_detached",
+                  return_value=tmp_path / "svc.log"),
+            patch("jacked.cli._wait_service_ready", return_value=False),
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code != 0
+        assert "didn't answer" in result.output.lower()

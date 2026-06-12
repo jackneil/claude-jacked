@@ -49,6 +49,49 @@ class TestCreateIcon:
         assert unknown.tobytes() == stopped.tobytes()
 
 
+class TestGlyphFont:
+    """Regression: the tray 'J' must render at full size, not the ~10px
+    bitmap default.
+
+    Pillow only resolves the bare family name 'Arial' on macOS; on Windows
+    and Linux it raises OSError, so the old code fell back to
+    ``ImageFont.load_default()`` (a ~10px bitmap face) and the 'J' shrank to
+    an invisible speck in the system tray. See _load_glyph_font.
+    """
+
+    def test_glyph_font_is_requested_size_not_tiny_default(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import _load_glyph_font
+        font = _load_glyph_font(36)
+        # The legacy argless load_default() is a ~10px bitmap face — the bug.
+        assert getattr(font, "size", 0) == 36
+
+    def test_running_icon_has_visible_white_glyph(self):
+        """The white 'J' must occupy a real chunk of the 64x64 icon, not a
+        2px speck. Counts near-white glyph pixels over the purple bg.
+
+        Calibration on Windows: old 10px default -> 10 white px;
+        fixed 36px arial -> 107 white px. Threshold of 60 separates them
+        with margin for DejaVu's slightly different glyph on Linux CI.
+        """
+        _skip_if_no_tray()
+        from jacked.service.tray import create_icon_image
+        img = create_icon_image("running").convert("RGBA")
+        # Iterate raw RGBA bytes — avoids getdata() (deprecated in Pillow 14)
+        # and get_flattened_data() (too new for our >=9.0 floor).
+        data = img.tobytes()
+        white = sum(
+            1
+            for i in range(0, len(data), 4)
+            if data[i + 3] > 200
+            and data[i] > 220 and data[i + 1] > 220 and data[i + 2] > 220
+        )
+        assert white > 60, (
+            f"glyph too small ({white} white px) — font fell back to the "
+            "bitmap default instead of a scalable 36px face"
+        )
+
+
 class TestBuildMenu:
     """Tests for build_menu()."""
 
