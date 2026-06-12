@@ -1,5 +1,6 @@
 """Tests for jacked.service.platform.native_restart() across macOS + Linux + Windows."""
 
+import os
 import subprocess
 import sys
 from unittest.mock import patch, MagicMock
@@ -13,6 +14,8 @@ class TestMacOS:
         fake_plist = tmp_path / "ai.hank.jacked.plist"
         fake_plist.write_text("<plist/>")
         monkeypatch.setattr(plat, "_get_launchd_plist_path", lambda: fake_plist)
+        # os.getuid doesn't exist on Windows; the darwin branch needs it.
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
 
         mock_result = MagicMock(returncode=0, stdout="", stderr="")
         with patch.object(plat.subprocess, "run", return_value=mock_result) as mock_run:
@@ -42,6 +45,7 @@ class TestMacOS:
         fake_plist = tmp_path / "ai.hank.jacked.plist"
         fake_plist.write_text("<plist/>")
         monkeypatch.setattr(plat, "_get_launchd_plist_path", lambda: fake_plist)
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
         mock_result = MagicMock(returncode=3, stdout="", stderr="not bootstrapped")
         with patch.object(plat.subprocess, "run", return_value=mock_result):
             ok, reason = plat.native_restart()
@@ -90,10 +94,12 @@ class TestWindows:
 
 
 class TestServiceRestartCli:
+    @patch("jacked.service.platform.ensure_native_lifecycle",
+           return_value=(True, "already_installed", "plist installed"))
     @patch("jacked.service.platform.native_restart", return_value=(True, "launchctl kickstart"))
     @patch("subprocess.Popen")
     def test_cli_defers_to_native_when_available(
-        self, mock_popen, mock_native,
+        self, mock_popen, mock_native, mock_ensure,
     ):
         from click.testing import CliRunner
         from jacked.cli import main
@@ -103,15 +109,19 @@ class TestServiceRestartCli:
         mock_native.assert_called_once()
         mock_popen.assert_not_called()
 
+    @patch("jacked.service.platform.ensure_native_lifecycle",
+           return_value=(True, "already_installed", "plist installed"))
     @patch("jacked.service.platform.native_restart", return_value=(False, "no native manager"))
     @patch(
         "jacked.service.process.stop_process_graceful",
         return_value={"was_running": False, "died": False, "killed": False},
     )
     @patch("subprocess.Popen")
-    def test_cli_falls_back_when_native_unavailable(
-        self, mock_popen, mock_stop, mock_native,
+    def test_cli_falls_back_when_native_restart_fails(
+        self, mock_popen, mock_stop, mock_native, mock_ensure,
     ):
+        """Native lifecycle is present but its kickstart fails → fall back to
+        the manual stop+detached-start path."""
         from click.testing import CliRunner
         from jacked.cli import main
         result = CliRunner().invoke(main, ["service", "restart"])
@@ -138,6 +148,8 @@ class TestServiceRestartCli:
 
 
 class TestUpdaterUsesNativeRestart:
+    @patch("jacked.service.platform.ensure_native_lifecycle",
+           return_value=(True, "already_installed", "plist installed"))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.platform.native_restart", return_value=(True, "launchctl kickstart"))
@@ -147,7 +159,7 @@ class TestUpdaterUsesNativeRestart:
     @patch("subprocess.Popen")
     def test_starting_service_uses_native_when_available(
         self, mock_popen, mock_run, mock_find, mock_port_avail, mock_native,
-        mock_gate, mock_method, tmp_path, monkeypatch,
+        mock_gate, mock_method, mock_ensure, tmp_path, monkeypatch,
     ):
         """When native_restart succeeds, the updater does NOT spawn its own
         detached `jacked service start`. That's the whole point — no race."""
@@ -172,6 +184,8 @@ class TestUpdaterUsesNativeRestart:
                     f"expected no detached service start when native restart succeeded, got: {cmd_str}"
                 )
 
+    @patch("jacked.service.platform.ensure_native_lifecycle",
+           return_value=(False, "unavailable", "no native lifecycle manager"))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.platform.native_restart", return_value=(False, "no plist"))
@@ -181,7 +195,7 @@ class TestUpdaterUsesNativeRestart:
     @patch("subprocess.Popen")
     def test_starting_service_falls_back_when_no_native(
         self, mock_popen, mock_run, mock_find, mock_port_avail, mock_native,
-        mock_gate, mock_method, tmp_path, monkeypatch,
+        mock_gate, mock_method, mock_ensure, tmp_path, monkeypatch,
     ):
         """When no native manager, updater uses its detached spawn (Windows
         and unmanaged-Linux behavior)."""
