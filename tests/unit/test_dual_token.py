@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from jacked.api.credential_helpers import build_oauth_data
-from jacked.web.auth import REFRESH_BUFFER_SECONDS, refresh_cc_token, should_refresh_cc
+from jacked.web.auth import refresh_cc_token, should_refresh_cc
 from jacked.web.database import Database
 
 
@@ -702,7 +702,7 @@ class TestCompleteAuthPurposeGuard:
             patch.object(flow, "_exchange_code", new_callable=AsyncMock, return_value=tokens),
             patch.object(flow, "_create_api_key", new_callable=AsyncMock) as mock_api_key,
         ):
-            result = asyncio.run(flow._complete_auth("test_code"))
+            asyncio.run(flow._complete_auth("test_code"))
 
         # _create_api_key should NOT have been called for CC flow
         mock_api_key.assert_not_called()
@@ -742,7 +742,7 @@ class TestCompleteAuthPurposeGuard:
             patch.object(flow, "_fetch_profile", new_callable=AsyncMock, return_value=profile),
             patch.object(flow, "_fetch_usage", new_callable=AsyncMock, return_value=usage),
         ):
-            result = asyncio.run(flow._complete_auth("test_code"))
+            asyncio.run(flow._complete_auth("test_code"))
 
         # _create_api_key SHOULD have been called for primary flow
         mock_api_key.assert_called_once()
@@ -1196,7 +1196,7 @@ class TestCcFlowDedup:
         """When an active CC flow exists for the same account, return it."""
         from jacked.web.oauth import _active_flows
 
-        db = _make_db(tmp_path)
+        _make_db(tmp_path)
 
         # Simulate an active CC flow
         class FakeFlow:
@@ -1219,7 +1219,7 @@ class TestCcFlowDedup:
         """CC flow for account 1 does not block account 2."""
         from jacked.web.oauth import _active_flows
 
-        db = _make_db(tmp_path)
+        _make_db(tmp_path)
 
         class FakeFlow:
             purpose = "claude_code"

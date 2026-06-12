@@ -7,9 +7,6 @@ import sys
 import threading
 import time
 import webbrowser
-from pathlib import Path
-
-logger = logging.getLogger(__name__)
 
 from jacked import __version__
 from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
@@ -19,6 +16,8 @@ from jacked.service.process import (
     write_pid,
 )
 from jacked.version_check import check_version_cached
+
+logger = logging.getLogger(__name__)
 
 try:
     import pystray

@@ -72,8 +72,10 @@ def test_windows_batch_body_contains_every_phase():
             ), f"Windows batch missing close for {name!r}"
     finally:
         import os as _os
-        try: _os.unlink(batch_path)
-        except OSError: pass
+        try:
+            _os.unlink(batch_path)
+        except OSError:
+            pass
 
 
 def test_update_html_still_embeds_every_phase():

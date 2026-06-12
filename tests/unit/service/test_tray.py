@@ -98,7 +98,8 @@ class TestBuildMenu:
     def test_menu_has_expected_items(self):
         _skip_if_no_tray()
         from jacked.service.tray import build_menu
-        noop = lambda: None
+        def noop():
+            return None
         menu = build_menu(
             port=8321,
             version="0.39.0",
@@ -393,8 +394,10 @@ class TestOnUpdateClick:
                 with patch.object(runner, "_on_stop"):
                     t1 = _threading.Thread(target=runner._on_update_click)
                     t2 = _threading.Thread(target=runner._on_update_click)
-                    t1.start(); t2.start()
-                    t1.join(); t2.join()
+                    t1.start()
+                    t2.start()
+                    t1.join()
+                    t2.join()
 
         assert len(spawn_calls) == 1
 
@@ -425,7 +428,8 @@ class TestCheckForUpdatesMenu:
     def test_menu_has_check_for_updates_item(self):
         _skip_if_no_tray()
         from jacked.service.tray import build_menu
-        noop = lambda: None
+        def noop():
+            return None
         called = []
         menu = build_menu(
             port=8321,
@@ -447,7 +451,8 @@ class TestCheckForUpdatesMenu:
     def test_menu_omits_check_for_updates_when_not_provided(self):
         _skip_if_no_tray()
         from jacked.service.tray import build_menu
-        noop = lambda: None
+        def noop():
+            return None
         menu = build_menu(
             port=8321,
             version="0.41.8",
@@ -539,7 +544,8 @@ class TestLastCheckedMenu:
     def test_menu_includes_last_checked_when_fn_provided(self):
         _skip_if_no_tray()
         from jacked.service.tray import build_menu
-        noop = lambda: None
+        def noop():
+            return None
         menu = build_menu(
             port=8321,
             version="0.41.13",
@@ -556,7 +562,8 @@ class TestLastCheckedMenu:
     def test_check_for_updates_disabled_while_in_progress(self):
         _skip_if_no_tray()
         from jacked.service.tray import build_menu
-        noop = lambda: None
+        def noop():
+            return None
         in_progress = {"v": True}
         menu = build_menu(
             port=8321,

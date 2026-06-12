@@ -142,7 +142,6 @@ def get_kpi_totals(db, days: int = 7) -> dict:
 
         allows = counts.get("ALLOW", 0)
         denials = counts.get("DENY", 0) + counts.get("DENY_PATTERN", 0)
-        ask_user = counts.get("ASK_USER", 0)
 
         # Method breakdown for rule_coverage and api_evaluations
         method_rows = conn.execute(

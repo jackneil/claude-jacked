@@ -22,7 +22,6 @@ from jacked.web.db_analytics import (
     get_suggested_rules,
     get_hot_rules,
     get_token_cost_summary,
-    MODEL_PRICING,
 )
 
 

@@ -919,7 +919,7 @@ class TestShouldSwapNow:
         assert reason is None
 
     def test_burn_rate_projection_triggers_swap(self):
-        from jacked.web.auto_swap import should_swap_now, BurnRate
+        from jacked.web.auto_swap import should_swap_now
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
         active = _acct(1, usage_5h=82, usage_7d=50,
                        resets_5h=_iso(now + timedelta(hours=2)),
@@ -1028,7 +1028,6 @@ class TestShouldSwapNow:
             REASON_PREFIX_DRAINED,
             REASON_PREFIX_FIVE_H,
             REASON_PREFIX_BURN_RATE,
-            BurnRate,
         )
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
 

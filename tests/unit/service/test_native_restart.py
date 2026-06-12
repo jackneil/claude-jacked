@@ -1,7 +1,6 @@
 """Tests for jacked.service.platform.native_restart() across macOS + Linux + Windows."""
 
 import os
-import subprocess
 import sys
 from unittest.mock import patch, MagicMock
 
