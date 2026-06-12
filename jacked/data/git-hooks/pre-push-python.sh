@@ -17,6 +17,13 @@ find_ruff() {
         fi
     fi
 
+    # 0b. Project-local uv venv — deterministic, version-pinned via dev deps.
+    #     Preferred over global installs so the hook never picks up a stray
+    #     ruff from a random conda env (the version-roulette this avoids).
+    for candidate in ".venv/bin/ruff" ".venv/Scripts/ruff.exe"; do
+        if [ -f "$candidate" ]; then echo "$candidate"; return; fi
+    done
+
     # 1. On PATH
     command -v ruff >/dev/null 2>&1 && { command -v ruff; return; }
 

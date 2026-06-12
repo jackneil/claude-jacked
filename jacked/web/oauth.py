@@ -321,6 +321,26 @@ class OAuthFlow:
             content_type="text/html",
         )
 
+    def _should_become_active(self, account: dict) -> bool:
+        """Whether this freshly-stored account should become the active one.
+
+        True only when there is no valid active account yet, or this account
+        already IS the active one (a re-auth). Adding an account must never
+        steal the active selection from a different existing account — the
+        user stays on whoever they were on. First account (or one added when
+        the prior active account is gone) still becomes active.
+        """
+        cur = self.db.get_setting("active_account_id")
+        if not cur:
+            return True  # no active account chosen yet → first one wins
+        try:
+            existing = self.db.get_account(int(cur))
+        except (TypeError, ValueError):
+            return True  # corrupt setting → treat as no active account
+        if existing is None:
+            return True  # active points to a deleted/missing account
+        return int(cur) == account.get("id")  # only when it already IS active
+
     async def _complete_auth(self, code: str) -> dict:
         """Complete the OAuth flow: token exchange, API key, profile, usage, DB store."""
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -348,14 +368,26 @@ class OAuthFlow:
             # Step 5: Store in database (branches on purpose)
             account = self._store_account(tokens, profile, usage)
 
-            # Step 6: Write to all credential stores (file, keychain, config)
-            from jacked.api.credential_helpers import sync_credential_to_all_stores
+            # Decide activation ONCE. An account becomes active only when there
+            # is no valid active account yet, or it already IS the active one
+            # (re-auth). Adding a background account must not steal the active
+            # selection from the account the user is currently on.
+            activate = self._should_become_active(account)
 
-            sync_credential_to_all_stores(account["id"], account)
+            # Step 6: Write credentials to the live stores ONLY when this account
+            # is (becoming) active. Otherwise adding an account would clobber the
+            # active account's live credentials and silently switch Claude Code
+            # to the new one. Non-active accounts live in the DB until the user
+            # explicitly switches (use_account) or launches them.
+            if activate:
+                from jacked.api.credential_helpers import sync_credential_to_all_stores
+
+                sync_credential_to_all_stores(account["id"], account)
 
             # Step 7: For primary flows, persist active account + auto-start CC flow
             if self.purpose == "primary":
-                self.db.set_setting("active_account_id", str(account["id"]))
+                if activate:
+                    self.db.set_setting("active_account_id", str(account["id"]))
 
                 # Auto-start CC flow so the account gets independent CC tokens.
                 # Wrapped in try/except: CC failure is non-fatal — primary account

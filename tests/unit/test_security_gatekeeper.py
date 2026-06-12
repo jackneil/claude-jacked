@@ -3629,7 +3629,7 @@ class TestFreezeBoundary:
             ),
             patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
             patch.object(gk, "_record_decision") as mock_record,
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
@@ -3657,7 +3657,7 @@ class TestFreezeBoundary:
             ),
             patch.object(gk, "_record_decision"),
             patch.object(gk, "_record_hook_execution"),
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
@@ -3682,7 +3682,7 @@ class TestFreezeBoundary:
             ),
             patch.object(gk, "_record_decision"),
             patch.object(gk, "_record_hook_execution"),
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "Write", {"file_path": str(target)}, str(tmp_path), "test-sess"
@@ -3708,7 +3708,7 @@ class TestFreezeBoundary:
             patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
             patch.object(gk, "_record_decision"),
             patch.object(gk, "_record_hook_execution"),
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "Read", {"file_path": str(target)}, str(tmp_path), "test-sess"
@@ -3729,7 +3729,7 @@ class TestFreezeBoundary:
             ),
             patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
             patch.object(gk, "_record_decision") as mock_record,
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
@@ -3754,7 +3754,7 @@ class TestFreezeBoundary:
             ),
             patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
             patch.object(gk, "_record_decision") as mock_record,
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "Edit", {"file_path": str(target)}, str(tmp_path), "test-sess"
@@ -3779,7 +3779,7 @@ class TestFreezeBoundary:
             ),
             patch.object(gk, "_check_file_tool_permissions", return_value=(False, None)),
             patch.object(gk, "_record_decision") as mock_record,
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "Edit", {"file_path": str(target_file)}, str(tmp_path), "test-sess"
@@ -3805,7 +3805,7 @@ class TestFreezeBoundary:
             ),
             patch.object(gk, "_record_decision"),
             patch.object(gk, "_record_hook_execution"),
-            patch.dict(os.environ, {"HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch.dict(os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "CLAUDE_PROJECT_DIR": str(tmp_path)}),
         ):
             gk._handle_file_tool(
                 "NotebookEdit", {"notebook_path": str(target)}, str(tmp_path), "test-sess"

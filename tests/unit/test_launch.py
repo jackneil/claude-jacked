@@ -20,6 +20,33 @@ from jacked.web.database import Database
 _WIN = os.name == "nt"
 
 
+def _symlinks_supported() -> bool:
+    """True if this process can create symlinks.
+
+    Windows requires admin or Developer Mode; without it os.symlink raises
+    OSError (WinError 1314). Probed once so symlink-specific tests skip
+    cleanly instead of erroring in setup.
+    """
+    if not _WIN:
+        return True
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as _d:
+        _src = Path(_d) / "s"
+        _src.write_text("x")
+        try:
+            (Path(_d) / "l").symlink_to(_src)
+            return True
+        except OSError:
+            return False
+
+
+requires_symlinks = pytest.mark.skipif(
+    not _symlinks_supported(),
+    reason="symlinks require admin or Developer Mode on Windows",
+)
+
+
 def _make_db(tmp_path: Path) -> Database:
     """Create a test DB with sample accounts.
 
@@ -194,6 +221,7 @@ class TestSeedWorkspaceTrust:
         result = json.loads((config_dir / ".claude.json").read_text())
         assert result == {}
 
+    @requires_symlinks
     def test_skips_when_global_is_symlink(self, tmp_path):
         """Skips seeding when global .claude.json is a symlink."""
         config_dir = tmp_path / "acct"
@@ -215,6 +243,7 @@ class TestSeedWorkspaceTrust:
         result = json.loads((config_dir / ".claude.json").read_text())
         assert "projects" not in result
 
+    @requires_symlinks
     def test_skips_when_local_is_symlink(self, tmp_path):
         """Skips seeding when per-account .claude.json is a symlink."""
         config_dir = tmp_path / "acct"
@@ -454,6 +483,7 @@ class TestSeedOauthAccount:
         result = json.loads((config_dir / ".claude.json").read_text())
         assert "oauthAccount" not in result
 
+    @requires_symlinks
     def test_skips_when_symlink(self, tmp_path):
         """Refuses to write when .claude.json is a symlink."""
         config_dir = tmp_path / "acct"
@@ -570,6 +600,7 @@ class TestPrepareAccountDir:
             with pytest.raises(click.ClickException, match="Invalid account ID"):
                 prepare_account_dir({"id": -1}, db)
 
+    @requires_symlinks
     def test_rejects_symlink_dir(self, tmp_path):
         """Refuses to use a symlinked account directory."""
         db = _make_db(tmp_path)
@@ -588,6 +619,7 @@ class TestPrepareAccountDir:
                 with pytest.raises(click.ClickException, match="symlink"):
                     prepare_account_dir(account, db)
 
+    @requires_symlinks
     def test_rejects_symlink_cred_file(self, tmp_path):
         """Refuses to write to a symlinked credential file."""
         db = _make_db(tmp_path)
@@ -1283,6 +1315,7 @@ class TestSessionPid:
 
 
 class TestSharedSymlinks:
+    @requires_symlinks
     def test_creates_symlinks_for_shared_resources(self, tmp_path):
         """prepare_account_dir symlinks settings.json, plugins/, etc."""
         db = _make_db(tmp_path)
@@ -1329,6 +1362,7 @@ class TestSharedSymlinks:
         assert not (config_dir / "settings.json").exists()
         assert not (config_dir / "plugins").exists()
 
+    @requires_symlinks
     def test_replaces_real_file_with_symlink(self, tmp_path):
         """Replaces a real settings.json (created by Claude Code) with a symlink."""
         db = _make_db(tmp_path)
@@ -1358,6 +1392,7 @@ class TestSharedSymlinks:
         assert (config_dir / "settings.json.bak").exists()
         assert json.loads((config_dir / "settings.json.bak").read_text()) == {"old": True}
 
+    @requires_symlinks
     def test_replaces_real_dir_with_symlink(self, tmp_path):
         """Replaces a real plugins/ dir (created by Claude Code) with a symlink."""
         db = _make_db(tmp_path)
@@ -1389,6 +1424,7 @@ class TestSharedSymlinks:
         assert (config_dir / "plugins.bak").is_dir()
         assert (config_dir / "plugins.bak" / "blocklist.json").exists()
 
+    @requires_symlinks
     def test_backup_already_exists_removes_and_recreates(self, tmp_path):
         """If .bak already exists, removes the real file and recreates symlink."""
         db = _make_db(tmp_path)
@@ -1415,6 +1451,7 @@ class TestSharedSymlinks:
         # Original backup preserved (not overwritten)
         assert json.loads((config_dir / "settings.json.bak").read_text()) == {"older": True}
 
+    @requires_symlinks
     def test_skips_existing_correct_symlink(self, tmp_path):
         """Doesn't recreate symlink if it already points to correct target."""
         db = _make_db(tmp_path)
