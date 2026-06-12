@@ -516,10 +516,15 @@ async function _triggerUsageRefresh(options) {
     try {
         const ss = window.jackedState.swapSettings || {};
         const activeId = window.jackedState.activeCredentialAccountId;
-        const skipParam = (ss.auto_swap_enabled && activeId) ? '?skip_account=' + activeId : '';
+        // user_initiated tells the server whether to apply the short manual floor
+        // (human click) or the full automatic rate-limit ceiling (auto-refresh timer).
+        const params = new URLSearchParams();
+        if (ss.auto_swap_enabled && activeId) params.set('skip_account', activeId);
+        if (userInitiated) params.set('user_initiated', '1');
+        const qs = params.toString() ? '?' + params.toString() : '';
         // Bulk refresh runs ~2s per account server-side — needs more headroom than the
         // default 60s API timeout when many accounts are configured.
-        const result = await api.post('/api/auth/accounts/refresh-all-usage' + skipParam, undefined, { timeout: 300000 });
+        const result = await api.post('/api/auth/accounts/refresh-all-usage' + qs, undefined, { timeout: 300000 });
         if (result.refreshed === 0 && result.failed === 0) {
             showToast('No active accounts to refresh', 'warning');
         } else if (result.failed > 0) {

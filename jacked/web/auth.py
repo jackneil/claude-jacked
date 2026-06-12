@@ -46,8 +46,11 @@ USAGE_CACHE_FRESHNESS_SECONDS = 30
 _REFRESH_LOCK_ACQUIRE_TIMEOUT = 60.0
 
 # Hard ceiling: never fetch usage more than once per this many seconds per account.
-# The Anthropic usage API rate limits at ~1 req/60s/account.
-_USAGE_RATE_LIMIT_CEILING = 65
+# The Anthropic usage API rate limits at ~1 req/60s/account, but jacked runs on
+# SEVERAL machines against the same accounts and each process paces independently
+# (state below is in-memory). Per-machine automatic checks are therefore budgeted
+# at once per 3 minutes so the aggregate across machines stays near the limit.
+_USAGE_RATE_LIMIT_CEILING = 180
 
 # Floor for manual=True fetches. Manual used to bypass the ceiling entirely,
 # which let a runaway dashboard bulk-refresh loop drive ~25 fetches/min
@@ -62,12 +65,14 @@ _USAGE_MANUAL_FLOOR_SECONDS = 20
 # goes straight to the escalating-backoff branch.
 _USAGE_429_ROTATION_INTERVAL = 600
 
-# Adaptive polling intervals by urgency tier
+# Adaptive polling intervals by urgency tier. The floor is the 180s rate-limit
+# ceiling above — polling faster than the ceiling just returns cached data while
+# churning logs, so no tier goes below it.
 _TIER_INTERVALS = {
-    "idle": 300,
-    "normal": 150,
-    "warning": 90,
-    "critical": 65,
+    "idle": 600,
+    "normal": 300,
+    "warning": 240,
+    "critical": 180,
 }
 _TIER_ORDER = ["idle", "normal", "warning", "critical"]
 
@@ -761,7 +766,15 @@ async def fetch_usage(
     # "reset to 0 before retry" un-paced the account and turned every
     # 429 into a license for the next client request to fetch again).
     if _retry_depth == 0:
-        elapsed = now - state["last_fetched_at"]
+        # Pace against BOTH the in-memory stamp and the DB's usage_cached_at.
+        # The in-memory dict dies with the process, so without the DB check
+        # every restart un-paced all accounts and the startup prime fetch
+        # re-hit the upstream API for the whole fleet (2026-06 incident).
+        try:
+            db_cached_at = float(account.get("usage_cached_at") or 0)
+        except (TypeError, ValueError):
+            db_cached_at = 0.0
+        elapsed = now - max(state["last_fetched_at"], db_cached_at)
         if manual:
             if elapsed < _USAGE_MANUAL_FLOOR_SECONDS:
                 logger.debug(

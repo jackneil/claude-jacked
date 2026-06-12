@@ -736,8 +736,18 @@ async def refresh_usage(account_id: int, request: Request):
 
 
 @router.post("/accounts/refresh-all-usage", response_model=BulkUsageRefreshResponse)
-async def refresh_all_usage(request: Request, skip_account: Optional[int] = Query(None)):
+async def refresh_all_usage(
+    request: Request,
+    skip_account: Optional[int] = Query(None),
+    user_initiated: bool = Query(False),
+):
     """Refresh usage cache for all active accounts, concurrently.
+
+    ``user_initiated`` distinguishes a human clicking "Refresh All" (gets
+    fetch_usage's short manual floor) from the dashboard auto-refresh timer
+    (an AUTOMATIC path that must respect the full rate-limit ceiling —
+    classifying it as manual let timers ride the 20s floor and stack on top
+    of the server's own polling).
 
     Accounts are fetched in parallel (bounded by _BULK_MAX_CONCURRENCY).
     Anthropic's usage-API rate limit is per-account/per-token, so
@@ -897,7 +907,8 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
                             effective_token = fresh_token
                     try:
                         usage_data = await asyncio.wait_for(
-                            fetch_usage(acct["id"], db, access_token=effective_token, manual=True),
+                            fetch_usage(acct["id"], db, access_token=effective_token,
+                                        manual=user_initiated),
                             timeout=_BULK_PER_ACCOUNT_TIMEOUT,
                         )
                     except asyncio.TimeoutError:

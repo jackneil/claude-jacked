@@ -133,7 +133,7 @@ class TestRetryPacing:
         """429 -> rotation -> retry fails with 500: last_fetched_at must NOT
         be left at 0 (the old reset let any client loop hammer the API)."""
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
         db = _mock_db()
         client = _mock_client([(429, {}, {"retry-after": "65"}), (500, {}, {})])
 
@@ -167,7 +167,7 @@ class TestRetryPacing:
         """401 -> primary refresh -> retry fails with 500: last_fetched_at
         must NOT be left at 0."""
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
         db = _mock_db()
         client = _mock_client([(401, {}, {}), (500, {}, {})])
 
