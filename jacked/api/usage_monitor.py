@@ -88,6 +88,14 @@ _STALL_TICK_THRESHOLD = 10
 _STALL_USAGE_STALENESS_SECONDS = 1800
 _STALL_WARNING_COOLDOWN_SECONDS = 1800
 
+# Window-keeper ping backoff: account_id -> {"fails": int, "skip_until": float
+# (monotonic)}. A consecutively-failing ping (e.g. an exhausted account
+# answering 429) must not be retried every sweep forever — 2026-06 incident:
+# one account pinged every 120s for hours, 429 every time. Exponential
+# backoff capped at 1h; cleared on the first successful ping.
+_ping_backoff: dict[int, dict] = {}
+_PING_BACKOFF_CAP_SECONDS = 3600
+
 
 def reset_locks() -> None:
     """Rebind module-level asyncio primitives + clear per-account state.
@@ -120,6 +128,7 @@ def reset_locks() -> None:
     _last_committed_swap_time = 0.0
     _same_tier_advisory_last = 0.0
     _drain_advisor_last_sent.clear()
+    _ping_backoff.clear()
 
 
 def note_external_swap() -> None:
@@ -859,6 +868,15 @@ async def active_account_poll_loop(app):
 
     while True:
         try:
+            # External heartbeat — consumed by active_poll_watchdog_loop.
+            # MUST be the first statement of the iteration: every early-exit
+            # branch below ends in ``continue`` and skips the rest of the
+            # body, so a tail-only write starves the watchdog whenever e.g.
+            # auto-swap is disabled (2026-06 incident: 56 pointless respawns
+            # at exactly 5-min intervals, ERROR-level log spam). Monotonic
+            # clock is immune to wall-clock skew.
+            app.state.active_poll_last_tick_at = time.monotonic()
+
             db = getattr(app.state, "db", None)
             if db is None:
                 await asyncio.sleep(60)
@@ -1555,10 +1573,12 @@ async def active_account_poll_loop(app):
             )
         _last_tick_at = now_tick
 
-        # External heartbeat — consumed by active_poll_watchdog_loop. Written
-        # on every iteration (including ticks that bailed early via continue)
-        # so a stuck or never-scheduled task is detectable. Monotonic clock
-        # is immune to wall-clock skew.
+        # Refresh the heartbeat after the tick body too. The authoritative
+        # write is at the TOP of the iteration (it covers all ``continue``
+        # early exits); this tail write only resets the staleness clock so
+        # it measures from the start of the upcoming sleep rather than
+        # from tick start — a single tick can legitimately run long
+        # (priming fetches, swap execution).
         try:
             app.state.active_poll_last_tick_at = time.monotonic()
         except Exception:
@@ -1735,6 +1755,16 @@ async def full_sweep_loop(app):
                     cc_at = acct.get("cc_access_token")
                     if not cc_at:
                         continue
+                    _backoff = _ping_backoff.get(acct["id"])
+                    if _backoff and _backoff["skip_until"] > time.monotonic():
+                        logger.debug(
+                            "Window keeper: account %d in ping backoff for "
+                            "%.0fs more (%d consecutive failures) — skipping",
+                            acct["id"],
+                            _backoff["skip_until"] - time.monotonic(),
+                            _backoff["fails"],
+                        )
+                        continue
 
                     logger.info(
                         "Window keeper: pinging account %d (%s)%s%s",
@@ -1776,6 +1806,7 @@ async def full_sweep_loop(app):
                                 if fresh_cc and fresh_cc != cc_at:
                                     success = await ping_account(fresh_cc)
                     if success:
+                        _ping_backoff.pop(acct["id"], None)
                         sweep_pinged += 1
                         # Fetch fresh usage so cached_5h_resets_at updates
                         # and needs_ping returns False next sweep.
@@ -1791,6 +1822,24 @@ async def full_sweep_loop(app):
                                 "exceeded 10s — moving on",
                                 acct["id"],
                             )
+                    else:
+                        # Still failing after the refresh/reconcile fallbacks
+                        # above — arm exponential backoff so the next sweeps
+                        # skip this account instead of hammering it.
+                        _backoff = _ping_backoff.setdefault(
+                            acct["id"], {"fails": 0, "skip_until": 0.0},
+                        )
+                        _backoff["fails"] += 1
+                        _delay = min(
+                            check_interval * 2 ** _backoff["fails"],
+                            _PING_BACKOFF_CAP_SECONDS,
+                        )
+                        _backoff["skip_until"] = time.monotonic() + _delay
+                        logger.info(
+                            "Window keeper: ping failed for account %d — "
+                            "backing off %.0fs (%d consecutive failures)",
+                            acct["id"], _delay, _backoff["fails"],
+                        )
                     await asyncio.sleep(2)  # pacing
 
             logger.info(

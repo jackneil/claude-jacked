@@ -49,6 +49,19 @@ _REFRESH_LOCK_ACQUIRE_TIMEOUT = 60.0
 # The Anthropic usage API rate limits at ~1 req/60s/account.
 _USAGE_RATE_LIMIT_CEILING = 65
 
+# Floor for manual=True fetches. Manual used to bypass the ceiling entirely,
+# which let a runaway dashboard bulk-refresh loop drive ~25 fetches/min
+# (2026-06 incident). No human workflow needs fresher-than-20s usage, and
+# this caps ANY client loop at 3 fetches/min/account worst case.
+_USAGE_MANUAL_FLOOR_SECONDS = 20
+
+# Minimum seconds between 429-triggered token rotations per account.
+# Rotating refresh tokens to dodge per-token rate limits at high frequency
+# churns the shared CC token store and masks real rate-limiting — the same
+# incident rotated CC tokens 243 times in 4.5h. Outside this window a 429
+# goes straight to the escalating-backoff branch.
+_USAGE_429_ROTATION_INTERVAL = 600
+
 # Adaptive polling intervals by urgency tier
 _TIER_INTERVALS = {
     "idle": 300,
@@ -545,10 +558,13 @@ def _get_usage_state(account_id: int) -> dict:
             "tier": "idle",
             "interval": _TIER_INTERVALS["idle"],
             "consecutive_429s": 0,
+            "last_429_rotation_at": 0.0,
         }
     state = _account_usage_state[account_id]
     if "consecutive_429s" not in state:
         state["consecutive_429s"] = 0
+    if "last_429_rotation_at" not in state:
+        state["last_429_rotation_at"] = 0.0
     return state
 
 
@@ -716,7 +732,9 @@ async def fetch_usage(
 
     Uses per-account coordinator state for rate limiting.  The hard ceiling
     (_USAGE_RATE_LIMIT_CEILING) is always enforced to prevent 429s from the
-    upstream API.
+    upstream API; manual=True gets the shorter _USAGE_MANUAL_FLOOR_SECONDS
+    floor instead of a full bypass.  Only the single bounded 401/429 retry
+    (_retry_depth > 0) skips pacing, and it never resets pacing state.
 
     Updates the account's cached usage fields in the database.
 
@@ -737,11 +755,22 @@ async def fetch_usage(
         )
         return {"_backed_off": True}
 
-    # Hard ceiling: never exceed 1 req per _USAGE_RATE_LIMIT_CEILING seconds.
-    # manual=True bypasses this (user explicitly asked for fresh data).
-    if not manual:
+    # Pacing: hard ceiling for background fetches, shorter floor for manual.
+    # _retry_depth > 0 is the single bounded 401/429 retry with a fresh
+    # token — let it through WITHOUT touching last_fetched_at (the old
+    # "reset to 0 before retry" un-paced the account and turned every
+    # 429 into a license for the next client request to fetch again).
+    if _retry_depth == 0:
         elapsed = now - state["last_fetched_at"]
-        if elapsed < _USAGE_RATE_LIMIT_CEILING:
+        if manual:
+            if elapsed < _USAGE_MANUAL_FLOOR_SECONDS:
+                logger.debug(
+                    f"Manual usage floor for account {account_id}: "
+                    f"{int(elapsed)}s < {_USAGE_MANUAL_FLOOR_SECONDS}s, "
+                    f"returning cached"
+                )
+                return {"_cached": True}
+        elif elapsed < _USAGE_RATE_LIMIT_CEILING:
             logger.debug(
                 f"Usage ceiling for account {account_id}: {int(elapsed)}s < "
                 f"{_USAGE_RATE_LIMIT_CEILING}s, returning cached"
@@ -749,6 +778,17 @@ async def fetch_usage(
             return {"_cached": True}
 
     token = access_token or account["access_token"]
+
+    # Stamp pacing at ATTEMPT time, not only on success/429: the failure
+    # exits below (401 after refresh + live import both fail, generic HTTP
+    # error, transport exception) never stamped, so a permanently failing
+    # account (dead refresh token, upstream 5xx) was never paced and EVERY
+    # client request made a fresh upstream GET — the unbounded half of the
+    # 2026-06 fetch storm. Success/429 paths re-stamp afterwards, which is
+    # harmless. Depth>0 retries skip this (the depth-0 frame re-stamps
+    # after they return).
+    if _retry_depth == 0:
+        state["last_fetched_at"] = time.time()
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -783,17 +823,21 @@ async def fetch_usage(
                 return data
 
             if resp.status_code in (401, 403):
-                # Try refreshing the primary token before giving up.
+                # Try refreshing the primary token before giving up. The
+                # retry rides _retry_depth through the pacing check; we
+                # re-stamp last_fetched_at afterwards (success or not) so
+                # a 401 retry can never un-pace the account.
                 if _retry_depth < 1:
                     fresh = await _try_refresh_primary_token(
                         account_id, db, stale_token=token,
                     )
                     if fresh:
-                        state["last_fetched_at"] = 0  # Reset ceiling for retry
-                        return await fetch_usage(
+                        result = await fetch_usage(
                             account_id, db, access_token=fresh,
                             _retry_depth=_retry_depth + 1,
                         )
+                        state["last_fetched_at"] = time.time()
+                        return result
 
                     # Refresh failed — try live credential import for active account
                     try:
@@ -803,11 +847,12 @@ async def fetch_usage(
                         if refreshed_acct:
                             live_token = refreshed_acct.get("access_token")
                             if live_token and live_token != token:
-                                state["last_fetched_at"] = 0
-                                return await fetch_usage(
+                                result = await fetch_usage(
                                     account_id, db, access_token=live_token,
                                     _retry_depth=_retry_depth + 1,
                                 )
+                                state["last_fetched_at"] = time.time()
+                                return result
                     except Exception:
                         logger.debug("Live credential import failed during 401 recovery",
                                      exc_info=True)
@@ -827,17 +872,35 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                # Try to clear the per-token rate limit by getting a fresh token.
-                # Only attempt on first try (_retry_depth=0) to prevent recursion.
-                if _retry_depth == 0:
+                # Try to clear the per-token rate limit by getting a fresh
+                # token. Only attempt on first try (_retry_depth=0) to
+                # prevent recursion, and at most once per
+                # _USAGE_429_ROTATION_INTERVAL per account — rotating
+                # refresh tokens to dodge per-token rate limits at high
+                # frequency churns the shared CC token store and masks
+                # real rate-limiting (243 rotations in one 4.5h incident).
+                # Otherwise skip straight to the backoff branch below.
+                rotation_due = (
+                    time.time() - state.get("last_429_rotation_at", 0.0)
+                    > _USAGE_429_ROTATION_INTERVAL
+                )
+                if _retry_depth == 0 and rotation_due:
+                    # Stamp at attempt time (success or not): a failed
+                    # rotation still hit the token endpoint.
+                    state["last_429_rotation_at"] = time.time()
                     fresh_token = await _try_refresh_on_429(account_id, db, state)
                     if fresh_token:
                         state["consecutive_429s"] = 0
-                        state["last_fetched_at"] = 0  # Allow immediate retry
                         logger.info("Account %d: retrying usage fetch with fresh token", account_id)
-                        return await fetch_usage(
+                        # The retry rides _retry_depth=1 through the pacing
+                        # check; re-stamp last_fetched_at afterwards
+                        # (success or not) so a 429 retry can never
+                        # un-pace the account.
+                        result = await fetch_usage(
                             account_id, db, access_token=fresh_token, _retry_depth=1,
                         )
+                        state["last_fetched_at"] = time.time()
+                        return result
 
                 # No refresh available — escalating backoff
                 state["consecutive_429s"] = state.get("consecutive_429s", 0) + 1

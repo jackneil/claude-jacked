@@ -1,5 +1,7 @@
 """Tests for the auto-swap dashboard JS (drain advisor, swap history
-status/residency, pause indicator, 24h swap counter).
+status/residency, pause indicator, 24h swap counter) and the
+account-actions auto-refresh guards (hard floor, fire-rate guard,
+cross-tab storage sync, overdue-fire circuit breaker).
 
 The web UI is plain browser JS with no bundler or JS test harness, so
 these tests drive ``node`` from pytest: each case evals the component
@@ -15,6 +17,7 @@ import pytest
 WEB_JS = Path(__file__).resolve().parents[2] / "jacked" / "data" / "web" / "js"
 AUTO_SWAP_JS = WEB_JS / "components" / "auto-swap.js"
 ACCOUNTS_JS = WEB_JS / "components" / "accounts.js"
+ACCOUNT_ACTIONS_JS = WEB_JS / "components" / "account-actions.js"
 WEBSOCKET_JS = WEB_JS / "websocket.js"
 
 EM_DASH = "—"
@@ -43,6 +46,7 @@ function makeEl(tag) {
         className: '',
         textContent: '',
         parentNode: null,
+        style: {},
         _classes: new Set(),
     };
     el.classList = {
@@ -79,12 +83,26 @@ function findById(root, id) {
 
 const body = makeEl('body');
 const _toasts = [];
+const _windowListeners = {};
+const _localStore = {};
 
-global.window = { jackedState: {} };
+global.window = {
+    jackedState: {},
+    addEventListener: (type, cb) => {
+        (_windowListeners[type] = _windowListeners[type] || []).push(cb);
+    },
+};
+global.__windowListeners = _windowListeners;
+global.localStorage = {
+    getItem: (k) => Object.prototype.hasOwnProperty.call(_localStore, k) ? _localStore[k] : null,
+    setItem: (k, v) => { _localStore[k] = String(v); },
+    removeItem: (k) => { delete _localStore[k]; },
+};
 global.document = {
     body,
     createElement: makeEl,
     createElementNS: (_ns, tag) => makeEl(tag),
+    createTextNode: (t) => ({ nodeType: 3, textContent: String(t), parentNode: null }),
     getElementById: (id) => findById(body, id),
     querySelector: () => null,
     querySelectorAll: () => [],
@@ -126,7 +144,9 @@ def _run_js(tmp_path, snippet, js_file=AUTO_SWAP_JS):
 
 
 @pytest.mark.parametrize(
-    "js_file", [AUTO_SWAP_JS, ACCOUNTS_JS, WEBSOCKET_JS], ids=lambda p: p.name
+    "js_file",
+    [AUTO_SWAP_JS, ACCOUNTS_JS, ACCOUNT_ACTIONS_JS, WEBSOCKET_JS],
+    ids=lambda p: p.name,
 )
 def test_node_syntax_check(js_file):
     proc = subprocess.run(
@@ -375,3 +395,249 @@ out({
         assert len(result["toasts"]) == 1
         assert result["toasts"][0]["type"] == "error"
         assert "account 4 failed: write error" in result["toasts"][0]["message"]
+
+
+# Shared setup for the auto-refresh guard tests: deterministic timers (so a real
+# 1s interval never keeps node alive), a refresh button + interval dropdown in
+# the stub DOM, and a counting api.post stub.
+_REFRESH_SETUP = r"""
+const _ticks = [];
+global.setInterval = (cb) => { _ticks.push(cb); return _ticks.length; };
+global.clearInterval = () => {};
+const btn = __makeEl('button'); btn.id = 'btn-refresh-all-usage'; __body.appendChild(btn);
+const sel = __makeEl('select'); sel.id = 'sel-auto-refresh'; __body.appendChild(sel);
+const posts = [];
+global.api.post = async (url) => { posts.push(url); return { refreshed: 1, failed: 0, results: [] }; };
+global.refreshAndRender = async () => {};
+// Button label is appended as a text node on every update; read the most recent one.
+const lastLabel = (el) => {
+    const texts = el.children.filter(c => c.nodeType === 3);
+    return texts.length ? texts[texts.length - 1].textContent : String(el.textContent || '');
+};
+"""
+
+
+class TestAutoRefreshGuards:
+    """Regression tests for the 2026-06 usage-fetch storm: a '0' interval in the
+    shared localStorage key (written by another tab's circuit breaker) made every
+    1s tick fire a bulk refresh pass back-to-back, indefinitely."""
+
+    def test_source_guards(self):
+        src = ACCOUNT_ACTIONS_JS.read_text()
+        # Hard floor matching the smallest dropdown option
+        assert "const _AUTO_REFRESH_FLOOR_SECS = 120" in src
+        # Cross-tab re-sync of the shared interval key
+        assert "window.addEventListener('storage'" in src
+        # The overdue fire must not swallow failures with a bare catch
+        assert "_triggerUsageRefresh().catch(() => {})" not in src
+        # The manual button is exempt from the fire-rate guard
+        assert "userInitiated: true" in src
+        # Server bulk-lock contention (HTTP 429 REFRESH_IN_PROGRESS) is benign
+        # cross-tab contention, never a circuit-break — breaking writes '0' to
+        # the SHARED localStorage key and kills auto-refresh in every tab
+        assert "REFRESH_IN_PROGRESS" in src
+
+    def test_zero_interval_circuit_breaker(self, tmp_path):
+        # Root cause (a): success path reset the countdown straight from
+        # localStorage; another tab writing '0' turned every tick into a fire.
+        result = _run_js(tmp_path, _REFRESH_SETUP + r"""
+(async () => {
+    localStorage.setItem('jacked_auto_refresh_interval', '120');
+    _startAutoRefresh();
+    const runningLabel = lastLabel(btn);
+
+    // Another tab's circuit breaker writes '0' to the SHARED key while our timer runs
+    localStorage.setItem('jacked_auto_refresh_interval', '0');
+    await _triggerUsageRefresh();   // success path must not reset countdown to 0
+    const postsAfterTrigger = posts.length;
+    await _autoRefreshTick();       // pre-fix: countdown <= 0 -> fires another bulk pass
+    await _autoRefreshTick();
+    out({
+        runningLabel,
+        postsAfterTrigger,
+        postsAfterTicks: posts.length,
+        stoppedLabel: lastLabel(btn),
+        selValue: sel.value,
+    });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""", js_file=ACCOUNT_ACTIONS_JS)
+        assert "Refresh now" in result["runningLabel"]
+        assert result["postsAfterTrigger"] == 1
+        # No runaway: the 0 interval stops the timer instead of firing every tick
+        assert result["postsAfterTicks"] == 1
+        assert "Refresh All Usage" in result["stoppedLabel"]
+        assert result["selValue"] == "0"
+
+    def test_automated_fire_rate_guard(self, tmp_path):
+        result = _run_js(tmp_path, _REFRESH_SETUP + r"""
+(async () => {
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    await _triggerUsageRefresh();                         // automated, first start -> allowed
+    await _triggerUsageRefresh();                         // back-to-back automated -> suppressed
+    await _triggerUsageRefresh();                         // suppressed again, warn only once
+    const postsAutomated = posts.length;
+    await _triggerUsageRefresh({ userInitiated: true });  // manual click stays allowed
+    out({
+        postsAutomated,
+        postsTotal: posts.length,
+        warns: warns.length,
+        toastTypes: __getToasts().map(t => t.type),
+    });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""", js_file=ACCOUNT_ACTIONS_JS)
+        assert result["postsAutomated"] == 1
+        assert result["postsTotal"] == 2
+        assert result["warns"] == 1
+        # Suppression is silent — console.warn only, no toast spam
+        assert "warning" not in result["toastTypes"]
+
+    def test_storage_event_cross_tab_sync(self, tmp_path):
+        result = _run_js(tmp_path, _REFRESH_SETUP + r"""
+(async () => {
+    const listeners = __windowListeners['storage'] || [];
+    // Deterministic phase jitter: floor(0.5 * 11) = 5s offset
+    Math.random = () => 0.5;
+    localStorage.setItem('jacked_auto_refresh_interval', '120');
+    _startAutoRefresh();
+    const localLabel = lastLabel(btn);
+
+    // Another tab turns auto-refresh off -> storage event fires here
+    localStorage.setItem('jacked_auto_refresh_interval', '0');
+    listeners.forEach(cb => cb({ key: 'jacked_auto_refresh_interval', newValue: '0' }));
+    const stoppedLabel = lastLabel(btn);
+    const selAfterOff = sel.value;
+
+    // Another tab picks a new interval -> this tab re-arms at that value
+    localStorage.setItem('jacked_auto_refresh_interval', '300');
+    listeners.forEach(cb => cb({ key: 'jacked_auto_refresh_interval', newValue: '300' }));
+    const rearmedLabel = lastLabel(btn);
+    const selAfterOn = sel.value;
+
+    // Unrelated keys are ignored (no crash, no timer change)
+    listeners.forEach(cb => cb({ key: 'jacked_tip_dismissed', newValue: '1' }));
+    out({ listenerCount: listeners.length, localLabel, stoppedLabel, selAfterOff,
+          rearmedLabel, selAfterOn, finalLabel: lastLabel(btn) });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""", js_file=ACCOUNT_ACTIONS_JS)
+        assert result["listenerCount"] >= 1
+        # Local (user-initiated) arm has no jitter — exactly the chosen interval
+        assert "2:00" in result["localLabel"]
+        assert "Refresh All Usage" in result["stoppedLabel"]
+        assert result["selAfterOff"] == "0"
+        assert "Refresh now" in result["rearmedLabel"]
+        # Storage-synced arm carries a random phase offset (5s with the stubbed
+        # Math.random) so tabs armed by the same write de-phase instead of
+        # firing in the same ~1s window and contending for the server bulk
+        # lock on every cycle
+        assert "5:05" in result["rearmedLabel"]
+        assert result["selAfterOn"] == "300"
+        assert "Refresh now" in result["finalLabel"]
+
+    def test_tick_refresh_in_progress_is_benign_skip(self, tmp_path):
+        # Two tabs phase-locked by the storage listener fire in the same ~1s
+        # window; the loser of the server-side bulk lock race gets HTTP 429
+        # REFRESH_IN_PROGRESS. That is benign contention — the tick catch must
+        # NOT trip the circuit breaker (which writes '0' to the SHARED
+        # localStorage key and kills auto-refresh in EVERY tab).
+        result = _run_js(tmp_path, _REFRESH_SETUP + r"""
+(async () => {
+    localStorage.setItem('jacked_auto_refresh_interval', '120');
+    _startAutoRefresh();
+
+    global.api.post = async () => {
+        throw Object.assign(new Error('Usage refresh already in progress'),
+                            { code: 'REFRESH_IN_PROGRESS', status: 429 });
+    };
+    for (let i = 0; i < 120; i++) await _autoRefreshTick();  // countdown 120 -> fire
+    const afterContention = {
+        stored: localStorage.getItem('jacked_auto_refresh_interval'),
+        label: lastLabel(btn),
+        errorToasts: __getToasts().filter(t => t.type === 'error').length,
+        infoToasts: __getToasts().filter(t => t.type === 'info').length,
+    };
+
+    // A genuine backend failure must still trip the breaker.
+    const realNow = Date.now;
+    Date.now = () => realNow() + 200000;   // clear the fire-rate guard window
+    global.api.post = async () => { throw new Error('backend down'); };
+    for (let i = 0; i < 120; i++) await _autoRefreshTick();
+    Date.now = realNow;
+    out({
+        afterContention,
+        storedAfterFailure: localStorage.getItem('jacked_auto_refresh_interval'),
+        labelAfterFailure: lastLabel(btn),
+    });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""", js_file=ACCOUNT_ACTIONS_JS)
+        # Benign contention: interval untouched, timer still armed, no error
+        # toast — an info toast tells the user another refresh already ran
+        assert result["afterContention"]["stored"] == "120"
+        assert "Refresh now" in result["afterContention"]["label"]
+        assert result["afterContention"]["errorToasts"] == 0
+        assert result["afterContention"]["infoToasts"] == 1
+        # Genuine failures still circuit-break
+        assert result["storedAfterFailure"] == "0"
+        assert "Refresh All Usage" in result["labelAfterFailure"]
+
+    def test_overdue_fire_refresh_in_progress_is_benign_skip(self, tmp_path):
+        # The overdue-fire .catch is the SILENT variant of the same kill:
+        # returning to the accounts route while another tab's pass is in
+        # flight must not disable auto-refresh everywhere.
+        result = _run_js(tmp_path, _REFRESH_SETUP + r"""
+(async () => {
+    localStorage.setItem('jacked_auto_refresh_interval', '120');
+    _startAutoRefresh();   // sets the elapsed-time anchor
+
+    // Jump the clock past the interval so the next change takes the overdue path
+    const realNow = Date.now;
+    Date.now = () => realNow() + 600000;
+    global.api.post = async () => {
+        throw Object.assign(new Error('Usage refresh already in progress'),
+                            { code: 'REFRESH_IN_PROGRESS', status: 429 });
+    };
+    _changeAutoRefreshInterval(120);                 // overdue -> fires immediately, 429s
+    await new Promise(r => setTimeout(r, 20));       // let the rejection settle
+    Date.now = realNow;
+    out({
+        storedInterval: localStorage.getItem('jacked_auto_refresh_interval'),
+        selValue: String(sel.value),
+        label: lastLabel(btn),
+    });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""", js_file=ACCOUNT_ACTIONS_JS)
+        assert result["storedInterval"] == "120"
+        assert result["selValue"] != "0"
+        assert "Refresh now" in result["label"]
+
+    def test_overdue_fire_failure_trips_circuit_breaker(self, tmp_path):
+        # Root cause (b): the overdue fire's bare .catch(() => {}) left the timer
+        # running against a failing backend with no circuit breaker.
+        result = _run_js(tmp_path, _REFRESH_SETUP + r"""
+(async () => {
+    localStorage.setItem('jacked_auto_refresh_interval', '120');
+    _startAutoRefresh();   // sets the elapsed-time anchor
+
+    // Jump the clock past the interval so the next change takes the overdue path
+    const realNow = Date.now;
+    Date.now = () => realNow() + 600000;
+    global.api.post = async () => { throw new Error('backend down'); };
+    _changeAutoRefreshInterval(120);                 // overdue -> fires immediately, fails
+    await new Promise(r => setTimeout(r, 20));       // let the rejection settle
+    Date.now = realNow;
+    out({
+        storedInterval: localStorage.getItem('jacked_auto_refresh_interval'),
+        selValue: sel.value,
+        label: lastLabel(btn),
+    });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""", js_file=ACCOUNT_ACTIONS_JS)
+        assert result["storedInterval"] == "0"
+        assert result["selValue"] == "0"
+        assert "Refresh All Usage" in result["label"]

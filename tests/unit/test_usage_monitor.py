@@ -136,6 +136,7 @@ def _reset_monitor_state():
     mod._emerged_tier_streak["tier"] = None
     mod._emerged_tier_streak["count"] = 0
     mod._last_observed_tiers.clear()
+    mod._ping_backoff.clear()
     mod._initial_fetch_done = True
     yield
 
@@ -558,6 +559,184 @@ class TestWindowKeeperPings:
                     f"Expected at least one fetch_usage call with access_token set "
                     f"(to bypass cache), but got: {mock_fetch.call_args_list}"
                 )
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Window keeper ping backoff — failing pings must not retry every sweep
+# ---------------------------------------------------------------------------
+
+class TestWindowKeeperPingBackoff:
+    """A consecutively-failing ping (e.g. an exhausted account answering
+    429) must back off exponentially instead of being retried every sweep
+    forever — 2026-06 incident: account pinged every 120s for hours."""
+
+    def _settings(self):
+        # Small interval so the tail sleep loop is a single sleep call,
+        # making per-sweep sleep accounting deterministic.
+        return {
+            "window_keeper_enabled": "true",
+            "usage_check_interval": "5",
+        }
+
+    def test_ping_failure_schedules_backoff_and_next_sweep_skips(self, caplog):
+        import jacked.api.usage_monitor as mod
+        accounts = [_acct(1, resets_at=None)]
+        db = _make_db(settings=self._settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                # Sweep 1: pacing sleep + tail sleep. Sweeps 2/3: tail sleep
+                # only (account skipped). Cancel on the 4th sleep => 3 sweeps.
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=3),
+                ),
+                patch(
+                    "jacked.web.window_keeper.is_active_hours",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.is_prewake_time",
+                    return_value=False,
+                ),
+                patch(
+                    "jacked.web.window_keeper.needs_ping",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.ping_account",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                ) as mock_ping,
+                patch(
+                    "jacked.api.credential_helpers.read_active_account_id",
+                    return_value=999,
+                ),
+                patch(
+                    "jacked.web.auth.refresh_cc_token",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                ),
+            ):
+                with caplog.at_level(
+                    logging.DEBUG, logger="jacked.api.usage_monitor",
+                ):
+                    with pytest.raises(asyncio.CancelledError):
+                        await full_sweep_loop(app)
+
+            assert mock_ping.call_count == 1, (
+                "a failing ping must be skipped on subsequent sweeps while "
+                f"backoff is armed, but ping ran {mock_ping.call_count} times"
+            )
+            state = mod._ping_backoff.get(1)
+            assert state is not None, "ping failure must arm per-account backoff"
+            assert state["fails"] == 1
+            assert state["skip_until"] > time.monotonic()
+            assert any(
+                r.levelno == logging.DEBUG and "backoff" in r.getMessage().lower()
+                for r in caplog.records
+            ), "backoff skip must be logged at DEBUG"
+
+        asyncio.run(_run())
+
+    def test_ping_success_resets_backoff(self):
+        import jacked.api.usage_monitor as mod
+        # Expired backoff (skip_until in the past) so the sweep pings again.
+        mod._ping_backoff[1] = {"fails": 3, "skip_until": 0.0}
+        accounts = [_acct(1, resets_at=None)]
+        db = _make_db(settings=self._settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=1),
+                ),
+                patch(
+                    "jacked.web.window_keeper.is_active_hours",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.is_prewake_time",
+                    return_value=False,
+                ),
+                patch(
+                    "jacked.web.window_keeper.needs_ping",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.ping_account",
+                    new_callable=AsyncMock,
+                    return_value=True,
+                ) as mock_ping,
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": False},
+                ),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await full_sweep_loop(app)
+
+            assert mock_ping.call_count == 1
+            assert 1 not in mod._ping_backoff, (
+                "a successful ping must clear the account's backoff state"
+            )
+
+        asyncio.run(_run())
+
+    def test_backoff_delay_is_exponential_and_capped(self):
+        import jacked.api.usage_monitor as mod
+        # fails=10 with check_interval=5 would be 5120s uncapped — the cap
+        # must hold skip_until to <= now + 3600.
+        mod._ping_backoff[1] = {"fails": 10, "skip_until": 0.0}
+        accounts = [_acct(1, resets_at=None)]
+        db = _make_db(settings=self._settings(), accounts=accounts)
+        app = _make_app(db=db)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=1),
+                ),
+                patch(
+                    "jacked.web.window_keeper.is_active_hours",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.is_prewake_time",
+                    return_value=False,
+                ),
+                patch(
+                    "jacked.web.window_keeper.needs_ping",
+                    return_value=True,
+                ),
+                patch(
+                    "jacked.web.window_keeper.ping_account",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_active_account_id",
+                    return_value=999,
+                ),
+                patch(
+                    "jacked.web.auth.refresh_cc_token",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                ),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await full_sweep_loop(app)
+
+            state = mod._ping_backoff[1]
+            assert state["fails"] == 11
+            assert state["skip_until"] <= time.monotonic() + 3600
 
         asyncio.run(_run())
 
@@ -1719,6 +1898,51 @@ class TestActivePollHeartbeat:
             "watchdog can detect a wedged task."
         )
 
+    def test_heartbeat_written_when_auto_swap_disabled(self):
+        """2026-06 respawn-churn incident: with auto_swap_enabled=false every
+        iteration exits via ``continue`` before a tail-only heartbeat write,
+        so the watchdog declared the healthy loop dead every ~5 minutes and
+        respawned it (56 respawns observed). The heartbeat must be written
+        at the TOP of every iteration, before any early-exit branch."""
+        db = _make_db(settings={"auto_swap_enabled": "false"})
+        app = _FakeApp()
+        app.state.db = db
+
+        async def _run():
+            with patch(
+                "jacked.api.usage_monitor.asyncio.sleep",
+                side_effect=_sleep_canceller(max_sleeps=0),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+            tick = getattr(app.state, "active_poll_last_tick_at", None)
+            assert tick is not None, (
+                "heartbeat must be written before the auto-swap-disabled "
+                "early exit, or the watchdog respawns a healthy loop forever"
+            )
+            assert time.monotonic() - tick < 5
+
+        asyncio.run(_run())
+
+    def test_heartbeat_written_when_db_missing(self):
+        """The db-None early exit is the very first branch in the loop body —
+        the heartbeat write must precede even that."""
+        app = _FakeApp()
+        app.state.db = None
+
+        async def _run():
+            with patch(
+                "jacked.api.usage_monitor.asyncio.sleep",
+                side_effect=_sleep_canceller(max_sleeps=0),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+            assert getattr(app.state, "active_poll_last_tick_at", None) is not None
+
+        asyncio.run(_run())
+
 
 class TestActivePollWatchdogRespawn:
     """Verify the watchdog respawns the poll task when its heartbeat goes stale."""
@@ -2476,6 +2700,7 @@ class TestResetLocksState:
         um._emerged_tier_streak["tier"] = 2
         um._emerged_tier_streak["count"] = 9
         um._last_observed_tiers[1] = 2
+        um._ping_backoff[1] = {"fails": 4, "skip_until": time.monotonic() + 60}
 
         um.reset_locks()
 
@@ -2486,3 +2711,4 @@ class TestResetLocksState:
         assert um._drain_advisor_last_sent == {}
         assert um._emerged_tier_streak == {"tier": None, "count": 0}
         assert um._last_observed_tiers == {}
+        assert um._ping_backoff == {}

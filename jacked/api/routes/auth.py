@@ -53,6 +53,14 @@ _SINGLE_USAGE_TIMEOUT = 60.0
 _TOKEN_REFRESH_TIMEOUT = 45.0
 _VALIDATE_TIMEOUT = 60.0
 
+# Pass-throttle for bulk refresh: if a new bulk request arrives within this
+# many seconds of the previous pass COMPLETION, serve current DB values
+# without touching the Anthropic API. A runaway client loop (2026-06
+# incident: a dashboard tab drove back-to-back bulk passes at ~25
+# fetches/min for hours) then only ever hits the DB.
+_BULK_PASS_MIN_INTERVAL = 30.0
+_last_bulk_completed_at: float = 0.0
+
 
 def _gateway_timeout(message: str, code: str) -> JSONResponse:
     return JSONResponse(
@@ -79,6 +87,7 @@ def reset_locks() -> None:
     will complete or cancel on their own.
     """
     global _bulk_refresh_lock, _bulk_refresh_acquired_at, _bulk_refresh_task
+    global _last_bulk_completed_at
     if _bulk_refresh_lock.locked():
         logger.warning(
             "reset_locks: bulk_refresh_lock was held at rebind "
@@ -88,6 +97,7 @@ def reset_locks() -> None:
     _bulk_refresh_lock = asyncio.Lock()
     _bulk_refresh_acquired_at = 0.0
     _bulk_refresh_task = None
+    _last_bulk_completed_at = 0.0
 
 
 # --- Pydantic v2 request/response models ---
@@ -201,6 +211,10 @@ class UsageRefreshResponse(BaseModel):
 class BulkUsageRefreshResponse(BaseModel):
     refreshed: int
     failed: int
+    # Number of accounts served from the DB by the pass-throttle (the
+    # request arrived within _BULK_PASS_MIN_INTERVAL of the previous
+    # pass's completion). 0 for a real API pass.
+    throttled: int = 0
     results: list[dict] = []
 
 
@@ -739,6 +753,41 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
     # at runtime (a coroutine stuck on a pathological Anthropic response).
     # Both are needed.
     global _bulk_refresh_lock, _bulk_refresh_acquired_at, _bulk_refresh_task
+    global _last_bulk_completed_at
+
+    # Pass-throttle: a pass that completed within the last
+    # _BULK_PASS_MIN_INTERVAL seconds means every account's cache is at
+    # most ~30s-plus-pass-length old — serve straight from the DB with no
+    # Anthropic calls. WS broadcasts are skipped entirely (rather than
+    # sending a total=0 usage_refresh_started) so other tabs never enter a
+    # "refreshing" state that no progress/done events would ever resolve;
+    # the requester gets its data in the HTTP response.
+    since_last = time.time() - _last_bulk_completed_at
+    if _last_bulk_completed_at and since_last < _BULK_PASS_MIN_INTERVAL:
+        accounts = db.list_accounts(include_inactive=False)
+        results = [
+            {
+                "account_id": acct["id"],
+                "email": acct["email"],
+                "success": True,
+                "throttled": True,
+                "cached_usage_5h": acct.get("cached_usage_5h"),
+                "cached_usage_7d": acct.get("cached_usage_7d"),
+            }
+            for acct in accounts
+        ]
+        logger.info(
+            "Bulk usage refresh throttled: previous pass completed %.1fs ago "
+            "(< %.0fs) — returning DB values for %d account(s)",
+            since_last, _BULK_PASS_MIN_INTERVAL, len(results),
+        )
+        return BulkUsageRefreshResponse(
+            refreshed=len(results),
+            failed=0,
+            throttled=len(results),
+            results=results,
+        )
+
     if _bulk_refresh_lock.locked():
         held_for = time.time() - _bulk_refresh_acquired_at if _bulk_refresh_acquired_at else 0
         if held_for > _BULK_REFRESH_STALE_AFTER:
@@ -923,6 +972,10 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
                          "account_data": acct_payload},
                     )
 
+            # Stamp completion only on a normally finished pass — a
+            # cancelled/raised pass must not arm the throttle and mask a
+            # legitimate retry.
+            _last_bulk_completed_at = time.time()
             return BulkUsageRefreshResponse(
                 refreshed=refreshed,
                 failed=failed,

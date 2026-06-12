@@ -1,12 +1,13 @@
-"""Tests for route-level timeout guards on single-account auth endpoints
-and the bulk-refresh 429 envelope / finally-block state reset.
+"""Tests for route-level timeout guards on single-account auth endpoints,
+the bulk-refresh 429 envelope / finally-block state reset, and the bulk
+pass-throttle (2026-06 usage-fetch storm fix).
 
 Uses asyncio.run() wrappers (project convention — no pytest-asyncio)."""
 import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -159,3 +160,129 @@ def test_bulk_refresh_finally_resets_acquired_at(monkeypatch):
     assert resp.refreshed == 1
     assert routes_auth._bulk_refresh_task is None
     assert routes_auth._bulk_refresh_acquired_at == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Bulk pass-throttle: a second pass within 30s of the previous pass's
+# completion must be served from the DB without touching the Anthropic API
+# (2026-06 incident: a runaway dashboard tab drove ~25 fetches/min for hours).
+# ---------------------------------------------------------------------------
+
+
+def _throttle_db():
+    db = MagicMock()
+    db.list_accounts.return_value = [
+        {"id": 1, "email": "a@x", "cached_usage_5h": 12.5, "cached_usage_7d": 40.0},
+    ]
+    # Full row: the real (non-throttled) pass feeds this through
+    # _account_to_response for the WS progress payload.
+    db.get_account.return_value = {
+        "id": 1,
+        "email": "a@x",
+        "expires_at": int(time.time()) + 3600,
+        "last_error": None,
+    }
+    return db
+
+
+def test_bulk_refresh_throttled_within_30s_fetches_once(monkeypatch):
+    """Two bulk passes back-to-back: only the first may call fetch_usage.
+    The second returns success=True per account with current DB values."""
+    from jacked.api.routes import auth as routes_auth
+
+    db = _throttle_db()
+    request = MagicMock()
+    request.app.state.ws_registry = None
+    monkeypatch.setattr(routes_auth, "_get_db", lambda r: db)
+
+    calls = {"n": 0}
+
+    async def fake_fetch(*args, **kwargs):
+        calls["n"] += 1
+        return {"five_hour": {"utilization": 12.5},
+                "seven_day": {"utilization": 40.0}}
+
+    async def _run():
+        with patch.object(routes_auth, "fetch_usage", side_effect=fake_fetch):
+            first = await routes_auth.refresh_all_usage(request)
+            second = await routes_auth.refresh_all_usage(request)
+        return first, second
+
+    first, second = asyncio.run(_run())
+    assert calls["n"] == 1, "second bulk pass within 30s must not hit the API"
+    assert first.refreshed == 1
+    assert first.throttled == 0
+    assert second.refreshed == 1
+    assert second.failed == 0
+    assert second.throttled == 1
+    assert second.results[0]["account_id"] == 1
+    assert second.results[0]["success"] is True
+    assert second.results[0]["cached_usage_5h"] == 12.5
+    assert second.results[0]["cached_usage_7d"] == 40.0
+
+
+def test_bulk_refresh_not_throttled_after_interval(monkeypatch):
+    """A pass that completed longer than the throttle window ago does not
+    block a fresh API pass."""
+    from jacked.api.routes import auth as routes_auth
+
+    db = _throttle_db()
+    request = MagicMock()
+    request.app.state.ws_registry = None
+    monkeypatch.setattr(routes_auth, "_get_db", lambda r: db)
+    routes_auth._last_bulk_completed_at = (
+        time.time() - routes_auth._BULK_PASS_MIN_INTERVAL - 1.0
+    )
+
+    calls = {"n": 0}
+
+    async def fake_fetch(*args, **kwargs):
+        calls["n"] += 1
+        return {"five_hour": {"utilization": 12.5},
+                "seven_day": {"utilization": 40.0}}
+
+    async def _run():
+        with patch.object(routes_auth, "fetch_usage", side_effect=fake_fetch):
+            return await routes_auth.refresh_all_usage(request)
+
+    resp = asyncio.run(_run())
+    assert calls["n"] == 1
+    assert resp.refreshed == 1
+
+
+def test_bulk_refresh_throttled_pass_sends_no_ws_events(monkeypatch):
+    """The throttled pass must not broadcast ANY WS events — otherwise other
+    tabs enter a 'refreshing' state that no progress/done event resolves."""
+    from jacked.api.routes import auth as routes_auth
+
+    db = _throttle_db()
+    ws = MagicMock()
+    ws.broadcast = AsyncMock()
+    request = MagicMock()
+    request.app.state.ws_registry = ws
+    monkeypatch.setattr(routes_auth, "_get_db", lambda r: db)
+
+    async def fake_fetch(*args, **kwargs):
+        return {"five_hour": {"utilization": 12.5},
+                "seven_day": {"utilization": 40.0}}
+
+    async def _run():
+        with patch.object(routes_auth, "fetch_usage", side_effect=fake_fetch):
+            await routes_auth.refresh_all_usage(request)
+            after_first = ws.broadcast.call_count
+            await routes_auth.refresh_all_usage(request)
+        return after_first, ws.broadcast.call_count
+
+    after_first, after_second = asyncio.run(_run())
+    assert after_first > 0  # real pass broadcasts started + progress
+    assert after_second == after_first  # throttled pass broadcasts nothing
+
+
+def test_reset_locks_clears_bulk_completion_throttle():
+    """reset_locks (lifespan/tray restart) must clear the throttle clock so
+    a fresh process never starts in a throttled state."""
+    from jacked.api.routes import auth as routes_auth
+
+    routes_auth._last_bulk_completed_at = time.time()
+    routes_auth.reset_locks()
+    assert routes_auth._last_bulk_completed_at == 0.0
