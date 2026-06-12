@@ -3,9 +3,9 @@
 import pytest
 pytest.importorskip("qdrant_client")
 
-from unittest.mock import patch
+from unittest.mock import patch  # noqa: E402
 
-from jacked.indexer import SessionIndexer
+from jacked.indexer import SessionIndexer  # noqa: E402
 
 
 class TestSessionIndexerInit:
