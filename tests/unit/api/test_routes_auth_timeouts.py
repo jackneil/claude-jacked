@@ -286,3 +286,122 @@ def test_reset_locks_clears_bulk_completion_throttle():
     routes_auth._last_bulk_completed_at = time.time()
     routes_auth.reset_locks()
     assert routes_auth._last_bulk_completed_at == 0.0
+
+
+def _multi_account_db(n=5):
+    db = MagicMock()
+    db.list_accounts.return_value = [
+        {"id": i, "email": f"a{i}@x", "cached_usage_5h": 10.0, "cached_usage_7d": 20.0}
+        for i in range(1, n + 1)
+    ]
+    db.get_account.side_effect = lambda aid: {
+        "id": aid,
+        "email": f"a{aid}@x",
+        "expires_at": int(time.time()) + 3600,
+        "last_error": None,
+    }
+    return db
+
+
+def test_bulk_refresh_fetches_accounts_concurrently(monkeypatch):
+    """Per-account fetches must overlap: the usage-API limit is
+    per-account/per-token, so a 5-account pass with a 0.3s fetch should
+    finish in ~one fetch duration, not five serialized ones."""
+    from jacked.api.routes import auth as routes_auth
+
+    db = _multi_account_db(5)
+    request = MagicMock()
+    request.app.state.ws_registry = None
+    monkeypatch.setattr(routes_auth, "_get_db", lambda r: db)
+
+    in_flight = {"now": 0, "peak": 0}
+
+    async def slow_fetch(*args, **kwargs):
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        await asyncio.sleep(0.3)
+        in_flight["now"] -= 1
+        return {"five_hour": {"utilization": 1.0},
+                "seven_day": {"utilization": 2.0}}
+
+    async def _run():
+        start = time.monotonic()
+        with patch.object(routes_auth, "fetch_usage", side_effect=slow_fetch):
+            resp = await routes_auth.refresh_all_usage(request)
+        return resp, time.monotonic() - start
+
+    resp, elapsed = asyncio.run(_run())
+    assert resp.refreshed == 5
+    assert resp.failed == 0
+    assert in_flight["peak"] >= 2, "fetches never overlapped — pass is serialized"
+    assert elapsed < 1.2, f"5x0.3s pass took {elapsed:.2f}s — looks serialized"
+
+
+def test_bulk_refresh_progress_counts_completions(monkeypatch):
+    """WS done/failed events must carry a monotonically increasing
+    completion count ending at total, so the 'Refreshing N/M' button label
+    stays meaningful under concurrency."""
+    from jacked.api.routes import auth as routes_auth
+
+    db = _multi_account_db(4)
+    request = MagicMock()
+    events = []
+
+    class FakeWS:
+        async def broadcast(self, event, payload=None, **kw):
+            events.append((event, payload))
+
+    request.app.state.ws_registry = FakeWS()
+    monkeypatch.setattr(routes_auth, "_get_db", lambda r: db)
+
+    async def fake_fetch(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        return {"five_hour": {"utilization": 1.0},
+                "seven_day": {"utilization": 2.0}}
+
+    async def _run():
+        with patch.object(routes_auth, "fetch_usage", side_effect=fake_fetch):
+            return await routes_auth.refresh_all_usage(request)
+
+    resp = asyncio.run(_run())
+    assert resp.refreshed == 4
+    done = [p for e, p in events
+            if e == "usage_refresh_progress" and p["status"] == "done"]
+    assert len(done) == 4
+    counts = [p["progress"] for p in done]
+    assert counts == sorted(counts), f"completion counts not monotonic: {counts}"
+    assert counts[-1] == 4
+    assert {p["account_id"] for p in done} == {1, 2, 3, 4}
+
+
+def test_bulk_refresh_one_account_error_does_not_strand_siblings(monkeypatch):
+    """A per-account internal error (e.g. sqlite OperationalError on the
+    update) must become a failed result row — never propagate out of the
+    gather, which would release the bulk lock with siblings still in
+    flight."""
+    from jacked.api.routes import auth as routes_auth
+
+    db = _multi_account_db(3)
+    request = MagicMock()
+    request.app.state.ws_registry = None
+    monkeypatch.setattr(routes_auth, "_get_db", lambda r: db)
+
+    async def fetch_or_boom(account_id, *args, **kwargs):
+        await asyncio.sleep(0.01)
+        if account_id == 2:
+            raise RuntimeError("synthetic db explosion")
+        return {"five_hour": {"utilization": 1.0},
+                "seven_day": {"utilization": 2.0}}
+
+    async def _run():
+        with patch.object(routes_auth, "fetch_usage", side_effect=fetch_or_boom):
+            return await routes_auth.refresh_all_usage(request)
+
+    resp = asyncio.run(_run())
+    assert resp.refreshed == 2
+    assert resp.failed == 1
+    bad = next(r for r in resp.results if r["account_id"] == 2)
+    assert bad["success"] is False
+    assert "synthetic db explosion" in (bad["error"] or "")
+    from jacked.api.routes.auth import _bulk_refresh_lock  # noqa: F401
+    assert not routes_auth._bulk_refresh_lock.locked()

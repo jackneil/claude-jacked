@@ -39,11 +39,16 @@ _bulk_refresh_acquired_at: float = 0.0
 # 0.41.23: track the task holding the lock so the stale-lock guard can
 # cancel it before swapping in a fresh lock.
 _bulk_refresh_task: "asyncio.Task | None" = None
-_BULK_REFRESH_STALE_AFTER = 180.0  # 4 accts * ~20s worst case + slack
+_BULK_REFRESH_STALE_AFTER = 180.0  # generous: a concurrent pass worst-cases at ~_BULK_PER_ACCOUNT_TIMEOUT
 # 0.41.25: max seconds per account in bulk refresh before declaring it hung.
 # Happy path is 1-2s; 10s is plenty of slack for a slow Anthropic refresh.
 # If refresh takes >10s something's wrong upstream — waiting longer doesn't help.
 _BULK_PER_ACCOUNT_TIMEOUT = 10.0
+# Accounts fetch concurrently — each uses its own OAuth token, and Anthropic's
+# usage-API limit is per-account/per-token, so cross-account parallelism is
+# safe. The cap exists only to bound simultaneous outbound sockets and
+# OAuth-refresh fan-out on the rare all-accounts-401 path.
+_BULK_MAX_CONCURRENCY = 8
 # Route-level upper bounds for single-account endpoints so a wedged upstream
 # call can't hold the HTTP request open indefinitely — the client gets a
 # deterministic 504 instead of a spinner. Looser than the bulk per-account
@@ -732,11 +737,14 @@ async def refresh_usage(account_id: int, request: Request):
 
 @router.post("/accounts/refresh-all-usage", response_model=BulkUsageRefreshResponse)
 async def refresh_all_usage(request: Request, skip_account: Optional[int] = Query(None)):
-    """Refresh usage cache for all active accounts.
+    """Refresh usage cache for all active accounts, concurrently.
 
-    Paces requests with a 2-second delay between accounts to avoid
-    Anthropic API rate limits (429).  Sends per-account progress via
-    WebSocket so the frontend can animate individual cards.
+    Accounts are fetched in parallel (bounded by _BULK_MAX_CONCURRENCY).
+    Anthropic's usage-API rate limit is per-account/per-token, so
+    cross-account concurrency doesn't approach it — only repeated hits
+    on the SAME account do, and fetch_usage's per-account floors guard
+    that. Sends per-account progress via WebSocket so the frontend can
+    animate individual cards; `progress` counts completions.
     """
     db = _get_db(request)
     if db is None:
@@ -826,9 +834,6 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
         _bulk_refresh_task = my_task
         try:
             accounts = db.list_accounts(include_inactive=False)
-            refreshed = 0
-            failed = 0
-            results = []
             ws_registry = getattr(request.app.state, "ws_registry", None)
             total = len(accounts)
 
@@ -864,113 +869,137 @@ async def refresh_all_usage(request: Request, skip_account: Optional[int] = Quer
                     {"account_ids": [a["id"] for a in accounts], "total": total},
                 )
 
-            for i, acct in enumerate(accounts):
-                if skip_account is not None and acct["id"] == skip_account:
-                    continue
-                if i > 0:
-                    await asyncio.sleep(2.0)  # Rate-limit pacing
+            targets = [
+                acct for acct in accounts
+                if not (skip_account is not None and acct["id"] == skip_account)
+            ]
+            sem = asyncio.Semaphore(_BULK_MAX_CONCURRENCY)
+            completed = {"n": 0}  # mutable closure counter; event loop is single-threaded
 
-                # Notify frontend: this account is being checked
-                if ws_registry:
-                    await ws_registry.broadcast(
-                        "usage_refresh_progress",
-                        {"account_id": acct["id"], "status": "checking",
-                         "progress": i + 1, "total": total},
-                    )
+            async def _refresh_one(acct: dict) -> dict:
+                async with sem:
+                    # No progress/total on checking events — under concurrency
+                    # the completed-count is 0 for the whole first batch and
+                    # the frontend would flash "Refreshing 0/N". The button
+                    # label only updates on integer progress, so omitting it
+                    # leaves the click-time "Refreshing..." text in place.
+                    if ws_registry:
+                        await ws_registry.broadcast(
+                            "usage_refresh_progress",
+                            {"account_id": acct["id"], "status": "checking"},
+                        )
 
-                effective_token = None
-                if acct["id"] == active_acct_id:
-                    fresh_token = read_fresh_active_token(acct["id"])
-                    db_token = acct.get("access_token")
-                    if fresh_token and fresh_token != db_token:
-                        effective_token = fresh_token
-                try:
-                    usage_data = await asyncio.wait_for(
-                        fetch_usage(acct["id"], db, access_token=effective_token, manual=True),
-                        timeout=_BULK_PER_ACCOUNT_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Bulk refresh: account %d fetch_usage exceeded %.0fs — "
-                        "marking failed and resetting validation_status",
-                        acct["id"], _BULK_PER_ACCOUNT_TIMEOUT,
-                    )
-                    timeout_error = (
-                        f"Usage fetch timed out after {int(_BULK_PER_ACCOUNT_TIMEOUT)}s "
-                        f"during bulk refresh"
-                    )
-                    # Reset validation_status in the same call that records
-                    # the error so the row doesn't sit at 'checking' waiting
-                    # for the watchdog's next 60s tick (PM3 fix).
-                    db.update_account(
-                        acct["id"],
-                        validation_status="unknown",
-                        last_error=timeout_error,
-                        last_error_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                    usage_data = None
+                    effective_token = None
+                    if acct["id"] == active_acct_id:
+                        fresh_token = read_fresh_active_token(acct["id"])
+                        db_token = acct.get("access_token")
+                        if fresh_token and fresh_token != db_token:
+                            effective_token = fresh_token
+                    try:
+                        usage_data = await asyncio.wait_for(
+                            fetch_usage(acct["id"], db, access_token=effective_token, manual=True),
+                            timeout=_BULK_PER_ACCOUNT_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Bulk refresh: account %d fetch_usage exceeded %.0fs — "
+                            "marking failed and resetting validation_status",
+                            acct["id"], _BULK_PER_ACCOUNT_TIMEOUT,
+                        )
+                        timeout_error = (
+                            f"Usage fetch timed out after {int(_BULK_PER_ACCOUNT_TIMEOUT)}s "
+                            f"during bulk refresh"
+                        )
+                        # Reset validation_status in the same call that records
+                        # the error so the row doesn't sit at 'checking' waiting
+                        # for the watchdog's next 60s tick (PM3 fix).
+                        db.update_account(
+                            acct["id"],
+                            validation_status="unknown",
+                            last_error=timeout_error,
+                            last_error_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        usage_data = None
 
-                # Cache hits return {"_cached": True} — read stored values from DB
-                is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
-                if is_cached:
-                    usage_data = None  # Treat as skip — use DB values below
+                    # Cache hits return {"_cached": True} — read stored values from DB
+                    is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
+                    if is_cached:
+                        usage_data = None  # Treat as skip — use DB values below
 
-                is_backed_off = isinstance(usage_data, dict) and usage_data.get("_backed_off")
-                if is_backed_off:
-                    usage_data = None
+                    is_backed_off = isinstance(usage_data, dict) and usage_data.get("_backed_off")
+                    if is_backed_off:
+                        usage_data = None
 
-                if usage_data is not None:
-                    refreshed += 1
-                    five_hour = usage_data.get("five_hour", {})
-                    seven_day = usage_data.get("seven_day", {})
-                    results.append(
-                        {
+                    if usage_data is not None:
+                        five_hour = usage_data.get("five_hour", {})
+                        seven_day = usage_data.get("seven_day", {})
+                        row = {
                             "account_id": acct["id"],
                             "email": acct["email"],
                             "success": True,
                             "cached_usage_5h": five_hour.get("utilization"),
                             "cached_usage_7d": seven_day.get("utilization"),
                         }
-                    )
-                elif is_cached:
-                    # Cache hit — report existing DB values, count as success
-                    refreshed += 1
-                    results.append(
-                        {
+                    elif is_cached:
+                        # Cache hit — report existing DB values, count as success
+                        row = {
                             "account_id": acct["id"],
                             "email": acct["email"],
                             "success": True,
                             "cached_usage_5h": acct.get("cached_usage_5h"),
                             "cached_usage_7d": acct.get("cached_usage_7d"),
                         }
-                    )
-                else:
-                    failed += 1
-                    updated_acct = db.get_account(acct["id"])
-                    results.append(
-                        {
+                    else:
+                        updated_acct = db.get_account(acct["id"])
+                        row = {
                             "account_id": acct["id"],
                             "email": acct["email"],
                             "success": False,
                             "error": updated_acct.get("last_error") if updated_acct else None,
                         }
-                    )
 
-                # Notify frontend: done or failed (include account data for immediate UI update)
-                progress_status = "failed" if (not is_cached and usage_data is None) else "done"
-                if ws_registry:
-                    updated_row = db.get_account(acct["id"])
-                    acct_payload = (
-                        _account_to_response(updated_row).model_dump()
-                        if updated_row else None
+                    completed["n"] += 1
+                    # Notify frontend: done or failed (include account data for immediate UI update)
+                    progress_status = "failed" if (not is_cached and usage_data is None) else "done"
+                    if ws_registry:
+                        updated_row = db.get_account(acct["id"])
+                        acct_payload = (
+                            _account_to_response(updated_row).model_dump()
+                            if updated_row else None
+                        )
+                        await ws_registry.broadcast(
+                            "usage_refresh_progress",
+                            {"account_id": acct["id"],
+                             "status": progress_status,
+                             "progress": completed["n"], "total": total,
+                             "account_data": acct_payload},
+                        )
+                    return row
+
+            async def _refresh_one_guarded(acct: dict) -> dict:
+                # A DB/validation error for ONE account must not propagate out
+                # of the gather — that would release the bulk lock while the
+                # sibling coroutines are still in flight, breaking the
+                # one-pass-at-a-time invariant for any immediate retry.
+                try:
+                    return await _refresh_one(acct)
+                except Exception as exc:
+                    logger.exception(
+                        "Bulk refresh: unexpected error for account %d", acct["id"],
                     )
-                    await ws_registry.broadcast(
-                        "usage_refresh_progress",
-                        {"account_id": acct["id"],
-                         "status": progress_status,
-                         "progress": i + 1, "total": total,
-                         "account_data": acct_payload},
-                    )
+                    completed["n"] += 1
+                    return {
+                        "account_id": acct["id"],
+                        "email": acct["email"],
+                        "success": False,
+                        "error": f"internal error during refresh: {exc}",
+                    }
+
+            results = list(await asyncio.gather(
+                *(_refresh_one_guarded(a) for a in targets)
+            ))
+            refreshed = sum(1 for r in results if r["success"])
+            failed = sum(1 for r in results if not r["success"])
 
             # Stamp completion only on a normally finished pass — a
             # cancelled/raised pass must not arm the throttle and mask a
