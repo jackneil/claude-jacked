@@ -77,8 +77,8 @@ class TestUsageCeiling:
         import jacked.web.auth as mod
         mod._account_usage_state.clear()
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 70
-        db = _mock_db({"usage_cached_at": int(time.time()) - 70})
+        state["last_fetched_at"] = time.time() - 200
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
         client = _mock_client(200, {"five_hour": {"utilization": 10.0}, "seven_day": {"utilization": 20.0}})
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
             result = asyncio.run(fetch_usage(1, db))
@@ -90,9 +90,9 @@ class TestUsageCeiling:
         import jacked.web.auth as mod
         mod._account_usage_state.clear()
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
-        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
-        client = _mock_client(429, {}, headers={"retry-after": "120"})
+        state["last_fetched_at"] = time.time() - 200
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
+        client = _mock_client(429, {}, headers={"retry-after": "240"})
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
              patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             result = asyncio.run(fetch_usage(1, db))
@@ -104,8 +104,8 @@ class TestUsageCeiling:
         import jacked.web.auth as mod
         mod._account_usage_state.clear()
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
-        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
+        state["last_fetched_at"] = time.time() - 200
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
         client = _mock_client(429, {}, headers={"retry-after": "999999"})
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
              patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
@@ -139,8 +139,8 @@ class TestCacheFreshnessGuard:
         """last_fetched_at old -> make API call."""
         import jacked.web.auth as mod
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
-        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
+        state["last_fetched_at"] = time.time() - 200
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
         client = _mock_client(200, {
             "five_hour": {"utilization": 25.0},
             "seven_day": {"utilization": 50.0},
@@ -198,7 +198,7 @@ class TestFetchUsage429:
         """429 -> record_account_error with increment_failures=False."""
         import jacked.web.auth as mod
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
 
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={"retry-after": "5"})
@@ -216,22 +216,22 @@ class TestFetchUsage429:
         """429 -> error message includes retry-after value."""
         import jacked.web.auth as mod
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
 
         db = _mock_db({"usage_cached_at": None})
-        client = _mock_client(429, headers={"retry-after": "120"})
+        client = _mock_client(429, headers={"retry-after": "240"})
 
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
             asyncio.run(fetch_usage(1, db))
 
         error_msg = db.record_account_error.call_args[0][1]
-        assert "120" in error_msg
+        assert "240" in error_msg
 
     def test_429_returns_none(self):
         """429 -> returns None (signals failure to caller)."""
         import jacked.web.auth as mod
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
 
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={})
@@ -245,7 +245,7 @@ class TestFetchUsage429:
         """429 with no retry-after header -> defaults to ceiling-based backoff."""
         import jacked.web.auth as mod
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
 
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={})
@@ -254,7 +254,7 @@ class TestFetchUsage429:
             asyncio.run(fetch_usage(1, db))
 
         error_msg = db.record_account_error.call_args[0][1]
-        assert "65" in error_msg
+        assert "180" in error_msg
 
 
 # ---------------------------------------------------------------------------
@@ -273,9 +273,9 @@ class TestUsageBackoff:
         """After a 429, subsequent calls should be skipped."""
         import jacked.web.auth as mod
         state = mod._get_usage_state(1)
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
 
-        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
         client = _mock_client(429, {}, headers={"retry-after": "65"})
 
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
@@ -290,9 +290,9 @@ class TestUsageBackoff:
         import jacked.web.auth as mod
         state = mod._get_usage_state(1)
         state["backoff_until"] = time.time() - 10
-        state["last_fetched_at"] = time.time() - 120
+        state["last_fetched_at"] = time.time() - 200
 
-        db = _mock_db({"usage_cached_at": int(time.time()) - 120})
+        db = _mock_db({"usage_cached_at": int(time.time()) - 200})
         client = _mock_client(200, {
             "five_hour": {"utilization": 0.0},
             "seven_day": {"utilization": 0.0},
@@ -315,7 +315,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.0, critical_5h=90.0,
         )
         assert tier == "idle"
-        assert interval == 300
+        assert interval == 600
 
     def test_normal_moderate_usage(self):
         """Usage 50-70%, low burn -> NORMAL (150s)."""
@@ -326,7 +326,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.2, critical_5h=90.0,
         )
         assert tier == "normal"
-        assert interval == 150
+        assert interval == 300
 
     def test_warning_high_usage(self):
         """Usage 70-85% -> WARNING (90s)."""
@@ -337,7 +337,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.5, critical_5h=90.0,
         )
         assert tier == "warning"
-        assert interval == 90
+        assert interval == 240
 
     def test_critical_very_high_usage(self):
         """Usage > 85% -> CRITICAL (65s)."""
@@ -348,7 +348,7 @@ class TestUrgencyTier:
             burn_rate_5h=1.0, critical_5h=90.0,
         )
         assert tier == "critical"
-        assert interval == 65
+        assert interval == 180
 
     def test_burn_rate_projects_critical_soon(self):
         """Usage 60% but burn rate projects critical in 5 min -> CRITICAL."""
@@ -359,7 +359,7 @@ class TestUrgencyTier:
             burn_rate_5h=6.0, critical_5h=90.0,
         )
         assert tier == "critical"
-        assert interval == 65
+        assert interval == 180
 
     def test_burn_rate_projects_critical_in_15_min(self):
         """Usage 60% but burn rate projects critical in 15 min -> WARNING."""
@@ -370,7 +370,7 @@ class TestUrgencyTier:
             burn_rate_5h=2.0, critical_5h=90.0,
         )
         assert tier == "warning"
-        assert interval == 90
+        assert interval == 240
 
     def test_7d_escalation(self):
         """7d > 80% bumps up one tier regardless of 5h."""
@@ -381,7 +381,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.0, critical_5h=90.0,
         )
         assert tier == "normal"
-        assert interval == 150
+        assert interval == 300
 
     def test_7d_escalation_stacks_with_warning(self):
         """7d > 80% bumps WARNING to CRITICAL."""
@@ -392,7 +392,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.5, critical_5h=90.0,
         )
         assert tier == "critical"
-        assert interval == 65
+        assert interval == 180
 
     def test_none_usage_defaults_to_idle(self):
         """None usage (never fetched) -> IDLE."""
@@ -403,7 +403,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.0, critical_5h=90.0,
         )
         assert tier == "idle"
-        assert interval == 300
+        assert interval == 600
 
 
 class TestConstants:
@@ -441,7 +441,7 @@ class TestEscalatingBackoff:
             asyncio.run(fetch_usage(1, db))
         assert state["consecutive_429s"] == 1
         backoff1 = state["backoff_until"] - time.time()
-        assert 60 <= backoff1 <= 70  # ~65s
+        assert 170 <= backoff1 <= 190  # ~180s
 
         # Second 429
         state["last_fetched_at"] = time.time() - 200
@@ -451,7 +451,7 @@ class TestEscalatingBackoff:
             asyncio.run(fetch_usage(1, db))
         assert state["consecutive_429s"] == 2
         backoff2 = state["backoff_until"] - time.time()
-        assert 125 <= backoff2 <= 135  # ~130s
+        assert 350 <= backoff2 <= 370  # ~360s
 
     def test_success_resets_consecutive_count(self):
         """Successful fetch should reset consecutive_429s to 0."""
