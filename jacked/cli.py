@@ -798,19 +798,41 @@ def _spawn_service_detached(host: str, port: int):
     except Exception:
         log_fh = _subprocess.DEVNULL
 
-    cmd = [jacked_bin, "service", "start", "--host", host, "--port", str(port)]
+    svc_args = ["service", "start", "--host", host, "--port", str(port)]
     if sys.platform == "win32":
-        _subprocess.Popen(
-            cmd,
+        # ROOT CAUSE of "close the window and the tray dies": the uv `jacked.exe`
+        # console-trampoline spawns python WITH a new console window even when we
+        # launch it DETACHED_PROCESS. That visible console is the "command window"
+        # users were closing — and closing it sends CTRL_CLOSE, killing the tray.
+        #
+        # Fix: launch the GUI-subsystem `pythonw.exe -m jacked` instead. pythonw
+        # never gets a console, so the service is truly windowless and outlives
+        # the launching terminal. Fall back to jacked.exe if pythonw isn't found.
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        if pythonw.exists():
+            cmd = [str(pythonw), "-m", "jacked", *svc_args]
+        else:
+            cmd = [jacked_bin, *svc_args]
+        # DETACHED (no console) + breakaway (escape any kill-on-close job the
+        # terminal may have placed us in), with a fallback if breakaway is
+        # disallowed by the job.
+        _detached = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+        _breakaway = getattr(_subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        _win_kwargs = dict(
             stdin=_subprocess.DEVNULL,
             stdout=log_fh,
             stderr=log_fh,
-            creationflags=getattr(_subprocess, "DETACHED_PROCESS", 0x00000008),
             close_fds=True,
         )
+        try:
+            _subprocess.Popen(
+                cmd, creationflags=_detached | _breakaway, **_win_kwargs
+            )
+        except OSError:
+            _subprocess.Popen(cmd, creationflags=_detached, **_win_kwargs)
     else:
         _subprocess.Popen(
-            cmd,
+            [jacked_bin, *svc_args],
             stdin=_subprocess.DEVNULL,
             stdout=log_fh,
             stderr=log_fh,
@@ -1183,16 +1205,30 @@ def _spawn_windows_upgrade_helper(
             pass
         raise
 
-    # Spawn the batch file detached. DETACHED_PROCESS so it survives our exit.
+    # Spawn the batch file detached. DETACHED_PROCESS survives our exit;
+    # CREATE_BREAKAWAY_FROM_JOB lets it survive the launching terminal closing
+    # (modern terminals kill their job object on close). Fall back if the job
+    # forbids breakaway.
     DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-    subprocess.Popen(
-        ["cmd.exe", "/c", batch_path],
+    BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    _helper_kwargs = dict(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=DETACHED_PROCESS,
         close_fds=True,
     )
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", batch_path],
+            creationflags=DETACHED_PROCESS | BREAKAWAY,
+            **_helper_kwargs,
+        )
+    except OSError:
+        subprocess.Popen(
+            ["cmd.exe", "/c", batch_path],
+            creationflags=DETACHED_PROCESS,
+            **_helper_kwargs,
+        )
 
     console.print(
         "[yellow]Windows upgrade:[/yellow] spawned detached helper. "

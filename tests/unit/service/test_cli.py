@@ -140,11 +140,16 @@ class TestServiceRestart:
         mock_stop.assert_called_once()
         assert mock_popen.call_count == 1
         args = mock_popen.call_args[0][0]
-        assert "/fake/jacked" in args
         assert "service" in args and "start" in args
         kwargs = mock_popen.call_args[1]
         import sys as _sys
-        if _sys.platform != "win32":
+        if _sys.platform == "win32":
+            # Windows launches `pythonw.exe -m jacked` to dodge the uv
+            # console-trampoline window; jacked.exe is only the fallback.
+            assert str(args[0]).lower().endswith("pythonw.exe")
+            assert "-m" in args and "jacked" in args
+        else:
+            assert "/fake/jacked" in args
             assert kwargs.get("start_new_session") is True
 
     @patch("jacked.service.platform.ensure_native_lifecycle",
