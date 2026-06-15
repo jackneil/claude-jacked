@@ -28,7 +28,7 @@ Check `$ARGUMENTS` for a target:
 work for repo cloners without jacked installed.
 
 Available targets:
-  whats-next  — Pre-configure lifecycle, planning doc paths, tier weights
+  whats-next  — Pre-configure lifecycle, planning doc paths, strategic emphasis
   qa          — Pre-configure browser tool, framework checks, component paths (also generates /ux)
   ux          — Pre-configure parallel UX checks (also generates /qa)
   dcr         — Pre-configure lens selection, context paths, domain-specific checks
@@ -331,8 +331,8 @@ Validate paths before reading (skip missing ones silently):
 ## TODO Scan Extensions
 Include: <file extensions for detected languages>
 
-## Tier Weights
-Emphasize: <tier guidance based on lifecycle>
+## Strategic Emphasis
+Lifecycle lean: <where to weight the Step 6 decision based on lifecycle — e.g. Greenfield/Alpha: capability gaps in the core loop; Beta/Growth: cross-cutting experience levers; Maintenance: operational/debt levers. A hint for the single decision, not a ranking scheme.>
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
@@ -343,7 +343,7 @@ Emphasize: <tier guidance based on lifecycle>
 ```markdown
 ---
 name: whats-next
-description: "Roadmap advisor — analyzes plans, issues, commits, and lifecycle to recommend highest-yield next work items. (repo)"
+description: "Roadmap advisor — weighs a coverage-matrix read plus plans, issues, commits, and lifecycle to decide the single highest-leverage initiative and forge a ready-to-run /goal brief. (repo)"
 ---
 Read `.claude/commands/whats-next.md` and follow it.
 ```

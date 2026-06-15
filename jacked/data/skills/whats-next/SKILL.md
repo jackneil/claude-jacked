@@ -1,6 +1,6 @@
 ---
 name: whats-next
-description: Use when the user asks "what should I work on", "what's next", "what are our priorities", "help me prioritize", "what should we build next", "I'm not sure what to do next", or "where should I start". Analyzes plans, issues, commits, and lifecycle stage to recommend highest-yield next work items.
+description: Use when the user asks "what should I work on", "what's next", "what are our priorities", "help me prioritize", "what should we build next", "I'm not sure what to do next", or "where should I start". Weighs a coverage-matrix read plus plans, issues, commits, and lifecycle to decide the single highest-leverage initiative and forge a ready-to-run /goal brief.
 ---
 
 First, check if a repo-scoped version exists in the current project:
