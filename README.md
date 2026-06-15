@@ -572,7 +572,7 @@ Type these directly in Claude Code:
 | `/swarm-research` | **Divergent Research** — Spawns 2-5 independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate |
 | `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
 | `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
-| `/whats-next` | **Roadmap Advisor** — Analyzes plans, issues, commits, and lifecycle stage to recommend highest-yield next work |
+| `/whats-next` | **Roadmap Advisor** — Analyzes plans, issues, commits, and lifecycle stage to recommend highest-yield next work, then forges your pick into a ready-to-run `/goal` brief (≤4000 chars) for autonomous, tested delivery |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
 | `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
 | `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
