@@ -164,11 +164,16 @@ def test_step_8_big_but_convergent(engine: str) -> None:
 
 
 def test_step_8_char_limit(engine: str) -> None:
-    """Target stays safely under /goal's hard 4000-char condition cap."""
+    """Brief size is MEASURED (wc -c) under /goal's hard 4000-char cap, not
+    eyeballed — a soft target was overshooting to 4100-4400 chars."""
     s = _section(engine, "## Step 8")
     assert "3600" in s
-    assert "under 3600" in s.lower()
-    assert "4,000" in s or "4000" in s   # references the real hard cap
+    assert "4,000" in s or "4000" in s          # references the real hard cap
+    assert "wc -c" in s                          # mechanical measurement
+    assert "Measure it: `wc -c" in s             # the actual measure step, pinned
+    assert "HARD SIZE GATE" in s
+    assert "Never present a brief you have not just measured" in s
+    assert "Next phases:" in s                   # counted toward the limit, never dropped
 
 
 def test_step_8_completion_condition(engine: str) -> None:
