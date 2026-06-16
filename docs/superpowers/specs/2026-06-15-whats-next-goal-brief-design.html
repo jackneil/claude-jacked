@@ -103,7 +103,7 @@
 a <strong>coverage-matrix read</strong> of how far the product is from best-in-class (10/10 across who-uses-it ×
 what-contexts, on both capability and lived experience), plus plans, issues, TODOs, commits, and lifecycle — and
 then uses its own judgment to <strong>commit to ONE ambitious, high-leverage initiative</strong> rather than handing
-back a menu. It forges that initiative into a ready-to-paste, ≤4000-char <code>/goal</code> brief engineered for
+back a menu. It forges that initiative into a ready-to-paste, ≤3600-char <code>/goal</code> brief engineered for
 autonomous, tested, iterated delivery.</p>
 
 <aside class="callout info">
@@ -123,6 +123,7 @@ autonomous, tested, iterated delivery.</p>
   <strong>decisive, coverage-matrix-led single recommendation</strong>: weigh everything, commit to one ambitious
   multi-part initiative, and forge its brief directly. The v1 brief hardening is preserved and extended (milestones,
   convergence sizing).</li>
+  <li><strong>v2.1 (0.49.0)</strong> — brief char target lowered to <strong>≤3600</strong> (buffer under <code>/goal</code>’s hard 4,000 cap), a <strong>file-backed pointer-goal</strong> fallback for briefs too big to fit inline (self-bootstrapping so the tool-less evaluator can judge it; gitignored and never committed; mutually exclusive with the inline brief), and an optional <strong>turn/time backstop</strong> for unattended runs (a non-success halt, not a DONE branch).</li>
 </ul>
 
 <h2 id="background">Background — how <code>/goal</code> works</h2>
@@ -132,7 +133,7 @@ The text becomes a standing completion condition: at the end of every turn a too
 transcript, and only lets Claude stop when it judges the condition met. Consequences that shape every brief: the DONE
 condition must rest on signals visible in the transcript (a named test command that exited clean; a real-run command +
 output); evidence over claims; and the work must be <em>sized to converge</em> in one run. Hook I/O caps at 10k chars;
-the brief targets ≤4000. Claude can't self-invoke <code>/goal</code>, so the deliverable is a copy-paste block.</p>
+the condition has a hard <strong>4,000-char cap</strong>, so the brief targets ≤3600 for buffer and falls back to a <strong>file-backed pointer-goal</strong> (a short condition that tells Claude to read+execute a brief file) when even one phase won't fit. The evaluator can't read files, so the pointer-goal is self-bootstrapping: Claude pastes the milestone+Verify list into the transcript first. Claude can't self-invoke <code>/goal</code>, so the deliverable is a copy-paste block.</p>
 
 <h2 id="architecture">Architecture &amp; flow</h2>
 <p>All logic lives in one source-of-truth file, <code>jacked/data/commands/whats-next.md</code>, embedded verbatim
@@ -165,7 +166,7 @@ flowchart TD
 <p>Step 8 fills this from the decided initiative (its bundled deliverables, the cross-cutting lever, the personas/contexts
 it lifts, cited evidence) plus the repo's project type and real test command. Bracketed <code>[…]</code>-tagged lines are
 conditional (kept-and-untagged or dropped whole; never emit literal brackets). For XL initiatives, the brief is forged for
-the first shippable phase with a <code>Next phases:</code> tail. Skeleton ≈ 2,300 chars (≈1,700 headroom under 4000).</p>
+the first shippable phase with a <code>Next phases:</code> tail. Skeleton ≈ 2,300 chars (≈1,300 headroom under the 3,600 target). For an unattended run the DONE line can carry a turn/time backstop (“stop after &lt;N&gt; turns”) framed as a non-success halt, not a DONE branch.</p>
 
 <pre><code>Deliver: &lt;the initiative — one line, the shippable best-in-class outcome it drives toward&gt;.
 

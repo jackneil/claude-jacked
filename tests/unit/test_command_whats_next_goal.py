@@ -164,9 +164,11 @@ def test_step_8_big_but_convergent(engine: str) -> None:
 
 
 def test_step_8_char_limit(engine: str) -> None:
+    """Target stays safely under /goal's hard 4000-char condition cap."""
     s = _section(engine, "## Step 8")
-    assert "4000" in s
-    assert "under 4000" in s.lower() or "4000 char" in s.lower()
+    assert "3600" in s
+    assert "under 3600" in s.lower()
+    assert "4,000" in s or "4000" in s   # references the real hard cap
 
 
 def test_step_8_completion_condition(engine: str) -> None:
@@ -282,3 +284,44 @@ def test_setup_uses_strategic_emphasis_not_stale_tiers(engine: str) -> None:
     template = setup[start:after if after != -1 else None]
     assert "## Strategic Emphasis" in template
     assert "Emphasize: <tier guidance based on lifecycle>" not in template
+
+
+def test_step_8_file_backed_goal(engine: str) -> None:
+    """Oversized briefs are written to a file with a short, self-bootstrapping
+    pointer-goal — and the doc notes the evaluator can't read files itself, so
+    the criteria must be pasted into the transcript."""
+    s = _section(engine, "## Step 8")
+    assert ".claude/goals/" in s
+    assert "paste its milestone list" in s          # self-bootstrapping into the transcript
+    low = s.lower()
+    assert "can't read files" in low or "cannot read files" in low
+
+
+def test_step_8_file_backed_not_committed(engine: str) -> None:
+    """The throwaway goal file must not be swept into the autonomous commit."""
+    s = _section(engine, "## Step 8")
+    assert ".gitignore" in s
+    assert "do NOT stage or commit the goal file" in s
+
+
+def test_step_8_file_backed_still_convergent(engine: str) -> None:
+    """File-backing relaxes the char limit, not the convergence requirement."""
+    s = _section(engine, "## Step 8")
+    assert "file-backing relaxes the char limit, not the spins-forever rule" in s
+
+
+def test_step_8_turn_cap(engine: str) -> None:
+    """For unattended runs, the brief can include a turn/time backstop — framed
+    as a non-success halt, NOT a DONE branch that abandons milestones."""
+    s = _section(engine, "## Step 8")
+    assert "blocked after <N> turns" in s
+    assert "halt, not completion" in s
+
+
+def test_step_8_inline_and_filebacked_are_exclusive(engine: str) -> None:
+    """Inline brief and file-backed pointer-goal are either/or — a file-backed
+    run must NOT also emit the inline template (else the recipe's 'block above'
+    points at the oversized inline brief)."""
+    s = _section(engine, "## Step 8")
+    assert "emit ONLY this pointer-goal block and skip the inline template" in s
+    assert "skip this entirely if you file-backed above" in s
