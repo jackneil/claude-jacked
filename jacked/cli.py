@@ -581,12 +581,17 @@ def recover(cwd, exclude, session_id, as_digest, limit, budget, as_json):
     exclude_id = exclude or os.getenv("CLAUDE_CODE_SESSION_ID") or os.getenv("CLAUDE_SESSION_ID")
     candidates = rec.list_candidates(project_dir, exclude_session_id=exclude_id)
     now = datetime.now(timezone.utc)
+    idx = rec.recommend_index(candidates) if candidates else 0
+    chosen = candidates[idx] if candidates else None
     top = candidates[:limit]
+    # ensure the recommended candidate is present in the returned list
+    if chosen is not None and chosen not in top:
+        top = [chosen] + top[: max(0, limit - 1)]
 
     if as_json:
         payload = {
             "project_dir": str(project_dir),
-            "chosen": top[0].to_dict(now) if top else None,
+            "chosen": chosen.to_dict(now) if chosen else None,
             "candidates": [c.to_dict(now) for c in top],
             "count": len(candidates),
         }

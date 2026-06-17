@@ -206,6 +206,18 @@ def list_candidates(project_dir, exclude_session_id: Optional[str] = None) -> li
     return out
 
 
+MIN_SUBSTANCE_MSGS = 4
+
+
+def recommend_index(candidates, min_msgs: int = MIN_SUBSTANCE_MSGS) -> int:
+    """Index of the recommended candidate: the newest with real substance.
+    Candidates are newest-first; skip a near-empty newest, else fall back to 0."""
+    for i, c in enumerate(candidates):
+        if c.msg_count >= min_msgs:
+            return i
+    return 0
+
+
 @dataclass
 class Digest:
     session_id: str

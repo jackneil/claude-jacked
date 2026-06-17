@@ -235,3 +235,31 @@ def test_cli_recover_no_sessions_json(tmp_path, monkeypatch):
     result = runner.invoke(main, ["recover", "--cwd", "/work/nope", "--json"])
     payload = _json.loads(result.output.strip())
     assert payload == {"project_dir": None, "chosen": None, "candidates": [], "count": 0}
+
+
+def _cand(session_id, msg_count, last_ts):
+    return rec.SessionCandidate(
+        session_id=session_id, path=Path(f"/x/{session_id}.jsonl"),
+        last_ts=datetime.fromisoformat(last_ts), msg_count=msg_count)
+
+
+def test_recommend_skips_near_empty_newest():
+    cands = [
+        _cand("new-empty", 1, "2026-06-17T12:00:00+00:00"),   # newest but tiny
+        _cand("substantive", 40, "2026-06-16T09:00:00+00:00"),
+    ]
+    assert rec.recommend_index(cands) == 1
+
+
+def test_recommend_takes_newest_when_substantive():
+    cands = [
+        _cand("new-big", 12, "2026-06-17T12:00:00+00:00"),
+        _cand("old", 40, "2026-06-16T09:00:00+00:00"),
+    ]
+    assert rec.recommend_index(cands) == 0
+
+
+def test_recommend_falls_back_when_all_tiny():
+    cands = [_cand("a", 1, "2026-06-17T12:00:00+00:00"),
+             _cand("b", 2, "2026-06-16T09:00:00+00:00")]
+    assert rec.recommend_index(cands) == 0
