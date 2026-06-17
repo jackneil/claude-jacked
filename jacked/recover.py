@@ -368,6 +368,6 @@ def render_digest(digest: Digest, budget_chars: int = DEFAULT_BUDGET_CHARS) -> s
     footer = [f"\nResume natively (preserves Claude's internal state): {digest.resume_cmd}"]
     if dropped:
         named = ", ".join(d for d in dropped if d) or "low-priority content"
-        footer.append(f"[budget note] Output trimmed to ~{budget_chars} chars; clipped/omitted: {named}. Run the resume command for the full thread.")
+        footer.append(f"[budget note] Section bodies trimmed to ~{budget_chars} chars; clipped/omitted: {named}. Run the resume command for the full thread.")
     out.append("\n".join(footer))
     return "\n\n".join(out)
