@@ -51,3 +51,46 @@ def test_write_last_install_roundtrip(tmp_path):
     p = tmp_path / "last.json"
     s.write_last_install(rec, p)
     assert json.loads(p.read_text(encoding="utf-8"))["to_version"] == "0.51.0"
+
+
+# --- CLI integration: install wires the manifest + summary (Task A3) ---
+from click.testing import CliRunner
+from jacked.cli import main
+
+
+def test_cli_install_writes_manifest_and_summary(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("JACKED_HOME", str(fake_home))
+    runner = CliRunner()
+    # First install: everything new, manifest + last-install written.
+    r1 = runner.invoke(main, ["install", "--no-security", "--no-rules"])
+    assert r1.exit_code == 0, r1.output
+    assert (fake_home / ".claude" / "jacked-manifest.json").exists()
+    last = fake_home / ".claude" / "jacked-last-install.json"
+    assert last.exists()
+    import json
+    rec = json.loads(last.read_text(encoding="utf-8"))
+    assert rec["from_version"] is None
+    assert "recover" in rec["changes"]["skills"]["added"]
+    assert "installed" in r1.output.lower()
+    # Old banner must be gone.
+    assert "What you get" not in r1.output
+
+    # Second install (no version change): up to date, no spurious changes.
+    r2 = runner.invoke(main, ["install", "--no-security", "--no-rules"])
+    assert r2.exit_code == 0, r2.output
+    assert "up to date" in r2.output.lower()
+
+
+def test_cli_install_json_emits_record(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("JACKED_HOME", str(fake_home))
+    runner = CliRunner()
+    r = runner.invoke(main, ["install", "--no-security", "--no-rules", "--json"])
+    assert r.exit_code == 0, r.output
+    import json
+    payload = json.loads(r.output.strip().splitlines()[-1])
+    assert payload["to_version"]
+    assert "skills" in payload["changes"]
