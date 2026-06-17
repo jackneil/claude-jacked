@@ -556,6 +556,15 @@ export JACKED_USER_NAME="sarah"
 /jacked how did Sam implement the payment system
 ```
 
+### `/recover` — rebuild a crashed session
+
+Opened Claude in a folder whose last session crashed mid-work and you don't know the
+session ID? Run `/recover`. It finds the most-recently-active prior session for the
+current folder from its on-disk transcript, shows you the pick to confirm, then injects
+a budgeted working-state digest (last instruction, todos, recent actions, files touched)
+so you continue right where it died — and prints `claude --resume <id>` for a full native
+continuation. Works on a bare install; no Qdrant/search extra required.
+
 ---
 
 ## Built-in Reviewers and Commands
