@@ -77,7 +77,15 @@ function renderInstallSummaryPanel(summary) {
 
     const panel = document.createElement('div');
     panel.id = 'install-summary-panel';
-    panel.className = 'stat-card mb-4 relative';
+    // Fixed banner over the content area. <body> is display:flex with a fixed
+    // w-56 sidebar; #content offsets itself by md:ml-56. We mirror that offset
+    // (left-0 mobile / md:left-56) and pin top/right so the panel floats above
+    // the content without becoming an in-flow flex column. z-50 keeps it over
+    // content but below the upgrade modal (z-9999). Cap height + scroll so a
+    // long change list never runs off-screen.
+    panel.className =
+        'stat-card fixed top-2 md:top-4 right-2 md:right-4 left-2 md:left-56 z-50 '
+        + 'max-w-none md:max-w-md md:ml-4 max-h-[80vh] overflow-y-auto shadow-xl';
     panel.style.borderColor = '#3b82f6';
 
     // Header: title + dismiss button.
@@ -126,14 +134,13 @@ function renderInstallSummaryPanel(summary) {
     foot.textContent = `${unchanged} unchanged`;
     panel.appendChild(foot);
 
-    // Mount above #content so it survives route re-renders (which overwrite
-    // #content.innerHTML). Insert as a sibling before #content in <main>.
-    const content = document.getElementById('content');
-    if (content && content.parentNode) {
-        content.parentNode.insertBefore(panel, content);
-    } else {
-        document.body.appendChild(panel);
-    }
+    // Mount on <body>, OUTSIDE #content, so the router's #content.innerHTML
+    // overwrite on every route change can't wipe it. #content IS the <main>
+    // flex child; inserting as its sibling would make the panel a second
+    // in-flow column under the fixed sidebar (hidden/broken), so we attach to
+    // <body> and rely on the panel's own `position: fixed` (see className) to
+    // float it over the content area, offset for the sidebar.
+    document.body.appendChild(panel);
 }
 
 async function loadInstallSummary() {
