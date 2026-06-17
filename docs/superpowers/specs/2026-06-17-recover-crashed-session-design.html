@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Design — /recover: rebuild a crashed Claude Code session from disk</title>
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="approved-by-user">
+<meta name="jacked:branch" content="master">
+<meta name="jacked:date" content="2026-06-17">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --danger:#b32424; --danger-bg:#fbe9e7; --ok:#1f7a3f; --ok-bg:#e8f4ec; --border:#d8d4cc; --code-bg:#f3efe8; --radius:6px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --danger:#ea7670; --danger-bg:#3a1f1c; --ok:#6acd8e; --ok-bg:#1c3327; --border:#2e2e2e; --code-bg:#232323; } }
+  *{box-sizing:border-box}
+  body{font-family:var(--sans);font-size:16px;line-height:1.6;color:var(--fg);background:var(--bg);margin:0;padding:2rem 1rem}
+  .wrap{max-width:880px;margin:0 auto}
+  h1{font-size:2rem;margin:0 0 .25rem}
+  h2{font-size:1.4rem;margin:2.5rem 0 .75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}
+  h3{font-size:1.1rem;margin:1.5rem 0 .5rem;color:var(--fg-muted)}
+  code{font-family:var(--mono);font-size:.92em;background:var(--code-bg);padding:.12em .35em;border-radius:3px}
+  pre{font-family:var(--mono);font-size:.85rem;background:var(--code-bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;overflow-x:auto;line-height:1.45}
+  pre code{background:transparent;padding:0}
+  table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--bg-card);border-radius:var(--radius);overflow:hidden}
+  th,td{text-align:left;padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+  th{background:var(--code-bg);font-weight:600;font-size:.9rem}
+  tr:last-child td{border-bottom:none}
+  aside.callout{margin:1rem 0;padding:.9rem 1.1rem;border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}
+  aside.callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  aside.callout.danger{border-color:var(--danger);background:var(--danger-bg)}
+  aside.callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  aside.callout > :first-child{margin-top:0}
+  aside.callout > :last-child{margin-bottom:0}
+  .meta{display:flex;flex-wrap:wrap;gap:.5rem 1rem;margin:.5rem 0 2rem;padding:.75rem 1rem;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
+  .meta .kv{display:flex;gap:.35rem}
+  .meta .k{color:var(--fg-muted)}
+  .meta .v{font-family:var(--mono)}
+  .badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.8rem;font-weight:500}
+  .badge.ok{background:var(--ok-bg);color:var(--ok)}
+  .badge.warn{background:var(--warn-bg);color:var(--warn)}
+  .badge.danger{background:var(--danger-bg);color:var(--danger)}
+  .badge.info{background:var(--accent-bg);color:var(--accent)}
+  nav.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.25rem;margin-bottom:2rem}
+  nav.toc h2{margin:0 0 .5rem;font-size:.9rem;text-transform:uppercase;letter-spacing:.05em;color:var(--fg-muted);border:none;padding:0}
+  nav.toc ol{margin:0;padding-left:1.5rem}
+  nav.toc li{margin:.15rem 0}
+  .diagram{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;margin:1rem 0;text-align:center;overflow-x:auto}
+  .diagram pre.mermaid-source{text-align:left;display:none}
+  .diagram.failed pre.mermaid-source{display:block}
+  .diagram.failed svg{display:none}
+  blockquote{border-left:3px solid var(--border);padding:.2rem 1rem;margin:1rem 0;color:var(--fg-muted);font-style:italic}
+  @media print{body{background:white;color:black;padding:0}.wrap{max-width:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Design — <code>/recover</code>: rebuild a crashed Claude Code session from disk</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">approved-by-user</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-06-17</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">master</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#why">Why this exists (and why not the built-ins)</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#resolve">Session resolution &amp; live-session exclusion</a></li>
+    <li><a href="#digest">The digest: what gets recovered</a></li>
+    <li><a href="#cli">CLI surface</a></li>
+    <li><a href="#skill">The <code>/recover</code> skill flow</a></li>
+    <li><a href="#files">File changes</a></li>
+    <li><a href="#testing">Testing</a></li>
+    <li><a href="#yagni">Scope boundaries (YAGNI)</a></li>
+    <li><a href="#failure">Failure modes</a></li>
+    <li><a href="#open-questions">Open questions</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>
+Add a manually-invoked <code>/recover</code> skill that, when the user opens Claude in a repo whose previous session crashed (computer died, terminal closed, Claude broke mid-task) and the session ID is unknown, finds the most-recently-active prior session <em>for that folder</em>, reconstructs its working state from the raw on-disk transcript, and injects a budgeted digest into the current session so work continues right where it left off. It also surfaces the native <code>claude --resume &lt;id&gt;</code> command for a true thread continuation.
+</p>
+
+<aside class="callout">
+  <strong>The trigger scenario:</strong> "I was deep in a task, it crashed, I reopened Claude in this folder, and I don't know the session ID or have a checkpoint. Get me back to where I was." This is <em>crash recovery without a save</em> — the defining precondition that separates <code>/recover</code> from every neighboring skill.
+</aside>
+
+<h2 id="why">Why this exists (and why not the built-ins)</h2>
+<p>
+Claude Code already ships <code>claude --continue</code>/<code>-c</code> (resume the most recent session in the cwd) and <code>claude --resume</code> (interactive picker). Those are excellent — but they have two gaps <code>/recover</code> fills:
+</p>
+<ul>
+  <li><strong>They require a fresh terminal.</strong> A skill runs <em>inside</em> an already-started session with no usable interactive TTY. It cannot meaningfully shell out to an interactive <code>claude --resume</code> (the picker needs a TTY) and spawning a nested <code>claude</code> is nonsense — the child's restored thread can't be piped back into the parent's context. So <code>/recover</code> reads the transcript itself and injects a digest into the <em>current</em> session, and merely <em>prints</em> <code>claude --resume &lt;id&gt;</code> as a suggestion the user runs from a real terminal.</li>
+  <li><strong>They replay the full thread.</strong> <code>/recover</code> produces a budgeted, noise-stripped digest (what was the goal, what was the plan, what was in flight) — useful when you want orientation fast, or the full transcript is too large, or you just want to keep going in the session you already have open.</li>
+</ul>
+
+<p>
+The neighboring jacked skills stay in their lanes. The dividing line is the source of truth and the precondition:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Skill</th><th>Precondition</th><th>Source of truth</th><th>Mechanism</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>retry</code></td><td>Transient API/rate-limit blip, mid-turn</td><td>Live context window (session still alive)</td><td>Prompt only — no file I/O</td></tr>
+    <tr><td><code>redo</code></td><td>Approach went sideways, want a clean restart</td><td>git + intent</td><td>Stash + rebranch (throws work away)</td></tr>
+    <tr><td><code>checkpoint</code></td><td>A <code>/checkpoint</code> was deliberately run earlier</td><td>Self-authored <code>.claude/checkpoints/*.html</code></td><td>Reload the saved artifact</td></tr>
+    <tr><td><code>jacked</code></td><td>Want a <em>specific past</em> session by topic, any machine</td><td>Qdrant semantic index over all sessions</td><td>Search → retrieve → inject</td></tr>
+    <tr><td><strong><code>recover</code> (new)</strong></td><td><strong>Session crashed before any save; ID unknown</strong></td><td><strong>Raw <code>~/.claude/projects/&lt;slug&gt;/*.jsonl</code> for THIS cwd</strong></td><td><strong>Newest prior transcript → reconstruct → inject</strong></td></tr>
+  </tbody>
+</table>
+
+<aside class="callout danger">
+  <strong>Hard constraint — no Qdrant dependency.</strong> Recovery must work on a bare install. The user just had a crash; making recovery depend on the optional <code>[search]</code> extra and a configured Qdrant Cloud index is exactly backwards. <code>/recover</code> reuses only the Qdrant-free modules (<code>transcript.py</code>, <code>config.py</code>) and must <strong>never</strong> import <code>retriever.py</code> / <code>searcher.py</code>. Its CLI command must <strong>not</strong> be gated by <code>_require_search</code>.
+</aside>
+
+<h2 id="architecture">Architecture</h2>
+<p>
+Three components with clean boundaries. The hard parts (JSONL parsing, repo-path mapping, noise-stripping, summary extraction) already exist in <code>transcript.py</code> and <code>config.py</code> — both verified Qdrant-free (stdlib imports only). The new logic is a thin, unit-testable layer plus a Click subcommand plus a Markdown skill.
+</p>
+
+<ul>
+  <li><strong><code>jacked/recover.py</code></strong> — pure logic. Resolves the project dir for the cwd, ranks candidate sessions (excluding the live one), and builds a budgeted digest. Imports <code>transcript.py</code> + <code>config.py</code> only.</li>
+  <li><strong><code>jacked recover</code></strong> — a Click subcommand in <code>cli.py</code> (matches the existing Click pattern; <strong>not</strong> <code>_require_search</code>-gated). Two phases so we confirm before injecting: <code>--json</code> (rank candidates, cheap metadata) and <code>--session &lt;id&gt; --digest</code> (the actual working-state digest).</li>
+  <li><strong><code>jacked/data/skills/recover/SKILL.md</code></strong> — thin orchestrator. Runs the CLI, presents the auto-pick, confirms, injects the digest, and re-anchors. Installs to <code>~/.claude/skills/recover/SKILL.md</code> automatically via the existing <code>jacked install</code> glob.</li>
+</ul>
+
+<div class="diagram">
+  <pre class="mermaid">
+flowchart TD
+    A[User runs /recover] --&gt; B["jacked recover --json --exclude $CLAUDE_CODE_SESSION_ID"]
+    B --&gt; C[recover.py: resolve project dir for cwd]
+    C --&gt; D[Rank candidates by last timestamped line; exclude live session]
+    D --&gt; E{Any candidates?}
+    E --&gt;|no| F[Tell user: no prior session for this folder — stop]
+    E --&gt;|yes| G[Skill shows auto-pick: title · last prompt · when · branch + alternates]
+    G --&gt; H{User confirms pick?}
+    H --&gt;|wrong one| I[User names an alternate]
+    I --&gt; J
+    H --&gt;|yes| J["jacked recover --session ID --digest"]
+    J --&gt; K[recover.py build_digest: budgeted, noise-stripped, TodoWrite, incomplete-turn flag]
+    K --&gt; L[Digest printed into current context = injection + print 'claude --resume ID']
+    L --&gt; M[Re-anchor: you were doing X, next step was Y — ready to continue]
+  </pre>
+  <pre class="mermaid-source">
+flowchart TD
+    A[User runs /recover] --> B["jacked recover --json --exclude $CLAUDE_CODE_SESSION_ID"]
+    B --> C[recover.py: resolve project dir for cwd]
+    C --> D[Rank candidates by last timestamped line; exclude live session]
+    D --> E{Any candidates?}
+    E -->|no| F[Tell user: no prior session for this folder — stop]
+    E -->|yes| G[Skill shows auto-pick: title, last prompt, when, branch + alternates]
+    G --> H{User confirms pick?}
+    H -->|wrong one| I[User names an alternate]
+    I --> J
+    H -->|yes| J["jacked recover --session ID --digest"]
+    J --> K[recover.py build_digest: budgeted, noise-stripped, TodoWrite, incomplete-turn flag]
+    K --> L[Digest printed into current context = injection + print 'claude --resume ID']
+    L --> M[Re-anchor: you were doing X, next step was Y — ready to continue]
+  </pre>
+</div>
+
+<h3><code>recover.py</code> public functions</h3>
+<table>
+  <thead><tr><th>Function</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>resolve_project_dir(cwd, projects_root=None) -&gt; Path | None</code></td><td>Map this folder → its <code>~/.claude/projects/&lt;slug&gt;</code> dir. Try <code>config.get_session_dir_for_repo()</code>; <strong>verify by reading the <code>cwd</code> field</strong> inside the dir's newest <code>.jsonl</code>; if mismatch or missing, fall back to enumerating <code>projects_root/*</code> and matching each folder's first <code>cwd</code> field against the real cwd. Defeats the dot-slug bug (<code>jack.neil</code> → <code>jack-neil</code>) and stale dot-preserving folders.</td></tr>
+    <tr><td><code>list_candidates(project_dir, exclude_session_id, now) -&gt; list[SessionCandidate]</code></td><td>List flat <code>*.jsonl</code> (main sessions; subagent transcripts live in <code>&lt;uuid&gt;/subagents/</code> and are skipped). Exclude <code>exclude_session_id</code>. Rank by <strong>last <em>timestamped</em> line</strong> (the literal last lines are untimestamped metadata). Tolerate a half-written final line. Each candidate carries <code>session_id, path, ai_title, last_prompt, last_ts, git_branch, msg_count, truncated</code>.</td></tr>
+    <tr><td><code>build_digest(session_path, budget=DEFAULT) -&gt; Digest</code></td><td>Reuse <code>parse_jsonl_file_enriched()</code> + the noise-strippers. Extract the working state (see Digest section). Respect <code>budget</code>; when truncating, emit a visible note pointing to <code>claude --resume &lt;id&gt;</code> — never a silent drop.</td></tr>
+    <tr><td><code>resume_command(session_id) -&gt; str</code></td><td>Return <code>claude --resume &lt;session_id&gt;</code>. Trivial; reimplemented here rather than importing the Qdrant-bound <code>retriever.get_resume_command</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="resolve">Session resolution &amp; live-session exclusion</h2>
+<p>
+Two subtleties, both verified empirically against real files on this machine, drive correctness here.
+</p>
+
+<h3>The path slug eats dots</h3>
+<p>
+A cwd maps to a projects folder by replacing both <code>/</code> <em>and</em> <code>.</code> with <code>-</code>. <code>/Users/jack.neil/Github/claude-jacked</code> → <code>-Users-jack-neil-Github-claude-jacked</code>. A naïve <code>/</code>-only slug misses it, and a stale dot-<em>preserving</em> folder from an older build also exists. <strong>Resolution therefore never trusts the slug alone</strong> — it verifies (or discovers) the folder by reading the <code>cwd</code> field stored inside the transcripts.
+</p>
+
+<h3>Excluding the currently-running session</h3>
+<aside class="callout warn">
+  The live session's own <code>.jsonl</code> is being written right now and is the newest by every clock — so it would be wrongly picked unless excluded. The reliable signal is the env var <strong><code>CLAUDE_CODE_SESSION_ID</code></strong> (verified set in interactive sessions). Note: jacked's existing code reads <code>CLAUDE_SESSION_ID</code> (without <code>_CODE_</code>), which is a <em>different, hook-context</em> variable and is empty in a normal session — do not rely on it alone.
+</aside>
+<p>
+Robust exclusion strategy, in order:
+</p>
+<ol>
+  <li><strong>Skill passes <code>--exclude "$CLAUDE_CODE_SESSION_ID"</code> at the shell level.</strong> This captures the value where it's known to be set, independent of the Python subprocess environment — the primary mechanism.</li>
+  <li><strong>CLI fallback:</strong> if <code>--exclude</code> is empty, read <code>CLAUDE_CODE_SESSION_ID</code>, then <code>CLAUDE_SESSION_ID</code>, from the environment.</li>
+  <li><strong>Belt-and-suspenders heuristic:</strong> also drop any candidate whose last timestamped line is within ~60s of <code>now</code> <em>and</em> whose tail looks live (ends in fresh <code>assistant</code>/<code>system</code> traffic rather than the untimestamped <code>last-prompt</code>/<code>ai-title</code>/<code>mode</code>/<code>permission-mode</code> tail a finished session leaves). This guards the rare case where the env var is unavailable.</li>
+</ol>
+
+<h2 id="digest">The digest: what gets recovered</h2>
+<p>
+There is <strong>no <code>summary</code> line type</strong> in the transcript format — recap state lives in lightweight metadata lines. <code>build_digest</code> walks the chosen transcript (skipping <code>isSidechain</code> subagent branches) and assembles, in priority order:
+</p>
+<ul>
+  <li><strong>Session title</strong> — the <code>ai-title</code> line (one-line "what this was about").</li>
+  <li><strong>Last instruction</strong> — the <code>last-prompt</code> line (<code>lastPrompt</code>), the fastest "what was I doing" signal.</li>
+  <li><strong>Recent real asks</strong> — the last few <code>user</code> messages with <code>isMeta:true</code> and <code>&lt;command-name&gt;…</code> wrappers stripped.</li>
+  <li><strong>Last assistant plan/answer</strong> — trailing <code>assistant</code> text blocks (tool-output noise removed).</li>
+  <li><strong>Todo state</strong> — the latest <code>TodoWrite</code> <code>tool_use</code> block's <code>input.todos</code> (content + status: in-progress / pending / completed), if any. Not every session has one.</li>
+  <li><strong>Recent tool actions</strong> — trailing <code>tool_use</code> names + key inputs (Bash commands, Edit/Write file paths) to show the last concrete operations.</li>
+  <li><strong>Files touched</strong> — from <code>Edit</code>/<code>Write</code>/<code>NotebookEdit</code> <code>input.file_path</code> and <code>file-history-snapshot</code> entries.</li>
+  <li><strong>git branch &amp; modes</strong> — the last <code>gitBranch</code>, plus <code>mode</code>/<code>permission-mode</code> to re-establish posture.</li>
+  <li><strong>Incomplete-turn flag</strong> — if the tail is a <code>tool_use</code> with no matching <code>tool_result</code>, or a half-written final line, mark "last turn may be incomplete — work was in progress on X" rather than presenting it as finished.</li>
+</ul>
+
+<aside class="callout">
+  <strong>Budget policy (per the project data-integrity rule).</strong> Full transcripts are 50K–200K+ chars and would blow up context. The digest is budgeted (default in the spirit of <code>/checkpoint</code>'s ~3000-line cap, overridable via <code>--budget</code>) by favoring summaries and the most recent turns. The cap is justified by a real constraint (context-window overflow), generous, and <strong>never silent</strong>: when content is dropped, the digest says so and points to <code>claude --resume &lt;id&gt;</code> for the complete thread.
+</aside>
+
+<h2 id="cli">CLI surface</h2>
+<pre><code># Phase 1 — rank candidates (cheap metadata, machine-readable)
+jacked recover --json [--cwd PATH] [--exclude SESSION_ID] [--limit N]
+
+# Phase 2 — build the digest for the confirmed session (the injection payload)
+jacked recover --session &lt;id&gt; --digest [--budget N] [--cwd PATH]</code></pre>
+<table>
+  <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>--json</code></td><td>Emit ranked candidates as JSON: <code>{chosen, candidates:[…]}</code>, each with id/title/last_prompt/last_ts/branch/msg_count/age/truncated. Default phase-1 output.</td></tr>
+    <tr><td><code>--session &lt;id&gt;</code></td><td>Target a specific session (the auto-pick, or an alternate the user named).</td></tr>
+    <tr><td><code>--digest</code></td><td>Print the budgeted working-state digest for <code>--session</code> + the <code>claude --resume &lt;id&gt;</code> line.</td></tr>
+    <tr><td><code>--exclude &lt;id&gt;</code></td><td>Session to exclude (the live one). Skill passes <code>"$CLAUDE_CODE_SESSION_ID"</code>; CLI falls back to env if empty.</td></tr>
+    <tr><td><code>--cwd PATH</code></td><td>Override the working directory to resolve (default: process cwd).</td></tr>
+    <tr><td><code>--limit N</code></td><td>How many candidates to return in phase 1 (default 3).</td></tr>
+    <tr><td><code>--budget N</code></td><td>Digest size cap (chars or lines). Generous default; truncation is logged in-output.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="skill">The <code>/recover</code> skill flow</h2>
+<p>
+A thin <code>SKILL.md</code> (frontmatter: <code>name: recover</code> + a trigger-tight <code>description</code> anchored on "session/computer crashed mid-work," "didn't run /checkpoint," "session ID unknown," "rebuild this folder's last session from the transcript" — and explicitly <em>not</em> for transient API errors, deliberately-saved state, or topic search across old projects). The body:
+</p>
+<ol>
+  <li>Run <code>jacked recover --json --exclude "$CLAUDE_CODE_SESSION_ID"</code>.</li>
+  <li><strong>No candidates</strong> → tell the user no prior session was found for this folder (fresh repo / wrong folder / nothing crashed here) and stop. Don't fabricate.</li>
+  <li>Present the auto-pick — title · last prompt · when · branch — plus the alternates list. <strong>Confirm before injecting.</strong></li>
+  <li>On confirm → <code>jacked recover --session &lt;id&gt; --digest</code>; that output is the injected working state. Then surface <code>claude --resume &lt;id&gt;</code> as "for a true native continuation (preserves Claude's internal state), run this in a fresh terminal."</li>
+  <li>Re-anchor in one or two lines: "You were doing X; the next step was Y," nodding to <code>MEMORY.md</code> for standing project conventions, and continue the work.</li>
+  <li><strong>Wrong pick</strong> → the user names an alternate from the list → re-call with <code>--session &lt;alt&gt;</code>.</li>
+</ol>
+
+<h2 id="files">File changes</h2>
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/recover.py</code></td><td><strong>New.</strong> The four public functions above + <code>SessionCandidate</code>/<code>Digest</code> dataclasses. Qdrant-free; imports <code>transcript</code> + <code>config</code> only.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td>Add the <code>recover</code> Click subcommand (phase-1 <code>--json</code> + phase-2 <code>--digest</code>). Not <code>_require_search</code>-gated. Tolerant error output (never a stack trace at the user).</td></tr>
+    <tr><td><code>jacked/data/skills/recover/SKILL.md</code></td><td><strong>New.</strong> The thin orchestrator skill. Installs via the existing <code>jacked install</code> skills glob.</td></tr>
+    <tr><td><code>tests/test_recover.py</code></td><td><strong>New.</strong> Unit tests over <code>recover.py</code> with JSONL fixtures (run with <code>uv run python -m pytest</code>).</td></tr>
+    <tr><td><code>jacked/__init__.py</code></td><td>Version bump.</td></tr>
+    <tr><td><code>README.md</code></td><td>One-paragraph mention of <code>/recover</code> under the skills/commands section.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="testing">Testing</h2>
+<h3>Python (TDD, pytest)</h3>
+<ul>
+  <li><code>resolve_project_dir</code>: dot-slug folder, enumerate-and-match fallback, stale dot-preserving folder ignored, missing folder → <code>None</code>.</li>
+  <li><code>list_candidates</code>: excludes the live session id; ranks by last <em>timestamped</em> line (not mtime); ignores subagent <code>&lt;uuid&gt;/</code> dirs; multiple-candidate ordering; tolerates a malformed/half-written final line without aborting the parse.</li>
+  <li><code>build_digest</code>: extracts <code>ai-title</code>/<code>last-prompt</code>/recent asks/last assistant text; pulls the latest <code>TodoWrite</code>; flags an incomplete final turn; respects <code>--budget</code> and emits the truncation note (no silent drop); strips tool-output noise.</li>
+  <li><code>resume_command</code>: exact string.</li>
+</ul>
+<aside class="callout warn">
+  Confirm whether <code>transcript.parse_jsonl_file*</code> swallows a bad trailing line gracefully. If it raises on a crash-truncated final line, harden it (skip/repair the last line) — that is the literal crash case this feature exists for.
+</aside>
+<h3>Skill (writing-skills RED → GREEN)</h3>
+<p>
+This is a <em>technique</em> skill, so test by application. RED: give a fresh agent "my session in this repo crashed, recover it" <strong>without</strong> the skill and document the flailing (won't know the env var to exclude, won't handle the dot-slug, may reach for Qdrant/<code>jacked</code>, may dump the whole transcript). GREEN: with the skill, the agent runs the two-phase CLI, confirms the pick, injects a budgeted digest, and offers <code>claude --resume</code>. REFACTOR: close any gaps surfaced.
+</p>
+
+<h2 id="yagni">Scope boundaries (YAGNI)</h2>
+<ul>
+  <li><strong>No Qdrant / <code>[search]</code> dependency</strong> — works on a bare install, by design.</li>
+  <li><strong>No nested/shelled <code>claude --resume</code></strong> — TTY + nested-session problems make it unworkable; we print the command for the user to run.</li>
+  <li><strong>No SessionStart auto-hook</strong> — a hook can't distinguish a crash from a normal boot and would nag or mis-fire. Manual <code>/recover</code> only, per the user's ask.</li>
+  <li><strong>No cross-machine / cross-repo search</strong> — that's <code>/jacked</code>'s job. <code>/recover</code> is strictly "this folder's last session."</li>
+  <li><strong>No write-back, no transcript editing, no checkpoint artifact</strong> — recovery injects into the live context; if the user wants durability afterward they can run <code>/checkpoint</code>.</li>
+  <li><strong>No automatic injection without confirmation</strong> — wrong-session is the headline risk; the user confirms the pick first.</li>
+</ul>
+
+<h2 id="failure">Failure modes</h2>
+<table>
+  <thead><tr><th>Scenario</th><th>Behavior</th></tr></thead>
+  <tbody>
+    <tr><td>No project folder resolves for this cwd</td><td>Report "no recorded sessions for this folder" and stop. Suggest checking the folder is right.</td></tr>
+    <tr><td>Folder exists but only the live session is present</td><td>After excluding the live id, zero candidates → "nothing to recover here yet."</td></tr>
+    <tr><td><code>CLAUDE_CODE_SESSION_ID</code> unavailable</td><td>Fall back to env names, then the live-tail heuristic; if still ambiguous, present candidates and let the user exclude the current one explicitly.</td></tr>
+    <tr><td>Multiple very-recent candidates</td><td>Auto-pick the newest, but the skill shows the alternates and confirms before injecting (never silently grabs).</td></tr>
+    <tr><td>Crash-truncated final line</td><td>Parser skips/repairs the bad last line; digest flags "last turn may be incomplete."</td></tr>
+    <tr><td>Chosen transcript exceeds budget</td><td>Digest is truncated <em>with a visible note</em> + the <code>claude --resume &lt;id&gt;</code> pointer to the full thread.</td></tr>
+    <tr><td><code>jacked</code> CLI not on PATH (skill running where the package isn't installed)</td><td>Skill detects the failure and tells the user to install/repair jacked, rather than half-recovering.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="open-questions">Open questions</h2>
+<ul>
+  <li>Default <code>--budget</code> units &amp; value — characters vs lines, and the exact cap. Leaning lines (~3000) to mirror <code>/checkpoint</code>; finalize during implementation against a real large transcript.</li>
+  <li>Should phase-1 <code>--json</code> ever auto-skip confirmation when there is exactly one candidate and it's unambiguous? Current spec: always confirm (cheap, and wrong-session is the headline risk). Revisit only if it feels heavy in practice.</li>
+</ul>
+
+<hr style="border:none;border-top:1px solid var(--border);margin:2.5rem 0">
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a> HTML artifact template.
+</p>
+
+</div>
+
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+  } catch (err) {
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>
