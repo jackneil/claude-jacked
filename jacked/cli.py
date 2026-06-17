@@ -581,12 +581,17 @@ def recover(cwd, exclude, session_id, as_digest, limit, budget, as_json):
     exclude_id = exclude or os.getenv("CLAUDE_CODE_SESSION_ID") or os.getenv("CLAUDE_SESSION_ID")
     candidates = rec.list_candidates(project_dir, exclude_session_id=exclude_id)
     now = datetime.now(timezone.utc)
+    idx = rec.recommend_index(candidates) if candidates else 0
+    chosen = candidates[idx] if candidates else None
     top = candidates[:limit]
+    # ensure the recommended candidate is present in the returned list
+    if chosen is not None and chosen not in top:
+        top = [chosen] + top[: max(0, limit - 1)]
 
     if as_json:
         payload = {
             "project_dir": str(project_dir),
-            "chosen": top[0].to_dict(now) if top else None,
+            "chosen": chosen.to_dict(now) if chosen else None,
             "candidates": [c.to_dict(now) for c in top],
             "count": len(candidates),
         }
@@ -596,8 +601,8 @@ def recover(cwd, exclude, session_id, as_digest, limit, budget, as_json):
     if not top:
         console.print(f"[yellow]No prior session to recover in[/yellow] {project_dir}")
         return
-    for i, c in enumerate(top):
-        marker = "->" if i == 0 else "  "
+    for c in top:
+        marker = "->" if c is chosen else "  "
         click.echo(f"{marker} {c.session_id}  ({c.ai_title or 'untitled'})  "
                    f"{rec._relative_age(c.last_ts, now)}  [{c.git_branch or '?'}]")
         if c.last_prompt:
@@ -1533,6 +1538,17 @@ def _is_editable_install() -> bool:
     """
     repo_root = _get_data_root().parent.parent
     return (repo_root / ".git").is_dir()
+
+
+def _jacked_home() -> Path:
+    """Resolve jacked's home dir for manifest/last-install/asset install.
+
+    Honors $JACKED_HOME so tests (and unusual setups) can redirect the
+    ~/.claude tree; defaults to the real home directory.
+    """
+    import os as _os
+
+    return Path(_os.getenv("JACKED_HOME") or Path.home())
 
 
 # Path markers identifying jacked-managed hook entries in settings.json.
@@ -2720,7 +2736,20 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     is_flag=True,
     help="Overwrite existing agents/commands without prompting",
 )
-def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force: bool):
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit the change-summary as JSON instead of the human summary",
+)
+def install(
+    sounds: bool,
+    search: bool,
+    no_security: bool,
+    no_rules: bool,
+    force: bool,
+    as_json: bool,
+):
     """Auto-install skill, agents, commands, and optional hooks.
 
     Base install: agents, commands, behavioral rules, /jacked skill,
@@ -2734,13 +2763,94 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
     import json
     import shutil
 
-    home = Path.home()
+    home = _jacked_home()
     pkg_root = _get_data_root()
+
+    # Capture the prior manifest BEFORE we touch anything, so the diff
+    # reflects source-now vs source-at-last-install (correct for both copy
+    # and editable/symlink installs).
+    from datetime import datetime, timezone
+
+    from jacked import __version__ as _ver
+    from jacked import install_manifest as _mani
+    from jacked import install_summary as _isum
+
+    _manifest_path = home / ".claude" / "jacked-manifest.json"
+    _prior_manifest = _mani.load(_manifest_path)
+    _prior_version = _prior_manifest.get("version") if _prior_manifest else None
 
     install_search = search
     install_security = not no_security
 
-    console.print("[bold]Installing Jacked...[/bold]\n")
+    # In --json mode, suppress the per-step "[OK] ..." chatter (and the same
+    # chatter emitted by helper functions) so stdout carries only the JSON
+    # record. The try/finally guarantees the module-level console is restored
+    # even if install raises — otherwise a later in-process command (tray)
+    # would silently inherit quiet=True.
+    _prev_quiet = console.quiet
+    if as_json:
+        console.quiet = True
+    try:
+        _run_install(
+            home=home,
+            pkg_root=pkg_root,
+            sounds=sounds,
+            search=search,
+            no_security=no_security,
+            no_rules=no_rules,
+            force=force,
+            as_json=as_json,
+            install_search=install_search,
+            install_security=install_security,
+        )
+    finally:
+        console.quiet = _prev_quiet
+
+    # --- Change summary (manifest-driven) ---
+    # Hash source-now, diff against the prior manifest, prune artifacts that
+    # jacked installed before but no longer ships, then persist the new
+    # manifest + the dashboard-readable last-install record.
+    _current_hashes = _mani.hash_source(pkg_root)
+    _d = _mani.diff(_prior_manifest, _current_hashes)
+    _mani.prune_removed(_d, home)
+    _now = datetime.now(timezone.utc).isoformat()
+    _mani.write(_manifest_path, _ver, _current_hashes, _now)
+    _record = _isum.build_record(_d, _prior_version, _ver, _now)
+    _isum.write_last_install(_record, home / ".claude" / "jacked-last-install.json")
+
+    if as_json:
+        click.echo(json.dumps(_record))
+    else:
+        console.print("")
+        console.print(_isum.render_terminal(_record))
+        # Required-plugin blocker only — the full recommendations now live in
+        # `jacked doctor`.
+        _warn_required_plugins_missing()
+
+
+def _run_install(
+    *,
+    home: Path,
+    pkg_root: Path,
+    sounds: bool,
+    search: bool,
+    no_security: bool,
+    no_rules: bool,
+    force: bool,
+    as_json: bool,
+    install_search: bool,
+    install_security: bool,
+) -> None:
+    """Run the artifact/hook/rules installation (no manifest, no summary).
+
+    Split out of `install` so the change-summary orchestration can wrap it in
+    a try/finally that always restores console state.
+    """
+    import json
+    import shutil
+
+    if not as_json:
+        console.print("[bold]Installing Jacked...[/bold]\n")
 
     # Check for existing settings
     settings_path = home / ".claude" / "settings.json"
@@ -2997,47 +3107,51 @@ def install(sounds: bool, search: bool, no_security: bool, no_rules: bool, force
         else:
             console.print("[dim][-][/dim] No project env detected")
 
-    console.print("\n[bold]Installation complete![/bold]")
-    console.print(
-        "\n[yellow]IMPORTANT: Restart Claude Code for new commands to take effect![/yellow]"
-    )
-    console.print("\nWhat you get:")
-    console.print("  - /jacked - Search past Claude sessions")
-    console.print("  - /dc - Double-check reviewer")
-    console.print("  - /pr - PR workflow helper")
-    console.print("  - /learn - Distill lessons into CLAUDE.md rules")
-    console.print("  - /techdebt - Project tech debt audit")
-    console.print("  - /redo - Scrap and re-implement with hindsight")
-    console.print("  - /audit-rules - CLAUDE.md quality audit")
-    console.print("  - 10 specialized agents (readme, wiki, tests, etc.)")
-    if install_search:
-        console.print("  - Session indexing hook (auto-indexes after each response)")
-    if install_security:
-        console.print("  - Security gatekeeper (auto-approves safe Bash commands)")
-    if not no_rules:
-        console.print("  - Behavioral rules in CLAUDE.md")
-    console.print("  - Chrome DevTools MCP (browser testing via /qa and /ux)")
-    console.print("  - Guardrails templates (run 'jacked init' in a project to set up)")
 
-    # Show next steps based on what's installed
-    console.print("\nNext steps:")
-    console.print("  1. Restart Claude Code (exit and run 'claude' again)")
-    if install_search:
-        console.print("  2. Set Qdrant credentials (run 'jacked configure' for help)")
-        console.print("  3. Run 'jacked backfill' to index existing sessions")
-        console.print("  4. Use '/jacked <description>' to search past sessions")
-    else:
-        console.print("\nOptional extras:")
-        console.print(
-            r'  uv tool install "claude-jacked\[search]" --force    # Session search via Qdrant'
-        )
-        console.print(
-            r'  jacked install --force                              # Re-install with security gatekeeper (default)'
-        )
-        console.print(r'  uv tool install "claude-jacked\[all]" --force       # Everything')
+# Plugins that jacked's behaviors and skills genuinely depend on. Missing
+# any of these means key workflows are broken, so install surfaces them as a
+# blocker; the full (optional/recommended) list lives in `jacked doctor`.
+_REQUIRED_PLUGINS = {
+    "superpowers@claude-plugins-official": "brainstorming, planning, TDD, subagent workflows",
+    "playwright@claude-plugins-official": "/qa and /ux browser testing",
+    "firecrawl@claude-plugins-official": "web search and scraping in skills",
+    "commit-commands@claude-plugins-official": "/commit, /commit-push-pr",
+    "pr-review-toolkit@claude-plugins-official": "/review-pr, code review agents",
+}
 
-    # Check for recommended external tools
-    _recommend_external_tools()
+
+def _installed_plugins() -> set[str]:
+    """Set of enabled Claude Code plugin ids from settings.json (empty if none)."""
+    import json
+
+    settings_path = _jacked_home() / ".claude" / "settings.json"
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            return set(settings.get("enabledPlugins", []))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return set()
+
+
+def _warn_required_plugins_missing() -> None:
+    """Print one yellow warning per genuinely-required, currently-missing plugin.
+
+    Prints nothing when every required plugin is enabled. This is the only
+    plugin nag the `install` command keeps — full recommendations moved to
+    `jacked doctor`.
+    """
+    installed = _installed_plugins()
+    missing = [(p, d) for p, d in _REQUIRED_PLUGINS.items() if p not in installed]
+    if not missing:
+        return
+    console.print("")
+    for plugin, desc in missing:
+        name = plugin.split("@")[0]
+        console.print(
+            f"[yellow]! Required plugin missing:[/yellow] {name} — {desc} "
+            "(enable via /plugins)"
+        )
 
 
 def _recommend_external_tools():
@@ -3062,13 +3176,7 @@ def _recommend_external_tools():
             pass
 
     # Plugins that jacked's behaviors and skills depend on
-    required_plugins = {
-        "superpowers@claude-plugins-official": "brainstorming, planning, TDD, subagent workflows",
-        "playwright@claude-plugins-official": "/qa and /ux browser testing",
-        "firecrawl@claude-plugins-official": "web search and scraping in skills",
-        "commit-commands@claude-plugins-official": "/commit, /commit-push-pr",
-        "pr-review-toolkit@claude-plugins-official": "/review-pr, code review agents",
-    }
+    required_plugins = dict(_REQUIRED_PLUGINS)
 
     # Nice-to-have plugins
     optional_plugins = {
@@ -3269,6 +3377,9 @@ def doctor():
             "  [cyan]uv tool install \"claude-jacked[tray]\" --force[/cyan]"
         )
 
+    # Plugin + external-tool recommendations (moved off the install banner).
+    _recommend_external_tools()
+
 
 @main.command()
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
@@ -3282,7 +3393,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     import json
     import shutil
 
-    home = Path.home()
+    home = _jacked_home()
     pkg_root = _get_data_root()
     settings_path = home / ".claude" / "settings.json"
 
@@ -3446,6 +3557,30 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
             templates_dst.rmdir()
         except OSError:
             pass
+
+    # Manifest-aware cleanup: remove any artifact jacked recorded but that the
+    # current source no longer ships (covers pruned-then-reinstalled history,
+    # which the source-glob loops above would miss), then drop the bookkeeping
+    # files so a fresh install starts clean.
+    from jacked import install_manifest as _mani
+
+    _manifest_path = home / ".claude" / "jacked-manifest.json"
+    _prior_manifest = _mani.load(_manifest_path)
+    if _prior_manifest:
+        # Treat current source as empty so every recorded artifact counts as
+        # "removed" and gets pruned from ~/.claude.
+        _empty = {cat.key: {} for cat in _mani.CATEGORIES}
+        _d = _mani.diff(_prior_manifest, _empty)
+        _pruned = _mani.prune_removed(_d, home)
+        if _pruned:
+            console.print(
+                f"[green][OK][/green] Removed {len(_pruned)} manifest-tracked artifacts"
+            )
+    if _manifest_path.exists():
+        _manifest_path.unlink()
+    _last_install_path = home / ".claude" / "jacked-last-install.json"
+    if _last_install_path.exists():
+        _last_install_path.unlink()
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(

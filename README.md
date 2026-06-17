@@ -421,6 +421,10 @@ That's it. One command. Works on macOS, Linux, and Windows. Does all three thing
 
 If you're running the background service, you can also click **Update to vX.Y.Z ->** in the tray menu when a newer version is available on PyPI. Same three-step sequence, fully detached — survives its own binary being replaced mid-update.
 
+### What changed in this update
+
+`jacked install` and `jacked upgrade` print a concise change-summary instead of a static banner: the version **before → after**, plus exactly which skills, commands, agents, lenses, and templates were **added / changed / removed** (and a count of everything unchanged). It's backed by a manifest (`~/.claude/jacked-manifest.json`) recording what jacked installed, so an upgrade can also prune artifacts it no longer ships — without ever touching your own files. The same summary shows up in the dashboard as a one-shot panel after an upgrade. Run `jacked install --json` for the machine-readable diff.
+
 ---
 
 ## Security Gatekeeper
@@ -564,6 +568,8 @@ current folder from its on-disk transcript, shows you the pick to confirm, then 
 a budgeted working-state digest (last instruction, todos, recent actions, files touched)
 so you continue right where it died — and prints `claude --resume <id>` for a full native
 continuation. Works on a bare install; no Qdrant/search extra required.
+
+It recommends the newest session **with real substance** — a near-empty newest session is skipped (but still offered as an alternate). And if the crashed session was actively driving a `/goal` or `/loop` (which can't be auto-resumed), the digest surfaces that exact command verbatim so you can copy-paste it back into Claude Code to restart it.
 
 ---
 

@@ -235,3 +235,75 @@ def test_cli_recover_no_sessions_json(tmp_path, monkeypatch):
     result = runner.invoke(main, ["recover", "--cwd", "/work/nope", "--json"])
     payload = _json.loads(result.output.strip())
     assert payload == {"project_dir": None, "chosen": None, "candidates": [], "count": 0}
+
+
+def _cand(session_id, msg_count, last_ts):
+    return rec.SessionCandidate(
+        session_id=session_id, path=Path(f"/x/{session_id}.jsonl"),
+        last_ts=datetime.fromisoformat(last_ts), msg_count=msg_count)
+
+
+def _loop_user_line(args="5m /babysit-prs", ts="2026-06-16T09:00:00.000Z"):
+    return {"type": "user", "timestamp": ts, "message": {"role": "user", "content":
+            f"<command-name>/loop</command-name><command-args>{args}</command-args>"}}
+
+
+def _plain_user(text, ts="2026-06-16T09:10:00.000Z"):
+    return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}}
+
+
+def test_active_loop_kickoff_surfaced_when_in_tail(tmp_path):
+    pdir = tmp_path / "p"
+    path = _write_session(pdir, SID_A, [
+        _user_line("/repo", ts="2026-06-16T08:00:00.000Z"),
+        _loop_user_line(),  # near the end -> active
+    ])
+    d = rec.build_digest(path)
+    assert d.resumable_commands == [{"type": "loop", "kickoff": "/loop 5m /babysit-prs"}]
+    rendered = rec.render_digest(d)
+    assert "Manual restart required" in rendered
+    assert "/loop 5m /babysit-prs" in rendered
+
+
+def test_goal_loop_not_surfaced_when_early_with_later_work(tmp_path):
+    pdir = tmp_path / "p"
+    records = [_user_line("/repo", ts="2026-06-16T08:00:00.000Z"), _loop_user_line()]
+    # bury the kickoff under > TAIL_WINDOW later messages
+    for i in range(rec.TAIL_WINDOW + 3):
+        records.append(_plain_user(f"more work {i}", ts="2026-06-16T09:%02d:00.000Z" % (i % 60)))
+    path = _write_session(pdir, SID_B, records)
+    d = rec.build_digest(path)
+    assert d.resumable_commands == []
+    assert "Manual restart required" not in rec.render_digest(d)
+
+
+def test_goal_kickoff_from_raw_slash_line(tmp_path):
+    pdir = tmp_path / "p"
+    path = _write_session(pdir, SID_A, [
+        _user_line("/repo", ts="2026-06-16T08:00:00.000Z"),
+        _plain_user("/goal ship the recover feature end to end"),
+    ])
+    d = rec.build_digest(path)
+    assert d.resumable_commands == [{"type": "goal", "kickoff": "/goal ship the recover feature end to end"}]
+
+
+def test_recommend_skips_near_empty_newest():
+    cands = [
+        _cand("new-empty", 1, "2026-06-17T12:00:00+00:00"),   # newest but tiny
+        _cand("substantive", 40, "2026-06-16T09:00:00+00:00"),
+    ]
+    assert rec.recommend_index(cands) == 1
+
+
+def test_recommend_takes_newest_when_substantive():
+    cands = [
+        _cand("new-big", 12, "2026-06-17T12:00:00+00:00"),
+        _cand("old", 40, "2026-06-16T09:00:00+00:00"),
+    ]
+    assert rec.recommend_index(cands) == 0
+
+
+def test_recommend_falls_back_when_all_tiny():
+    cands = [_cand("a", 1, "2026-06-17T12:00:00+00:00"),
+             _cand("b", 2, "2026-06-16T09:00:00+00:00")]
+    assert rec.recommend_index(cands) == 0

@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from jacked.findbin import find_bin
+from jacked.install_summary import DEFAULT_LAST_INSTALL_PATH as _LAST_INSTALL_PATH
 from jacked.service import update_status as _update_status_mod
 
 logger = logging.getLogger(__name__)
@@ -322,6 +323,28 @@ async def get_update_status():
         _update_status_mod.UPDATE_STATUS_FILE,
     )
     return {"status": data, "mtime_iso": mtime_iso}
+
+
+@router.get("/install/summary")
+async def get_install_summary():
+    """Return the last-install change record + its mtime.
+
+    Used by the dashboard "what changed" panel. The record is written by
+    ``jacked install`` to ``~/.claude/jacked-last-install.json``. Never raises:
+    a missing or corrupt file yields {"summary": None, "mtime_iso": None}.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    p = _LAST_INSTALL_PATH
+    try:
+        if not p.exists():
+            return {"summary": None, "mtime_iso": None}
+        summary = json.loads(p.read_text(encoding="utf-8"))
+        mtime_iso = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
+        return {"summary": summary, "mtime_iso": mtime_iso}
+    except (OSError, json.JSONDecodeError):
+        return {"summary": None, "mtime_iso": None}
 
 
 @router.post("/project/guardrails-init")

@@ -34,6 +34,17 @@
                    text-decoration: none; border-radius: 4px; }
         code { background: #111827; padding: 0.1em 0.4em; border-radius: 3px; }
         .banner .row { margin-top: 0.4em; }
+        .changes { margin: 1.5em 0; }
+        .changes h2 { font-size: 1em; margin: 0 0 0.6em; color: #e5e7eb; }
+        .change-row { display: flex; align-items: center; gap: 0.6em;
+                      padding: 0.25em 0; font-size: 0.9em; color: #d1d5db; }
+        .chg-badge { display: inline-block; padding: 0.1em 0.55em; border-radius: 9999px;
+                     font-size: 0.7em; font-weight: 600; text-transform: uppercase;
+                     letter-spacing: 0.03em; min-width: 3.4em; text-align: center; }
+        .chg-badge.added { background: #166534; color: #bbf7d0; }
+        .chg-badge.changed { background: #92400e; color: #fde68a; }
+        .chg-badge.removed { background: #991b1b; color: #fecaca; }
+        .changes .unchanged { margin-top: 0.6em; font-size: 0.82em; color: #6b7280; }
     </style>
 </head>
 <body>
@@ -106,6 +117,60 @@
         meta.textContent = txt;
     }
 
+    // --- post-success change summary (mirrors the dashboard panel) ---
+    // Category key -> label. Mirrors jacked/install_summary.py _LABELS.
+    const CHANGE_CATEGORIES = [
+        ["skills", "Skills"], ["commands", "Commands"], ["agents", "Agents"],
+        ["lenses", "Lenses"], ["templates", "Templates"],
+    ];
+    const CHANGE_KINDS = {
+        added: "new", changed: "updated", removed: "removed",
+    };
+    let _changesFetched = false;
+
+    async function renderChangeSummary() {
+        if (_changesFetched) return;
+        _changesFetched = true;
+        let summary;
+        try {
+            const r = await fetch("/api/install/summary", {cache: "no-store"});
+            if (!r.ok) return;
+            const body = await r.json();
+            summary = body && body.summary;
+        } catch (_) {
+            return;
+        }
+        if (!summary || !summary.changes) return;
+
+        const rows = [];
+        for (const [catKey, label] of CHANGE_CATEGORIES) {
+            const ch = summary.changes[catKey] || {};
+            for (const kind of ["added", "changed", "removed"]) {
+                for (const name of (ch[kind] || [])) {
+                    rows.push([label, name, kind]);
+                }
+            }
+        }
+        if (rows.length === 0) return;
+        if (document.getElementById("change-summary")) return;
+
+        const wrap = makeEl("div", "changes");
+        wrap.id = "change-summary";
+        wrap.appendChild(makeEl("h2", null, "What changed in this update"));
+        for (const [label, name, kind] of rows) {
+            const row = makeEl("div", "change-row");
+            row.appendChild(makeEl("span", "chg-badge " + kind, CHANGE_KINDS[kind]));
+            row.appendChild(makeEl("span", null, label + ": " + name));
+            wrap.appendChild(row);
+        }
+        const unchanged = Number(summary.unchanged_count) || 0;
+        wrap.appendChild(makeEl("div", "unchanged", unchanged + " unchanged"));
+
+        // Insert just below the banner.
+        const banner = document.getElementById("banner");
+        banner.parentNode.insertBefore(wrap, banner.nextSibling);
+    }
+
     function renderBanner() {
         const banner = document.getElementById("banner");
         clearChildren(banner);
@@ -132,6 +197,8 @@
             a.href = "/";
             banner.appendChild(a);
             banner.style.display = "block";
+            // Append the added/changed/removed lists below the banner (once).
+            renderChangeSummary();
         } else if (state.overall === "failed") {
             banner.classList.add("failed");
             banner.appendChild(makeEl("div", null, "Update failed."));

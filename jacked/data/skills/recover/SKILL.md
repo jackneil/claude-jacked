@@ -30,7 +30,7 @@ Needs a current `jacked` CLI on PATH (a bare install is enough — recovery neve
 
 3. **Sanity-check the auto-pick.** If `chosen.last_prompt` is itself a `/recover` invocation, that is the live session leaking through — drop it and use the next candidate (or re-run with that id added to `--exclude`).
 
-4. **Present and confirm — before injecting.** Show the chosen session and the alternates: `ai_title`, `age`, `git_branch`, and `last_prompt`. Ask: "Recover this one, or pick an alternate (<ids>)?" Wait for the user. Do not inject until they confirm.
+4. **Present and confirm — before injecting.** Show the chosen session and the alternates: `ai_title`, `age`, `git_branch`, and `last_prompt`. The recommended `chosen` is the newest session with real substance — if the very newest session is near-empty (almost no messages) it is skipped as the recommendation but still appears in the candidate list, so the user can pick it as an alternate. Ask: "Recover this one, or pick an alternate (<ids>)?" Wait for the user. Do not inject until they confirm.
 
 5. **Inject the digest.** On confirmation:
    ```bash
@@ -41,6 +41,9 @@ Needs a current `jacked` CLI on PATH (a bare install is enough — recovery neve
 6. **Offer native resume.** Tell the user: "For a true continuation that preserves Claude's internal state, run `claude --resume <id>` in a fresh terminal. The digest above lets us continue right here instead."
 
 7. **Re-anchor and continue.** Summarize in 1-2 lines: "You were working on X; last step was Y; next was Z." `MEMORY.md` already carries standing project conventions. Then continue the work.
+
+## Manual restart of /goal or /loop
+If the recovered digest contains a "Manual restart required" block, the crashed session was driving a `/goal` or `/loop` that **cannot be auto-resumed** (these only run when pasted into a live Claude Code session). Surface that exact command to the user and tell them to paste it into Claude Code themselves to restart it — do not try to run it yourself.
 
 ## Wrong pick
 If the user says it is the wrong session, re-run step 5 with the alternate's id from the candidate list.

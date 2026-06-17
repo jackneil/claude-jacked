@@ -394,6 +394,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadAllData();
     renderRoute(getRoute());
 
+    // One-shot post-upgrade "what changed" panel. Runs on every init, including
+    // the post-upgrade reload triggered by _startHealthPolling() -> location.reload().
+    // Self-guards via localStorage so it renders at most once per install record.
+    if (typeof loadInstallSummary === 'function') {
+        loadInstallSummary();
+    }
+
     // Pill handlers are registered via bindAccountEvents() inside renderRoute()
     // No standalone call needed here — it would double-attach on initial load.
 

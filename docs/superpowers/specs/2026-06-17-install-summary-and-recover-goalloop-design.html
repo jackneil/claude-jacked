@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Design — jacked 0.51.0: install/upgrade change-summary + /recover goal-loop recovery</title>
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="approved-by-user">
+<meta name="jacked:branch" content="feat/install-summary-and-recover-goalloop">
+<meta name="jacked:date" content="2026-06-17">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --danger:#b32424; --danger-bg:#fbe9e7; --ok:#1f7a3f; --ok-bg:#e8f4ec; --border:#d8d4cc; --code-bg:#f3efe8; --radius:6px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --danger:#ea7670; --danger-bg:#3a1f1c; --ok:#6acd8e; --ok-bg:#1c3327; --border:#2e2e2e; --code-bg:#232323; } }
+  *{box-sizing:border-box}
+  body{font-family:var(--sans);font-size:16px;line-height:1.6;color:var(--fg);background:var(--bg);margin:0;padding:2rem 1rem}
+  .wrap{max-width:900px;margin:0 auto}
+  h1{font-size:1.9rem;margin:0 0 .25rem}
+  h2{font-size:1.4rem;margin:2.5rem 0 .75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}
+  h3{font-size:1.12rem;margin:1.5rem 0 .5rem;color:var(--fg-muted)}
+  code{font-family:var(--mono);font-size:.92em;background:var(--code-bg);padding:.12em .35em;border-radius:3px}
+  pre{font-family:var(--mono);font-size:.85rem;background:var(--code-bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;overflow-x:auto;line-height:1.45}
+  pre code{background:transparent;padding:0}
+  table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--bg-card);border-radius:var(--radius);overflow:hidden}
+  th,td{text-align:left;padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+  th{background:var(--code-bg);font-weight:600;font-size:.9rem}
+  tr:last-child td{border-bottom:none}
+  aside.callout{margin:1rem 0;padding:.9rem 1.1rem;border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}
+  aside.callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  aside.callout.danger{border-color:var(--danger);background:var(--danger-bg)}
+  aside.callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  aside.callout > :first-child{margin-top:0}
+  aside.callout > :last-child{margin-bottom:0}
+  .meta{display:flex;flex-wrap:wrap;gap:.5rem 1rem;margin:.5rem 0 2rem;padding:.75rem 1rem;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
+  .meta .kv{display:flex;gap:.35rem}
+  .meta .k{color:var(--fg-muted)}
+  .meta .v{font-family:var(--mono)}
+  .badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.8rem;font-weight:500}
+  .badge.ok{background:var(--ok-bg);color:var(--ok)}
+  .badge.info{background:var(--accent-bg);color:var(--accent)}
+  nav.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.25rem;margin-bottom:2rem}
+  nav.toc h2{margin:0 0 .5rem;font-size:.9rem;text-transform:uppercase;letter-spacing:.05em;color:var(--fg-muted);border:none;padding:0}
+  nav.toc ol{margin:0;padding-left:1.5rem}
+  nav.toc li{margin:.15rem 0}
+  blockquote{border-left:3px solid var(--border);padding:.2rem 1rem;margin:1rem 0;color:var(--fg-muted);font-style:italic}
+  @media print{body{background:white;color:black;padding:0}.wrap{max-width:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Design — jacked 0.51.0: install/upgrade change-summary + <code>/recover</code> goal-loop recovery</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">approved-by-user</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-06-17</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">feat/install-summary-and-recover-goalloop</span></div>
+  <div class="kv"><span class="k">Release:</span><span class="v">0.51.0</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#partA">Part A — install/upgrade change-summary</a></li>
+    <li><a href="#manifest">A1. The manifest</a></li>
+    <li><a href="#install">A2. install: diff, prune, summary, --json</a></li>
+    <li><a href="#dashboard">A3. Dashboard surface</a></li>
+    <li><a href="#partB">Part B — /recover goal-loop + near-empty pick</a></li>
+    <li><a href="#files">File changes</a></li>
+    <li><a href="#testing">Testing</a></li>
+    <li><a href="#yagni">Scope boundaries (YAGNI)</a></li>
+    <li><a href="#failure">Failure modes</a></li>
+    <li><a href="#open">Open questions</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>
+Two user-facing improvements, shipped together as 0.51.0 on one branch:
+</p>
+<ul>
+  <li><strong>Part A — install/upgrade change-summary.</strong> Replace <code>jacked install</code>'s static "What you get / Next steps" banner with a concise, accurate summary of <em>what actually changed</em>: the version before → after, and which skills/commands/agents/lenses/templates were <strong>added / changed / removed</strong>. Surface the same summary in the dashboard/tray update UI.</li>
+  <li><strong>Part B — <code>/recover</code> goal-loop recovery.</strong> When recovering a crashed session, recommend the newest session <em>with real substance</em> (skip a near-empty newest), and if that session was actively driving a <code>/goal</code> or <code>/loop</code>, surface the exact kickoff prompt verbatim so the user can copy-paste it to restart — these cannot be auto-resumed.</li>
+</ul>
+
+<aside class="callout">
+  <strong>Why a release together:</strong> the user asked for both in one cycle. They touch disjoint areas (Part A: <code>cli.py</code> + new manifest module + web UI; Part B: <code>recover.py</code> + its skill), so they're implemented as two independent task groups on one branch and cut as one release.
+</aside>
+
+<aside class="callout warn">
+  <strong>Two corrections that shaped this design (from codebase investigation):</strong>
+  <ol>
+    <li><strong>Two separate update paths exist.</strong> The dashboard's own upgrade button (<code>POST /api/upgrade</code> → <code>_do_upgrade</code> in <code>jacked/api/routes/system.py</code>) runs <code>uv tool upgrade</code> + <code>jacked install --force</code> in-process and then <code>os.execv</code>'s a reload — it never writes the status file. The tray "Update" spawns a detached <code>jacked/service/updater.py</code> that writes <code>~/.claude/jacked-update-status.json</code>, polled by the standalone <code>jacked/data/web/update.html</code>. The summary must reach both — solved by having <code>install</code> self-record (see A3).</li>
+    <li><strong>The dashboard theme is dark-slate + blue (<code>#3b82f6</code>), with no beta tag.</strong> The "canonical cyan + beta tag" is the <em>Hank control-plane</em> theme, which this dashboard does not use. The new UI matches the existing slate/blue cards/badges (<code>.stat-card</code>, <code>.badge</code> in <code>jacked/data/web/css/style.css</code>). No cyan, no beta tag.</li>
+  </ol>
+</aside>
+
+<h2 id="partA">Part A — install/upgrade change-summary</h2>
+
+<h3 id="manifest">A1. The manifest</h3>
+<p>
+The root problem: jacked keeps <strong>no record of what it previously installed</strong> — no manifest, and the prior version isn't durably stored. A small manifest fixes this and powers everything in Part A.
+</p>
+<p><strong>New module <code>jacked/install_manifest.py</code></strong> (pure, no Click/rich, fully unit-testable). Manifest file at <code>~/.claude/jacked-manifest.json</code>:</p>
+<pre><code>{
+  "version": "0.51.0",                // the jacked version that wrote this manifest
+  "written_at": "2026-06-17T16:40:00Z",
+  "artifacts": {
+    "skills":    {"recover": "sha256:…", "whats-next": "sha256:…", …},
+    "commands":  {"dc": "sha256:…", …},
+    "agents":    {"readme-maintainer": "sha256:…", …},
+    "lenses":    {…},
+    "templates": {"plan-template.html": "sha256:…", …}
+  }
+}</code></pre>
+<p>Public API:</p>
+<table>
+  <thead><tr><th>Function</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>CATEGORIES</code></td><td>Ordered list describing each artifact category: key (skills/commands/agents/lenses/templates), source glob + name-extraction, destination dir + dest-path-for-name. Single source of truth shared by install, prune, and diff.</td></tr>
+    <tr><td><code>hash_source(data_root) -&gt; dict</code></td><td>Walk the package source for every category; return <code>{category: {name: "sha256:…"}}</code> of the current shipped artifacts (hash of file bytes).</td></tr>
+    <tr><td><code>load(path=DEFAULT) -&gt; dict | None</code></td><td>Read + JSON-parse the manifest; <code>None</code> if missing/corrupt (corrupt → treat as first install, logged).</td></tr>
+    <tr><td><code>diff(prior, current_hashes) -&gt; ManifestDiff</code></td><td>Per category: <code>added</code> (name in current, not in prior), <code>changed</code> (in both, hash differs), <code>removed</code> (in prior, not in current), <code>unchanged</code>. <code>prior=None</code> → everything is <code>added</code> (first manifested install).</td></tr>
+    <tr><td><code>write(path, version, current_hashes)</code></td><td>Atomic write (temp + rename) of the new manifest.</td></tr>
+  </tbody>
+</table>
+<p>
+Diffing <strong>by content hash of the source</strong> (current-source vs prior-manifest) is correct in both copy installs (PyPI) <em>and</em> editable/symlink dev installs — it compares "what we ship now" against "what we shipped last time," never the lossy dest-vs-source comparison.
+</p>
+
+<h3 id="install">A2. install: diff, prune, summary, --json</h3>
+<p>The <code>install</code> command (<code>jacked/cli.py</code>) is refactored to drive the manifest:</p>
+<ol>
+  <li><strong>Load prior manifest</strong> → capture <code>prior_version</code> (or <code>None</code>).</li>
+  <li><strong>Hash current source</strong> → <code>diff(prior, current)</code>.</li>
+  <li><strong>Install</strong> added + changed artifacts via the existing link/copy path (unchanged behavior, including editable symlinks).</li>
+  <li><strong>Prune removed</strong>: for each <code>removed</code> name (present in the prior manifest, so jacked-owned), delete its destination (skills: <code>rmtree</code> the skill dir; others: <code>unlink</code> the file). The manifest is the ownership proof — the user's own skills/commands are never in it, so never touched.</li>
+  <li><strong>Write the new manifest</strong> (current version + current hashes).</li>
+  <li><strong>Write <code>~/.claude/jacked-last-install.json</code></strong> (see A3) — the structured summary record.</li>
+  <li><strong>Render the concise terminal summary</strong> (below), replacing the old banner.</li>
+</ol>
+
+<p><strong>Terminal summary</strong> (rich, slate/blue-agnostic — uses the existing <code>[green]</code>/<code>[yellow]</code>/<code>→</code> vocabulary). Upgrade example:</p>
+<pre><code>Jacked upgraded   0.50.0 → 0.51.0
+
+  Skills      + recover            new
+  Commands    ~ whats-next         updated
+  Agents      − legacy-helper      removed
+              34 unchanged
+
+→ Restart Claude Code to load changes.</code></pre>
+<p>First install (no prior manifest): header reads <code>Jacked installed  —  0.51.0</code> and every artifact is listed as <code>new</code> (per the chosen "concise always" output style). If nothing changed on a re-run: <code>Jacked 0.51.0 — already up to date (N artifacts unchanged).</code></p>
+
+<aside class="callout warn">
+  <strong>Banner removal — and the one exception.</strong> The verbose "What you get / Next steps / Recommended tools" block (<code>cli.py</code> ~3000–3147, incl. <code>_recommend_external_tools()</code>) is removed from default install output. The only thing preserved is a <strong>blocker</strong>: if a genuinely <em>required</em> Claude Code plugin is detected missing, print a single warning line (not the full recommendations dump). The full recommendations move behind <code>jacked doctor</code> (or <code>jacked install --recommend</code>). This honors "no welcome banner" without silently swallowing a real setup blocker.
+</aside>
+
+<p><strong><code>--json</code> flag</strong> on <code>install</code>: emit the structured summary to stdout (and suppress the human render), shape identical to <code>jacked-last-install.json</code> below. Lets any caller capture the diff programmatically.</p>
+
+<h3 id="dashboard">A3. Dashboard surface</h3>
+<p>
+Rather than scrape <code>install</code>'s stdout from two different update paths, <strong><code>install</code> self-records</strong>: it always writes <code>~/.claude/jacked-last-install.json</code>:
+</p>
+<pre><code>{
+  "at": "2026-06-17T16:40:01Z",
+  "from_version": "0.50.0",          // null on first install
+  "to_version": "0.51.0",
+  "changes": {
+    "skills":   {"added": ["recover"], "changed": [], "removed": []},
+    "commands": {"added": [], "changed": ["whats-next"], "removed": []},
+    "agents":   {"added": [], "changed": [], "removed": ["legacy-helper"]},
+    "lenses":   {"added": [], "changed": [], "removed": []},
+    "templates":{"added": [], "changed": [], "removed": []}
+  },
+  "unchanged_count": 34
+}</code></pre>
+<p>Both update paths get the summary for free because the record is produced by <code>install</code> itself, which both paths run.</p>
+<ul>
+  <li><strong>New endpoint</strong> <code>GET /api/install/summary</code> (in <code>jacked/api/routes/system.py</code>) → returns <code>{summary: &lt;jacked-last-install.json or null&gt;, mtime_iso}</code>.</li>
+  <li><strong>Main SPA</strong> (<code>jacked/data/web/js/</code>): a new small component renders a one-shot <em>"What changed in this update"</em> panel (slate <code>.stat-card</code> + <code>.badge</code> styling) — shown after a post-upgrade reload when <code>/api/install/summary</code> is fresh and unseen (a <code>localStorage</code> "seen <code>at</code>" marker prevents re-showing). Wired into both the dashboard upgrade-modal completion (<code>header.js</code>) and initial app load (<code>app.js</code>).</li>
+  <li><strong><code>update.html</code></strong> (standalone tray-update page): on <code>overall==="succeeded"</code>, fetch <code>/api/install/summary</code> and render the added/changed/removed lists (its own inline dark palette).</li>
+</ul>
+<aside class="callout">
+  The existing <code>jacked-update-status.json</code> phase machinery is left as-is; the change-summary rides on the separate, simpler <code>jacked-last-install.json</code> that <code>install</code> owns. This decouples "what changed" from "upgrade progress phases."
+</aside>
+
+<h2 id="partB">Part B — <code>/recover</code> goal-loop + near-empty pick</h2>
+<p>Two focused additions to <code>jacked/recover.py</code> + a skill update. No change to the CLI's two-phase shape.</p>
+
+<h3>B1. Near-empty recommendation</h3>
+<p>
+Candidates are already ranked newest-first by last-timestamped line. Add <code>recommend_index(candidates, min_msgs=MIN_SUBSTANCE_MSGS)</code>: return the index of the first candidate whose <code>msg_count &gt;= min_msgs</code> (default <code>MIN_SUBSTANCE_MSGS = 4</code>); if none qualify, fall back to index 0 (absolute newest). The CLI's <code>chosen</code> becomes <code>candidates[recommend_index(...)]</code>; the full candidate list (including any skipped near-empty newest) is still returned as alternates. This matches "newest unless the very newest is nearly empty."
+</p>
+
+<h3>B2. Goal/loop kickoff recovery (only if it looks active)</h3>
+<p>
+A <code>/goal</code> or <code>/loop</code> run cannot be auto-resumed — it only continues when the user pastes the command into a live Claude Code session. So when the recommended session was driving one and it looks like it was still active at the crash, <code>/recover</code> surfaces the exact kickoff verbatim for copy-paste.
+</p>
+<ul>
+  <li><strong>Extraction:</strong> scan the recommended session's <em>raw</em> user records for <code>/goal</code> and <code>/loop</code> invocations. The command lives in the command wrapper (<code>&lt;command-name&gt;/loop&lt;/command-name&gt;</code> + <code>&lt;command-args&gt;…&lt;/command-args&gt;</code>) or as a raw line beginning <code>/goal </code> / <code>/loop </code>. Reconstruct the verbatim kickoff (<code>/loop &lt;args&gt;</code> or <code>/goal &lt;args&gt;</code>), preserving the original text exactly. Record each with its position (record index).</li>
+  <li><strong>"Looks active" gate (strict, per decision):</strong> surface a kickoff only if the <em>latest</em> <code>/goal</code> or <code>/loop</code> invocation falls within the transcript <strong>tail window</strong> — default the last <code>TAIL_WINDOW = 10</code> records — with no later explicit stop signal (a subsequent user line containing a stop instruction for that command). A kickoff that appears early with substantial unrelated work after it is treated as finished and is <em>not</em> surfaced.</li>
+  <li><strong>Digest field:</strong> new <code>Digest.resumable_commands: list[dict]</code>, each <code>{type: "goal"|"loop", kickoff: "&lt;verbatim&gt;"}</code> — populated only when the active gate passes (usually 0 or 1 entries).</li>
+  <li><strong>Render:</strong> when non-empty, a prominent block near the top of the digest (always inside the budget — it's tiny and high-value):
+    <pre><code>## ⚠ Manual restart required
+This session was driving a /loop that can't be auto-resumed.
+Copy this back into Claude Code to restart it:
+
+    /loop 5m /babysit-prs</code></pre>
+  </li>
+</ul>
+
+<h3>B3. Skill update</h3>
+<p>
+<code>jacked/data/skills/recover/SKILL.md</code> gains: (a) a note that the recommended pick skips a near-empty newest session (and the user can still choose it as an alternate); (b) a step instructing the agent that if the digest contains a "Manual restart required" block, present that <code>/goal</code> or <code>/loop</code> command to the user to copy-paste, and explicitly state it cannot be auto-run.
+</p>
+
+<h2 id="files">File changes</h2>
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/install_manifest.py</code></td><td><strong>New.</strong> Manifest schema, <code>CATEGORIES</code>, <code>hash_source</code>, <code>load</code>, <code>diff</code>, <code>write</code>, <code>ManifestDiff</code>. Pure/stdlib.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td><code>install</code> refactor: manifest-driven diff + prune + manifest write + <code>jacked-last-install.json</code> write + concise summary render + <code>--json</code> flag; remove the verbose banner (keep required-plugin blocker line); move full recommendations behind <code>jacked doctor</code>/<code>--recommend</code>. Make <code>uninstall</code> manifest-aware (clean pruned artifacts too).</td></tr>
+    <tr><td><code>jacked/api/routes/system.py</code></td><td><strong>New route</strong> <code>GET /api/install/summary</code> reading <code>jacked-last-install.json</code>.</td></tr>
+    <tr><td><code>jacked/data/web/js/components/*.js</code>, <code>app.js</code>, <code>header.js</code></td><td>New one-shot "What changed" panel + wiring on post-upgrade reload and app load (slate/blue, <code>localStorage</code> seen-marker).</td></tr>
+    <tr><td><code>jacked/data/web/update.html</code></td><td>Render added/changed/removed on <code>succeeded</code> via <code>/api/install/summary</code>.</td></tr>
+    <tr><td><code>jacked/data/web/css/style.css</code></td><td>Styles for the change panel if not covered by existing <code>.stat-card</code>/<code>.badge</code>.</td></tr>
+    <tr><td><code>jacked/recover.py</code></td><td><code>recommend_index</code> (near-empty skip); goal/loop extraction + active-gate; <code>Digest.resumable_commands</code> + render block.</td></tr>
+    <tr><td><code>jacked/data/skills/recover/SKILL.md</code></td><td>Note the near-empty skip + the "Manual restart required" copy-paste step.</td></tr>
+    <tr><td><code>tests/test_install_manifest.py</code>, <code>tests/test_recover.py</code>, <code>tests/…api…</code></td><td><strong>New/extended.</strong> Unit tests (run via <code>uv run python -m pytest</code>).</td></tr>
+    <tr><td><code>jacked/__init__.py</code>, <code>README.md</code></td><td>Version → 0.51.0; document the change-summary + goal-loop recovery.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="testing">Testing</h2>
+<ul>
+  <li><strong>Manifest (Part A core):</strong> <code>diff</code> across added/changed/removed/unchanged and first-install (<code>prior=None</code>); <code>hash_source</code> over a fake data root; <code>load</code> on missing/corrupt; <code>write</code> roundtrip (atomic).</li>
+  <li><strong>install (Part A):</strong> prune deletes only manifest-listed removed artifacts and never a non-jacked file; manifest written with current version+hashes; <code>jacked-last-install.json</code> shape; <code>--json</code> output equals the record; first-install vs upgrade vs no-op render. Driven through <code>CliRunner</code> against a fake source data-root + temp <code>~/.claude</code> (env override).</li>
+  <li><strong>API (Part A):</strong> <code>GET /api/install/summary</code> via FastAPI <code>TestClient</code> — returns the record + mtime, and <code>null</code> when absent.</li>
+  <li><strong>Dashboard JS (Part A):</strong> no JS unit harness exists; validate via <code>/qa</code> browser pass (panel renders, seen-marker suppresses re-show, slate/blue styling).</li>
+  <li><strong>recover (Part B):</strong> <code>recommend_index</code> skips a near-empty newest and falls back when all are tiny; goal/loop extraction captures verbatim kickoff; active-gate surfaces when the kickoff is in the tail window and suppresses when it's early-with-later-work; render block present only when non-empty.</li>
+</ul>
+
+<h2 id="yagni">Scope boundaries (YAGNI)</h2>
+<ul>
+  <li>Manifest tracks only jacked-installed artifact files (skills/commands/agents/lenses/templates) — not settings.json hook entries or CLAUDE.md rule blocks (those have their own managed-block logic).</li>
+  <li>No rollback/downgrade tooling — the summary is informational; the manifest is not a backup.</li>
+  <li>Goal/loop recovery surfaces the kickoff text only; it never attempts to run <code>/goal</code> or <code>/loop</code> (impossible from a skill) and does not reconstruct loop schedule/iteration state.</li>
+  <li>Detected commands limited to <code>/goal</code> and <code>/loop</code> (the two non-resumable ones the user named) — not a general non-resumable-command registry.</li>
+  <li>No cyan re-theme / beta tag — match the existing dashboard.</li>
+</ul>
+
+<h2 id="failure">Failure modes</h2>
+<table>
+  <thead><tr><th>Scenario</th><th>Behavior</th></tr></thead>
+  <tbody>
+    <tr><td>No prior manifest (first run after this ships)</td><td>Treat as first install: everything listed as <code>new</code>, write baseline manifest. No pruning (nothing recorded to prune).</td></tr>
+    <tr><td>Corrupt manifest JSON</td><td><code>load</code> returns <code>None</code> (logged); treated as first install. Never crash the install.</td></tr>
+    <tr><td>Prune target already gone / not writable</td><td>Skip with a logged warning; never abort install.</td></tr>
+    <tr><td>Editable/dev install (symlinks)</td><td>Hash-of-source diff still works (compares source-now vs manifest); version arrow still correct.</td></tr>
+    <tr><td><code>jacked-last-install.json</code> unreadable in UI</td><td><code>/api/install/summary</code> returns <code>{summary: null}</code>; UI shows nothing (no error toast).</td></tr>
+    <tr><td>Session has a <code>/goal</code>/<code>/loop</code> early but lots of later unrelated work</td><td>Active-gate fails → not surfaced (treated as finished).</td></tr>
+    <tr><td>Recommended session is near-empty and so are all others</td><td><code>recommend_index</code> falls back to absolute newest; all candidates still listed.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="open">Open questions</h2>
+<ul>
+  <li>Exact <code>MIN_SUBSTANCE_MSGS</code> (default 4) and <code>TAIL_WINDOW</code> (default 10) — sensible defaults; tune against real transcripts during implementation.</li>
+  <li>Whether the full external-tool recommendations live under <code>jacked doctor</code> vs a new <code>jacked install --recommend</code> flag — decide during implementation against the existing <code>doctor</code> command's scope.</li>
+</ul>
+
+<hr style="border:none;border-top:1px solid var(--border);margin:2.5rem 0">
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a> HTML artifact template.
+</p>
+</div>
+</body>
+</html>
