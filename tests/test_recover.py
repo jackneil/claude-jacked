@@ -172,3 +172,68 @@ def test_render_digest_budget_notes_when_trimmed(tmp_path):
     assert "truncated to fit budget" in rendered or "budget note" in rendered
     assert "claude --resume" in rendered
     assert len(rendered) < 2000  # budget respected (plus small footer)
+
+
+import json as _json
+from click.testing import CliRunner
+from jacked.cli import main
+
+
+def test_cli_recover_json_lists_candidates(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    cwd = "/work/myrepo"
+    pdir = projects / "-work-myrepo"
+    _write_session(pdir, SID_A, [
+        _user_line(cwd, ts="2026-06-16T09:50:00.000Z"),
+        _meta("ai-title", aiTitle="My recent work"),
+        _meta("last-prompt", lastPrompt="finish the thing"),
+    ])
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects))
+    runner = CliRunner()
+    result = runner.invoke(main, ["recover", "--cwd", cwd, "--json"])
+    assert result.exit_code == 0, result.output
+    payload = _json.loads(result.output.strip())
+    assert payload["count"] == 1
+    assert payload["chosen"]["session_id"] == SID_A
+    assert payload["chosen"]["ai_title"] == "My recent work"
+
+
+def test_cli_recover_excludes_live_session(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    cwd = "/work/myrepo"
+    pdir = projects / "-work-myrepo"
+    _write_session(pdir, SID_A, [_user_line(cwd, ts="2026-06-16T09:00:00.000Z")])
+    _write_session(pdir, SID_LIVE, [_user_line(cwd, ts="2026-06-17T12:00:00.000Z")])
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects))
+    runner = CliRunner()
+    result = runner.invoke(main, ["recover", "--cwd", cwd, "--exclude", SID_LIVE, "--json"])
+    payload = _json.loads(result.output.strip())
+    assert [c["session_id"] for c in payload["candidates"]] == [SID_A]
+
+
+def test_cli_recover_digest_for_session(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    cwd = "/work/myrepo"
+    pdir = projects / "-work-myrepo"
+    _write_session(pdir, SID_A, [
+        _user_line(cwd),
+        {"type": "user", "timestamp": "2026-06-16T09:01:00.000Z",
+         "message": {"role": "user", "content": "build it"}},
+        _meta("last-prompt", lastPrompt="build it"),
+    ])
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects))
+    runner = CliRunner()
+    result = runner.invoke(main, ["recover", "--cwd", cwd, "--session", SID_A, "--digest"])
+    assert result.exit_code == 0, result.output
+    assert "Recovered session" in result.output
+    assert f"claude --resume {SID_A}" in result.output
+
+
+def test_cli_recover_no_sessions_json(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    projects.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects))
+    runner = CliRunner()
+    result = runner.invoke(main, ["recover", "--cwd", "/work/nope", "--json"])
+    payload = _json.loads(result.output.strip())
+    assert payload == {"project_dir": None, "chosen": None, "candidates": [], "count": 0}

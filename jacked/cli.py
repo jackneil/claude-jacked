@@ -538,6 +538,72 @@ def retrieve(
         console.print(text)
 
 
+@main.command()
+@click.option("--cwd", default=None, help="Working directory to recover (default: current dir)")
+@click.option("--exclude", default=None, help="Session id to exclude (the live one)")
+@click.option("--session", "session_id", default=None, help="Recover this specific session id")
+@click.option("--digest", "as_digest", is_flag=True, help="Emit the working-state digest for --session")
+@click.option("--limit", "-n", default=3, help="How many candidates to list")
+@click.option("--budget", default=12000, help="Digest size budget in characters")
+@click.option("--json", "as_json", is_flag=True, help="Emit candidates as JSON")
+def recover(cwd, exclude, session_id, as_digest, limit, budget, as_json):
+    """Recover a crashed session for this folder from its on-disk transcript.
+
+    Works on a bare install — no Qdrant/search extra required.
+    Phase 1: 'jacked recover --json' ranks candidate sessions.
+    Phase 2: 'jacked recover --session <id> --digest' prints the injection digest.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+    from jacked import recover as rec
+
+    target_cwd = cwd or os.getcwd()
+    project_dir = rec.resolve_project_dir(target_cwd)
+
+    if project_dir is None:
+        if as_json:
+            click.echo(_json.dumps({"project_dir": None, "chosen": None, "candidates": [], "count": 0}))
+        else:
+            console.print(f"[yellow]No recorded Claude sessions found for[/yellow] {target_cwd}")
+        return
+
+    # Phase 2 — digest for a specific session
+    if session_id and as_digest:
+        session_path = project_dir / f"{session_id}.jsonl"
+        if not session_path.exists():
+            console.print(f"[red]Session {session_id} not found in {project_dir}[/red]")
+            sys.exit(1)
+        digest = rec.build_digest(session_path)
+        click.echo(rec.render_digest(digest, budget_chars=budget))
+        return
+
+    # Phase 1 — rank candidates
+    exclude_id = exclude or os.getenv("CLAUDE_CODE_SESSION_ID") or os.getenv("CLAUDE_SESSION_ID")
+    candidates = rec.list_candidates(project_dir, exclude_session_id=exclude_id)
+    now = datetime.now(timezone.utc)
+    top = candidates[:limit]
+
+    if as_json:
+        payload = {
+            "project_dir": str(project_dir),
+            "chosen": top[0].to_dict(now) if top else None,
+            "candidates": [c.to_dict(now) for c in top],
+            "count": len(candidates),
+        }
+        click.echo(_json.dumps(payload))
+        return
+
+    if not top:
+        console.print(f"[yellow]No prior session to recover in[/yellow] {project_dir}")
+        return
+    for i, c in enumerate(top):
+        marker = "->" if i == 0 else "  "
+        click.echo(f"{marker} {c.session_id}  ({c.ai_title or 'untitled'})  "
+                   f"{rec._relative_age(c.last_ts, now)}  [{c.git_branch or '?'}]")
+        if c.last_prompt:
+            click.echo(f"     last: {c.last_prompt[:120]}")
+
+
 @main.command(name="sessions")
 @click.option("--repo", "-r", help="Filter by repository path")
 @click.option("--limit", "-n", default=20, help="Maximum results")
