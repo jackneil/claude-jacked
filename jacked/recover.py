@@ -110,3 +110,97 @@ def resolve_project_dir(cwd, projects_root=None) -> Optional[Path]:
         if d.is_dir() and _dir_matches_cwd(d, norm):
             return d
     return None
+
+
+@dataclass
+class SessionCandidate:
+    session_id: str
+    path: Path
+    ai_title: Optional[str] = None
+    last_prompt: Optional[str] = None
+    last_ts: Optional[datetime] = None
+    git_branch: Optional[str] = None
+    msg_count: int = 0
+    truncated: bool = False
+
+    def to_dict(self, now: Optional[datetime] = None) -> dict:
+        return {
+            "session_id": self.session_id,
+            "path": str(self.path),
+            "ai_title": self.ai_title,
+            "last_prompt": self.last_prompt,
+            "last_ts": self.last_ts.isoformat() if self.last_ts else None,
+            "age": _relative_age(self.last_ts, now),
+            "git_branch": self.git_branch,
+            "msg_count": self.msg_count,
+            "truncated": self.truncated,
+        }
+
+
+def _relative_age(ts: Optional[datetime], now: Optional[datetime] = None) -> Optional[str]:
+    if not ts:
+        return None
+    now = now or datetime.now(timezone.utc)
+    secs = max(0, int((now - ts).total_seconds()))
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def _scan_candidate(path: Path) -> SessionCandidate:
+    """One raw pass over a transcript collecting ranking + preview metadata.
+    Reads raw (not via _iter_records) so it can flag a garbled final line."""
+    ai_title = last_prompt = git_branch = None
+    last_ts: Optional[datetime] = None
+    msg_count = 0
+    last_line_ok = True
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec_obj = json.loads(stripped)
+                    last_line_ok = True
+                except json.JSONDecodeError:
+                    last_line_ok = False
+                    continue
+                t = rec_obj.get("type")
+                if t == "ai-title":
+                    ai_title = rec_obj.get("aiTitle") or ai_title
+                elif t == "last-prompt":
+                    last_prompt = rec_obj.get("lastPrompt") or last_prompt
+                if t in ("user", "assistant"):
+                    msg_count += 1
+                    if rec_obj.get("gitBranch"):
+                        git_branch = rec_obj["gitBranch"]
+                ts = _parse_ts(rec_obj.get("timestamp"))
+                if ts and (last_ts is None or ts > last_ts):
+                    last_ts = ts
+    except (IOError, OSError):
+        pass
+    return SessionCandidate(
+        session_id=path.stem, path=path, ai_title=ai_title,
+        last_prompt=last_prompt, last_ts=last_ts, git_branch=git_branch,
+        msg_count=msg_count, truncated=not last_line_ok,
+    )
+
+
+def list_candidates(project_dir, exclude_session_id: Optional[str] = None) -> list[SessionCandidate]:
+    """Rank prior sessions in a project dir, newest-by-content-timestamp first.
+    Excludes only the given session id (the live one) — never time-based."""
+    project_dir = Path(project_dir)
+    out: list[SessionCandidate] = []
+    for f in project_dir.glob("*.jsonl"):
+        if not f.is_file() or not _t._is_uuid_format(f.stem):
+            continue
+        if exclude_session_id and f.stem == exclude_session_id:
+            continue
+        out.append(_scan_candidate(f))
+    out.sort(key=lambda c: c.last_ts or _EPOCH, reverse=True)
+    return out
