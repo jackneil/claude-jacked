@@ -601,8 +601,8 @@ def recover(cwd, exclude, session_id, as_digest, limit, budget, as_json):
     if not top:
         console.print(f"[yellow]No prior session to recover in[/yellow] {project_dir}")
         return
-    for i, c in enumerate(top):
-        marker = "->" if i == 0 else "  "
+    for c in top:
+        marker = "->" if c is chosen else "  "
         click.echo(f"{marker} {c.session_id}  ({c.ai_title or 'untitled'})  "
                    f"{rec._relative_age(c.last_ts, now)}  [{c.git_branch or '?'}]")
         if c.last_prompt:

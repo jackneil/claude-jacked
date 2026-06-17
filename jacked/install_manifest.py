@@ -139,10 +139,13 @@ def prune_removed(d: ManifestDiff, home) -> list[str]:
         for name in cd.removed:
             target = cat.prune_target(name, home)
             try:
-                if cat.is_skill_dir and target.is_dir():
+                if target.is_symlink():
+                    target.unlink()
+                    pruned.append(f"{key}/{name}")
+                elif cat.is_skill_dir and target.is_dir():
                     shutil.rmtree(target)
                     pruned.append(f"{key}/{name}")
-                elif target.is_symlink() or target.exists():
+                elif target.exists():
                     target.unlink()
                     pruned.append(f"{key}/{name}")
             except OSError as e:
