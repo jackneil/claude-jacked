@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,14 @@ _RECENT_USER_ASKS = 3
 _MAX_TOOL_ACTIONS = 12
 _MAX_FILES = 20
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+# /goal and /loop drive long-running, self-pacing work that Claude Code cannot
+# auto-resume on --resume; we surface the verbatim kickoff so it can be re-run.
+TAIL_WINDOW = 10
+_GOAL_LOOP = ("goal", "loop")
+_CN_RE = re.compile(r"<command-name>\s*/?([a-z0-9-]+)\s*</command-name>", re.IGNORECASE)
+_CA_RE = re.compile(r"<command-args>(.*?)</command-args>", re.IGNORECASE | re.DOTALL)
+_RAW_CMD_RE = re.compile(r"^/(goal|loop)\b", re.IGNORECASE)
 
 
 def _norm_path(p: str) -> str:
@@ -234,6 +243,7 @@ class Digest:
     incomplete_last_turn: bool = False
     truncated_file: bool = False
     resume_cmd: str = ""
+    resumable_commands: list[dict] = field(default_factory=list)
 
 
 def resume_command(session_id: str) -> str:
@@ -298,11 +308,71 @@ def _extract_actions(path: Path):
     return todos, actions[-_MAX_TOOL_ACTIONS:], files[:_MAX_FILES], incomplete
 
 
+def _raw_user_text(rec_obj: dict) -> str:
+    content = (rec_obj.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        return " ".join(parts)
+    return ""
+
+
+def _parse_goal_loop(raw: str):
+    """Return (type, verbatim_kickoff) if raw invokes /goal or /loop, else (None, None)."""
+    m = _CN_RE.search(raw)
+    if m and m.group(1).lower() in _GOAL_LOOP:
+        name = m.group(1).lower()
+        args_m = _CA_RE.search(raw)
+        args = args_m.group(1).strip() if args_m else ""
+        return name, (f"/{name} {args}".rstrip())
+    stripped = raw.strip()
+    rm = _RAW_CMD_RE.match(stripped)
+    if rm:
+        name = rm.group(1).lower()
+        return name, stripped.splitlines()[0].strip()
+    return None, None
+
+
+def _extract_kickoffs(path):
+    """Return (kickoffs, total_records). Each kickoff: (index, type, verbatim)."""
+    kickoffs = []
+    total = 0
+    for i, rec_obj in enumerate(_iter_records(path)):
+        total = i + 1
+        if not isinstance(rec_obj, dict) or rec_obj.get("type") != "user":
+            continue
+        raw = _raw_user_text(rec_obj)
+        if not raw:
+            continue
+        kind, kickoff = _parse_goal_loop(raw)
+        if kind:
+            kickoffs.append((i, kind, kickoff))
+    return kickoffs, total
+
+
+def _active_kickoffs(path, tail_window: int = TAIL_WINDOW) -> list[dict]:
+    """Surface the latest /goal|/loop kickoff only if it falls in the transcript tail."""
+    kickoffs, total = _extract_kickoffs(path)
+    if not kickoffs:
+        return []
+    last_idx, kind, kickoff = kickoffs[-1]
+    if last_idx >= total - tail_window:
+        return [{"type": kind, "kickoff": kickoff}]
+    return []
+
+
 def build_digest(session_path) -> Digest:
     session_path = Path(session_path)
     enriched = _t.parse_jsonl_file_enriched(session_path)
     cand = _scan_candidate(session_path)
     todos, actions, files, incomplete = _extract_actions(session_path)
+    resumable = _active_kickoffs(session_path)
 
     recent_user_asks = [m.content for m in enriched.user_messages if m.content][-_RECENT_USER_ASKS:]
     last_assistant_text = None
@@ -326,6 +396,7 @@ def build_digest(session_path) -> Digest:
         incomplete_last_turn=incomplete or cand.truncated,
         truncated_file=cand.truncated,
         resume_cmd=resume_command(enriched.session_id),
+        resumable_commands=resumable,
     )
 
 
@@ -382,4 +453,17 @@ def render_digest(digest: Digest, budget_chars: int = DEFAULT_BUDGET_CHARS) -> s
         named = ", ".join(d for d in dropped if d) or "low-priority content"
         footer.append(f"[budget note] Section bodies trimmed to ~{budget_chars} chars; clipped/omitted: {named}. Run the resume command for the full thread.")
     out.append("\n".join(footer))
+
+    # A still-active /goal|/loop can't be auto-resumed by --resume. Surface the
+    # verbatim kickoff as an always-on block right under the header — it is tiny
+    # and load-bearing, so it bypasses the char budget and is never trimmed.
+    if digest.resumable_commands:
+        rc = digest.resumable_commands[0]
+        restart = (
+            "## ⚠ Manual restart required\n"
+            f"This session was driving a /{rc['type']} that can't be auto-resumed.\n"
+            "Copy this back into Claude Code to restart it:\n\n"
+            f"    {rc['kickoff']}"
+        )
+        out.insert(1, restart)
     return "\n\n".join(out)
