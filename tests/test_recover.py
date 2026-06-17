@@ -99,3 +99,76 @@ def test_list_candidates_ignores_non_uuid_files(tmp_path):
     (pdir / "notes.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
     cands = rec.list_candidates(pdir)
     assert [c.session_id for c in cands] == [SID_A]
+
+
+def _assistant_tool_use(name: str, tool_input: dict, tool_id: str, ts: str) -> dict:
+    return {"type": "assistant", "timestamp": ts, "gitBranch": "master",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}]}}
+
+
+def _assistant_text(text: str, ts: str) -> dict:
+    return {"type": "assistant", "timestamp": ts,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+
+def test_resume_command_string():
+    assert rec.resume_command("xyz") == "claude --resume xyz"
+
+
+def test_build_digest_extracts_todos_actions_files_and_branch(tmp_path):
+    pdir = tmp_path / "p"
+    path = _write_session(pdir, SID_A, [
+        _user_line("/repo", ts="2026-06-16T09:00:00.000Z"),
+        {"type": "user", "timestamp": "2026-06-16T09:01:00.000Z",
+         "message": {"role": "user", "content": "implement the parser"}},
+        _assistant_tool_use("TodoWrite",
+                            {"todos": [{"content": "write parser", "status": "in_progress"},
+                                       {"content": "write tests", "status": "pending"}]},
+                            "t1", "2026-06-16T09:02:00.000Z"),
+        _assistant_tool_use("Edit", {"file_path": "/repo/parser.py"}, "t2",
+                            "2026-06-16T09:03:00.000Z"),
+        _assistant_tool_use("Bash", {"command": "uv run python -m pytest"}, "t3",
+                            "2026-06-16T09:04:00.000Z"),
+        {"type": "user", "timestamp": "2026-06-16T09:04:30.000Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "t3", "content": "ok"}]}},
+        _meta("ai-title", aiTitle="Parser work"),
+        _meta("last-prompt", lastPrompt="implement the parser"),
+    ])
+    d = rec.build_digest(path)
+    assert d.ai_title == "Parser work"
+    assert d.last_prompt == "implement the parser"
+    assert d.git_branch == "master"
+    assert [td["content"] for td in d.todos] == ["write parser", "write tests"]
+    assert "/repo/parser.py" in d.files_touched
+    assert any(a.startswith("Bash: uv run python -m pytest") for a in d.recent_tool_actions)
+    # t1/t2 had no tool_result, but the final content-bearing action (t3) did,
+    # and we only flag when the LAST tool_use is unmatched:
+    assert d.resume_cmd == f"claude --resume {SID_A}"
+
+
+def test_build_digest_flags_incomplete_last_turn(tmp_path):
+    pdir = tmp_path / "p"
+    path = _write_session(pdir, SID_B, [
+        _user_line("/repo", ts="2026-06-16T09:00:00.000Z"),
+        _assistant_tool_use("Bash", {"command": "sleep 1"}, "open1",
+                            "2026-06-16T09:05:00.000Z"),  # no matching tool_result -> crashed mid-action
+    ])
+    d = rec.build_digest(path)
+    assert d.incomplete_last_turn is True
+
+
+def test_render_digest_budget_notes_when_trimmed(tmp_path):
+    pdir = tmp_path / "p"
+    big = "X" * 5000
+    path = _write_session(pdir, SID_A, [
+        _user_line("/repo"),
+        _assistant_text(big, "2026-06-16T09:10:00.000Z"),
+        _meta("last-prompt", lastPrompt="keep going"),
+    ])
+    d = rec.build_digest(path)
+    rendered = rec.render_digest(d, budget_chars=500)
+    assert "truncated to fit budget" in rendered or "budget note" in rendered
+    assert "claude --resume" in rendered
+    assert len(rendered) < 2000  # budget respected (plus small footer)

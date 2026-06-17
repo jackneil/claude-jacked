@@ -204,3 +204,170 @@ def list_candidates(project_dir, exclude_session_id: Optional[str] = None) -> li
         out.append(_scan_candidate(f))
     out.sort(key=lambda c: c.last_ts or _EPOCH, reverse=True)
     return out
+
+
+@dataclass
+class Digest:
+    session_id: str
+    ai_title: Optional[str] = None
+    last_prompt: Optional[str] = None
+    git_branch: Optional[str] = None
+    recent_user_asks: list[str] = field(default_factory=list)
+    last_assistant_text: Optional[str] = None
+    todos: list[dict] = field(default_factory=list)
+    recent_tool_actions: list[str] = field(default_factory=list)
+    files_touched: list[str] = field(default_factory=list)
+    agent_summaries: list[str] = field(default_factory=list)
+    plan_excerpt: Optional[str] = None
+    incomplete_last_turn: bool = False
+    truncated_file: bool = False
+    resume_cmd: str = ""
+
+
+def resume_command(session_id: str) -> str:
+    return f"claude --resume {session_id}"
+
+
+def _action_label(name: str, tool_input: dict) -> str:
+    if name == "Bash":
+        lines = (tool_input.get("command") or "").strip().splitlines()
+        first = lines[0] if lines else ""
+        if len(first) > 80:
+            first = first[:77] + "..."
+        return f"Bash: {first}"
+    fp = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if fp:
+        return f"{name}: {fp}"
+    return name
+
+
+def _extract_actions(path: Path):
+    """Raw pass: latest TodoWrite todos, trailing tool actions, files touched,
+    and whether the final tool_use went unanswered (crashed mid-action)."""
+    todos: list[dict] = []
+    actions: list[str] = []
+    files: list[str] = []
+    seen_files: set[str] = set()
+    open_ids: set[str] = set()
+    last_tool_id: Optional[str] = None
+    for rec_obj in _iter_records(path):
+        if not isinstance(rec_obj, dict):
+            continue
+        t = rec_obj.get("type")
+        content = (rec_obj.get("message") or {}).get("content")
+        if t == "assistant" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name", "?")
+                tool_input = block.get("input") or {}
+                tid = block.get("id")
+                if tid:
+                    open_ids.add(tid)
+                    last_tool_id = tid
+                if name == "TodoWrite" and isinstance(tool_input.get("todos"), list):
+                    todos = tool_input["todos"]
+                actions.append(_action_label(name, tool_input))
+                fp = tool_input.get("file_path") or tool_input.get("notebook_path")
+                if fp and fp not in seen_files:
+                    seen_files.add(fp)
+                    files.append(fp)
+        elif t == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    open_ids.discard(block.get("tool_use_id"))
+        elif t == "file-history-snapshot":
+            backups = (rec_obj.get("snapshot") or {}).get("trackedFileBackups") or {}
+            for fp in backups:
+                if fp not in seen_files:
+                    seen_files.add(fp)
+                    files.append(fp)
+    incomplete = last_tool_id is not None and last_tool_id in open_ids
+    return todos, actions[-_MAX_TOOL_ACTIONS:], files[:_MAX_FILES], incomplete
+
+
+def build_digest(session_path) -> Digest:
+    session_path = Path(session_path)
+    enriched = _t.parse_jsonl_file_enriched(session_path)
+    cand = _scan_candidate(session_path)
+    todos, actions, files, incomplete = _extract_actions(session_path)
+
+    recent_user_asks = [m.content for m in enriched.user_messages if m.content][-_RECENT_USER_ASKS:]
+    last_assistant_text = None
+    for m in reversed(enriched.messages):
+        if m.role == "assistant" and m.content:
+            last_assistant_text = m.content
+            break
+
+    return Digest(
+        session_id=enriched.session_id,
+        ai_title=cand.ai_title,
+        last_prompt=cand.last_prompt,
+        git_branch=cand.git_branch,
+        recent_user_asks=recent_user_asks,
+        last_assistant_text=last_assistant_text,
+        todos=todos,
+        recent_tool_actions=actions,
+        files_touched=files,
+        agent_summaries=[a.summary_text for a in enriched.agent_summaries if a.summary_text],
+        plan_excerpt=enriched.plan.content if enriched.plan else None,
+        incomplete_last_turn=incomplete or cand.truncated,
+        truncated_file=cand.truncated,
+        resume_cmd=resume_command(enriched.session_id),
+    )
+
+
+def render_digest(digest: Digest, budget_chars: int = DEFAULT_BUDGET_CHARS) -> str:
+    """Render the digest in priority order under a char budget. Never drops
+    silently: clipped/omitted sections are named, with a pointer to resume."""
+    sections: list[tuple[str, str]] = []
+    head = [f"# Recovered session {digest.session_id}"]
+    if digest.ai_title:
+        head.append(f"**About:** {digest.ai_title}")
+    if digest.git_branch:
+        head.append(f"**Branch:** {digest.git_branch}")
+    sections.append(("", "\n".join(head)))
+    if digest.incomplete_last_turn:
+        sections.append(("", "> WARNING: the last turn may be incomplete — work was in progress when the session ended. Verify before building on it."))
+    if digest.last_prompt:
+        sections.append(("Last instruction", digest.last_prompt))
+    if digest.recent_user_asks:
+        sections.append(("Recent requests", "\n".join(f"- {a}" for a in digest.recent_user_asks)))
+    if digest.todos:
+        marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+        sections.append(("Todo state", "\n".join(
+            f"- {marks.get(td.get('status'), '[ ]')} {td.get('content', '')}" for td in digest.todos)))
+    if digest.last_assistant_text:
+        sections.append(("Last assistant message", digest.last_assistant_text))
+    if digest.recent_tool_actions:
+        sections.append(("Recent actions", "\n".join(f"- {a}" for a in digest.recent_tool_actions)))
+    if digest.files_touched:
+        sections.append(("Files touched", "\n".join(f"- {f}" for f in digest.files_touched)))
+    if digest.plan_excerpt:
+        sections.append(("Plan", digest.plan_excerpt))
+    if digest.agent_summaries:
+        sections.append(("Sub-agent findings", "\n\n".join(digest.agent_summaries)))
+
+    out: list[str] = []
+    used = 0
+    dropped: list[str] = []
+    for title, body in sections:
+        block = f"## {title}\n{body}" if title else body
+        remaining = budget_chars - used
+        if remaining <= 0:
+            dropped.append(title or "section")
+            continue
+        if len(block) > remaining:
+            out.append(block[:remaining].rstrip() + "\n...[truncated to fit budget]")
+            used = budget_chars
+            dropped.append(title or "section")
+            continue
+        out.append(block)
+        used += len(block)
+
+    footer = [f"\nResume natively (preserves Claude's internal state): {digest.resume_cmd}"]
+    if dropped:
+        named = ", ".join(d for d in dropped if d) or "low-priority content"
+        footer.append(f"[budget note] Output trimmed to ~{budget_chars} chars; clipped/omitted: {named}. Run the resume command for the full thread.")
+    out.append("\n".join(footer))
+    return "\n\n".join(out)
