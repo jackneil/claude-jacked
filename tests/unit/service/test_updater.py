@@ -305,14 +305,14 @@ class TestSpawnDetached:
         assert kwargs.get("stdin") is subprocess.DEVNULL
 
     @patch("subprocess.Popen")
-    def test_windows_uses_detached_process_flag(self, mock_popen):
+    def test_windows_uses_no_window_flag(self, mock_popen):
         from jacked.service.updater import _spawn_detached
         with patch.object(sys, "platform", "win32"):
-            with patch.object(subprocess, "DETACHED_PROCESS", 0x8, create=True):
+            with patch.object(subprocess, "CREATE_NO_WINDOW", 0x8, create=True):
                 _spawn_detached(["cmd", "/c", "exit"])
         kwargs = mock_popen.call_args[1]
         flags = kwargs.get("creationflags", 0)
-        assert flags & 0x8  # DETACHED_PROCESS
+        assert flags & 0x8  # CREATE_NO_WINDOW (hidden console — no popped window)
 
 
 class TestFindUpdaterPython:
@@ -390,7 +390,7 @@ class TestSpawnFromTrayWindows:
         from jacked.service import updater
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(
-            subprocess, "DETACHED_PROCESS", 0x8, raising=False,
+            subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False,
         )
 
         updater._spawn_windows_tray_updater(parent_pid=12345, extras="tray")
@@ -402,7 +402,8 @@ class TestSpawnFromTrayWindows:
         assert args[2].endswith(".bat")
         kwargs = mock_popen.call_args[1]
         flags = kwargs.get("creationflags", 0)
-        assert flags & 0x8
+        assert flags & 0x08000000  # CREATE_NO_WINDOW — no flashing find/timeout windows
+        assert not (flags & 0x00000008)  # never DETACHED_PROCESS
 
         import os as _os
         try:

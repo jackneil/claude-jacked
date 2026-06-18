@@ -17,6 +17,7 @@ import time
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
 from jacked.service.process import is_process_alive, is_port_available
+from jacked.winproc import NO_WINDOW
 
 UPDATE_LOG = CLAUDE_DIR / "jacked-update.log"
 RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
@@ -49,6 +50,7 @@ def _force_kill_pid(pid: int) -> None:
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/F", "/T"],
                 capture_output=True, check=False,
+                creationflags=NO_WINDOW,
             )
         else:
             import signal as _signal
@@ -65,6 +67,7 @@ def _pids_bound_to_port(port: int) -> list[int]:
             out = subprocess.run(
                 ["netstat", "-ano"],
                 capture_output=True, text=True, check=False,
+                creationflags=NO_WINDOW,
             ).stdout
             pids: set[int] = set()
             for line in out.splitlines():
@@ -100,7 +103,10 @@ def _spawn_detached(cmd: list, log_fh=None) -> "subprocess.Popen":
         "stderr": log_fh if log_fh is not None else subprocess.DEVNULL,
     }
     if sys.platform == "win32":
-        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        # CREATE_NO_WINDOW, not DETACHED_PROCESS: callers hand us the jacked.exe
+        # console trampoline (and python.exe), which pop a visible console under
+        # DETACHED (no inherited console). A hidden console suppresses the flash.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     else:
         kwargs["start_new_session"] = True
     return subprocess.Popen(cmd, **kwargs)
@@ -258,7 +264,10 @@ def run_update(
         _begin("installing_package")
         log(f"Install method: {method}")
         log(f"Running: {label}")
-        result = subprocess.run(cmd, stdout=log_fh, stderr=log_fh, check=False)
+        result = subprocess.run(
+            cmd, stdout=log_fh, stderr=log_fh, check=False,
+            creationflags=NO_WINDOW,
+        )
         log(f"upgrade command returncode: {result.returncode}")
 
         if result.returncode != 0:
@@ -300,6 +309,7 @@ def run_update(
         migrate_result = subprocess.run(
             [jacked, "install", "--force"],
             stdout=log_fh, stderr=log_fh, check=False,
+            creationflags=NO_WINDOW,
         )
         log(f"jacked install returncode: {migrate_result.returncode}")
 
@@ -668,15 +678,35 @@ def _spawn_windows_tray_updater(
             pass
         raise
 
-    DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-    subprocess.Popen(
-        ["cmd.exe", "/c", batch_path],
+    # CREATE_NO_WINDOW, NOT DETACHED_PROCESS. This batch is spawned by the tray,
+    # which runs under the windowless pythonw.exe — so there's no console to
+    # inherit. Under DETACHED_PROCESS every console child (the `tasklist | find`
+    # + `timeout` poll loop running once a second, the `jacked _update_status`
+    # shims, the uv upgrade, and the powershell verify loop) auto-allocates its
+    # own visible console window. CREATE_NO_WINDOW hands cmd.exe a hidden console
+    # the whole batch shares, so nothing pops. CREATE_BREAKAWAY_FROM_JOB lets the
+    # helper outlive the tray/job dying; fall back to CREATE_NO_WINDOW alone if
+    # the job forbids breakaway.
+    NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    _kwargs = dict(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=DETACHED_PROCESS,
         close_fds=True,
     )
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", batch_path],
+            creationflags=NO_WINDOW | BREAKAWAY,
+            **_kwargs,
+        )
+    except OSError:
+        subprocess.Popen(
+            ["cmd.exe", "/c", batch_path],
+            creationflags=NO_WINDOW,
+            **_kwargs,
+        )
 
 
 def _cli() -> None:

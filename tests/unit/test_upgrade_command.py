@@ -268,7 +268,8 @@ class TestUpgradeWindows:
         assert args[2].endswith(".bat")
         kwargs = mock_popen.call_args[1]
         flags = kwargs.get("creationflags", 0)
-        assert flags & 0x00000008  # DETACHED_PROCESS
+        assert flags & 0x08000000  # CREATE_NO_WINDOW (hidden console, no flashing windows)
+        assert not (flags & 0x00000008)  # never DETACHED_PROCESS — that's what popped the windows
 
     @patch("sys.platform", "win32")
     @patch("jacked.install_method.detect_install_method", return_value="uv")

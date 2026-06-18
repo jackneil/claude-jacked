@@ -31,9 +31,11 @@ class TestRunClaudeMcp:
             result = _run_claude_mcp("get", "chrome-devtools")
             assert result is not None
             assert result.returncode == 0
+            from jacked.winproc import NO_WINDOW
             run.assert_called_once_with(
                 ["/usr/bin/claude", "mcp", "get", "chrome-devtools"],
                 capture_output=True, text=True, timeout=10,
+                creationflags=NO_WINDOW,
             )
 
     def test_custom_timeout_passed_through(self):
