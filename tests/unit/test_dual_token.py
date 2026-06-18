@@ -1240,13 +1240,19 @@ class TestRefreshCCTokenNetworkError:
 class TestPrepareAccountDirCCRefresh:
     """Verify prepare_account_dir triggers CC refresh when CC token is near-expiry."""
 
+    @patch("jacked.api.credential_helpers.read_active_account_id")
     @patch("jacked.launch.should_refresh_cc")
     @patch("jacked.launch.should_refresh")
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     def test_cc_refresh_called_when_cc_near_expiry(
-        self, mock_cc_refresh, mock_should_primary, mock_should_cc, tmp_path
+        self, mock_cc_refresh, mock_should_primary, mock_should_cc, mock_active_id, tmp_path
     ):
-        """When should_refresh_cc returns True, refresh_cc_token is called."""
+        """When should_refresh_cc is True AND this is not the active CC session,
+        refresh_cc_token is called. read_active_account_id is mocked to a
+        DIFFERENT account so the active-session skip-gate (launch.py:378 — don't
+        rotate the live session's CC token) doesn't suppress the refresh. Without
+        this mock the test is nondeterministic: it reads the machine's real active
+        account and silently passes/fails on ordering luck."""
         from jacked.launch import prepare_account_dir
 
         db = _make_db(tmp_path)
@@ -1257,6 +1263,7 @@ class TestPrepareAccountDirCCRefresh:
             cc_expires_at=int(time.time()) - 100,
         )
 
+        mock_active_id.return_value = 999  # a DIFFERENT account holds the active CC session
         mock_should_primary.return_value = False  # Primary fine
         mock_should_cc.return_value = True  # CC needs refresh
 
@@ -1268,6 +1275,39 @@ class TestPrepareAccountDirCCRefresh:
             pass  # May fail on later steps, we only care about refresh call
 
         mock_cc_refresh.assert_called_once()
+
+    @patch("jacked.api.credential_helpers.read_active_account_id")
+    @patch("jacked.launch.should_refresh_cc")
+    @patch("jacked.launch.should_refresh")
+    @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
+    def test_cc_refresh_skipped_when_account_is_active_session(
+        self, mock_cc_refresh, mock_should_primary, mock_should_cc, mock_active_id, tmp_path
+    ):
+        """Even when near-expiry, CC refresh is SKIPPED for the account that is
+        the active Claude Code session — rotating its CC token upstream would
+        invalidate the live process's in-memory token (launch.py:368-372)."""
+        from jacked.launch import prepare_account_dir
+
+        db = _make_db(tmp_path)
+        db.update_account(
+            1,
+            cc_access_token="cc_at",
+            cc_refresh_token="cc_rt",
+            cc_expires_at=int(time.time()) - 100,
+        )
+
+        mock_active_id.return_value = 1  # THIS account holds the active CC session
+        mock_should_primary.return_value = False
+        mock_should_cc.return_value = True
+
+        account = db.get_account(1)
+
+        try:
+            prepare_account_dir(account, db)
+        except Exception:
+            pass
+
+        mock_cc_refresh.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
