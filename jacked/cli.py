@@ -2795,8 +2795,6 @@ def install(
             home=home,
             pkg_root=pkg_root,
             sounds=sounds,
-            search=search,
-            no_security=no_security,
             no_rules=no_rules,
             force=force,
             as_json=as_json,
@@ -2833,8 +2831,6 @@ def _run_install(
     home: Path,
     pkg_root: Path,
     sounds: bool,
-    search: bool,
-    no_security: bool,
     no_rules: bool,
     force: bool,
     as_json: bool,
@@ -3166,7 +3162,7 @@ def _recommend_external_tools():
     # ---------------------------------------------------------------
     # Claude Code plugins — check which are installed
     # ---------------------------------------------------------------
-    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_path = _jacked_home() / ".claude" / "settings.json"
     installed_plugins: set[str] = set()
     if settings_path.exists():
         try:

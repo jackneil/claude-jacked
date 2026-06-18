@@ -1,9 +1,11 @@
 """System routes — health, version, installations, settings, gatekeeper config."""
 
 import asyncio
+import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Request, status
@@ -333,9 +335,6 @@ async def get_install_summary():
     ``jacked install`` to ``~/.claude/jacked-last-install.json``. Never raises:
     a missing or corrupt file yields {"summary": None, "mtime_iso": None}.
     """
-    import json
-    from datetime import datetime, timezone
-
     p = _LAST_INSTALL_PATH
     try:
         if not p.exists():

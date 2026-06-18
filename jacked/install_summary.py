@@ -59,7 +59,7 @@ def render_terminal(record: dict) -> str:
                 lines.append(f"  {label:<11}[{color}]{sym}[/{color}] {name:<28}{word}")
     if not changed:
         lines.append("  (no artifact changes)")
-    lines.append(f"            {record['unchanged_count']} unchanged")
+    lines.append(f"  {record['unchanged_count']} unchanged")
     lines.append("")
     lines.append("→ Restart Claude Code to load changes.")
     return "\n".join(lines)

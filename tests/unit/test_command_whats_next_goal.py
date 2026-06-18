@@ -164,10 +164,13 @@ def test_step_8_big_but_convergent(engine: str) -> None:
 
 
 def test_step_8_char_limit(engine: str) -> None:
-    """Brief size is MEASURED (wc -c) under /goal's hard 4000-char cap, not
-    eyeballed — a soft target was overshooting to 4100-4400 chars."""
+    """Brief size is MEASURED (wc -c) and targeted directly UNDER /goal's hard
+    4,000-char cap — bytes >= chars, so a wc -c byte count under 4,000 guarantees
+    the char count is under 4,000 too. The old conservative 3,600-byte proxy is
+    gone: we measure exactly, so the full budget is used."""
     s = _section(engine, "## Step 8")
-    assert "3600" in s
+    assert "3600" not in s and "3,600" not in s  # conservative proxy removed
+    assert "under 4,000" in s                    # targets the real cap directly
     assert "4,000" in s or "4000" in s          # references the real hard cap
     assert "wc -c" in s                          # mechanical measurement
     assert "Measure it: `wc -c" in s             # the actual measure step, pinned

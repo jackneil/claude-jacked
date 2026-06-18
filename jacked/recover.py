@@ -465,5 +465,5 @@ def render_digest(digest: Digest, budget_chars: int = DEFAULT_BUDGET_CHARS) -> s
             "Copy this back into Claude Code to restart it:\n\n"
             f"    {rc['kickoff']}"
         )
-        out.insert(1, restart)
+        out.insert(min(1, len(out)), restart)
     return "\n\n".join(out)

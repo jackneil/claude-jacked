@@ -45,6 +45,24 @@ def test_render_no_changes_says_up_to_date():
     assert "up to date" in out.lower()
 
 
+def test_render_files_refreshed_branch():
+    # Same version (from == to) but real changes -> "files refreshed" header.
+    d = _diff(skills=CategoryDiff(added=["recover"], unchanged=["whats-next"]))
+    rec = s.build_record(d, "0.51.0", "0.51.0", "2026-06-17T00:00:00Z")
+    out = s.render_terminal(rec)
+    assert "files refreshed" in out
+    assert "recover" in out
+
+
+def test_render_removed_only():
+    # Only a removed entry — the removed name and the "removed" marker show.
+    d = _diff(agents=CategoryDiff(removed=["legacy.md"]))
+    rec = s.build_record(d, "0.50.0", "0.51.0", "2026-06-17T00:00:00Z")
+    out = s.render_terminal(rec)
+    assert "legacy.md" in out
+    assert "removed" in out
+
+
 def test_write_last_install_roundtrip(tmp_path):
     rec = {"at": "x", "from_version": None, "to_version": "0.51.0",
            "changes": {}, "unchanged_count": 0}
