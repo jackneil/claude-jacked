@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from jacked.service import DEFAULT_PORT
+from jacked.winproc import NO_WINDOW
 
 
 def write_pid(pid_file: Path, port: int = DEFAULT_PORT) -> None:
@@ -120,6 +121,7 @@ def stop_process(pid_file: Path) -> bool:
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/F"],
             capture_output=True,
+            creationflags=NO_WINDOW,
         )
     else:
         os.kill(pid, signal.SIGTERM)
@@ -173,7 +175,11 @@ def stop_process_graceful(
     if sys.platform == "win32":
         import subprocess
         # Graceful first — no /F. Sends WM_CLOSE to GUI procs / CTRL_BREAK to consoles.
-        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True)
+        subprocess.run(
+            ["taskkill", "/PID", str(pid)],
+            capture_output=True,
+            creationflags=NO_WINDOW,
+        )
     else:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -191,6 +197,7 @@ def stop_process_graceful(
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/F", "/T"],
             capture_output=True,
+            creationflags=NO_WINDOW,
         )
     else:
         try:

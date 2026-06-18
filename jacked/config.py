@@ -59,12 +59,14 @@ class SmartForkConfig:
     def _default_user_name() -> str:
         """Get default user name from git config or system."""
         import subprocess
+        from jacked.winproc import NO_WINDOW
         try:
             result = subprocess.run(
                 ["git", "config", "user.name"],
                 capture_output=True,
                 text=True,
                 timeout=5,
+                creationflags=NO_WINDOW,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()

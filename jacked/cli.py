@@ -852,9 +852,10 @@ def _spawn_service_detached(host: str, port: int):
     """Spawn `jacked service start` detached so it survives the caller exiting.
 
     Returns the log path the detached service writes to. The child runs the
-    tray icon + uvicorn (ServiceRunner). Windows uses DETACHED_PROCESS;
-    POSIX uses start_new_session. Shared by `jacked start` and
-    `jacked service restart`.
+    tray icon + uvicorn (ServiceRunner). Windows uses DETACHED_PROCESS for the
+    windowless pythonw.exe path and CREATE_NO_WINDOW for the jacked.exe fallback
+    (a console trampoline that would otherwise pop a window); POSIX uses
+    start_new_session. Shared by `jacked start` and `jacked service restart`.
     """
     import subprocess as _subprocess
 
@@ -882,12 +883,18 @@ def _spawn_service_detached(host: str, port: int):
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         if pythonw.exists():
             cmd = [str(pythonw), "-m", "jacked", *svc_args]
+            # pythonw is GUI-subsystem and never touches a console, so
+            # DETACHED_PROCESS (no console at all) is correct and windowless.
+            _console = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
         else:
             cmd = [jacked_bin, *svc_args]
-        # DETACHED (no console) + breakaway (escape any kill-on-close job the
-        # terminal may have placed us in), with a fallback if breakaway is
-        # disallowed by the job.
-        _detached = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+            # jacked.exe is the console trampoline: under DETACHED_PROCESS it
+            # auto-allocates a visible console. CREATE_NO_WINDOW gives it a
+            # hidden one so the fallback stays as windowless as the pythonw path.
+            _console = getattr(_subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        # Console flag (per binary above) + breakaway (escape any kill-on-close
+        # job the terminal may have placed us in), with a fallback if breakaway
+        # is disallowed by the job.
         _breakaway = getattr(_subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
         _win_kwargs = dict(
             stdin=_subprocess.DEVNULL,
@@ -897,10 +904,10 @@ def _spawn_service_detached(host: str, port: int):
         )
         try:
             _subprocess.Popen(
-                cmd, creationflags=_detached | _breakaway, **_win_kwargs
+                cmd, creationflags=_console | _breakaway, **_win_kwargs
             )
         except OSError:
-            _subprocess.Popen(cmd, creationflags=_detached, **_win_kwargs)
+            _subprocess.Popen(cmd, creationflags=_console, **_win_kwargs)
     else:
         _subprocess.Popen(
             [jacked_bin, *svc_args],
@@ -1276,11 +1283,19 @@ def _spawn_windows_upgrade_helper(
             pass
         raise
 
-    # Spawn the batch file detached. DETACHED_PROCESS survives our exit;
-    # CREATE_BREAKAWAY_FROM_JOB lets it survive the launching terminal closing
-    # (modern terminals kill their job object on close). Fall back if the job
-    # forbids breakaway.
-    DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    # Spawn the batch CREATE_NO_WINDOW, NOT DETACHED_PROCESS. The batch runs a
+    # pile of console children — the `tasklist | find "<pid>"` + `timeout /t 1`
+    # poll loop, then the uv/pip upgrade, `jacked install --force`, and
+    # `jacked service restart`. DETACHED_PROCESS gives cmd.exe NO console, so
+    # every one of those children auto-allocates its OWN visible console window
+    # — that's the "find <pid>" window that flashes once a second and reappears
+    # the instant you close it. CREATE_NO_WINDOW gives cmd.exe a HIDDEN console
+    # that all children inherit, so nothing pops. CREATE_BREAKAWAY_FROM_JOB is
+    # orthogonal to the console flag and still lets the helper survive the
+    # launching terminal closing (modern terminals kill their job on close).
+    # Fall back to CREATE_NO_WINDOW alone if the job forbids breakaway — never
+    # back to DETACHED_PROCESS, or the windows come right back.
+    NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
     _helper_kwargs = dict(
         stdin=subprocess.DEVNULL,
@@ -1291,13 +1306,13 @@ def _spawn_windows_upgrade_helper(
     try:
         subprocess.Popen(
             ["cmd.exe", "/c", batch_path],
-            creationflags=DETACHED_PROCESS | BREAKAWAY,
+            creationflags=NO_WINDOW | BREAKAWAY,
             **_helper_kwargs,
         )
     except OSError:
         subprocess.Popen(
             ["cmd.exe", "/c", batch_path],
-            creationflags=DETACHED_PROCESS,
+            creationflags=NO_WINDOW,
             **_helper_kwargs,
         )
 
@@ -2534,6 +2549,8 @@ def _run_claude_mcp(
     import shutil
     import subprocess
 
+    from jacked.winproc import NO_WINDOW
+
     claude_bin = shutil.which("claude")
     if not claude_bin:
         return None
@@ -2544,6 +2561,7 @@ def _run_claude_mcp(
             capture_output=True,
             text=True,
             timeout=timeout,
+            creationflags=NO_WINDOW,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -2761,7 +2779,6 @@ def install(
     Use --search to add session indexing (requires qdrant-client).
     """
     import json
-    import shutil
 
     home = _jacked_home()
     pkg_root = _get_data_root()

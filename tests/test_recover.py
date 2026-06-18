@@ -1,6 +1,6 @@
 # tests/test_recover.py
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from jacked import recover as rec
@@ -172,9 +172,9 @@ def test_render_digest_budget_notes_when_trimmed(tmp_path):
     assert len(rendered) < 2000  # budget respected (plus small footer)
 
 
-import json as _json
-from click.testing import CliRunner
-from jacked.cli import main
+import json as _json  # noqa: E402
+from click.testing import CliRunner  # noqa: E402
+from jacked.cli import main  # noqa: E402
 
 
 def test_cli_recover_json_lists_candidates(tmp_path, monkeypatch):

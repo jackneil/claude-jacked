@@ -72,8 +72,8 @@ def test_write_last_install_roundtrip(tmp_path):
 
 
 # --- CLI integration: install wires the manifest + summary (Task A3) ---
-from click.testing import CliRunner
-from jacked.cli import main
+from click.testing import CliRunner  # noqa: E402
+from jacked.cli import main  # noqa: E402
 
 
 def test_cli_install_writes_manifest_and_summary(tmp_path, monkeypatch):
