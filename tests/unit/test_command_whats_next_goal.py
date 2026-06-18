@@ -179,6 +179,17 @@ def test_step_8_char_limit(engine: str) -> None:
     assert "Next phases:" in s                   # counted toward the limit, never dropped
 
 
+def test_step_8_staged_pr_posture(engine: str) -> None:
+    """The everyday /whats-next brief is safe-by-default: it opens a PR and
+    never merges to main itself, and points at /bhag for autonomous merge-as-
+    you-go build-out."""
+    s = _section(engine, "## Step 8")
+    low = s.lower()
+    assert "open a pr" in low                     # stages a PR
+    assert "not merged to main" in low           # DONE line: '(not merged to main)'
+    assert "/bhag" in s                          # names the autonomous alternative
+
+
 def test_step_8_completion_condition(engine: str) -> None:
     s = _section(engine, "## Step 8")
     assert "DONE when" in s
