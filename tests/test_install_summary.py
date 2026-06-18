@@ -80,6 +80,8 @@ def test_cli_install_writes_manifest_and_summary(tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setenv("JACKED_HOME", str(fake_home))
+    # Don't let the install integration test register autostart or spawn a tray.
+    monkeypatch.setattr("jacked.cli._setup_tray_autostart", lambda: None)
     runner = CliRunner()
     # First install: everything new, manifest + last-install written.
     r1 = runner.invoke(main, ["install", "--no-security", "--no-rules"])
@@ -105,6 +107,8 @@ def test_cli_install_json_emits_record(tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setenv("JACKED_HOME", str(fake_home))
+    # Don't let the install integration test register autostart or spawn a tray.
+    monkeypatch.setattr("jacked.cli._setup_tray_autostart", lambda: None)
     runner = CliRunner()
     r = runner.invoke(main, ["install", "--no-security", "--no-rules", "--json"])
     assert r.exit_code == 0, r.output

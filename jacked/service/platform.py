@@ -199,11 +199,23 @@ def _generate_windows_vbs(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> str:
-    """Generate VBScript for Windows startup folder."""
+    """Generate VBScript for the Windows startup folder.
+
+    Prefer the GUI-subsystem ``pythonw.exe -m jacked`` (never touches a console)
+    over the ``jacked.exe`` console trampoline — same reasoning as
+    _spawn_service_detached. Window style 0 keeps it hidden either way.
+    """
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if pythonw.exists():
+        return (
+            'Set WshShell = CreateObject("WScript.Shell")\n'
+            f'WshShell.Run """{pythonw}"" -m jacked service start'
+            f' --host {host} --port {port}", 0, False\n'
+        )
     return (
         'Set WshShell = CreateObject("WScript.Shell")\n'
         f'WshShell.Run """{jacked_bin}"" service start'
-        f" --host {host} --port {port}\", 0, False\n"
+        f' --host {host} --port {port}", 0, False\n'
     )
 
 

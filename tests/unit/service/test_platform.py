@@ -45,10 +45,26 @@ class TestGenerateLaunchdPlist:
 
 
 class TestGenerateWindowsVbs:
-    def test_contains_jacked_path(self):
+    def test_prefers_pythonw_when_present(self, tmp_path, monkeypatch):
+        # pythonw.exe next to the interpreter -> VBS launches it, not jacked.exe
+        (tmp_path / "pythonw.exe").write_text("")
+        monkeypatch.setattr(
+            "jacked.service.platform.sys.executable", str(tmp_path / "python.exe")
+        )
         from jacked.service.platform import _generate_windows_vbs
-        vbs = _generate_windows_vbs(jacked_bin=r"C:\Users\test\.local\bin\jacked.exe", host="127.0.0.1", port=8321)
-        assert r"C:\Users\test\.local\bin\jacked.exe" in vbs
+        vbs = _generate_windows_vbs(jacked_bin=r"C:\bin\jacked.exe", host="127.0.0.1", port=8321)
+        assert "pythonw.exe" in vbs
+        assert "-m jacked service start" in vbs
+        assert r"C:\bin\jacked.exe" not in vbs
+
+    def test_falls_back_to_jacked_exe_without_pythonw(self, tmp_path, monkeypatch):
+        # no pythonw.exe -> fall back to the jacked.exe trampoline
+        monkeypatch.setattr(
+            "jacked.service.platform.sys.executable", str(tmp_path / "python.exe")
+        )
+        from jacked.service.platform import _generate_windows_vbs
+        vbs = _generate_windows_vbs(jacked_bin=r"C:\bin\jacked.exe", host="127.0.0.1", port=8321)
+        assert r"C:\bin\jacked.exe" in vbs
 
     def test_hidden_window(self):
         from jacked.service.platform import _generate_windows_vbs
@@ -120,7 +136,10 @@ class TestInstallAutostart:
                 install_autostart("127.0.0.1", 8321)
         assert vbs.exists()
         content = vbs.read_text()
-        assert "jacked.exe" in content
+        # Launches jacked either way: pythonw -m jacked (preferred) or the
+        # jacked.exe trampoline as fallback.
+        assert "jacked" in content
+        assert "service start --host 127.0.0.1 --port 8321" in content
 
 
 class TestUninstallAutostart:
