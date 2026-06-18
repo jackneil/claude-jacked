@@ -3153,6 +3153,78 @@ def _run_install(
         else:
             console.print("[dim][-][/dim] No project env detected")
 
+    # Tray: when the [tray] extra is installed, make it "just work" — register
+    # login autostart and start the tray now (idempotent; no-op without [tray]).
+    _setup_tray_autostart()
+
+
+def _tray_extra_installed() -> bool:
+    """True if the optional [tray] dependency (pystray) is importable."""
+    try:
+        import pystray  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_autostart_and_running(
+    host: str, port: int, *, label: str = "Service"
+) -> None:
+    """Register login autostart and make sure the service is running now.
+
+    macOS: ``install_autostart`` loads it via launchd (starts immediately).
+    Windows/Linux: ``install_autostart`` only registers the login entry, so we
+    spawn the detached service ourselves when nothing is already listening.
+    Idempotent and non-fatal — never aborts the caller.
+    """
+    from jacked.service import PID_FILE
+    from jacked.service.platform import install_autostart
+    from jacked.service.process import is_process_alive, read_pid
+
+    result = install_autostart(host, port)
+    if result.startswith("Could not find"):
+        console.print(f"[red]Error:[/red] {result}")
+        return
+    console.print("[green][OK][/green] Autostart registered (starts on login)")
+
+    info = read_pid(PID_FILE)
+    if info and is_process_alive(info["pid"]):
+        console.print(
+            f"[dim][-][/dim] {label} already running "
+            f"(pid {info['pid']} -> http://127.0.0.1:{info['port']})"
+        )
+        return
+    if sys.platform == "darwin":
+        # launchd just started it via install_autostart's launchctl load; the
+        # PID file can lag a beat, so don't race it with a second spawn.
+        console.print(
+            f"[green][OK][/green] {label} started via launchd -> "
+            f"http://127.0.0.1:{port}"
+        )
+        return
+    try:
+        _spawn_service_detached(host, port)
+        console.print(
+            f"[green][OK][/green] {label} started -> http://127.0.0.1:{port}"
+        )
+    except Exception as exc:
+        console.print(
+            f"[yellow][WARN][/yellow] Could not start {label.lower()}: {exc} "
+            "-- run `jacked start`"
+        )
+
+
+def _setup_tray_autostart() -> None:
+    """When the [tray] extra is installed, register login autostart and start
+    the tray now so `jacked install` makes the icon appear. No-op without the
+    extra (base / headless / CI installs)."""
+    if not _tray_extra_installed():
+        return
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+
+    _ensure_autostart_and_running(DEFAULT_HOST, DEFAULT_PORT, label="Tray")
+
 
 # Plugins that jacked's behaviors and skills genuinely depend on. Missing
 # any of these means key workflows are broken, so install surfaces them as a
@@ -4083,15 +4155,12 @@ def service_status():
 @click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_install(host: str | None, port: int | None):
-    """Configure jacked to start automatically on login."""
+    """Configure jacked to start automatically on login, and start it now."""
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT
-    from jacked.service.platform import install_autostart
 
-    result = install_autostart(host or DEFAULT_HOST, port or DEFAULT_PORT)
-    if result.startswith("Could not find"):
-        console.print(f"[red]Error:[/red] {result}")
-    else:
-        console.print(f"[green][OK][/green] {result}")
+    _ensure_autostart_and_running(
+        host or DEFAULT_HOST, port or DEFAULT_PORT, label="Service"
+    )
 
 
 @service.command(name="uninstall")

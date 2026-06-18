@@ -1,0 +1,127 @@
+"""Tests for tray auto-install during `jacked install` (and `jacked service install`)."""
+
+import builtins
+import sys
+from unittest import mock
+
+
+# ---------------------------------------------------------------------------
+# _tray_extra_installed
+# ---------------------------------------------------------------------------
+
+
+class TestTrayExtraInstalled:
+    def test_true_when_pystray_importable(self, monkeypatch):
+        import jacked.cli as cli
+        monkeypatch.setitem(sys.modules, "pystray", mock.MagicMock())
+        assert cli._tray_extra_installed() is True
+
+    def test_false_when_pystray_missing(self, monkeypatch):
+        import jacked.cli as cli
+        monkeypatch.delitem(sys.modules, "pystray", raising=False)
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "pystray":
+                raise ImportError("no pystray here")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        assert cli._tray_extra_installed() is False
+
+
+# ---------------------------------------------------------------------------
+# _setup_tray_autostart
+# ---------------------------------------------------------------------------
+
+
+class TestSetupTrayAutostart:
+    def test_noop_without_tray_extra(self, monkeypatch):
+        import jacked.cli as cli
+        monkeypatch.setattr(cli, "_tray_extra_installed", lambda: False)
+        calls = []
+        monkeypatch.setattr(cli, "_ensure_autostart_and_running", lambda *a, **k: calls.append(a))
+        cli._setup_tray_autostart()
+        assert calls == []  # base/headless install -> nothing happens
+
+    def test_registers_and_starts_with_tray_extra(self, monkeypatch):
+        import jacked.cli as cli
+        monkeypatch.setattr(cli, "_tray_extra_installed", lambda: True)
+        captured = {}
+
+        def fake_ensure(host, port, *, label="Service"):
+            captured.update(host=host, port=port, label=label)
+
+        monkeypatch.setattr(cli, "_ensure_autostart_and_running", fake_ensure)
+        cli._setup_tray_autostart()
+        assert captured["label"] == "Tray"
+        assert captured["port"]  # DEFAULT_PORT threaded through
+
+
+# ---------------------------------------------------------------------------
+# _ensure_autostart_and_running
+# ---------------------------------------------------------------------------
+
+
+def _patch_autostart(monkeypatch, *, result, pid=None, alive=True, platform="win32"):
+    import jacked.cli as cli
+    monkeypatch.setattr("jacked.service.platform.install_autostart", lambda *a, **k: result)
+    monkeypatch.setattr("jacked.service.process.read_pid", lambda *a, **k: pid)
+    monkeypatch.setattr("jacked.service.process.is_process_alive", lambda _pid: alive)
+    monkeypatch.setattr(cli.sys, "platform", platform)
+    spawned = []
+    monkeypatch.setattr(cli, "_spawn_service_detached", lambda h, p: spawned.append((h, p)))
+    return cli, spawned
+
+
+class TestEnsureAutostartAndRunning:
+    def test_never_starts_if_autostart_registration_failed(self, monkeypatch):
+        cli, spawned = _patch_autostart(
+            monkeypatch, result="Could not find 'jacked' binary on PATH."
+        )
+        cli._ensure_autostart_and_running("127.0.0.1", 8321)
+        assert spawned == []
+
+    def test_skips_spawn_when_already_running(self, monkeypatch):
+        cli, spawned = _patch_autostart(
+            monkeypatch,
+            result="Installed startup script: x",
+            pid={"pid": 999, "port": 8321},
+            alive=True,
+        )
+        cli._ensure_autostart_and_running("127.0.0.1", 8321)
+        assert spawned == []  # no double-start
+
+    def test_spawns_when_stopped_on_windows(self, monkeypatch):
+        cli, spawned = _patch_autostart(
+            monkeypatch, result="Installed startup script: x", pid=None, platform="win32"
+        )
+        cli._ensure_autostart_and_running("127.0.0.1", 8321, label="Tray")
+        assert spawned == [("127.0.0.1", 8321)]
+
+    def test_no_self_spawn_on_macos(self, monkeypatch):
+        # launchd already started it via install_autostart's launchctl load
+        cli, spawned = _patch_autostart(
+            monkeypatch,
+            result="Installed and started launchd agent",
+            pid=None,
+            platform="darwin",
+        )
+        cli._ensure_autostart_and_running("127.0.0.1", 8321)
+        assert spawned == []
+
+    def test_spawn_failure_is_non_fatal(self, monkeypatch):
+        import jacked.cli as cli
+        monkeypatch.setattr(
+            "jacked.service.platform.install_autostart",
+            lambda *a, **k: "Installed startup script: x",
+        )
+        monkeypatch.setattr("jacked.service.process.read_pid", lambda *a, **k: None)
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+
+        def boom(*a, **k):
+            raise OSError("spawn blew up")
+
+        monkeypatch.setattr(cli, "_spawn_service_detached", boom)
+        # Must not propagate — install should never die over the tray.
+        cli._ensure_autostart_and_running("127.0.0.1", 8321)

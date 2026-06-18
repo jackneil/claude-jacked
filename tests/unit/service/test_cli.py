@@ -74,14 +74,17 @@ class TestServiceStop:
 
 
 class TestServiceInstall:
+    @patch("jacked.cli._spawn_service_detached")
+    @patch("jacked.service.process.read_pid", return_value=None)
     @patch("jacked.service.platform.install_autostart")
-    def test_install_calls_platform(self, mock_install):
+    def test_install_calls_platform(self, mock_install, _mock_read, _mock_spawn):
         from jacked.cli import main
-        mock_install.return_value = "Installed launchd agent: /test/path"
+        mock_install.return_value = "Installed startup script: /test/path"
         runner = CliRunner()
         result = runner.invoke(main, ["service", "install"])
         assert result.exit_code == 0
         mock_install.assert_called_once()
+        assert "Autostart registered" in result.output
 
 
 class TestServiceUninstall:
@@ -106,10 +109,12 @@ class TestServiceInstallError:
         assert "Error" in result.output
         assert "Could not find" in result.output
 
+    @patch("jacked.cli._spawn_service_detached")
+    @patch("jacked.service.process.read_pid", return_value=None)
     @patch("jacked.service.platform.install_autostart")
-    def test_install_shows_ok_on_success(self, mock_install):
+    def test_install_shows_ok_on_success(self, mock_install, _mock_read, _mock_spawn):
         from jacked.cli import main
-        mock_install.return_value = "Installed launchd agent: /test/path"
+        mock_install.return_value = "Installed startup script: /test/path"
         runner = CliRunner()
         result = runner.invoke(main, ["service", "install"])
         assert "OK" in result.output
