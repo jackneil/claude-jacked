@@ -2779,7 +2779,6 @@ def install(
     Use --search to add session indexing (requires qdrant-client).
     """
     import json
-    import shutil
 
     home = _jacked_home()
     pkg_root = _get_data_root()
