@@ -571,6 +571,12 @@ continuation. Works on a bare install; no Qdrant/search extra required.
 
 It recommends the newest session **with real substance** — a near-empty newest session is skipped (but still offered as an alternate). And if the crashed session was actively driving a `/goal` or `/loop` (which can't be auto-resumed), the digest surfaces that exact command verbatim so you can copy-paste it back into Claude Code to restart it.
 
+### `/whats-next` ambition: safe by default, `/bhag` to build it all
+
+`/whats-next` is the everyday, **safe-by-default** roadmap command: it picks the highest-leverage work and forges a `/goal` brief that lands on a feature branch and **opens a PR for review — it never merges to `main` itself**.
+
+When a product is **pre-production** and you want it driven to completion autonomously, run **`/bhag`** (Big Hairy Audacious Goal). It runs the coverage matrix at full breadth and forges a long-running `/goal` brief that loops cell-by-cell — implement → verify → PR → **merge to `main`** → next — until the product is built out. Auto-merge is **double-gated**: it only happens when the repo's declared Lifecycle is Greenfield/Alpha **and** you explicitly authorize it in-session (and only after CI is green); on anything resembling a live product it refuses and degrades to safe staged PRs. `/bhag` is a deliberately-typed command (never auto-triggered), because auto-merging to `main` in a loop is the most powerful thing jacked can do.
+
 ---
 
 ## Built-in Reviewers and Commands

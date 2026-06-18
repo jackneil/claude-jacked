@@ -240,7 +240,7 @@ Build the complete scope of this brief as ordered milestones — no MVP, no stub
 3. <milestone 3 — concrete deliverable(s)>
 (add only the milestones this initiative truly needs)
 
-Approach: plan before coding (write the plan down first for an initiative this size). Use TDD where it fits — failing test, then implement, then green. Match the existing patterns in <relevant area>. Build cleanly: no silent failures, no swallowed errors, no arbitrary data/scope caps; follow CLAUDE.md. Stay in scope: work only on this initiative's feature branch, committing each green milestone so an interrupted run leaves a clean, resumable state — do not refactor unrelated code, force-push, rewrite shared history, delete data, or run untrusted install/network scripts. If a step looks destructive or out of scope, stop and ask.
+Approach: plan before coding (write the plan down first for an initiative this size). Use TDD where it fits — failing test, then implement, then green. Match the existing patterns in <relevant area>. Build cleanly: no silent failures, no swallowed errors, no arbitrary data/scope caps; follow CLAUDE.md. Stay in scope: work only on this initiative's feature branch, committing each green milestone so an interrupted run leaves a clean, resumable state — do not refactor unrelated code, force-push, rewrite shared history, delete data, or run untrusted install/network scripts. When the work is verified, open a PR (feature branch → main) for review — do **not** merge to main yourself; the user reviews and merges. (For an autonomous, pre-production build-out that merges each improvement as it goes, that's `/bhag`, not this.) If a step looks destructive or out of scope, stop and ask.
 
 Verify — run each and show the output; ALL must pass before you stop:
 - <repo's real test command, e.g. `uv run python -m pytest`> exits clean, with NEW tests covering every milestone's behavior and its edge cases
@@ -249,7 +249,7 @@ Verify — run each and show the output; ALL must pass before you stop:
 - [security-sensitive only — auth, RBAC, tenancy, billing, credentials] `/cso` runs and reports no high/critical findings
 - [if `/dcr` is available] `/dcr` runs and reports a clean pass
 
-DONE when: every milestone is built, the test command and the per-milestone real-run proofs all pass in the transcript, every applicable review gate reports clean, and the work is committed on a feature branch. Do NOT stop while any milestone is unmet or unproven — diagnose, fix, re-run. Never report success without the supporting output.
+DONE when: every milestone is built, the test command and the per-milestone real-run proofs all pass in the transcript, every applicable review gate reports clean, and the work is committed on a feature branch and opened as a PR for review (not merged to main). Do NOT stop while any milestone is unmet or unproven — diagnose, fix, re-run. Never report success without the supporting output.
 ```
 
 After the block, add exactly this recipe line: **"Copy the block above (not this line), type `/goal `, paste, and send — Claude then works autonomously until every Verify item passes and shows its evidence. Prefer to drive it yourself? Run `/jack-it-up` instead."** (`/goal` is a built-in on recent Claude Code versions; if it's unavailable, the same brief works pasted as an ordinary message.) For a file-backed run you already emitted the pointer-goal in place of this template — the user copies that block instead; same `/goal ` paste-and-send.
