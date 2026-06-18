@@ -2567,6 +2567,36 @@ def _run_claude_mcp(
         return None
 
 
+def _run_claude_plugin(
+    *args: str, timeout: int = 120
+) -> "subprocess.CompletedProcess[str] | None":
+    """Run a ``claude plugin`` subcommand, returning the result or None on error.
+
+    stdin is closed (DEVNULL) so an unexpected confirmation prompt can never
+    hang ``jacked install``.
+    """
+    import shutil
+    import subprocess
+
+    from jacked.winproc import NO_WINDOW
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        return None
+
+    try:
+        return subprocess.run(
+            [claude_bin, "plugin", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def _install_chrome_devtools_mcp(force: bool = False) -> None:
     """Install Chrome DevTools MCP server (user-scoped via ``claude mcp add``)."""
     result = _run_claude_mcp("get", "chrome-devtools")
@@ -3089,6 +3119,9 @@ def _run_install(
     # Install Chrome DevTools MCP server (user-scoped)
     _install_chrome_devtools_mcp(force=force)
 
+    # Auto-install required Claude Code plugins (user-scoped, best-effort)
+    _install_required_plugins(force=force)
+
     # Ensure analytics DB exists
     try:
         from jacked.web.database import Database
@@ -3127,9 +3160,8 @@ def _run_install(
 _REQUIRED_PLUGINS = {
     "superpowers@claude-plugins-official": "brainstorming, planning, TDD, subagent workflows",
     "playwright@claude-plugins-official": "/qa and /ux browser testing",
-    "firecrawl@claude-plugins-official": "web search and scraping in skills",
     "commit-commands@claude-plugins-official": "/commit, /commit-push-pr",
-    "pr-review-toolkit@claude-plugins-official": "/review-pr, code review agents",
+    "code-review@claude-code-plugins": "/code-review multi-agent PR review",
 }
 
 
@@ -3165,6 +3197,47 @@ def _warn_required_plugins_missing() -> None:
             f"[yellow]! Required plugin missing:[/yellow] {name} — {desc} "
             "(enable via /plugins)"
         )
+
+
+def _install_required_plugins(force: bool = False) -> None:
+    """Auto-install jacked's required Claude Code plugins (best-effort).
+
+    Runs ``claude plugin install <id> -s user`` for each required plugin that
+    isn't already present in settings.json's enabledPlugins. Idempotent and
+    non-fatal: a missing ``claude`` binary, a timeout, or a plugin error just
+    prints a warning with the manual fallback — install never aborts over it.
+    A plugin the user explicitly disabled (key present but false) is left alone
+    unless ``force`` is set.
+    """
+    import shutil
+
+    if not shutil.which("claude"):
+        console.print(
+            "[yellow][WARN][/yellow] `claude` CLI not found — skipping plugin "
+            "install. Enable required plugins via /plugins."
+        )
+        return
+
+    installed = _installed_plugins()
+    for plugin, desc in _REQUIRED_PLUGINS.items():
+        name = plugin.split("@")[0]
+        if plugin in installed and not force:
+            console.print(f"[dim][-][/dim] Plugin already configured: {name}")
+            continue
+        result = _run_claude_plugin("install", plugin, "-s", "user")
+        if result is None:
+            console.print(
+                f"[yellow][WARN][/yellow] Could not install {name} — enable via /plugins"
+            )
+        elif result.returncode == 0:
+            console.print(f"[green][OK][/green] Plugin installed: {name} — {desc}")
+        else:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()
+            msg = tail[-1] if tail else "unknown error"
+            console.print(
+                f"[yellow][WARN][/yellow] Plugin install failed for {name}: {msg} "
+                "— enable via /plugins"
+            )
 
 
 def _recommend_external_tools():
@@ -3260,6 +3333,14 @@ def _recommend_external_tools():
                 "  npm install -g agent-browser                           "
                 "# Browser QA testing (/dogfood skill)"
             )
+
+    # Firecrawl CLI — web search & scraping used by jacked skills. We use the
+    # CLI, not the (buggy) firecrawl MCP plugin.
+    if not shutil.which("firecrawl"):
+        tools.append(
+            "  npm install -g firecrawl-cli                           "
+            "# Web search & scraping (then: firecrawl login)"
+        )
 
     if tools:
         console.print("\nRecommended tools:")
