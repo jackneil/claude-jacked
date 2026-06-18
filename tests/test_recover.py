@@ -227,6 +227,38 @@ def test_cli_recover_digest_for_session(tmp_path, monkeypatch):
     assert f"claude --resume {SID_A}" in result.output
 
 
+def test_cli_recover_human_marker_points_at_recommended(tmp_path, monkeypatch):
+    # Human (non-json) path: the '->' marker must point at the substantive
+    # session, not the near-empty newest one. Mirrors recommend_index logic.
+    projects = tmp_path / "projects"
+    cwd = "/work/myrepo"
+    pdir = projects / "-work-myrepo"
+    # Near-empty NEWEST session (just 1 user msg) -> must be skipped.
+    _write_session(pdir, SID_LIVE, [
+        _user_line(cwd, ts="2026-06-17T12:00:00.000Z"),
+    ])
+    # Older but SUBSTANTIVE session (>= 4 user/assistant msgs).
+    _write_session(pdir, SID_A, [
+        _user_line(cwd, ts="2026-06-16T09:00:00.000Z"),
+        {"type": "user", "timestamp": "2026-06-16T09:01:00.000Z",
+         "message": {"role": "user", "content": "do the thing"}},
+        _assistant_text("on it", "2026-06-16T09:02:00.000Z"),
+        {"type": "user", "timestamp": "2026-06-16T09:03:00.000Z",
+         "message": {"role": "user", "content": "keep going"}},
+        _assistant_text("done", "2026-06-16T09:04:00.000Z"),
+        _meta("ai-title", aiTitle="Substantive work"),
+        _meta("last-prompt", lastPrompt="keep going"),
+    ])
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects))
+    runner = CliRunner()
+    result = runner.invoke(main, ["recover", "--cwd", cwd, "--limit", "5"])
+    assert result.exit_code == 0, result.output
+    marker_lines = [ln for ln in result.output.splitlines() if ln.startswith("->")]
+    assert len(marker_lines) == 1, result.output
+    assert SID_A in marker_lines[0]
+    assert SID_LIVE not in marker_lines[0]
+
+
 def test_cli_recover_no_sessions_json(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
     projects.mkdir(parents=True)
