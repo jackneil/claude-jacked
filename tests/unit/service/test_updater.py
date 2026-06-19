@@ -136,6 +136,41 @@ class TestRunUpdate:
     # Removed in 0.41.19: pip installs are refused by the gate, not auto-upgraded.
 
 
+class TestWindowsTrayUpdaterBatch:
+    @patch("sys.platform", "win32")
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.findbin.find_bin", return_value=r"C:\uv\uv.exe")
+    @patch("subprocess.Popen")
+    def test_tray_update_wait_loop_is_bounded(
+        self, mock_popen, mock_find, mock_method, mock_gate, tmp_path, monkeypatch,
+    ):
+        """Tray-update helper must bound its parent-wait loop too — same
+        PID-reuse infinite-spin bug as the `jacked upgrade` helper."""
+        from jacked.service.updater import _spawn_windows_tray_updater
+
+        import tempfile as _tempfile
+        real_mkstemp = _tempfile.mkstemp
+        created = []
+        def fake_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, dir=str(tmp_path), **{k: v for k, v in kwargs.items() if k != "dir"})
+            created.append(path)
+            return fd, path
+        monkeypatch.setattr(_tempfile, "mkstemp", fake_mkstemp)
+
+        _spawn_windows_tray_updater(parent_pid=4242, extras="tray", port=8321)
+
+        assert len(created) == 1
+        batch = open(created[0]).read()
+        assert "JACKED_WAITED" in batch
+        assert ":waitdone" in batch
+        assert "GEQ 120" in batch
+        assert "4242" in batch  # waits on the correct parent PID
+        # old unbounded form gone
+        assert "if not errorlevel 1" not in batch
+        mock_popen.assert_called_once()
+
+
 class TestPortWaitBeforeServiceStart:
     @patch("jacked.service.platform.ensure_native_lifecycle",
            return_value=(False, "unavailable", "test: force manual spawn"))
