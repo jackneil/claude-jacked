@@ -1250,12 +1250,23 @@ def _spawn_windows_upgrade_helper(
         'set SKIP_SERVICE=' + ("1" if skip_service else "") + '\r\n'
         'echo [%date% %time%] jacked upgrade helper starting (parent PID ' + str(my_pid) + ') >> "%LOGFILE%"\r\n'
         'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
+        # Bounded poll: a bare `find "<pid>"` matches ANY process that later
+        # reuses this PID, so an unbounded loop can spin forever (each iter
+        # spawning a visible find/tasklist console) long after the real parent
+        # died. Cap the wait and proceed anyway — same "give up and continue"
+        # contract as the POSIX updater's wait_for_exit timeout.
+        'set /a JACKED_WAITED=0\r\n'
         ':wait\r\n'
         'tasklist /FI "PID eq ' + str(my_pid) + '" 2>NUL | find "' + str(my_pid) + '" >NUL\r\n'
-        'if not errorlevel 1 (\r\n'
-        '    timeout /t 1 /nobreak >NUL\r\n'
-        '    goto wait\r\n'
+        'if errorlevel 1 goto waitdone\r\n'
+        'set /a JACKED_WAITED+=1\r\n'
+        'if %JACKED_WAITED% GEQ 120 (\r\n'
+        '    echo [%date% %time%] WARNING: parent ' + str(my_pid) + ' still listed after 120s; proceeding (PID may be reused) >> "%LOGFILE%"\r\n'
+        '    goto waitdone\r\n'
         ')\r\n'
+        'timeout /t 1 /nobreak >NUL\r\n'
+        'goto wait\r\n'
+        ':waitdone\r\n'
         'echo [%date% %time%] parent exited, running upgrade command >> "%LOGFILE%"\r\n'
         + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
         'if errorlevel 1 (\r\n'

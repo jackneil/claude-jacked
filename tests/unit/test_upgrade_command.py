@@ -331,3 +331,35 @@ class TestUpgradeWindows:
 
         batch = open(created[0]).read()
         assert "set SKIP_SERVICE=1" in batch
+
+    @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.findbin.find_bin")
+    @patch("subprocess.Popen")
+    def test_windows_batch_wait_loop_is_bounded(
+        self, mock_popen, mock_find, mock_method, tmp_path, monkeypatch,
+    ):
+        """Parent-wait loop must be bounded — an unbounded `find <pid>` poll
+        spins forever once the dead PID is reused (the original bug)."""
+        from jacked.cli import main
+        mock_find.side_effect = lambda name: {"uv": r"C:\uv\uv.exe"}.get(name)
+
+        import tempfile as _tempfile
+        real_mkstemp = _tempfile.mkstemp
+        created = []
+        def fake_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, dir=str(tmp_path), **{k: v for k, v in kwargs.items() if k != "dir"})
+            created.append(path)
+            return fd, path
+        monkeypatch.setattr(_tempfile, "mkstemp", fake_mkstemp)
+
+        CliRunner().invoke(main, ["upgrade"])
+
+        batch = open(created[0]).read()
+        # bounded loop markers present
+        assert "JACKED_WAITED" in batch
+        assert ":waitdone" in batch
+        assert "GEQ 120" in batch
+        assert "goto wait" in batch  # the loop itself still exists
+        # the old unbounded form is gone
+        assert "if not errorlevel 1" not in batch

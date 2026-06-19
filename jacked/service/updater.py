@@ -607,12 +607,22 @@ def _spawn_windows_tray_updater(
         # Phase: waiting_for_parent
         'jacked _update_status waiting_for_parent in_progress\r\n'
         + DRIFT_GUARD +
+        # Bounded poll — see _spawn_windows_upgrade_helper in cli.py. A bare
+        # `find "<pid>"` matches any process that reuses this PID, so an
+        # unbounded loop can spin forever after the real parent died. Cap it
+        # and proceed (mirrors the POSIX wait_for_exit timeout).
+        'set /a JACKED_WAITED=0\r\n'
         ':wait\r\n'
         'tasklist /FI "PID eq ' + str(parent_pid) + '" 2>NUL | find "' + str(parent_pid) + '" >NUL\r\n'
-        'if not errorlevel 1 (\r\n'
-        '    timeout /t 1 /nobreak >NUL\r\n'
-        '    goto wait\r\n'
+        'if errorlevel 1 goto waitdone\r\n'
+        'set /a JACKED_WAITED+=1\r\n'
+        'if %JACKED_WAITED% GEQ 120 (\r\n'
+        '    echo [%date% %time%] WARNING: parent ' + str(parent_pid) + ' still listed after 120s; proceeding (PID may be reused) >> "%LOGFILE%"\r\n'
+        '    goto waitdone\r\n'
         ')\r\n'
+        'timeout /t 1 /nobreak >NUL\r\n'
+        'goto wait\r\n'
+        ':waitdone\r\n'
         'jacked _update_status waiting_for_parent ok\r\n'
         + DRIFT_GUARD +
         'echo [%date% %time%] parent exited >> "%LOGFILE%"\r\n'
