@@ -121,12 +121,15 @@
    auto-fit + minmax(min(...)) keeps ONE column until each card can be a
    comfortable width, then flows to two side-by-side. The min() guard stops
    the track from overflowing below the breakpoint; the page wrapper's
-   max-width caps the flow at two columns. */
+   max-width caps the flow at two columns.
+   align-items: stretch makes side-by-side cards share the row height, so a
+   card with lots of repos doesn't tower over a bare one next to it — both
+   columns line up evenly. */
 .accounts-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(600px, 100%), 1fr));
     gap: 1rem;
-    align-items: start;
+    align-items: stretch;
 }
 
 /* Badge styles */
