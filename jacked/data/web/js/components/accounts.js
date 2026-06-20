@@ -389,7 +389,7 @@ function renderAccounts(accounts) {
     const cardsHtml = sorted.map((acct, idx) => renderAccountCard(acct, idx, sorted.length)).join('');
 
     return `
-        <div class="max-w-5xl">
+        <div class="max-w-[1700px]">
             <div class="flex items-center justify-between mb-5">
                 <h2 class="text-xl font-semibold text-white">Accounts</h2>
                 <div class="flex items-center gap-2">
@@ -415,20 +415,23 @@ function renderAccounts(accounts) {
             <div id="oauth-flow-status"></div>
             ${typeof renderSessionControls === 'function' ? renderSessionControls() : ''}
             ${typeof renderSessionLookupResult === 'function' ? renderSessionLookupResult() : ''}
-            <div id="accounts-list" class="flex flex-col gap-3">
+            <!-- Responsive card grid — see .accounts-grid in style.css.
+                 Reflows to 2 columns only when each card can be a comfortable
+                 width; the wrapper's max-width caps the flow at 2. -->
+            <div id="accounts-list" class="accounts-grid">
                 ${cardsHtml}
             </div>
 
             <div class="mt-6 bg-slate-800 border border-slate-700 rounded-lg p-4">
                 <h3 class="text-sm font-medium text-slate-300 mb-3">Swap History</h3>
-                <div id="swap-history-container">
+                <div id="swap-history-container" class="overflow-x-auto">
                     <div class="text-xs text-slate-500">Loading...</div>
                 </div>
             </div>
 
             <div class="mt-6 bg-slate-800 border border-slate-700 rounded-lg p-4">
                 <h3 class="text-sm font-medium text-slate-300 mb-3">Decision Log</h3>
-                <div id="decision-log-container" data-show-all="false">
+                <div id="decision-log-container" class="overflow-x-auto" data-show-all="false">
                     <div class="text-xs text-slate-500">Loading...</div>
                 </div>
             </div>

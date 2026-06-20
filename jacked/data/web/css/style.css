@@ -117,6 +117,18 @@
     box-shadow: 0 0 0 1px rgba(71, 85, 105, 0.3);
 }
 
+/* Accounts page: responsive card grid (Bootstrap-style reflow).
+   auto-fit + minmax(min(...)) keeps ONE column until each card can be a
+   comfortable width, then flows to two side-by-side. The min() guard stops
+   the track from overflowing below the breakpoint; the page wrapper's
+   max-width caps the flow at two columns. */
+.accounts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(600px, 100%), 1fr));
+    gap: 1rem;
+    align-items: start;
+}
+
 /* Badge styles */
 .badge {
     display: inline-flex;
