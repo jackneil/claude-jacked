@@ -36,12 +36,12 @@ Carry `/whats-next`'s rules into the brief: **measure the brief with `wc -c` and
 ```
 Deliver: drive <product> toward best-in-class across its full coverage matrix, autonomously, one verified improvement at a time, merging each to main, until the matrix is covered.
 
-Loop — repeat until the worklist is empty or the backstop hits. For each matrix cell, in order:
+Loop — repeat until the worklist is empty or the backstop hits. Each iteration delivers exactly ONE cell end-to-end — implement, verify, open a PR, and merge it to main — and that merge MUST land on main before the next iteration starts; never run two cells at once or carry an unmerged cell forward. For each matrix cell, in order:
 1. State the cell and the concrete improvement it needs (regenerate this each iteration; do not pre-write them all).
 2. Implement it on a fresh feature branch off the latest main. TDD where it fits; match existing patterns; build cleanly (no silent failures, no stubs, no arbitrary caps); follow CLAUDE.md.
 3. Verify: run <repo's real test command> and show passing output; add NEW tests covering the change; run any applicable gate (/cso for security-sensitive, /qa for UI). A red iteration is NEVER merged — fix it or STOP.
 4. Open a PR (feature branch → main). **WAIT for all CI checks to finish**, then merge ONLY if local tests were green AND every CI check reports **passed** — never while any check is pending, skipped, neutral, or failed; if CI does not run at all, treat the iteration as unverified and do NOT merge. Merge with `gh pr merge --merge` (a true merge commit) — never `--squash`, `--rebase`, or `--admin`, and never bypass branch protection. Never force-push, never rewrite shared history, never merge a red or unverified change.
-5. Pull main and move to the next cell.
+5. Only after that PR has actually merged into main, pull the updated main and move on. Do NOT start the next cell until the current cell's PR is both opened AND merged to main — one cell → one PR → one merge → then the next.
 
 Worklist: <the ordered matrix cells from Step 1-6>.
 
@@ -52,7 +52,7 @@ STOP / BLOCKED: if an iteration can't be made green, or anything looks unsafe, S
 DONE when: every worklist cell is delivered, verified with passing output shown, and merged to main green — or the backstop halts the run with a summary of what landed and what remains.
 ```
 
-**STAGED mode brief** (production / unconfirmed — the safe default) — identical to the MERGE brief EXCEPT step 4 becomes: *"Open a PR (feature branch → main) and leave it for human review. **Do NOT merge to main.**"* and the DONE line becomes *"...every cell delivered and verified with each landed as an open PR awaiting review; nothing merged to main."* Tell the user this is staged mode and why.
+**STAGED mode brief** (production / unconfirmed — the safe default) — identical to the MERGE brief EXCEPT: step 4 becomes *"Open a PR (feature branch → main) and leave it for human review. **Do NOT merge to main.**"*; step 5 becomes *"Leave that PR open for review and move to the next cell — each cell still gets its own fresh branch + PR."*; the loop intro drops the "merge it to main … that merge MUST land before the next iteration" clause (replace with "open a PR for it before starting the next"); and the DONE line becomes *"...every cell delivered and verified with each landed as an open PR awaiting review; nothing merged to main."* Tell the user this is staged mode and why.
 
 After the block, add: **"Copy the block above (not this line), type `/goal `, paste, and send — Claude then runs the build-out loop autonomously. Prefer to drive it yourself or go targeted? Run `/whats-next` instead."** (`/goal` is built in on recent Claude Code; the brief also works pasted as an ordinary message.)
 
