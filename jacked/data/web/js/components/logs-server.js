@@ -45,17 +45,17 @@ function renderServerLogs(container) {
         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
             <div class="flex items-center gap-3">
                 <div class="text-sm text-slate-400">Live server output</div>
-                <span id="srv-new-badge" class="hidden text-xs px-2 py-0.5 rounded-full bg-blue-600 text-blue-100 font-medium"></span>
+                <span id="srv-new-badge" class="hidden text-xs px-2 py-0.5 rounded-full bg-blue-600 text-blue-100 font-medium tabular-nums"></span>
             </div>
             <div class="flex flex-wrap items-center gap-2">
                 <div id="srv-level-filters" class="flex rounded-lg overflow-hidden border border-slate-700 text-xs">
                     ${_srvFilterBtn('ALL')}${_srvFilterBtn('ERROR')}${_srvFilterBtn('WARNING')}${_srvFilterBtn('INFO')}
                 </div>
-                <button id="srv-pause-btn" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition-colors">
+                <button id="srv-pause-btn" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition active:scale-[0.96]">
                     <span class="srv-pause-dot w-2 h-2 rounded-full bg-green-400 logs-live-indicator"></span>
                     <span class="srv-pause-label">Live</span>
                 </button>
-                <button id="srv-clear-btn" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition-colors">
+                <button id="srv-clear-btn" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition active:scale-[0.96]">
                     Clear
                 </button>
             </div>

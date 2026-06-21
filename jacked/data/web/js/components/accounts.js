@@ -160,8 +160,8 @@ function renderExtraUsageCredits(usage) {
                 <div class="usage-bar flex-1">
                     <div class="fill ${colorClass}" style="width: ${Math.min(100, pct).toFixed(1)}%"></div>
                 </div>
-                <span class="text-xs font-mono w-10 text-right ${textColor}">${Math.round(pct)}%</span>
-                <span class="text-xs text-slate-500 w-36 text-right">${escapeHtml(creditText)}</span>
+                <span class="text-xs font-mono w-10 text-right tabular-nums ${textColor}">${Math.round(pct)}%</span>
+                <span class="text-xs text-slate-500 w-36 text-right tabular-nums">${escapeHtml(creditText)}</span>
             </div>
         </div>
     `;
@@ -207,7 +207,7 @@ function renderActionButtons(acct) {
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
     } else if (acct.is_active) {
-        setActiveHtml = `<button class="btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 border border-teal-600/30 rounded font-medium transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Use Account</button>`;
+        setActiveHtml = `<button class="btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 border border-teal-600/30 rounded font-medium transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Use Account</button>`;
     }
 
     // Copy launch command — hidden now that dashboard switching works.
@@ -220,7 +220,7 @@ function renderActionButtons(acct) {
     const showReauth = status === 'invalid' || status === 'expired';
     let reauthHtml = '';
     if (showReauth) {
-        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition-colors" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
+        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
     }
 
     // Toggle active/disabled
@@ -233,8 +233,8 @@ function renderActionButtons(acct) {
             ${copyHtml}
             <div class="flex-1"></div>
             ${reauthHtml}
-            <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition-colors" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
-            <button class="btn-delete text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded transition-colors" data-id="${acct.id}" title="Delete account">
+            <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition active:scale-[0.96]" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
+            <button class="btn-delete text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded transition active:scale-[0.96]" data-id="${acct.id}" title="Delete account">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
             </button>
         </div>
@@ -313,7 +313,7 @@ function renderAccountCard(acct, idx, total) {
                     <div class="flex items-center gap-2 flex-wrap">
                         <span class="status-dot ${status}"></span>
                         <span class="font-medium text-white truncate max-w-[300px]" title="${escapeHtml(primaryName)}">${escapeHtml(primaryName)}</span>
-                        <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors" data-id="${acct.id}" data-label="${escapeHtml(label)}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
+                        <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors relative" data-id="${acct.id}" data-label="${escapeHtml(label)}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
                         </button>
                         ${priorityBadge}
@@ -327,7 +327,7 @@ function renderAccountCard(acct, idx, total) {
                         <span class="text-xs text-slate-400">${escapeHtml(subDisplay)}</span>
                         <span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
-                        <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">
+                        <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded relative" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                         </button>
                     </div>
@@ -391,9 +391,9 @@ function renderAccounts(accounts) {
     return `
         <div class="max-w-[1700px]">
             <div class="flex items-center justify-between mb-5">
-                <h2 class="text-xl font-semibold text-white">Accounts</h2>
+                <h2 class="text-xl font-semibold text-white text-balance">Accounts</h2>
                 <div class="flex items-center gap-2">
-                    <button id="btn-refresh-all-usage" class="flex items-center gap-2 px-4 py-2 text-slate-300 hover:text-white hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-600 transition-colors">
+                    <button id="btn-refresh-all-usage" class="flex items-center gap-2 px-4 py-2 text-slate-300 hover:text-white hover:bg-slate-700 text-sm font-medium rounded-lg border border-slate-600 transition active:scale-[0.96]">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                         Refresh All Usage
                     </button>
@@ -403,7 +403,7 @@ function renderAccounts(accounts) {
                         <option value="300">Auto: 5 min</option>
                         <option value="600">Auto: 10 min</option>
                     </select>
-                    <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors">
+                    <button id="btn-add-account" class="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition active:scale-[0.96]">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                         Add Account
                     </button>
@@ -450,7 +450,7 @@ function renderEmptyState() {
             </div>
             <h3 class="text-lg font-semibold text-white mb-1">No accounts connected</h3>
             <p class="text-sm text-slate-400 mb-6">Connect your Claude account to get started</p>
-            <button id="btn-add-account" class="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors">
+            <button id="btn-add-account" class="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition active:scale-[0.96]">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                 Add Account
             </button>

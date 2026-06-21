@@ -50,14 +50,14 @@ function _renderSessionRiskTable(data) {
                 <td class="px-3 py-2 text-xs font-mono text-slate-300" title="${escapeHtml(s.repo_path || '')}">
                     ${escapeHtml(repo || shortId)}
                 </td>
-                <td class="px-3 py-2 text-xs text-slate-200 text-center">${(s.total_decisions || 0).toLocaleString()}</td>
-                <td class="px-3 py-2 text-xs text-red-300 text-center">${(s.denials || 0).toLocaleString()}</td>
-                <td class="px-3 py-2 text-xs font-semibold text-center ${riskClass}">${risk.toFixed(1)}</td>
+                <td class="px-3 py-2 text-xs text-slate-200 text-center tabular-nums">${(s.total_decisions || 0).toLocaleString()}</td>
+                <td class="px-3 py-2 text-xs text-red-300 text-center tabular-nums">${(s.denials || 0).toLocaleString()}</td>
+                <td class="px-3 py-2 text-xs font-semibold text-center ${riskClass} tabular-nums">${risk.toFixed(1)}</td>
             </tr>`;
     }).join('');
 
     container.innerHTML = `
-        <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden overflow-x-auto">
+        <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden overflow-x-auto" style="box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25)">
             <table class="w-full">
                 <thead>
                     <tr class="border-b border-slate-700">
@@ -125,9 +125,9 @@ function _renderRulesTables(data) {
                     <td class="px-3 py-2 text-center">
                         <span class="inline-block px-2 py-0.5 rounded text-xs font-medium ${badgeClass}">${decision}</span>
                     </td>
-                    <td class="px-3 py-2 text-xs text-slate-300 text-center">${count.toLocaleString()}</td>
+                    <td class="px-3 py-2 text-xs text-slate-300 text-center tabular-nums">${count.toLocaleString()}</td>
                     <td class="px-3 py-2 text-center">
-                        <button class="analytics-add-rule-btn px-2 py-1 rounded text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors"
+                        <button class="analytics-add-rule-btn px-2 py-1 rounded text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition active:scale-[0.96]"
                             data-command="${cmd}" data-decision="${decision}">
                             Add Rule
                         </button>
@@ -138,7 +138,7 @@ function _renderRulesTables(data) {
         html += `
             <div class="mb-4">
                 <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Suggested Rules</h4>
-                <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden overflow-x-auto">
+                <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden overflow-x-auto" style="box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25)">
                     <table class="w-full">
                         <thead>
                             <tr class="border-b border-slate-700">
@@ -162,14 +162,14 @@ function _renderRulesTables(data) {
             return `
                 <tr class="hover:bg-slate-700/30 transition-colors">
                     <td class="px-3 py-2 text-xs font-mono text-slate-200">${escapeHtml(h.method || '')}</td>
-                    <td class="px-3 py-2 text-xs text-slate-300 text-center">${(h.count || 0).toLocaleString()}</td>
+                    <td class="px-3 py-2 text-xs text-slate-300 text-center tabular-nums">${(h.count || 0).toLocaleString()}</td>
                 </tr>`;
         }).join('');
 
         html += `
             <div>
                 <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Hot Methods</h4>
-                <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden overflow-x-auto">
+                <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden overflow-x-auto" style="box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25)">
                     <table class="w-full">
                         <thead>
                             <tr class="border-b border-slate-700">

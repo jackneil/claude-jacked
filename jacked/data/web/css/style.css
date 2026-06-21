@@ -1,5 +1,10 @@
 /* jacked web dashboard — custom styles */
 
+body {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
 /* Status dots */
 .status-dot {
     display: inline-block;
@@ -230,7 +235,7 @@
 
 /* Priority arrows */
 .priority-btn {
-    padding: 2px;
+    padding: 4px;
     border-radius: 4px;
     color: #64748b;
     transition: color 150ms ease, background-color 150ms ease;
@@ -238,6 +243,17 @@
     border: none;
     background: none;
     line-height: 1;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.priority-btn::before {
+    content: '';
+    position: absolute;
+    inset: -1px -10px;
+    pointer-events: auto;
 }
 
 .priority-btn:hover {
@@ -443,6 +459,14 @@
     transition: opacity 0.15s;
     vertical-align: baseline;
     display: inline;
+    position: relative;
+}
+
+.version-upgrade-btn::before {
+    content: '';
+    position: absolute;
+    inset: -8px 1px -8px -8px;
+    pointer-events: auto;
 }
 
 .version-upgrade-btn:hover { opacity: 1; }
@@ -512,6 +536,14 @@
     transition: opacity 0.15s;
     vertical-align: baseline;
     display: inline;
+    position: relative;
+}
+
+.version-refresh::before {
+    content: '';
+    position: absolute;
+    inset: -8px -8px -8px 1px;
+    pointer-events: auto;
 }
 
 .version-refresh:hover {

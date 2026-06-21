@@ -126,7 +126,7 @@ function renderAutoSwapPanel() {
                                 <div class="flex items-center justify-between">
                                     <div class="flex items-center gap-2">
                                         <span class="text-slate-400 text-sm">Enable Auto-Swap</span>
-                                        <span id="auto-swap-24h-counter" class="text-xs text-slate-500">${escapeHtml(counterText)}</span>
+                                        <span id="auto-swap-24h-counter" class="text-xs text-slate-500 tabular-nums">${escapeHtml(counterText)}</span>
                                     </div>
                                     <label class="toggle-switch">
                                         <input type="checkbox" id="chk-auto-swap" ${autoSwapEnabled ? 'checked' : ''}>
@@ -143,7 +143,7 @@ function renderAutoSwapPanel() {
                                     </div>
                                     <div class="flex items-center gap-1.5">
                                         ${isPaused
-                                            ? '<button id="btn-swap-resume" class="text-xs px-2.5 py-1 bg-teal-600/20 text-teal-400 border border-teal-600/30 rounded hover:bg-teal-600/30 transition-colors">Resume</button>'
+                                            ? '<button id="btn-swap-resume" class="text-xs px-2.5 py-1 bg-teal-600/20 text-teal-400 border border-teal-600/30 rounded hover:bg-teal-600/30 transition active:scale-[0.96]">Resume</button>'
                                             : `<select id="sel-swap-pause" class="bg-slate-700 border border-slate-600 text-slate-300 text-xs rounded px-2 py-1 cursor-pointer hover:border-slate-500 transition-colors">
                                                     <option value="">Not paused</option>
                                                     <option value="30">30 min</option>
@@ -157,7 +157,7 @@ function renderAutoSwapPanel() {
                                 <div>
                                     <div class="flex items-center justify-between mb-1">
                                         <span class="text-slate-400 text-sm">5h Warning Threshold</span>
-                                        <span class="text-slate-300 text-sm font-mono" id="lbl-warn-5h">${warn5h}%</span>
+                                        <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-warn-5h">${warn5h}%</span>
                                     </div>
                                     <input type="range" id="rng-warn-5h" min="50" max="100" value="${warn5h}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer">
                                 </div>
@@ -166,7 +166,7 @@ function renderAutoSwapPanel() {
                                 <div>
                                     <div class="flex items-center justify-between mb-1">
                                         <span class="text-slate-400 text-sm">5h Critical Threshold</span>
-                                        <span class="text-slate-300 text-sm font-mono" id="lbl-crit-5h">${crit5h}%</span>
+                                        <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-crit-5h">${crit5h}%</span>
                                     </div>
                                     <input type="range" id="rng-crit-5h" min="50" max="100" value="${crit5h}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer">
                                 </div>
@@ -175,7 +175,7 @@ function renderAutoSwapPanel() {
                                 <div>
                                     <div class="flex items-center justify-between mb-1">
                                         <span class="text-slate-400 text-sm">7-Day Threshold</span>
-                                        <span class="text-slate-300 text-sm font-mono" id="lbl-thresh-7d">${thresh7d}%</span>
+                                        <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-thresh-7d">${thresh7d}%</span>
                                     </div>
                                     <input type="range" id="rng-thresh-7d" min="50" max="100" value="${thresh7d}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer">
                                 </div>
@@ -314,10 +314,10 @@ function renderSwapLogTable(entries) {
         const residency = escapeHtml(formatResidency(res));
         return `
             <tr class="border-t border-slate-700/30">
-                <td class="py-1.5 pr-3 text-xs text-slate-400 whitespace-nowrap">${ts}</td>
+                <td class="py-1.5 pr-3 text-xs text-slate-400 whitespace-nowrap tabular-nums">${ts}</td>
                 <td class="py-1.5 pr-3 text-xs text-slate-300 whitespace-nowrap">${from} \u2192 ${to}</td>
                 <td class="py-1.5 pr-3 text-xs whitespace-nowrap">${statusBadge}</td>
-                <td class="py-1.5 pr-3 text-xs ${residencyCls} whitespace-nowrap">${residency}</td>
+                <td class="py-1.5 pr-3 text-xs ${residencyCls} whitespace-nowrap tabular-nums">${residency}</td>
                 <td class="py-1.5 text-xs text-slate-500">${reason}</td>
             </tr>
         `;
@@ -383,7 +383,7 @@ function renderDecisionLogTable(entries) {
             : 'border-t border-slate-700/30';
 
         return '<tr class="' + rowClass + '"' + clickHandler + '>' +
-            '<td class="py-1.5 pr-3 text-xs text-slate-400 whitespace-nowrap">' + ts + '</td>' +
+            '<td class="py-1.5 pr-3 text-xs text-slate-400 whitespace-nowrap tabular-nums">' + ts + '</td>' +
             '<td class="py-1.5 pr-3 text-xs">' + actionBadge + '</td>' +
             '<td class="py-1.5 pr-3 text-xs text-slate-300">' + accountLabel + '</td>' +
             '<td class="py-1.5 text-xs text-slate-500">' + reason + '</td>' +
@@ -434,7 +434,7 @@ function buildDecisionDetailHtml(d, detailId) {
     // Candidates table
     if (d.candidates && d.candidates.length > 0) {
         let table = '<div class="mb-2"><span class="text-slate-400">Candidates evaluated:</span></div>' +
-            '<table class="w-full text-[10px] mb-2"><thead><tr class="text-slate-500">' +
+            '<table class="w-full text-[10px] mb-2 tabular-nums"><thead><tr class="text-slate-500">' +
             '<th class="text-left pr-2">Account</th>' +
             '<th class="pr-2 text-right">5h</th>' +
             '<th class="pr-2 text-right">7d</th>' +
