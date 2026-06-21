@@ -47,13 +47,13 @@ function _section(id, title, defaultOpen, contentHtml) {
     const open = _isOpen(id, defaultOpen);
     return `
         <div class="mb-4">
-            <button class="analytics-collapse-btn flex items-center justify-between w-full text-left py-2 group" data-section="${id}">
+            <button class="analytics-collapse-btn flex items-center justify-between w-full text-left py-2 group rounded-t-lg" data-section="${id}">
                 <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider group-hover:text-white">${title}</h3>
                 <svg class="w-4 h-4 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
                 </svg>
             </button>
-            <div id="analytics-section-${id}" class="${open ? '' : 'hidden'}">
+            <div id="analytics-section-${id}" class="${open ? 'rounded-b-lg' : 'rounded-lg hidden'}">
                 ${contentHtml}
             </div>
         </div>`;
@@ -89,28 +89,28 @@ function _renderKpis(kpi, tokenCosts) {
     return `
         <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
             <div class="stat-card">
-                <div class="text-2xl font-bold text-white">${(kpi.total_decisions || 0).toLocaleString()}</div>
+                <div class="text-2xl font-bold text-white tabular-nums">${(kpi.total_decisions || 0).toLocaleString()}</div>
                 <div class="text-xs text-slate-400 mt-1">Total Decisions</div>
             </div>
             <div class="stat-card">
-                <div class="text-2xl font-bold ${rateColor}">${rate}%</div>
+                <div class="text-2xl font-bold ${rateColor} tabular-nums">${rate}%</div>
                 <div class="text-xs text-slate-400 mt-1">Approval Rate</div>
             </div>
             <div class="stat-card">
-                <div class="text-2xl font-bold text-red-400">${(kpi.denials || 0).toLocaleString()}</div>
+                <div class="text-2xl font-bold text-red-400 tabular-nums">${(kpi.denials || 0).toLocaleString()}</div>
                 <div class="text-xs text-slate-400 mt-1">Denials</div>
             </div>
             <div class="stat-card">
-                <div class="text-2xl font-bold text-blue-400">${cov}%</div>
+                <div class="text-2xl font-bold text-blue-400 tabular-nums">${cov}%</div>
                 <div class="text-xs text-slate-400 mt-1">Rule Coverage</div>
             </div>
             <div class="stat-card">
-                <div class="text-2xl font-bold text-amber-400">${(kpi.api_evaluations || 0).toLocaleString()}</div>
+                <div class="text-2xl font-bold text-amber-400 tabular-nums">${(kpi.api_evaluations || 0).toLocaleString()}</div>
                 <div class="text-xs text-slate-400 mt-1">API Evaluations</div>
             </div>
             <div class="stat-card">
-                <div class="text-2xl font-bold text-emerald-400">${costDisplay}</div>
-                <div class="text-xs text-slate-400 mt-1">API Cost <span class="text-slate-500">(${tokenDisplay} tok)</span></div>
+                <div class="text-2xl font-bold text-emerald-400 tabular-nums">${costDisplay}</div>
+                <div class="text-xs text-slate-400 mt-1">API Cost <span class="text-slate-500 tabular-nums">(${tokenDisplay} tok)</span></div>
             </div>
         </div>`;
 }

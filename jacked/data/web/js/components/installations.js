@@ -100,11 +100,11 @@ function renderGlobalInstallationCard(gi) {
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
                 <div>
                     <div class="text-xs text-slate-400 mb-1">Agents</div>
-                    <div class="text-lg font-bold text-white">${agentsInstalled}<span class="text-sm text-slate-500">/${agentsTotal}</span></div>
+                    <div class="text-lg font-bold text-white tabular-nums">${agentsInstalled}<span class="text-sm text-slate-500">/${agentsTotal}</span></div>
                 </div>
                 <div>
                     <div class="text-xs text-slate-400 mb-1">Commands</div>
-                    <div class="text-lg font-bold text-white">${cmdsInstalled}<span class="text-sm text-slate-500">/${cmdsTotal}</span></div>
+                    <div class="text-lg font-bold text-white tabular-nums">${cmdsInstalled}<span class="text-sm text-slate-500">/${cmdsTotal}</span></div>
                 </div>
                 <div>
                     <div class="text-xs text-slate-400 mb-1">Hooks</div>
@@ -176,7 +176,7 @@ function renderProjectCard(project) {
         statsHtml += `
             <div class="flex items-center justify-between text-xs">
                 <span class="text-slate-400">Gatekeeper</span>
-                <span class="text-white">${project.gatekeeper_decisions.toLocaleString()} <span class="text-slate-500">(${approvalRate}% approved)</span></span>
+                <span class="text-white tabular-nums">${project.gatekeeper_decisions.toLocaleString()} <span class="text-slate-500">(${approvalRate}% approved)</span></span>
             </div>
         `;
     }
@@ -185,7 +185,7 @@ function renderProjectCard(project) {
         statsHtml += `
             <div class="flex items-center justify-between text-xs">
                 <span class="text-slate-400">Commands</span>
-                <span class="text-white">${project.commands_run.toLocaleString()}</span>
+                <span class="text-white tabular-nums">${project.commands_run.toLocaleString()}</span>
             </div>
         `;
     }
@@ -194,7 +194,7 @@ function renderProjectCard(project) {
         statsHtml += `
             <div class="flex items-center justify-between text-xs">
                 <span class="text-slate-400">Hook runs</span>
-                <span class="text-white">${project.hook_executions.toLocaleString()}</span>
+                <span class="text-white tabular-nums">${project.hook_executions.toLocaleString()}</span>
             </div>
         `;
     }
@@ -203,7 +203,7 @@ function renderProjectCard(project) {
         statsHtml += `
             <div class="flex items-center justify-between text-xs">
                 <span class="text-slate-400">Sessions</span>
-                <span class="text-white">${project.unique_sessions.toLocaleString()}</span>
+                <span class="text-white tabular-nums">${project.unique_sessions.toLocaleString()}</span>
             </div>
         `;
     }
@@ -245,8 +245,8 @@ function renderProjectCard(project) {
             <div class="flex items-center gap-1.5 mb-2 text-[10px]">
                 <span class="text-slate-500">Env:</span>
                 <span class="text-cyan-400 font-mono truncate max-w-[200px]" title="${escapeHtml(project.env_path)}">${escapeHtml(project.env_path)}</span>
-                <button class="jacked-edit-env text-slate-600 hover:text-cyan-400 transition-colors" data-repo="${escapeHtml(project.repo_path)}" title="Edit env path">
-                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
+                <button class="jacked-edit-env text-slate-600 hover:text-cyan-400 transition-colors relative before:absolute before:inset-[-8px] before:z-0 before:pointer-events-auto" data-repo="${escapeHtml(project.repo_path)}" title="Edit env path">
+                    <svg class="w-3 h-3 relative z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
                 </button>
             </div>`;
     } else {
@@ -254,11 +254,11 @@ function renderProjectCard(project) {
             <div class="flex items-center gap-1.5 mb-2 text-[10px]">
                 <span class="text-slate-500">Env:</span>
                 <span class="text-slate-600">Not configured</span>
-                <button class="jacked-detect-env text-slate-600 hover:text-cyan-400 transition-colors" data-repo="${escapeHtml(project.repo_path)}" title="Auto-detect env">
-                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+                <button class="jacked-detect-env text-slate-600 hover:text-cyan-400 transition-colors relative before:absolute before:inset-[-3px] before:z-0 before:pointer-events-auto" data-repo="${escapeHtml(project.repo_path)}" title="Auto-detect env">
+                    <svg class="w-3 h-3 relative z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
                 </button>
-                <button class="jacked-edit-env text-slate-600 hover:text-cyan-400 transition-colors" data-repo="${escapeHtml(project.repo_path)}" title="Set env path manually">
-                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
+                <button class="jacked-edit-env text-slate-600 hover:text-cyan-400 transition-colors relative before:absolute before:inset-[-3px] before:z-0 before:pointer-events-auto" data-repo="${escapeHtml(project.repo_path)}" title="Set env path manually">
+                    <svg class="w-3 h-3 relative z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
                 </button>
             </div>`;
     }
@@ -446,8 +446,8 @@ function _renderLessonsEditor(panel, repoPath, lessons) {
             <div class="flex items-start gap-2 group lesson-row" data-lesson-idx="${i}">
                 <span class="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border ${strikeColor} mt-0.5 shrink-0">${lesson.strike}x</span>
                 <textarea class="lesson-text flex-1 bg-slate-900/50 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 resize-none outline-none focus:border-purple-600 transition-colors" rows="1" data-idx="${i}">${escapeHtml(lesson.text)}</textarea>
-                <button class="lesson-delete text-slate-600 hover:text-red-400 transition-colors mt-0.5 shrink-0" data-idx="${i}" title="Delete lesson">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                <button class="lesson-delete text-slate-600 hover:text-red-400 transition-colors mt-0.5 shrink-0 relative before:absolute before:inset-[-6px] before:z-0 before:pointer-events-auto" data-idx="${i}" title="Delete lesson">
+                    <svg class="w-3.5 h-3.5 relative z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                 </button>
             </div>
         `;
@@ -455,7 +455,7 @@ function _renderLessonsEditor(panel, repoPath, lessons) {
 
     html += `
         <div class="flex items-center gap-2 pt-1">
-            <button class="lessons-save text-[10px] px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white transition-colors" data-repo="${escapeHtml(repoPath)}">Save</button>
+            <button class="lessons-save text-[10px] px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white transition active:scale-[0.96]" data-repo="${escapeHtml(repoPath)}">Save</button>
             <span class="lessons-status text-[10px] text-slate-500"></span>
         </div>
     </div>`;
@@ -561,8 +561,8 @@ function _showEnvEditor(repoPath) {
     panel.innerHTML = `
         <div class="flex items-center gap-1.5">
             <input type="text" class="env-path-input flex-1 bg-slate-900/50 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 outline-none focus:border-cyan-600 transition-colors font-mono" placeholder="/path/to/env" value="">
-            <button class="env-save-btn text-[10px] px-2 py-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white transition-colors" data-repo="${escapeHtml(repoPath)}">Save</button>
-            <button class="env-cancel-btn text-[10px] px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors">Cancel</button>
+            <button class="env-save-btn text-[10px] px-2 py-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white transition active:scale-[0.96]" data-repo="${escapeHtml(repoPath)}">Save</button>
+            <button class="env-cancel-btn text-[10px] px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition active:scale-[0.96]">Cancel</button>
         </div>
         <div class="env-error text-[10px] text-red-400 mt-1 hidden"></div>
     `;

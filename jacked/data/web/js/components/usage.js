@@ -30,7 +30,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label) {
                 <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>
                 ${markerHtml}
             </div>
-            <span class="text-xs font-mono w-10 text-right ${colorClass === 'red' ? 'text-red-400' : colorClass === 'yellow' ? 'text-yellow-400' : 'text-slate-300'}">${Math.round(pct)}%</span>
+            <span class="text-xs font-mono w-10 text-right tabular-nums ${colorClass === 'red' ? 'text-red-400' : colorClass === 'yellow' ? 'text-yellow-400' : 'text-slate-300'}">${Math.round(pct)}%</span>
             <span class="text-xs text-slate-500 w-28 text-right">${escapeHtml(resetDisplay)}</span>
         </div>
     `;

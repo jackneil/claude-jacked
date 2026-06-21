@@ -13,7 +13,7 @@ function renderHookLogs(container) {
             <div class="text-sm text-slate-400">Hook execution history</div>
             <div class="flex flex-wrap items-center gap-2">
                 ${renderPauseButton()}
-                <button id="hook-logs-refresh" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition-colors">
+                <button id="hook-logs-refresh" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition active:scale-[0.96]">
                     Refresh
                 </button>
             </div>
@@ -79,7 +79,7 @@ async function loadHookLogsData() {
                     <td class="px-3 py-2 text-sm font-mono text-slate-200">${escapeHtml(r.hook_name || '-')}</td>
                     <td class="px-3 py-2 text-xs text-slate-300">${escapeHtml(r.hook_type || '-')}</td>
                     <td class="px-3 py-2">${successBadge(r.success)}</td>
-                    <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap text-right">${formatDuration(r.duration_ms)}</td>
+                    <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap text-right tabular-nums">${formatDuration(r.duration_ms)}</td>
                     <td class="px-3 py-2 text-xs text-slate-500 font-mono">${escapeHtml(r.session_id ? r.session_id.substring(0, 8) : '-')}</td>
                     <td class="px-3 py-2 text-xs text-slate-500 font-mono" title="${escapeHtml(r.repo_path || '')}">${escapeHtml(repoShort(r.repo_path))}</td>
                 </tr>

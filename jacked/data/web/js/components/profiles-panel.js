@@ -13,10 +13,10 @@ function renderProfilesPanel() {
             <div class="flex items-center justify-between mb-4">
                 <h3 class="text-sm font-medium text-slate-300">Security Profiles</h3>
                 <div class="flex gap-2">
-                    <button id="btn-import-profile" class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 text-slate-300 hover:bg-slate-600 hover:text-white transition-colors">
+                    <button id="btn-import-profile" class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 text-slate-300 hover:bg-slate-600 hover:text-white transition active:scale-[0.96]">
                         Import
                     </button>
-                    <button id="btn-export-profile" class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 text-white hover:bg-blue-500 transition-colors">
+                    <button id="btn-export-profile" class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 text-white hover:bg-blue-500 transition active:scale-[0.96]">
                         Export Current
                     </button>
                 </div>
@@ -59,7 +59,7 @@ async function _loadProfilesTable() {
                     <td class="px-3 py-2 text-xs text-slate-500 font-mono">${escapeHtml(p.jacked_version || '-')}</td>
                     <td class="px-3 py-2 text-xs text-slate-500">${escapeHtml(created)}</td>
                     <td class="px-3 py-2 text-right">
-                        <button class="profile-delete-btn text-red-400 hover:text-red-300 text-xs" data-name="${escapeHtml(p.name)}">
+                        <button class="profile-delete-btn text-red-400 hover:text-red-300 text-xs relative before:absolute before:inset-[-8px] before:z-0 before:pointer-events-auto" data-name="${escapeHtml(p.name)}">
                             Delete
                         </button>
                     </td>

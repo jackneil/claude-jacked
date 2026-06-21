@@ -14,7 +14,7 @@ function renderSettings(settings) {
     return `
         <div class="max-w-4xl">
             <div class="flex items-center justify-between mb-5">
-                <h2 class="text-xl font-semibold text-white">Settings</h2>
+                <h2 class="text-xl font-semibold text-white text-balance">Settings</h2>
             </div>
 
             <!-- Tab Bar -->
@@ -221,7 +221,7 @@ async function renderAgentsTab(container) {
         }).join('');
 
         container.innerHTML = `
-            <p class="text-xs text-slate-500 mb-4">Specialized agents installed to <code class="text-slate-300">~/.claude/agents/</code>. Toggle to enable or disable individual agents.</p>
+            <p class="text-xs text-slate-500 mb-4 text-pretty">Specialized agents installed to <code class="text-slate-300">~/.claude/agents/</code>. Toggle to enable or disable individual agents.</p>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 ${cardsHtml}
             </div>
@@ -232,7 +232,7 @@ async function renderAgentsTab(container) {
         container.innerHTML = `
             <div class="text-center py-12">
                 <div class="text-red-400 text-sm mb-3">Failed to load agents: ${escapeHtml(e.message)}</div>
-                <button onclick="renderSettingsTab('agents')" class="text-xs text-blue-400 hover:text-blue-300">Retry</button>
+                <button onclick="renderSettingsTab('agents')" class="text-xs text-blue-400 hover:text-blue-300 transition active:scale-[0.96]">Retry</button>
             </div>
         `;
     }
@@ -270,7 +270,7 @@ async function renderCommandsTab(container) {
         `).join('');
 
         container.innerHTML = `
-            <p class="text-xs text-slate-500 mb-4">Slash commands installed to <code class="text-slate-300">~/.claude/commands/</code>. Use these with <code class="text-slate-300">/command-name</code> in Claude Code.</p>
+            <p class="text-xs text-slate-500 mb-4 text-pretty">Slash commands installed to <code class="text-slate-300">~/.claude/commands/</code>. Use these with <code class="text-slate-300">/command-name</code> in Claude Code.</p>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 ${cardsHtml}
             </div>
@@ -281,7 +281,7 @@ async function renderCommandsTab(container) {
         container.innerHTML = `
             <div class="text-center py-12">
                 <div class="text-red-400 text-sm mb-3">Failed to load commands: ${escapeHtml(e.message)}</div>
-                <button onclick="renderSettingsTab('commands')" class="text-xs text-blue-400 hover:text-blue-300">Retry</button>
+                <button onclick="renderSettingsTab('commands')" class="text-xs text-blue-400 hover:text-blue-300 transition active:scale-[0.96]">Retry</button>
             </div>
         `;
     }
@@ -321,7 +321,7 @@ async function renderGatekeeperTab(container) {
         container.innerHTML = `
             <div class="text-center py-12">
                 <div class="text-red-400 text-sm mb-3">Failed to load gatekeeper config: ${escapeHtml(e.message)}</div>
-                <button onclick="renderSettingsTab('gatekeeper')" class="text-xs text-blue-400 hover:text-blue-300">Retry</button>
+                <button onclick="renderSettingsTab('gatekeeper')" class="text-xs text-blue-400 hover:text-blue-300 transition active:scale-[0.96]">Retry</button>
             </div>
         `;
     }
@@ -481,10 +481,10 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety, commandCateg
                     <div class="flex items-center gap-2">
                         <input id="gk-api-key" type="password" placeholder="${config.api_key_set && config.api_key_source === 'db' ? 'API key saved \u2014 enter new value to replace' : 'Leave empty to use ANTHROPIC_API_KEY env var'}"
                                class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
-                        <button id="btn-gk-toggle-key" class="px-3 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors" title="Show/hide">
+                        <button id="btn-gk-toggle-key" class="px-3 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors relative before:absolute before:inset-[-8px] before:z-0" title="Show/hide">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
                         </button>
-                        <button id="btn-gk-test-key" class="px-3 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition-colors">Test</button>
+                        <button id="btn-gk-test-key" class="px-3 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition active:scale-[0.96]">Test</button>
                     </div>
                     <div id="gk-key-test-result" class="mt-1 text-xs"></div>
                     <p class="mt-1 text-xs text-slate-500">Overrides the ANTHROPIC_API_KEY environment variable. Clear to revert to env var.</p>
@@ -493,14 +493,14 @@ function renderGatekeeperContent(config, hookInstalled, pathSafety, commandCateg
                 <!-- Save Button -->
                 <div class="flex items-center justify-between pt-2 border-t border-slate-700">
                     <button id="btn-gk-clear-key" class="text-xs text-red-400 hover:text-red-300 transition-colors ${config.api_key_source === 'db' ? '' : 'hidden'}">Clear stored API key</button>
-                    <button id="btn-gk-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors">Save Config</button>
+                    <button id="btn-gk-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition active:scale-[0.96]">Save Config</button>
                 </div>
 
                 <!-- Prompt Editor (collapsible) -->
                 <div class="border-t border-slate-700 pt-4 mt-2">
                     <div id="prompt-editor-header" class="flex items-center justify-between cursor-pointer select-none">
                         <div class="flex items-center gap-3">
-                            <span class="text-sm font-medium text-slate-300">Gatekeeper LLM Prompt</span>
+                            <span class="text-sm font-medium text-slate-300 text-balance">Gatekeeper LLM Prompt</span>
                             <span id="prompt-source-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">Loading...</span>
                         </div>
                         <svg id="prompt-chevron" class="w-5 h-5 text-slate-400 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -562,9 +562,9 @@ function renderPathSafetySection(pathSafety) {
     }).join('');
 
     const pathRows = allowedPaths.map((p, i) => `
-        <div class="flex items-center gap-2 p-2 bg-slate-900/50 rounded border border-slate-700/50">
+        <div class="flex items-center gap-2 p-2 bg-slate-900/50 rounded shadow-sm shadow-slate-900/40">
             <code class="text-xs text-slate-300 flex-1 truncate">${escapeHtml(p)}</code>
-            <button class="ps-remove-path text-xs text-red-400 hover:text-red-300 px-1" data-index="${i}" title="Remove">&times;</button>
+            <button class="ps-remove-path text-xs text-red-400 hover:text-red-300 px-1 relative before:absolute before:inset-x-[-8px] before:inset-y-[-2px] before:z-0" data-index="${i}" title="Remove">&times;</button>
         </div>
     `).join('');
 
@@ -579,7 +579,7 @@ function renderPathSafetySection(pathSafety) {
                 <span class="toggle-slider"></span>
             </label>
         </div>
-        <p class="text-xs text-slate-500 mb-4">Requires permission for reads/writes to files that commonly contain secrets and access outside your project directory. Deterministic checks — no LLM needed.</p>
+        <p class="text-xs text-slate-500 mb-4 text-pretty">Requires permission for reads/writes to files that commonly contain secrets and access outside your project directory. Deterministic checks — no LLM needed.</p>
 
         <div id="ps-config-body" class="${sectionOpacity}">
             <!-- Sensitive File Patterns -->
@@ -658,15 +658,15 @@ function renderPathSafetySection(pathSafety) {
                             <div class="flex items-center gap-2 p-2 bg-red-900/20 rounded border border-red-800/30">
                                 <code class="text-xs text-red-300 flex-1 truncate">${escapeHtml(p)}</code>
                                 ${watchedExistence[p] === false ? '<span class="text-[10px] text-amber-400 whitespace-nowrap">(does not exist)</span>' : ''}
-                                <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1" data-index="${i}" title="Remove">&times;</button>
+                                <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1 relative before:absolute before:inset-x-[-8px] before:inset-y-[-2px] before:z-0" data-index="${i}" title="Remove">&times;</button>
                             </div>
                         `).join('') : '<div class="text-xs text-slate-500 italic p-2">No watched paths. Add paths to always require permission when accessed.</div>'}
                     </div>
                     <div class="flex items-center gap-2">
                         <input id="ps-new-watched" type="text" placeholder="e.g. C:/Users/jack/production-configs"
                                class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-red-500">
-                        <button id="ps-add-watched" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition-colors">+ Add</button>
-                        <button id="ps-browse-watched" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition-colors">Browse</button>
+                        <button id="ps-add-watched" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition active:scale-[0.96]">+ Add</button>
+                        <button id="ps-browse-watched" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition active:scale-[0.96]">Browse</button>
                     </div>
                     <div id="ps-watched-error" class="text-xs text-red-400 mt-1 hidden"></div>
                     <div id="ps-dir-browser" class="hidden mt-2 bg-slate-900 border border-slate-700 rounded-lg p-3"></div>
@@ -688,7 +688,7 @@ function renderPathSafetySection(pathSafety) {
                     <div class="flex items-center gap-2">
                         <input id="ps-new-path" type="text" placeholder="e.g. C:/Users/jack/.conda/envs"
                                class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-orange-500">
-                        <button id="ps-add-path" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition-colors">+ Add</button>
+                        <button id="ps-add-path" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition active:scale-[0.96]">+ Add</button>
                     </div>
                 </div>
             </div>
@@ -697,14 +697,14 @@ function renderPathSafetySection(pathSafety) {
             <div id="ps-unsaved-banner" class="hidden mb-3 p-3 bg-amber-900/30 border border-amber-600/50 rounded-lg flex items-center justify-between">
                 <span class="text-xs text-amber-300 font-medium">You have unsaved changes</span>
                 <div class="flex gap-2">
-                    <button id="ps-banner-save" class="px-3 py-1 text-xs bg-amber-600 hover:bg-amber-500 text-white rounded transition-colors">Save Now</button>
-                    <button id="ps-banner-discard" class="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors">Discard</button>
+                    <button id="ps-banner-save" class="px-3 py-1 text-xs bg-amber-600 hover:bg-amber-500 text-white rounded transition active:scale-[0.96]">Save Now</button>
+                    <button id="ps-banner-discard" class="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition active:scale-[0.96]">Discard</button>
                 </div>
             </div>
 
             <!-- Save button -->
             <div class="flex items-center justify-end pt-2">
-                <button id="btn-ps-save" class="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm rounded transition-colors">Save Path Rules</button>
+                <button id="btn-ps-save" class="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm rounded transition active:scale-[0.96]">Save Path Rules</button>
             </div>
         </div>
     `;
@@ -732,7 +732,7 @@ function renderCommandCategoriesSection(commandCategories) {
         }).join('');
 
         return `
-            <div class="flex items-center gap-3 p-3 rounded ${colors.bg} border ${colors.border} transition-all" data-cat-key="${escapeHtml(key)}">
+            <div class="flex items-center gap-3 p-3 rounded ${colors.bg} border ${colors.border} transition-colors" data-cat-key="${escapeHtml(key)}">
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2">
                         <span class="w-2 h-2 rounded-full ${colors.dot} flex-shrink-0"></span>
@@ -765,7 +765,7 @@ function renderCommandCategoriesSection(commandCategories) {
                 ${rows}
             </div>
             <div class="flex items-center justify-end">
-                <button id="btn-cc-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors">Save Categories</button>
+                <button id="btn-cc-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition active:scale-[0.96]">Save Categories</button>
             </div>
         </div>
     `;
@@ -981,10 +981,10 @@ function bindPathSafetyEvents(pathSafety) {
 
         const idx = list.querySelectorAll('.ps-remove-path').length;
         const row = document.createElement('div');
-        row.className = 'flex items-center gap-2 p-2 bg-slate-900/50 rounded border border-slate-700/50';
+        row.className = 'flex items-center gap-2 p-2 bg-slate-900/50 rounded shadow-sm shadow-slate-900/40';
         row.innerHTML = `
             <code class="text-xs text-slate-300 flex-1 truncate">${escapeHtml(val)}</code>
-            <button class="ps-remove-path text-xs text-red-400 hover:text-red-300 px-1" data-index="${idx}" title="Remove">&times;</button>
+            <button class="ps-remove-path text-xs text-red-400 hover:text-red-300 px-1 relative before:absolute before:inset-x-[-8px] before:inset-y-[-2px] before:z-0" data-index="${idx}" title="Remove">&times;</button>
         `;
         list.appendChild(row);
         pathInput.value = '';
@@ -1222,7 +1222,7 @@ function _insertWatchedRow(list, path, exists) {
     row.innerHTML = `
         <code class="text-xs text-red-300 flex-1 truncate">${escapeHtml(path)}</code>
         ${existsBadge}
-        <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1" data-index="${idx}" title="Remove">&times;</button>
+        <button class="ps-remove-watched text-xs text-red-400 hover:text-red-300 px-1 relative before:absolute before:inset-x-[-8px] before:inset-y-[-2px] before:z-0" data-index="${idx}" title="Remove">&times;</button>
     `;
     list.appendChild(row);
     _rebindRemoveWatchedButtons();
@@ -1282,7 +1282,7 @@ async function _loadDirBrowser(startPath) {
         let html = `
             <div class="flex items-center justify-between mb-2">
                 <span class="text-xs text-slate-400 font-mono truncate flex-1" title="${escapeHtml(current)}">${escapeHtml(current)}</span>
-                <button id="ps-dir-close" class="text-xs text-slate-500 hover:text-slate-300 px-1 ml-2" title="Close">&times;</button>
+                <button id="ps-dir-close" class="text-xs text-slate-500 hover:text-slate-300 px-1 ml-2 relative before:absolute before:inset-[-8px] before:z-0" title="Close">&times;</button>
             </div>
         `;
 
@@ -1611,7 +1611,7 @@ async function loadPromptEditor() {
                 <button id="btn-prompt-reset" class="text-xs text-red-400 hover:text-red-300 transition-colors ${isCustom ? '' : 'hidden'}">Reset to Built-in</button>
                 <div class="flex items-center gap-2">
                     <span id="prompt-save-status" class="text-xs text-slate-500"></span>
-                    <button id="btn-prompt-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed" disabled>Save Prompt</button>
+                    <button id="btn-prompt-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition active:scale-[0.96] disabled:opacity-40 disabled:cursor-not-allowed" disabled>Save Prompt</button>
                 </div>
             </div>
         `;
@@ -1782,7 +1782,7 @@ async function renderFeaturesTab(container) {
         container.innerHTML = `
             <div class="text-center py-12">
                 <div class="text-red-400 text-sm mb-3">Failed to load features: ${escapeHtml(e.message)}</div>
-                <button onclick="renderSettingsTab('features')" class="text-xs text-blue-400 hover:text-blue-300">Retry</button>
+                <button onclick="renderSettingsTab('features')" class="text-xs text-blue-400 hover:text-blue-300 transition active:scale-[0.96]">Retry</button>
             </div>
         `;
     }
@@ -1875,7 +1875,7 @@ async function renderPluginsTab(container) {
         container.innerHTML = `
             <div class="text-center py-12">
                 <div class="text-red-400 text-sm mb-3">Failed to load plugins: ${escapeHtml(e.message)}</div>
-                <button onclick="renderSettingsTab('plugins')" class="text-xs text-blue-400 hover:text-blue-300">Retry</button>
+                <button onclick="renderSettingsTab('plugins')" class="text-xs text-blue-400 hover:text-blue-300 transition active:scale-[0.96]">Retry</button>
             </div>
         `;
     }
@@ -1958,7 +1958,7 @@ async function renderClaudeCodeTab(container) {
                         <div class="text-sm text-white">${escapeHtml(pref.display_name)}</div>
                         <div class="text-xs text-slate-400">${escapeHtml(pref.description)}</div>
                     </div>
-                    <input type="number" class="cc-key-number w-24 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white text-right focus:outline-none focus:border-blue-500"
+                    <input type="number" class="cc-key-number w-24 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white text-right tabular-nums focus:outline-none focus:border-blue-500"
                            data-key="${escapeHtml(pref.name)}" value="${escapeHtml(String(pref.value))}" data-default="${escapeHtml(String(pref.default))}">
                 </div>
             `;
@@ -2026,7 +2026,7 @@ async function renderClaudeCodeTab(container) {
                         <button id="btn-raw-revert" class="text-xs text-slate-400 hover:text-slate-300 transition-colors">Revert</button>
                         <div class="flex items-center gap-2">
                             <span id="raw-save-status" class="text-xs text-slate-500"></span>
-                            <button id="btn-raw-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed" disabled>Save</button>
+                            <button id="btn-raw-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition active:scale-[0.96] disabled:opacity-40 disabled:cursor-not-allowed" disabled>Save</button>
                         </div>
                     </div>
                 </div>
@@ -2039,7 +2039,7 @@ async function renderClaudeCodeTab(container) {
         container.innerHTML = `
             <div class="text-center py-12">
                 <div class="text-red-400 text-sm mb-3">Failed to load Claude Code settings: ${escapeHtml(e.message)}</div>
-                <button onclick="renderSettingsTab('claude-code')" class="text-xs text-blue-400 hover:text-blue-300">Retry</button>
+                <button onclick="renderSettingsTab('claude-code')" class="text-xs text-blue-400 hover:text-blue-300 transition active:scale-[0.96]">Retry</button>
             </div>
         `;
     }
@@ -2075,7 +2075,7 @@ function _renderNumericSection(title, items) {
                 <div class="text-sm text-white">${escapeHtml(item.display_name)}</div>
                 <div class="text-xs text-slate-400">${escapeHtml(item.description)}</div>
             </div>
-            <input type="number" class="cc-env-number w-28 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white text-right focus:outline-none focus:border-blue-500"
+            <input type="number" class="cc-env-number w-28 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white text-right tabular-nums focus:outline-none focus:border-blue-500"
                    data-env="${escapeHtml(item.name)}" value="${escapeHtml(item.value)}"
                    min="${item.min}" max="${item.max}" data-default="${escapeHtml(item.default)}">
         </div>
@@ -2117,7 +2117,7 @@ function _renderPermissionsSection(permissions) {
             ? items.map((rule, i) => `
                 <div class="flex items-center justify-between py-1.5 px-2 bg-slate-800 rounded text-sm group">
                     <code class="text-slate-200 text-xs font-mono truncate">${escapeHtml(rule)}</code>
-                    <button class="perm-remove-btn opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-all ml-2 flex-shrink-0"
+                    <button class="perm-remove-btn opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-opacity transition-colors ml-2 flex-shrink-0"
                             data-list="${listName}" data-index="${i}" title="Remove">
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                     </button>
@@ -2135,7 +2135,7 @@ function _renderPermissionsSection(permissions) {
                 <div class="flex items-center gap-2 mt-2">
                     <input type="text" class="perm-add-input flex-1 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs text-white font-mono placeholder-slate-500 focus:outline-none focus:border-blue-500"
                            data-list="${listName}" placeholder="e.g. Bash(git status:*)">
-                    <button class="perm-add-btn px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition-colors" data-list="${listName}">Add</button>
+                    <button class="perm-add-btn px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 text-white rounded transition active:scale-[0.96]" data-list="${listName}">Add</button>
                 </div>
             </div>
         `;
@@ -2631,11 +2631,11 @@ function renderAdvancedTab(container) {
         </div>
 
         <div class="mt-4 bg-slate-800 border border-slate-700 rounded-lg p-4">
-            <h3 class="text-sm font-medium text-slate-300 mb-3">Add Setting</h3>
+            <h3 class="text-sm font-medium text-slate-300 mb-3 text-balance">Add Setting</h3>
             <div class="flex items-center gap-3">
                 <input id="new-setting-key" type="text" placeholder="Key" class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
                 <input id="new-setting-value" type="text" placeholder="Value" class="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
-                <button id="btn-add-setting" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors">Add</button>
+                <button id="btn-add-setting" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition active:scale-[0.96]">Add</button>
             </div>
         </div>
     `;
@@ -2729,7 +2729,7 @@ function renderSettingRow(key, value) {
             </td>
             <td>
                 <div class="flex items-center gap-1">
-                    <button class="btn-save-setting text-xs px-2 py-1 text-blue-400 hover:text-blue-300 hover:bg-blue-900/30 rounded transition-colors hidden" data-key="${escapeHtml(key)}" title="Save">Save</button>
+                    <button class="btn-save-setting text-xs px-2 py-1 text-blue-400 hover:text-blue-300 hover:bg-blue-900/30 rounded transition active:scale-[0.96] hidden" data-key="${escapeHtml(key)}" title="Save">Save</button>
                     <button class="btn-delete-setting text-xs px-2 py-1 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded transition-colors" data-key="${escapeHtml(key)}" title="Delete">
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                     </button>

@@ -421,7 +421,11 @@ jackedWS.on('usage_refresh_progress', (msg) => {
             ? _createInlineSpinner()
             : document.createTextNode('');
         btn.appendChild(spinner);
-        btn.appendChild(document.createTextNode(' Refreshing ' + d.progress + '/' + d.total + '\u2026'));
+        btn.appendChild(document.createTextNode(' Refreshing '));
+        const counter = document.createElement('span');
+        counter.className = 'tabular-nums';
+        counter.textContent = d.progress + '/' + d.total + '\u2026';
+        btn.appendChild(counter);
     }
 });
 

@@ -13,7 +13,7 @@ function renderVersionCheckLogs(container) {
             <div class="text-sm text-slate-400">Version check history</div>
             <div class="flex flex-wrap items-center gap-2">
                 ${renderPauseButton()}
-                <button id="ver-logs-refresh" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition-colors">
+                <button id="ver-logs-refresh" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition active:scale-[0.96]">
                     Refresh
                 </button>
             </div>
@@ -73,8 +73,8 @@ async function loadVersionCheckLogsData() {
         const rowsHtml = logs.map(r => `
             <tr class="hover:bg-slate-700/50 transition-colors">
                 <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap font-mono">${formatLogTs(r.timestamp)}</td>
-                <td class="px-3 py-2 text-sm font-mono text-slate-200">${escapeHtml(r.current_version || '-')}</td>
-                <td class="px-3 py-2 text-sm font-mono text-slate-200">${escapeHtml(r.latest_version || '-')}</td>
+                <td class="px-3 py-2 text-sm font-mono text-slate-200 tabular-nums">${escapeHtml(r.current_version || '-')}</td>
+                <td class="px-3 py-2 text-sm font-mono text-slate-200 tabular-nums">${escapeHtml(r.latest_version || '-')}</td>
                 <td class="px-3 py-2">${boolBadge(r.outdated, 'Outdated', 'Current')}</td>
                 <td class="px-3 py-2">${boolBadge(r.cache_hit, 'Cached', 'Fresh')}</td>
             </tr>

@@ -55,8 +55,8 @@ function _renderHealthBanner(overview) {
         <div class="flex items-center gap-4 p-4 ${bgColor} border rounded-lg mb-4">
             <div class="text-4xl font-black ${gradeColor}">${grade}</div>
             <div class="flex-1">
-                <div class="text-sm font-medium text-slate-200">Cache health: ${cacheRatio.toFixed(0)}% hit rate</div>
-                <div class="text-xs text-slate-400">${tokenStr} tokens today &middot; ${costStr} estimated &middot; ${overview.session_count || 0} sessions</div>
+                <div class="text-sm font-medium text-slate-200">Cache health: <span class="tabular-nums">${cacheRatio.toFixed(0)}%</span> hit rate</div>
+                <div class="text-xs text-slate-400 text-pretty"><span class="tabular-nums">${tokenStr}</span> tokens today &middot; <span class="tabular-nums">${costStr}</span> estimated &middot; <span class="tabular-nums">${overview.session_count || 0}</span> sessions</div>
             </div>
             <div id="usage-live-pulse"></div>
         </div>`;
@@ -78,8 +78,8 @@ function _renderFlags(flags) {
                     <div class="text-sm text-slate-200">${escapeHtml(f.message)}</div>
                     <div class="text-xs text-slate-500">${escapeHtml(f.flag_type || '')} &middot; ${_usageTimeAgo(f.created_at)}</div>
                 </div>
-                <button class="text-xs text-slate-400 hover:text-white px-2 py-1" data-dismiss-flag="${escapeHtml(String(f.id))}">dismiss</button>
-                <button class="text-xs text-slate-400 hover:text-white px-2 py-1" data-snooze-flag="${escapeHtml(f.flag_type || '')}">snooze 24h</button>
+                <button class="text-xs text-slate-400 hover:text-white px-2 py-1 transition active:scale-[0.96]" data-dismiss-flag="${escapeHtml(String(f.id))}">dismiss</button>
+                <button class="text-xs text-slate-400 hover:text-white px-2 py-1 transition active:scale-[0.96]" data-snooze-flag="${escapeHtml(f.flag_type || '')}">snooze 24h</button>
             </div>`;
     }).join('');
 
@@ -110,11 +110,11 @@ function _renderProjectBreakdown(projects) {
         return `
             <div class="grid grid-cols-[2fr_1fr_1fr_0.5fr] gap-2 py-2 px-3 border-t border-slate-700/30 items-center">
                 <span class="text-sm text-slate-200 truncate">${escapeHtml(name)}</span>
-                <span class="text-xs text-slate-400 text-right">${tokenStr}</span>
+                <span class="text-xs text-slate-400 text-right tabular-nums">${tokenStr}</span>
                 <div class="h-1.5 bg-slate-700 rounded-full overflow-hidden">
                     <div class="h-full bg-teal-500 rounded-full" style="width:${pct}%"></div>
                 </div>
-                <span class="text-xs ${cacheColor} text-right">${cacheStr}</span>
+                <span class="text-xs ${cacheColor} text-right tabular-nums">${cacheStr}</span>
             </div>`;
     }).join('');
 
@@ -142,19 +142,19 @@ function _renderTodaySummary(overview) {
     return `
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div class="stat-card">
-                <div class="text-lg font-bold text-blue-400">${fmt(input)}</div>
+                <div class="text-lg font-bold text-blue-400 tabular-nums">${fmt(input)}</div>
                 <div class="text-xs text-slate-400 mt-1">Input Tokens</div>
             </div>
             <div class="stat-card">
-                <div class="text-lg font-bold text-purple-400">${fmt(output)}</div>
+                <div class="text-lg font-bold text-purple-400 tabular-nums">${fmt(output)}</div>
                 <div class="text-xs text-slate-400 mt-1">Output Tokens</div>
             </div>
             <div class="stat-card">
-                <div class="text-lg font-bold text-teal-400">${fmt(cacheRead)}</div>
+                <div class="text-lg font-bold text-teal-400 tabular-nums">${fmt(cacheRead)}</div>
                 <div class="text-xs text-slate-400 mt-1">Cache Read</div>
             </div>
             <div class="stat-card">
-                <div class="text-lg font-bold text-amber-400">${fmt(cacheCreate)}</div>
+                <div class="text-lg font-bold text-amber-400 tabular-nums">${fmt(cacheCreate)}</div>
                 <div class="text-xs text-slate-400 mt-1">Cache Create</div>
             </div>
         </div>`;
@@ -190,7 +190,7 @@ function _renderScanProgress(status) {
     const pct = status.projects_total > 0 ? Math.round((status.projects_scanned || 0) / status.projects_total * 100) : 0;
     const projectInfo = status.current_project ? '<p class="text-slate-600 text-xs mt-1">' + escapeHtml(_decodeProjectName(status.current_project)) + '</p>' : '';
     const progressBar = status.projects_total > 0
-        ? '<div class="w-48 h-1 bg-slate-700 rounded-full mt-3"><div class="h-full bg-teal-500 rounded-full transition-all" style="width:' + pct + '%"></div></div>'
+        ? '<div class="w-48 h-1 bg-slate-700 rounded-full mt-3"><div class="h-full bg-teal-500 rounded-full transition-[width]" style="width:' + pct + '%"></div></div>'
         : '';
 
     return '<div class="flex flex-col items-center justify-center py-16">'

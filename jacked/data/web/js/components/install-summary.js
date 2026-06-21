@@ -99,14 +99,15 @@ function renderInstallSummaryPanel(summary) {
     titleWrap.appendChild(title);
 
     const sub = document.createElement('div');
-    sub.className = 'text-xs text-slate-400 mt-0.5';
+    sub.className = 'text-xs text-slate-400 mt-0.5 text-balance';
     sub.textContent = 'What changed in this update';
     titleWrap.appendChild(sub);
     head.appendChild(titleWrap);
 
     const dismiss = document.createElement('button');
     dismiss.type = 'button';
-    dismiss.className = 'text-slate-400 hover:text-white text-lg leading-none shrink-0';
+    dismiss.className = 'text-slate-400 hover:text-white text-lg leading-none shrink-0 '
+        + 'relative before:absolute before:inset-[-8px] before:z-0 before:pointer-events-auto';
     dismiss.setAttribute('aria-label', 'Dismiss');
     dismiss.textContent = '×';
     dismiss.addEventListener('click', () => panel.remove());
@@ -130,7 +131,7 @@ function renderInstallSummaryPanel(summary) {
     // Footer: unchanged count.
     const unchanged = Number(summary.unchanged_count) || 0;
     const foot = document.createElement('div');
-    foot.className = 'text-xs text-slate-500 mt-3';
+    foot.className = 'text-xs text-slate-500 mt-3 tabular-nums';
     foot.textContent = `${unchanged} unchanged`;
     panel.appendChild(foot);
 

@@ -837,13 +837,13 @@ function renderGatekeeperSubTab(container) {
                 </select>
                 ${renderPauseButton()}
                 <button id="logs-export-btn" title="Export as JSON"
-                    class="p-1.5 rounded-lg bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition-colors">
+                    class="p-2 rounded-lg bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition-colors">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                     </svg>
                 </button>
                 <button id="logs-purge-btn" title="Purge old logs"
-                    class="p-1.5 rounded-lg bg-slate-900 border border-slate-700 hover:border-red-500 text-slate-400 hover:text-red-300 transition-colors">
+                    class="p-2 rounded-lg bg-slate-900 border border-slate-700 hover:border-red-500 text-slate-400 hover:text-red-300 transition-colors">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
                     </svg>
@@ -983,13 +983,13 @@ function renderSessionCards(sessions, activeId) {
     const totalDecisions = sessions.reduce((sum, s) => sum + (s.total || 0), 0);
 
     const allCard = `
-        <button class="session-card flex-shrink-0 rounded-lg px-3 py-2.5 text-left transition-all cursor-pointer min-w-[80px]
+        <button class="session-card flex-shrink-0 rounded-lg px-3 py-2.5 text-left transition-colors cursor-pointer min-w-[80px]
             ${activeId === 'ALL'
                 ? 'bg-blue-900/40 border-2 border-blue-500 ring-1 ring-blue-500/30'
                 : 'bg-slate-800 border border-slate-700 hover:border-slate-500'}"
             data-session="ALL">
             <div class="text-xs font-semibold text-slate-300 uppercase tracking-wider">All</div>
-            <div class="text-lg font-bold text-white mt-0.5">${totalDecisions}</div>
+            <div class="text-lg font-bold text-white mt-0.5 tabular-nums">${totalDecisions}</div>
             <div class="text-xs text-slate-500">decisions</div>
         </button>
     `;
@@ -1004,7 +1004,7 @@ function renderSessionCards(sessions, activeId) {
         const lastTime = formatLogTimestamp(s.last_seen);
 
         return `
-            <button class="session-card flex-shrink-0 rounded-lg px-3 py-2.5 text-left transition-all cursor-pointer min-w-[180px] max-w-[240px]
+            <button class="session-card flex-shrink-0 rounded-lg px-3 py-2.5 text-left transition-colors cursor-pointer min-w-[180px] max-w-[240px]
                 ${isSelected
                     ? 'bg-blue-900/40 border-2 border-blue-500 ring-1 ring-blue-500/30'
                     : 'bg-slate-800 border border-slate-700 hover:border-slate-500'}"
@@ -1015,9 +1015,9 @@ function renderSessionCards(sessions, activeId) {
                 </div>
                 <div class="text-xs text-slate-400 mt-1 truncate" title="${escapeHtml(s.repo_path || '')}">${escapeHtml(repo)}</div>
                 <div class="flex items-center gap-2 mt-1.5">
-                    <span class="text-xs font-medium text-white">${s.total || 0}</span>
-                    ${(s.allowed || 0) > 0 ? `<span class="inline-block px-1.5 py-0 rounded text-[10px] font-medium bg-green-800/60 text-green-300">${s.allowed}A</span>` : ''}
-                    ${(s.asked || 0) > 0 ? `<span class="inline-block px-1.5 py-0 rounded text-[10px] font-medium bg-yellow-800/60 text-yellow-300">${s.asked}U</span>` : ''}
+                    <span class="text-xs font-medium text-white tabular-nums">${s.total || 0}</span>
+                    ${(s.allowed || 0) > 0 ? `<span class="inline-block px-1.5 py-1 rounded text-[10px] font-medium bg-green-800/60 text-green-300 tabular-nums">${s.allowed}A</span>` : ''}
+                    ${(s.asked || 0) > 0 ? `<span class="inline-block px-1.5 py-1 rounded text-[10px] font-medium bg-yellow-800/60 text-yellow-300 tabular-nums">${s.asked}U</span>` : ''}
                 </div>
                 <div class="text-[10px] text-slate-500 mt-1">${firstTime} → ${lastTime}</div>
             </button>
@@ -1153,7 +1153,7 @@ function _renderTrajectory(traj) {
         const label = TIER_LABELS[step.tier] || escapeHtml(step.tier || '');
         const detail = step.detail ? ` \u00b7 ${escapeHtml(String(step.detail).substring(0, 40))}` : '';
         const msVal = Number(step.ms);
-        const ms = !isNaN(msVal) ? ` ${msVal < 1 ? '<1' : Math.round(msVal)}ms` : '';
+        const ms = !isNaN(msVal) ? ` <span class="tabular-nums">${msVal < 1 ? '<1' : Math.round(msVal)}</span>ms` : '';
         if (step.result === 'pass') {
             return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-transparent text-[10px] bg-slate-700/50 text-slate-400"><span class="text-green-500">\u2713</span>${label}<span class="text-slate-500">${ms}</span></span>`;
         }
@@ -1194,7 +1194,7 @@ function buildRowHtml(r, showRepo) {
                 <div class="text-sm font-mono text-slate-200 truncate">${cmd}</div>
                 ${reason ? `<div class="text-xs text-slate-400 italic truncate mt-0.5">${reason}</div>` : ''}
             </td>
-            <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap text-right">${elapsed}</td>
+            <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap text-right tabular-nums">${elapsed}</td>
             ${showRepo
                 ? `<td class="px-3 py-2 text-xs text-slate-500 whitespace-nowrap font-mono">${escapeHtml(repo || session)}</td>`
                 : ''}

@@ -117,7 +117,7 @@ function updatePauseButtons() {
 
 function renderPauseButton() {
     const paused = window.jackedState.logsPaused;
-    return `<button class="logs-pause-btn flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition-colors" onclick="toggleLogsPause()">
+    return `<button class="logs-pause-btn flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 border border-slate-700 hover:border-blue-500 text-slate-400 hover:text-blue-300 transition active:scale-[0.96]" onclick="toggleLogsPause()">
         <span class="pause-dot w-2 h-2 rounded-full ${paused ? 'bg-amber-400' : 'bg-green-400 logs-live-indicator'}"></span>
         <span class="pause-label">${paused ? 'Paused' : 'Live'}</span>
     </button>`;
@@ -133,16 +133,16 @@ function renderPagination(prefix, page, pageSize, total) {
     const end = Math.min((page + 1) * pageSize, total);
 
     return `<div class="pagination-controls flex flex-wrap items-center gap-2 text-xs text-slate-400 mt-3">
-        <span>Showing ${start}-${end} of ${total}</span>
+        <span class="text-pretty">Showing ${start}-${end} of ${total}</span>
         <select class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200" onchange="${prefix}ChangePageSize(this.value)">
             <option value="25" ${pageSize === 25 ? 'selected' : ''}>25</option>
             <option value="50" ${pageSize === 50 ? 'selected' : ''}>50</option>
             <option value="100" ${pageSize === 100 ? 'selected' : ''}>100</option>
             <option value="200" ${pageSize === 200 ? 'selected' : ''}>200</option>
         </select>
-        <button class="px-2 py-1 rounded bg-slate-800 border border-slate-700 hover:border-blue-500 disabled:opacity-30 disabled:cursor-not-allowed" onclick="${prefix}PrevPage()" ${page === 0 ? 'disabled' : ''}>Prev</button>
+        <button class="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 hover:border-blue-500 disabled:opacity-30 disabled:cursor-not-allowed" onclick="${prefix}PrevPage()" ${page === 0 ? 'disabled' : ''}>Prev</button>
         <span>Page ${page + 1} of ${totalPages}</span>
-        <button class="px-2 py-1 rounded bg-slate-800 border border-slate-700 hover:border-blue-500 disabled:opacity-30 disabled:cursor-not-allowed" onclick="${prefix}NextPage()" ${page >= totalPages - 1 ? 'disabled' : ''}>Next</button>
+        <button class="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 hover:border-blue-500 disabled:opacity-30 disabled:cursor-not-allowed" onclick="${prefix}NextPage()" ${page >= totalPages - 1 ? 'disabled' : ''}>Next</button>
     </div>`;
 }
 

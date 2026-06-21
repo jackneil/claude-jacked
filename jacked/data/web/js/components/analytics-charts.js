@@ -52,11 +52,11 @@ function _renderTrendAndDoughnut(data) {
 
     container.innerHTML = `
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            <div class="lg:col-span-2 bg-slate-800 border border-slate-700 rounded-lg p-4">
+            <div class="lg:col-span-2 bg-slate-800 border border-slate-700 rounded-lg p-4" style="box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25)">
                 <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Decision Trend</h4>
                 <div style="position:relative;height:260px"><canvas id="analytics-trend-canvas"></canvas></div>
             </div>
-            <div class="bg-slate-800 border border-slate-700 rounded-lg p-4">
+            <div class="bg-slate-800 border border-slate-700 rounded-lg p-4" style="box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25)">
                 <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Method Breakdown</h4>
                 <div style="position:relative;height:260px"><canvas id="analytics-doughnut-canvas"></canvas></div>
             </div>
@@ -205,7 +205,7 @@ function _renderHeatmap(heatmapData) {
     const dayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
     // Build HTML grid
-    let html = '<div class="bg-slate-800 border border-slate-700 rounded-lg p-4 overflow-x-auto">';
+    let html = '<div class="bg-slate-800 border border-slate-700 rounded-lg p-4 overflow-x-auto" style="box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25)">';
     html += '<div class="min-w-[600px]">';
 
     // Hour header row

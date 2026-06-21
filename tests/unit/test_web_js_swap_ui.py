@@ -200,12 +200,13 @@ out({ html });
         assert 'bg-teal-900/50 text-teal-300">committed</span>' in html
         # Rows without a status (pre-migration) render as committed
         assert html.count("committed</span>") == 2
-        # Residency under 15 min highlighted red; longer ones muted
-        assert 'text-red-400 whitespace-nowrap">4m 32s' in html
-        assert 'text-slate-400 whitespace-nowrap">1h 2m' in html
-        assert 'text-slate-400 whitespace-nowrap">20m 0s' in html
+        # Residency under 15 min highlighted red; longer ones muted.
+        # tabular-nums keeps the fixed-width durations from shifting layout.
+        assert 'text-red-400 whitespace-nowrap tabular-nums">4m 32s' in html
+        assert 'text-slate-400 whitespace-nowrap tabular-nums">1h 2m' in html
+        assert 'text-slate-400 whitespace-nowrap tabular-nums">20m 0s' in html
         # Null residency renders an em-dash placeholder
-        assert f'text-slate-400 whitespace-nowrap">{EM_DASH}' in html
+        assert f'text-slate-400 whitespace-nowrap tabular-nums">{EM_DASH}' in html
         # New header columns
         assert ">Status</th>" in html
         assert ">Residency</th>" in html
