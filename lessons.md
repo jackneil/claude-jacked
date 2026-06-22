@@ -2,6 +2,8 @@
 
 - [1x] PyPI publishing is handled via GitHub Actions trusted publishing. NEVER use twine to upload directly. Create a GitHub release and PyPI pulls it automatically.
 - [2x] Always run tests with `uv run python -m pytest` (NOT bare `python -m pytest`). Dev deps (pytest) are in `[dependency-groups] dev` which uv auto-includes. System/conda Python won't have project deps.
+- [1x] When the user picks a "PR first, then release"-style path, treat the PR as a REVIEW GATE — open it and STOP. Do not self-merge into master without an explicit, separate go-ahead. The auto-mode classifier will (correctly) block the merge otherwise. Build the whole thing on the branch, push, open the PR, then ask before merging.
+- [1x] Frontend polish (Tailwind class tweaks in JS template literals) can break unit tests that assert on EXACT rendered class strings (e.g. `test_web_js_swap_ui.py` asserts `whitespace-nowrap">4m 32s`). Adding `tabular-nums` etc. shifts those substrings. Run the full suite before any release and update the brittle assertions to the new intended markup — don't revert the improvement.
 - [1x] When adding shell operators to SHELL_OPERATOR_RE, enumerate ALL operators including redirection (>, >>, <) and newlines (\n). Missing even one creates a bypass where safe-prefix commands can write to arbitrary files.
 - [1x] SAFE_PREFIXES entries that also exist in SAFE_EXACT must have a trailing space (e.g. "env " not "env") — otherwise startswith() matches unintended commands like envsubst, lsblk, etc.
 - [1x] After changing install/uninstall logic, ALWAYS verify the live hook path in ~/.claude/settings.json points to the right python and script. Stale non-editable installs mean your code changes are invisible.
