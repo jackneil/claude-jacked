@@ -577,6 +577,8 @@ It recommends the newest session **with real substance** — a near-empty newest
 
 When a product is **pre-production** and you want it driven to completion autonomously, run **`/bhag`** (Big Hairy Audacious Goal). It runs the coverage matrix at full breadth and forges a long-running `/goal` brief that loops cell-by-cell — implement → verify → PR → **merge to `main`** → next — until the product is built out. Auto-merge is **double-gated**: it only happens when the repo's declared Lifecycle is Greenfield/Alpha **and** you explicitly authorize it in-session (and only after CI is green); on anything resembling a live product it refuses and degrades to safe staged PRs. `/bhag` is a deliberately-typed command (never auto-triggered), because auto-merging to `main` in a loop is the most powerful thing jacked can do.
 
+**Already know what to build?** Run **`/goal-maker`** — it skips the deciding and packages the work already in front of you (this conversation, a spec, a plan, an in-flight build) into one hardcore, **overnight-sized** `/goal` brief: full scope, TDD + tests-green, UI/UX + front-end-polish gates, evidence-based DONE, and a `Next:` line so a later `/whats-next` picks up. It **defaults to opening a PR**; pass `merge` (`/goal-maker merge`) to auto-merge each milestone — always gated on green CI, never a red build, and with the `gh pr checks` output pasted so the run is verifiable. Like `/bhag` it's deliberately typed (never auto-triggered) so auto-merge can't be reached by accident. The trio: **`/whats-next` decides**, **`/goal-maker` packages what you've decided**, **`/bhag` drives the whole matrix autonomously**.
+
 ---
 
 ## Built-in Reviewers and Commands
@@ -594,6 +596,7 @@ Type these directly in Claude Code:
 | `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
 | `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
 | `/whats-next` | **Roadmap Advisor** — Weighs a coverage-matrix read (toward 10/10) plus plans, issues, commits, and lifecycle, then **decides the single highest-leverage initiative** and forges a ready-to-run `/goal` brief (≤4000 chars) for autonomous, tested delivery |
+| `/goal-maker` | **Goal Forge** — Packages the work already in front of you (this conversation, a spec, a plan, an in-flight build) into one overnight-sized `/goal` brief (≤4000 chars) — full scope, TDD, UI/UX + polish gates, evidence-based DONE, plan-ahead `Next:`. Defaults to PR; `merge` arg auto-merges each milestone on green CI |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
 | `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
 | `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
