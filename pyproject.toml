@@ -32,6 +32,13 @@ dependencies = [
     "aiohttp>=3.9,<4",
     "packaging>=23.0,<26",
     "anthropic>=0.40,<1",
+    # Tray icon is ON by default — pystray/Pillow are core so a bare
+    # `uv tool install claude-jacked` lights up the tray with no extra needed.
+    # Opt out of the icon at runtime with `jacked install --no-tray`. Headless
+    # CI/servers still pull these but the tray degrades gracefully (the service
+    # runs; the icon is skipped when there's no display).
+    "pystray>=0.19,<1",
+    "Pillow>=9.0,<13",
 ]
 
 [project.optional-dependencies]
@@ -40,14 +47,9 @@ search = [
 ]
 security = []  # backwards compat — anthropic is now a core dependency
 web = []
-tray = [
-    "pystray>=0.19,<1",
-    "Pillow>=9.0,<13",
-]
+tray = []  # backwards compat — pystray/Pillow are now CORE deps (tray on by default)
 all = [
     "qdrant-client>=1.7,<2",
-    "pystray>=0.19,<1",
-    "Pillow>=9.0,<13",
 ]
 
 [dependency-groups]

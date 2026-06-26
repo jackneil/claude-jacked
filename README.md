@@ -45,10 +45,12 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
 Run once from anywhere — installs globally to `~/.claude/` and applies to all your Claude Code sessions:
 
 ```bash
-uv tool install claude-jacked
-jacked install --force
-jacked webux              # opens your dashboard at localhost:8321
+uv tool install claude-jacked   # tray icon + background service included by default
+jacked install --force          # deploys skills/commands/agents/hooks AND starts the tray
+jacked webux                    # opens your dashboard at localhost:8321
 ```
+
+> **The tray is on by default.** A bare `uv tool install claude-jacked` now ships the tray (no `[tray]` extra needed), and `jacked install` registers login-autostart and starts it. Don't want the icon (or on a headless box)? `jacked install --force --no-tray`. **You MUST run `jacked install`** — `uv tool`/`pip install` only drop the package on disk; running `jacked` before that prints a loud banner reminding you.
 
 > **Don't have uv?** Install it first: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Mac/Linux) or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
 
@@ -73,8 +75,9 @@ uv tool install "claude-jacked[search]" --force && jacked install --force
 # enable it from the dashboard (Settings > Gatekeeper) when you want LLM-evaluated
 # interception layered on top of Claude Code's auto permission mode.
 
-# Add the background service + system tray icon (auto-start on login)
-uv tool install "claude-jacked[tray]" --force && jacked service install && jacked service start
+# The background service + system tray icon ship by DEFAULT (auto-start on login) —
+# `jacked install` already started them. Opt out of the icon: jacked install --force --no-tray
+# (The legacy `claude-jacked[tray]` extra still resolves — it's just empty now.)
 
 # Everything (base + search + tray)
 uv tool install "claude-jacked[all]" --force && jacked install --force
@@ -210,13 +213,11 @@ Here's the deal: if you don't want to remember to run `jacked webux` every time,
 ### Install
 
 ```bash
-uv tool install "claude-jacked[tray]" --force   # add pystray + Pillow
-jacked install --force                          # wire up hooks
-jacked service install                          # configure auto-start on login
-jacked service start                            # start it now
+uv tool install claude-jacked --force   # pystray + Pillow ship in the base package
+jacked install --force                  # wires up hooks AND starts the tray (autostart on login)
 ```
 
-The `[tray]` extra is required — it pulls in `pystray` and `Pillow` for the icon rendering.
+`jacked install` already registers login-autostart and starts the tray — no separate `jacked service install/start` needed. `pystray` and `Pillow` are core dependencies now, so the icon "just works" out of the base package. Don't want it? `jacked install --force --no-tray`.
 
 ### What You Get
 
@@ -269,7 +270,7 @@ jacked service start
 
 Common issues:
 
-- **Tray icon never appears after install** — you didn't install the `[tray]` extra. Run `uv tool install "claude-jacked[tray]" --force && jacked service start`.
+- **Tray icon never appears after install** — the tray ships by default now, so the usual causes are: (a) you passed `jacked install --no-tray`, (b) you're on a **headless** box (no `DISPLAY`/Wayland) where the icon is skipped on purpose — the service still runs, reach it at `http://127.0.0.1:8321`, or (c) the service isn't running: `jacked service start`. Confirm with `curl -s http://127.0.0.1:8321/api/version`.
 - **Tray shows a wrong version** — the menu anchors on the running process's `__version__`, so if it shows "v0.41.2" and you just upgraded, the running process is stale. The tray is still the *old* binary. Fix: `jacked service stop && jacked service start`, or `jacked service restart`. `Check for updates...` in the menu forces a fresh PyPI poll (useful if only the cached "latest" is stale).
 - **`jacked upgrade` said "Upgrade complete" but the tray is still running the old version** — this was the 0.41.6→0.41.9 bug. `jacked service stop` sends SIGTERM, but pystray on macOS runs the AppKit NSRunLoop on the main thread, which can silently swallow Python signals. The upgrade's port-wait timed out and the detached `service start` hit "port in use." Fixed in 0.41.10+: graceful stop now polls for actual PID death and escalates to SIGKILL if SIGTERM is ignored. Confirm the fix took with `curl -s http://127.0.0.1:8321/api/version` and check the `current` field matches your installed version. If you're stuck on an older upgrade, follow the port-recovery sequence above and then `jacked service start`.
 - **"Port 8321 in use" after `jacked upgrade`** — an old tray didn't fully release the socket. Resolved in 0.41.6+ for service restart, and in 0.41.10+ for the upgrade path specifically (with SIGKILL escalation). Run `jacked upgrade` once more to pick up the fix.
@@ -811,7 +812,7 @@ jacked webux                       # Open web dashboard
 jacked webux --port 9000           # Custom port
 jacked webux --no-browser          # Server only, no auto-open
 
-# Background Service (requires [tray] extra)
+# Background Service (tray icon ships by default)
 jacked service install             # Configure auto-start on login
 jacked service uninstall           # Remove auto-start
 jacked service start               # Start service with tray icon
