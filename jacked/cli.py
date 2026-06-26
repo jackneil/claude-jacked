@@ -611,9 +611,11 @@ def retrieve(
 @click.option("--session", "session_id", default=None, help="Recover this specific session id")
 @click.option("--digest", "as_digest", is_flag=True, help="Emit the working-state digest for --session")
 @click.option("--limit", "-n", default=3, help="How many candidates to list")
-@click.option("--budget", default=12000, help="Digest size budget in characters")
+@click.option("--depth", type=click.Choice(["brief", "standard", "full"]), default="standard",
+              help="Digest detail level (scales message/action/file caps + char budget)")
+@click.option("--budget", default=None, type=int, help="Override the digest char budget (defaults to --depth's budget)")
 @click.option("--json", "as_json", is_flag=True, help="Emit candidates as JSON")
-def recover(cwd, exclude, session_id, as_digest, limit, budget, as_json):
+def recover(cwd, exclude, session_id, as_digest, limit, depth, budget, as_json):
     """Recover a crashed session for this folder from its on-disk transcript.
 
     Works on a bare install — no Qdrant/search extra required.
@@ -640,8 +642,10 @@ def recover(cwd, exclude, session_id, as_digest, limit, budget, as_json):
         if not session_path.exists():
             console.print(f"[red]Session {session_id} not found in {project_dir}[/red]")
             sys.exit(1)
-        digest = rec.build_digest(session_path)
-        click.echo(rec.render_digest(digest, budget_chars=budget))
+        prof = rec.DEPTH_PROFILES.get(depth, rec.DEPTH_PROFILES["standard"])
+        effective_budget = budget if budget is not None else prof["budget"]
+        digest = rec.build_digest(session_path, depth=depth)
+        click.echo(rec.render_digest(digest, budget_chars=effective_budget))
         return
 
     # Phase 1 — rank candidates

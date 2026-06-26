@@ -415,10 +415,14 @@ def find_session_files(projects_dir: Path, repo_pattern: Optional[str] = None) -
         if repo_pattern and repo_pattern.lower() not in repo_path.lower():
             continue
 
-        # Find all .jsonl files that look like session files
+        # Find all .jsonl files that look like session files.
+        # Skip agent-* sidecar transcripts: they are sub-agent sessions whose
+        # content is already folded into the parent session's summaries, so
+        # indexing them as standalone sessions only pollutes search results.
         for session_file in repo_dir.glob("*.jsonl"):
-            # Include UUID sessions and agent sessions
-            if _is_uuid_format(session_file.stem) or session_file.stem.startswith("agent-"):
+            if session_file.stem.startswith("agent-"):
+                continue
+            if _is_uuid_format(session_file.stem):
                 yield session_file, repo_path
 
 

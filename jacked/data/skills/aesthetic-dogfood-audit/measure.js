@@ -11,6 +11,13 @@
  *   - white-ish text on a DARK background → correct (dark theme), not invisible.
  *   - a child inset by card padding reads as "misaligned" → compare top-level siblings.
  *   - SVG chart axis labels show as non-tabular / odd sizes → expected, ignore.
+ *   - a11y.focusRingCandidates: programmatic focus may not trip :focus-visible, and a ring
+ *       drawn on a PARENT or via :focus-within/background swap isn't detected → these are
+ *       candidates, confirm with the keyboard Tab walk. If hasGlobalFocusStyle is false the
+ *       app has no focus ring at all → real Blocker.
+ *   - smallTouchTargets: inline text links inside prose aren't tap targets; judge
+ *       standalone buttons/links/controls, not every <a> in a paragraph.
+ *   - colorOnlyStatus: a purely decorative red/green dot (not conveying status) is a FP.
  */
 () => {
   const root = document.querySelector('main') || document.body;
@@ -23,13 +30,17 @@
     const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
     return 0.2126 * f(+m[1]) + 0.7152 * f(+m[2]) + 0.0722 * f(+m[3]); };
 
-  // 1. TYPE-SCALE SPRAWL — distinct font-size/weight on text leaves (>~6 = sprawl)
+  // 1. TYPE-SCALE SPRAWL — distinct font-size/weight on text leaves (>~6 = sprawl),
+  //    plus distinct font-FAMILY count (>3 distinct families = font drift).
   const type = new Map();
+  const fam = new Map();
   root.querySelectorAll('*').forEach((e) => {
     if (e.children.length === 0 && e.textContent.trim() && vis(e)) {
       const cs = getComputedStyle(e);
       const k = `${Math.round(parseFloat(cs.fontSize))}px/${cs.fontWeight}`;
       type.set(k, (type.get(k) || 0) + 1);
+      const ff = (cs.fontFamily.split(',')[0] || '').replace(/["']/g, '').trim().toLowerCase();
+      if (ff) fam.set(ff, (fam.get(ff) || 0) + 1);
     }
   });
 
@@ -103,10 +114,90 @@
     if (Math.abs(a.top - b.top) < 4 && a.right <= b.left && b.left - a.right < 8) tightTaps++;
   }
 
+  // 9. A11Y — FOCUS VISIBILITY. Does the app define ANY :focus/:focus-visible ring in CSS,
+  //    and which focusables show no visible indicator when focused? (See false-positive note.)
+  const hasGlobalFocusStyle = (() => {
+    try {
+      for (const ss of document.styleSheets) {
+        let rules; try { rules = ss.cssRules; } catch (_) { continue; }
+        if (!rules) continue;
+        for (const r of rules) {
+          const sel = r.selectorText;
+          if (sel && /:focus(-visible)?/.test(sel) && r.style) {
+            const o = r.style.outline, ow = r.style.outlineWidth, bs = r.style.boxShadow;
+            if ((o && o !== 'none' && o !== '0') || (ow && ow !== '0px' && ow !== '0') || (bs && bs !== 'none')) return true;
+          }
+        }
+      }
+    } catch (_) {}
+    return false;
+  })();
+  const focusSel = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [role=button]';
+  const focusables = [...root.querySelectorAll(focusSel)].filter(vis);
+  const prevFocus = document.activeElement;
+  const noFocusRing = [];
+  focusables.slice(0, 80).forEach((e) => {
+    const before = getComputedStyle(e).boxShadow;
+    try { e.focus({ preventScroll: true }); } catch (_) { return; }
+    const cs = getComputedStyle(e);
+    const outline = cs.outlineStyle !== 'none' && parseFloat(cs.outlineWidth) !== 0;
+    const shadow = cs.boxShadow !== 'none' && cs.boxShadow !== before;
+    let fv = false; try { fv = e.matches(':focus-visible'); } catch (_) {}
+    if (!outline && !shadow && !fv) noFocusRing.push(T(e) || e.tagName.toLowerCase());
+  });
+  try { if (prevFocus && typeof prevFocus.focus === 'function') prevFocus.focus({ preventScroll: true }); } catch (_) {}
+
+  // 10. TOUCH-TARGET SIZE — interactive controls smaller than 44×44 (mobile fit). Pairs
+  //     with the 8px-proximity check above; judge standalone controls, not inline prose links.
+  const smallTargets = [...root.querySelectorAll('button, a, input, select, textarea, [role=button]')]
+    .filter((e) => { const r = R(e); return r.width > 0 && r.height > 0 && (r.width < 44 || r.height < 44); })
+    .map((e) => `${T(e) || e.tagName.toLowerCase()} (${Math.round(R(e).width)}×${Math.round(R(e).height)})`);
+
+  // 11. MOTION — no `transition: all`; animate transform/opacity, never layout props
+  //     (width/height/top/left/margin jank); honor prefers-reduced-motion.
+  const LAYOUT_PROPS = ['width', 'height', 'top', 'left', 'right', 'bottom', 'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left'];
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const motionAll = []; const motionLayout = []; let stillAnimating = 0;
+  root.querySelectorAll('*').forEach((e) => {
+    if (!vis(e)) return;
+    const cs = getComputedStyle(e);
+    const tp = cs.transitionProperty;
+    if (tp === 'all') motionAll.push(T(e) || e.tagName.toLowerCase());
+    else if (tp && tp !== 'none') {
+      const hit = tp.split(',').map((s) => s.trim()).filter((p) => LAYOUT_PROPS.includes(p));
+      if (hit.length) motionLayout.push(`${T(e) || e.tagName.toLowerCase()} (${hit.join('/')})`);
+    }
+    if (reduceMotion) {
+      const animating = (cs.transitionDuration && /[1-9]/.test(cs.transitionDuration)) || (cs.animationName && cs.animationName !== 'none');
+      if (animating) stillAnimating++;
+    }
+  });
+
+  // 12. COPY HYGIENE + COLOR-ONLY STATUS
+  //     - typographic polish: literal "..." (want "…"), straight ' / " (want curly ’ “ ”).
+  //     - color-only status: a small red/green dot/badge with no text label and no icon
+  //       fails for ~8% colorblind users — pair the color with an icon or word.
+  const copyHygiene = {
+    literalEllipsis: (txt.match(/\.\.\./g) || []).length,
+    straightApostrophes: (txt.match(/[A-Za-z]'[A-Za-z]/g) || []).length,
+    straightQuotes: (txt.match(/"/g) || []).length,
+  };
+  const isRedGreen = (c) => { const m = c.match(/(\d+), (\d+), (\d+)/); if (!m) return false;
+    const r = +m[1], g = +m[2], b = +m[3];
+    return (r > 140 && g < 110 && b < 110) || (g > 110 && r < 130 && b < 130); };
+  const colorOnlyStatus = [...root.querySelectorAll('span, div, i, [class*=badge], [class*=status], [class*=dot], [class*=indicator]')]
+    .filter((e) => { if (!vis(e)) return false; const r = R(e);
+      if (r.width > 28 || r.height > 28) return false;
+      if ((e.textContent || '').trim()) return false;
+      if (e.querySelector('svg, img, [class*=icon]')) return false;
+      const cs = getComputedStyle(e); return isRedGreen(cs.backgroundColor) || isRedGreen(cs.color); })
+    .length;
+
   return {
     width: window.innerWidth,
     pageScrollsSideways: de.scrollWidth > vw + 1,
-    typeScale: { distinct: type.size, styles: [...type.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12), SPRAWL: type.size > 6 },
+    typeScale: { distinct: type.size, styles: [...type.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12), SPRAWL: type.size > 6,
+      fontFamilies: [...fam.keys()], familyCount: fam.size, FAMILY_DRIFT: fam.size > 3 },
     spacingValues: [...gaps.entries()].sort((a, b) => b[1] - a[1]),
     cardLeftEdges: lefts, MISALIGNED: Object.keys(lefts).length > 1,
     money: { count: money.length, nonTabular: moneyNonTabular },
@@ -117,5 +208,10 @@
     tables,
     clippedTables: tables.filter((t) => t.clipped).length,
     tightTapTargets: tightTaps,
+    smallTouchTargets: { count: smallTargets.length, sample: [...new Set(smallTargets)].slice(0, 8) },
+    a11y: { focusables: focusables.length, hasGlobalFocusStyle, focusRingMissingCount: noFocusRing.length, focusRingCandidates: [...new Set(noFocusRing)].slice(0, 8) },
+    motion: { transitionAll: [...new Set(motionAll)].slice(0, 8), animatingLayoutProps: [...new Set(motionLayout)].slice(0, 8), reducedMotionActive: reduceMotion, stillAnimatingUnderReduce: stillAnimating },
+    copyHygiene,
+    colorOnlyStatus,
   };
 }

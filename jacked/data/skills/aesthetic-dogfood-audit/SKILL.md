@@ -39,9 +39,15 @@ If the ask is "did my change break," that's `/qa`/`/ux`, not this.
 1. **Drive** the real workflow, logged in **AS the target persona** (see Crawl).
 2. **Crawl exhaustively** — expand and click everything (see Crawl discipline).
 3. **Measure** — run `measure.js` (paste into the browser's evaluate/console tool).
-4. **Screenshot the VIEWPORT** (not fullPage) and critique it like a design director.
-5. **Log** each defect: `page · width · lens · severity · what's wrong`.
-6. If fixing: fix at the **source** (a shared theme class / token / component, not per
+4. **Keyboard + a11y walk** — Tab through the page, capturing `document.activeElement` at
+   each stop: focus order must follow visual order, every stop must show a visible focus
+   ring, there must be no focus trap (Tab eventually loops/leaves), and Enter/Space must
+   activate the focused control. If `axe-core` is available, inject it and run it against
+   the live DOM; fold violations into the log. `measure.js` seeds this with
+   `a11y.hasGlobalFocusStyle`, focus-ring candidates, and small touch targets.
+5. **Screenshot the VIEWPORT** (not fullPage) and critique it like a design director.
+6. **Log** each defect: `page · width · lens · severity · what's wrong`.
+7. If fixing: fix at the **source** (a shared theme class / token / component, not per
    instance) → re-measure + re-screenshot at the affected widths → confirm zero
    regression → ship a small focused change → next screen.
 
@@ -82,8 +88,18 @@ This is where audits are incomplete. Be exhaustive:
 7. **Copy & states** — no raw enum / UUID / `[object Object]` / `$undefined` / `NaN`
    shown to a user; humane empty states (not a blank box or lonely sentence); real
    loading skeletons that match the final layout; consistent `—` vs `N/A`.
-8. **Motion / focus** — visible keyboard focus ring on every interactive element; hover
-   feedback on clickable rows/cards; smooth transitions; obvious active nav state.
+8. **Motion, focus & a11y** — visible keyboard focus ring on EVERY interactive element
+   (`measure.js` flags focusables with none — real Blocker if `hasGlobalFocusStyle` is
+   false) and a logical Tab order with no focus trap; hover feedback on clickable
+   rows/cards; obvious active nav state. **Touch targets ≥44×44px at mobile (~375)** —
+   measured. **Motion (measured):** no `transition: all`, animate only `transform`/
+   `opacity` (never `width`/`height`/`top`/`left`/`margin` — they jank the main thread),
+   durations ~50–700ms, and honor `prefers-reduced-motion: reduce`.
+9. **Copy hygiene & colorblind-safe status** — typographic polish (`…` not `...`, curly
+   `’ “ ”` not straight `' "`, `Saving…` not `Saving...`); status must never be conveyed
+   by color ALONE — every red/green dot or badge pairs the color with an icon or label
+   (fails ~8% of users otherwise). One font-family set (≤3 distinct; `measure.js` flags
+   `FAMILY_DRIFT`).
 
 ## Tooling realities — what WILL fool you
 
@@ -116,11 +132,37 @@ color on a light-themed layout root (kills the whole white-on-light class); a gl
 `:focus-visible` outline (every button gets a focus ring). Use an **outline**, not a
 box-shadow ring, for focus — box-shadow rings get clipped by `overflow-hidden` wrappers.
 
-## Output
+## Output — scan wide, report tight
 
-A ranked defect log table: `page · width · lens · severity (MED/S) · what's wrong →
-fix · status`. Group entries that share a single fix-at-source. If you also fixed, ship
-one small, independently-reviewable change per coherent slice and re-verify each.
+**Scan posture** (during the walk): "nothing is fine" (above) — flag everything the
+measure or your eye catches. **Report posture:** don't dump the raw pile. The report is a
+*ranked, capped, confidence-gated* defect log so a real Blocker never drowns under nits.
+
+- **Severity ladder:** `Blocker` (broken / unreadable / unreachable UI, or an a11y
+  violation that blocks use) > `High` (clearly wrong and hits every page — misaligned
+  columns, failed contrast, no focus ring at all) > `Medium` (a noticeable polish miss on
+  one surface) > `Nit` (true hair-splitting). Lead with Blocker/High.
+- **Confidence gate:** report a finding only when you can name the measured failure or
+  cite the specific token / rule / lens it violates. Suppress pure preference ("I'd prefer
+  blue"). When you're unsure or it's opinion-only, drop it.
+- **Cap, don't wall:** after the Blocker/High items, keep the highest-signal Medium items
+  and at most a handful of Nits — **group entries that share one fix-at-source** so the
+  count reflects fixes, not symptoms. A wall of 80 unranked items is a failed report.
+
+Table: `page · width · lens · severity (Blocker/High/Medium/Nit) · what's wrong → fix ·
+status`. If you also fixed, ship one small, independently-reviewable change per coherent
+slice and re-verify each.
+
+## Baseline & regression (optional)
+
+On the first full pass, persist each page's `measure.js` JSON to the run dir (e.g.
+`design-baseline/<route>.json`). On any re-run — after a fix or next session — re-measure
+and **diff against the saved baseline** instead of re-judging from scratch: surface *new*
+defects, *resolved* ones, and per-lens deltas (type-scale & font-family counts, contrast
+fails, focus-ring-missing count, small touch targets, motion flags, color-only status).
+That turns a one-shot audit into a trackable gate. The within-session
+fix→re-measure→confirm-zero-regression loop already covers the immediate case; the
+baseline adds cross-session tracking.
 
 ## Common mistakes
 
@@ -131,3 +173,7 @@ one small, independently-reviewable change per coherent slice and re-verify each
   statuses distinct within one screen) → that's not drift; don't force false uniformity.
 - Flagging in-container table scroll, modal z-index overlaps, white-on-dark text, or
   padding-inset children → false positives; verify the predicate first.
+- Reporting `focusRingCandidates` blindly → programmatic focus may not trip
+  `:focus-visible` and a ring drawn on a parent isn't detected; confirm via the Tab walk
+  (a true Blocker only when `hasGlobalFocusStyle` is false). Inline prose links aren't tap
+  targets, and a purely decorative red/green dot isn't a color-only-status defect.

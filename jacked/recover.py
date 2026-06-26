@@ -26,7 +26,21 @@ DEFAULT_BUDGET_CHARS = 12000
 _RECENT_USER_ASKS = 3
 _MAX_TOOL_ACTIONS = 12
 _MAX_FILES = 20
+_MAX_FAILED_ACTIONS = 5
+_INFLIGHT_INTENT_CHARS = 400
+_FAIL_TAIL_CHARS = 100
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+# Verbosity presets for the digest. 'standard' reproduces the historical fixed
+# behaviour (budget 12000 + the original caps); 'brief'/'full' scale message
+# count, tool-sample depth, files, and char budget together so a one-line
+# recovery and a heavy multi-file recovery each get a fitting digest.
+DEPTH_PROFILES = {
+    "brief":    {"budget": 6000,  "asks": 2, "actions": 6,  "files": 10},
+    "standard": {"budget": DEFAULT_BUDGET_CHARS, "asks": _RECENT_USER_ASKS,
+                 "actions": _MAX_TOOL_ACTIONS, "files": _MAX_FILES},
+    "full":     {"budget": 24000, "asks": 6, "actions": 24, "files": 40},
+}
 
 # /goal and /loop drive long-running, self-pacing work that Claude Code cannot
 # auto-resume on --resume; we surface the verbatim kickoff so it can be re-run.
@@ -235,8 +249,10 @@ class Digest:
     git_branch: Optional[str] = None
     recent_user_asks: list[str] = field(default_factory=list)
     last_assistant_text: Optional[str] = None
+    in_flight_intent: Optional[str] = None
     todos: list[dict] = field(default_factory=list)
     recent_tool_actions: list[str] = field(default_factory=list)
+    failed_actions: list[str] = field(default_factory=list)
     files_touched: list[str] = field(default_factory=list)
     agent_summaries: list[str] = field(default_factory=list)
     plan_excerpt: Optional[str] = None
@@ -250,24 +266,86 @@ def resume_command(session_id: str) -> str:
     return f"claude --resume {session_id}"
 
 
-def _action_label(name: str, tool_input: dict) -> str:
+def _result_text(block: dict, rec_obj: dict) -> str:
+    """Best-effort text of a tool_result: the block's content first, then the
+    transcript record's top-level toolUseResult (stderr preferred over stdout)."""
+    content = block.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        text = "\n".join(parts)
+    else:
+        text = ""
+    if not text.strip():
+        tur = rec_obj.get("toolUseResult")
+        if isinstance(tur, str):
+            text = tur
+        elif isinstance(tur, dict):
+            text = tur.get("stderr") or tur.get("stdout") or ""
+    return text
+
+
+def _result_outcome(block: dict, rec_obj: dict) -> dict:
+    """Classify a tool_result as ok/failed and keep a short text tail.
+
+    A crash's most load-bearing fact is whether the last action errored, so we
+    read the result's is_error flag plus any nonzero exit / interrupted signal
+    on the record's toolUseResult, and stash the tail of stderr/stdout."""
+    is_error = bool(block.get("is_error"))
+    tur = rec_obj.get("toolUseResult")
+    if isinstance(tur, dict):
+        if tur.get("is_error") or tur.get("interrupted"):
+            is_error = True
+        code = tur.get("exitCode", tur.get("returnCode"))
+        if isinstance(code, int) and code != 0:
+            is_error = True
+    return {"is_error": is_error, "text": _result_text(block, rec_obj)}
+
+
+def _fail_tail(text: str, limit: int = _FAIL_TAIL_CHARS) -> str:
+    """One-line tail of failing output: the last non-blank line, capped."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    tail = lines[-1]
+    return tail[: limit - 3] + "..." if len(tail) > limit else tail
+
+
+def _action_label(name: str, tool_input: dict, outcome: Optional[dict] = None) -> str:
     if name == "Bash":
         lines = (tool_input.get("command") or "").strip().splitlines()
         first = lines[0] if lines else ""
         if len(first) > 80:
             first = first[:77] + "..."
-        return f"Bash: {first}"
-    fp = tool_input.get("file_path") or tool_input.get("notebook_path")
-    if fp:
-        return f"{name}: {fp}"
-    return name
+        label = f"Bash: {first}"
+    else:
+        fp = tool_input.get("file_path") or tool_input.get("notebook_path")
+        label = f"{name}: {fp}" if fp else name
+    if outcome and outcome.get("is_error"):
+        tail = _fail_tail(outcome.get("text", ""))
+        label += f" → FAILED: {tail}" if tail else " → FAILED"
+    return label
 
 
-def _extract_actions(path: Path):
-    """Raw pass: latest TodoWrite todos, trailing tool actions, files touched,
-    and whether the final tool_use went unanswered (crashed mid-action)."""
+def _extract_actions(path: Path, max_actions: int = _MAX_TOOL_ACTIONS,
+                     max_files: int = _MAX_FILES,
+                     max_failed: int = _MAX_FAILED_ACTIONS):
+    """Raw pass: latest TodoWrite todos, trailing tool actions (each folded
+    with its tool_result OUTCOME), files touched, whether the final tool_use
+    went unanswered (crashed mid-action), and the recent FAILED actions.
+
+    Knowing the last command/edit ERRORED is the single most load-bearing
+    recovery fact, so we pair each tool_use with its tool_result by id and
+    annotate failures (e.g. 'Bash: pytest -q → FAILED: 3 errors')."""
     todos: list[dict] = []
-    actions: list[str] = []
+    raw_actions: list[dict] = []
+    by_tid: dict[str, dict] = {}
     files: list[str] = []
     seen_files: set[str] = set()
     open_ids: set[str] = set()
@@ -289,7 +367,10 @@ def _extract_actions(path: Path):
                     last_tool_id = tid
                 if name == "TodoWrite" and isinstance(tool_input.get("todos"), list):
                     todos = tool_input["todos"]
-                actions.append(_action_label(name, tool_input))
+                act = {"name": name, "input": tool_input, "outcome": None}
+                raw_actions.append(act)
+                if tid:
+                    by_tid[tid] = act
                 fp = tool_input.get("file_path") or tool_input.get("notebook_path")
                 if fp and fp not in seen_files:
                     seen_files.add(fp)
@@ -297,7 +378,11 @@ def _extract_actions(path: Path):
         elif t == "user" and isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
-                    open_ids.discard(block.get("tool_use_id"))
+                    tuid = block.get("tool_use_id")
+                    open_ids.discard(tuid)
+                    act = by_tid.get(tuid)
+                    if act is not None:
+                        act["outcome"] = _result_outcome(block, rec_obj)
         elif t == "file-history-snapshot":
             backups = (rec_obj.get("snapshot") or {}).get("trackedFileBackups") or {}
             for fp in backups:
@@ -305,7 +390,11 @@ def _extract_actions(path: Path):
                     seen_files.add(fp)
                     files.append(fp)
     incomplete = last_tool_id is not None and last_tool_id in open_ids
-    return todos, actions[-_MAX_TOOL_ACTIONS:], files[:_MAX_FILES], incomplete
+    labels = [_action_label(a["name"], a["input"], a["outcome"]) for a in raw_actions]
+    failed = [_action_label(a["name"], a["input"], a["outcome"])
+              for a in raw_actions if a["outcome"] and a["outcome"].get("is_error")]
+    failed_recent = list(reversed(failed))[:max_failed]  # most recent first
+    return todos, labels[-max_actions:], files[:max_files], incomplete, failed_recent
 
 
 def _raw_user_text(rec_obj: dict) -> str:
@@ -367,19 +456,52 @@ def _active_kickoffs(path, tail_window: int = TAIL_WINDOW) -> list[dict]:
     return []
 
 
-def build_digest(session_path) -> Digest:
+def _last_thinking(path: Path) -> Optional[str]:
+    """Last assistant THINKING block — the in-flight intent that explains why
+    the next step was next (exactly the context a fresh session lacks). The
+    enriched parser strips thinking, so do a dedicated raw pass. Falls back to
+    the last assistant text block when no thinking block is present."""
+    last_thought: Optional[str] = None
+    last_text: Optional[str] = None
+    for rec_obj in _iter_records(path):
+        if not isinstance(rec_obj, dict) or rec_obj.get("type") != "assistant":
+            continue
+        content = (rec_obj.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "thinking":
+                txt = block.get("thinking") or block.get("text")
+                if txt and txt.strip():
+                    last_thought = txt.strip()
+            elif bt == "text":
+                txt = block.get("text")
+                if txt and txt.strip():
+                    last_text = txt.strip()
+    return last_thought or last_text
+
+
+def build_digest(session_path, depth: str = "standard") -> Digest:
     session_path = Path(session_path)
+    prof = DEPTH_PROFILES.get(depth, DEPTH_PROFILES["standard"])
     enriched = _t.parse_jsonl_file_enriched(session_path)
     cand = _scan_candidate(session_path)
-    todos, actions, files, incomplete = _extract_actions(session_path)
+    todos, actions, files, incomplete, failed = _extract_actions(
+        session_path, max_actions=prof["actions"], max_files=prof["files"])
     resumable = _active_kickoffs(session_path)
 
-    recent_user_asks = [m.content for m in enriched.user_messages if m.content][-_RECENT_USER_ASKS:]
+    recent_user_asks = [m.content for m in enriched.user_messages if m.content][-prof["asks"]:]
     last_assistant_text = None
     for m in reversed(enriched.messages):
         if m.role == "assistant" and m.content:
             last_assistant_text = m.content
             break
+    intent = _last_thinking(session_path)
+    if intent and len(intent) > _INFLIGHT_INTENT_CHARS:
+        intent = intent[:_INFLIGHT_INTENT_CHARS].rstrip() + "…"
 
     return Digest(
         session_id=enriched.session_id,
@@ -388,8 +510,10 @@ def build_digest(session_path) -> Digest:
         git_branch=cand.git_branch,
         recent_user_asks=recent_user_asks,
         last_assistant_text=last_assistant_text,
+        in_flight_intent=intent,
         todos=todos,
         recent_tool_actions=actions,
+        failed_actions=failed,
         files_touched=files,
         agent_summaries=[a.summary_text for a in enriched.agent_summaries if a.summary_text],
         plan_excerpt=enriched.plan.content if enriched.plan else None,
@@ -412,6 +536,17 @@ def render_digest(digest: Digest, budget_chars: int = DEFAULT_BUDGET_CHARS) -> s
     sections.append(("", "\n".join(head)))
     if digest.incomplete_last_turn:
         sections.append(("", "> WARNING: the last turn may be incomplete — work was in progress when the session ended. Verify before building on it."))
+    # In-flight intent: the crashed agent's final reasoning (why the next step
+    # was next). Skip when it merely duplicates the last assistant message
+    # (the text-fallback case) — compare with any trailing cap-ellipsis removed.
+    if digest.in_flight_intent:
+        _probe = digest.in_flight_intent.rstrip("…").rstrip()
+        if _probe and _probe not in (digest.last_assistant_text or ""):
+            sections.append(("In-flight intent", digest.in_flight_intent))
+    # What actually broke is the top fact to re-anchor on after a crash.
+    if digest.failed_actions:
+        sections.append(("Failed actions (most recent first)",
+                         "\n".join(f"- {a}" for a in digest.failed_actions)))
     if digest.last_prompt:
         sections.append(("Last instruction", digest.last_prompt))
     if digest.recent_user_asks:

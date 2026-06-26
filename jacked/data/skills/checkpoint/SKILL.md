@@ -15,6 +15,8 @@ left off — with full knowledge of what was learned, decided, and attempted.
 /checkpoint              — save current session state
 /checkpoint resume       — load most recent in-progress checkpoint, auto-load all referenced files
 /checkpoint resume {slug} — resume a specific checkpoint (slug from /checkpoint list)
+/checkpoint resume {slug} --goal "<next task>" — goal-directed resume: extract only the context that
+                           matters for that next task and propose a focused starting plan (see Resume Step 6)
 /checkpoint complete     — mark the most recent in-progress checkpoint (current branch) as completed
 /checkpoint list         — show all checkpoints for this project
 ```
@@ -65,6 +67,8 @@ Also determine:
 - **Active lenses** — which specialist lenses (by filename stem, e.g., `accessibility`) were relevant during this session. Populated from: lenses selected by DCR, lenses whose triggers matched files modified, or lenses explicitly referenced in conversation.
 
 If the user provided a title, use it. Otherwise infer one from the work.
+
+**Secrets hygiene (do this before writing anything in Step 4 or 5):** scan the drafted **Session Context**, **Gotchas & Notes**, and **Key Files** content — the free-form sections most likely to have slurped up a pasted value — for likely credentials: API keys (`sk-…`, `ghp_…`, `AKIA…`, `xox[bap]-…`), bearer/access tokens, passwords, `.env` values, and DB/connection strings (`postgres://user:pass@…`). Redact each to a descriptive placeholder, e.g. `{REDACTED: openai key}`, `{REDACTED: postgres connection string}`. Keep the surrounding prose so the context still reads — redact the secret, not the sentence. **Never write a credential or secret into a checkpoint or research file** (these HTML files may be committed to git — see the git-hygiene note in Step 5).
 
 ### Step 4: Write research files (if needed)
 
@@ -127,6 +131,8 @@ Then edit the temp file. The metadata that used to live in YAML frontmatter goes
 <meta name="jacked:status" content="in-progress">
 <meta name="jacked:branch" content="{branch}">
 <meta name="jacked:timestamp" content="{ISO-8601}">
+<meta name="jacked:head_sha" content="{output of `git rev-parse HEAD`}">
+<meta name="jacked:dirty_files" content="{number of lines in `git status --short`, i.e. count of uncommitted/untracked files}">
 <meta name="jacked:releases" content="{comma-separated versions released this session, if any}">
 <meta name="jacked:plans_in_progress" content="{semicolon-separated paths to active plan files}">
 <meta name="jacked:research_files" content="{semicolon-separated paths to research files}">
@@ -175,6 +181,8 @@ mv "$TMPFILE" "${CHECKPOINT_DIR}/${TIMESTAMP}-{slug}.html"
 ```
 
 > **Migration note**: existing `.md` checkpoints from before 0.43.2 still load fine on `/checkpoint resume`. Leave them as-is; only new checkpoints are HTML.
+>
+> **Git hygiene**: `.claude/checkpoints/` can be **committed** to share session handoffs with teammates, or **gitignored** for local-only use — your call. If you commit it, the Step 3 secrets-hygiene scan is **mandatory**, not optional: a checkpoint with a leaked key becomes a leaked key in git history.
 
 ### Step 6: Display confirmation
 
@@ -218,7 +226,26 @@ Read the branch from the checkpoint — for HTML checkpoints, `<meta name="jacke
 
 Do NOT auto-switch branches.
 
-### Step 3: Auto-load referenced files with budget
+### Step 3: Freshness check
+
+The checkpoint captured a snapshot of repo state at save time. If the repo moved on since, the **Current State** section is stale and should not be trusted verbatim. Compare the saved fingerprint to now:
+
+```bash
+SAVED_SHA="{value of <meta name=\"jacked:head_sha\"> — empty for legacy checkpoints}"
+CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null)
+if [ -n "$SAVED_SHA" ] && [ "$SAVED_SHA" != "$CURRENT_SHA" ]; then
+  git log --oneline "$SAVED_SHA..HEAD" 2>/dev/null | wc -l   # new commits since save
+fi
+git status --short 2>/dev/null | wc -l                       # current dirty-file count
+```
+
+If `head_sha` is present and differs, or the current dirty-file count differs from the saved `dirty_files` meta, surface a one-line warning before presenting the checkpoint:
+
+> "⚠ State has moved since this checkpoint: **{N} new commits**, **{M} files changed** — treat *Current State* / *Gotchas* as possibly stale and re-verify against the live tree."
+
+If `head_sha` is missing (legacy checkpoint), skip silently — there's nothing to compare. Never block resume on this; it's a heads-up, not a gate.
+
+### Step 4: Auto-load referenced files with budget
 
 Read files in priority order. Track total lines loaded.
 
@@ -230,7 +257,9 @@ For each file:
 - If it doesn't exist: warn "Referenced file {path} no longer exists (may have been renamed/deleted since checkpoint)" and continue
 - If total lines loaded would exceed ~3000: stop loading. Present remaining as "Also referenced (not loaded): {list}" so the user can request specific ones.
 
-### Step 4: Present checkpoint
+**Goal-directed loading** (when `--goal "<next task>"` was passed): rank the candidate files by relevance to the stated goal *before* applying the budget — load the plan/research/key files that bear on that task first, and let the lower-relevance ones spill into "Also referenced (not loaded)". The goal narrows what's worth pulling into context; don't burn the budget on files unrelated to the next task.
+
+### Step 5: Present checkpoint
 
 ```
 RESUMING CHECKPOINT
@@ -245,9 +274,20 @@ Loaded:   {N} referenced files ({total_lines} lines)
 {Checkpoint summary — What We're Working On + Remaining Work + Current State + Gotchas}
 ```
 
-### Step 5: Continue
+If a **project journal** exists (`.claude/checkpoints/PROJECT-NOTES.md` — see Complete Flow), read it and fold its durable learnings into how you resume. It outlives any single checkpoint, so it's authoritative for recurring gotchas, user preferences, and non-obvious patterns.
 
-Begin working on the first remaining work item.
+### Step 6: Continue
+
+**Plain resume** (no `--goal`): begin working on the first remaining work item.
+
+**Goal-directed resume** (`--goal "<next task>"` was passed, or the user supplied a free-text goal on resume): don't replay the full snapshot — launch the *next focused task* with exactly the context it needs. Synthesize a **next-task brief**:
+
+1. **Goal** — restate the stated next task in one line.
+2. **Relevant context** — only the decisions, session-context facts, and gotchas from the checkpoint that bear on this goal (drop the rest).
+3. **Relevant files** — the subset of loaded files (ranked in Step 4) that matter for this goal.
+4. **Proposed first steps** — the Remaining-Work items that advance this goal, in order.
+
+Present the brief as a **proposed starting plan the user can edit before you begin** — do not start executing until they confirm or amend it. (This mirrors Amp's handoff: a focused, reviewable launch beats a meandering full-context replay.)
 
 ## Complete Flow
 
@@ -261,6 +301,12 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 Find the most recent in-progress checkpoint on the current branch (HTML or legacy MD). If none found on current branch, show all in-progress checkpoints and ask which to complete.
 
 Update the checkpoint file's status. For HTML: change `<meta name="jacked:status" content="in-progress">` to `content="completed"`. For legacy MD: change the YAML `status: in-progress` to `status: completed`.
+
+**Promote durable learnings to the project journal.** A completed checkpoint's hard-won project knowledge would otherwise die with it. Before finishing, scan this checkpoint's **Decisions**, **Session Context**, and **Gotchas** for learnings that are *durable and checkpoint-independent* — recurring gotchas, user preferences, non-obvious patterns that will matter on the next task too (not one-off state like "stopped mid-DCR"). If any exist, offer:
+
+> "Promote N durable learning(s) to the project journal so they survive this checkpoint? (Y/n)"
+
+If yes, append them as terse bullets to `.claude/checkpoints/PROJECT-NOTES.md` (create from a plain `# Project Notes` heading if absent). Keep it **small and curated** — merge into or sharpen an existing bullet rather than duplicating, and skip anything already captured in `CLAUDE.md`. This journal is read on every resume (Resume Step 5). The same secrets-hygiene scan as Save Step 3 applies — never write a credential into it.
 
 ```
 CHECKPOINT COMPLETED
@@ -298,12 +344,14 @@ CHECKPOINTS
 
 - `plans_in_progress`, `research_files` — **file paths** resolved against project root
 - `active_lenses` — **lens filename stems** (e.g., `accessibility`, `api-ergonomics`). NOT frontmatter name field, NOT file paths.
+- `head_sha`, `dirty_files` — repo fingerprint at save time, consumed by the Resume Step 3 freshness check. Optional; absent on legacy checkpoints (freshness check skips silently when missing).
 - All list fields are optional. Missing fields = empty lists (backward compatible with older checkpoints).
 - Older checkpoints may have deprecated fields (e.g., `files_modified`). Ignore on read.
 
 ## Rules
 
 - **Never modify code** during checkpoint save — only read state and write checkpoint/research files.
+- **Never write credentials or secrets** into a checkpoint, research file, or the project journal. Run the Save Step 3 redaction scan (API keys, tokens, passwords, `.env` values, connection strings → `{REDACTED: …}` placeholders) before any write. These files may be committed to git, so a leaked key is a permanent leak.
 - **Infer, don't interrogate** — use git state and conversation context. Only ask for a title if it genuinely can't be inferred.
 - **Checkpoint files are append-only** — each save creates a new file. Never overwrite (except status changes via /checkpoint complete).
 - **Atomic writes** — always write to temp file first, then rename.

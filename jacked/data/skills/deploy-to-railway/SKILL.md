@@ -38,12 +38,22 @@ on a command's exact flags; this skill wins on the *sequence and the traps*.
 | Project shape | Services to create |
 |---|---|
 | **Full-stack framework** (Next.js, Remix, SvelteKit, Rails, Django+templates) | **ONE** app service. The framework serves UI *and* API from one process. Do NOT split it — two services for one codebase is wrong and leaves a dead/broken half. |
-| **Truly separate FE + BE** (React/Vue SPA + a separate Node/Python/Go API) | **TWO** services from the same or two repos. FE gets the public domain; BE stays private (or its own domain); FE reaches BE via `${{ backend.RAILWAY_PRIVATE_DOMAIN }}` or a public URL. Set `NEXT_PUBLIC_API_URL`/`VITE_API_URL` on the FE to the BE's URL. |
+| **Truly separate FE + BE** (React/Vue SPA + a separate Node/Python/Go API) | **TWO** services from the same or two repos. FE gets the public domain; BE stays private (or its own domain); FE reaches BE via `${{ backend.RAILWAY_PRIVATE_DOMAIN }}` or a public URL. Set `NEXT_PUBLIC_API_URL`/`VITE_API_URL` on the FE to the BE's URL. **If both live in ONE repo (monorepo), each service needs its own Root Directory** — see the monorepo note below. |
 | **+ background jobs / cron** | A **separate** service (same repo) with its own config file (cron schedule + start command + `restartPolicy NEVER`). |
 | **+ object storage** | A **bucket** (project-level), creds shared to the services that need it. |
 
 If the user says "separate front and back end" but the repo is a full-stack
 framework, **tell them it's one service** and why — build the right thing.
+
+**Monorepo (FE + BE, or many packages, in one repo):** each service needs a
+**Root Directory** set to its package path (e.g. `/frontend`, `/backend`) — a
+**dashboard/MCP-only** setting (like the cron Config File Path below), so hand the
+user the click or set it via `update_service`. ⚠️ A `railway.json`/`railway.toml`
+config file does NOT follow Root Directory — give it an ABSOLUTE path (e.g.
+`/backend/railway.toml`), not one relative to the root dir. Shortcut: importing
+the repo via `railway.com/new` can auto-stage one service per package for
+pnpm/npm/yarn/bun workspaces. Pair this with per-service Watch Paths (gotcha #9)
+so a push only rebuilds the service it touched.
 
 ## The deploy sequence (CLI; the MCP is often unauthenticated — verify and fall back to CLI)
 
@@ -71,6 +81,14 @@ frequently prints `Unauthorized`/errors on a step that actually succeeded.
    `railway deployment list --service <name> --limit 1 --json` until `status` is
    `SUCCESS` (deployed) or `FAILED`/`CRASHED` (triage logs). Then `curl` the
    public `/health` (or `/api/health`) endpoint to confirm it's actually serving.
+   **Set the service's `healthcheckPath`** (e.g. `/health`, `/api/health`) so
+   Railway itself gates the traffic cutover on a 200 before going live — without
+   it, a broken new deploy silently replaces a working one. The default
+   healthcheck timeout is **300s**; raise it via `RAILWAY_HEALTHCHECK_TIMEOUT_SEC`
+   for slow first boots/migrations. The check runs **once at deploy time, NOT
+   continuously** — a passing deploy is not uptime monitoring (use Uptime Kuma or
+   similar for that). Railway's healthcheck hits the app over the injected `PORT`
+   from `healthcheck.railway.app`, so gotchas #2 and #3 apply.
 8. **Cron/worker service**: `railway add --service <name> --repo … --branch main`,
    set its env, then set its **Config File Path** to the cron config (e.g.
    `/railway.cron.json`) — that file carries `deploy.cronSchedule` +
@@ -134,35 +152,63 @@ BYPASS row-level security → cross-tenant data leak).
    too-new major, the Nix env fails to evaluate before any build log prints. Fix:
    set `NIXPACKS_NODE_VERSION=22` (or another LTS the engines allow). This is the
    single highest-value gotcha — a no-output build failure is almost always this.
-2. **`npm ci` "Missing @esbuild/<platform>@x from lock file" → npm version skew.**
+2. **Deploy goes SUCCESS but the app healthcheck-fails / crash-loops → it's
+   binding `127.0.0.1` or a hardcoded port.** Railway injects `PORT` and routes
+   traffic to it; an app listening on `localhost`/`127.0.0.1` or a baked-in port
+   answers nobody, and Railway reports "service unavailable" despite a green build.
+   This is the #1 "deployed but not serving" failure (vendor- and cross-platform-
+   confirmed), and a different root cause than the Nixpacks gotchas above. The
+   server MUST listen on `0.0.0.0` AND read the injected `PORT`:
+   `app.listen(process.env.PORT, '0.0.0.0')`, `uvicorn --host 0.0.0.0 --port $PORT`,
+   `gunicorn -b 0.0.0.0:$PORT`. **Dockerfile twist:** exec-form `CMD ["node","server.js"]`
+   (JSON array) does NOT expand `$PORT` — use shell-form `CMD node server.js` /
+   `CMD gunicorn -b 0.0.0.0:${PORT:-8000} app:app` so the variable interpolates.
+3. **Host-allowlist apps reject Railway's healthcheck → 400 / "service
+   unavailable" despite a healthy app.** Railway's healthcheck request originates
+   from hostname `healthcheck.railway.app`. Apps with a host allowlist — Django
+   `ALLOWED_HOSTS`, Rails `config.hosts`, Express `helmet`, some reverse proxies —
+   reject that `Host` header and the deploy fails even though the app is fine. Fix:
+   add `healthcheck.railway.app` to the allowlist (or scope `*` to the health
+   route). Looks like a Railway bug; it's an app-config issue.
+4. **`npm ci` "Missing @esbuild/<platform>@x from lock file" → npm version skew.**
    npm 11 (ships with Node 24+) prunes optional per-platform packages from the
    lockfile that npm 10 (ships with Node 22) strictly requires. If you pin Node 22
    on Railway but the lockfile was written by npm 11, `npm ci` fails. Fix:
    regenerate the lockfile with the matching npm —
    `npx -y npm@10 install --package-lock-only` — commit it (it only ADDS platform
    entries, no version changes), verify with `npx npm@10 ci --dry-run`.
-3. **`Unauthorized` that actually succeeded.** Railway's CLI/MCP throws auth-y
+5. **"I set X but Railway ignores it" → build-method precedence.** Any `Dockerfile`
+   in the repo SILENTLY overrides Nixpacks and the `DOCKER_IMAGE` setting; a
+   `railway.json`/`railway.toml` `deploy.startCommand` SILENTLY overrides the
+   Dockerfile `CMD`. Before debugging Nixpacks, check for a stray `Dockerfile` or a
+   config `startCommand` — that's a distinct failure class from the Node/npm
+   gotchas above.
+6. **`Unauthorized` that actually succeeded.** Railway's CLI/MCP throws auth-y
    errors on `add --database`/provisioning that nonetheless create the resource.
    Always re-verify with `railway service list` before retrying (retrying makes
    duplicates).
-4. **MCP unauthenticated even though the CLI is authed.** The Railway MCP server
+7. **MCP unauthenticated even though the CLI is authed.** The Railway MCP server
    has its own token; `railway --help` shows an "Agent tooling" health section. If
    the MCP is `✗`, just use the CLI (don't block on `railway setup agent`, which
-   needs a tool restart). Some settings (a service's Config File Path) are only
-   reachable via MCP/dashboard, not the CLI.
-5. **RLS bypass via DATABASE_URL.** Covered above — the app's `DATABASE_URL` must
+   needs a tool restart). Some settings (a service's Config File Path, Root
+   Directory, Watch Paths) are only reachable via MCP/dashboard, not the CLI.
+8. **RLS bypass via DATABASE_URL.** Covered above — the app's `DATABASE_URL` must
    be the app-role URL, never `${{ Postgres.DATABASE_URL }}` (superuser).
-6. **GitHub auto-deploy-on-merge needs the Railway GitHub App authorized on the
+9. **GitHub auto-deploy-on-merge needs the Railway GitHub App authorized on the
    repo.** Connecting a repo by name (`add --repo`) sets the metadata, but the
    first build won't auto-fire and merges won't deploy until the user installs/
    authorizes Railway's GitHub App for that repo (railway.com → the service →
    Settings → Source, or Account → Integrations → GitHub). Until then, deploy with
    `railway up` (deploys the local checkout) to get it live, and hand off the
-   one-time App authorization to enable the watch.
-7. **`railway up` deploys the LOCAL directory**, not GitHub. It's the fastest way
+   one-time App authorization to enable the watch. **Monorepo with multiple
+   services:** set per-service **Watch Paths** (gitignore-style globs, e.g.
+   `/backend/**`) — without them, every merge to main rebuilds and redeploys EVERY
+   service in the project, not just the one that changed. Watch Paths are a
+   dashboard/MCP-only setting (see gotcha #7).
+10. **`railway up` deploys the LOCAL directory**, not GitHub. It's the fastest way
    to a first live build, but it's a manual upload — the GitHub *watch* still needs
-   gotcha #6. Use it to validate the pipeline, then enable GitHub auto-deploy.
-8. **Verify, don't trust.** A returning `up` only means "build queued." Poll
+   gotcha #9. Use it to validate the pipeline, then enable GitHub auto-deploy.
+11. **Verify, don't trust.** A returning `up` only means "build queued." Poll
    `deployment list` to a terminal `SUCCESS`, then `curl` the health endpoint.
 
 ## Output

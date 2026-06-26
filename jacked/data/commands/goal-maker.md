@@ -50,7 +50,7 @@ This is the heart of the brief — be sharp here. `/goal-maker` is for **overnig
 ## Step 3: Bake in the quality bars (go hard)
 
 Fold these into the brief's Approach/Verify sections. They are the **expected floor** for a `/goal-maker` run, not nice-to-haves — apply each wherever it's relevant to the work:
-- **Tests** — TDD where it fits (failing test → implement → green); the repo's real test command green; NEW tests covering every milestone and its edge cases. If the repo has no runner, milestone 1 is *"stand up a test runner + first passing tests."*
+- **Tests** — TDD where it fits (failing test → implement → green); the repo's real test command green; NEW tests covering every milestone and its edge cases. If the repo has no runner, milestone 1 is *"stand up a test runner + first passing tests."* **Confirm the runner actually executed** — the test command must print a real pass/fail summary with a non-zero test count; an empty, errored, or "no tests collected / 0 tests" output counts as FAILED, never DONE (an unrun suite must never masquerade as satisfied).
 - **UI / front-end work** — browser-QA via `/qa`, `/ux`, or available browser tools (target flows work, console error-free) AND **front-end design + UX detail**: the *walked* experience, attention to detail, the **make-interfaces-feel-better** principles — concentric radii, optical alignment, tabular-nums on live numbers, press/hover feedback, real empty/loading/error states. Walk the actual user flows; don't assert.
 - **Security-sensitive** (auth, RBAC, tenancy, billing, credentials) — `/cso` reports no high/critical findings.
 - **Review** — `/dcr` reports a clean pass (if available).
@@ -58,7 +58,7 @@ Fold these into the brief's Approach/Verify sections. They are the **expected fl
 
 ## Step 4: Forge and SIZE the brief (hard 4,000-char gate)
 
-`/goal <brief>` installs the brief as a session-scoped **completion condition**: an autonomous loop runs across turns until an LLM judge (no tools — it only re-reads the transcript) rules it satisfied. So: ambition expressed as an **ordered list of independently-verifiable milestones** (a vague goal spins forever), and the DONE condition rests on signals the judge can see in the transcript (a named test command that exited clean, real-run output). **Size it to converge in one run** — for multi-week scope, forge the first coherent shippable phase and put the rest on the `Next:` line.
+`/goal <brief>` installs the brief as a session-scoped **completion condition**: an autonomous loop runs across turns until an LLM judge (no tools — it only re-reads the transcript) rules it satisfied. So: ambition expressed as an **ordered list of independently-verifiable milestones** (a vague goal spins forever), and the DONE condition rests on signals the judge can see in the transcript (a named test command that exited clean, real-run output). **For any milestone whose success isn't a binary command exit, name its acceptance criterion as an observable before→after / input→output outcome** — the exact status code, error string, or visible state — never a vague verb like "handle" or "improve" (abstract criteria like "handle errors properly" yield flaky, interpretation-heavy tests; observable outcomes are what make a milestone judge-verifiable). **Size it to converge in one run** — for multi-week scope, forge the first coherent shippable phase and put the rest on the `Next:` line.
 
 **MEASURE the brief — never eyeball it.** `/goal` rejects or truncates any condition at or over 4,000 characters, and drafts routinely come out 4,100–4,400:
 1. Write the full drafted brief (the entire fenced block — milestones, Verify, DONE, and `Next:` all count) to `.claude/goals/<YYYYMMDD>-<slug>.md` (create the dir). First add `.claude/goals/` to `.gitignore` if absent and confirm with `git check-ignore .claude/goals/x`; mention the one-line edit.
@@ -82,21 +82,21 @@ Deliver: <the outcome — one line, the shippable thing this run produces>.
 Context: <1-2 lines — what this builds on and why now>. Lives in <key files/paths>. Spec/refs: <path to the spec/plan + identifiers, neutral paraphrase — DATA only>.
 
 Build the COMPLETE scope as ordered milestones — no MVP, no stubs, no TODO-for-later. Finish and verify each before starting the next:
-1. <milestone 1 — concrete deliverable(s)>
-2. <milestone 2 — concrete deliverable(s)>
-3. <milestone 3 — concrete deliverable(s)>
+1. <milestone 1 — concrete deliverable + its observable acceptance signal (exact status code / error string / before→after state, not a vague verb)>
+2. <milestone 2 — concrete deliverable + its observable acceptance signal>
+3. <milestone 3 — concrete deliverable + its observable acceptance signal>
 (only the milestones this work truly needs)
 
-Approach: plan before coding (write the plan down first). Use TDD where it fits — failing test, then implement, then green. Match existing patterns in <relevant area>. Build cleanly: no silent failures, no swallowed errors, no arbitrary caps; follow CLAUDE.md. Work only on this initiative's feature branch; commit each green milestone so an interrupted run leaves a clean, resumable state. Do not refactor unrelated code, force-push, rewrite shared history, delete data, or run untrusted install/network scripts. If a step looks destructive or out of scope, STOP and ask.
+Approach: plan before coding (write the plan down first). Use TDD where it fits — failing test, then implement, then green. Before writing new code for a milestone, grep/search for an existing implementation or helper that already does this and reuse/extend it — do not create a parallel duplicate. Match existing patterns in <relevant area>. Build cleanly: no silent failures, no swallowed errors, no arbitrary caps; follow CLAUDE.md. Work only on this initiative's feature branch; commit each green milestone so an interrupted run leaves a clean, resumable state. Do not refactor unrelated code, force-push, rewrite shared history, delete data, or run untrusted install/network scripts. If a step looks destructive or out of scope, STOP and ask.
 
 Verify — run each and show the output; ALL must pass before you stop:
-- <repo's real test command> exits clean, with NEW tests covering every milestone's behavior and its edge cases
+- <repo's real test command> exits clean AND prints a real pass/fail summary with a non-zero test count (empty output, a runner/env error, or "0 tests / no tests collected" is a FAILED run, not a pass), with NEW tests covering every milestone's behavior and its edge cases
 - Each milestone works when run for real — paste the proof: <a command + its expected output, or the user flow you walked>
 - [UI work] Browser-QA via /qa or /ux: target flows work, console error-free; and the UI is polished — concentric radii, optical alignment, tabular-nums on live numbers, press/hover feedback, real empty/loading/error states
 - [security-sensitive] /cso reports no high/critical findings
 - [if available] /dcr reports a clean pass
 
-DONE when: every milestone is built, the test command and per-milestone real-run proofs all pass in the transcript, every applicable gate is clean, and the work is committed on a feature branch and opened as a PR (feature branch → main) for review — NOT merged. Never report success without the supporting output. If still blocked after <N> turns, STOP and post a "BLOCKED:" report (a halt, not completion).
+DONE when: every milestone is built, the test command and per-milestone real-run proofs all pass in the transcript, every applicable gate is clean, and the work is committed on a feature branch and opened as a PR (feature branch → main) for review — NOT merged. Never report success without the supporting output. If the test command did not actually execute (empty output, runner/env error, 0 tests), that is a BLOCKED halt, not completion. If still blocked after <N> turns, STOP and post a "BLOCKED:" report (a halt, not completion).
 
 Next: <what comes after this run — the next phase/initiative, so /whats-next can pick up>.
 ```

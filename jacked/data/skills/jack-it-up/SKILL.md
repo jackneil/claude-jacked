@@ -37,6 +37,7 @@ These thoughts mean the work is drifting toward "just get it done":
 | "I'll fix that later" | Fix it now. "Later" means "never." |
 | "The tests pass, we're done" | Tests passing is the minimum. Review quality, not just correctness. |
 | "This review cycle is overkill" | The review found issues last time. Trust the process. |
+| "I'll just keep going in this one thread" (brainstorm + plan + execute all piled up) | Context rot / kitchen-sink session — quality degrades as the window fills. Fix: /clear and re-load the saved spec + plan before continuing. |
 
 ## The Cycle
 
@@ -45,13 +46,14 @@ digraph cycle {
     rankdir=TB;
     node [shape=box];
 
-    brainstorm [label="1. Brainstorm\n(superpowers:brainstorming)"];
+    brainstorm [label="1. Brainstorm + Spec\n(superpowers:brainstorming)"];
     plan [label="2. Write Plan\n(superpowers:writing-plans)"];
     review_plan [label="3. Review Plan\n(/dc on plan)"];
     execute [label="4. Execute Plan\n(superpowers:subagent-driven-development)"];
     review_impl [label="5. Double-Check Review\n(/dc on implementation)"];
     clean [shape=diamond, label="Clean pass?"];
-    ship [label="6. Ship It\n(/pr)"];
+    verify [label="6. Prove It Runs\n(/qa · /ux · /verify — capture evidence)"];
+    ship [label="7. Ship It\n(/pr)"];
     done [label="PR created", shape=doublecircle];
 
     brainstorm -> plan;
@@ -60,8 +62,9 @@ digraph cycle {
     review_plan -> plan [label="plan has issues\n(fix and re-review)"];
     execute -> review_impl;
     review_impl -> clean;
-    clean -> ship [label="yes"];
+    clean -> verify [label="yes"];
     clean -> plan [label="no — findings become\nspec for next plan"];
+    verify -> ship;
     ship -> done;
 }
 ```
@@ -70,9 +73,7 @@ digraph cycle {
 
 **REQUIRED SUB-SKILL:** `superpowers:brainstorming`
 
-Explore the user's intent, requirements, and design space before touching code. Do not assume the first idea is the right one. Ask questions. Challenge assumptions. Consider alternatives.
-
-Output: A clear understanding of what to build and why.
+Explore the user's intent, requirements, and design space before touching code. Do not assume the first idea is the right one. Ask questions. Challenge assumptions. Consider alternatives. The goal of this phase is a clear understanding of what to build and why — captured as the written spec below.
 
 **Lens awareness:** Before presenting the design, check for installed specialist lenses:
 
@@ -86,11 +87,28 @@ If lenses exist, read their frontmatter (name, description, triggers). If any le
 
 This is informational only — it doesn't block or change the brainstorm flow. It ensures specialist concerns are raised during design rather than caught late in review.
 
+**Capture a written spec (the contract).** Brainstorming is not done until you've written down a short spec the plan traces back to. Four parts:
+
+1. **User-facing goal** — one or two sentences: what the user gets and why.
+2. **Acceptance criteria** — testable bullets ("given X, when Y, then Z"). These are the done conditions.
+3. **NON-GOALS / out-of-scope** — what this explicitly will NOT do. This is the scope-creep firewall.
+4. **Files & interfaces involved** — the modules, functions, and contracts this touches.
+
+For a large or ambiguous feature, don't guess the spec — let Claude interview the user with `AskUserQuestion` first. One round of targeted questions beats a confidently-wrong spec.
+
+Write it inline at the top of the Phase-2 plan, or — for a substantial feature — as its own artifact at `docs/superpowers/specs/{YYYY-MM-DD}-{slug}.html` (HTML, same template as plans; it's a human-read contract, so the artifact-format rule applies). Every task in the plan MUST trace to an acceptance criterion — anything that doesn't is scope creep. Phase 3's `/dc` plan review checks the plan against these acceptance criteria and non-goals.
+
+**Context hygiene:** once the spec is on disk it's safe to `/clear` the heavy brainstorm context and re-open the spec to write the plan with a clean window. Nothing is lost — the spec persists.
+
+Output: A clear understanding of what to build and why, plus a written spec (goal + acceptance criteria + non-goals + files/interfaces) the plan and review trace back to.
+
 ### Phase 2: Write Plan
 
 **REQUIRED SUB-SKILL:** `superpowers:writing-plans`
 
-Turn the brainstorm output into a concrete, task-by-task implementation plan with complete code, exact file paths, test commands, and commit messages. No placeholders. No "TBD."
+Turn the brainstorm output into a concrete, task-by-task implementation plan with complete code, exact file paths, test commands, and commit messages. No placeholders. No "TBD." Every task traces to an acceptance criterion from the spec.
+
+**Slice vertically, not horizontally.** When the feature spans multiple layers, decompose into thin end-to-end vertical slices (the smallest user-visible behavior working all the way through — UI-first-with-mocks, then wire down) rather than horizontal layer-by-layer steps. Horizontal slicing hides integration mismatches until every layer is built in isolation; vertical slicing surfaces them on slice two. `superpowers:writing-plans` handles the mechanics.
 
 **Output format: HTML, not Markdown.** When you invoke `superpowers:writing-plans`, **explicitly instruct the sub-skill in its prompt**:
 
@@ -105,9 +123,12 @@ Why HTML: plans are artifacts the human re-reads during execution. Markdown open
 Invoke `/dc` (which auto-detects planning phase). The double-check review spawns reviewers and a pre-mortem analyst to stress-test the plan.
 
 - If CRITICAL or MEDIUM issues found → fix the plan, re-review until clean.
+- Verify every plan task traces to an acceptance criterion in the spec, and that nothing has drifted into the non-goals.
 - Do NOT proceed to execution with an unreviewed or failing plan.
 
-Output: A reviewed, clean plan.
+**Context hygiene before executing:** the spec and plan now live on disk. `/clear` (or start a fresh session) and re-anchor on the saved spec + plan files before Phase 4 — nothing is lost, and execution starts with a clean window instead of one polluted by the brainstorm and planning history (the "kitchen-sink session" failure mode).
+
+Output: A reviewed, clean plan, traced to the spec.
 
 ### Phase 4: Execute the Plan
 
@@ -128,7 +149,7 @@ Invoke `/dc` (which auto-detects implementation/post-implementation phase). The 
 3. Invokes `superpowers:writing-plans` to turn findings into a fix plan
 4. Reviews that fix plan before presenting it
 
-- If the review passes clean → done. Ship it.
+- If the review passes clean → proceed to Phase 6 (prove it runs), then ship.
 - If findings exist → the fix plan becomes the input for a new Phase 4 (execute) → Phase 5 (review) cycle.
 
 ### The Loop
@@ -138,9 +159,22 @@ Phases 4 and 5 repeat until a clean pass. Each cycle:
 - Increases confidence (more lenses pass clean)
 - Converges toward 10/10 quality
 
-Do NOT declare "done" until the final /dc review passes with no CRITICAL or MEDIUM findings.
+Do NOT declare "done" until the final /dc review passes with no CRITICAL or MEDIUM findings **and** you can show evidence rather than assert success: the passing test command and its actual output, plus the Phase-6 end-to-end run result (or screenshot) demonstrating each acceptance criterion. "Show evidence, do not assert success" — captured proof, not "it works," is what makes an unattended/overnight run trustworthy.
 
-### Phase 6: Ship It
+### Phase 6: Prove It Runs (End-to-End Verification)
+
+A clean `/dc` and green tests mean the code reviews well and the units pass — they do NOT mean the assembled feature actually works. `/dc` reviews artifacts; it never runs the app. Close that trust-then-verify gap before shipping: exercise the real feature end-to-end and capture evidence.
+
+- **UI changes** → invoke `/qa` (single component or bug fix) or `/ux` (multi-page change / new flow) to drive the running interface; `/qa-video` when you want a recorded walkthrough.
+- **Non-UI changes** → invoke `/verify`, or run the app / CLI / endpoint directly against a real input.
+
+Walk the **acceptance criteria from the Phase-1 spec** one by one against the running system and confirm each passes. Capture the evidence — test output, the exact command and its result, or a screenshot — do not paraphrase it.
+
+Do NOT ship on green tests + clean review alone. If verification surfaces a failure, it becomes a finding → back to Phase 4 (execute) → Phase 5 (review) → here again.
+
+Output: The feature, proven to run, with captured evidence tied to each acceptance criterion.
+
+### Phase 7: Ship It
 
 Invoke `/pr` to create or update the pull request. The `/pr` command runs the `pr-workflow-checker` agent which now includes a **pre-flight verification** phase that automatically checks for:
 

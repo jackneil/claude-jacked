@@ -198,18 +198,28 @@ for f in .npmrc .yarnrc.yml; do
   echo "=== $f (auth lines redacted) ==="
   sed -E 's/(_authToken|_password|_auth|token|password)\s*[:=]\s*\S+/\1=<REDACTED>/gi' "$f"
 done
-grep -E "onlyBuiltDependencies|minimumReleaseAge|trustPolicy" pnpm-workspace.yaml 2>/dev/null
+grep -E "onlyBuiltDependencies|allowBuilds|minimumReleaseAge|trustPolicy|blockExoticSubdeps|verifyDepsBeforeRun" pnpm-workspace.yaml 2>/dev/null
+```
+
+```bash
+# pnpm major version — drives which install-script key is current (allowBuilds vs onlyBuiltDependencies)
+# and whether v11 security defaults (blockExoticSubdeps, verifyDepsBeforeRun) are expected.
+grep -E '"packageManager"\s*:\s*"pnpm@' package.json 2>/dev/null
+[ -f pnpm-lock.yaml ] && grep -E "^lockfileVersion:" pnpm-lock.yaml 2>/dev/null
 ```
 
 Flag as **CRITICAL**:
 - `package.json` present but no lockfile committed
-- `.npmrc` missing `ignore-scripts=true` (npm/yarn) OR pnpm-workspace.yaml missing `onlyBuiltDependencies` allowlist (pnpm 10+ blocks by default — verify)
+- `.npmrc` missing `ignore-scripts=true` (npm/yarn) OR pnpm-workspace.yaml missing an install-script allowlist (`allowBuilds` on pnpm v11+, legacy `onlyBuiltDependencies` on pnpm <11 — pnpm blocks builds by default, verify the allowlist is the current key for the repo's pnpm major version)
 - No cooldown configured (`min-release-age` / `minimumReleaseAge` / `npmMinimalAgeGate`) — the #1 cheap win, would have blocked every smash-and-grab worm
 
 Flag as **HIGH**:
 - Loose version specifiers (`"^1.2.3"`) for any prod dep that handles PHI / auth / crypto / network
 - No `audit-level=high` set in `.npmrc`
-- Missing `enableHardenedMode`, `enableImmutableInstalls`, `enableStrictSsl` in `.yarnrc.yml` (Yarn Berry)
+- Missing `enableHardenedMode` (defends against **lockfile poisoning** — a malicious PR rewriting a lockfile entry to point at a compromised package; hardened mode re-validates lockfile content against the registry), `enableImmutableInstalls`, `enableStrictSsl` in `.yarnrc.yml` (Yarn Berry)
+- **pnpm repo without `trustPolicy: no-downgrade`** (pnpm v10.21+; **opt-in, default off; pnpm-only**) — an attacker who steals a maintainer token republishes a version with weaker/no provenance than prior releases; `no-downgrade` blocks the install when a version's publish-trust level drops vs. earlier releases. This is the install-time defense our `npm audit signatures` provenance check (Phase 3) does NOT cover — the only consumer-side control for the s1ngularity / credential-downgrade republish pattern.
+- **pnpm repo without `blockExoticSubdeps: true`** (pnpm v11 default) — blocks git/tarball URLs sneaking in via transitive deps, closing a real transitive-injection vector
+- **pnpm repo without `verifyDepsBeforeRun`** (pnpm v11 default) — guards against a stale or tampered `node_modules` being used before scripts run
 
 ### CI install enforcement
 
@@ -302,9 +312,13 @@ grep -E "^ignore-scripts" .npmrc 2>/dev/null || echo "MISSING: ignore-scripts=tr
 ```
 
 ```bash
-# pnpm 10+ — onlyBuiltDependencies allowlist
-grep -E "onlyBuiltDependencies" pnpm-workspace.yaml package.json 2>/dev/null
+# pnpm — install-script allowlist. pnpm v11 (April 2026) unified onlyBuiltDependencies /
+# neverBuiltDependencies / ignoredBuiltDependencies into a single `allowBuilds` map.
+# Match either key; the version grep above tells you which is current for this repo.
+grep -E "allowBuilds|onlyBuiltDependencies|neverBuiltDependencies|ignoredBuiltDependencies" pnpm-workspace.yaml package.json 2>/dev/null
 ```
+
+On pnpm **v11+** the current key is `allowBuilds` — recommend/auto-fix that. On pnpm **<11** use the legacy `onlyBuiltDependencies` allowlist. Detect the major version from the `packageManager` field (`pnpm@11.x`) or corepack; **if the version is unknown, recommend `allowBuilds` and note that `onlyBuiltDependencies` is the pre-v11 alias** — never write a deprecated key onto a v11 repo.
 
 ```bash
 # Yarn Berry
@@ -679,8 +693,8 @@ These can be applied safely without behavioral changes:
 - Add `persist-credentials: false` to every `actions/checkout`
 - Add `step-security/harden-runner` (audit mode) as first step of every workflow
 - Create `.npmrc` with: `ignore-scripts=true`, `audit-level=high`, `fund=false`, `min-release-age=7d`
-- Create/update `pnpm-workspace.yaml` with `minimumReleaseAge: 10080` and a starter `onlyBuiltDependencies` allowlist
-- Create `.yarnrc.yml` with `enableScripts: false`, `enableHardenedMode: true`, `enableImmutableInstalls: true`, `enableStrictSsl: true`, `npmMinimalAgeGate: 10080`
+- Create/update `pnpm-workspace.yaml` with `minimumReleaseAge: 10080`, `trustPolicy: no-downgrade` (opt-in install-time downgrade detection — blocks a credential-compromise republish that drops provenance vs. prior releases), `blockExoticSubdeps: true` and `verifyDepsBeforeRun: true` (v11 defaults), and a starter install-script allowlist — `allowBuilds` on pnpm v11+, legacy `onlyBuiltDependencies` on pnpm <11 (pick the key matching the repo's detected pnpm major version; when unknown, write `allowBuilds`). These are config keys, not deps, so they stay inside the read-only-on-manifests rule.
+- Create `.yarnrc.yml` with `enableScripts: false`, `enableHardenedMode: true` (defends against **lockfile poisoning** — a malicious PR rewriting a lockfile entry to point at a compromised package; hardened mode re-validates lockfile content against the remote registry), `enableImmutableInstalls: true`, `enableStrictSsl: true`, `npmMinimalAgeGate: 10080`
 - Add `--only-binary=:all:` to `pip install` lines in workflows and Makefiles
 - Extend `.gitignore` to cover missing secret patterns (`.env*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `service-account*.json`)
 - Generate `.github/dependabot.yml` with weekly schedule + `cooldown` block
@@ -820,7 +834,7 @@ Used by `verify` mode and tagged in the report. Healthcare orgs should aim for 1
 3. Every workflow has top-level `permissions: read-all`
 4. Every third-party Action SHA-pinned to 40-char commit
 5. `actions/checkout` uses `persist-credentials: false`
-6. Install scripts blocked (`ignore-scripts=true` / pnpm `onlyBuiltDependencies` allowlist)
+6. Install scripts blocked (`ignore-scripts=true` / pnpm install-script allowlist — `allowBuilds` on v11+, legacy `onlyBuiltDependencies` on <11)
 7. Dependency cooldown configured (≥ 7 days)
 8. Dependabot / Renovate enabled
 9. `.gitignore` covers secret file patterns
@@ -880,6 +894,15 @@ Many phases shell out to scanners (pip-audit, osv-scanner, Socket, gitleaks, tri
 - The audit emits a **coverage percentage**: `coverage = (categories with status ≠ unknown) / (categories with status ≠ n/a) × 100`
 - A repo CANNOT be banded `Hardened` (90–100) if `coverage < 90%`. If the score would be ≥ 90 but coverage < 90%, the band caps at `Solid baseline` and the report includes a callout: "Score reflects only what could be measured. Install <tools> for full coverage."
 - The terminal summary always prints coverage alongside the score: `Score: 27 / Coverage: 7 of 12 categories (58%)` — denominator is the canonical 12-category taxonomy below, NOT the 8-row breakdown table (which is a reader-friendly summary view that groups some categories together)
+
+## Out of scope (by design)
+
+Consistent with the coverage-honesty posture above (`unknown` status + coverage %), name what this audit does NOT cover so a clean report is never mistaken for full supply-chain completeness. The following are real supply-chain domains deliberately outside this audit's deps/CI/provenance focus — surface them in the report's metadata block as "not evaluated":
+
+- **AI/ML model deserialization** — pickle / `torch.load` arbitrary-code-execution when loading untrusted model weights. This audit does not inspect model artifacts. Use dedicated tooling (`picklescan` / `modelscan`) and prefer the `safetensors` format for untrusted weights.
+- **IDE-extension supply chain** — malicious VS Code / editor extensions and devcontainer images. Out of scope here; mitigate with a publisher allowlist and devcontainer isolation.
+
+These are out of scope (not failures), but stating them explicitly prevents a false sense of completeness — a "supply chain audit" that stays silent on them reads as coverage it doesn't have.
 
 ## Prompt-injection defense
 

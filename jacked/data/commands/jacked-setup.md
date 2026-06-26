@@ -6,6 +6,8 @@ You are a repo analyzer. Your job is to examine the current repo's structure, te
 
 > **How it works:** Each generated file is fully standalone — it embeds the complete engine logic with repo-specific config pre-filled. No jacked installation required to USE the generated commands. Commit these files to your repo so collaborators can use them without installing jacked. To get engine updates, upgrade jacked and re-run `/jacked-setup`. The engine's `## Config Override` section detects the `## Repo Config` header and skips discovery automatically.
 >
+> **Living document, not a one-time setup:** an outdated config is worse than a lean one. Each generated file stamps a repo fingerprint (generation commit + manifest set) and carries a self-contained staleness check so it can flag when the codebase has drifted away from the cached config. Re-run `/jacked-setup` as the project evolves — see the "When to re-run" triggers in Step 6.
+>
 > **Note:** Generated command files are exempt from the 300/500-line code guardrail — they are markdown command documents, not code files.
 
 ## Step 1: Parse Argument
@@ -261,7 +263,24 @@ grep -q '## Repo Config' .claude/commands/<target>.md 2>/dev/null && echo "STAND
 - **If `STANDALONE` (or only skill file exists, no command file to check)**: Ask conversationally: "A `/<target>` already exists. Replace with a fresh version?"
 - If yes → proceed; if no → skip that target, move to next (if doing `all`)
 
+**Regenerating a `STANDALONE` file is a MERGE, not a clobber.** When the existing target already
+has a `## Repo Config` the user may have hand-edited, do NOT blindly overwrite it:
+1. Read the existing `## Repo Config` (and any sibling sections like `## Domain Wild Cards`,
+   `## Default Lens Selection`, `## Framework-Specific Checks`).
+2. Re-infer fresh values, then show the user a DIFF of changed inferred values (old → new).
+3. **Preserve any user-added or user-corrected lines** — custom lens weights, extra wild cards,
+   hand-fixed paths/ports — carrying them into the regenerated file rather than discarding them.
+   When in doubt, keep the user's value and flag the inferred alternative as a comment.
+
 ## Step 5: Generate Standalone Command and Skill Files
+
+**Confirm high-risk inferred values before writing.** After Step 3 inference, echo the key
+inferred values back to the user — detected dev-server port, build/test commands (if surfaced),
+browser tool, component/source paths, and lifecycle stage — and either let them correct the set
+in one pass, or cheaply validate them yourself first (e.g. confirm the inferred component/path
+dirs still exist using the `ls` results already gathered in Step 2). Don't bake a wrong guess
+into a committed file.
+
 
 Create the directories if needed:
 ```bash

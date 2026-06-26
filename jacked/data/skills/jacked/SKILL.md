@@ -1,6 +1,6 @@
 ---
 name: jacked
-description: Use when the user mentions a past project like "configurator", asks to continue/resume previous work, says "how did I do X before", references past sessions, or starts work on a feature that may have been done before. Searches and loads context from past Claude Code sessions.
+description: Use when the user references past work — "how did I do/fix X before", "where did I debug Y", "what was that command/approach", "what did I work on yesterday/this week", "search my history", mentions a past project like "configurator", asks to continue/resume previous work, references past sessions, or starts work on a feature that may have been done before. Searches and loads context from past Claude Code sessions.
 ---
 
 # Jacked
@@ -44,13 +44,29 @@ Example:
 
 When the user runs `/jacked <description>`, follow these steps:
 
+### Step 0: Classify the Query
+
+Before searching, decide which kind of recall this is — it changes the path:
+
+- **Topic** ("how did we fix the auth bug", "where did I debug the K8s OOM", "what was that migration approach") → the default flow below (Steps 1–5).
+- **Temporal / digest** ("what did I do yesterday", "what was I working on this week", "give me standup notes") → jump to the **Temporal / Digest Queries** section; it lists recent sessions by age instead of forcing a topic match.
+- **Hybrid** ("yesterday's auth work") → run the default topic flow but bias toward the most recent matches, reading the Age column.
+
 ### Step 1: Search for Similar Sessions
 
-Run the search command:
+**Freshness first (avoid silent misses):** the index is updated by a Stop hook *after* each response, so the current in-flight session and very-recently-finished work may not be searchable yet. If the user is asking about something from this session or the last few minutes, index the current session before searching:
+
+```bash
+jacked index   # indexes the current session (uses CLAUDE_SESSION_ID); no-op if already current
+```
+
+Then run the search:
 
 ```bash
 jacked search "<user's description>" --limit 5
 ```
+
+If a just-discussed item still doesn't appear in the results, say so and fall back to the local transcript or `git log`/`git diff` for the current repo rather than reporting "nothing found" — a miss here usually means "not yet indexed," not "never happened."
 
 The output includes:
 - Relevance score (percentage)
@@ -59,6 +75,8 @@ The output includes:
 - Repository name
 - Content indicators: 📋 = has plan file, 🤖 = has agent summaries
 - Preview of matched content
+
+**Drop /jacked recall sessions from the results.** Because every session is indexed by the Stop hook, prior `/jacked` runs get indexed too — so a search can surface your *own past recall sessions* instead of real work. Before presenting results, discard (or, if nothing else matches, visibly de-prioritize and label) any hit whose preview is dominated by `jacked search` / `jacked retrieve` output, "CONTEXT FROM PREVIOUS SESSION" injection blocks, or otherwise reads as a session that was itself searching history rather than doing the work. The picker should show real work, not echoes of earlier recalls.
 
 ### Step 2: Present Results Using AskUserQuestion
 
@@ -114,6 +132,15 @@ Smart mode retrieval output includes:
 - Summary labels (chapter titles)
 - First few user messages
 
+**Surface "files touched" and "key commands run" as a compact recall block.** These are the cheapest, highest-signal artifacts for recreating a past solution without re-reading the whole transcript — the core "no more re-solving" payoff. From the retrieved content, extract the files Read/Write/Edit'd and the key Bash commands run (in smart mode they're referenced in the plan, summaries, and user messages; if the user explicitly wants to reproduce a fix and they aren't visible, escalate that one session to `--mode full` and pull the actual tool calls from the transcript). When present, **lead your post-injection summary with them**:
+
+```
+Files touched: src/api/auth.py, tests/test_auth.py, migrations/004_add_token.sql
+Key commands: alembic upgrade head · pytest tests/test_auth.py -k token · ruff check src/api
+```
+
+Then follow with the narrative summary (what the session covered, key decisions).
+
 ### Step 4: Handle Based on Session Location
 
 **If session is local:**
@@ -149,6 +176,29 @@ After injection, summarize:
 2. Key decisions or implementations found
 3. Ask what the user wants to work on now
 
+## Temporal / Digest Queries
+
+When the user asks what they *did* in a time window rather than about a topic ("what did I do yesterday", "what was I working on this week", "give me standup notes"), don't force a topic match — produce a recency-ordered digest instead.
+
+1. Run a broad listing scoped to the user (and the current repo when the question is repo-specific):
+
+   ```bash
+   jacked search "<broad term, e.g. the repo or current focus area>" --mine --limit 15
+   ```
+
+   The result table already carries the Age column ("today", "yesterday", "3d ago", "2w ago"). Use it to keep only sessions inside the asked-for window, and drop /jacked recall sessions (see Step 1) so the digest is real work.
+
+2. Order the survivors newest-first and summarize each as one compact line:
+
+   ```
+   • yesterday — hank-coder (feat/auth) — files: auth.py, test_auth.py — added refresh-token rotation, fixed 401 retry
+   • yesterday — krac-llm (main) — files: scheduler.py — debugged overnight OB time merge
+   ```
+
+   Pull repo, branch (when known), files touched, and the key decision from each session's plan/summaries — `jacked retrieve <id> --mode labels` or `--mode plan` is cheap when you need a one-line gist per session. Don't dump full transcripts for a digest.
+
+3. Close by asking whether they want to dive into any one of those sessions (then fall through to Step 3 retrieval for the chosen one).
+
 ## Retrieval Modes
 
 | Mode | What's Included | When to Use |
@@ -174,6 +224,7 @@ After injection, summarize:
 - Local sessions can be resumed natively with `claude --resume` for the best experience
 - Remote sessions are retrieved and injected as context (works but Claude won't have internal memory state)
 - Use `jacked cleardb` to wipe your data before re-indexing with a new schema
+- **Skip sub-agent sidecar transcripts.** If you ever enumerate local session files directly (the git/local fallback above, or a `recover`-style scan), ignore files named `agent-*.jsonl` — those are sub-agent sidecars, not standalone sessions, and their content is already folded into the parent session's summaries. Surfacing them as their own results is noise. (`backfill` already excludes them from the index.)
 
 ## Artifact Format Preference
 
