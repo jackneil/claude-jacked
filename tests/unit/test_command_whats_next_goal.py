@@ -329,12 +329,17 @@ def test_step_8_file_backed_still_convergent(engine: str) -> None:
     assert "file-backing relaxes the char limit, not the spins-forever rule" in s
 
 
-def test_step_8_turn_cap(engine: str) -> None:
-    """For unattended runs, the brief can include a turn/time backstop — framed
-    as a non-success halt, NOT a DONE branch that abandons milestones."""
+def test_step_8_drives_to_completion_not_turn_capped(engine: str) -> None:
+    """Unattended runs drive to TRUE completion — the brief must NOT cap
+    successful work (no turn/merge/time cap). The only halt is genuine
+    stuck-detection (a no-progress loop), an unsafe step, or a fully-blocked
+    worklist; completed work never triggers a stop."""
     s = _section(engine, "## Step 8")
-    assert "blocked after <N> turns" in s
-    assert "halt, not completion" in s
+    assert "blocked after <N> turns" not in s   # the old success-cap is gone
+    assert "TRUE completion" in s               # drive to completion, not a turn budget
+    assert "no-progress" in s.lower()           # the only loop-halt is stuck-detection
+    assert "stuck-detection" in s.lower()
+    assert "BLOCKED" in s                       # a genuine block still halts (that item)
 
 
 def test_step_8_inline_and_filebacked_are_exclusive(engine: str) -> None:

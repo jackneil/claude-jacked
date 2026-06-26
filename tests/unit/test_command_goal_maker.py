@@ -5,7 +5,8 @@ default-PR / opt-in-merge toggle.
 These guard the contract: default is PR-only (merge is opt-in via the `merge`
 arg), auto-merge is always CI-gated and uses a true merge commit, the brief
 inherits /whats-next's hard 4,000-char measurement + file-backed fallback +
-turn backstop + DATA-only rule, and the UI/UX/TDD quality bars are baked in.
+stuck-detection backstop (drives to completion, never caps successful work) +
+DATA-only rule, and the UI/UX/TDD quality bars are baked in.
 Like the other command tests, these are string-presence checks on the LLM
 instruction document, not runtime-behavior assertions.
 """
@@ -60,7 +61,7 @@ def test_inherits_whatsnext_brief_engine(gm: str):
     # file-backed fallback for briefs that won't fit
     assert "pointer-goal" in gm
     # bounded unattended run
-    assert "backstop" in gm.lower()
+    assert "backstop" in gm.lower()  # stuck-detection backstop (drives to completion, never caps successful work)
     assert "BLOCKED" in gm
     # the brief skeleton
     assert "Deliver:" in gm and "Verify" in gm and "DONE when:" in gm

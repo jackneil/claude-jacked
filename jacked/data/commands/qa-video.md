@@ -43,7 +43,8 @@ Caveat from Step 0: **if you chose Path P/T, the driver is Playwright MCP** (vid
 
 ## Step 2: Scope the journey (URL + what to walk + credentials)
 
-- **URL:** if `$ARGUMENTS` contains a URL, use it. Otherwise detect a running dev server (conversation context, then `lsof -i -P -sTCP:LISTEN | grep -E ':(3000|3001|4200|5000|5173|5174|8000|8080|8765|8888) '`). If none, ask.
+- **Prefer a LOCAL instance — don't record against production.** This drives and clicks through the UI; if the journey writes anything (submit/save/delete), run it against a LOCAL dev server — start one if none is running (`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose up`, `manage.py runserver`, `uv run`/`flask run`, etc., with seed/sample data) — or a disposable staging, **never production**. If only a production URL is reachable, keep the recording READ-ONLY (navigate + observe, no mutating clicks) and say so.
+- **URL:** if `$ARGUMENTS` contains a URL, use it (confirm it's local/disposable before any mutating interaction). Otherwise detect a running dev server (conversation context, then `lsof -i -P -sTCP:LISTEN | grep -E ':(3000|3001|4200|5000|5173|5174|8000|8080|8765|8888) '`). If none, ask.
 - **What to walk:** if the user named a flow ("login → dashboard"), follow it. Otherwise scope to what changed (`git diff --name-only HEAD`, UI files) like `/qa` Step 2 — record the journey through the affected areas.
 - **Credentials:** if auth is needed, find creds in `.env*` exactly as `/qa` Step 5 (announce variable names only, never values; skip `DB_`/`AWS_`/infra vars). **Never fake a login** — if you can't get past auth, record up to the login wall and narrate that the rest is blocked on credentials.
 - Confirm the app is actually up before recording: `curl -sS -o /dev/null -w '%{http_code}' <url>` — a blank/error page is only worth recording if that *is* the bug.

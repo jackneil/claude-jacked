@@ -78,6 +78,11 @@ git log --oneline -10 2>/dev/null
 ```
 
 ```bash
+# Generation fingerprint (stamp into ## Repo Config so generated files can self-check staleness)
+git rev-parse HEAD 2>/dev/null || echo "no-commits"
+```
+
+```bash
 # GitHub CLI availability
 gh auth status 2>/dev/null && echo "GH_OK" || echo "GH_NOT_AUTH"
 ```
@@ -317,12 +322,28 @@ description: "<standalone description — see per-target templates below>"
 
 <structured config data discovered above>
 
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection — e.g. `pyproject.toml, package.json`>
+
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
 <engine body, front matter and delegation Note stripped — embedded verbatim from ~/.claude/commands/<target>.md>
 ```
 
 **Critical:** Use the Read tool output verbatim for the engine body. Do NOT reproduce it from memory. The engine body is injected as-is after the `<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->` marker.
+
+**Staleness self-check (bake into every generated file).** Immediately after the `## Repo Config` block (just above the `<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->` marker), append this verbatim `## Config Staleness Check` block so the embedded engine's Config-Override path runs it on every invocation. It is **advisory, never blocking** — it surfaces a one-line nudge and then proceeds normally:
+
+```markdown
+## Config Staleness Check
+Before using the config above, run a lightweight drift check (advisory only — never block on it):
+1. `git rev-parse HEAD` and compare to **Generated at commit** above.
+2. `ls package.json pyproject.toml go.mod Cargo.toml setup.py Gemfile pom.xml build.gradle composer.json mix.exs 2>/dev/null` and compare the manifest set to **Detected stack** above.
+3. If EITHER differs, count the intervening commits (`git rev-list --count <generated-commit>..HEAD 2>/dev/null`) and surface one line, then continue:
+   > ⚠️ This `/<target>` config was generated N commits ago and the stack/paths may have drifted — re-run `/jacked-setup <target>` to refresh.
+   If the generated commit is unreachable (history rewritten) or the manifest set changed, surface the nudge regardless of commit count. Never stop or skip the run on a staleness mismatch.
+```
 
 **Also write a local skill file** after the command file. Use `mkdir -p .claude/skills/<target>` first. Local skills use RELATIVE paths — do NOT use `~/.claude/commands/`. Do NOT add Glob fallback checks to local skills (those are only for global skills). See per-target skill bodies below.
 
@@ -352,6 +373,10 @@ Include: <file extensions for detected languages>
 
 ## Strategic Emphasis
 Lifecycle lean: <where to weight the Step 6 decision based on lifecycle — e.g. Greenfield/Alpha: capability gaps in the core loop; Beta/Growth: cross-cutting experience levers; Maintenance: operational/debt levers. A hint for the single decision, not a ranking scheme.>
+
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
@@ -392,6 +417,10 @@ description: "Browser QA — standalone (generated <date>; upgrade jacked + re-r
 - React: Verify key props on list items, check useEffect cleanup, test controlled inputs
 - Tailwind: Check responsive classes at mobile/tablet breakpoints
 - Next.js: Test client/server component boundaries, check hydration
+
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
@@ -437,6 +466,10 @@ description: "Parallel UX checks — standalone (generated <date>; upgrade jacke
 
 ## UX Focus Areas
 <emphasis based on stack — e.g. "Tailwind: verify responsive breakpoints (375px, 768px, 1280px)" or "Next.js: test hydration boundaries, client/server component interactions" or "Nav changes: emphasize Discoverability aspect across all agents">
+
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
@@ -491,6 +524,10 @@ In addition to the standard pool, include:
 In addition to the standard pool, include:
 <1-2 repo-specific failure scenarios based on project type>
 
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
+
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
 [Engine body from `~/.claude/commands/dcr.md` embedded here — front matter and delegation Note stripped]
@@ -539,6 +576,10 @@ Examples:
 | Models/Schemas | <list existing docs that cover data models> |
 | Tests | <list existing docs that cover testing> |
 
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
+
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
 [Engine body from `~/.claude/commands/docs-sync.md` embedded here — front matter and delegation Note stripped]
@@ -574,6 +615,14 @@ If the result is `GITIGNORED`, warn the user:
 > ⚠️ `.claude/` appears to be gitignored. Your teammates and repo cloners won't get these files unless you commit them explicitly. Add a `.gitignore` exception: `!.claude/` (or commit the files directly with `git add -f .claude/`).
 
 If the repo is greenfield (<10 commits), add: "This is a young repo — re-run `/jacked-setup <target>` as your project matures to capture new planning docs and lifecycle changes."
+
+**Confirm the staleness self-check is baked in.** Verify each generated file carries the `## Config Staleness Check` block (from Step 5) plus its two stamped fingerprint lines (**Generated at commit**, **Detected stack**). This is what lets the embedded engine's Config-Override path flag drift on future runs — an advisory nudge, never a hard stop.
+
+**When to re-run:** the generated config is a living document — re-run `/jacked-setup <target>` when:
+- The stack or framework changes (new language, new frontend/CSS framework, swapped build tool).
+- New planning docs appear (roadmap, specs, design docs) that should feed the config.
+- The project lifecycle shifts (Greenfield → Alpha → Beta → Growth → Maintenance).
+- A major refactor moves component, route, or API paths the config points at.
 
 ## HARD RULES
 

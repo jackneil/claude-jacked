@@ -24,7 +24,8 @@ Before anything else:
 1. Run `git status` to check for uncommitted changes.
 2. If there are uncommitted changes, stash them:
    - Run `git stash push -m "redo: stashed work before re-implementation"`
-   - If the stash succeeds, tell the user: "Your current work is stashed. Run `git stash pop` if you want it back."
+   - If the stash succeeds, immediately run `git stash apply` to restore the changes to the working tree. The stash entry is retained as your safety backup, but the working tree must still contain the old approach so Step 2 can read it to capture the baseline. **Do not leave the tree empty going into Step 2** - stashing alone removes the very code Step 2 needs to inspect.
+   - After applying, tell the user: "Your current work is stashed as a backup (and restored to your working tree). Run `git stash drop` once the redo lands, or `git checkout -- .` then `git stash pop` to get the original back."
    - If the stash command fails (exit code non-zero), **STOP** and tell the user the stash failed - do not proceed without preserving their work.
    - If there's nothing to stash (clean working tree), that's fine - proceed. Already-committed work is safe in git history.
 

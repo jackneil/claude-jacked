@@ -15,8 +15,8 @@ triggers: [schema, migration, model, sql, database, orm, table, column, index, q
 - Migrations are backward-compatible (can roll back without data loss)
 - Large table migrations avoid locking (use batched updates, not ALTER TABLE on hot tables)
 - **Index builds on large/production tables use `CREATE INDEX CONCURRENTLY`** (and
-  `DROP INDEX CONCURRENTLY`) — a plain `CREATE INDEX` takes an ACCESS EXCLUSIVE lock and blocks
-  all writes for the whole build. Note `CONCURRENTLY` cannot run inside a transaction
+  `DROP INDEX CONCURRENTLY`) — a plain `CREATE INDEX` takes a SHARE lock that blocks
+  writes (reads still proceed) for the whole build. Note `CONCURRENTLY` cannot run inside a transaction
 - **Add constraints as `NOT VALID` first, then `VALIDATE CONSTRAINT` separately:** FKs, CHECKs,
   and `SET NOT NULL` on existing columns. The `NOT VALID` add is instant; `VALIDATE` takes a
   non-blocking ShareUpdateExclusive lock. For NOT NULL on PG12+, add a `CHECK (col IS NOT NULL)

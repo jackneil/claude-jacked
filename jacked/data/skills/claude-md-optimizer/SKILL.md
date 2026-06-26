@@ -36,7 +36,7 @@ Find all CLAUDE.md files and related documentation:
 
 ```bash
 # Find CLAUDE.md files
-find . -name "CLAUDE.md" -o -name ".claude.md" -o -name ".claude.local.md" 2>/dev/null | head -20
+find . -name "CLAUDE.md" -o -name "CLAUDE.local.md" 2>/dev/null | head -20
 
 # Find referenced docs (design guides, guardrails, workflows, etc.)
 grep -roh '\[.*\](.*\.md)' ./CLAUDE.md 2>/dev/null | sort -u

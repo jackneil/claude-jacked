@@ -105,7 +105,15 @@ If no shared files changed, skip the spot-check entirely.
 
 ## Step 4: Determine App URL
 
-**If `$ARGUMENTS` contains a URL**: Use that URL directly.
+**Prefer a LOCAL instance — don't run interactive/mutating checks against production.** This
+pass clicks and fills forms, and may submit/save. If so, run it against a LOCAL dev server —
+start one if none is running (`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose
+up`, `manage.py runserver`, `uv run`/`flask run`, etc., with seed/sample data), or a disposable
+staging — **never production**. If only a production URL is reachable, keep the pass READ-ONLY
+(look, don't submit/save/delete) and tell the user the interactive checks need a local instance.
+
+**If `$ARGUMENTS` contains a URL**: Use that URL directly (confirm it's local/disposable before
+any mutating interaction).
 
 **Otherwise**, try to detect a running dev server:
 1. Check conversation context for recently mentioned URLs (e.g., `http://localhost:3000`)

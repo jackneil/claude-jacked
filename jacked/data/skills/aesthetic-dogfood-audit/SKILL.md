@@ -38,15 +38,35 @@ This is the **comprehensive end-to-end dogfood** — the widest and deepest of t
 
 When in doubt and the ask is "look at the whole thing / is it any good", it's this one.
 
+## Run against a LOCAL instance — never prod the real thing
+
+This skill clicks, types, and (the F1 functional lens) **creates, edits, and DELETES**.
+Doing that against a production or shared environment mutates real data, fires real
+emails/webhooks/jobs, and disrupts real users. So before any walkthrough:
+
+- **Prefer to spin up the app locally yourself.** If no local dev server is already
+  running, *try to start one* rather than asking for a URL: detect the start command
+  (`package.json` scripts `dev`/`start`, a `Makefile`/`justfile` target, `docker compose
+  up`, a `Procfile`, `manage.py runserver`, `rails s`, `uv run`/`flask run`, etc.) AND the
+  local data layer (a `docker-compose` DB, a SQLite file, or a `seed`/`migrate`/`fixtures`
+  command), load `.env.local`/`.env.example`, start it **in the background**, and wait until
+  it serves (`curl` the root/health). Drive it with **seed/sample data**, never real data.
+- **Only use a deployed URL if the user explicitly gives one AND confirms it's safe to
+  interact with** — a throwaway/staging with disposable data, not production.
+- **If only a production/shared env is reachable and you can't run local:** switch to
+  **READ-ONLY** — look, don't touch: NO create/edit/delete/submit, no destructive clicks —
+  and tell the user the F1 functional + F2 data-mutation checks need a local or disposable
+  instance to run safely. Do the aesthetic (Bar B) and discoverability passes read-only;
+  defer the mutating checks.
+
 ## Repo-callable — point it at a repo and go
 
-You should be able to run this with no setup. Auto-detect, exactly as `/qa` does
-(read `~/.claude/commands/qa.md` Steps 1, 4, 5 for the precise probes):
+Auto-detect the rest, exactly as `/qa` does (read `~/.claude/commands/qa.md` Steps 1, 4, 5):
 1. **Browser tool** — Chrome DevTools MCP (preferred) → Playwright MCP → Claude-in-Chrome
    → `agent-browser` CLI. If none, print the setup hint and stop.
-2. **App URL** — `$ARGUMENTS` if given, else detect a running dev server
-   (`lsof -i -P -sTCP:LISTEN | grep -E ':(3000|3001|4200|5000|5173|5174|8000|8080|8765|8888) '`),
-   else ask.
+2. **App URL** — the **local** instance from above (spin it up if needed); use `$ARGUMENTS`
+   only if it's explicitly a safe local/throwaway URL. Detect an already-running local server
+   with `lsof -i -P -sTCP:LISTEN | grep -E ':(3000|3001|4200|5000|5173|5174|8000|8080|8765|8888) '`.
 3. **Personas + credentials** — discover the product's roles/personas from the codebase:
    auth/RBAC config, role enums, seed/fixture data, a permissions matrix, `.env` test
    creds (announce variable names only, never values — `/qa` Step 5). If you can't infer

@@ -88,7 +88,7 @@ Use a portable, conventional vocabulary instead of ad-hoc labels:
 - **Stale handling**: flag issues with no activity for a long window as candidates for `waiting-for-response` follow-up or closure, rather than letting them rot.
 - **Project board sync** (when one exists): move grouped issues Backlog → In Progress → Review → Done in lockstep with PR state (opened-draft → ready-for-review → merged).
 
-### 5. PULL REQUEST MANAGEMENT
+### 6. PULL REQUEST MANAGEMENT
 When creating or managing PRs, you will:
 - **Open a draft PR EARLY** — at the start of implementation, linked to the issue(s), containing
   a task checklist derived from the plan/acceptance criteria. Tick items off and push iteratively,

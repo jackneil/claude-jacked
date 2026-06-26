@@ -248,7 +248,16 @@ Determine whether the project targets mobile users using **weighted signals**:
 
 ## Step 6: Determine App URL
 
-**If `$ARGUMENTS` contains a URL**: Use that URL directly.
+**Prefer a LOCAL instance — don't drive interactive/mutating flows against production.** This
+review clicks through pages and exercises interactions across personas. If any of it writes
+(submit, save, delete), run against a LOCAL dev server — start one if none is running
+(`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose up`, `manage.py runserver`,
+`uv run`/`flask run`, etc., with seed/sample data) — or a disposable staging, **never
+production**. If only a production URL is reachable, keep it READ-ONLY and say the interactive
+checks need a local instance.
+
+**If `$ARGUMENTS` contains a URL**: Use that URL directly (confirm it's local/disposable before
+any mutating interaction).
 
 **Otherwise**, try to detect a running dev server:
 1. Check conversation context for recently mentioned URLs

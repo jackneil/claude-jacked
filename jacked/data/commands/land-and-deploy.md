@@ -38,8 +38,9 @@ If the PR is already merged: skip to Step 4 (diff-scope classification, then dep
 Verify the PR is ready to merge:
 
 ```bash
-# Check CI status
-gh pr checks --json name,state,conclusion 2>/dev/null
+# Check CI status — key the decision off `bucket` (pass/fail/pending/skipping/cancel),
+# not `conclusion` (which is NOT a valid --json field for `gh pr checks` and errors)
+gh pr checks --json name,state,bucket 2>/dev/null
 ```
 
 **If any required check is PENDING/QUEUED (not yet a pass or fail), actively wait instead of stopping.** A user who runs this the moment checks queue should be landed, not bounced. Watch CI to completion with a bounded timeout:
@@ -49,7 +50,7 @@ gh pr checks --json name,state,conclusion 2>/dev/null
 timeout 900 gh pr checks --watch --fail-fast 2>/dev/null
 ```
 
-Record the CI wait duration for the report. Only **stop** on FAIL (a check concluded failing) or on TIMEOUT (15 min elapsed with checks still pending — report "CI still pending after 15 min" and let the user decide). If `--watch` is unsupported in the installed `gh`, poll `gh pr checks --json name,state,conclusion` every 20s until all states are non-pending or the timeout hits.
+Record the CI wait duration for the report. Only **stop** on FAIL (a check's `bucket == "fail"`) or on TIMEOUT (15 min elapsed with checks still in `bucket == "pending"` — report "CI still pending after 15 min" and let the user decide). If `--watch` is unsupported in the installed `gh`, poll `gh pr checks --json name,state,bucket` every 20s and key the pending/pass/fail decision off `bucket` (pass/fail/pending/skipping/cancel) until no check is `pending` or the timeout hits.
 
 ```bash
 # Check review status

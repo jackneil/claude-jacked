@@ -54,7 +54,13 @@ preferred — smoother motion reads better for teaching.
 
 ## Step 3: Stage a clean set — this is a demo, not a test
 
-A teaching video must look intentional:
+A teaching video must look intentional — and the demo *performs actions* (clicks, exports,
+saves), so it must NOT run against production:
+- **Record against a LOCAL instance.** Spin up the app locally if it isn't already running
+  (`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose up`, `manage.py runserver`,
+  `uv run`/`flask run`, etc.) with seed/sample data, and point the walkthrough at `localhost`.
+  Only use a deployed URL if the user gives a disposable/staging one — never production, where
+  the demo's clicks would mutate real data or fire real side effects.
 - Log in as the **demo persona** with **representative, clean data** (not empty, not debug
   junk, no real PII — use seed/sample data; if the screen would show real customer data, switch
   to a demo account or sanitize).

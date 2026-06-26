@@ -274,7 +274,7 @@ Loaded:   {N} referenced files ({total_lines} lines)
 {Checkpoint summary — What We're Working On + Remaining Work + Current State + Gotchas}
 ```
 
-If a **project journal** exists (`.claude/checkpoints/PROJECT-NOTES.md` — see Complete Flow), read it and fold its durable learnings into how you resume. It outlives any single checkpoint, so it's authoritative for recurring gotchas, user preferences, and non-obvious patterns.
+If a **project journal** exists (`.claude/PROJECT-NOTES.md` — see Complete Flow), read it and fold its durable learnings into how you resume. It outlives any single checkpoint, so it's authoritative for recurring gotchas, user preferences, and non-obvious patterns.
 
 ### Step 6: Continue
 
@@ -306,7 +306,7 @@ Update the checkpoint file's status. For HTML: change `<meta name="jacked:status
 
 > "Promote N durable learning(s) to the project journal so they survive this checkpoint? (Y/n)"
 
-If yes, append them as terse bullets to `.claude/checkpoints/PROJECT-NOTES.md` (create from a plain `# Project Notes` heading if absent). Keep it **small and curated** — merge into or sharpen an existing bullet rather than duplicating, and skip anything already captured in `CLAUDE.md`. This journal is read on every resume (Resume Step 5). The same secrets-hygiene scan as Save Step 3 applies — never write a credential into it.
+If yes, append them as terse bullets to `.claude/PROJECT-NOTES.md` (create from a plain `# Project Notes` heading if absent). Keep it **small and curated** — merge into or sharpen an existing bullet rather than duplicating, and skip anything already captured in `CLAUDE.md`. This journal is read on every resume (Resume Step 5). The same secrets-hygiene scan as Save Step 3 applies — never write a credential into it.
 
 ```
 CHECKPOINT COMPLETED
