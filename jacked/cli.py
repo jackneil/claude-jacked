@@ -111,11 +111,78 @@ def _log_to_db(table: str, **kwargs):
         pass
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-def main(verbose: bool):
+@click.pass_context
+def main(ctx, verbose: bool):
     """Jacked - Cross-machine context for Claude Code sessions."""
     setup_logging(verbose)
+    # First-run nudge: `pip`/`uv tool install` run no code, so this is the
+    # earliest point we can tell a user the install isn't finished. Loud banner
+    # + offer to run `jacked install` when it hasn't been wired up yet.
+    _maybe_prompt_first_run(ctx)
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+        ctx.exit()
+
+
+def _already_installed() -> bool:
+    """True once `jacked install` has run at least once (manifest present)."""
+    return (_jacked_home() / ".claude" / "jacked-manifest.json").exists()
+
+
+def _is_headless() -> bool:
+    """True when there's no GUI display to draw a tray icon on.
+
+    macOS/Windows always have a window server. On Linux/BSD a tray needs X11 or
+    Wayland; absent both (CI, servers, Docker, SSH) we skip the icon and just
+    run the service."""
+    import os
+
+    if sys.platform in ("darwin", "win32"):
+        return False
+    return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _maybe_prompt_first_run(ctx) -> None:
+    """When jacked is on disk but `jacked install` has never run, show a loud
+    banner and (interactively) offer to run it now.
+
+    Fires only for a human at an interactive terminal — never for the hook /
+    update-status shims (names starting with ``_``), for ``install`` itself, or
+    for any non-TTY caller (scripts, CI, Claude Code hooks, the test runner), so
+    it can't corrupt automated stdout/stderr."""
+    sub = ctx.invoked_subcommand
+    if sub and (sub.startswith("_") or sub == "install"):
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    if _already_installed():
+        return
+
+    from rich.panel import Panel
+    from rich.text import Text
+
+    msg = Text()
+    msg.append("Jacked is installed but NOT wired into Claude Code yet.\n\n", style="bold yellow")
+    msg.append("Run this ONE command to deploy the skills, commands, agents,\n", style="white")
+    msg.append("hooks, and tray icon:\n\n", style="white")
+    msg.append("    jacked install\n", style="bold cyan")
+    console.print(
+        Panel(
+            msg,
+            title="[bold white on red]  ⚠  ONE MORE STEP — RUN `jacked install`  ⚠  [/]",
+            border_style="bold red",
+            expand=False,
+        )
+    )
+    try:
+        if click.confirm("Run `jacked install` now?", default=True):
+            ctx.invoke(install)
+            if sub is None:
+                ctx.exit(0)
+    except (click.Abort, EOFError, KeyboardInterrupt):
+        console.print("[dim]No problem — run `jacked install` whenever you're ready.[/dim]")
 
 
 @main.command()
@@ -2790,6 +2857,11 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
 )
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
 @click.option(
+    "--no-tray",
+    is_flag=True,
+    help="Skip registering/starting the tray icon (the tray is on by default)",
+)
+@click.option(
     "--force",
     "-f",
     is_flag=True,
@@ -2806,6 +2878,7 @@ def install(
     search: bool,
     no_security: bool,
     no_rules: bool,
+    no_tray: bool,
     force: bool,
     as_json: bool,
 ):
@@ -2854,6 +2927,7 @@ def install(
             pkg_root=pkg_root,
             sounds=sounds,
             no_rules=no_rules,
+            no_tray=no_tray,
             force=force,
             as_json=as_json,
             install_search=install_search,
@@ -2894,6 +2968,7 @@ def _run_install(
     as_json: bool,
     install_search: bool,
     install_security: bool,
+    no_tray: bool = False,
 ) -> None:
     """Run the artifact/hook/rules installation (no manifest, no summary).
 
@@ -3164,13 +3239,15 @@ def _run_install(
         else:
             console.print("[dim][-][/dim] No project env detected")
 
-    # Tray: when the [tray] extra is installed, make it "just work" — register
-    # login autostart and start the tray now (idempotent; no-op without [tray]).
-    _setup_tray_autostart()
+    # Tray: ON by default (pystray/Pillow are core deps) — register login
+    # autostart and start the tray now. `--no-tray` opts out.
+    if not no_tray:
+        _setup_tray_autostart()
 
 
 def _tray_extra_installed() -> bool:
-    """True if the optional [tray] dependency (pystray) is importable."""
+    """True if pystray is importable. pystray/Pillow are CORE deps now (tray on
+    by default), so this is False only on a broken/incomplete install."""
     try:
         import pystray  # noqa: F401
 
@@ -3227,10 +3304,18 @@ def _ensure_autostart_and_running(
 
 
 def _setup_tray_autostart() -> None:
-    """When the [tray] extra is installed, register login autostart and start
-    the tray now so `jacked install` makes the icon appear. No-op without the
-    extra (base / headless / CI installs)."""
+    """Register login autostart and start the tray now so `jacked install` makes
+    the icon appear. The tray is ON by default (pystray/Pillow are core deps);
+    `jacked install --no-tray` skips this. No-ops when pystray can't import, or
+    on a headless box (no display) so CI/servers run the service without trying
+    to draw a broken icon."""
     if not _tray_extra_installed():
+        return
+    if _is_headless():
+        console.print(
+            "[dim][-][/dim] Headless environment (no display) — skipping tray icon. "
+            "Run `jacked service start` to run the service without a tray."
+        )
         return
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT
 
