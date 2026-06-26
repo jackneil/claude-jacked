@@ -63,7 +63,7 @@ Add to your team's Claude Code environment — no Python install needed:
 /plugin install jacked@jacked-marketplace
 ```
 
-Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 24 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 25 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
 
 **Want more?** Add optional extras:
 
@@ -91,7 +91,7 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 ### Toggle Features On and Off
 
-Enable or disable any of the 10 built-in code reviewers and 23 slash commands with one click. Each card shows what it does so you know what you're turning on.
+Enable or disable any of the 10 built-in code reviewers and 24 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
 ![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
 
@@ -118,7 +118,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable any of the 23 slash commands.
+**Commands** — Enable or disable any of the 24 slash commands.
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
 
@@ -156,7 +156,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **24 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **25 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/qa-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -596,6 +596,7 @@ Type these directly in Claude Code:
 | `/swarm-research` | **Divergent Research** — Spawns 2-5 independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate |
 | `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
 | `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
+| `/qa-video` | **QA Video** — Records a playable video of a test journey (true-motion via Playwright MCP video + chapters, or a frame-stitched MP4/GIF) plus a video-synced narration doc — for regression evidence and bug repros |
 | `/whats-next` | **Roadmap Advisor** — Weighs a coverage-matrix read (toward 10/10) plus plans, issues, commits, and lifecycle, then **decides the single highest-leverage initiative** and forges a ready-to-run `/goal` brief (≤4000 chars) for autonomous, tested delivery |
 | `/goal-maker` | **Goal Forge** — Packages the work already in front of you (this conversation, a spec, a plan, an in-flight build) into one overnight-sized `/goal` brief (≤4000 chars) — full scope, TDD, UI/UX + polish gates, evidence-based DONE, plan-ahead `Next:`. Defaults to PR; `merge` arg auto-merges each milestone on green CI |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
@@ -710,6 +711,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.58.0** | **Three skills ported in from personal use.** `aesthetic-dogfood-audit` (skill) — a measure-driven, design-director fit-and-finish pass that drives every route/persona/state in a browser and flags pixel-level defects via an in-page `measure.js` instrument (type-scale sprawl, spacing dupes, edge misalignment, WCAG contrast); disambiguated from `/qa`/`/ux`. `deploy-to-railway` (skill) — an opinionated, gotcha-laden end-to-end Railway provisioning playbook (Postgres + services + bucket + shared env + GitHub auto-deploy + SSO), companion to the official `railway:use-railway`. `qa-video` (skill + `/qa-video` command) — records a playable video of a QA journey plus a video-synced narration: true-motion via Playwright MCP's native video + chapter markers when available, else a frame-stitched MP4 (ffmpeg) or zero-install animated GIF (ImageMagick), with up-front path selection and playback verification. |
 | **0.49.1** | **`/whats-next` now MEASURES the `/goal` brief instead of eyeballing it.** A soft “target ≤3600” was still producing 4,100–4,400-char briefs that `/goal` rejects/truncates. Step 8 now writes the drafted brief to a scratch file and `wc -c`-checks it ≤3600 bytes (bytes ≥ chars, so that guarantees under the hard 4,000-char cap) before it can be emitted, trimming Why-now/Approach prose and re-measuring until it fits. The `Next phases:` line counts and is never dropped. |
 | **0.49.0** | **`/whats-next` `/goal` brief: char-safe + file-backed for big initiatives.** Brief target lowered to **≤3600 chars** (a buffer under `/goal`’s hard 4,000-char condition cap, so briefs stop spilling over). When even one phase’s brief won’t fit, it’s written to a gitignored `.claude/goals/<date>-<slug>.md` and replaced by a short, self-bootstrapping **pointer-goal** (`/goal`’s evaluator can’t read files, so Claude pastes the milestone+Verify list into the transcript first) — never truncated, never committed. Optional **turn/time backstop** for unattended runs, framed as a non-success halt. |
 | **0.48.0** | **`/whats-next` → decisive, coverage-matrix-led recommendation.** `/whats-next` no longer returns a ranked menu — it weighs a coverage-matrix read (personas × contexts, capability *and* lived experience, toward 10/10) alongside plans/issues/TODOs/commits/lifecycle, then commits to ONE ambitious cross-cutting initiative and forges its `/goal` brief directly. Biased toward big combinatorial levers over nitpicky one-offs, with confidence calibration (thin signal → smaller high-certainty move), anti-fabrication guards on the inline read, and convergence sizing (XL initiatives forge the first shippable phase + `Next phases:`). `/jacked-setup whats-next` config switches `## Tier Weights` → `## Strategic Emphasis`. |
