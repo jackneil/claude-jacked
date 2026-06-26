@@ -325,7 +325,7 @@ Build a matrix of (aspect, page) and assign to 2-4 agents:
 - Agent A: Page 1 — Visual & Layout + Responsive
 - Agent B: Page 1 — Interactions + Console & Network + Robustness & States
 - Agent C: Page 2 — Visual & Layout + Accessibility
-- Agent D: Page 2 — Interactions + Discoverability (receives the entry point pages list)
+- Agent D: Page 2 — Interactions + Discoverability + Robustness & States (receives the entry point pages list)
 
 **Robustness & States placement:** by default the agent that owns **Interactions** also owns **Robustness & States** (forms and states are tested together). When that agent is already carrying three aspects, hand Robustness to the lightest agent on the same page instead. At the 4-agent cap, never drop it — fold it into the Interactions agent.
 
@@ -339,7 +339,7 @@ Use your judgment — adjust grouping based on what changed. Skip aspects that c
 **Personas:** [Persona 1] + [Persona 2] (inferred: [classification])
 **Mobile deep dive:** Yes ([signal]) / No ([reason])
 - Agent A: [Page URL] — Visual & Layout + Responsive
-- Agent B: [Page URL] — Interactions + Console & Network
+- Agent B: [Page URL] — Interactions + Console & Network + Robustness & States
 - Agent C: [Page URL] — Accessibility
 ```
 

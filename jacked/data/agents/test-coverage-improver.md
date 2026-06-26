@@ -86,10 +86,10 @@ The single most common failure of AI-written tests is the **tautological test**:
 - If you cannot independently determine the correct answer, do not invent an assertion — switch to a characterization test (below) and label it as such, or flag the unit as needing a human-provided spec.
 
 ```python
-# BAD — tautological: the "expected" value is just whatever the code returns
+# BAD — tautological: the "expected" value is derived by calling the code under test
 def test_discount():
-    result = apply_discount(100, 0.2)
-    assert result == apply_discount(100, 0.2)   # mirrors the code; can never catch a bug
+    expected = apply_discount(100, 0.2)   # expected value derived by calling the code under test
+    assert apply_discount(100, 0.2) == expected   # mirrors the implementation — passes even if apply_discount is wrong
 
 # GOOD — expected value hand-computed from the rule "20% off 100 is 80"
 def test_discount():

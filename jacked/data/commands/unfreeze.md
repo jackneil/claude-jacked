@@ -21,7 +21,7 @@ You are executing the `/unfreeze` command to remove the directory edit restricti
 
    Capture the boundary you're about to clear in the *same* read that removes it, so there's no read-then-remove gap and the no-op vs. success branches stay deterministic. Resolve the current project root first:
    ```bash
-   ROOT="$(realpath "${CLAUDE_PROJECT_DIR:-$CWD}" 2>/dev/null)"
+   ROOT="$(realpath "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null)"
    ```
 
    - **Per-project removal (default):** read `~/.claude/jacked-freeze.json` once. In that single pass, capture the boundary of the entry whose `project` matches `$ROOT` as `$PREVIOUS_BOUNDARY`, drop that entry, and write the remaining entries back with the Write tool — so a freeze you set in another repo stays put. If no entries remain, delete the file:

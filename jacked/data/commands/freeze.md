@@ -18,7 +18,7 @@ The boundary supports **multiple included paths**, optional **sub-path excludes*
 
    - Everything before the `except` keyword is an **included** path.
    - Everything after `except` is an **excluded** sub-path (a file is editable only if it's under an included path AND not under an excluded one).
-   - If `$ARGUMENTS` is empty, use the current working directory as the single included path and confirm: "Freezing edits to the current directory: `$CWD`. Run `/freeze <path> [<path> ...] [except <subpath>]` to specify a different boundary."
+   - If `$ARGUMENTS` is empty, use the current working directory as the single included path and confirm: "Freezing edits to the current directory: `$PWD`. Run `/freeze <path> [<path> ...] [except <subpath>]` to specify a different boundary."
 
    Resolve every path to an absolute path. Verify each **included** path exists:
    ```bash
@@ -30,7 +30,7 @@ The boundary supports **multiple included paths**, optional **sub-path excludes*
 
    Resolve the project root the gatekeeper keys on:
    ```bash
-   realpath "${CLAUDE_PROJECT_DIR:-$CWD}" 2>/dev/null
+   realpath "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null
    ```
    This becomes the freeze entry's `project` so the boundary applies only to this repo.
 

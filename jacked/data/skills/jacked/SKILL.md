@@ -218,7 +218,7 @@ When the user asks what they *did* in a time window rather than about a topic ("
 ## Notes
 
 - Sessions are indexed automatically via a Stop hook (after each Claude response)
-- **New in v0.2.6**: Indexes plan files, subagent summaries, and summary labels for smarter retrieval
+- Indexes plan files, subagent summaries, and summary labels for smarter retrieval
 - Smart mode prevents context explosion by returning ~5-10K tokens instead of 50-200K
 - The index is stored in Qdrant Cloud, accessible from any machine
 - Local sessions can be resumed natively with `claude --resume` for the best experience

@@ -72,7 +72,7 @@ DEBUG=* npx chrome-devtools-mcp@latest --log-file=<scratchpad>/cdm.log
 |---|---|---|
 | `Target closed` | A Chrome instance is already running, so the MCP couldn't start its own | Fully quit Chrome (`Cmd+Q` / kill all Chrome, not just the window), then retry |
 | `Could not find DevToolsActivePort` / `Network.enable timed out` / `socket connection was closed unexpectedly` | `--autoConnect` can't reach a debuggable Chrome | Work the autoConnect checklist below |
-| `ERR_MODULE_NOT_FOUND` | Wrong Node version or a corrupt npx cache | `rm -rf ~/.npm/_npx && npm cache clean --force`, confirm `node -v` ≥ 18, then retry |
+| `ERR_MODULE_NOT_FOUND` | Wrong Node version or a corrupt npx cache | `rm -rf ~/.npm/_npx && npm cache clean --force`, confirm `node -v` >= 20.19 (CDM requires Node 20.19+ / 22.12+ / 23+), then retry |
 
 **`--autoConnect` timeout checklist** (the most specific "browser stuck" case — work through all four):
 1. Chrome 144+ is already RUNNING (`chrome://version` to confirm).

@@ -127,7 +127,7 @@ Borrowed from Argo Rollouts' dryRun/abort distinction: some signals are abort-wo
 
 ### Step 2.5: Pre-loop health gate (fail-fast)
 
-Before spending the full monitoring budget, run **every** check (A–G) exactly ONCE against the first load. If ANY ALERT-tier check is already tripped on this first sample — page is down, a NEW console error is present, a 5xx is already serving, the journey assertion already fails, OR the build fingerprint did NOT change from baseline (still serving the old artifact) — **fail fast**:
+Before spending the full monitoring budget, run **every APPLICABLE** check (A–E always; F if `--journey` given; G if a baseline fingerprint exists) exactly ONCE against the first load. If ANY ALERT-tier check is already tripped on this first sample — page is down, a NEW console error is present, a 5xx is already serving, the journey assertion already fails, OR the build fingerprint did NOT change from baseline (still serving the old artifact) — **fail fast**:
 
 ```
 CANARY FAIL-FAST at [time] — the first load is already broken; not spending [duration] min monitoring.
@@ -170,20 +170,20 @@ Then stop — there is no value in monitoring a deploy that is already failing. 
 
    ### Check E: Network errors & success rate (ALERT-tier)
    - List network requests
-   - **Success-rate floor** (applies even with no baseline): if <99% of tracked requests completed non-failed, OR any 5xx is present → **fail** (streak++). ALERT at `--failure-limit`.
+   - **Success-rate floor** (applies even with no baseline): if <99% of tracked requests completed non-failed, OR any 5xx is present → **fail** (streak++). ALERT at `--failure-limit`. For this rate, "failed" = 5xx and network-level failures (timeout, DNS, connection reset); pre-existing/expected 4xx do not count against the rate.
    - **New failures**: any 4xx/5xx not in baseline → **fail** (streak++).
    - Track the success rate as a number (non-failed / total) so the final report can state it. Pair this with Check D: assert **both** success-rate AND latency every interval.
-
-   ### Check G: Build verification (ALERT-tier)
-   - Only runs if the baseline captured a non-null `build_fingerprint`. If null, skip and note "build-verification skipped (no baseline fingerprint)".
-   - Re-read the live fingerprint the same way the baseline did (asset hash / `<meta name=build>` / `/version` body).
-   - If the live fingerprint **equals** the baseline fingerprint, the new deploy is NOT being served (stale CDN/cache) → **fail** (streak++). ALERT at `--failure-limit`. This catches the silent false-HEALTHY where every page/console/perf check passes against the *old* artifact.
 
    ### Check F: Critical user journey (ALERT-tier, only if `--journey` given)
    - A 200 with a clean console can still be a functionally dead page; an element count alone passes a half-broken render. Exercise one real flow instead.
    - From the `--journey` description, script: navigate → wait for a named selector → interact (click/fill) → assert a post-action element or text exists.
    - If the post-action assertion fails (selector never appears, expected text absent) → **fail** (streak++). ALERT at `--failure-limit`.
    - When `--journey` is omitted, this check is skipped and the bare navigate (Check A) is the only load signal.
+
+   ### Check G: Build verification (ALERT-tier)
+   - Only runs if the baseline captured a non-null `build_fingerprint`. If null, skip and note "build-verification skipped (no baseline fingerprint)".
+   - Re-read the live fingerprint the same way the baseline did (asset hash / `<meta name=build>` / `/version` body).
+   - If the live fingerprint **equals** the baseline fingerprint, the new deploy is NOT being served (stale CDN/cache) → **fail** (streak++). ALERT at `--failure-limit`. This catches the silent false-HEALTHY where every page/console/perf check passes against the *old* artifact.
 
    **Between checks:** Append status to the rolling log and report:
    ```

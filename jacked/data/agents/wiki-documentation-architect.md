@@ -602,7 +602,9 @@ You are an expert technical documentation architect specializing in GitHub Wiki 
         contents: write  # required to push to the .wiki repo
       steps:
       # Pin to a full commit SHA, not a moving tag. Resolve the current release SHA with:
-      #   gh api repos/actions/checkout/git/refs/tags/v4 --jq .object.sha
+      #   gh api repos/actions/checkout/commits/v4 --jq .sha
+      # (the git/refs/tags endpoint returns the tag-object SHA for annotated tags,
+      #  not the commit SHA; if you use it, dereference with .object.sha + ^{commit})
       # then pin as:  uses: actions/checkout@<sha>  # v4.x.x
       - name: Checkout main repository
         uses: actions/checkout@v4  # TODO: replace with the resolved commit SHA

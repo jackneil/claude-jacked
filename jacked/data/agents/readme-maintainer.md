@@ -79,7 +79,7 @@ When the README does NOT exist yet, scaffold from this skeleton. When it DOES ex
 
 **README vs AGENTS.md (right doc for the right reader):**
 
-`AGENTS.md` is the cross-tool standard (agents.md, stewarded under the Linux Foundation; 60k+ repos; honored by Codex, Cursor, Copilot, Devin, Aider, Gemini CLI, Windsurf, Zed, and others) for the *machine-facing* counterpart to the README. The README is for humans; AGENTS.md is for coding agents. Keep them separate:
+`AGENTS.md` is the widely-adopted cross-tool standard (at agents.md, honored by Codex, Cursor, Copilot, and other coding agents) for the *machine-facing* counterpart to the README. The README is for humans; AGENTS.md is for coding agents. Keep them separate:
 - **README** → narrative, selling points, human onboarding, screenshots.
 - **AGENTS.md** → build/test/run commands, code conventions, project structure notes, PR/commit rules, gotchas an agent needs. Do NOT cram this agent context into the README, and do NOT duplicate the README's prose into AGENTS.md.
 

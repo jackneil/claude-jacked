@@ -10,7 +10,7 @@ If this command was invoked via a local config wrapper (you see a `## Repo Confi
 - **Base Branch** specified? → Use it instead of auto-detecting in Step 1
 - **Doc Inventory** listed? → Skip doc discovery in Step 1, use the listed files (validate with `ls` first, skip missing)
 - **Change-to-Doc Map** specified? → Use it in Step 3 instead of the default mapping
-- **Staleness Defaults** specified (age / drift days)? → Use them as the repo-wide defaults in Step 2.5 (a per-doc `ttl_days` frontmatter contract still wins over the repo default)
+- **Staleness Defaults** specified (age / drift days)? → Use them as the repo-wide defaults in Step 2.5 (a per-doc `ttl_days` frontmatter contract still wins over the repo default). To make this actually take effect, substitute the configured values inline into the Step 2.5a bash: replace `DEFAULT_AGE_DAYS=${DOCS_SYNC_AGE_DAYS:-90}` with the configured age (e.g. `DEFAULT_AGE_DAYS=60`) and `DEFAULT_DRIFT_DAYS=${DOCS_SYNC_DRIFT_DAYS:-30}` with the configured drift, OR export `DOCS_SYNC_AGE_DAYS` / `DOCS_SYNC_DRIFT_DAYS` before running that block so the `${VAR:-default}` expansion picks them up. The `90`/`30` literals are field fallbacks only — when the config supplies values, they must override.
 
 If the config overlay date is more than 90 days old, mention: "Your `/docs-sync` config is over 90 days old — consider running `/jacked-setup docs-sync` to refresh it."
 
@@ -149,6 +149,8 @@ One global 30-day cutoff over-flags slow-moving architecture docs and under-flag
 
 A doc is also flagged if its declared `sources:` globs were edited >30d more recently than the doc itself (drift), even when the doc is younger than its TTL.
 
+> If the Repo Config overlay specified **Staleness Defaults**, substitute those values inline here before running: set `DEFAULT_AGE_DAYS` / `DEFAULT_DRIFT_DAYS` to the configured numbers (or export `DOCS_SYNC_AGE_DAYS` / `DOCS_SYNC_DRIFT_DAYS` ahead of this block). The `:-90` / `:-30` literals below are the field fallback used only when no config value is supplied.
+
 ```bash
 DEFAULT_AGE_DAYS=${DOCS_SYNC_AGE_DAYS:-90}
 DEFAULT_DRIFT_DAYS=${DOCS_SYNC_DRIFT_DAYS:-30}
@@ -230,11 +232,11 @@ while IFS= read -r doc; do                                                      
       *.*)                                                                          # dotted Cls.method — present only if EVERY component resolves
         ok=1
         for part in $(echo "$word" | tr '.' ' '); do
-          code_grep "$part" . 2>/dev/null || { ok=0; break; }
+          code_grep -- "$part" . 2>/dev/null || { ok=0; break; }
         done
         [ "$ok" = 0 ] && MISSING+=("symbol:$word");;
       *[a-zA-Z]*)                                                                   # bare identifier / env var
-        code_grep "$word" . 2>/dev/null || MISSING+=("symbol:$word");;
+        code_grep -- "$word" . 2>/dev/null || MISSING+=("symbol:$word");;
     esac
   done <<< "$TOKENS"
   if [ "${#MISSING[@]}" -gt 0 ]; then
@@ -483,7 +485,7 @@ Aggregate every agent's verification report. Show a structured summary:
 | Doc | Status | Missing symbols | Days since edit |
 |-----|--------|-----------------|-----------------|
 | README.md | drifted→fixed | 0 | 12 |
-| docs/architecture.md | fresh | 0 | 40 |
+| docs/architecture.md | drifted→fixed | 0 | 95 |
 | CONTRIBUTING.md | needs-human | 2 | 412 |
 
 **Branch-driven updates:**
@@ -491,7 +493,7 @@ Aggregate every agent's verification report. Show a structured summary:
 - _wiki/page.md: updated <sections>
 
 **Stale-doc audits (past freshness window):**
-- docs/architecture.md (87d > 90d ttl): <fixes applied>
+- docs/architecture.md (95d > 90d ttl): <fixes applied>
 - CONTRIBUTING.md (412d): <fixes applied>
 
 **Symbol drift (Step 2.5b):**

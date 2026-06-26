@@ -181,8 +181,8 @@ Navigate to the app URL. For each UI area affected by the changes:
 ### Network Errors
 A failed API call is a leading cause of "the UI looks broken" and is invisible to a visual + console pass — check it explicitly. After exercising each UI area, list the network requests and flag anything tied to the changed code that didn't succeed:
 - Non-2xx/3xx responses (4xx/5xx), failed fetches, CORS errors, and pending/hung requests that never resolve
-- Per-tool calls: Chrome DevTools MCP `mcp__chrome-devtools__list_network_requests` (drill into one with `mcp__chrome-devtools__get_network_request`); Playwright `mcp__plugin_playwright_playwright__browser_network_requests`; agent-browser `npx agent-browser eval "performance.getEntriesByType('resource')"` (or its network-log command if available)
-- For each failure, record the **URL**, the **status code**, and whether it **correlates with a visible UI defect** (empty state, a spinner that never resolves, an error toast, missing data). Surface it even when the page otherwise renders.
+- Per-tool calls: Chrome DevTools MCP `mcp__chrome-devtools__list_network_requests` (drill into one with `mcp__chrome-devtools__get_network_request`); Playwright `mcp__plugin_playwright_playwright__browser_network_requests`; agent-browser `npx agent-browser eval "performance.getEntriesByType('resource')"` (or its network-log command if available). Note: `PerformanceResourceTiming` exposes no HTTP status code, so the agent-browser `eval` path cannot read response status — use its dedicated network-log command if available, otherwise capture the request URL/duration and infer failures from `transferSize === 0`/hung timing rather than a status code.
+- For each failure, record the **URL**, the **status code** (when the tool exposes it — the agent-browser `eval` path above does not, so omit it there), and whether it **correlates with a visible UI defect** (empty state, a spinner that never resolves, an error toast, missing data). Surface it even when the page otherwise renders.
 
 ### Edge Cases
 - Empty states: What happens with no data?
@@ -217,7 +217,7 @@ Skip items that require specialized tooling (screen reader testing, automated WC
 Run this **only** when Chrome DevTools MCP is the active tool AND the change plausibly affects performance or a11y — new/large images or fonts, bigger bundles, render-blocking resources, a new heavy component, or markup/contrast changes. Skip it for quick single-component checks so they stay fast.
 
 - **Lighthouse:** run `mcp__chrome-devtools__lighthouse_audit` (mode=`navigation`, device matching the viewport you're testing) on the **primary changed page** for **accessibility / SEO / best-practices**. Note: Lighthouse here **EXCLUDES performance** — use the trace below for Core Web Vitals.
-- **Performance trace (optional):** `mcp__chrome-devtools__performance_start_trace` → reload the page → `mcp__chrome-devtools__performance_stop_trace` → `mcp__chrome-devtools__performance_analyze_insight` to read **LCP / INP / CLS** and render-blocking resources.
+- **Performance trace (optional):** navigate to the target URL first, then `mcp__chrome-devtools__performance_start_trace` — by default it reloads the page and auto-stops once the page settles, so no manual reload or separate `performance_stop_trace` call is needed (pass `reload=false`/`autoStop=false` only if you want to drive an interaction yourself, then call `mcp__chrome-devtools__performance_stop_trace`). Then `mcp__chrome-devtools__performance_analyze_insight` to read **LCP / INP / CLS** and render-blocking resources.
 - **Keep it token-cheap:** direct the heavy report to disk — set the tool's `outputDirPath` to `$REPO_ROOT/tmp/qa_screenshots/` (run `mkdir -p "$REPO_ROOT/tmp/qa_screenshots"` first if you skipped the screenshot setup), or write to a tmp path. Pull only the scores + top failing audits into the QA report; **never inline the raw JSON**.
 
 ## Step 7: Report Findings

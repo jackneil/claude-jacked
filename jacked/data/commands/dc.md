@@ -46,7 +46,7 @@ User asking for final verification
 **AMBIGUOUS/UNCLEAR indicators:**
 If conversation has signals from multiple phases or no clear signals at all, do NOT guess. Ask the user: "I can't tell what phase you're in. What would you like me to review?" and offer the options (planning, implementation, post-implementation, grill mode).
 
-## REVIEW LENSES (shared with /dcr)
+## REVIEW LENSES (dc's set — overlaps /dcr)
 
 Two categories: **required** (always reviewed) and **optional** (select based on relevance to the changes).
 

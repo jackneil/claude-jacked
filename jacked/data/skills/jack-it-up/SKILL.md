@@ -52,7 +52,7 @@ digraph cycle {
     execute [label="4. Execute Plan\n(superpowers:subagent-driven-development)"];
     review_impl [label="5. Double-Check Review\n(/dc on implementation)"];
     clean [shape=diamond, label="Clean pass?"];
-    verify [label="6. Prove It Runs\n(/qa · /ux · /verify — capture evidence)"];
+    verify [label="6. Prove It Runs\n(/qa · /ux · run it directly — capture evidence)"];
     ship [label="7. Ship It\n(/pr)"];
     done [label="PR created", shape=doublecircle];
 
@@ -166,7 +166,7 @@ Do NOT declare "done" until the final /dc review passes with no CRITICAL or MEDI
 A clean `/dc` and green tests mean the code reviews well and the units pass — they do NOT mean the assembled feature actually works. `/dc` reviews artifacts; it never runs the app. Close that trust-then-verify gap before shipping: exercise the real feature end-to-end and capture evidence.
 
 - **UI changes** → invoke `/qa` (single component or bug fix) or `/ux` (multi-page change / new flow) to drive the running interface; `/qa-video` when you want a recorded walkthrough.
-- **Non-UI changes** → invoke `/verify`, or run the app / CLI / endpoint directly against a real input.
+- **Non-UI changes** → run the app / CLI / endpoint directly against a real input (if a `/verify` command is available in your setup, you can invoke it instead).
 
 Walk the **acceptance criteria from the Phase-1 spec** one by one against the running system and confirm each passes. Capture the evidence — test output, the exact command and its result, or a screenshot — do not paraphrase it.
 

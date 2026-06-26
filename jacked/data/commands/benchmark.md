@@ -17,7 +17,7 @@ You are running performance benchmarking on a web application. You capture real 
 
 Try calling `mcp__chrome-devtools__list_pages`.
 
-**If it works:** use Chrome DevTools MCP. This is preferred — it gives BOTH a trace-based capture path (`performance_start_trace` + `performance_analyze_insight`, the only way to actually measure LCP/CLS/TBT and get fix insights) AND `evaluate_script` for Navigation-Timing + resource breakdown.
+**If it works:** use Chrome DevTools MCP. This is preferred — it gives BOTH a trace-based capture path (`performance_start_trace` + `performance_analyze_insight`, the most reliable way to measure LCP/CLS/INP and derive TBT, plus fix insights) AND `evaluate_script` for Navigation-Timing + resource breakdown.
 
 **If it fails:** try `mcp__plugin_playwright_playwright__browser_evaluate`.
 - If Playwright works: use Playwright MCP. There is no trace path here, so LCP/CLS come from a buffered `PerformanceObserver` (Step 1 fallback script). Throttle via CDP (Step 1).
@@ -40,7 +40,7 @@ Unthrottled local runs report falsely-good numbers AND make baseline-vs-compare 
 
 This is the PRIMARY method when chrome-devtools MCP is available, because raw `getEntriesByType` cannot return LCP/CLS/TBT.
 
-1. Call `mcp__chrome-devtools__performance_start_trace` with `reload=true, autoStop=true`. The returned summary is a compact (~4KB) AI-ready trace with **LCP, CLS, TBT, and the LCP subpart breakdown** (TTFB / load delay / load duration / render delay). Read these directly.
+1. Call `mcp__chrome-devtools__performance_start_trace` with `reload=true, autoStop=true`. The returned summary is a compact (~4KB) AI-ready trace that reliably reports **LCP, CLS (and INP), plus the LCP subpart breakdown** (TTFB / load delay / load duration / render delay) — read those directly. **TBT** is not returned as a field; derive it from the trace's long-tasks when they're surfaced, otherwise fall back to the `PerformanceObserver` long-task approximation (Step 1c).
 2. Optionally call `mcp__chrome-devtools__performance_analyze_insight` for actionable "why" insights — `LCPBreakdown`/`LCPDiscovery` (lazy/late-discovered LCP image), `CLSCulprits` (shifting elements), `RenderBlocking` (blocking CSS/JS), and third-party weight. Surface the top 2-3 in the report.
 3. Still run the `evaluate_script` script below to enrich the resource breakdown (byType, slowest, transfer bytes) — the trace gives CWV, the script gives bytes.
 
@@ -67,10 +67,15 @@ Install the observer as early as possible (ideally before navigation; otherwise 
     }
   }).observe({ type: 'layout-shift', buffered: true });
   // Long tasks — proxy for TBT (sum of task time over 50ms, post-FCP)
+  // longtask does not support buffered:true, so only tasks AFTER install are seen (best-effort).
   try {
     new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) window.__benchCWV.longTasksMs += Math.max(0, e.duration - 50);
-    }).observe({ type: 'longtask', buffered: true });
+      const fcpEntry = performance.getEntriesByName('first-contentful-paint')[0];
+      const fcp = fcpEntry ? fcpEntry.startTime : 0;
+      for (const e of list.getEntries()) {
+        if (e.startTime > fcp) window.__benchCWV.longTasksMs += Math.max(0, e.duration - 50);
+      }
+    }).observe({ type: 'longtask' });
   } catch (_) { /* longtask not supported in this browser */ }
   return 'observer installed';
 })()
@@ -138,7 +143,7 @@ Install the observer as early as possible (ideally before navigation; otherwise 
 })()
 ```
 
-When the trace path (Step 1b) is available, prefer its LCP/CLS/TBT over the observer values (the trace is authoritative); use the observer values only on the Playwright/no-trace path.
+When the trace path (Step 1b) is available, prefer its LCP/CLS values over the observer values (the trace is authoritative for those), and prefer the trace's long-task-derived TBT when it's surfaced; use the observer values only on the Playwright/no-trace path or when the trace doesn't surface TBT.
 
 ### Step 1d: Run multiple samples + noise floor
 
@@ -245,7 +250,7 @@ Per-resource-type byte budgets (reuse the `byType` + `thirdParty` breakdown from
 | Font | < 100 KB |
 | Third-party | < 300 KB |
 
-(Speed Index comes from the trace path when available; if only the evaluate_script path ran, mark it `n/a — needs trace`.)
+(Speed Index is rarely available from the MCP trace — expect `n/a` unless a full Lighthouse run is wired in. Mark it `n/a — needs Lighthouse` whenever it isn't present.)
 
 ## Step 4: Report
 
