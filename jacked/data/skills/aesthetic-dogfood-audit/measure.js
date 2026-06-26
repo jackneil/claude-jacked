@@ -180,11 +180,16 @@
   const copyHygiene = {
     literalEllipsis: (txt.match(/\.\.\./g) || []).length,
     straightApostrophes: (txt.match(/[A-Za-z]'[A-Za-z]/g) || []).length,
-    straightQuotes: (txt.match(/"/g) || []).length,
+    // Only count straight double-quotes used as QUOTATION marks: a quote wrapping a letter,
+    // but NOT one touching a digit — so inch marks / dimensions (5"x7", 12") and code don't
+    // inflate the count, while real prose quotes ("hello") still register.
+    straightQuotes: (txt.match(/(?<!\d)"(?=[A-Za-z])|(?<=[A-Za-z])"(?!\d)/g) || []).length,
   };
+  // Red OR green with clear hue dominance — exclude neutral grays (r≈g≈b), which would
+  // otherwise match the green branch (e.g. rgb(128,128,128)).
   const isRedGreen = (c) => { const m = c.match(/(\d+), (\d+), (\d+)/); if (!m) return false;
     const r = +m[1], g = +m[2], b = +m[3];
-    return (r > 140 && g < 110 && b < 110) || (g > 110 && r < 130 && b < 130); };
+    return (r > 140 && r - g > 30 && r - b > 30) || (g > 110 && g - r > 25 && g - b > 25); };
   const colorOnlyStatus = [...root.querySelectorAll('span, div, i, [class*=badge], [class*=status], [class*=dot], [class*=indicator]')]
     .filter((e) => { if (!vis(e)) return false; const r = R(e);
       if (r.width > 28 || r.height > 28) return false;

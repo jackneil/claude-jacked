@@ -63,7 +63,7 @@ Add to your team's Claude Code environment — no Python install needed:
 /plugin install jacked@jacked-marketplace
 ```
 
-Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 25 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 26 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
 
 **Want more?** Add optional extras:
 
@@ -91,7 +91,7 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 ### Toggle Features On and Off
 
-Enable or disable any of the 10 built-in code reviewers and 24 slash commands with one click. Each card shows what it does so you know what you're turning on.
+Enable or disable any of the 10 built-in code reviewers and 25 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
 ![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
 
@@ -118,7 +118,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable any of the 24 slash commands.
+**Commands** — Enable or disable any of the 25 slash commands.
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
 
@@ -156,7 +156,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **25 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/qa-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **26 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -597,6 +597,7 @@ Type these directly in Claude Code:
 | `/qa` | **QA Testing** — Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
 | `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
 | `/qa-video` | **QA Video** — Records a playable video of a test journey (true-motion via Playwright MCP video + chapters, or a frame-stitched MP4/GIF) plus a video-synced narration doc — for regression evidence and bug repros |
+| `/demo-video` | **Demo Video** — Produces a polished, narrated feature walkthrough video for docs/education from a committed narration script (Playwright recording + timed `say`/TTS voiceover + captions, muxed with ffmpeg) — regenerable when the UI changes |
 | `/whats-next` | **Roadmap Advisor** — Weighs a coverage-matrix read (toward 10/10) plus plans, issues, commits, and lifecycle, then **decides the single highest-leverage initiative** and forges a ready-to-run `/goal` brief (≤4000 chars) for autonomous, tested delivery |
 | `/goal-maker` | **Goal Forge** — Packages the work already in front of you (this conversation, a spec, a plan, an in-flight build) into one overnight-sized `/goal` brief (≤4000 chars) — full scope, TDD, UI/UX + polish gates, evidence-based DONE, plan-ahead `Next:`. Defaults to PR; `merge` arg auto-merges each milestone on green CI |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
@@ -711,6 +712,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.60.0** | **`aesthetic-dogfood-audit` rebuilt into a full end-to-end product evaluator + new `/demo-video` skill.** `aesthetic-dogfood-audit` is no longer aesthetics-only — it now drives the app as EACH persona through EVERY workflow (login → core jobs → nitty-gritty) and judges both function and finish: a **Functional/interaction** lens (modals that actually open AND close, buttons that do their job, actions that update the view with no stale data), a **Data-accuracy** lens (totals that match their parts, counts that match the rows), a **Discoverability** lens (frequency-weighted effort/findability — *not* the debunked 3-click rule, per NN/G), explicit **dark-mode dark-text** contrast, and repo-callable auto-detection of app/personas/creds. New **`demo-video`** skill + `/demo-video` command: produces a polished, narrated feature-walkthrough video for docs/education from a committed narration script (Playwright recording, timed `say`/TTS voiceover, captions, ffmpeg mux with `-shortest`), distinct from `/qa-video`'s bug evidence and regenerable when the UI changes. Plus verification-pass fixes across 16 capabilities (`$CWD`→`$PWD`, removed a false "Opus is the project standard" claim, dropped a non-shipped `/verify` route, corrected the Chrome DevTools MCP Node floor, fixed example arithmetic, and more). |
 | **0.59.0** | **Best-in-class upgrade pass across the entire command / skill / agent / lens suite.** Researched all 50 shipped capabilities against the field (Claude Code ecosystem, other agentic-coding tools, domain best practice) via Firecrawl and baked in 284 cited improvements. Highlights: review commands (`/dcr`, `/dc`, `/cso`) gain a per-finding **false-positive validation gate** + evidence requirement + "do-NOT-flag" suppression list (plus `/cso` precedent rulings) — mirroring Anthropic's official `/code-review` & `/security-review`; **`/swarm` rewritten off the defunct `TeamCreate` API** to the current agent-teams model (preflight feature-flag check, plan-first gate, git-worktree isolation, self-contained spawn prompts); monitors (`/canary`, `/benchmark`) get **consecutive-failure budgets + absolute thresholds + real trace/DevTools capture** instead of single-sample alarms; the four review **lenses** gain WCAG 2.2 (correct 24×24 target size), RFC 9457, Postgres `CONCURRENTLY`/`NOT VALID` migration safety, and circuit-breaker/idempotency depth; `readme-maintainer` + `wiki-documentation-architect` **genericized and made non-destructive** with source-grounding/anti-fabrication rules; `/bhag` gains a durable on-disk progress ledger + test ratchet; `/qa`+`aesthetic-dogfood-audit` gain keyboard/axe a11y passes; `/qa-video` adds a Playwright trace path. Full cited research report in `docs/superpowers/research/`. |
 | **0.58.0** | **Three skills ported in from personal use.** `aesthetic-dogfood-audit` (skill) — a measure-driven, design-director fit-and-finish pass that drives every route/persona/state in a browser and flags pixel-level defects via an in-page `measure.js` instrument (type-scale sprawl, spacing dupes, edge misalignment, WCAG contrast); disambiguated from `/qa`/`/ux`. `deploy-to-railway` (skill) — an opinionated, gotcha-laden end-to-end Railway provisioning playbook (Postgres + services + bucket + shared env + GitHub auto-deploy + SSO), companion to the official `railway:use-railway`. `qa-video` (skill + `/qa-video` command) — records a playable video of a QA journey plus a video-synced narration: true-motion via Playwright MCP's native video + chapter markers when available, else a frame-stitched MP4 (ffmpeg) or zero-install animated GIF (ImageMagick), with up-front path selection and playback verification. |
 | **0.49.1** | **`/whats-next` now MEASURES the `/goal` brief instead of eyeballing it.** A soft “target ≤3600” was still producing 4,100–4,400-char briefs that `/goal` rejects/truncates. Step 8 now writes the drafted brief to a scratch file and `wc -c`-checks it ≤3600 bytes (bytes ≥ chars, so that guarantees under the hard 4,000-char cap) before it can be emitted, trimming Why-now/Approach prose and re-measuring until it fits. The `Next phases:` line counts and is never dropped. |
