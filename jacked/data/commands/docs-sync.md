@@ -10,6 +10,7 @@ If this command was invoked via a local config wrapper (you see a `## Repo Confi
 - **Base Branch** specified? → Use it instead of auto-detecting in Step 1
 - **Doc Inventory** listed? → Skip doc discovery in Step 1, use the listed files (validate with `ls` first, skip missing)
 - **Change-to-Doc Map** specified? → Use it in Step 3 instead of the default mapping
+- **Staleness Defaults** specified (age / drift days)? → Use them as the repo-wide defaults in Step 2.5 (a per-doc `ttl_days` frontmatter contract still wins over the repo default). To make this actually take effect, substitute the configured values inline into the Step 2.5a bash: replace `DEFAULT_AGE_DAYS=${DOCS_SYNC_AGE_DAYS:-90}` with the configured age (e.g. `DEFAULT_AGE_DAYS=60`) and `DEFAULT_DRIFT_DAYS=${DOCS_SYNC_DRIFT_DAYS:-30}` with the configured drift, OR export `DOCS_SYNC_AGE_DAYS` / `DOCS_SYNC_DRIFT_DAYS` before running that block so the `${VAR:-default}` expansion picks them up. The `90`/`30` literals are field fallbacks only — when the config supplies values, they must override.
 
 If the config overlay date is more than 90 days old, mention: "Your `/docs-sync` config is over 90 days old — consider running `/jacked-setup docs-sync` to refresh it."
 
@@ -30,23 +31,40 @@ echo "REPO_NAME=$(basename "$REPO_ROOT")"
 git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main"
 
 # Doc files at repo root
-ls README.md CONTRIBUTING.md CHANGELOG.md LICENSE.md 2>/dev/null
+ls README.md CONTRIBUTING.md CHANGELOG.md LICENSE.md AGENTS.md 2>/dev/null
 
 # Wiki structure
 ls -d _wiki 2>/dev/null
 ls _wiki/*.md 2>/dev/null | head -30
 
-# CLAUDE.md sections
+# Agent-instruction files (CLAUDE.md / AGENTS.md) sections
 grep -n "^#" CLAUDE.md 2>/dev/null | head -20
+grep -n "^#" AGENTS.md 2>/dev/null | head -20
 
 # docs/ directory
 find docs -name "*.md" -maxdepth 2 2>/dev/null | head -20
 
 # Other root-level markdown
 ls *.md 2>/dev/null
+
+# Symlink map — CLAUDE.md is frequently a symlink to AGENTS.md (cross-tool compat).
+# Editing the alias leaves the canonical file stale, or silently forks the two.
+ls -la *.md 2>/dev/null
+for f in *.md; do
+  [ -L "$f" ] && echo "SYMLINK: $f -> $(readlink -f "$f" 2>/dev/null || readlink "$f")"
+done
 ```
 
-Build a mental doc inventory from the results. Note which doc files exist and what sections they cover.
+Build a doc inventory from the results, checked for completeness against the **three doc layers** — a whole missing layer is itself a gap worth surfacing:
+- **User-facing** — README.md, docs/ guides, quick-starts, SDK/usage docs. What a consumer reads.
+- **Contributor-facing** — CONTRIBUTING.md, architecture docs, _wiki/. How to build, test, and extend.
+- **Agent-facing** — CLAUDE.md and AGENTS.md. Instructions coding agents (Claude, Cursor, Codex, Copilot) read. AGENTS.md is a first-class surface now — never skip it.
+
+**Symlink resolution (do this before any dispatch).** From the `ls -la` / `SYMLINK` output, resolve every root-level markdown symlink to its canonical target:
+- Record each canonical (real) file and its aliases. Dispatch exactly ONE audit agent per canonical file — never against an alias. Editing the alias path leaves the canonical agent-instructions file stale, or silently forks the two.
+- If Repo Config or the user targets an alias, redirect the dispatch to the canonical target.
+- If CLAUDE.md and AGENTS.md exist as two separate, non-symlinked files, audit both independently AND diff their content — flag any divergence (a rule present in one but not the other) for human review in Step 6.
+- Carry the canonical↔alias map forward to Step 6 so the relationship is reported.
 
 ## Step 2: Diff Analysis
 
@@ -56,10 +74,19 @@ Diff the current branch against the base branch:
 # Get base branch (from Repo Config or detected above)
 BASE_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main")
 
+# Diff against the MERGE-BASE, not the moving base-branch tip. On long-lived
+# branches the base tip advances independently, so diffing against it re-flags
+# changes already merged to main and inflates false drift. merge-base is the
+# stable fork point — use it as the reference for the diff AND for any downstream
+# age-delta comparison.
+MERGE_BASE=$(git merge-base origin/${BASE_BRANCH} HEAD 2>/dev/null || git merge-base ${BASE_BRANCH} HEAD 2>/dev/null)
+echo "MERGE_BASE=${MERGE_BASE}"
+DIFF_REF=${MERGE_BASE:-${BASE_BRANCH}}
+
 # Summary of changes
-git diff ${BASE_BRANCH}...HEAD --stat 2>/dev/null || git diff ${BASE_BRANCH}..HEAD --stat
-git diff ${BASE_BRANCH}...HEAD --name-only 2>/dev/null || git diff ${BASE_BRANCH}..HEAD --name-only
-git log ${BASE_BRANCH}..HEAD --oneline 2>/dev/null
+git diff ${DIFF_REF}...HEAD --stat 2>/dev/null || git diff ${DIFF_REF}..HEAD --stat
+git diff ${DIFF_REF}...HEAD --name-only 2>/dev/null || git diff ${DIFF_REF}..HEAD --name-only
+git log ${DIFF_REF}..HEAD --oneline 2>/dev/null
 ```
 
 If there are no changes (empty diff), **do not stop** — proceed to Step 2.5 in case stale docs need auditing. Otherwise, categorize changes below.
@@ -78,45 +105,166 @@ Categorize all changes into these buckets:
 
 ## Step 2.5: Stale Doc Detection (mandatory)
 
-Documentation rots silently when PRs forget to run `/docs-sync`. Catch that drift here. Every doc file whose last git-tracked modification is **older than 30 days** gets a full fresh audit, regardless of whether the current branch touches it.
+Documentation rots silently when PRs forget to run `/docs-sync`. Catch that drift here. A doc joins the **audit queue** if it is stale by age/TTL (2.5a) OR has symbol drift (2.5b) — regardless of whether the current branch touches it.
 
-Find stale docs using git's last-commit timestamp (filesystem mtime is unreliable — it changes on checkout):
+Use git's last-commit timestamp throughout (filesystem mtime is unreliable — it changes on checkout, with a `stat` fallback for untracked files).
+
+> Run the three bash blocks in this step **in a single shell session** (concatenate them into one Bash call). Blocks 2.5a and 2.5b reuse `DOC_CANDIDATES` and the `is_excluded` / `doc_ttl_days` helpers defined here — a fresh shell would lose them and silently stop excluding changelogs.
 
 ```bash
-THIRTY_DAYS_AGO=$(( $(date +%s) - 30*24*60*60 ))
+NOW=$(date +%s)
 
-# Collect candidate doc files (root markdown, docs/, _wiki/, CLAUDE.md hierarchy)
+# Collect candidate doc files (root markdown, docs/, _wiki/, agent-instruction files)
 DOC_CANDIDATES=$(
   {
     ls *.md 2>/dev/null
     find docs -name "*.md" 2>/dev/null
     find _wiki -name "*.md" 2>/dev/null
-    find . -maxdepth 4 -name "CLAUDE.md" 2>/dev/null
+    find . -maxdepth 4 \( -name "CLAUDE.md" -o -name "AGENTS.md" \) 2>/dev/null
   } | sort -u
 )
 
-STALE_DOCS=()
-for doc in $DOC_CANDIDATES; do
-  [ -f "$doc" ] || continue
-  LAST_COMMIT_TS=$(git log -1 --format=%ct -- "$doc" 2>/dev/null)
-  # If file is untracked or has no history, fall back to filesystem mtime
-  [ -z "$LAST_COMMIT_TS" ] && LAST_COMMIT_TS=$(stat -f %m "$doc" 2>/dev/null || stat -c %Y "$doc" 2>/dev/null)
-  [ -z "$LAST_COMMIT_TS" ] && continue
-  if [ "$LAST_COMMIT_TS" -lt "$THIRTY_DAYS_AGO" ]; then
-    DAYS_OLD=$(( ($(date +%s) - LAST_COMMIT_TS) / 86400 ))
-    echo "STALE: $doc (${DAYS_OLD}d since last edit)"
-    STALE_DOCS+=("$doc")
-  fi
-done
+# Changelogs / historical / migration docs legitimately reference deleted code and
+# old versions — exclude them from BOTH staleness and symbol-drift. A doc may also
+# opt out with `freshness: { exclude: true }` (or `freshness_exclude: true`) in frontmatter.
+is_excluded() {
+  case "$(basename "$1" | tr 'A-Z' 'a-z')" in
+    changelog.md|changelog*.md|history.md|changes.md|releases.md|migration*.md|upgrading.md) return 0;;
+  esac
+  case "$1" in
+    */migrations/*|*/changelog/*|*/history/*) return 0;;
+  esac
+  head -20 "$1" 2>/dev/null | grep -qiE '(freshness_)?exclude:[[:space:]]*true' && return 0
+  return 1
+}
 ```
 
-Build a **stale audit queue** from this output. These docs go through the full audit pipeline in Step 4 even if the current branch doesn't touch their related code.
+### 2.5a — Staleness (age + TTL)
 
-If `STALE_DOCS` is empty AND no branch changes exist, say: "No branch changes and no stale docs. Nothing to sync." Stop.
+One global 30-day cutoff over-flags slow-moving architecture docs and under-flags fast-moving quick-starts. Use tiered thresholds instead (docvet field defaults: **age 90d**, **drift 30d**):
 
-If `STALE_DOCS` is empty but branch changes exist, proceed to Step 3 with branch-driven mapping only.
+- **Per-doc TTL** — if the doc declares `ttl_days: N` (or `freshness: { ttl_days: N }`) in frontmatter, that wins.
+- **Repo-wide default** — else the Repo Config overlay's staleness default (`DOCS_SYNC_AGE_DAYS`), if set.
+- **Field default** — else 90 days.
 
-If `STALE_DOCS` has entries, they will be merged into the agent dispatch in Step 4 with a `fresh-audit` flag (no diff context — agents must verify the entire doc against current code).
+A doc is also flagged if its declared `sources:` globs were edited >30d more recently than the doc itself (drift), even when the doc is younger than its TTL.
+
+> If the Repo Config overlay specified **Staleness Defaults**, substitute those values inline here before running: set `DEFAULT_AGE_DAYS` / `DEFAULT_DRIFT_DAYS` to the configured numbers (or export `DOCS_SYNC_AGE_DAYS` / `DOCS_SYNC_DRIFT_DAYS` ahead of this block). The `:-90` / `:-30` literals below are the field fallback used only when no config value is supplied.
+
+```bash
+DEFAULT_AGE_DAYS=${DOCS_SYNC_AGE_DAYS:-90}
+DEFAULT_DRIFT_DAYS=${DOCS_SYNC_DRIFT_DAYS:-30}
+
+doc_ttl_days() {  # per-doc ttl_days frontmatter, else repo default
+  local t
+  t=$(head -20 "$1" 2>/dev/null | grep -iE 'ttl_days:' | head -1 | grep -oE '[0-9]+' | head -1)
+  [ -n "$t" ] && echo "$t" || echo "$DEFAULT_AGE_DAYS"
+}
+
+# Iterate with `while read` (not `for doc in $DOC_CANDIDATES`): unquoted `$var`
+# word-splits in bash but NOT in zsh, so a `for` over a multiline var iterates
+# once on the whole blob under zsh (the default macOS shell). A here-string is
+# shell-agnostic.
+STALE_DOCS=()
+while IFS= read -r doc; do
+  [ -z "$doc" ] && continue
+  [ -f "$doc" ] || continue
+  is_excluded "$doc" && { echo "SKIP (changelog/historical/excluded): $doc"; continue; }
+  TS=$(git log -1 --format=%ct -- "$doc" 2>/dev/null)
+  [ -z "$TS" ] && TS=$(stat -f %m "$doc" 2>/dev/null || stat -c %Y "$doc" 2>/dev/null)
+  [ -z "$TS" ] && continue
+  DAYS_OLD=$(( (NOW - TS) / 86400 ))
+  TTL=$(doc_ttl_days "$doc")
+  reason=""
+  [ "$DAYS_OLD" -gt "$TTL" ] && reason="${DAYS_OLD}d old > ${TTL}d ttl"
+  # drift: newest commit touching any declared `sources:` glob vs the doc's own
+  # last edit. Hand the pathspec to git (quoted) so git does the glob match —
+  # avoids shell glob-expansion, which differs across bash/zsh.
+  newest=0
+  globs=$(awk 'NR==1&&/^---/{fm=1;next} fm&&/^---/{exit} fm&&/^sources:/{s=1;next} fm&&/^[^[:space:]-]/{s=0} fm&&s&&/^[[:space:]]*-[[:space:]]/{sub(/^[[:space:]]*-[[:space:]]*/,"");sub(/[[:space:]]+$/,"");print}' "$doc" 2>/dev/null)
+  while IFS= read -r glob; do
+    [ -z "$glob" ] && continue
+    sts=$(git log -1 --format=%ct -- "$glob" 2>/dev/null)
+    [ -n "$sts" ] && [ "$sts" -gt "$newest" ] && newest=$sts
+  done <<< "$globs"
+  if [ "$newest" -gt 0 ]; then
+    DELTA=$(( (newest - TS) / 86400 ))
+    [ "$DELTA" -gt "$DEFAULT_DRIFT_DAYS" ] && reason="${reason:+$reason; }sources ${DELTA}d newer than doc (drift)"
+  fi
+  if [ -n "$reason" ]; then
+    echo "STALE: $doc ($reason)"
+    STALE_DOCS+=("$doc")
+  fi
+done <<< "$DOC_CANDIDATES"
+```
+
+### 2.5b — Symbol drift (deterministic pre-pass)
+
+The field's #1 cheap drift signal: a 2024 study found **28.9% of repos document a symbol that no longer exists** (wrong for 4.7 years on average). Before any LLM call, extract the identifiers each doc references and confirm they still exist in the codebase.
+
+```bash
+# Search only CODE for symbols. Exclude *.md so a symbol surviving only in prose
+# (not code) still reads as missing — otherwise the doc's own backtick matches
+# itself and hides the drift. Use a function (not a flags-in-a-variable) so it is
+# shell-agnostic: unquoted `$VAR` word-splits in bash but NOT in zsh, which would
+# pass the whole flag string as one bogus argument and silently skip the exclude.
+code_grep() {
+  grep -rqwI --exclude='*.md' \
+    --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor \
+    --exclude-dir=dist --exclude-dir=build --exclude-dir=.venv "$@"
+}
+SYMBOL_DRIFT_DOCS=()
+while IFS= read -r doc; do                                                          # while-read, not `for in $var` (zsh-safe)
+  [ -z "$doc" ] && continue
+  [ -f "$doc" ] || continue
+  is_excluded "$doc" && continue
+  MISSING=()
+  TOKENS=$(grep -oE '`[^`]+`' "$doc" 2>/dev/null | tr -d '`' | sort -u)
+  while IFS= read -r tok; do
+    [ -z "$tok" ] && continue
+    word=$(echo "$tok" | awk '{print $1}' | tr -d '()[]{},;:')   # first word, strip call punctuation
+    [ -z "$word" ] && continue
+    case "$word" in
+      */*|*.py|*.js|*.ts|*.tsx|*.go|*.rs|*.java|*.rb|*.json|*.yaml|*.yml|*.toml)   # file path
+        [ -e "$word" ] || git ls-files --error-unmatch "$word" >/dev/null 2>&1 || MISSING+=("path:$word");;
+      --*)                                                                          # CLI flag
+        code_grep -- "$word" . 2>/dev/null || MISSING+=("flag:$word");;
+      *.*)                                                                          # dotted Cls.method — present only if EVERY component resolves
+        ok=1
+        for part in $(echo "$word" | tr '.' ' '); do
+          code_grep -- "$part" . 2>/dev/null || { ok=0; break; }
+        done
+        [ "$ok" = 0 ] && MISSING+=("symbol:$word");;
+      *[a-zA-Z]*)                                                                   # bare identifier / env var
+        code_grep -- "$word" . 2>/dev/null || MISSING+=("symbol:$word");;
+    esac
+  done <<< "$TOKENS"
+  if [ "${#MISSING[@]}" -gt 0 ]; then
+    echo "SYMBOL-DRIFT: $doc -> ${MISSING[*]}"
+    SYMBOL_DRIFT_DOCS+=("$doc")
+  fi
+done <<< "$DOC_CANDIDATES"
+```
+
+The regex-on-backticks pass above is the **starter**. For polyglot repos where backtick-grep is too noisy, the upgrade path is tree-sitter / LSP (SCIP) symbol indexing for precise function/class/signature resolution — swap it in there.
+
+Use the `SYMBOL-DRIFT` output two ways:
+1. **Queue expansion** — any doc with one or more missing symbols joins the audit queue (Step 4) even if it is fresh and untouched by the branch.
+2. **Concrete Pass-2 worklist** — pass that doc's missing-symbol list verbatim into its agent prompt as a `## Symbol worklist` section. This turns Pass 2 from "notice every claim unprompted" into "clear this concrete list."
+
+**False-positive guards (mandatory):**
+- A dotted `Cls.method` counts as PRESENT if every component resolves — only flag when a component is genuinely gone.
+- Backticked English words, shell builtins, and literals (`true`, `null`, `cd`, `ls`) are not symbols. The agent must not "fix" them.
+- The grep is a worklist, not a verdict — the agent confirms each before editing or removing.
+- Excluded docs (changelog/historical/migration, `freshness: exclude`) are skipped here too.
+
+### Assemble the audit queue
+
+The **audit queue** = `STALE_DOCS` ∪ `SYMBOL_DRIFT_DOCS`. These docs go through the full audit pipeline in Step 4 even if the current branch doesn't touch their related code.
+
+- Queue empty AND no branch changes → say "No branch changes, no stale docs, no symbol drift. Nothing to sync." Stop.
+- Queue empty but branch changes exist → proceed to Step 3 with branch-driven mapping only.
+- Otherwise the queued docs merge into Step 4 dispatch: stale docs get the `fresh-audit` flag (no diff context — verify the whole doc against current code); symbol-drift docs carry their missing-symbol worklist into the prompt; a doc in both modes gets both.
 
 ## Step 3: Map Changes to Docs
 
@@ -126,17 +274,17 @@ If `STALE_DOCS` has entries, they will be merged into the agent dispatch in Step
 
 | Change Category | Likely Affected Docs |
 |----------------|---------------------|
-| Pipeline/Architecture | README.md (architecture section), CLAUDE.md |
+| Pipeline/Architecture | README.md (architecture section), CLAUDE.md / AGENTS.md |
 | Configuration | README.md (env vars / config section) |
 | Commands/CLI | README.md (usage section) |
 | Dependencies | README.md (install / requirements section) |
 | UI/Frontend | README.md (features section) |
-| Models/Schemas | _wiki/ pages if they exist, CLAUDE.md |
+| Models/Schemas | _wiki/ pages if they exist, CLAUDE.md / AGENTS.md |
 | Tests | README.md (testing section) |
 
-Filter to only doc files that actually exist. Merge with `STALE_DOCS` from Step 2.5.
+Filter to only doc files that actually exist. Merge with the audit queue (`STALE_DOCS` ∪ `SYMBOL_DRIFT_DOCS`) from Step 2.5.
 
-If the combined set (branch-affected ∪ stale) is empty, say: "Changes don't affect any docs and no stale docs found." Stop.
+If the combined set (branch-affected ∪ audit queue) is empty, say: "Changes don't affect any docs, and no stale or symbol-drifted docs found." Stop.
 
 ## Step 4: Spawn Audit Agents (Multi-Pass Verification)
 
@@ -148,6 +296,9 @@ Spawn one agent per doc file in the combined set. Agents run in parallel — sen
 - `branch-driven` — doc is in the branch-change map. Agent gets diff context.
 - `fresh-audit` — doc is in `STALE_DOCS`. Agent gets NO diff (might be stale in ways nobody flagged). Must audit the entire file against current code from scratch.
 - `both` — doc is in both. Agent does fresh-audit AND incorporates branch changes.
+- `symbol-drift` — doc is in `SYMBOL_DRIFT_DOCS` (Step 2.5b found backticked references that no longer resolve). Combinable with any mode above. The agent gets the missing-symbol worklist and must verify/fix each.
+
+**Symbol worklist.** When a doc carries symbol drift, add a `## Symbol worklist` section to its prompt listing the exact `path:`/`symbol:`/`flag:` entries from Step 2.5b, with this instruction: "These backticked references could not be located in the codebase. Verify each — a backticked prose word or literal (`true`, `null`, `cd`) is NOT a symbol and must be left alone — then fix or remove the genuinely-dead ones. Pass 2 must clear this list."
 
 **Use the appropriate template below.** Each template embeds the 3-pass protocol verbatim — do not summarize or shorten it when constructing the agent prompt.
 
@@ -209,7 +360,10 @@ Commit messages:
 <paste git log --oneline output>
 
 ## Context (fresh-audit or both)
-This doc has not been edited in the git history for over 30 days. The codebase has likely drifted. Audit the entire README against the current code. Do not assume any claim is correct just because it has been there for a while.
+This doc is past its freshness window (its `ttl_days`, or the 90-day field default). The codebase has likely drifted. Audit the entire README against the current code. Do not assume any claim is correct just because it has been there for a while.
+
+## Symbol worklist (symbol-drift mode only)
+<paste this doc's missing-symbol list from Step 2.5b, with the "verify or remove" instruction>
 
 ## Style constraints
 - Match existing voice, formatting, and structure
@@ -238,7 +392,10 @@ Changes summary:
 <paste git diff --stat output>
 
 ## Context (fresh-audit or both)
-This page has not been edited in the git history for over 30 days. Audit the entire page against the current code from scratch.
+This page is past its freshness window (its `ttl_days`, or the 90-day field default). Audit the entire page against the current code from scratch.
+
+## Symbol worklist (symbol-drift mode only)
+<paste this page's missing-symbol list from Step 2.5b, with the "verify or remove" instruction>
 
 ## Style constraints
 - Match existing wiki formatting and structure
@@ -249,10 +406,13 @@ This page has not been edited in the git history for over 30 days. Audit the ent
 <paste the entire 3-Pass Verification Protocol above, verbatim>
 ```
 
-**CLAUDE.md Agent** — branch-driven or fresh-audit:
+**Agent-instruction Agent (CLAUDE.md / AGENTS.md)** — branch-driven or fresh-audit:
 
 ```
-You are a CLAUDE.md auditor and updater. Your job is to make CLAUDE.md project instructions factually accurate against the current codebase.
+You are an agent-instruction auditor and updater for <CLAUDE.md | AGENTS.md>. Your job is to make these project instructions factually accurate against the current codebase. These files are read by coding agents (Claude, Cursor, Codex, Copilot) — a wrong instruction misdirects every future agent run.
+
+## Target file
+<the CANONICAL path resolved in Step 1 — never an alias/symlink>
 
 ## Mode
 <branch-driven | fresh-audit | both>
@@ -263,7 +423,13 @@ Changes summary:
 <paste git diff --stat output>
 
 ## Context (fresh-audit or both)
-This CLAUDE.md has not been edited in the git history for over 30 days. Audit the entire file against the current codebase.
+This file is past its freshness window (its `ttl_days`, or the 90-day field default). Audit the entire file against the current codebase.
+
+## Symbol worklist (symbol-drift mode only)
+<paste this file's missing-symbol list from Step 2.5b, with the "verify or remove" instruction>
+
+## Divergence check (only if CLAUDE.md and AGENTS.md both exist as separate files)
+The repo carries CLAUDE.md and AGENTS.md as two independent (non-symlinked) files. Compare them: any rule present in one but absent or contradictory in the other is divergence — flag it for human review with an HTML comment; do NOT unilaterally reconcile them.
 
 ## Scope constraints
 - Update factual descriptions: architecture, testing commands, env vars, file paths, build steps
@@ -281,7 +447,10 @@ This CLAUDE.md has not been edited in the git history for over 30 days. Audit th
 You are a documentation auditor for <doc path>. Your job is to make this doc perfectly accurate against the current codebase.
 
 ## Mode
-fresh-audit (file unedited for over 30 days in git history)
+<fresh-audit (past its freshness window) | symbol-drift | both>
+
+## Symbol worklist (symbol-drift mode only)
+<paste this doc's missing-symbol list from Step 2.5b, with the "verify or remove" instruction>
 
 ## Style constraints
 - Match existing voice, formatting, and structure
@@ -312,13 +481,23 @@ Aggregate every agent's verification report. Show a structured summary:
 ```
 ## docs-sync complete
 
+**Freshness summary** (advisory — does not gate; a trackable signal for a human or future CI wrapper)
+| Doc | Status | Missing symbols | Days since edit |
+|-----|--------|-----------------|-----------------|
+| README.md | drifted→fixed | 0 | 12 |
+| docs/architecture.md | drifted→fixed | 0 | 95 |
+| CONTRIBUTING.md | needs-human | 2 | 412 |
+
 **Branch-driven updates:**
 - README.md: updated <sections>
 - _wiki/page.md: updated <sections>
 
-**Stale-doc audits (>30d unedited):**
-- docs/architecture.md (87d): <fixes applied>
+**Stale-doc audits (past freshness window):**
+- docs/architecture.md (95d > 90d ttl): <fixes applied>
 - CONTRIBUTING.md (412d): <fixes applied>
+
+**Symbol drift (Step 2.5b):**
+- <doc>: <missing symbol> → <fixed | removed | confirmed-real false positive>
 
 **Verification findings (Pass 2 cross-check):**
 - <claim that was wrong> → <how it was fixed>
@@ -327,15 +506,21 @@ Aggregate every agent's verification report. Show a structured summary:
 **Misdirection caught (Pass 3 fresh-reader audit):**
 - <misleading instruction> → <correction>
 
+**Agent-instruction divergence (CLAUDE.md vs AGENTS.md):**
+- <rule present in one but not the other> → flagged for human review
+
+**Symlinks resolved:**
+- <alias> → <canonical> (audited the canonical file only)
+
 **Suggestions:**
 - <any new doc suggestions from Step 5>
 ```
 
-If any agent left `<!-- docs-sync: unable to verify -->` markers, list them explicitly so the human can resolve them before merging.
+The freshness summary stays advisory — never block on it. If any agent left `<!-- docs-sync: unable to verify -->` markers, or any CLAUDE.md↔AGENTS.md divergence was flagged, list them explicitly so the human can resolve them before merging.
 
-Stage the changed doc files:
+Stage the changed doc files (use the CANONICAL paths from Step 1, never aliases):
 ```bash
-git add README.md CLAUDE.md _wiki/ docs/ 2>/dev/null
+git add README.md CLAUDE.md AGENTS.md CONTRIBUTING.md _wiki/ docs/ 2>/dev/null
 git status --short
 ```
 
@@ -345,6 +530,7 @@ Say: "Doc changes staged. Review the diffs and commit when ready."
 
 - Internal-only refactors with no user-facing impact
 - Auto-generated docs (check for generation scripts first — e.g., `docs/api/` with a Makefile)
+- Changelogs, release notes, historical/migration docs (CHANGELOG.md, HISTORY.md, `migrations/`, `UPGRADING.md`) — they legitimately reference removed code and old versions, so scoring them like living docs flags every "replaced X with Y" line as false drift. Step 2.5 already excludes them from the staleness and symbol-drift queues; honor a `freshness: { exclude: true }` opt-out for any other doc that should be frozen.
 - Scratch/debug scripts
 - Unfinished/WIP features unless explicitly asked
 - Test-only changes (unless they change how to run tests)

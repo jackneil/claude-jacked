@@ -18,6 +18,8 @@ Needs a current `jacked` CLI on PATH (a bare install is enough — recovery neve
 - **`jacked` not found** -> tell the user to install or repair jacked, then stop.
 - **`jacked recover` reports `No such command 'recover'` / exits 2** -> the on-PATH `jacked` is outdated (it predates this command). Tell the user to upgrade with `uv tool install claude-jacked --force && jacked install`. In a uv-managed repo checkout, `uv run jacked recover ...` runs the current source instead.
 
+**On-disk source of truth (for self-verification only).** Transcripts always survive at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, where `<encoded-cwd>` is the cwd with `/`, `\`, and `.` all replaced by `-`. If `jacked recover` finds nothing or a near-empty list, the cause is almost always the wrong folder or a non-default `CLAUDE_CONFIG_DIR`/`CLAUDE_PROJECTS_DIR` (an index/path mismatch), **not** data loss — point the user at that path to confirm the files exist before concluding the session is gone. Do not invent state.
+
 ## Steps
 
 1. **Find candidates.** Run:
@@ -36,7 +38,9 @@ Needs a current `jacked` CLI on PATH (a bare install is enough — recovery neve
    ```bash
    jacked recover --session <id> --digest
    ```
-   The output IS the recovered working state — read it. It ends with a `claude --resume <id>` line and, if it was trimmed to fit, a budget note.
+   The output IS the recovered working state — read it. Besides the todos, files, plan, and sub-agent findings, it surfaces two crash-critical facts when present: an **In-flight intent** block (the crashed agent's final reasoning — why the next step was next) and a **Failed actions** list (e.g. `Bash: pytest -q → FAILED: 3 errors`), since the last command/edit that *errored* is usually the single most load-bearing recovery fact. It ends with a `claude --resume <id>` line and, if it was trimmed to fit, a budget note.
+
+   Scale the digest with `--depth {brief|standard|full}` (default `standard`): use `--depth full` for a heavy multi-file session (more requests, tool actions, files, and a larger char budget), `--depth brief` for a quick one-liner recovery. `--budget N` overrides the char budget independently.
 
 6. **Offer native resume.** Tell the user: "For a true continuation that preserves Claude's internal state, run `claude --resume <id>` in a fresh terminal. The digest above lets us continue right here instead."
 

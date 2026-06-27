@@ -105,7 +105,15 @@ If no shared files changed, skip the spot-check entirely.
 
 ## Step 4: Determine App URL
 
-**If `$ARGUMENTS` contains a URL**: Use that URL directly.
+**Prefer a LOCAL instance — don't run interactive/mutating checks against production.** This
+pass clicks and fills forms, and may submit/save. If so, run it against a LOCAL dev server —
+start one if none is running (`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose
+up`, `manage.py runserver`, `uv run`/`flask run`, etc., with seed/sample data), or a disposable
+staging — **never production**. If only a production URL is reachable, keep the pass READ-ONLY
+(look, don't submit/save/delete) and tell the user the interactive checks need a local instance.
+
+**If `$ARGUMENTS` contains a URL**: Use that URL directly (confirm it's local/disposable before
+any mutating interaction).
 
 **Otherwise**, try to detect a running dev server:
 1. Check conversation context for recently mentioned URLs (e.g., `http://localhost:3000`)
@@ -150,6 +158,15 @@ mkdir -p "$REPO_ROOT/tmp/qa_screenshots"
 Save all screenshots to `$REPO_ROOT/tmp/qa_screenshots/<descriptive-name>.png`.
 *Add `tmp/` to your project's `.gitignore` if it isn't already there.*
 
+### State Hygiene
+
+Start each UI area from a known state so cross-test contamination doesn't manufacture false bugs (a half-filled form, a leftover session, a record mutated by an earlier check):
+- Begin from a fresh navigation, or — where the tool supports it — an isolated/incognito context (Chrome DevTools MCP: `mcp__chrome-devtools__new_page` with `isolatedContext` partitions cookies/storage; Playwright: a fresh browser context).
+- Don't mutate real or shared records when a throwaway path exists — use a seeded/test entity, not production data.
+- After the pass, restore state: log out, clear any half-filled form, and close or delete entities you created.
+
+> **Warning — live session:** With Chrome DevTools MCP `--autoConnect` you are driving the user's REAL signed-in Chrome, not a sandbox. Do not leave it mid-flow, on a destructive confirmation, or logged into something it wasn't before — leave it where you found it.
+
 Navigate to the app URL. For each UI area affected by the changes:
 
 ### Visual Check
@@ -166,8 +183,14 @@ Navigate to the app URL. For each UI area affected by the changes:
 
 ### Console Errors
 - Check the browser console for JavaScript errors
-- Use `mcp__plugin_playwright_playwright__browser_console_messages` or `mcp__claude-in-chrome__read_console_messages`
+- Per-tool calls: Chrome DevTools MCP `mcp__chrome-devtools__list_console_messages` (drill into one with `mcp__chrome-devtools__get_console_message`); Playwright `mcp__plugin_playwright_playwright__browser_console_messages`; Claude-in-Chrome `mcp__claude-in-chrome__read_console_messages`
 - Flag any errors, especially new ones related to the changed code
+
+### Network Errors
+A failed API call is a leading cause of "the UI looks broken" and is invisible to a visual + console pass — check it explicitly. After exercising each UI area, list the network requests and flag anything tied to the changed code that didn't succeed:
+- Non-2xx/3xx responses (4xx/5xx), failed fetches, CORS errors, and pending/hung requests that never resolve
+- Per-tool calls: Chrome DevTools MCP `mcp__chrome-devtools__list_network_requests` (drill into one with `mcp__chrome-devtools__get_network_request`); Playwright `mcp__plugin_playwright_playwright__browser_network_requests`; agent-browser `npx agent-browser eval "performance.getEntriesByType('resource')"` (or its network-log command if available). Note: `PerformanceResourceTiming` exposes no HTTP status code, so the agent-browser `eval` path cannot read response status — use its dedicated network-log command if available, otherwise capture the request URL/duration and infer failures from `transferSize === 0`/hung timing rather than a status code.
+- For each failure, record the **URL**, the **status code** (when the tool exposes it — the agent-browser `eval` path above does not, so omit it there), and whether it **correlates with a visible UI defect** (empty state, a spinner that never resolves, an error toast, missing data). Surface it even when the page otherwise renders.
 
 ### Edge Cases
 - Empty states: What happens with no data?
@@ -197,6 +220,14 @@ If found, read it and incorporate its "What to check" items into your testing ch
 
 Skip items that require specialized tooling (screen reader testing, automated WCAG scanners) unless the user specifically requests them.
 
+### Performance & Lighthouse (Chrome DevTools MCP only, opt-in)
+
+Run this **only** when Chrome DevTools MCP is the active tool AND the change plausibly affects performance or a11y — new/large images or fonts, bigger bundles, render-blocking resources, a new heavy component, or markup/contrast changes. Skip it for quick single-component checks so they stay fast.
+
+- **Lighthouse:** run `mcp__chrome-devtools__lighthouse_audit` (mode=`navigation`, device matching the viewport you're testing) on the **primary changed page** for **accessibility / SEO / best-practices**. Note: Lighthouse here **EXCLUDES performance** — use the trace below for Core Web Vitals.
+- **Performance trace (optional):** navigate to the target URL first, then `mcp__chrome-devtools__performance_start_trace` — by default it reloads the page and auto-stops once the page settles, so no manual reload or separate `performance_stop_trace` call is needed (pass `reload=false`/`autoStop=false` only if you want to drive an interaction yourself, then call `mcp__chrome-devtools__performance_stop_trace`). Then `mcp__chrome-devtools__performance_analyze_insight` to read **LCP / INP / CLS** and render-blocking resources.
+- **Keep it token-cheap:** direct the heavy report to disk — set the tool's `outputDirPath` to `$REPO_ROOT/tmp/qa_screenshots/` (run `mkdir -p "$REPO_ROOT/tmp/qa_screenshots"` first if you skipped the screenshot setup), or write to a tmp path. Pull only the scores + top failing audits into the QA report; **never inline the raw JSON**.
+
 ## Step 7: Report Findings
 
 Present a structured report:
@@ -218,19 +249,36 @@ Present a structured report:
 ### Console Errors
 - [List any JS errors found, or "None"]
 
+### Network Errors
+- [List any failed/4xx/5xx/CORS/hung requests — URL + status + linked UI defect, or "None"]
+
 ### Suggestions
 - [Optional improvements noticed during testing]
 ```
 
 If everything passes, say so clearly. If issues are found, prioritize them by severity.
 
-## Step 8: Cleanup
+## Step 8: (Optional) Convert a Verified Journey to a Regression Test
+
+**Strictly opt-in.** The QA pass itself stays read-only (detect + report) — this only runs if the user explicitly asks for it after seeing the report. Offer it once:
+
+> Want me to lock this in? I can turn a verified PASS journey (or a reproduced bug) into a runnable regression test so it can't silently come back.
+
+If the user says yes:
+1. **Pick the journey** — a clean PASS path worth protecting, or the exact reproduction steps for a confirmed bug.
+2. **Replay** the steps through the active browser tool to confirm they're accurate.
+3. **Emit a spec** using the repo's existing e2e framework (`@playwright/test` if none is established), written into the repo's existing tests directory — match the current layout and naming (e.g. `e2e/`, `tests/e2e/`, `playwright/`).
+4. **Run it and iterate until green.** For a bug, write the test to fail against current behavior first, so it goes green only once the fix lands.
+
+If the user declines, skip straight to Cleanup.
+
+## Step 9: Cleanup
 
 Remove the screenshot directory after presenting the report:
 ```bash
 rm -rf "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/tmp/qa_screenshots"
 ```
 
-This command is **read-only** — it detects and reports issues but does NOT fix them. The detailed issue list is returned to the parent caller (Claude Code), which should then use `superpowers:writing-plans` to build a fix plan from the findings, let the user iterate on it, and execute with `/dcr` verification.
+This command is **read-only** — the QA pass detects and reports issues but does NOT fix them. The single exception is Step 8, which writes a regression test only on explicit user approval (an opt-in follow-on, never part of the detection pass). The detailed issue list is returned to the parent caller (Claude Code), which should then use `superpowers:writing-plans` to build a fix plan from the findings, let the user iterate on it, and execute with `/dcr` verification.
 
 > **Tip:** Run `/jacked-setup qa` to generate a repo-specific config that skips browser detection, bakes in your tech stack, and adds framework-specific QA checks.

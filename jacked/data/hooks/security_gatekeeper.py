@@ -1708,6 +1708,212 @@ def _check_file_tool_permissions(tool_name: str, file_path: str) -> tuple[bool, 
     return (False, None)
 
 
+# --- Freeze boundary (set by /freeze, cleared by /unfreeze) ---
+# Canonical files (resolved against home at call time, not import, so a changed
+# HOME is honored): ~/.claude/jacked-freeze.json (JSON multi-path format, takes
+# precedence) and ~/.claude/jacked-freeze-dir.txt (legacy single-line path, still
+# honored for backward compatibility with freezes set by older /freeze).
+
+
+def _freeze_norm(p: str) -> str:
+    """Resolve symlinks and forward-slash normalize a path for boundary tests.
+
+    Resolving first means a symlink inside the frozen dir that points outside is
+    correctly caught (the boundary applies to the real target), and the
+    forward-slash normalization keeps the prefix test holding on Windows.
+    """
+    return str(Path(p).resolve()).replace("\\", "/")
+
+
+def _load_freeze_entries(
+    json_path: Path | None = None, txt_path: Path | None = None
+) -> tuple[list[dict] | None, bool]:
+    """Load active freeze entries.
+
+    Returns (entries, corrupt):
+      entries: list of {"project", "include", "exclude", "since"} or None if no
+               freeze is active.
+      corrupt: True if a freeze file EXISTS but cannot be parsed into a valid
+               boundary. The caller must FAIL CLOSED (deny) — a freeze is a
+               deliberately-enabled guard, so silently allowing on corruption is
+               the opposite of what the user asked for.
+
+    Prefers the JSON multi-path format (~/.claude/jacked-freeze.json); falls back
+    to the legacy single-line text file (~/.claude/jacked-freeze-dir.txt). A truly
+    empty file means "no freeze" (not corrupt) so a manual truncate or half-finished
+    /unfreeze never bricks edits.
+
+    >>> _load_freeze_entries(Path("/nope.json"), Path("/nope.txt"))
+    (None, False)
+    """
+    # Resolve home at call time (not the module-level constants) so a test or a
+    # changed HOME env is honored — matches the inline Path.home() the old check used.
+    jp = json_path if json_path is not None else (Path.home() / ".claude" / "jacked-freeze.json")
+    tp = txt_path if txt_path is not None else (Path.home() / ".claude" / "jacked-freeze-dir.txt")
+
+    if jp.exists():
+        try:
+            raw = jp.read_text(encoding="utf-8").strip()
+        except Exception:
+            return None, True  # exists but unreadable → fail closed
+        if not raw:
+            return None, False  # empty == no freeze
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, True  # present but unparseable → fail closed
+        freezes = data.get("freezes") if isinstance(data, dict) else None
+        if not isinstance(freezes, list):
+            return None, True
+        entries: list[dict] = []
+        for f in freezes:
+            if not isinstance(f, dict):
+                return None, True
+            include = f.get("include", [])
+            if isinstance(include, str):
+                include = [include]
+            if (
+                not isinstance(include, list)
+                or not include
+                or not all(isinstance(x, str) and x.strip() for x in include)
+            ):
+                return None, True  # a non-empty include set is mandatory
+            exclude = f.get("exclude", []) or []
+            if isinstance(exclude, str):
+                exclude = [exclude]
+            if not isinstance(exclude, list) or not all(
+                isinstance(x, str) for x in exclude
+            ):
+                return None, True
+            project = f.get("project")
+            if project is not None and not isinstance(project, str):
+                return None, True
+            since = f.get("since")
+            entries.append(
+                {
+                    "project": project,
+                    "include": list(include),
+                    "exclude": [x for x in exclude if x.strip()],
+                    "since": since if isinstance(since, str) else None,
+                }
+            )
+        if not entries:
+            return None, False
+        return entries, False
+
+    if tp.exists():
+        try:
+            raw = tp.read_text(encoding="utf-8").strip()
+        except Exception:
+            return None, True
+        if not raw:
+            return None, False
+        # Legacy single global path → one global include, no excludes.
+        return [{"project": None, "include": [raw], "exclude": [], "since": None}], False
+
+    return None, False
+
+
+def _freeze_entries_for_project(entries: list[dict], repo_path: str) -> list[dict]:
+    """Filter freeze entries to those governing the current project.
+
+    Global entries (project None/""/"*") apply everywhere — backward compatible
+    with the legacy single global freeze. Project-keyed entries apply ONLY when
+    their resolved project root equals repo_path, so a freeze set in repo A never
+    governs repo B opened in another terminal, and /freeze in a new repo doesn't
+    silently stomp an existing one.
+    """
+    repo_norm = _freeze_norm(repo_path) if repo_path else ""
+    out: list[dict] = []
+    for e in entries:
+        proj = e.get("project")
+        if proj in (None, "", "*"):
+            out.append(e)
+        elif repo_norm and _freeze_norm(proj) == repo_norm:
+            out.append(e)
+    return out
+
+
+def _freeze_allows(file_path: str, entries: list[dict]) -> bool:
+    """True if file_path is editable under ANY of the given freeze entries.
+
+    A path is allowed by an entry when it is at/under one of the entry's include
+    paths AND not at/under any of that entry's exclude paths. Multiple entries
+    union their allowed regions; each entry's excludes carve out only its own
+    region.
+    """
+    file_norm = _freeze_norm(file_path)
+
+    def _within(p: str, base: str) -> bool:
+        return p == base or p.startswith(base + "/")
+
+    for e in entries:
+        includes = [_freeze_norm(p) for p in e.get("include", [])]
+        excludes = [_freeze_norm(p) for p in e.get("exclude", [])]
+        if not any(_within(file_norm, inc) for inc in includes):
+            continue
+        if any(_within(file_norm, exc) for exc in excludes):
+            continue
+        return True
+    return False
+
+
+def evaluate_freeze_boundary(
+    tool_name: str,
+    file_path: str,
+    repo_path: str,
+    json_path: Path | None = None,
+    txt_path: Path | None = None,
+) -> tuple[str, str] | None:
+    """Decide whether the freeze boundary blocks this edit.
+
+    Returns None to allow (no active freeze, freeze governs a different project,
+    or the path is inside the frozen scope), or (user_message, log_reason) to DENY.
+    Read-only tools are never restricted.
+
+    FAIL-CLOSED: a freeze is a deliberately-enabled guard, so a corrupt/unreadable
+    freeze file — or any internal error evaluating the boundary — DENIES rather
+    than silently allowing. This is the opposite of the old fail-open behavior,
+    matching blocking-hook security consensus (a deliberate guard must fail closed).
+
+    >>> evaluate_freeze_boundary("Read", "/x", "/repo") is None
+    True
+    """
+    if tool_name not in ("Edit", "Write", "NotebookEdit"):
+        return None
+    try:
+        entries, corrupt = _load_freeze_entries(json_path=json_path, txt_path=txt_path)
+        if corrupt:
+            return (
+                "Freeze boundary: freeze file is corrupt or unreadable — edits are "
+                "blocked (fail-closed). Run /unfreeze to reset.",
+                "freeze file corrupt (fail-closed)",
+            )
+        if not entries:
+            return None
+        matched = _freeze_entries_for_project(entries, repo_path)
+        if not matched:
+            return None  # freeze exists but governs a different project
+        if _freeze_allows(file_path, matched):
+            return None
+        allowed = sorted({inc for e in matched for inc in e.get("include", [])})
+        excluded = sorted({exc for e in matched for exc in e.get("exclude", [])})
+        since = [e.get("since") for e in matched if e.get("since")]
+        since_note = f" (active since {min(since)})" if since else ""
+        excl_note = f"; excluded: {', '.join(excluded)}" if excluded else ""
+        return (
+            f"Freeze boundary: edits restricted to {', '.join(allowed)}"
+            f"{excl_note}{since_note} — run /unfreeze to remove",
+            f"outside frozen scope: {', '.join(allowed)}{excl_note}",
+        )
+    except Exception as exc:  # fail CLOSED on any boundary-check error
+        return (
+            "Freeze boundary: boundary check failed — edits blocked (fail-closed). "
+            "Run /unfreeze to reset.",
+            f"freeze boundary check error: {exc}",
+        )
+
+
 def _handle_file_tool(
     tool_name: str,
     tool_input: dict,
@@ -1769,45 +1975,27 @@ def _handle_file_tool_inner(
         )
         return
 
-    # Freeze boundary check — block Edit/Write/NotebookEdit outside the frozen directory.
-    # /freeze writes a path to this file; /unfreeze deletes it.
-    # Read-only tools (Read, Grep, Glob) are NOT restricted.
-    if tool_name in ("Edit", "Write", "NotebookEdit"):
-        _freeze_path = Path.home() / ".claude" / "jacked-freeze-dir.txt"
-        if _freeze_path.exists():
-            try:
-                _frozen_dir = _freeze_path.read_text().strip()
-                if _frozen_dir:
-                    # Forward-slash normalize so the boundary holds on Windows,
-                    # where Path.resolve() yields backslash paths but the prefix
-                    # test below appends "/".
-                    _resolved_file = str(Path(file_path).resolve()).replace("\\", "/")
-                    _frozen_resolved = str(Path(_frozen_dir).resolve()).replace("\\", "/")
-                    if (
-                        _resolved_file != _frozen_resolved
-                        and not _resolved_file.startswith(_frozen_resolved + "/")
-                    ):
-                        elapsed = time.time() - start
-                        log(
-                            f"FREEZE BOUNDARY [{tool_name}]: DENY "
-                            f"{file_path[:100]} — outside frozen dir {_frozen_dir}"
-                        )
-                        _record_decision(
-                            "DENY",
-                            f"[{tool_name}] {file_path[:200]}",
-                            "FREEZE_BOUNDARY",
-                            f"outside frozen dir: {_frozen_dir}",
-                            elapsed * 1000,
-                            session_id,
-                            repo_path,
-                        )
-                        _emit_deny(
-                            f"Freeze boundary: edits restricted to {_frozen_dir} "
-                            f"(run /unfreeze to remove)"
-                        )
-                        return
-            except Exception:
-                pass  # fail-open if freeze file is corrupted
+    # Freeze boundary check — block Edit/Write/NotebookEdit outside the frozen scope.
+    # /freeze writes the boundary (multi-path + per-project, JSON or legacy text);
+    # /unfreeze clears it. Read-only tools (Read, Grep, Glob) are NOT restricted.
+    # FAIL-CLOSED: a corrupt freeze file or an internal error denies edits rather
+    # than silently evaporating a deliberately-enabled guard.
+    freeze_decision = evaluate_freeze_boundary(tool_name, file_path, repo_path)
+    if freeze_decision is not None:
+        user_msg, log_reason = freeze_decision
+        elapsed = time.time() - start
+        log(f"FREEZE BOUNDARY [{tool_name}]: DENY {file_path[:100]} — {log_reason}")
+        _record_decision(
+            "DENY",
+            f"[{tool_name}] {file_path[:200]}",
+            "FREEZE_BOUNDARY",
+            log_reason,
+            elapsed * 1000,
+            session_id,
+            repo_path,
+        )
+        _emit_deny(user_msg)
+        return
 
     # Step 1: Path safety checks FIRST — security always wins over permissions.
     # Split into three calls (watched → sensitive → outside-project) so that

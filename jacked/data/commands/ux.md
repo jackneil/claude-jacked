@@ -20,16 +20,17 @@ You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each
 
 > **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.
 
-## UX CHECK ASPECTS (6 total)
+## UX CHECK ASPECTS (7 total)
 
 | # | Aspect | What to Check |
 |---|--------|---------------|
 | 1 | **Visual & Layout** | Broken layouts, overlapping elements, spacing, alignment, text readability, color consistency, images/icons loading |
 | 2 | **Responsive** | Mobile (375px), tablet (768px), desktop (1280px+) — layout integrity, touch targets, text wrapping, no horizontal scroll |
 | 3 | **Interactions** | Buttons, forms, navigation, modals, dropdowns, toggles, hover states, loading states, error feedback |
-| 4 | **Console & Network** | JS errors, unhandled rejections, 404s, failed API calls, slow requests, deprecation warnings |
-| 5 | **Accessibility** | Semantic HTML, focus order, keyboard navigation, color contrast, ARIA labels, screen reader landmarks |
+| 4 | **Console & Network** | JS errors, unhandled rejections, 404s, failed API calls, slow requests, deprecation warnings, visible-text grammar/clarity/jargon |
+| 5 | **Accessibility** | Semantic HTML, focus order, keyboard navigation, WCAG 2.1 AA contrast (4.5:1 body / 3:1 large), Enter/Space activation, visible focus, ARIA labels, landmarks |
 | 6 | **Discoverability** | New features only: entry points from related pages, navigation depth to reach feature, first-use clarity, return navigation back to origin |
+| 7 | **Robustness & States** | Content-overflow stress (long strings, many rows, narrow columns), invalid-input form validation, distinct loading / empty / error states |
 
 ## Step 1: Detect Browser Tools
 
@@ -182,7 +183,7 @@ If cross-page impact detected:
 
 ## Step 4: Select UX Personas
 
-Select 2-3 personas that match the project's target users. These personas shape HOW agents evaluate their assigned aspects — they don't replace the 6 aspects, they add evaluative bias.
+Select 2-3 personas that match the project's target users. These personas shape HOW agents evaluate their assigned aspects — they don't replace the 7 aspects, they add evaluative bias.
 
 ### Persona Pool
 
@@ -247,7 +248,16 @@ Determine whether the project targets mobile users using **weighted signals**:
 
 ## Step 6: Determine App URL
 
-**If `$ARGUMENTS` contains a URL**: Use that URL directly.
+**Prefer a LOCAL instance — don't drive interactive/mutating flows against production.** This
+review clicks through pages and exercises interactions across personas. If any of it writes
+(submit, save, delete), run against a LOCAL dev server — start one if none is running
+(`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose up`, `manage.py runserver`,
+`uv run`/`flask run`, etc., with seed/sample data) — or a disposable staging, **never
+production**. If only a production URL is reachable, keep it READ-ONLY and say the interactive
+checks need a local instance.
+
+**If `$ARGUMENTS` contains a URL**: Use that URL directly (confirm it's local/disposable before
+any mutating interaction).
 
 **Otherwise**, try to detect a running dev server:
 1. Check conversation context for recently mentioned URLs
@@ -297,6 +307,7 @@ Pass the resolved `REPO_ROOT` path as a **literal string** to each agent's Task 
 Select which aspects are relevant based on what changed:
 - CSS/styling changes → weight **Visual & Layout** + **Responsive**
 - JS logic/component changes → weight **Interactions** + **Console & Network**
+- JS logic or form/input changes (forms, lists, tables, data rendering) → weight **Robustness & States**
 - HTML structure changes → weight **Accessibility** + **Visual & Layout**
 - New UI files added (`new_feature_detected = true`) → include **Discoverability** — assign the entry point pages list to the agent handling this aspect
 - When in doubt, include the aspect.
@@ -306,24 +317,26 @@ Build a matrix of (aspect, page) and assign to 2-4 agents:
 **1 page (modified only):**
 - Agent A: Visual & Layout + Responsive
 - Agent B: Interactions + Console & Network
-- Agent C: Accessibility
+- Agent C: Accessibility + Robustness & States
 
 **1 page (new feature — new_feature_detected = true):**
 - Agent A: Visual & Layout + Responsive
-- Agent B: Interactions + Console & Network
+- Agent B: Interactions + Console & Network + Robustness & States
 - Agent C: Accessibility + Discoverability
 
 **2 pages (modified only):**
 - Agent A: Page 1 — Visual & Layout + Responsive
-- Agent B: Page 1 — Interactions + Console & Network + Accessibility
+- Agent B: Page 1 — Interactions + Console & Network + Robustness & States
 - Agent C: Page 2 — Visual & Layout + Responsive
-- Agent D: Page 2 — Interactions + Console & Network + Accessibility
+- Agent D: Page 2 — Interactions + Console & Network + Robustness & States
 
 **2 pages (new feature — new_feature_detected = true):**
 - Agent A: Page 1 — Visual & Layout + Responsive
-- Agent B: Page 1 — Interactions + Console & Network
+- Agent B: Page 1 — Interactions + Console & Network + Robustness & States
 - Agent C: Page 2 — Visual & Layout + Accessibility
-- Agent D: Page 2 — Interactions + Discoverability (receives the entry point pages list)
+- Agent D: Page 2 — Interactions + Discoverability + Robustness & States (receives the entry point pages list)
+
+**Robustness & States placement:** by default the agent that owns **Interactions** also owns **Robustness & States** (forms and states are tested together). When that agent is already carrying three aspects, hand Robustness to the lightest agent on the same page instead. At the 4-agent cap, never drop it — fold it into the Interactions agent.
 
 **3+ pages:** Group intelligently, cap at 4 agents. Prioritize pages most affected by changes. When `new_feature_detected = true`, assign Discoverability to whichever agent tests the new feature's page — pass them the full entry point pages list so they can navigate to those pages during checks.
 
@@ -335,7 +348,7 @@ Use your judgment — adjust grouping based on what changed. Skip aspects that c
 **Personas:** [Persona 1] + [Persona 2] (inferred: [classification])
 **Mobile deep dive:** Yes ([signal]) / No ([reason])
 - Agent A: [Page URL] — Visual & Layout + Responsive
-- Agent B: [Page URL] — Interactions + Console & Network
+- Agent B: [Page URL] — Interactions + Console & Network + Robustness & States
 - Agent C: [Page URL] — Accessibility
 ```
 
@@ -436,6 +449,10 @@ For every check, ask: would this pass for EACH persona? A button that works for 
 - **[MEDIUM] [Novice]** Button label "Dispatch" is jargon — unclear to non-technical users
 - **[LOW] [Power User]** No keyboard shortcut for the primary action
 
+### Task traversal (think-aloud)
+
+Static aspect scoring isn't enough. For EACH selected persona, pick one realistic goal that persona would have on your assigned page (e.g., Novice: "create my first record"; Power User: "filter and bulk-edit"; Design Consultant: "scan the page for hierarchy and polish"). Actually attempt to complete that goal end-to-end in the browser. As you go, "think aloud": note every point of friction, hesitation, or dead end — where you weren't sure what to click, where a label was ambiguous, where the flow stalled. Report those friction points as findings (tagged with the persona), in addition to the static checklist results. This is where the highest-signal usability issues surface.
+
 ## ASPECT CHECKLISTS
 
 ### Visual & Layout
@@ -471,6 +488,13 @@ For every check, ask: would this pass for EACH persona? A button that works for 
 - [ ] Test loading states — what shows during async operations?
 - [ ] Test error states — what happens on invalid input or failed operations?
 
+**Heuristic lens (Nielsen) — ask these while testing, flag misses as usability issues:**
+- Is system status visible during async actions (spinner, progress, disabled state), or does the UI look frozen?
+- Is there an escape hatch / undo for destructive or multi-step actions (cancel, confirm, undo)?
+- Are labels jargon-free and matched to the real world, or do they assume internal terminology?
+- Is the interaction consistent with the rest of the app (same patterns, wording, placement)?
+- When an error occurs, can the user understand and recover from it (plain-language message + a way forward)?
+
 ### Console & Network
 - [ ] Read console messages — any JavaScript errors?
 - [ ] Check for unhandled promise rejections
@@ -479,19 +503,38 @@ For every check, ask: would this pass for EACH persona? A button that works for 
 - [ ] Check for deprecation warnings
 - [ ] Verify no sensitive data in console output
 
+**Content & microcopy** (cheap to catch in the browser, high-impact for novice users):
+- [ ] Read the visible text — any grammar, spelling, or clarity problems?
+- [ ] Flag jargon or internal terminology that a real user wouldn't recognize
+- [ ] Flag mislabeled or ambiguous buttons and headings (does the label match what the control actually does?)
+
+### Robustness & States (forms, lists, and async states)
+- [ ] Content overflow — paste a very long string into text fields and headings; load (or simulate) many list/table rows; check narrow columns. Does anything clip, push the layout, or scroll horizontally?
+- [ ] Invalid-input validation — submit every form with empty, malformed, and out-of-range values. Is there a clear, specific validation message for each, and is submission blocked?
+- [ ] Loading state — is there a distinct loading indicator during async work (not a frozen or blank screen)?
+- [ ] Empty state — when there's no data yet, is there a helpful message and a clear next action (not a bare empty container)?
+- [ ] Error state — when an operation fails, is there a distinct, recoverable error screen (not a silent failure or raw stack trace)?
+
 ### Accessibility
 - [ ] Take a snapshot (accessibility tree) — check semantic structure
 - [ ] Verify heading hierarchy (h1 → h2 → h3, no skips)
 - [ ] Check that interactive elements have accessible names
 - [ ] Test keyboard navigation (Tab through elements — logical order?)
 - [ ] Look for ARIA labels on icons and non-text elements
-- [ ] Check color contrast (text should be legible)
-- [ ] Verify focus indicators are visible on all interactive elements
+- [ ] Check color contrast against WCAG 2.1 AA: >= 4.5:1 for body text, >= 3:1 for large text (>=18pt or >=14pt bold). Compute via DevTools/accessibility panel — do not eyeball it.
+- [ ] Verify focused controls activate on Enter and Space (buttons, links, custom widgets)
+- [ ] Confirm a visible focus state on EVERY interactive element (no `outline: none` with no replacement)
 
 ### Discoverability (include ONLY if new_feature_detected = true)
 
 **New feature:** [description — e.g., "Account Details page at /accounts/:id"]
 **Expected entry points:** [list from Step 2 analysis — existing pages where users would look for this]
+
+**Heuristic lens (Nielsen) — apply while walking the path in:**
+- Match real world: is the feature's name/label something a user would recognize and search for, or internal jargon?
+- Recognition over recall: can the user *see* the way in (a visible link/affordance), or must they remember a route?
+- Consistency: does the entry point follow the same navigation patterns as the rest of the app?
+- Help & recovery: if the user lands somewhere wrong, is there an obvious way back or forward?
 
 #### Entry Point Checks
 For each expected entry point page:
@@ -539,14 +582,25 @@ If found, read it and incorporate its "What to check" items into your testing ch
 
 Skip items that require specialized tooling (screen reader testing, automated WCAG scanners) unless the user specifically requests them.
 
+## COMMUNICATION PRINCIPLES
+
+How you WRITE findings matters as much as what you find:
+
+1. **Problems over prescriptions.** Describe the problem and its impact on the user — do NOT prescribe the CSS/code fix. This is a read-only diagnostic; the fix is decided downstream.
+   - Good: "Spacing is inconsistent with adjacent elements, creating visual clutter that makes the form harder to scan."
+   - Bad: "Change the margin to 16px." (prescribes a fix you aren't allowed to make and may be wrong)
+2. **Lead with what works.** Open your report with one honest line acknowledging what's working well before listing issues. It calibrates severity and keeps the review constructive — but never invent praise; if a screen is genuinely broken, say so.
+
 ## REPORT FORMAT
 
 Structure your findings like this:
 
 ## [Aspect Name] — [PASS / ISSUES FOUND]
 
+**What works:** [one line on what's solid here — the strong parts of this aspect]
+
 ### Issues
-- **[CRITICAL/HIGH/MEDIUM/LOW]** [Description]
+- **[CRITICAL/HIGH/MEDIUM/LOW]** [Problem + its user impact — not a prescribed fix]
   - Steps: [how to reproduce]
   - Expected: [what should happen]
   - Actual: [what happens]
@@ -562,10 +616,12 @@ Wait for all agents to complete. Aggregate findings into a single report:
 ```
 ## UX Check Report
 
-**Pages tested:** [N] | **Aspects covered:** [N] of 6 | **Agents used:** [N]
+**Pages tested:** [N] | **Aspects covered:** [N] of 7 | **Agents used:** [N]
 **Browser:** Playwright MCP / Claude-in-Chrome
 **Personas applied:** [list of selected personas]
 **Mobile deep dive:** Yes / No
+
+**What works well:** [one honest line synthesizing the strongest parts across agents — lead here before the issues. Don't invent praise.]
 
 ### Results by Page
 
@@ -574,12 +630,13 @@ Wait for all agents to complete. Aggregate findings into a single report:
   ✗ Responsive — 1 issue (Agent A)
   ✓ Interactions — PASS (Agent B)
   ✓ Console & Network — PASS (Agent B)
+  ✓ Robustness & States — PASS (Agent B)
   ✓ Accessibility — PASS (Agent C)
   ✓ Discoverability — PASS / N/A (Agent C)
 
 ### Issues ([N] total)
 
-1. **[MEDIUM] [Persona]** [Description]
+1. **[MEDIUM] [Persona]** [Problem + its user impact — describe the issue, not a prescribed fix]
    - Page: [URL]
    - Aspect: [which aspect found it]
    - Steps: [reproduction steps]

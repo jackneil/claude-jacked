@@ -2,7 +2,9 @@
 description: Use after implementing security-sensitive changes — auth, RBAC, multi-tenancy, billing, credential handling. Systematic OWASP Top 10 + STRIDE threat model analysis.
 ---
 
-You are the Chief Security Officer running a systematic security audit of this codebase. You produce a Security Posture Report — findings only, no code changes. Every finding must have an 8/10+ confidence rating and include a concrete exploit scenario.
+You are the Chief Security Officer running a systematic security audit of this codebase. You produce a Security Posture Report — findings only, no code changes.
+
+Detection is deliberately **two-stage**: you first cast a wide net for candidate findings (Phases 6-7: OWASP + STRIDE), then run a *separate* adversarial per-finding verification pass (Phase 8) that re-reads the code as a skeptic trying to **disprove** each candidate before it can ship. A dedicated adjudication pass suppresses far more false positives than bundling the judgment into detection. Every reported finding must survive that pass with a concrete exploit scenario and be scored on two independent axes — **SEVERITY** (blast radius) and **CONFIDENCE** (exploit certainty). Anything theoretical, or below the reporting floor, is dropped — not reported.
 
 ## Arguments
 
@@ -109,9 +111,25 @@ npm audit --json 2>/dev/null | head -50 || echo "npm audit not available"
 grep -E '"version"' package-lock.json 2>/dev/null | head -5 || true
 ```
 
-## Phase 5: OWASP Top 10 Analysis
+## Phase 5: Baseline / Comparative Analysis
 
-For each OWASP category, search for specific vulnerability patterns. Only report findings with **8/10+ confidence** — meaning you can describe a concrete exploit scenario, not just a theoretical risk.
+Before hunting for vulnerabilities, learn how *this* codebase already does security, so you flag **deviations** rather than your own generic preferences. Judging each file against a checklist in isolation is the #1 source of false positives; judging it against the project's own established secure pattern is the highest-signal bug class.
+
+Establish the baseline first:
+- **Existing security frameworks** — what does the project already rely on? (auth middleware, a `@requires_auth` / `get_current_user` dependency, an ORM that parameterizes by default, CSRF middleware, a central `sanitize()` / `escape()` helper, a secrets manager.)
+- **Sanitization & validation helpers** — find the canonical ones and where they live (a shared `validators.py`, a `db.query()` wrapper, a template engine with autoescape on).
+- **Secure-coding conventions** — how are queries built, output encoded, routes protected, secrets loaded? Sample 3-5 representative "known-good" files to learn the pattern.
+
+```bash
+# Central sanitization / validation / auth helpers the team already uses
+grep -rnE 'def (sanitize|escape|validate|clean|require_auth|get_current_user|authorize)|parameteriz|autoescape|csrf' --include="*.py" --include="*.ts" --include="*.js" 2>/dev/null | head -30
+```
+
+Then, during OWASP/STRIDE, **prefer findings where new or changed code DEVIATES from these established patterns** — a raw string-concat query in a codebase that otherwise uses the ORM; a route missing the `@requires_auth` every sibling route has; output emitted without the shared escaper. Code that is consistent with the project's own deliberate convention is **not** a finding merely because it differs from a generic checklist.
+
+## Phase 6: OWASP Top 10 Analysis
+
+For each OWASP category, gather **candidate** findings — anything with a plausible, concrete exploit path (not a theoretical risk). Do not finalize a finding here: every candidate is filtered and scored in the Phase 8 adversarial verification before it can be reported. The bar remains concrete evidence in the code — "an attacker could…" with a real data flow, never "this could theoretically be unsafe."
 
 ### A01: Broken Access Control
 - Missing auth checks on routes
@@ -178,9 +196,18 @@ For each OWASP category, search for specific vulnerability patterns. Only report
 - Missing allowlist for outbound requests
 - Internal service URLs constructable from user input
 
-For each category, read the relevant source files found in Phase 2 and search for these specific patterns. Skip categories that clearly don't apply to this stack.
+### A11: LLM / AI-Component Threats (OWASP LLM Top 10)
 
-## Phase 6: STRIDE Threat Model
+**Apply this category ONLY when the stack includes LLM calls, agent frameworks, or MCP tools** (Phase 1 found an LLM SDK such as `openai` / `anthropic` / `@anthropic-ai`, a LangChain/LlamaIndex/agent library, MCP server/tool definitions, or model-completion calls). It adds zero noise for non-LLM repos — skip it entirely if no model usage exists. The static-file analog (auditing skill/command/agent markdown for injected instructions) is the `--skills` mode.
+
+- **Prompt injection into model inputs** — untrusted data (user messages, scraped pages, tool results, retrieved documents) concatenated into prompts that carry privileged instructions, with no separation between trusted system instructions and untrusted content.
+- **Insecure handling of model OUTPUT** — the highest-severity AI bug class: a completion fed into `eval`/`exec`, a shell command, a SQL query, a file path, an HTTP request, or an authorization decision without validation. Treat model output as untrusted input.
+- **Excessive agency / over-broad tool permissions** — agents/tools granted more capability than the task needs (unrestricted filesystem or shell, write access where read suffices, no human-in-the-loop on destructive or state-changing tool calls).
+- **System-prompt / secret leakage** — secrets, API keys, internal URLs, or other sensitive context placed in system prompts or tool definitions where a crafted input can exfiltrate them.
+
+For each category (A01-A11), read the relevant source files found in Phase 2 and search for these specific patterns. Skip categories that clearly don't apply to this stack — A11 in particular only applies to repos with LLM/agent/MCP usage.
+
+## Phase 7: STRIDE Threat Model
 
 Apply STRIDE to the most critical components identified:
 
@@ -195,7 +222,32 @@ Apply STRIDE to the most critical components identified:
 
 Focus STRIDE analysis on the 3-5 most critical data flows (auth, payments, PII handling, admin actions, external integrations).
 
-## Phase 7: Security Posture Report
+## Phase 8: Adversarial False-Positive Verification
+
+The single biggest lever on report quality is false-positive suppression, and a *separate* adjudication pass beats bundling the judgment into detection. Treat detection (Phases 6-7) and verification (this phase) as two distinct stages: the first casts a wide net for candidates; this stage tries to **kill** each one. Run it per-finding and in isolation — a candidate that "feels" real in aggregate often evaporates once you trace its single data flow.
+
+For EVERY candidate finding, independently:
+1. **Re-read the code as a skeptic trying to disprove the finding.** Trace the actual untrusted-input path from entry point to sink. If you cannot name the concrete source of attacker-controlled data AND the exact sink it reaches, the finding dies here.
+2. **Run it through the False Positive Exclusions and Precedent Rulings below.** If any applies, drop it.
+3. **Score the survivors on the two axes below.** Drop anything beneath the reporting floor.
+
+Only findings that survive all three steps reach the report.
+
+### Severity and Confidence (two independent axes)
+
+Score every surviving finding on BOTH axes — do not collapse them into one number:
+
+- **SEVERITY** (blast radius if exploited):
+  - `HIGH` — RCE, auth bypass, mass data exposure, privilege escalation, secret/credential leakage.
+  - `MEDIUM` — scoped data exposure, stored XSS behind auth, CSRF on a state-changing action, SSRF to internal services.
+  - `LOW` — defense-in-depth gaps, info leak with no direct exploit path.
+- **CONFIDENCE** (certainty the exploit actually works), anchored:
+  - `0.90-1.00` — you traced a concrete, unconditional exploit path end to end.
+  - `0.80-0.90` — a known-bad pattern with a clear exploit, modulo trivial conditions.
+  - `0.70-0.80` — real but needs specific conditions; you MUST state those conditions in the finding.
+  - `< 0.70` — theoretical or unproven. **Do not report.**
+
+**Reporting floor: report only HIGH and MEDIUM severity findings with confidence ≥ 0.70.** LOW-severity items belong in Recommendations, not Critical Findings. This two-axis model is the successor to the old single 8/10 gate — the same "concrete evidence, never theoretical" bar, now split so triage information isn't lost.
 
 ### False Positive Exclusions
 
@@ -218,6 +270,23 @@ Do NOT report these common false positives:
 16. Type stubs / .d.ts files
 17. Changelog entries
 
+### Precedent Rulings
+
+The exclusions above name *categories*; these rulings resolve the ambiguous middle cases that drive most of the remaining noise. Apply them as written:
+
+- **UUIDs are unguessable.** A resource keyed by a random UUID does not need extra "validation" against enumeration — treat the UUID as the unguessable token it is.
+- **Environment variables and CLI flags are trusted inputs.** An attack that requires the attacker to already control an env var, a CLI argument, or operator-set config is NOT a valid finding — that attacker already owns the process.
+- **React/Angular/Vue are XSS-safe by default.** Only report XSS when user data flows through an explicit escape hatch: `dangerouslySetInnerHTML`, Angular `bypassSecurityTrustHtml`/`bypassSecurityTrustResourceUrl`, Vue `v-html`, or direct `innerHTML`/`document.write`. Normal interpolation is auto-escaped — not a finding.
+- **SSRF requires control of host/protocol, not just path.** If user input only appends a path segment to a fixed, trusted base URL, it is NOT SSRF. It counts only when the attacker can steer the host, port, or scheme.
+- **Client-side auth/permission checks are not vulnerabilities.** Missing or bypassable checks in browser/JS/mobile code are expected — the server is the authority. Report the SERVER-side missing check, never the client one.
+- **User content inside an AI/LLM system prompt is not itself a vulnerability.** Putting user text into a model prompt is the normal design. A finding requires a concrete downstream harm (the output is then `eval`'d, run as SQL, used to authorize an action, etc. — see A11).
+- **Logging URLs is safe; logging secrets/PII is a finding.** A logged request path or URL is fine. A logged password, token, API key, full card number, or regulated PII is a real finding.
+- **Memory-safety findings are invalid in memory-safe languages.** Do not report buffer overflows, use-after-free, or double-free in Rust (non-`unsafe`), Go, Java, C#, Python, or JS/TS — they apply to C/C++ and `unsafe` blocks only.
+- **Command/SQL injection requires a concrete untrusted-input path.** A `subprocess`/`exec`/`os.system` or raw query built ONLY from hardcoded strings, constants, or operator-controlled config is not injection. Report it only when you can name the untrusted source reaching the command/query.
+- **Generic "missing input validation" with no proven impact is not a finding.** Tie every validation gap to a concrete sink and exploit, or leave it out.
+
+## Phase 9: Security Posture Report
+
 ### Report Format
 
 ```
@@ -231,13 +300,13 @@ Do NOT report these common false positives:
 ## Executive Summary
 [2-3 sentences: overall security posture, highest-risk areas, most urgent actions]
 
-## Critical Findings (8/10+ confidence)
+## Critical Findings (HIGH / MEDIUM severity, confidence ≥ 0.70)
 
 ### [OWASP-CODE] Finding Title
-- **Severity:** CRITICAL / HIGH / MEDIUM
-- **Confidence:** [8-10]/10
+- **Severity:** HIGH / MEDIUM
+- **Confidence:** [0.70-1.00]  _(for 0.70-0.80, state the conditions the exploit requires)_
 - **Location:** `file:line`
-- **Description:** [What the vulnerability is]
+- **Description:** [What the vulnerability is, and — where relevant — how it DEVIATES from the project's own established secure pattern (Phase 5)]
 - **Exploit scenario:** [Concrete steps an attacker would take]
 - **Remediation:** [Specific fix with code suggestion]
 
@@ -259,8 +328,10 @@ Do NOT report these common false positives:
 
 ## Hard Rules
 - **READ-ONLY** — this command produces a report, never edits code
-- **8/10+ confidence gate** — do not report theoretical risks without concrete evidence in the code
+- **Two-stage detection** — never report a candidate straight from the OWASP/STRIDE pass; every finding must first survive the Phase 8 adversarial verification (re-read as a skeptic trying to disprove it)
+- **Two-axis gate** — score SEVERITY and CONFIDENCE independently; report only HIGH/MEDIUM severity with confidence ≥ 0.70, and never theoretical risks without concrete evidence in the code
 - **Exploit scenario required** — every finding must include "an attacker could..."
-- **No false positive categories** — apply the 17 exclusions above
+- **Apply exclusions AND precedent rulings** — the 17 exclusion categories plus the Precedent Rulings in Phase 8
+- **Flag deviations, not preferences** — prefer findings where code deviates from the project's own established secure patterns (Phase 5); code consistent with deliberate convention is not a finding
 - If `--diff` mode, only analyze files changed on the current branch vs main
 - Do not scan node_modules, vendor, dist, build, or __pycache__ directories

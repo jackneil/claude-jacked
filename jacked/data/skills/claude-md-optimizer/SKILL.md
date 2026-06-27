@@ -24,7 +24,9 @@ Sub-docs  = detailed reference loaded on-demand when relevant
 | Medium (20-100 files) | < 150 lines | 200 lines |
 | Large (100+ files) | < 200 lines | 250 lines |
 
-If CLAUDE.md exceeds the max, it MUST be restructured — not trimmed. Trimming loses information. Restructuring moves it to sub-docs.
+Lines are a proxy — **tokens are the real per-turn cost.** Measure them directly with `/context` (run it in the target repo). Anthropic's official guidance is **< 200 lines**; lean teams run ~60 lines / **< 500 tokens** (a verified 3,847 → 312-token cut = 91.9% reduction with no quality loss). Aim under the line budget above *and* as far under ~500 tokens as the project allows.
+
+If CLAUDE.md exceeds the max, it MUST be restructured — not trimmed. Trimming loses information. Restructuring moves it to sub-docs, path-scoped rules, or Skills.
 
 ## Workflow
 
@@ -34,7 +36,7 @@ Find all CLAUDE.md files and related documentation:
 
 ```bash
 # Find CLAUDE.md files
-find . -name "CLAUDE.md" -o -name ".claude.md" -o -name ".claude.local.md" 2>/dev/null | head -20
+find . -name "CLAUDE.md" -o -name "CLAUDE.local.md" 2>/dev/null | head -20
 
 # Find referenced docs (design guides, guardrails, workflows, etc.)
 grep -roh '\[.*\](.*\.md)' ./CLAUDE.md 2>/dev/null | sort -u
@@ -44,16 +46,24 @@ Read every file found. Map the full reference chain — which docs point to whic
 
 ### Phase 2: Measure
 
+Quantify in **tokens**, not just lines. Inside the target repo, run the built-in commands that expose the real cost:
+
+```
+/context   # per-turn context breakdown — shows what CLAUDE.md + rules actually cost
+/memory    # which memory/CLAUDE.md files are loaded and their sizes
+/usage     # token usage to date — confirms the per-turn overhead is real spend
+```
+
 For CLAUDE.md and every referenced doc, measure:
 
 ```
 File: ./CLAUDE.md
 Lines: XXX
-Chars: XXX (~XXX tokens at 1 token/4 chars)
+Tokens: XXX (from /context if available; else ~chars/4)
 Referenced docs: X files
 ```
 
-Calculate total per-turn token cost (CLAUDE.md only — sub-docs don't count since they load on-demand).
+Calculate total per-turn token cost. This counts CLAUDE.md **plus any `.claude/rules/*.md` without `paths:` frontmatter** (those load every turn too) — sub-docs and path-scoped rules don't count, since they load on-demand.
 
 ### Phase 3: Content Audit
 
@@ -63,11 +73,12 @@ Score CLAUDE.md on two dimensions: **Quality** and **Efficiency**.
 
 | Criterion | Points | What to check |
 |---|---|---|
-| **Commands present** | 10 | Are build/test/dev/lint commands documented and copy-paste ready? |
-| **Critical rules present** | 15 | Are security rules, workflow rules, and "never do X" guardrails in the main file? |
-| **Gotchas & non-obvious patterns** | 10 | Are project-specific quirks captured (not generic advice)? |
-| **Currency** | 10 | Do commands work? Do file references exist? Is tech stack current? |
-| **Actionability** | 5 | Are instructions concrete with real paths, not vague? |
+| **Commands present (with flags)** | 10 | Are build/test/dev/lint commands documented as exact copy-paste invocations *with their flags* (`uv run python -m pytest -q`, not "run the tests")? |
+| **Critical rules present** | 10 | Are security rules, workflow rules, and "never do X" guardrails in the main file? |
+| **Boundaries (Always / Ask-first / Never)** | 10 | Is there an explicit three-tier boundary block — Always-do, Ask-first, Never-do (never commit secrets, never edit vendor/generated dirs, never force-push) — plus escalation-when-blocked guidance? |
+| **Gotchas & non-obvious patterns** | 8 | Are project-specific quirks captured (not generic advice)? |
+| **Currency** | 7 | Do commands work? Do file references exist? Is the stack named with versions ("React 18 + TS + Vite", not "React project")? |
+| **Actionability & verifiability** | 5 | Are instructions concrete (real paths, no vague directives like "be careful"/"gracefully")? Do high-stakes rules carry a verification command or Definition of Done? |
 
 #### Efficiency Score (50 points)
 
@@ -78,6 +89,16 @@ Score CLAUDE.md on two dimensions: **Quality** and **Efficiency**.
 | **Strong pointer language** | 10 | Do cross-references use MANDATORY/REQUIRED language with trigger conditions? |
 | **No duplication across docs** | 10 | Is the same content repeated in multiple files? |
 | **Clean doc chain** | 5 | Is there a clear hierarchy with no circular or orphaned references? |
+
+#### Content-Quality Lint (weak rules)
+
+Vagueness — not length — is the #1 reason instruction files get ignored (studies across 2,500+ repos and 10+-run behavior tests). Flag every rule that trips these and dock the Quality score; they're the rule-level analog of the weak-pointer anti-patterns:
+
+- **Prose without a command** — a paragraph describing a workflow with no copy-paste invocation. One real command beats three paragraphs.
+- **Ambiguous directives** — "be careful", "gracefully", "where possible", "use good judgment". They mean nothing to an agent. Replace with a concrete, checkable action.
+- **Contradictory priorities without ordering** — competing rules ("move fast" vs "always add tests") with no explicit numbered precedence.
+- **Style rule with no enforcement command** — a style guide not backed by a formatter/linter invocation. Instructions without a verification command are suggestions, not rules.
+- **Command without flags** — "run the linter" instead of the exact `ruff check .` an agent can paste.
 
 #### Grades
 
@@ -96,6 +117,7 @@ Go through CLAUDE.md section by section and classify each:
 | Classification | Meaning | Action |
 |---|---|---|
 | **KEEP** | Needed on every turn regardless of task | Leave in CLAUDE.md |
+| **SCOPE** | A real rule, but only applies to files under a path | Move to `.claude/rules/<area>.md` with `paths:` frontmatter — auto-loads only when a matching file is touched |
 | **EXTRACT** | Only needed for specific task types | Move to sub-doc, add strong pointer |
 | **DEDUPE** | Same content exists in another doc | Remove from CLAUDE.md, ensure pointer exists |
 | **DELETE** | Stale, empty, or discoverable by tools | Remove entirely |
@@ -105,6 +127,7 @@ Go through CLAUDE.md section by section and classify each:
 - Reference doc pointers (the "read these" section)
 - Critical commands (dev server start/stop/health — NOT full install procedures)
 - Security rules and hard constraints ("never push to master", "always filter by org_id")
+- Boundaries — explicit three-tier **Always-do / Ask-first / Never-do** (never commit secrets, never edit vendor/generated dirs, never force-push) + escalation-when-blocked guidance (what to do instead of inventing a destructive workaround)
 - Business logic rules that affect every code change
 - Pre-commit / CI commands
 - Workflow rules (git flow, PR process)
@@ -121,11 +144,18 @@ Go through CLAUDE.md section by section and classify each:
 - Authentication flow details
 - CI/CD pipeline details
 
+**What belongs in SCOPE (path-specific rules → `.claude/rules/<area>.md`):**
+- Rules that only matter when editing one area ("in `src/api/**`, every endpoint must filter by `org_id`")
+- Per-language / style rules tied to a file glob (test-file conventions under `tests/**`, component conventions under a package)
+
+A rules file **without** `paths:` frontmatter loads every session like a second CLAUDE.md — no saving. **With** `paths:` (e.g. `paths: ["src/api/**/*.ts"]`) it loads only when a matching file is touched (documented ~41% always-loaded-overhead reduction). This is strictly better than a pointer for path-specific rules: it auto-loads instead of relying on Claude choosing to read the doc. For extracted *multi-step procedures*, prefer a **Skill** (progressive disclosure — 30-100 tokens at startup vs. loading the full doc).
+
 **What belongs in DELETE:**
 - Empty sections ("Known Issues: None")
 - Changelog entries older than 1-2 months
 - Content that duplicates what's in referenced docs
 - Generic advice not specific to this project
+- **Inference test:** anything Claude can infer from reading the codebase — or a senior dev could in ~20 min — cut it (framework-default conventions, generic stack facts, globbable directory structure)
 
 ### Phase 5: Quality Report
 
@@ -178,11 +208,12 @@ CLAUDE.md (XXX lines, loaded every turn)
 
 After user approval, execute the restructure:
 
-1. **Create sub-docs** — Extract content into well-organized reference files
-2. **Rewrite CLAUDE.md** — Keep only KEEP-classified content + pointer section
-3. **Add pointer section** — Centralized, strongly-worded reference section near the top
-4. **Fix cross-references** — Update all docs to point to correct locations
-5. **Deduplicate** — Remove any content that now lives in two places
+1. **Create sub-docs** — Extract EXTRACT content into well-organized reference files
+2. **Create path-scoped rules** — Move SCOPE rules into `.claude/rules/<area>.md`, each with `paths:` frontmatter so it auto-loads only for matching files; move multi-step procedures into a Skill
+3. **Rewrite CLAUDE.md** — Keep only KEEP-classified content + pointer section
+4. **Add pointer section** — Centralized, strongly-worded reference section near the top
+5. **Fix cross-references** — Update all docs to point to correct locations
+6. **Deduplicate** — Remove any content that now lives in two places
 
 #### Pointer Language Patterns
 
@@ -240,16 +271,24 @@ project/
 +-- FEEDBACK_WORKFLOW.md   # Operational procedures
 ```
 
+#### Mechanics — free wins and one myth
+
+- **HTML comments are stripped before injection.** `<!-- note to teammates -->` costs zero runtime tokens — use it for human-only notes inside CLAUDE.md.
+- **`@path` imports are organizational only.** Splitting CLAUDE.md into `@docs/foo.md` imports does **not** save tokens — every imported file still loads at session start. Use imports for editing ergonomics, not budget. To actually defer load, use path-scoped rules (`.claude/rules/`) or Skills.
+- **`CLAUDE.local.md` (gitignored)** holds personal / machine-specific prefs so they never bloat the shared, committed CLAUDE.md.
+
 ### Phase 7: Verify
 
 After restructuring:
 
 1. **Line count check** — Is CLAUDE.md within budget?
-2. **Pointer check** — Does every referenced file exist?
-3. **Chain check** — No circular references, no orphaned docs?
-4. **Content check** — Was any content lost (not in CLAUDE.md or any sub-doc)?
-5. **Strength check** — Does every pointer use MANDATORY/REQUIRED language?
-6. **Duplication check** — Is any content repeated across files?
+2. **Token delta** — Re-run `/context` and report before/after **tokens** (not just lines) and the % reduction. Confirm no `.claude/rules/*.md` lost its `paths:` frontmatter (or it's now always-loaded).
+3. **Pointer check** — Does every referenced file exist?
+4. **Chain check** — No circular references, no orphaned docs?
+5. **Content check** — Was any content lost (not in CLAUDE.md, a sub-doc, a rules file, or a Skill)?
+6. **Strength check** — Does every pointer use MANDATORY/REQUIRED language?
+7. **Duplication check** — Is any content repeated across files?
+8. **Recite test** — In a fresh context, ask Claude to reproduce the build/test commands and the top 3 constraints verbatim. If it can't, the file is still too verbose or too vague — iterate.
 
 ```bash
 # Verify all referenced docs exist
@@ -283,13 +322,20 @@ grep -n 'See\|refer to\|check\|for more' CLAUDE.md | grep -iv 'MUST\|MANDATORY\|
 **Symptom:** Multiple docs exist but CLAUDE.md doesn't point to them.
 **Fix:** Add the centralized pointer section. Organize by trigger condition.
 
+## AGENTS.md Interop
+
+If the repo or team also uses other agent tools (Codex, Cursor, Copilot, Windsurf, Amp), don't hand-maintain a second instruction file — it silently drifts from CLAUDE.md, which is exactly the duplication this skill exists to kill. `AGENTS.md` is a Linux-Foundation standard read by 30+ tools. Treat it as the **canonical source** for shared sections and have CLAUDE.md mirror or `@AGENTS.md`-import them, so there's one source of truth instead of two diverging copies.
+
 ## What Makes an A-Grade CLAUDE.md
 
-- Under token budget for project size
+- Under token budget for project size — verified in **tokens** via `/context`, not just line count
 - Every line is a rule, a command, or a strong pointer — no reference material
+- Explicit three-tier **boundaries** (Always / Ask-first / Never) + escalation-when-blocked
+- All commands copy-paste ready, **with their flags**
+- Path-specific rules live in `.claude/rules/*.md` with `paths:` frontmatter (auto-load), not inlined; multi-step procedures live in Skills
+- No vague directives — every high-stakes rule has a verification command / Definition of Done
 - Centralized pointer section with MANDATORY/REQUIRED language
 - Sub-docs organized by trigger condition (always, when UI, when task-specific)
 - No duplication across files
-- All commands copy-paste ready
 - All pointers resolve to existing files
 - Clean hierarchy: main file -> coding rules -> domain guides -> component references

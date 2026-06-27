@@ -46,28 +46,49 @@ User asking for final verification
 **AMBIGUOUS/UNCLEAR indicators:**
 If conversation has signals from multiple phases or no clear signals at all, do NOT guess. Ask the user: "I can't tell what phase you're in. What would you like me to review?" and offer the options (planning, implementation, post-implementation, grill mode).
 
-## REVIEW LENSES (shared with /dcr)
+## REVIEW LENSES (dc's set — overlaps /dcr)
 
 Two categories: **required** (always reviewed) and **optional** (select based on relevance to the changes).
 
 ### Required (always included)
 | # | Lens | Focus Areas |
 |---|------|-------------|
-| 1 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
+| 1 | **Intent & Requirements** | Does the diff do what it was SUPPOSED to do? Code-vs-intent gaps, missing requirements, NEGATIVE requirements (what it must NEVER do / impossible states / data that must never be exposed), missing authorization (CWE-862), unspecified trust boundaries |
+| 2 | **Guardrails** | Project conventions (from discovered context files), file sizes, naming, structure |
 
 ### Optional (select based on relevance)
 | # | Lens | Focus Areas |
 |---|------|-------------|
-| 2 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
-| 3 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
-| 4 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
-| 5 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
-| 6 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
-| 7 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
-| 8 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
-| 9 | **Simplicity & Reuse** | Redundant logic, reinvented utilities, over-engineering, premature abstraction |
-| 10 | **Observability & Debuggability** | Error context preservation, silent failure detection, structured logging adequacy, correlation/tracing, alertability |
-| 11 | **Data Integrity & Schema Safety** | Transaction boundaries, migration rollback safety, schema-code coupling, cache invalidation, idempotency, partial write recovery |
+| 3 | **Security** | Auth bypass, injection, IDOR, data exposure, secrets, input validation |
+| 4 | **Access Control** | RBAC, permissions, org/tenant isolation, cross-tenant leaks |
+| 5 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
+| 6 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
+| 7 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
+| 8 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
+| 9 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
+| 10 | **Simplicity & Reuse** | Redundant logic, reinvented utilities, over-engineering, premature abstraction |
+| 11 | **Observability & Debuggability** | Error context preservation, silent failure detection, structured logging adequacy, correlation/tracing, alertability |
+| 12 | **Data Integrity & Schema Safety** | Transaction boundaries, migration rollback safety, schema-code coupling, cache invalidation, idempotency, partial write recovery |
+
+### Intent & Requirements lens (required — the half structural review misses)
+
+Structural/pattern review plateaus at ~50-60% of bugs (NIST SATE; Charoenwet et al. ISSTA 2024 — 22% of vuln commits undetected). The other half are **intent violations**: structurally perfect code that does the wrong thing — including the single most dangerous security class, CWE-862 Missing Authorization. NO other lens here can catch these, because every other lens reviews the code as written. Run this lens in two passes so the model never holds the whole behavioral surface at once:
+
+1. **Contract discovery (read-only, write nothing yet)** — Derive the intended behavior from the conversation, the plan/spec/ADR files, commit messages, and CLAUDE.md/AGENTS.md. List the contracts: what each changed unit is supposed to do, its inputs/outputs, its callers, and its trust boundaries.
+2. **Requirement verification** — For each discovered contract, check the resolved diff actually satisfies it. Flag any place the code is structurally correct but does the wrong thing, drifts from the stated intent, or silently drops a stated requirement.
+
+**NEGATIVE-REQUIREMENTS sub-check (do this every time):** explicitly write down (a) what this code must NEVER do, (b) which states must be impossible, and (c) which data must never be exposed — then verify the diff actually enforces each. Missing authorization / an unspecified-but-required trust boundary is the canonical finding: an endpoint that returns the right data but never checks the caller is allowed to see it passes every structural lens and fails here.
+
+## SCOPE RESOLUTION
+
+Before anything else, resolve a CONCRETE diff to review. Phase detection tells you HOW to review; this tells you WHAT. Never rely on "infer from recent conversation" alone — in a fresh or context-compacted session that heuristic silently degrades and you can review the wrong thing or nothing. Walk this ladder and stop at the first match:
+
+1. **User-specified scope** in `$ARGUMENTS` — an explicit branch, SHA, PR number, or path(s). Resolve to a diff (`git diff <base>...<head>`, `git show <sha>`, `gh pr diff <n>`, or scope the review to the named paths).
+2. **Feature branch** — if on a branch other than the default, diff against it: `git diff $(git remote show origin | sed -n 's/.*HEAD branch: //p')...HEAD` (fall back to `git diff main...HEAD`, then `git diff master...HEAD`).
+3. **Staged changes** — if not on a feature branch but changes are staged: `git diff --staged`.
+4. **Last commit** — otherwise review the last commit: `git show HEAD`.
+
+Announce the resolved scope ("Reviewing branch X (42 files vs main)" / "Reviewing staged changes" / "Reviewing HEAD: <subject>"). Feed the resolved diff to EVERY reviewer (main, pre-mortem, and any multi-thread reviewers) as a `## REVIEW SCOPE` section — recent conversation and file activity AUGMENT this concrete target, they do not replace it. If the ladder yields an empty diff (nothing staged, no branch divergence, HEAD already reviewed), say so and ask the user what to review rather than reviewing nothing.
 
 ## PRE-REVIEW CONTEXT DISCOVERY
 
@@ -88,6 +109,20 @@ Before spawning any reviewer, discover and read project convention files. Use Gl
 
 Read everything found. Include the contents as a `## PROJECT CONTEXT` section in every reviewer prompt. For the Guardrails lens, the reviewer must cite specific rule violations with the rule text and file:line of the violation.
 
+## DETERMINISM GATE (Build & Test) — runs BEFORE the reasoning lenses
+
+Every other lens is an LLM reasoning agent that can be wrong. This gate is the 13th lens and the only deterministic one: it runs the project's real tooling and reports GROUND TRUTH, so the dispatcher can never bless code that doesn't compile or whose tests fail. Skip it ONLY for the PLANNING phase (no code to build yet) and GRILL mode.
+
+Before spawning the reasoning reviewers, on the changed files from the resolved scope:
+
+1. **Type-check / compile** — run the project's checker (e.g. `tsc --noEmit`, `mypy`, `cargo check`, `go build ./...`). Use the repo's configured command from package.json/pyproject/Makefile/CI when present.
+2. **Lint / static diagnostics** — run the configured linter on the changed files (e.g. `eslint`, `ruff check`, `biome lint`, `golangci-lint`).
+3. **Tests** — run the project's test command, scoped to the changed area when the runner supports it (e.g. `pytest <paths>`, `npm test`, `go test ./...`). Honor any test convention in the project's CLAUDE.md (e.g. a repo may mandate `uv run python -m pytest` over bare `python -m pytest`).
+
+Discover commands from `.github/workflows/*.yml`, `package.json` scripts, `Makefile`, `pyproject.toml`, or the project context files — DO NOT invent them. If a tool genuinely isn't configured for this repo, record "not configured" for that step and move on; do not fabricate a pass.
+
+Feed every failure into the merge step as a finding: a failing type-check or compile is **CRITICAL**, a failing test is **CRITICAL**, a lint/diagnostic error is **MEDIUM** (warnings are LOW). **A clean pass is impossible while the type-checker, compiler, or tests are failing** — the verdict is NEEDS WORK regardless of what the reasoning lenses conclude.
+
 ## SPAWNING INSTRUCTIONS
 
 Once you detect the phase, use the Task tool to spawn double-check-reviewer with these specific instructions:
@@ -95,7 +130,8 @@ Once you detect the phase, use the Task tool to spawn double-check-reviewer with
 ### FOR PLANNING PHASE:
 Review this plan with ultrathink depth. Ralph Wiggum style - appear simple but catch everything.
 
-Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the planning perspective:
+Intent & Requirements and Guardrails are always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the planning perspective:
+- Intent & Requirements: Does the design actually deliver what was asked? What NEGATIVE requirements (must-never-do / impossible states / never-exposed data) does the plan leave unenforced? Is any trust boundary or authorization requirement unstated?
 - Security/Access Control: Are auth and isolation designed correctly?
 - Logic & Edge Cases: What edge cases aren't addressed in the design?
 - UX & Flow: Does the user journey make sense? Error feedback planned?
@@ -109,7 +145,8 @@ STOP CONDITION: ALL applicable lenses must pass clean. If ANY fix is made, reset
 ### FOR IMPLEMENTATION PHASE:
 Review recent code changes with ultrathink depth. Ralph Wiggum style - innocent questions that expose real issues.
 
-Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the implementation perspective:
+Intent & Requirements and Guardrails are always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the implementation perspective:
+- Intent & Requirements: Derive the intended behavior (conversation, plan/spec/ADR, commit messages, CLAUDE.md), then check the diff against it — flag structurally-correct code that does the wrong thing. Run the NEGATIVE-REQUIREMENTS sub-check: list what this must NEVER do / which states must be impossible / which data must never be exposed, then verify the diff enforces each. Missing authorization (CWE-862) is the canonical finding.
 - Security: Auth bypass? Injection? IDOR? Input validation?
 - Access Control: Every endpoint checks permissions? Multi-role handled?
 - Logic & Edge Cases: Empty states, nulls, timeouts, concurrent edits, max limits?
@@ -125,15 +162,18 @@ STOP CONDITION: ALL applicable lenses pass clean. Any fix resets pass tracker.
 Verify this implementation with ultrathink depth. Ralph Wiggum style - the innocent question that breaks everything.
 
 Checklist (ALL must pass):
-[ ] Original issue solved
+[ ] Original issue solved — code does what it was SUPPOSED to do, not just what it does cleanly
+[ ] Negative requirements enforced (must-never-do / impossible states / never-exposed data)
 [ ] Auth/RBAC correct (test as each role type, including multi-role if supported)
 [ ] Org isolation intact (no cross-tenant data access possible)
 [ ] Error paths handled
 [ ] UX coherent (web + mobile if applicable)
 [ ] No perf regressions
 [ ] Tests added/updated
+[ ] Determinism gate green (type-check/compile + lint + tests pass)
 
-Guardrails is always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the verification perspective:
+Intent & Requirements and Guardrails are always required. Select other lenses based on what's being reviewed — skip lenses that clearly don't apply to this specific review. For each selected lens, apply it through the verification perspective:
+- Intent & Requirements: Does the code do what it was SUPPOSED to do, not just what it does cleanly? Verify each NEGATIVE requirement (must-never-do / impossible states / never-exposed data) is actually enforced — an endpoint returning correct data without checking the caller is allowed to see it passes every other lens and fails here.
 - Security/Access Control: Auth, RBAC, org isolation all solid?
 - Logic & Edge Cases: What assumptions might be wrong?
 - UX & Flow: What would confuse someone seeing this first time?
@@ -228,42 +268,49 @@ The pre-mortem agent spawns once (cycle 1 only). Its findings merge with the mai
 
 ## EXECUTION FLOW
 
-1. Announce detected phase and reasoning
-2. **Discover project context** using PRE-REVIEW CONTEXT DISCOVERY above. Announce what was found.
-3. Identify if multiple threads are needed
-4. Spawn TWO reviewers in parallel (one message, two Task calls):
-   a. **Main reviewer**: double-check-reviewer with phase-appropriate instructions + discovered context
-   b. **Pre-mortem analyst**: double-check-reviewer with pre-mortem instructions from the PRE-MORTEM ANALYST section above, with 2-3 shuffled failure scenarios + discovered context
-5. If the main review needs additional threads (multi-domain), spawn those too — the pre-mortem agent is always additive
-6. When ALL reviewer results come back (main + pre-mortem), merge findings and evaluate:
-   - If **no CRITICAL or MEDIUM issues** → report clean pass. Done.
-   - If **CRITICAL or MEDIUM issues found** → proceed to step 7
+1. **Resolve scope** using the SCOPE RESOLUTION ladder above. Announce the concrete diff being reviewed.
+2. Announce detected phase and reasoning
+3. **Discover project context** using PRE-REVIEW CONTEXT DISCOVERY above. Announce what was found.
+4. **Run the DETERMINISM GATE** (Build & Test) on the resolved scope — skip only for PLANNING phase and GRILL mode. Announce results. Carry any failures forward as findings (failing type-check/compile/tests → CRITICAL; lint errors → MEDIUM).
+5. Identify if multiple threads are needed
+6. Spawn TWO reviewers in parallel (one message, two Task calls). Pass the resolved diff (`## REVIEW SCOPE`) and discovered context to each:
+   a. **Main reviewer**: double-check-reviewer with phase-appropriate instructions + scope + discovered context
+   b. **Pre-mortem analyst**: double-check-reviewer with pre-mortem instructions from the PRE-MORTEM ANALYST section above, with 2-3 shuffled failure scenarios + scope + discovered context
+7. If the main review needs additional threads (multi-domain), spawn those too — the pre-mortem agent is always additive
+8. When ALL reviewer results come back (main + pre-mortem), merge them with the determinism-gate findings and emit a **VERDICT**:
+   - **READY** — no CRITICAL/MEDIUM findings and the determinism gate is green. Suggestions (LOW) optional. Report clean pass. Done.
+   - **NEEDS ATTENTION** — MEDIUM findings or important suggestions, but no CRITICAL and the gate is green. Proceed to the findings step.
+   - **NEEDS WORK** — any CRITICAL, or the determinism gate is failing (type-check/compile/tests red). Proceed to the findings step.
 
-### Step 7: Handle findings (phase-dependent)
+   **Output discipline:** collapse every CLEAN lens to a single one-line summary (`Performance — clean`); never emit a wall of per-lens prose on an all-clean run. Spend the prose only on lenses with findings. Rank suggestion-level (LOW) findings by **impact × effort** so the list is triageable. The VERDICT maps onto the existing CRITICAL/MEDIUM/LOW gate and onto downstream commands (/pr, /land-and-deploy).
+
+   If the verdict is READY → done. Otherwise → proceed to step 9 (Handle findings).
+
+### Step 9: Handle findings (phase-dependent)
 
 **PLANNING PHASE** — fix the plan directly:
 - Edit the plan file to address each CRITICAL/MEDIUM finding. Summarize what you changed.
 - LOW issues: Report them but do NOT block the loop for LOWs.
-- Proceed to step 8 (re-verify).
+- Proceed to step 10 (re-verify).
 
 **IMPLEMENTATION / POST-IMPLEMENTATION PHASE** — document findings, then create and review a fix plan:
 
 Do NOT fix code directly. Instead, follow this pipeline:
 
-7a. **Document all findings** — Compile a structured summary of every CRITICAL and MEDIUM issue from both the main reviewer and pre-mortem analyst. Include file:line references, severity, and a one-line description of each. LOW issues are listed but marked as non-blocking.
+9a. **Document all findings** — Compile a structured summary of every CRITICAL and MEDIUM issue from the main reviewer, the pre-mortem analyst, and the determinism gate. Include file:line references, severity, and a one-line description of each. LOW issues are listed but marked as non-blocking.
 
-7b. **Create a fix plan** — Invoke the `superpowers:writing-plans` skill, passing the documented findings as the spec. The plan should turn each CRITICAL/MEDIUM finding into a concrete task with tests and code. **Save as HTML, not Markdown.** Start from `~/.claude/jacked-templates/plan-template.html` and write to `docs/superpowers/plans/YYYY-MM-DD-<feature>-fixes.html`. Explicitly tell the sub-skill: "Output the plan as HTML using the jacked template — do not produce Markdown."
+9b. **Create a fix plan** — Invoke the `superpowers:writing-plans` skill, passing the documented findings as the spec. The plan should turn each CRITICAL/MEDIUM finding into a concrete task with tests and code. **Save as HTML, not Markdown.** Start from `~/.claude/jacked-templates/plan-template.html` and write to `docs/superpowers/plans/YYYY-MM-DD-<feature>-fixes.html`. Explicitly tell the sub-skill: "Output the plan as HTML using the jacked template — do not produce Markdown."
 
-7c. **Review the fix plan** — Re-enter this skill's PLANNING PHASE review: spawn a double-check-reviewer with planning-phase instructions to review the fix plan. If the plan review finds issues, fix the plan and re-review until the plan passes clean.
+9c. **Review the fix plan** — Re-enter this skill's PLANNING PHASE review: spawn a double-check-reviewer with planning-phase instructions to review the fix plan. If the plan review finds issues, fix the plan and re-review until the plan passes clean.
 
-7d. **Present the reviewed plan** — Show the user the plan with a summary of what it addresses. Wait for the user to approve execution before proceeding. Do NOT auto-execute the plan.
+9d. **Present the reviewed plan** — Show the user the plan with a summary of what it addresses. Wait for the user to approve execution before proceeding. Do NOT auto-execute the plan.
 
-### Step 8: Re-verify (planning phase only)
+### Step 10: Re-verify (planning phase only)
 
-This step applies only when step 7 fixed a plan directly (PLANNING PHASE):
+This step applies only when step 9 fixed a plan directly (PLANNING PHASE):
 
-8. **Re-spawn the main double-check-reviewer only** (NOT the pre-mortem agent — it's one-shot) with the same phase instructions + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Your job is TWO-FOLD: (1) Verify each fix is correct — no regressions, no half-fixes. (2) Do a FULL fresh review as if seeing this for the first time. Prior waves found issues, so there may be adjacent problems that were missed. Do NOT limit your scope to verifying prior fixes."
-9. **Repeat from step 6** until the reviewer returns clean (no CRITICAL/MEDIUM).
-10. Report final clean pass with a summary of all cycles.
+10. **Re-spawn the main double-check-reviewer only** (NOT the pre-mortem agent — it's one-shot) with the same phase instructions + scope + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Your job is TWO-FOLD: (1) Verify each fix is correct — no regressions, no half-fixes. (2) Do a FULL fresh review as if seeing this for the first time. Prior waves found issues, so there may be adjacent problems that were missed. Do NOT limit your scope to verifying prior fixes."
+11. **Repeat from step 8** until the reviewer returns READY (no CRITICAL/MEDIUM and the determinism gate green).
+12. Report final clean pass with a summary of all cycles.
 
 HARD RULE: Do NOT stop the loop early. Do NOT skip re-verification. Do NOT ask the user "should I continue?" — the answer is always yes for planning-phase fix loops. For implementation-phase findings, the pipeline produces a reviewed plan and waits for user approval. If the user's project or global CLAUDE.md specifies a wave/cycle cap, respect it.

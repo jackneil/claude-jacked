@@ -155,6 +155,21 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
     Your failure scenarios: [SCENARIO 1], [SCENARIO 2], [SCENARIO 3]
 
     You are READ-ONLY. Report findings but do NOT edit files. Include file paths and line numbers."
+11. **Evidence requirement** (always): "Every CRITICAL or MEDIUM finding you report MUST include (a) the exact `file:line`, (b) the concrete trigger — the specific input, state, or call path that produces the failure — and (c) one sentence on why it is wrong. If you cannot point to the specific code path that exhibits the problem, do NOT report it as CRITICAL/MEDIUM — downgrade it to LOW or drop it. No evidence, no report."
+12. **Exclusions (always)**: Include the full `## DO NOT FLAG` list (below) verbatim in every reviewer prompt. Those items are out of scope at every severity — reporting them erodes trust and triggers wasted fix waves.
+
+## DO NOT FLAG
+
+Inject this exclusion list into every reviewer prompt (item 12 above). It is the primary signal-to-noise control — **false positives erode trust and trigger wasted fix waves** in the recursive loop. Do NOT report, at any severity:
+
+- **Pre-existing issues** not introduced or touched by the change under review. Review the delta, not the whole codebase.
+- **Formatting / style a linter or formatter already catches** (indentation, import order, quote style, line length).
+- **Pedantic nitpicks** a senior engineer would wave through in review.
+- **Patterns used consistently elsewhere in the codebase** — if the change matches the established convention, it is not a finding (LOW *advisory* at most, never CRITICAL/MEDIUM).
+- **Rules explicitly silenced inline** (e.g. `# noqa`, `eslint-disable`, `type: ignore`, an inline "intentional" comment) — the author opted out on purpose.
+- **Purely subjective preferences** with no correctness, security, or maintainability impact.
+
+If you are not certain an issue is real, do not flag it. When genuinely torn on severity, downgrade rather than inflate.
 
 ## EXECUTION FLOW
 
@@ -333,6 +348,17 @@ Announce format (always):
 - Pre-Mortem Analyst: [2-3 failure scenarios from pool]
 ```
 
+#### CONDITIONAL: Deterministic Diagnostics (POST-IMPLEMENTATION only)
+
+If phase is POST-IMPLEMENTATION, gather deterministic ground truth in Wave 1 — cheap, deterministic signal that complements the probabilistic lenses and catches type/import/test breakage the LLM may rationalize away:
+
+- **Detect the toolchain** from the repo (e.g. ruff/flake8/mypy/pyright for Python; eslint/tsc/biome for JS/TS — honor the config files found in step 3a) and the test runner. **Honor project CLAUDE.md rules for HOW to invoke them** (e.g. `uv run python -m pytest`, never bare `python -m pytest`).
+- **Run** the linter + type-checker on the CHANGED files and run the relevant/affected tests. Capture pass/fail and the concrete error output.
+- **Inject** the results as a `## DETERMINISTIC DIAGNOSTICS — ground truth` block into every reviewer's prompt (alongside PROJECT_CONTEXT). A failure here is already a confirmed finding — its evidence is the tool output — so it enters the FIX PHASE directly and does not need FINDING VALIDATION (step 8b).
+- **Skip gracefully** if no toolchain/test runner is detected, or the project can't be built/run in this environment: note "Diagnostics: no toolchain detected — skipped" and proceed with the LLM lenses only. Do NOT fabricate diagnostics.
+
+Run this as a parent pre-step (you run the tools before spawning the wave) or as one dedicated READ-ONLY subagent that only collects and reports diagnostics. Either way it runs once in Wave 1 — it does NOT re-spawn per wave. In the FIX PHASE, re-run the failing linter/tests yourself after applying fixes to confirm they pass.
+
 #### CONDITIONAL: UX & Flow Discoverability Sub-checklist
 
 If any reviewer in this wave is assigned the **UX & Flow** lens, append the following block
@@ -353,11 +379,22 @@ to their Lens details (item 3) in the spawn prompt:
 
 8. **Wait** for all results.
 
+### FINDING VALIDATION (gate before fixing)
+
+8b. **Validate every CRITICAL/MEDIUM finding before it enters the fix phase.** Reviewers are probabilistic — an unvalidated false positive makes you edit working code, which can introduce a regression and spawn another wave (the most expensive failure mode in a recursive loop, worse than in a single-pass reviewer). So for each CRITICAL/MEDIUM finding, confirm it is REAL against the actual code:
+   - **Cited location exists** — open the claimed `file:line`; the code it describes is actually there.
+   - **Trigger path is real** — the input/state/call path the reviewer cited actually occurs (the "undefined variable" is genuinely undefined here; the race window genuinely exists; the N+1 genuinely fires).
+   - **Rule is in-scope and violated** — for a Guardrails/CLAUDE.md finding, the cited rule actually applies to this file and is genuinely broken, not silenced inline.
+   - The evidence each reviewer already attached (item 11) makes this fast. For a large wave you MAY dispatch one cheap READ-ONLY validation subagent per finding, asking only: "is this finding real — yes/no — with the confirming or refuting code." Keep writing and validation separate (don't let the reviewer that raised it grade its own finding).
+   - **Drop any finding you cannot confirm.** Record dropped findings in the final report as "unconfirmed — not actioned" with the reason. Never fix a finding you could not validate.
+   - LOW findings skip validation (they don't trigger fixes anyway).
+   Mirrors Anthropic's per-finding validation pass and dev.to's Gate 5: confirm before acting.
+
 ### FIX PHASE (sequential, you the parent)
 
-9. **Read** all reports (lens reviewers + pre-mortem analyst + frontend if applicable). For each lens across all reports:
-   - **Clean** (no CRITICAL/MEDIUM) → move lens to `covered`
-   - **CRITICAL/MEDIUM found** → add findings to list
+9. **Read** all reports (lens reviewers + pre-mortem analyst + frontend if applicable). For each lens across all reports, using only the findings that survived FINDING VALIDATION (step 8b):
+   - **Clean** (no *validated* CRITICAL/MEDIUM — a lens whose only findings were dropped as unconfirmed counts as clean) → move lens to `covered`
+   - **Validated CRITICAL/MEDIUM** → add findings to list
    - **LOW issues** → report them but do NOT block progress
 10. **If findings exist**:
     - Apply all fixes holistically (you see the full picture across all reports)
@@ -378,6 +415,11 @@ to their Lens details (item 3) in the spawn prompt:
 
 ### REPORTING
 
+Every report ends with one crisp **Verdict** a human or an autonomous agent (/bhag, /goal-maker) can branch on, plus a one-sentence next step:
+- **Ready to Merge** — all selected lenses clean, zero confirmed CRITICAL/MEDIUM open. Next step: commit / open the PR.
+- **Needs Attention** — clean of CRITICAL/MEDIUM, but advisory LOW or unconfirmed items remain. Next step: glance at them; merge if cheap-or-irrelevant, otherwise fix first.
+- **Needs Work** — wave cap reached with confirmed CRITICAL/MEDIUM still open. Next step: re-run /dcr or fix the listed issues manually before merging.
+
 16. **Report clean pass**:
     ```
     ## DCR Clean Pass ✓
@@ -396,9 +438,12 @@ to their Lens details (item 3) in the spawn prompt:
       ⊘ Data Integrity & Schema Safety — skipped (not relevant)
     **Frontend design:** ✓ Reviewed (N findings) / ⊘ Skipped
     **Pre-mortem analysis:** ✓ [N] scenarios analyzed ([N] findings)
+    **Diagnostics:** ✓ lint/type/tests green ([N] tests) / ⊘ no toolchain detected — skipped / n/a (not POST-IMPLEMENTATION)
     **Issues found and fixed:** [count] ([which lenses/pre-mortem])
+    **Unconfirmed findings (not actioned):** [list with reason, or "none"]
     **Context sources:** [list of discovered files]
-    **Final verdict:** All selected lenses passed clean.
+    **Verdict:** Ready to Merge — all selected lenses clean, no confirmed CRITICAL/MEDIUM. (If advisory LOW/unconfirmed items remain, report **Needs Attention** instead and list them.)
+    **Next step:** [one sentence — e.g. "Commit and open the PR." or "N LOW items remain; merge if cheap-or-irrelevant, else address first."]
 
     A clean DCR pass subsumes /dc — no separate /dc needed before committing.
     ```
@@ -410,8 +455,8 @@ to their Lens details (item 3) in the spawn prompt:
     **Covered:** [list of covered lenses]
     **Still failing:** [list of lenses still in needs_recheck with latest issues]
     **Summary:** [what was fixed vs what remains]
-
-    Re-run /dcr to continue, or address remaining issues manually.
+    **Verdict:** Needs Work — wave cap reached with confirmed CRITICAL/MEDIUM still open.
+    **Next step:** Re-run /dcr to continue, or fix the listed issues manually before merging.
     ```
 
 ## HARD RULES

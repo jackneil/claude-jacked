@@ -149,14 +149,18 @@ Before creating or updating a PR, check code quality:
 **Case C: Has commits, no existing PR**
 - Analyze all commits and changes
 - Search issues for matches based on changed files and commit messages
+- **Decide ready-for-review vs draft** using the draft heuristic (see PHASE 4, step 0). If the work looks in-progress, offer a `--draft` PR instead of a ready one.
 - Offer to create new PR
 - If user confirms, proceed to PR creation
 
 **Case D: Has commits, existing PR exists**
 - Show existing PR details
+- **Report CI/check health** (PHASE 6) — never just confirm a PR exists; tell the user whether it's green, red, or pending
+- **Triage open review comments and review decision** (PHASE 5.5) — unresolved reviewer threads are the dominant reason an existing PR needs attention, not a stale description
+- **Check mergeability** (`mergeable` / `mergeStateStatus`) — warn on conflicts or a branch that's behind base
 - Check if new commits were added since PR creation
-- Offer to update PR description with new changes
-- If user confirms, update the PR
+- Offer to update PR description with new changes, address review threads, and/or rebase as needed
+- If user confirms, take the chosen action
 
 ### PHASE 3: ISSUE ANALYSIS
 For PR creation/updates, intelligently search for related issues:
@@ -178,6 +182,21 @@ Be aggressive about linking issues - better to suggest too many than miss one.
 
 When creating a new PR:
 
+0. **Pre-flight: push-state, freshness, and draft decision** (before composing anything)
+   - **Verify the branch is actually pushed and in sync with its remote.** `gh pr create` on an unpushed or stale branch is a routine failure — pre-empt it:
+     ```bash
+     git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null   # does an upstream exist?
+     git rev-list --left-right --count @{u}...HEAD 2>/dev/null          # behind<TAB>ahead vs upstream
+     ```
+     - **No upstream** → branch was never pushed. Offer (with confirmation) `git push -u origin $(git branch --show-current)` before creating the PR.
+     - **ahead > 0** → local commits aren't on the remote. Push them (confirm first) or the PR will be missing commits.
+     - **behind > 0** → remote has commits you don't. Pull/rebase as appropriate before creating.
+   - **Draft heuristic** — suggest a draft PR when the work looks in-progress, otherwise create ready-for-review:
+     - Commit messages signal WIP (`wip`, `WIP`, `tmp`, `fixup!`, `squash!`, `do not merge`)
+     - Local tests or lint (PHASE 1.5) are still failing
+     - The user signalled "early feedback", "draft", or "not ready yet"
+     If any apply, pass `--draft`. Always let the user override the verdict.
+
 1. **Analyze all commits** (not just the last one!)
    - Read every commit message on the branch
    - Understand the full scope of changes
@@ -186,7 +205,12 @@ When creating a new PR:
    - Use `git diff main...HEAD` to see what actually changed
    - Understand the technical details
 
-3. **Generate comprehensive PR description**:
+3. **Detect and honor repo conventions** (adapt to the repo, don't only impose ours):
+   - **PR template** — if `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or a `.github/PULL_REQUEST_TEMPLATE/` directory exists, read it and use its required sections as the skeleton for the body. Our Summary/Changes/Fixed Issues/Test Plan structure layers on top of — does not replace — the template's mandatory sections.
+   - **CODEOWNERS** — if `.github/CODEOWNERS`, `CODEOWNERS`, or `docs/CODEOWNERS` exists, match the changed paths against its patterns and propose the owners as `--reviewer` (strip the leading `@`; skip yourself). Confirm before assigning.
+   - **Conventional Commits** — inspect recent history (`git log --oneline -20`) for a `type(scope): subject` pattern (`feat`, `fix`, `chore`, `docs`, `refactor`, `test`, etc.). If the repo clearly uses it, format the PR title the same way (e.g. `fix(auth): reject expired tokens`) and detect the scope from the changed paths. If the repo does NOT use it, keep the freeform style below — don't impose a convention the repo doesn't follow.
+
+4. **Generate comprehensive PR description** (seeded by the template if one exists):
    ```markdown
    ## Summary
    [2-3 sentences explaining WTF this PR does and why it matters]
@@ -209,13 +233,14 @@ When creating a new PR:
    Co-Authored-By: Claude <noreply@anthropic.com>
    ```
 
-4. **Follow the user's tone requirements**:
+5. **Follow the user's tone requirements**:
    - User has a "foul mouth and hates computers"
    - Tone should be rude and use subtle profanity
    - Be a bit of an asshole (but still informative)
    - Examples: "Finally fixed this goddamn bug", "This bullshit was broken because...", "Had to unfuck the validation logic"
+   - Apply the tone in the prose; never strip out a template's required sections to make room for it.
 
-5. **Create PR with proper formatting**:
+6. **Create PR with proper formatting** (add `--draft` and `--reviewer` per steps 0 and 3 when applicable):
    ```bash
    gh pr create --title "Concise title summarizing the shit we did" --body "$(cat <<'EOF'
    [PR description from above]
@@ -223,7 +248,9 @@ When creating a new PR:
    )"
    ```
 
-6. **Return the PR URL** so user can see it
+7. **Verify mergeability and report CI health** immediately after creation (see PHASE 6) — don't hand back a PR without telling the user whether it's mergeable and whether its checks are green.
+
+8. **Return the PR URL** so user can see it
 
 ### PHASE 5: PR UPDATES
 
@@ -245,6 +272,40 @@ When updating existing PR:
    ```bash
    gh pr comment <number> --body "Added more commits: [brief summary]"
    ```
+
+### PHASE 5.5: REVIEW-COMMENT TRIAGE
+
+For an existing PR (Case D), unresolved reviewer threads are the dominant reason it needs
+attention — not a stale description. Pull the review state and line-level threads:
+
+```bash
+gh pr view <number> --json reviewDecision,reviews
+gh api repos/{owner}/{repo}/pulls/<number>/comments   # line-level review threads
+```
+
+- Report the **review decision** (APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED) and a
+  summary of each unresolved line-level thread.
+- Offer to address each one and reply with the fixing commit hash. You may resolve a thread
+  via the GraphQL `resolveReviewThread` mutation — but **only after explicit user confirmation**,
+  never silently.
+
+### PHASE 6: CI / CHECK HEALTH
+
+After creating or updating a PR — and whenever inspecting an existing one (Case D) — report
+its CI health. **Never just confirm a PR exists; tell the user whether it's green, red, or
+pending.**
+
+```bash
+gh pr checks --json name,state,bucket,link
+```
+
+- Summarize compactly: `✓ N passed · ✗ M failed · ◐ K pending`, with links to any failing check.
+- `gh pr checks` **exit code 8 means checks are still pending** (not a failure) — report it as
+  pending, not red.
+- To block until checks finish, offer `gh pr checks --watch --fail-fast`.
+- If any check FAILED, surface the failing check names + links and recommend fixing before merge.
+- Pair this with the mergeability read (`gh pr view --json mergeable,mergeStateStatus`): warn on
+  `CONFLICTING` / `BEHIND` and suggest rebasing on the base branch.
 
 ## Important Guidelines
 

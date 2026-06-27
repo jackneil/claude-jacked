@@ -6,6 +6,8 @@ You are a repo analyzer. Your job is to examine the current repo's structure, te
 
 > **How it works:** Each generated file is fully standalone — it embeds the complete engine logic with repo-specific config pre-filled. No jacked installation required to USE the generated commands. Commit these files to your repo so collaborators can use them without installing jacked. To get engine updates, upgrade jacked and re-run `/jacked-setup`. The engine's `## Config Override` section detects the `## Repo Config` header and skips discovery automatically.
 >
+> **Living document, not a one-time setup:** an outdated config is worse than a lean one. Each generated file stamps a repo fingerprint (generation commit + manifest set) and carries a self-contained staleness check so it can flag when the codebase has drifted away from the cached config. Re-run `/jacked-setup` as the project evolves — see the "When to re-run" triggers in Step 6.
+>
 > **Note:** Generated command files are exempt from the 300/500-line code guardrail — they are markdown command documents, not code files.
 
 ## Step 1: Parse Argument
@@ -73,6 +75,11 @@ find . -maxdepth 3 -type f \
 # Git maturity
 git rev-list --count HEAD 2>/dev/null || echo "0"
 git log --oneline -10 2>/dev/null
+```
+
+```bash
+# Generation fingerprint (stamp into ## Repo Config so generated files can self-check staleness)
+git rev-parse HEAD 2>/dev/null || echo "no-commits"
 ```
 
 ```bash
@@ -261,7 +268,24 @@ grep -q '## Repo Config' .claude/commands/<target>.md 2>/dev/null && echo "STAND
 - **If `STANDALONE` (or only skill file exists, no command file to check)**: Ask conversationally: "A `/<target>` already exists. Replace with a fresh version?"
 - If yes → proceed; if no → skip that target, move to next (if doing `all`)
 
+**Regenerating a `STANDALONE` file is a MERGE, not a clobber.** When the existing target already
+has a `## Repo Config` the user may have hand-edited, do NOT blindly overwrite it:
+1. Read the existing `## Repo Config` (and any sibling sections like `## Domain Wild Cards`,
+   `## Default Lens Selection`, `## Framework-Specific Checks`).
+2. Re-infer fresh values, then show the user a DIFF of changed inferred values (old → new).
+3. **Preserve any user-added or user-corrected lines** — custom lens weights, extra wild cards,
+   hand-fixed paths/ports — carrying them into the regenerated file rather than discarding them.
+   When in doubt, keep the user's value and flag the inferred alternative as a comment.
+
 ## Step 5: Generate Standalone Command and Skill Files
+
+**Confirm high-risk inferred values before writing.** After Step 3 inference, echo the key
+inferred values back to the user — detected dev-server port, build/test commands (if surfaced),
+browser tool, component/source paths, and lifecycle stage — and either let them correct the set
+in one pass, or cheaply validate them yourself first (e.g. confirm the inferred component/path
+dirs still exist using the `ls` results already gathered in Step 2). Don't bake a wrong guess
+into a committed file.
+
 
 Create the directories if needed:
 ```bash
@@ -298,12 +322,28 @@ description: "<standalone description — see per-target templates below>"
 
 <structured config data discovered above>
 
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection — e.g. `pyproject.toml, package.json`>
+
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
 <engine body, front matter and delegation Note stripped — embedded verbatim from ~/.claude/commands/<target>.md>
 ```
 
 **Critical:** Use the Read tool output verbatim for the engine body. Do NOT reproduce it from memory. The engine body is injected as-is after the `<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->` marker.
+
+**Staleness self-check (bake into every generated file).** Immediately after the `## Repo Config` block (just above the `<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->` marker), append this verbatim `## Config Staleness Check` block so the embedded engine's Config-Override path runs it on every invocation. It is **advisory, never blocking** — it surfaces a one-line nudge and then proceeds normally:
+
+```markdown
+## Config Staleness Check
+Before using the config above, run a lightweight drift check (advisory only — never block on it):
+1. `git rev-parse HEAD` and compare to **Generated at commit** above.
+2. `ls package.json pyproject.toml go.mod Cargo.toml setup.py Gemfile pom.xml build.gradle composer.json mix.exs 2>/dev/null` and compare the manifest set to **Detected stack** above.
+3. If EITHER differs, count the intervening commits (`git rev-list --count <generated-commit>..HEAD 2>/dev/null`) and surface one line, then continue:
+   > ⚠️ This `/<target>` config was generated N commits ago and the stack/paths may have drifted — re-run `/jacked-setup <target>` to refresh.
+   If the generated commit is unreachable (history rewritten) or the manifest set changed, surface the nudge regardless of commit count. Never stop or skip the run on a staleness mismatch.
+```
 
 **Also write a local skill file** after the command file. Use `mkdir -p .claude/skills/<target>` first. Local skills use RELATIVE paths — do NOT use `~/.claude/commands/`. Do NOT add Glob fallback checks to local skills (those are only for global skills). See per-target skill bodies below.
 
@@ -333,6 +373,10 @@ Include: <file extensions for detected languages>
 
 ## Strategic Emphasis
 Lifecycle lean: <where to weight the Step 6 decision based on lifecycle — e.g. Greenfield/Alpha: capability gaps in the core loop; Beta/Growth: cross-cutting experience levers; Maintenance: operational/debt levers. A hint for the single decision, not a ranking scheme.>
+
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
@@ -373,6 +417,10 @@ description: "Browser QA — standalone (generated <date>; upgrade jacked + re-r
 - React: Verify key props on list items, check useEffect cleanup, test controlled inputs
 - Tailwind: Check responsive classes at mobile/tablet breakpoints
 - Next.js: Test client/server component boundaries, check hydration
+
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
@@ -418,6 +466,10 @@ description: "Parallel UX checks — standalone (generated <date>; upgrade jacke
 
 ## UX Focus Areas
 <emphasis based on stack — e.g. "Tailwind: verify responsive breakpoints (375px, 768px, 1280px)" or "Next.js: test hydration boundaries, client/server component interactions" or "Nav changes: emphasize Discoverability aspect across all agents">
+
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
@@ -472,6 +524,10 @@ In addition to the standard pool, include:
 In addition to the standard pool, include:
 <1-2 repo-specific failure scenarios based on project type>
 
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
+
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
 [Engine body from `~/.claude/commands/dcr.md` embedded here — front matter and delegation Note stripped]
@@ -520,6 +576,10 @@ Examples:
 | Models/Schemas | <list existing docs that cover data models> |
 | Tests | <list existing docs that cover testing> |
 
+<!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
+- **Generated at commit**: <git rev-parse HEAD from Step 2>
+- **Detected stack**: <manifest set from Step 2 tech-stack detection>
+
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
 [Engine body from `~/.claude/commands/docs-sync.md` embedded here — front matter and delegation Note stripped]
@@ -555,6 +615,14 @@ If the result is `GITIGNORED`, warn the user:
 > ⚠️ `.claude/` appears to be gitignored. Your teammates and repo cloners won't get these files unless you commit them explicitly. Add a `.gitignore` exception: `!.claude/` (or commit the files directly with `git add -f .claude/`).
 
 If the repo is greenfield (<10 commits), add: "This is a young repo — re-run `/jacked-setup <target>` as your project matures to capture new planning docs and lifecycle changes."
+
+**Confirm the staleness self-check is baked in.** Verify each generated file carries the `## Config Staleness Check` block (from Step 5) plus its two stamped fingerprint lines (**Generated at commit**, **Detected stack**). This is what lets the embedded engine's Config-Override path flag drift on future runs — an advisory nudge, never a hard stop.
+
+**When to re-run:** the generated config is a living document — re-run `/jacked-setup <target>` when:
+- The stack or framework changes (new language, new frontend/CSS framework, swapped build tool).
+- New planning docs appear (roadmap, specs, design docs) that should feed the config.
+- The project lifecycle shifts (Greenfield → Alpha → Beta → Growth → Maintenance).
+- A major refactor moves component, route, or API paths the config points at.
 
 ## HARD RULES
 
