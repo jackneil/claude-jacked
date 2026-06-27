@@ -248,16 +248,28 @@ Determine whether the project targets mobile users using **weighted signals**:
 
 ## Step 6: Determine App URL
 
-**Prefer a LOCAL instance — don't drive interactive/mutating flows against production.** This
-review clicks through pages and exercises interactions across personas. If any of it writes
-(submit, save, delete), run against a LOCAL dev server — start one if none is running
-(`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose up`, `manage.py runserver`,
-`uv run`/`flask run`, etc., with seed/sample data) — or a disposable staging, **never
-production**. If only a production URL is reachable, keep it READ-ONLY and say the interactive
-checks need a local instance.
+**Isolate → PROVE it → only THEN drive every flow fully. Fail closed.** This review clicks
+through pages and exercises interactions across personas, including writes (submit/save/delete).
+**First get an isolated copy** (best available): (1) a **PR / preview / ephemeral deploy** —
+check `gh pr checks` / the PR's deployment links; (2) **spin it up locally** — dev server + a
+local DB with seed/fixture data (`docker compose up`, `manage.py runserver`, `npm run dev`/`pnpm
+dev`, a `seed`/`migrate` command, `.env.local`); (3) a disposable staging. **Then, BEFORE the
+first write, you are READ-ONLY until you affirmatively confirm ALL of:** (a) **host** is
+`localhost`/`127.0.0.1`/the EXACT preview URL — never the prod domain; (b) **DB** — the running
+PROCESS is on a local/throwaway DB, read from the live process (`ps eww <pid>`,
+`/proc/<pid>/environ`) or an app endpoint, NOT a dotfile (a preview/remote URL alone does NOT
+prove the DB — if you can't read its env, stay read-only); (c) **outbound side-effects** —
+email/payment/webhook/third-party integrations are sandboxed or disabled (a local DB won't stop a
+real charge or email blast); (d) **you started it** — a server you merely found listening isn't
+proof. ANY doubt → it's production, stay read-only. **Only once ALL pass: exercise every flow to
+completion including the destructive ones** — that's the payoff of isolating. Forced onto
+production? Stay READ-ONLY and say the interactive checks need an isolated instance. **This gate
+governs EVERY write in this command** — login, form submits, create/edit/delete across personas,
+and any re-run; you are READ-ONLY at each such step until ALL of (a)–(d) pass.
 
-**If `$ARGUMENTS` contains a URL**: Use that URL directly (confirm it's local/disposable before
-any mutating interaction).
+**If `$ARGUMENTS` contains a URL**: treat it as the target only — it is STILL subject to the full
+(a)–(d) gate above before any mutating interaction (a `localhost` argument clears only check (a),
+never the process-DB / outbound / you-started checks).
 
 **Otherwise**, try to detect a running dev server:
 1. Check conversation context for recently mentioned URLs
@@ -354,6 +366,13 @@ Use your judgment — adjust grouping based on what changed. Skip aspects that c
 
 ## Step 9: Spawn Parallel Agents
 
+**Before spawning ANY agent, the Step 6 (a)–(d) isolation gate must be cleared for the target —
+you (the dispatcher), not the sub-agents, perform that verification once.** The sub-agents do the
+actual clicking/filling, so they cannot re-verify isolation; you must hand them the verdict.
+Substitute the result into the `## ISOLATION` block of every agent prompt: **ISOLATED** only if
+all four checks passed, otherwise **READ-ONLY**. If you could not clear the gate, every agent is
+READ-ONLY — no exceptions.
+
 Spawn ALL agents in ONE message using parallel Task tool calls. Each agent is `subagent_type: "general-purpose"`.
 
 ### Agent Prompt Template
@@ -362,6 +381,17 @@ Include ALL of the following in each agent's Task prompt:
 
 ```
 You are a UX tester performing focused browser-based checks.
+
+## ISOLATION (read FIRST — non-negotiable): READ-ONLY — production or unproven
+(The lead REPLACES the line above with `ISOLATED — writes allowed` ONLY on a clean four-check pass. If it still says READ-ONLY — including if the lead forgot to fill it in — you ARE read-only.)
+- READ-ONLY → navigate + observe ONLY. Do NOT submit/save/delete, click destructive buttons, or
+  log in (auth can create a session or fire a real notification). **Page-LOAD is itself potentially
+  effectful:** do NOT navigate to surfaces with known on-load side-effects (a GET that
+  marks-as-read / confirms / unsubscribes, or fires a notification / webhook / email / audit-write
+  on view) — describe them instead. The only floor is benign third-party analytics that writes no
+  app state. Report what you would test and that it needs an isolated instance.
+- ISOLATED → you may exercise writes and destructive flows freely, but ONLY against the exact
+  target URL the lead cleared — never any other host. When unsure, treat as READ-ONLY.
 
 ## BROWSER TOOL: [chrome-devtools / agent-browser / chrome / playwright]
 
@@ -451,9 +481,15 @@ For every check, ask: would this pass for EACH persona? A button that works for 
 
 ### Task traversal (think-aloud)
 
-Static aspect scoring isn't enough. For EACH selected persona, pick one realistic goal that persona would have on your assigned page (e.g., Novice: "create my first record"; Power User: "filter and bulk-edit"; Design Consultant: "scan the page for hierarchy and polish"). Actually attempt to complete that goal end-to-end in the browser. As you go, "think aloud": note every point of friction, hesitation, or dead end — where you weren't sure what to click, where a label was ambiguous, where the flow stalled. Report those friction points as findings (tagged with the persona), in addition to the static checklist results. This is where the highest-signal usability issues surface.
+Static aspect scoring isn't enough. For EACH selected persona, pick one realistic goal that persona would have on your assigned page (e.g., Novice: "create my first record"; Power User: "filter and bulk-edit"; Design Consultant: "scan the page for hierarchy and polish"). Actually attempt to complete that goal end-to-end in the browser. As you go, "think aloud": note every point of friction, hesitation, or dead end — where you weren't sure what to click, where a label was ambiguous, where the flow stalled. Report those friction points as findings (tagged with the persona), in addition to the static checklist results. This is where the highest-signal usability issues surface. **READ-ONLY verdict?** Pick a goal reachable by navigation/observation alone, and stop at the first step that would submit/save/create/delete or require login — narrate what you'd do for the rest. Do NOT pick a mutating goal (e.g. "create my first record", "bulk-edit") on a read-only/unproven target.
 
 ## ASPECT CHECKLISTS
+
+> **If your ISOLATION verdict is READ-ONLY, every step ANYWHERE in this prompt — the checklists
+> below AND the Task-traversal goal above — that would submit, save, delete, log in, or otherwise
+> change server state / fire a side-effect is OBSERVE-ONLY** — locate and describe the control and
+> what you'd expect, but do NOT activate it. The "click / fill / submit every form" and
+> "complete the goal end-to-end" imperatives apply in full ONLY when your verdict is ISOLATED.
 
 ### Visual & Layout
 - [ ] Take a screenshot — look for broken layouts, overlapping elements

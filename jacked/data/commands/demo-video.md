@@ -55,12 +55,26 @@ preferred — smoother motion reads better for teaching.
 ## Step 3: Stage a clean set — this is a demo, not a test
 
 A teaching video must look intentional — and the demo *performs actions* (clicks, exports,
-saves), so it must NOT run against production:
-- **Record against a LOCAL instance.** Spin up the app locally if it isn't already running
-  (`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose up`, `manage.py runserver`,
-  `uv run`/`flask run`, etc.) with seed/sample data, and point the walkthrough at `localhost`.
-  Only use a deployed URL if the user gives a disposable/staging one — never production, where
-  the demo's clicks would mutate real data or fire real side effects.
+saves), so it must run on an ISOLATED instance, never production:
+- **Record against an isolated instance.** Best available, in order: (1) a **PR / preview /
+  ephemeral deploy** if one exists (the PR's "View deployment" link, a Vercel/Netlify/Cloudflare
+  preview, a Railway/Heroku review app); (2) **spin it up locally** — dev server + a local DB
+  with seed/sample data (`docker compose up`, `manage.py runserver`, `npm run dev`/`pnpm dev`,
+  `.env.local`), pointed at `localhost`; (3) a disposable staging the user confirms. Keep the
+  data **clean and staged** — this is a polished demo, not a stress test.
+- **Confirm non-prod before any write — fail closed.** Before the first save/export/submit, you
+  are READ-ONLY until you confirm ALL of: (a) the host is local or the EXACT preview URL (never
+  the production domain); (b) the running PROCESS is on a local/throwaway DB — read it from the
+  live process (`ps eww <pid>`, `/proc/<pid>/environ`) or an app endpoint, NOT a dotfile (a
+  preview/remote URL alone does NOT prove the DB); (c) email/payment/webhook integrations are
+  sandboxed or disabled (a local DB won't stop a real send/charge); (d) **you started it** — the
+  server is one YOU spun up this session or the verified preview env, not one you merely found
+  listening. If you can't prove ALL of it, do NOT perform writes — narrate a read-only walkthrough
+  instead. When unsure, it's production. A URL passed in or auto-detected clears only the Host
+  check, never the rest.
+  **This gate governs EVERY write in the skill** — logging in as the demo persona (next bullet),
+  every `action`/`highlight` segment that submits/saves/exports (Step 4), and any re-run. On an
+  unproven/production target: navigate + observe only — no login, no writes.
 - Log in as the **demo persona** with **representative, clean data** (not empty, not debug
   junk, no real PII — use seed/sample data; if the screen would show real customer data, switch
   to a demo account or sanitize).
