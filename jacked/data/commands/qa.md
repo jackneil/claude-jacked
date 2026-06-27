@@ -105,15 +105,27 @@ If no shared files changed, skip the spot-check entirely.
 
 ## Step 4: Determine App URL
 
-**Prefer a LOCAL instance — don't run interactive/mutating checks against production.** This
-pass clicks and fills forms, and may submit/save. If so, run it against a LOCAL dev server —
-start one if none is running (`npm run dev`/`pnpm dev`, a `Makefile` target, `docker compose
-up`, `manage.py runserver`, `uv run`/`flask run`, etc., with seed/sample data), or a disposable
-staging — **never production**. If only a production URL is reachable, keep the pass READ-ONLY
-(look, don't submit/save/delete) and tell the user the interactive checks need a local instance.
+**Isolate → PROVE it → only THEN test hard. Fail closed.** This pass clicks, fills forms, and
+may submit/save/delete. **First get an isolated copy** (best available): (1) a **PR / preview /
+ephemeral deploy** — check `gh pr checks` / the PR's "View deployment" links; (2) **spin it up
+locally** — dev server + a local DB with seed/fixture data (`docker compose up`, `manage.py
+runserver`, `npm run dev`/`pnpm dev`, a `seed`/`migrate` command, `.env.local`); (3) a disposable
+staging. **Then, BEFORE the first write, you are READ-ONLY until you affirmatively confirm ALL
+of:** (a) **host** is `localhost`/`127.0.0.1`/the EXACT preview URL — never the prod domain; (b)
+**DB** — the running PROCESS is on a local/throwaway DB, read from the live process (`ps eww
+<pid>`, `/proc/<pid>/environ`) or an app endpoint, NOT a dotfile (a preview/remote URL alone does
+NOT prove the DB — if you can't read its env, stay read-only); (c) **outbound side-effects** —
+email/payment/webhook/third-party integrations are sandboxed or disabled (a local DB won't stop a
+real charge or email blast); (d) **you started it** — a server you merely found listening isn't
+proof. ANY doubt → it's production, stay read-only. **Only once ALL pass: go after the edge and
+destructive paths freely** — that's the payoff of isolating. Forced onto production? Stay
+READ-ONLY and tell the user the interactive checks need an isolated instance. **This gate governs
+EVERY write in this command** — login, form submits, create/edit/delete, and any
+replay/iterate-until-green re-run; you are READ-ONLY at each such step until ALL of (a)–(d) pass.
 
-**If `$ARGUMENTS` contains a URL**: Use that URL directly (confirm it's local/disposable before
-any mutating interaction).
+**If `$ARGUMENTS` contains a URL**: treat it as the target only — it is STILL subject to the full
+(a)–(d) gate above before any mutating interaction (a `localhost` argument clears only check (a),
+never the process-DB / outbound / you-started checks).
 
 **Otherwise**, try to detect a running dev server:
 1. Check conversation context for recently mentioned URLs (e.g., `http://localhost:3000`)

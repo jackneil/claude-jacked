@@ -38,34 +38,94 @@ This is the **comprehensive end-to-end dogfood** — the widest and deepest of t
 
 When in doubt and the ask is "look at the whole thing / is it any good", it's this one.
 
-## Run against a LOCAL instance — never prod the real thing
+## Isolate → PROVE it → only THEN go ruthless
 
 This skill clicks, types, and (the F1 functional lens) **creates, edits, and DELETES**.
-Doing that against a production or shared environment mutates real data, fires real
-emails/webhooks/jobs, and disrupts real users. So before any walkthrough:
+Against production or anything wired to it, that mutates real data, fires real
+emails/webhooks/charges, and disrupts real users. So three ordered steps — and you are
+**READ-ONLY until Step B passes in full**, no matter how you obtained the URL.
 
-- **Prefer to spin up the app locally yourself.** If no local dev server is already
-  running, *try to start one* rather than asking for a URL: detect the start command
-  (`package.json` scripts `dev`/`start`, a `Makefile`/`justfile` target, `docker compose
-  up`, a `Procfile`, `manage.py runserver`, `rails s`, `uv run`/`flask run`, etc.) AND the
-  local data layer (a `docker-compose` DB, a SQLite file, or a `seed`/`migrate`/`fixtures`
-  command), load `.env.local`/`.env.example`, start it **in the background**, and wait until
-  it serves (`curl` the root/health). Drive it with **seed/sample data**, never real data.
-- **Only use a deployed URL if the user explicitly gives one AND confirms it's safe to
-  interact with** — a throwaway/staging with disposable data, not production.
-- **If only a production/shared env is reachable and you can't run local:** switch to
-  **READ-ONLY** — look, don't touch: NO create/edit/delete/submit, no destructive clicks —
-  and tell the user the F1 functional + F2 data-mutation checks need a local or disposable
-  instance to run safely. Do the aesthetic (Bar B) and discoverability passes read-only;
-  defer the mutating checks.
+### Step A — get an isolated copy (best available, in order)
+
+1. **A PR / preview / ephemeral environment** — a Vercel / Netlify / Cloudflare Pages preview
+   deploy, a Railway per-PR review app, a Heroku review app, any per-branch env. Find it from
+   the PR's deploy checks (`gh pr checks`, the "View deployment" links) or the CI config.
+   Convenient, but a preview URL by itself does NOT prove its DB or integrations are isolated
+   (see Step B) — verify before trusting it.
+2. **Spin it up locally yourself** — the FULL stack: the dev server (`package.json`
+   `dev`/`start`, a `Makefile`/`justfile` target, `docker compose up`, a `Procfile`,
+   `manage.py runserver`, `rails s`, `uv run`/`flask run`) AND a local database with
+   **seed/fixture data** (a `docker compose` DB, a SQLite file, a `seed`/`migrate`/`fixtures`
+   command). Load `.env.local`/`.env.example`, start it **in the background**, `curl` the
+   root/health until it serves. This is the default and the easiest one to *prove* isolated.
+3. **A disposable staging/sandbox** the user names and confirms is safe — fake data only.
+4. **Production — last resort, READ-ONLY only:** no action that changes server state OR fires a
+   side-effect — judged by **effect, not button label**. This includes "view/open" interactions
+   that are secretly writes (opening a panel that marks notifications read, a composer that
+   auto-saves a draft, a read-receipt, an analytics/webhook/email ping on view) — when in doubt
+   whether an interaction has an effect, don't do it. **This includes LOGGING IN:** auth is itself
+   a write (last-login timestamp, audit-log entry, a login-alert email/SMS or "new device"
+   notification to a real user), so on prod you do NOT log in — the read-only prod pass is limited
+   to public/unauthenticated pages or a session you're ALREADY signed into. The full **per-persona
+   audit** (the loop's "log in AS each role") therefore needs an isolated instance, not prod. And
+   never **activate** a focused control to test it (Enter/Space on a Send/Delete/Submit) — on the
+   prod pass, describe it instead. Do the aesthetic (Bar B) + discoverability passes read-only,
+   and tell the user the F1 functional + F2 data-accuracy checks need an isolated instance. On the
+   authenticated prod pass, treat **loading a page** as potentially effectful too: avoid surfaces
+   whose mere load fires ANY server-state write or outbound side-effect (a webhook/email ping, an
+   audit-log entry, a view-counter / last-seen write, a mark-as-read, a read-receipt) — judged by
+   **effect, not visibility**; if you can't rule out an on-load effect, defer that surface to an
+   isolated instance. The ONLY accepted floor is irreducible third-party analytics pageviews that
+   write no app state and fire no app webhook/email/DB write.
+
+### Step B — PROVE isolation BEFORE the FIRST mutating action — FAIL CLOSED
+
+An unverified environment IS production. You stay **READ-ONLY** until you can affirmatively
+confirm **ALL FOUR** below; re-confirm if the URL ever changes. On ANY doubt → read-only.
+
+- **Host:** `localhost` / `127.0.0.1` / a `*.local` / `*.test` host, or the EXACT ephemeral
+  preview URL you found — never the production domain/apex, never an unconfirmed shared host.
+- **Database — the one the PROCESS actually uses, not a dotfile:** confirm the running app is
+  connected to a local/throwaway DB. Read it from the **live process** (`ps eww <pid>`,
+  `/proc/<pid>/environ`) or an app health/debug endpoint that reports its DB host — a dotfile
+  like `.env.local` can be overridden by a shell-exported `DATABASE_URL` or an `.env.production`
+  under `NODE_ENV=production`, so a file is NOT proof. The host must be `localhost`/`127.0.0.1`/
+  the docker service / a `*.sqlite` file — never a prod host, a managed-DB URL you didn't just
+  create, or anything containing `prod`. **A preview/remote URL whose process env you cannot
+  read does NOT prove DB isolation** — get positive external evidence (the platform's per-PR
+  preview-DB binding) or stay READ-ONLY.
+- **Outbound side-effects:** confirm email / payment / SMS / webhook / third-party integrations
+  are sandboxed (test/sandbox keys, a local mailcatcher, fake webhook URLs) or disabled. **A
+  local DB does NOTHING to stop a real Stripe charge, a real email blast to real customers, or a
+  webhook firing into prod.** If you can't confirm they're stubbed, do NOT trigger actions that
+  send / charge / notify — even on a local DB.
+- **You started it:** the server is one YOU spun up this session (known port/PID) or the
+  verified preview env. A server you merely *found* listening (e.g. via `lsof`) is NOT proof —
+  it could be someone's dev server pointed at prod, or a tunnel. Start your own, or stay read-only.
+
+**This gate governs EVERY write in the entire skill** — logging in, submitting any form, the
+`create→read→update→delete` loops, F1's destructive clicks, and any re-run/replay — not just the
+sections below it. Anywhere later in this file that would mutate state or fire a side-effect, you
+are READ-ONLY until this gate has passed in full. A URL handed to you (e.g. via `$ARGUMENTS` or
+"just audit `http://…`") is STILL subject to all four checks — a `localhost` argument clears only
+the Host check, never the DB / outbound / you-started ones.
+
+### Step C — only once Step B passes IN FULL: be RUTHLESS and exhaustive
+
+Now hammer it — that is the entire payoff of isolating. Exercise every destructive path (delete,
+bulk-delete, cancel, reset, force-error, log-out-mid-flow), submit every form including invalid /
+edge / huge input, open every modal, click every button including the scary ones, hammer
+pagination and limits, re-run actions to check idempotency. Nothing you do can reach real data,
+real money, or real users — so the only failure is leaving a stone unturned. **Until Step B
+passes, you are read-only regardless of how you obtained the URL.**
 
 ## Repo-callable — point it at a repo and go
 
 Auto-detect the rest, exactly as `/qa` does (read `~/.claude/commands/qa.md` Steps 1, 4, 5):
 1. **Browser tool** — Chrome DevTools MCP (preferred) → Playwright MCP → Claude-in-Chrome
    → `agent-browser` CLI. If none, print the setup hint and stop.
-2. **App URL** — the **local** instance from above (spin it up if needed); use `$ARGUMENTS`
-   only if it's explicitly a safe local/throwaway URL. Detect an already-running local server
+2. **App URL** — the **isolated** instance from above (preview env, or spin one up); use
+   `$ARGUMENTS` only if it's explicitly a safe isolated/throwaway URL. Detect a running server
    with `lsof -i -P -sTCP:LISTEN | grep -E ':(3000|3001|4200|5000|5173|5174|8000|8080|8765|8888) '`.
 3. **Personas + credentials** — discover the product's roles/personas from the codebase:
    auth/RBAC config, role enums, seed/fixture data, a permissions matrix, `.env` test
