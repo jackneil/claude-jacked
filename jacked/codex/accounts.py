@@ -75,6 +75,17 @@ def import_codex_account(
         organization_uuid=ident.account_id,  # org/workspace sentinel ("" if none)
         provider="codex",
     )
+
+    # Capture this (currently-live) account's auth.json into its per-account slot
+    # so switching/launch have its credentials. Best-effort — a missing slot just
+    # means switching to it will report "add it while logged in first".
+    try:
+        from .switching import seed_codex_slot
+
+        seed_codex_slot(acct["id"], base=home, env=env)
+    except Exception:  # pragma: no cover - capture is best-effort
+        logger.debug("seed_codex_slot failed for account %s", acct.get("id"), exc_info=True)
+
     if make_active:
         db.set_active_account_id(acct["id"], provider="codex")
     logger.info("Imported Codex account %s (id=%s)", ident.email, acct.get("id"))

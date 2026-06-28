@@ -5020,6 +5020,80 @@ def codex_add_cmd(make_active, no_login):
     )
 
 
+def _codex_db():
+    from jacked.web.database import Database
+
+    return Database(str(Path.home() / ".claude" / "jacked.db"))
+
+
+@codex_group.command(name="list")
+def codex_list_cmd():
+    """List the Codex accounts jacked knows about.
+
+    >>> # CLI command: jacked codex list
+    """
+    db = _codex_db()
+    try:
+        active = db.get_active_account_id("codex")
+        rows = [a for a in db.list_accounts() if a.get("provider") == "codex"]
+    finally:
+        db.close()
+    if not rows:
+        console.print("No Codex accounts yet. Add one with [bold]jacked codex add[/bold].")
+        return
+    for a in rows:
+        mark = "→ " if a["id"] == active else "  "
+        plan = a.get("subscription_type") or "?"
+        console.print(f"{mark}[bold]{a['id']}[/bold]  {a['email']}  ({plan})")
+
+
+@codex_group.command(name="use")
+@click.argument("account_id", type=int)
+def codex_use_cmd(account_id):
+    """Make ACCOUNT_ID the active Codex account (swaps ~/.codex/auth.json).
+
+    Restart Codex afterwards — it caches auth at startup.
+
+    >>> # CLI command: jacked codex use <id>
+    """
+    from jacked.codex.switching import CodexSwapError, swap_codex_account
+
+    db = _codex_db()
+    try:
+        swap_codex_account(db, account_id)
+    except CodexSwapError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        db.close()
+    console.print(
+        f"Active Codex account → [bold]{account_id}[/bold]. "
+        "Restart Codex (CLI/app/IDE) to pick it up — it caches auth at startup."
+    )
+
+
+@codex_group.command(
+    name="launch", context_settings={"ignore_unknown_options": True}
+)
+@click.argument("account_id", type=int)
+@click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
+def codex_launch_cmd(account_id, codex_args):
+    """Launch Codex isolated on ACCOUNT_ID via its own CODEX_HOME.
+
+    Unlike `use`, this does NOT touch the shared root account — it runs Codex in
+    a per-account home, sidestepping the single-file refresh-token race. Extra
+    args pass through to `codex`.
+
+    >>> # CLI command: jacked codex launch <id> [codex args...]
+    """
+    from jacked.codex.switching import CodexSwapError, launch_codex
+
+    try:
+        console.print(f"Launching Codex on account [bold]{account_id}[/bold]...")
+        launch_codex(account_id, codex_args)
+    except CodexSwapError as exc:
+        raise click.ClickException(str(exc))
+
+
 # ── Convenience init command ─────────────────────────────────────────
 
 

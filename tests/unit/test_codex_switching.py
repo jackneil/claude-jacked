@@ -1,0 +1,246 @@
+"""M6: guardrailed Codex account switching.
+
+Covers the in-place active swap (capture the outgoing live auth.json FIRST,
+write the target field-complete with no field loss, refuse a stale-snapshot
+replay, set the per-provider active account, signal restart) and the
+per-account CODEX_HOME slot/home + launch env.
+"""
+
+import base64
+import json
+
+import pytest
+
+from jacked.codex import switching as sw
+from jacked.codex.switching import CodexSwapError
+from jacked.web.database import Database
+
+
+def _b64url(obj):
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+
+def _jwt(account_id, email="dev@example.com"):
+    h = _b64url({"alg": "RS256", "typ": "JWT"})
+    p = _b64url({
+        "email": email,
+        "exp": 9999999999,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+            "chatgpt_plan_type": "pro",
+        },
+    })
+    s = base64.urlsafe_b64encode(b"sig").rstrip(b"=").decode()
+    return f"{h}.{p}.{s}"
+
+
+def _auth(account_id, email="dev@example.com", last_refresh="2026-06-27T00:00:00Z",
+          api_key=None, extra=None):
+    d = {
+        "OPENAI_API_KEY": api_key,
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "id_token": _jwt(account_id, email),
+            "access_token": f"access-{account_id}",
+            "refresh_token": f"refresh-{account_id}",
+            "account_id": account_id,
+        },
+        "last_refresh": last_refresh,
+    }
+    if extra:
+        d.update(extra)
+    return d
+
+
+def _write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+@pytest.fixture
+def db(tmp_path):
+    d = Database(str(tmp_path / "jacked.db"))
+    yield d
+    d.close()
+
+
+# --------------------------------------------------------------------------
+# seed / slots
+# --------------------------------------------------------------------------
+
+def test_seed_codex_slot_captures_root(tmp_path):
+    base = tmp_path / ".codex"
+    _write(base / "auth.json", _auth("acct-live"))
+    assert sw.seed_codex_slot(7, base) is True
+    slot = json.loads(sw.codex_slot_auth_path(7, base).read_text())
+    assert slot["tokens"]["account_id"] == "acct-live"
+
+
+def test_seed_codex_slot_no_root_returns_false(tmp_path):
+    base = tmp_path / ".codex"
+    base.mkdir()
+    assert sw.seed_codex_slot(7, base) is False
+
+
+# --------------------------------------------------------------------------
+# swap — the guardrails
+# --------------------------------------------------------------------------
+
+def test_swap_field_complete_and_captures_outgoing(tmp_path, db):
+    base = tmp_path / ".codex"
+    # B is live + active; A is a stored slot. Switch to A.
+    b_live = _auth("acct-B", email="b@x.com", last_refresh="2026-06-28T10:00:00Z")
+    a_slot = _auth("acct-A", email="a@x.com", last_refresh="2026-06-28T09:00:00Z",
+                   api_key=None, extra={"custom_field": "keepme"})
+    _write(base / "auth.json", b_live)
+    _write(sw.codex_slot_auth_path(1, base), a_slot)   # account 1 = A
+    db.set_active_account_id(2, provider="codex")        # account 2 = B is active
+
+    result = sw.swap_codex_account(db, 1, base=base)
+
+    # Root now holds A, field-complete (every key preserved, incl. the extra one).
+    root = json.loads((base / "auth.json").read_text())
+    assert root == a_slot
+    assert root["custom_field"] == "keepme"
+    assert root["auth_mode"] == "chatgpt"
+    # Outgoing (B) was captured into its slot FIRST.
+    b_captured = json.loads(sw.codex_slot_auth_path(2, base).read_text())
+    assert b_captured == b_live
+    # Bookkeeping
+    assert result.captured_outgoing is True
+    assert result.restart_required is True
+    assert result.outgoing_id == 2
+    assert db.get_active_account_id("codex") == 1
+    assert db.get_active_account_id("claude") is None  # provider-isolated
+
+
+def test_swap_refuses_stale_replay_same_account(tmp_path, db):
+    base = tmp_path / ".codex"
+    # Live root is account A @ T2 (newer); the slot is account A @ T1 (older).
+    live = _auth("acct-A", last_refresh="2026-06-28T12:00:00Z")
+    stale_slot = _auth("acct-A", last_refresh="2026-06-28T08:00:00Z")
+    _write(base / "auth.json", live)
+    _write(sw.codex_slot_auth_path(1, base), stale_slot)
+    db.set_active_account_id(1, provider="codex")
+
+    with pytest.raises(CodexSwapError, match="stale"):
+        sw.swap_codex_account(db, 1, base=base)
+    # Root is untouched (still the newer live one).
+    assert json.loads((base / "auth.json").read_text())["last_refresh"] == "2026-06-28T12:00:00Z"
+
+
+def test_swap_missing_slot_raises(tmp_path, db):
+    base = tmp_path / ".codex"
+    _write(base / "auth.json", _auth("acct-B"))
+    with pytest.raises(CodexSwapError):
+        sw.swap_codex_account(db, 99, base=base)
+
+
+def test_swap_refuses_incomplete_slot(tmp_path, db):
+    base = tmp_path / ".codex"
+    _write(base / "auth.json", _auth("acct-B"))
+    # Slot missing auth_mode → would break Codex.
+    _write(sw.codex_slot_auth_path(1, base), {"tokens": {"id_token": _jwt("acct-A")}})
+    with pytest.raises(CodexSwapError, match="auth_mode"):
+        sw.swap_codex_account(db, 1, base=base)
+
+
+def test_swap_different_account_not_treated_as_stale(tmp_path, db):
+    base = tmp_path / ".codex"
+    # Live A @ T2; target B @ T1 — older, but DIFFERENT account → allowed.
+    _write(base / "auth.json", _auth("acct-A", last_refresh="2026-06-28T12:00:00Z"))
+    _write(sw.codex_slot_auth_path(1, base),
+           _auth("acct-B", last_refresh="2026-06-28T08:00:00Z"))
+    db.set_active_account_id(2, provider="codex")
+    result = sw.swap_codex_account(db, 1, base=base)
+    assert result.ok
+    assert json.loads((base / "auth.json").read_text())["tokens"]["account_id"] == "acct-B"
+
+
+def test_swap_forces_file_storage(tmp_path, db):
+    base = tmp_path / ".codex"
+    (base).mkdir(parents=True)
+    (base / "config.toml").write_text('cli_auth_credentials_store = "keyring"\n')
+    _write(base / "auth.json", _auth("acct-B"))
+    _write(sw.codex_slot_auth_path(1, base), _auth("acct-A"))
+    db.set_active_account_id(2, provider="codex")
+    sw.swap_codex_account(db, 1, base=base)
+    from jacked.codex.credentials import credential_store_mode
+    assert credential_store_mode(base) == "file"
+
+
+# --------------------------------------------------------------------------
+# per-account CODEX_HOME launch
+# --------------------------------------------------------------------------
+
+def test_prepare_account_home_and_launch_env(tmp_path):
+    base = tmp_path / ".codex"
+    _write(sw.codex_slot_auth_path(1, base), _auth("acct-A"))
+    env = sw.build_codex_launch_env(1, base=base, env={})
+    assert env["CODEX_HOME"] == str(sw.codex_account_home(1, base))
+    # the per-account home has the account's auth.json + a file-store config
+    assert sw.codex_slot_auth_path(1, base).exists()
+    from jacked.codex.credentials import credential_store_mode
+    assert credential_store_mode(sw.codex_account_home(1, base)) == "file"
+
+
+def test_prepare_account_home_missing_creds_raises(tmp_path):
+    base = tmp_path / ".codex"
+    base.mkdir()
+    with pytest.raises(CodexSwapError):
+        sw.prepare_codex_account_home(5, base=base)
+
+
+# --------------------------------------------------------------------------
+# import seeds the slot (M3 + M6 integration)
+# --------------------------------------------------------------------------
+
+def test_import_seeds_codex_slot(tmp_path, db, monkeypatch):
+    from jacked.codex.accounts import import_codex_account
+
+    base = tmp_path / ".codex"
+    _write(base / "auth.json", _auth("acct-X", email="x@example.com"))
+    monkeypatch.setenv("CODEX_HOME", str(base))
+    acct = import_codex_account(db)
+    # the new account's slot now holds the live auth.json
+    assert sw.codex_slot_auth_path(acct["id"], base).exists()
+    slot = json.loads(sw.codex_slot_auth_path(acct["id"], base).read_text())
+    assert slot["tokens"]["account_id"] == "acct-X"
+
+
+# --------------------------------------------------------------------------
+# /accounts/{id}/use route dispatches Codex to the guardrailed swap
+# --------------------------------------------------------------------------
+
+def test_use_account_route_swaps_codex(tmp_path, db, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from jacked.api.routes.auth import router
+
+    base = tmp_path / ".codex"
+    _write(base / "auth.json", _auth("acct-B", email="b@x.com"))
+    monkeypatch.setenv("CODEX_HOME", str(base))
+
+    # account 1 (A) is the target with a stored slot; account 2 (B) is live/active
+    a = db.create_account("a@x.com", "atok", 9999999999, provider="codex",
+                          organization_uuid="acct-A")
+    _write(sw.codex_slot_auth_path(a["id"], base), _auth("acct-A", email="a@x.com"))
+    b = db.create_account("b@x.com", "btok", 9999999999, provider="codex",
+                          organization_uuid="acct-B")
+    db.set_active_account_id(b["id"], provider="codex")
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/auth")
+    app.state.db = db
+    client = TestClient(app)
+
+    resp = client.post(f"/api/auth/accounts/{a['id']}/use")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["provider"] == "codex"
+    assert body["restart_required"] is True
+    assert db.get_active_account_id("codex") == a["id"]
+    # root now holds account A
+    root = json.loads((base / "auth.json").read_text())
+    assert root["tokens"]["account_id"] == "acct-A"
