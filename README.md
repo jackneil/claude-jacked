@@ -598,7 +598,7 @@ Type these directly in Claude Code:
 | `/ux` | **UX Testing** — Parallel browser-based UX checks across multiple pages and aspects simultaneously |
 | `/qa-video` | **QA Video** — Records a playable video of a test journey (true-motion via Playwright MCP video + chapters, or a frame-stitched MP4/GIF) plus a video-synced narration doc — for regression evidence and bug repros |
 | `/demo-video` | **Demo Video** — Produces a polished, narrated feature walkthrough video for docs/education from a committed narration script (Playwright recording + timed `say`/TTS voiceover + captions, muxed with ffmpeg) — regenerable when the UI changes |
-| `/whats-next` | **Roadmap Advisor** — Weighs a coverage-matrix read (toward 10/10) plus plans, issues, commits, and lifecycle, then **decides the single highest-leverage initiative** and forges a ready-to-run `/goal` brief (≤4000 chars) for autonomous, tested delivery |
+| `/whats-next` | **Roadmap Advisor** — Weighs a coverage-matrix read (toward 10/10) plus plans, issues, commits, lifecycle, and (when configured) assigned Asana tasks, then **decides the single highest-leverage initiative** and forges a ready-to-run `/goal` brief (≤4000 chars) for autonomous, tested delivery |
 | `/goal-maker` | **Goal Forge** — Packages the work already in front of you (this conversation, a spec, a plan, an in-flight build) into one overnight-sized `/goal` brief (≤4000 chars) — full scope, TDD, UI/UX + polish gates, evidence-based DONE, plan-ahead `Next:`. Defaults to PR; `merge` arg auto-merges each milestone on green CI |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
 | `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
@@ -637,6 +637,10 @@ Use the double-check reviewer to review what we just built
 ### QA Browser Testing
 
 The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.
+
+### Asana in `/whats-next`
+
+When Asana is reachable, `/whats-next` blends your assigned tasks into the same coverage-led recommendation as GitHub issues and code TODOs. Run `/jacked-setup whats-next` once per repo to probe for access (an Asana MCP plugin, a local `asana` CLI, or `ASANA_PERSONAL_ACCESS_TOKEN`) and write a `## Asana Integration` block into the standalone command. Tasks that touch the current repo — by GitHub URL, repo basename, file/module mention, or project-name resemblance — are weighed alongside the rest, with priority and due-date read as demand/cost-of-delay signals. Asana origin appears on the Evidence line; it grants no priority bonus, and if Asana isn't configured the step is skipped silently.
 
 ---
 

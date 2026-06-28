@@ -113,6 +113,38 @@ grep -r "version" pyproject.toml package.json Cargo.toml go.mod setup.py 2>/dev/
 grep -r "__version__" --include="*.py" -l 2>/dev/null | head -3
 ```
 
+**Asana access probe** (whats-next only) — try three methods in order, stop at the first that succeeds. This decides the `## Asana Integration` config block below.
+
+1. **MCP**: check whether an Asana MCP plugin is installed and its tools are reachable.
+   ```bash
+   ls -d ~/.claude/plugins/marketplaces/*/external_plugins/asana ~/.claude/plugins/*asana* 2>/dev/null && echo "ASANA_PLUGIN_PRESENT" || echo "ASANA_PLUGIN_ABSENT"
+   ```
+   If present, try a read-only Asana MCP tool from whichever namespace is connected (e.g. `mcp__claude_ai_Asana__get_me` or `mcp__plugin_asana_asana__*`). If a call succeeds, record `Access: mcp` (note the namespace) and proceed to discovery.
+2. **CLI**: probe for a local Asana CLI binary.
+   ```bash
+   command -v asana >/dev/null 2>&1 && asana --version 2>/dev/null
+   command -v asana-cli >/dev/null 2>&1 && asana-cli --version 2>/dev/null
+   ```
+   If either responds, record `Access: cli` (and the binary name) and proceed to discovery.
+3. **REST + PAT**: probe for a personal access token in the environment.
+   ```bash
+   if [ -n "$ASANA_PERSONAL_ACCESS_TOKEN" ] || [ -n "$ASANA_TOKEN" ]; then
+     TOKEN="${ASANA_PERSONAL_ACCESS_TOKEN:-$ASANA_TOKEN}"
+     curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" https://app.asana.com/api/1.0/users/me
+   else
+     echo "NO_TOKEN"
+   fi
+   ```
+   `200` → record `Access: rest-pat` and proceed to discovery. `401` → the token is set but rejected: record `Access: none` (runtime will skip cleanly), and surface a refresh nudge instead of the generic install hint — tell the user their `ASANA_PERSONAL_ACCESS_TOKEN` is rejected and to refresh it at https://app.asana.com/0/my-apps. Any other non-200/no response → fall through.
+4. **None**: if all three fail, record `Access: none`, skip discovery, and write the install-hint variant of the `## Asana Integration` block (see the whats-next template below).
+
+**Asana zero-touch discovery** (only if access succeeded), using whichever method won:
+- `users/me` — cache the user GID and friendly name.
+- List the user's workspaces; report the count (`Found N workspace(s)`).
+- List the projects the user belongs to per workspace; report the count (`Found M project(s) across N workspace(s)`).
+- Ask one question: *"Track tasks across all M projects, or pick specific projects? [all/pick]"* (default `all` on empty input; if `pick`, list and accept a comma-separated selection).
+- Sniff one or two selected projects' `custom_fields` for a name matching `Priority`, `Status`, `Tier`, `P0`, `P1`. If found, record the field GID + its enum value names. Do NOT pre-bake a values→tier mapping — the engine maps at runtime.
+
 Infer **lifecycle stage** using these signals:
 
 | Stage | Signals |
@@ -373,6 +405,24 @@ Include: <file extensions for detected languages>
 
 ## Strategic Emphasis
 Lifecycle lean: <where to weight the Step 6 decision based on lifecycle — e.g. Greenfield/Alpha: capability gaps in the core loop; Beta/Growth: cross-cutting experience levers; Maintenance: operational/debt levers. A hint for the single decision, not a ranking scheme.>
+
+## Asana Integration
+
+<If Access succeeded, emit this block populated:>
+- **Access**: <mcp|cli|rest-pat> <(note MCP namespace or CLI binary if relevant)>
+- **User GID**: <user gid> — <user name>
+- **Workspaces**:
+  - <workspace gid> — <workspace name>
+- **Projects**: <all | list of `- <project gid> — <project name>`>
+- **Priority Field**:
+  - GID: <field gid>
+  - Name: <field name>
+  - Values: <comma-separated enum value names>
+  (Omit the Priority Field block if no matching field was sniffed.)
+
+<If Access is `none`, emit this block instead — install hint only:>
+- **Access**: none
+- **To enable**: install an Asana MCP plugin (recommended) — or set `ASANA_PERSONAL_ACCESS_TOKEN` from https://app.asana.com/0/my-apps — or install an `asana` CLI. Then re-run `/jacked-setup whats-next`.
 
 <!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
 - **Generated at commit**: <git rev-parse HEAD from Step 2>
