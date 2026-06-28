@@ -93,9 +93,11 @@ function buildSingleAccountHtml(group, nextRefreshAt) {
         org.orgLabel && org.orgLabel !== 'Personal'
             ? `<span class="org-tag" title="${escapeHtml(org.orgLabel)}">${escapeHtml(org.orgLabel)}</span>`
             : '';
+    const provider = org.provider || 'claude';
     return `
-        <section class="acct${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
+        <section class="acct provider-${provider}${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
             <div class="acct-head">
+                ${providerGlyph(provider)}
                 <span class="acct-email" title="${escapeHtml(group.email)}">${escapeHtml(group.email)}</span>
                 ${orgTag}
                 ${orgMetaHtml(org, nextRefreshAt)}
@@ -109,8 +111,9 @@ function buildMultiOrgLoginHtml(group, nextRefreshAt) {
     const rows = group.orgs
         .map(
             (org) => `
-            <div class="org-row${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
+            <div class="org-row provider-${org.provider || 'claude'}${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
                 <div class="org-row-head">
+                    ${providerGlyph(org.provider || 'claude')}
                     <span class="org-name" title="${escapeHtml(org.orgLabel)}">${escapeHtml(org.orgLabel)}</span>
                     ${orgMetaHtml(org, nextRefreshAt)}
                 </div>

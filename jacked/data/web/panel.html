@@ -96,6 +96,21 @@
         border-color: rgba(45, 212, 191, 0.22);
     }
 
+    /* Provider identity (Claude vs Codex) — shared glyph from js/util/provider.js.
+       The brand-colored glyph before the email/org-name is the primary cue; a
+       subtle left-edge bar on single-org cards adds an at-a-glance "backdrop"
+       (pseudo-element, no layout shift; .acct is position:relative). */
+    .provider-glyph {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 12px; height: 12px; flex: 0 0 auto;
+    }
+    .acct.provider-claude::before, .acct.provider-codex::before {
+        content: ""; position: absolute; left: 0; top: 7px; bottom: 7px;
+        width: 2px; border-radius: 2px;
+    }
+    .acct.provider-claude::before { background: rgba(217, 119, 87, 0.6); }
+    .acct.provider-codex::before { background: rgba(16, 163, 127, 0.7); }
+
     /* Identity line — shared by the single-account head, multi-org header, and
        per-org rows so columns line up across every account type. */
     .acct-head, .login-header, .org-row-head {
@@ -241,6 +256,7 @@
 
     <!-- Order matters: helpers → bar component → grouping util → panel renderer -->
     <script src="/js/utils.js"></script>
+    <script src="/js/util/provider.js"></script>
     <script src="/js/components/usage.js"></script>
     <script src="/js/util/account-grouping.js"></script>
     <script src="/js/components/panel.js"></script>

@@ -305,12 +305,14 @@ function renderAccountCard(acct, idx, total) {
 
     const disabledClass = status === 'disabled' ? ' opacity-60' : '';
     const primaryName = label || email;
+    const provider = (acct.provider || 'claude');
     return `
-        <div class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 card-hover${disabledClass}" data-account-id="${acct.id}">
+        <div class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 card-hover provider-card provider-${provider}${disabledClass}" data-account-id="${acct.id}">
             <div class="flex items-start">
                 ${priorityButtons}
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2 flex-wrap">
+                        ${providerBadge(provider)}
                         <span class="status-dot ${status}"></span>
                         <span class="font-medium text-white truncate max-w-[300px]" title="${escapeHtml(primaryName)}">${escapeHtml(primaryName)}</span>
                         <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors relative" data-id="${acct.id}" data-label="${escapeHtml(label)}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
