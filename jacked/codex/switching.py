@@ -133,7 +133,12 @@ def seed_codex_slot(
 # ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
-def _codex_swap_lock(base: Path, retries: int = 50) -> Iterator[bool]:
+def _codex_swap_lock(base: Path, retries: int = 340) -> Iterator[bool]:
+    # Default budget ≈ 17s (340 × 0.05s) so a user swap (run off the event loop
+    # via asyncio.to_thread) outlasts a usage poll's WORST-CASE lock hold —
+    # _APP_SERVER_TIMEOUT (12s) plus the ~3s app-server terminate tail — and
+    # acquires once it finishes instead of failing. The usage poll itself passes
+    # retries=1 (non-blocking skip).
     lock_dir = base / ".jacked-codex-swap.lock"
     pid_file = lock_dir / "pid"
     acquired = False
@@ -293,15 +298,14 @@ def swap_codex_account(
         # mutually exclusive on the shared root.
         live = _read_json(root_path)
 
-        # Identify the outgoing account from the LIVE auth.json's own identity
-        # (org OR email — handles personal/empty-org accounts and an out-of-band
-        # `codex login`), not just jacked's tracked pointer. Fall back to the
-        # tracked pointer when the live identity isn't a known Codex account.
-        outgoing_id = db.get_active_account_id("codex")
-        if live:
-            live_owner = find_codex_account_id(db, extract_identity(live))
-            if live_owner is not None:
-                outgoing_id = live_owner
+        # The outgoing account is whoever the LIVE root actually belongs to,
+        # resolved from the file's own identity by org OR email (handles
+        # personal/empty-org accounts and an out-of-band `codex login`). If that
+        # identity isn't a known Codex account, there is NO correct slot to
+        # capture into — skip the capture rather than clobber a tracked
+        # account's slot with a stranger's tokens (losing an untracked account's
+        # tokens is acceptable; corrupting a tracked slot is not).
+        outgoing_id = find_codex_account_id(db, extract_identity(live)) if live else None
 
         # Stale-replay guard BEFORE any write.
         _refuse_stale_replay(target_data, live)
@@ -309,7 +313,7 @@ def swap_codex_account(
         # 1. CAPTURE the live root into the outgoing account's slot FIRST, so the
         #    tokens Codex rotated while it was active are not lost.
         captured = False
-        if live and outgoing_id and outgoing_id != target_id:
+        if live and outgoing_id is not None and outgoing_id != target_id:
             _atomic_write_json(codex_slot_auth_path(outgoing_id, base), live)
             captured = True
 

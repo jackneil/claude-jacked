@@ -88,29 +88,33 @@ def test_seed_codex_slot_no_root_returns_false(tmp_path):
 
 def test_swap_field_complete_and_captures_outgoing(tmp_path, db):
     base = tmp_path / ".codex"
-    # B is live + active; A is a stored slot. Switch to A.
+    # B is live; A is a stored slot. Both are known Codex accounts. Switch to A.
+    a = db.create_account("a@x.com", "t", 9999999999, provider="codex",
+                          organization_uuid="acct-A")
+    b = db.create_account("b@x.com", "t", 9999999999, provider="codex",
+                          organization_uuid="acct-B")
     b_live = _auth("acct-B", email="b@x.com", last_refresh="2026-06-28T10:00:00Z")
     a_slot = _auth("acct-A", email="a@x.com", last_refresh="2026-06-28T09:00:00Z",
                    api_key=None, extra={"custom_field": "keepme"})
     _write(base / "auth.json", b_live)
-    _write(sw.codex_slot_auth_path(1, base), a_slot)   # account 1 = A
-    db.set_active_account_id(2, provider="codex")        # account 2 = B is active
+    _write(sw.codex_slot_auth_path(a["id"], base), a_slot)
+    db.set_active_account_id(b["id"], provider="codex")
 
-    result = sw.swap_codex_account(db, 1, base=base)
+    result = sw.swap_codex_account(db, a["id"], base=base)
 
     # Root now holds A, field-complete (every key preserved, incl. the extra one).
     root = json.loads((base / "auth.json").read_text())
     assert root == a_slot
     assert root["custom_field"] == "keepme"
     assert root["auth_mode"] == "chatgpt"
-    # Outgoing (B) was captured into its slot FIRST.
-    b_captured = json.loads(sw.codex_slot_auth_path(2, base).read_text())
+    # Outgoing (B) was captured into its slot FIRST (resolved from the live file).
+    b_captured = json.loads(sw.codex_slot_auth_path(b["id"], base).read_text())
     assert b_captured == b_live
     # Bookkeeping
     assert result.captured_outgoing is True
     assert result.restart_required is True
-    assert result.outgoing_id == 2
-    assert db.get_active_account_id("codex") == 1
+    assert result.outgoing_id == b["id"]
+    assert db.get_active_account_id("codex") == a["id"]
     assert db.get_active_account_id("claude") is None  # provider-isolated
 
 
@@ -197,6 +201,29 @@ def test_swap_captures_empty_org_outgoing_by_email(tmp_path, db):
     assert result.outgoing_id == o["id"]
     o_slot = json.loads(sw.codex_slot_auth_path(o["id"], base).read_text())
     assert o_slot["tokens"]["account_id"] == ""  # the empty-org account's live tokens
+
+
+def test_swap_skips_capture_for_unknown_live_account(tmp_path, db):
+    """If the live root belongs to an account jacked doesn't know (out-of-band
+    login), capture is SKIPPED — it must not clobber a tracked account's slot
+    with the stranger's tokens. (Regression for the /dcr Wave-2 finding.)"""
+    base = tmp_path / ".codex"
+    a = db.create_account("a@x.com", "t", 9999999999, provider="codex",
+                          organization_uuid="acct-A")
+    t = db.create_account("t@x.com", "t", 9999999999, provider="codex",
+                          organization_uuid="acct-T")
+    t_good = _auth("acct-T", email="t@x.com")
+    _write(sw.codex_slot_auth_path(t["id"], base), t_good)
+    _write(sw.codex_slot_auth_path(a["id"], base), _auth("acct-A", email="a@x.com"))
+    # Live root is a stranger not in the DB; the tracked pointer wrongly says T.
+    _write(base / "auth.json", _auth("acct-STRANGER", email="stranger@x.com"))
+    db.set_active_account_id(t["id"], provider="codex")
+
+    result = sw.swap_codex_account(db, a["id"], base=base)
+    assert result.captured_outgoing is False
+    assert result.outgoing_id is None
+    # T's slot is intact — NOT clobbered with the stranger's tokens.
+    assert json.loads(sw.codex_slot_auth_path(t["id"], base).read_text()) == t_good
 
 
 def test_accounts_container_locked_0700(tmp_path):

@@ -1171,10 +1171,17 @@ async def use_account(account_id: int, request: Request):
     # writing the Claude credential stores — and Codex has no CC tokens, so this
     # branches before the Claude-only checks below.
     if account.get("provider") == "codex":
+        import asyncio
+
         from jacked.codex.switching import CodexSwapError, swap_codex_account
 
         try:
-            result = swap_codex_account(db, account_id)
+            # swap_codex_account is SYNC and its file lock sleeps up to seconds;
+            # it shares the swap lock with the async usage poll, so running it
+            # on the event loop would freeze every coroutine (incl. the
+            # lock-holding poll) and deadlock the collision. Off-load it — the
+            # same convention the Claude swap path follows (usage_monitor).
+            result = await asyncio.to_thread(swap_codex_account, db, account_id)
         except CodexSwapError as exc:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,

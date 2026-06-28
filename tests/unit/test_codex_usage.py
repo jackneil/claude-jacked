@@ -134,7 +134,10 @@ def test_fetch_codex_usage_all_none_is_soft_failure(db, tmp_path, monkeypatch):
     result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
     assert result is None
     row = db.get_account(acct["id"])
-    assert row["consecutive_failures"] == 1
+    # SOFT failure: recorded, but does NOT increment consecutive_failures (would
+    # starve a healthy-but-empty/new account out of auto-swap fallback).
+    assert row["consecutive_failures"] == 0
+    assert row["last_error"] is not None
     assert row["cached_usage_5h"] is None  # not stamped with empty data
 
 

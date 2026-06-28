@@ -29,8 +29,10 @@ from .credentials import codex_home
 
 logger = logging.getLogger(__name__)
 
-# Whole handshake + read budget. app-server starts fast; this is a safety cap.
-_APP_SERVER_TIMEOUT = 20.0
+# Whole handshake + read budget. A usage read is fast (~1-2s); this is a safety
+# cap for a hung app-server. Kept tight because fetch_codex_usage holds the swap
+# lock for this whole duration, and a user swap waits on that lock.
+_APP_SERVER_TIMEOUT = 12.0
 
 
 class CodexUsageError(Exception):
@@ -263,7 +265,15 @@ async def fetch_codex_usage(
     if five["utilization"] is None and seven["utilization"] is None:
         logger.warning("Codex usage for account %s returned no windows", account_id)
         try:
-            db.record_account_error(account_id, "codex app-server returned no rate limits")
+            # SOFT failure: a brand-new account (pre-first-use) or an API-key
+            # account legitimately has no plan windows — record it without
+            # incrementing consecutive_failures, or it would be starved out of
+            # auto-swap fallback (get_fallback_account excludes failures >= 3).
+            db.record_account_error(
+                account_id,
+                "codex app-server returned no rate limits",
+                increment_failures=False,
+            )
         except Exception:  # pragma: no cover
             logger.debug("record_account_error failed", exc_info=True)
         return None
