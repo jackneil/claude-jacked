@@ -61,105 +61,83 @@
         box-shadow: 0 0 6px var(--accent);
     }
 
-    /* ---- Login group ---- */
-    .login-group {
+    /* ---- Account card (single-org) + login group (multi-org) ---- */
+    .acct, .login-group {
         background: var(--glass-panel);
         border: 1px solid var(--glass-border);
-        border-radius: 12px;
-        padding: 10px 12px;
-        margin-bottom: 10px;
+        border-radius: 10px;
+        padding: 7px 10px;
+        margin-bottom: 6px;
         position: relative;
     }
-    .login-header {
+    .acct.is-active, .login-group.has-active {
+        background: rgba(45, 212, 191, 0.07);
+        border-color: rgba(45, 212, 191, 0.22);
+    }
+
+    /* Identity line — shared by the single-account head, multi-org header, and
+       per-org rows so columns line up across every account type. */
+    .acct-head, .login-header, .org-row-head {
         display: flex;
         align-items: center;
-        gap: 8px;
-        margin-bottom: 2px;
-    }
-    .login-name {
-        font-weight: 600;
-        font-size: 13px;
-        color: var(--txt);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 230px;
-    }
-    .login-email {
-        font-size: 11px;
-        color: var(--txt-muted);
+        gap: 6px;
         margin-bottom: 4px;
+        min-width: 0;
+    }
+    .acct-email, .login-name {
+        font-weight: 600;
+        font-size: 12px;
+        color: var(--txt);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        flex: 0 1 auto; min-width: 0; max-width: 210px;
+    }
+    .org-name {
+        font-size: 12px; color: var(--txt);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        flex: 0 1 auto; min-width: 0; max-width: 150px;
+    }
+    .org-tag {
+        font-size: 10px; color: var(--txt-muted);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        flex: 0 1 auto; min-width: 0; max-width: 90px;
     }
     .org-chip {
-        font-size: 10px;
-        font-weight: 600;
-        color: var(--accent);
+        font-size: 10px; font-weight: 600; color: var(--accent);
         background: rgba(45, 212, 191, 0.12);
         border: 1px solid rgba(45, 212, 191, 0.25);
-        border-radius: 999px;
-        padding: 1px 7px;
-        line-height: 1.5;
+        border-radius: 999px; padding: 0 6px; line-height: 1.5; flex: none;
+    }
+    .plan-badge {
+        font-size: 10px; color: var(--txt-muted);
+        background: rgba(255,255,255,0.06);
+        border-radius: 4px; padding: 0 5px; flex: none; white-space: nowrap;
+    }
+    .active-badge {
+        font-size: 9px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+        color: #0b1f1c; background: var(--accent);
+        border-radius: 4px; padding: 1px 5px; flex: none;
+    }
+    /* Pushes the freshness age to the right edge so all ages align in a column. */
+    .meta-spacer { flex: 1 1 0; }
+    .acct-age {
+        font-size: 10px; color: var(--txt-dim);
+        font-variant-numeric: tabular-nums; flex: none;
     }
 
     /* Connecting rail for multi-org logins */
-    .login-group.has-rail .org-rows {
-        margin-left: 8px;
-        padding-left: 12px;
-        border-left: 2px solid var(--rail);
-    }
+    .login-group.has-rail .org-rows { margin-left: 6px; padding-left: 10px; border-left: 2px solid var(--rail); }
+    .org-row { padding: 5px 0 2px; }
+    .org-row + .org-row { border-top: 1px solid rgba(255,255,255,0.05); }
+    .org-row.is-active { margin: 0 -6px; padding: 5px 6px 3px; border-radius: 7px; background: rgba(45, 212, 191, 0.06); }
 
-    /* ---- Org row ---- */
-    .org-row {
-        padding: 7px 0 3px;
-    }
-    .org-row + .org-row {
-        border-top: 1px solid rgba(255,255,255,0.05);
-    }
-    .org-row.is-active {
-        /* active org gets a faint accent wash + left edge marker */
-        margin: 0 -6px;
-        padding: 7px 6px 4px;
-        border-radius: 8px;
-        background: rgba(45, 212, 191, 0.06);
-    }
-    .org-row-head {
-        display: flex;
-        align-items: center;
-        gap: 7px;
-        margin-bottom: 5px;
-    }
-    .org-name {
-        font-size: 12px;
-        color: var(--txt);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 170px;
-    }
-    .plan-badge {
-        font-size: 10px;
-        color: var(--txt-muted);
-        background: rgba(255,255,255,0.06);
-        border-radius: 5px;
-        padding: 1px 6px;
-    }
-    .active-badge {
-        font-size: 10px;
-        font-weight: 600;
-        color: #0b1f1c;
-        background: var(--accent);
-        border-radius: 5px;
-        padding: 1px 6px;
-        margin-left: auto;
-    }
-    .org-bars { display: flex; flex-direction: column; gap: 3px; }
+    .org-bars { display: flex; flex-direction: column; gap: 2px; }
 
     /* ---- Usage bar — copied verbatim from css/style.css so the bars render
          identically here without pulling the whole dashboard stylesheet. ---- */
     .usage-bar {
         position: relative;
-        height: 12px;
-        border-radius: 6px;
+        height: 10px;
+        border-radius: 5px;
         background-color: #334155;
         overflow: visible;
         width: 100%;
