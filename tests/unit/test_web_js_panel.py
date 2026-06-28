@@ -135,6 +135,40 @@ out({ hasMarker: html.includes('elapsed-marker') });
     assert result["hasMarker"] is False
 
 
+def test_compact_bar_shows_reset_time_inline(tmp_path):
+    """The dropdown panel must show WHEN each window resets, inline — not only on
+    hover. Regression for the "dropdown doesn't show 5h/7d reset time" report."""
+    result = _run(tmp_path, """
+formatResetTime = (iso) => iso ? 'resets 3:45 PM' : '';
+const reset = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'a@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 40, cached_usage_7d: 30,
+      cached_5h_resets_at: reset, cached_7d_resets_at: reset },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert html.count("reset-caption") == 2, "both 5h and 7d show an inline reset"
+    assert ">3:45 PM<" in html, "the stripped reset time renders as visible text"
+    # The 'resets ' prefix is dropped in the visible caption (kept in the title)
+    assert ">resets 3:45 PM<" not in html
+    assert "tabular-nums" in html
+
+
+def test_compact_bar_no_reset_caption_without_reset_time(tmp_path):
+    """No reset timestamp → no caption span (don't render an empty element)."""
+    result = _run(tmp_path, """
+formatResetTime = (iso) => iso ? 'resets 3:45 PM' : '';
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'a@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 50, cached_usage_7d: 50 },
+], null));
+out({ hasCaption: html.includes('reset-caption') });
+""")
+    assert result["hasCaption"] is False
+
+
 def test_single_account_is_email_primary_and_strips_org_noise(tmp_path):
     """Single-org account collapses to one email-primary line; the noisy
     "<email>'s Organization" label is gone; freshness age is shown; no chip/rail."""
