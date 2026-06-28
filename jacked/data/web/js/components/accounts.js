@@ -305,12 +305,14 @@ function renderAccountCard(acct, idx, total) {
 
     const disabledClass = status === 'disabled' ? ' opacity-60' : '';
     const primaryName = label || email;
+    const provider = (acct.provider || 'claude');
     return `
-        <div class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 card-hover${disabledClass}" data-account-id="${acct.id}">
+        <div class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 card-hover provider-card provider-${provider}${disabledClass}" data-account-id="${acct.id}">
             <div class="flex items-start">
                 ${priorityButtons}
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2 flex-wrap">
+                        ${providerBadge(provider)}
                         <span class="status-dot ${status}"></span>
                         <span class="font-medium text-white truncate max-w-[300px]" title="${escapeHtml(primaryName)}">${escapeHtml(primaryName)}</span>
                         <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors relative" data-id="${acct.id}" data-label="${escapeHtml(label)}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
@@ -449,7 +451,7 @@ function renderEmptyState() {
                 <svg class="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
             </div>
             <h3 class="text-lg font-semibold text-white mb-1">No accounts connected</h3>
-            <p class="text-sm text-slate-400 mb-6">Connect your Claude account to get started</p>
+            <p class="text-sm text-slate-400 mb-6">Connect a Claude or Codex account to get started</p>
             <button id="btn-add-account" class="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition active:scale-[0.96]">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                 Add Account

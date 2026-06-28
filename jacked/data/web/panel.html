@@ -9,10 +9,38 @@
 <link rel="icon" href="data:,">
 <link rel="apple-touch-icon" href="data:,">
 
-<!-- Tailwind: renderUsageBar() emits Tailwind utility classes, so we load the
-     same CDN the dashboard uses. Keeps the bars pixel-identical to the dashboard
-     (single source of truth) instead of forking a second renderer. -->
-<script src="https://cdn.tailwindcss.com"></script>
+<!-- The dropdown must open INSTANTLY and work offline, so it does NOT load the
+     Tailwind CDN (a network fetch + runtime JIT on every open). renderUsageBar()
+     emits a small, fixed set of Tailwind utility classes; we vendor exactly
+     those below so the bars stay pixel-identical to the dashboard. -->
+<style>
+    /* ---- Vendored Tailwind utilities used by renderUsageBar / providerGlyph ---- */
+    .flex { display: flex; }
+    .flex-1 { flex: 1 1 0%; }
+    .items-center { align-items: center; }
+    .gap-2 { gap: 0.5rem; }
+    .gap-3 { gap: 0.75rem; }
+    .mb-0\.5 { margin-bottom: 0.125rem; }
+    .mb-1 { margin-bottom: 0.25rem; }
+    .shrink-0 { flex-shrink: 0; }
+    .whitespace-nowrap { white-space: nowrap; }
+    .text-right { text-align: right; }
+    .w-5 { width: 1.25rem; }
+    .w-9 { width: 2.25rem; }
+    .w-10 { width: 2.5rem; }
+    .w-14 { width: 3.5rem; }
+    .w-28 { width: 7rem; }
+    .text-\[10px\] { font-size: 10px; }
+    .text-\[11px\] { font-size: 11px; }
+    .text-xs { font-size: 0.75rem; line-height: 1rem; }
+    .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+    .text-slate-300 { color: #cbd5e1; }
+    .text-slate-400 { color: #94a3b8; }
+    .text-slate-500 { color: #64748b; }
+    .text-red-400 { color: #f87171; }
+    .text-yellow-400 { color: #facc15; }
+</style>
 
 <style>
     /* ---- Compact dark-glass theme (purpose-built, not a shrunk dashboard) ---- */
@@ -95,6 +123,21 @@
         background: rgba(45, 212, 191, 0.07);
         border-color: rgba(45, 212, 191, 0.22);
     }
+
+    /* Provider identity (Claude vs Codex) — shared glyph from js/util/provider.js.
+       The brand-colored glyph before the email/org-name is the primary cue; a
+       subtle left-edge bar on single-org cards adds an at-a-glance "backdrop"
+       (pseudo-element, no layout shift; .acct is position:relative). */
+    .provider-glyph {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 12px; height: 12px; flex: 0 0 auto;
+    }
+    .acct.provider-claude::before, .acct.provider-codex::before {
+        content: ""; position: absolute; left: 0; top: 7px; bottom: 7px;
+        width: 2px; border-radius: 2px;
+    }
+    .acct.provider-claude::before { background: rgba(167, 139, 250, 0.7); }
+    .acct.provider-codex::before { background: rgba(96, 165, 250, 0.7); }
 
     /* Identity line — shared by the single-account head, multi-org header, and
        per-org rows so columns line up across every account type. */
@@ -241,6 +284,7 @@
 
     <!-- Order matters: helpers → bar component → grouping util → panel renderer -->
     <script src="/js/utils.js"></script>
+    <script src="/js/util/provider.js"></script>
     <script src="/js/components/usage.js"></script>
     <script src="/js/util/account-grouping.js"></script>
     <script src="/js/components/panel.js"></script>

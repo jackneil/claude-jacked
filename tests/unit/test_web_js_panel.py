@@ -18,6 +18,7 @@ WEB_JS = Path(__file__).resolve().parents[2] / "jacked" / "data" / "web" / "js"
 USAGE_JS = WEB_JS / "components" / "usage.js"
 GROUPING_JS = WEB_JS / "util" / "account-grouping.js"
 PANEL_JS = WEB_JS / "components" / "panel.js"
+PROVIDER_JS = WEB_JS / "util" / "provider.js"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node not installed"
@@ -30,6 +31,7 @@ global.escapeHtml = (s) => String(s == null ? '' : s)
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 global.formatResetTime = (iso) => iso ? 'resets soon' : '';
 const out = (o) => process.stdout.write('\n' + JSON.stringify(o) + '\n');
+eval(fs.readFileSync(__PROVIDER__, 'utf8'));
 eval(fs.readFileSync(__USAGE__, 'utf8'));
 eval(fs.readFileSync(__GROUPING__, 'utf8'));
 eval(fs.readFileSync(__PANEL__, 'utf8'));
@@ -39,6 +41,7 @@ eval(fs.readFileSync(__PANEL__, 'utf8'));
 def _run(tmp_path, snippet):
     program = (
         _HARNESS
+        .replace("__PROVIDER__", json.dumps(str(PROVIDER_JS)))
         .replace("__USAGE__", json.dumps(str(USAGE_JS)))
         .replace("__GROUPING__", json.dumps(str(GROUPING_JS)))
         .replace("__PANEL__", json.dumps(str(PANEL_JS)))
@@ -55,7 +58,9 @@ def _run(tmp_path, snippet):
     return json.loads(lines[-1])
 
 
-@pytest.mark.parametrize("js_file", [USAGE_JS, GROUPING_JS, PANEL_JS], ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    "js_file", [PROVIDER_JS, USAGE_JS, GROUPING_JS, PANEL_JS], ids=lambda p: p.name
+)
 def test_node_syntax_check(js_file):
     proc = subprocess.run(["node", "--check", str(js_file)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
@@ -133,6 +138,74 @@ const html = buildPanelHtml(groupAccountsByLogin([
 out({ hasMarker: html.includes('elapsed-marker') });
 """)
     assert result["hasMarker"] is False
+
+
+def test_panel_marks_provider_per_account(tmp_path):
+    """Each panel row carries a provider glyph + provider-* class; Codex and
+    Claude get distinct brand colors so you can tell accounts apart."""
+    result = _run(tmp_path, """
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'claudey@x.com', organization_uuid: '', priority: 0,
+      provider: 'claude', cached_usage_5h: 10, cached_usage_7d: 5 },
+    { id: 2, email: 'codey@x.com', organization_uuid: '', priority: 1,
+      provider: 'codex', cached_usage_5h: 20, cached_usage_7d: 15 },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert "provider-glyph" in html
+    assert "provider-claude" in html and "provider-codex" in html
+    assert "#a78bfa" in html  # Claude violet
+    assert "#60a5fa" in html  # Codex blue
+    assert 'title="Claude account"' in html and 'title="Codex account"' in html
+
+
+def test_panel_provider_defaults_to_claude_when_missing(tmp_path):
+    """An account row with no provider field renders as Claude (back-compat)."""
+    result = _run(tmp_path, """
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'legacy@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 10, cached_usage_7d: 5 },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert "provider-claude" in html
+    assert "provider-codex" not in html
+
+
+def test_compact_bar_shows_reset_time_inline(tmp_path):
+    """The dropdown panel must show WHEN each window resets, inline — not only on
+    hover. Regression for the "dropdown doesn't show 5h/7d reset time" report."""
+    result = _run(tmp_path, """
+formatResetTime = (iso) => iso ? 'resets 3:45 PM' : '';
+const reset = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'a@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 40, cached_usage_7d: 30,
+      cached_5h_resets_at: reset, cached_7d_resets_at: reset },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert html.count("reset-caption") == 2, "both 5h and 7d show an inline reset"
+    assert ">3:45 PM<" in html, "the stripped reset time renders as visible text"
+    # The 'resets ' prefix is dropped in the visible caption (kept in the title)
+    assert ">resets 3:45 PM<" not in html
+    assert "tabular-nums" in html
+
+
+def test_compact_bar_no_reset_caption_without_reset_time(tmp_path):
+    """No reset timestamp → no caption span (don't render an empty element)."""
+    result = _run(tmp_path, """
+formatResetTime = (iso) => iso ? 'resets 3:45 PM' : '';
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'a@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 50, cached_usage_7d: 50 },
+], null));
+out({ hasCaption: html.includes('reset-caption') });
+""")
+    assert result["hasCaption"] is False
 
 
 def test_single_account_is_email_primary_and_strips_org_noise(tmp_path):

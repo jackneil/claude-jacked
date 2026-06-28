@@ -113,20 +113,37 @@ def _http_send_json(url: str, method: str, payload: dict | None, timeout: float 
         return json.loads(body) if body else {}
 
 
-def _render_status_icon(color: str, update: bool = False) -> "str | None":
+# Per-provider accent dot drawn on the pill when the active account isn't Claude.
+# RGB tuples mirror the web provider marks (js/util/provider.js).
+_PROVIDER_DOT = {
+    "codex": (96, 165, 250, 255),  # blue (matches the web Codex mark)
+}
+
+
+def _render_status_icon(
+    color: str, update: bool = False, provider: str = "claude"
+) -> "str | None":
     """Draw a rounded-rect "J" glyph filled with the status color; return a PNG
-    path (cached per color+update under ~/.claude). When *update* is set, overlay
-    an "update available" badge (a blue dot with a white ring, top-right) so the
-    menu bar makes a waiting update obvious without opening the menu. Returns None
-    if rendering fails — the caller then falls back to text only."""
+    path (cached per color+update+provider under ~/.claude). When *update* is set,
+    overlay an "update available" badge (a blue dot with a white ring, top-right)
+    so the menu bar makes a waiting update obvious without opening the menu. When
+    the active account's *provider* isn't Claude (e.g. Codex), overlay a small
+    brand-colored dot (bottom-left) so the pill shows which provider you're on.
+    The Claude icon is unchanged (same cache path). Returns None if rendering
+    fails — the caller then falls back to text only."""
     try:
         from PIL import Image, ImageDraw
 
         from jacked.service import CLAUDE_DIR
         from jacked.service.tray import _load_glyph_font
 
+        provider = provider or "claude"
+        prov_suffix = "" if provider == "claude" else f"-{provider}"
         CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-        path = CLAUDE_DIR / f"jacked-menubar-{color}{'-upd' if update else ''}.png"
+        path = (
+            CLAUDE_DIR
+            / f"jacked-menubar-{color}{'-upd' if update else ''}{prov_suffix}.png"
+        )
         if path.exists():
             return str(path)
 
@@ -147,11 +164,19 @@ def _render_status_icon(color: str, update: bool = False) -> "str | None":
             cx, cy, r = size - 11, 11, 8
             draw.ellipse([cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2], fill=(255, 255, 255, 255))
             draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(59, 130, 246, 255))
+        dot = _PROVIDER_DOT.get(provider)
+        if dot:
+            # Provider badge: brand dot + white ring, bottom-left (opposite the
+            # update badge so they never overlap).
+            cx, cy, r = 11, size - 11, 8
+            draw.ellipse([cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2], fill=(255, 255, 255, 255))
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=dot)
         img.save(str(path))
         return str(path)
     except Exception:
         logger.exception(
-            "Could not render menu-bar status icon (color=%s, update=%s)", color, update
+            "Could not render menu-bar status icon (color=%s, update=%s, provider=%s)",
+            color, update, provider,
         )
         return None
 
@@ -268,6 +293,12 @@ if RUMPS_AVAILABLE:
             # the left/right click split from a short poll timer.
             self._wire_timer = rumps.Timer(self._try_wire_click, WIRE_RETRY_INTERVAL)
             self._wire_timer.start()
+            # Pre-warm the dropdown webview shortly after launch (the server is up
+            # by now) so the FIRST tray click opens instantly — the webview has
+            # already loaded /panel + fetched usage by the time it's clicked,
+            # instead of paying WKWebView init + page load + first fetch on click.
+            self._prewarm_timer = rumps.Timer(self._prewarm_dropdown, 1.5)
+            self._prewarm_timer.start()
 
             # Version/update: the pystray path starts this in _setup; the mac path
             # must start it too, or the version line never learns about updates.
@@ -291,7 +322,11 @@ if RUMPS_AVAILABLE:
                 data = _http_get_json(self._base_url + "/api/menubar-summary")
                 active = data.get("active")
                 self.title = " " + menubar_title(active)
-                self._set_icon((active or {}).get("color") or "gray", upd)
+                self._set_icon(
+                    (active or {}).get("color") or "gray",
+                    upd,
+                    (active or {}).get("provider") or "claude",
+                )
             except Exception:
                 self.title = " —"  # degraded — server unreachable
                 self._set_icon("gray", upd)
@@ -307,12 +342,13 @@ if RUMPS_AVAILABLE:
             # Keep the version line / last-checked / autostart state fresh.
             self._refresh_version_menu()
 
-        def _set_icon(self, color, update=False):
-            """Set the colored "J" icon (+ update badge), only when it changed."""
-            key = (color, update)
+        def _set_icon(self, color, update=False, provider="claude"):
+            """Set the colored "J" icon (+ update badge + provider dot), only when
+            it changed."""
+            key = (color, update, provider)
             if key == self._current_icon_key:
                 return
-            path = _render_status_icon(color, update)
+            path = _render_status_icon(color, update, provider)
             if path:
                 try:
                     self.icon = path
@@ -470,18 +506,37 @@ if RUMPS_AVAILABLE:
                 self._panel.orderFrontRegardless()
                 self._panel_visible = True
 
+        def _ensure_popover(self):
+            """Create the dropdown popover + its /panel webview if not made yet.
+            Idempotent; called both at startup (pre-warm) and lazily on click."""
+            if self._popover is not None:
+                return
+            pop = NSPopover.alloc().init()
+            pop.setBehavior_(NSPopoverBehaviorTransient)
+            pop.setContentSize_(NSSize(PANEL_WIDTH, POPOVER_HEIGHT))
+            web = self._make_webview(PANEL_WIDTH, POPOVER_HEIGHT)
+            vc = NSViewController.alloc().init()
+            vc.setView_(web)
+            pop.setContentViewController_(vc)
+            self._popover = pop
+            self._popover_web = web
+
+        def _prewarm_dropdown(self, timer=None):
+            """One-shot: build + load the dropdown webview ahead of the first
+            click. Best-effort — on failure the click falls back to lazy build."""
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+            try:
+                self._ensure_popover()
+            except Exception:
+                logger.exception("dropdown pre-warm failed")
+
         def _on_dropdown(self, _sender):
             """Toggle the rich /panel as an NSPopover anchored to the status button."""
-            if self._popover is None:
-                pop = NSPopover.alloc().init()
-                pop.setBehavior_(NSPopoverBehaviorTransient)
-                pop.setContentSize_(NSSize(PANEL_WIDTH, POPOVER_HEIGHT))
-                web = self._make_webview(PANEL_WIDTH, POPOVER_HEIGHT)
-                vc = NSViewController.alloc().init()
-                vc.setView_(web)
-                pop.setContentViewController_(vc)
-                self._popover = pop
-                self._popover_web = web
+            self._ensure_popover()
             if self._popover.isShown():
                 self._popover.performClose_(None)
                 return

@@ -439,3 +439,40 @@ async function startCcAuthFlow(accountId, email) {
 
     window.jackedState.flowPolling = pollInterval;
 }
+
+// ---------------------------------------------------------------------------
+// Codex add flow — imports the signed-in ~/.codex account (no browser OAuth;
+// Codex sign-in happens via `codex login` in a terminal).
+// ---------------------------------------------------------------------------
+async function startAddCodexFlow() {
+    window.jackedState._accountActionInFlight = true;
+    const statusEl = document.getElementById('oauth-flow-status');
+    if (statusEl) {
+        statusEl.innerHTML = `
+            <div class="bg-blue-900/30 border border-blue-700 rounded-lg px-4 py-3 text-sm text-blue-200 flex items-center gap-3">
+                <div class="spinner"></div>
+                <div>Importing your signed-in Codex account…</div>
+            </div>`;
+    }
+    try {
+        const result = await api.post('/api/auth/accounts/add?provider=codex');
+        if (statusEl) statusEl.innerHTML = '';
+        showToast(`Added Codex account ${result.email || ''}`.trim(), 'success');
+        await refreshAndRender();
+    } catch (e) {
+        const needsLogin = e && e.code === 'CODEX_LOGIN_REQUIRED';
+        const msg = needsLogin
+            ? 'Not signed in to Codex. Run `codex login` in a terminal, then click Add Account → Codex again.'
+            : (e && e.message) || 'Failed to add Codex account';
+        if (statusEl) {
+            statusEl.innerHTML = `
+                <div class="bg-amber-900/30 border border-amber-700 rounded-lg px-4 py-3 text-sm text-amber-200">
+                    ${escapeHtml(msg)}
+                </div>`;
+        } else {
+            showToast(msg, needsLogin ? 'warning' : 'error');
+        }
+    } finally {
+        window.jackedState._accountActionInFlight = false;
+    }
+}

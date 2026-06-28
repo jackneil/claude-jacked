@@ -2885,6 +2885,11 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     is_flag=True,
     help="Emit the change-summary as JSON instead of the human summary",
 )
+@click.option(
+    "--no-codex",
+    is_flag=True,
+    help="Skip installing skills/commands/rules/gatekeeper into Codex (auto-detected by default)",
+)
 def install(
     sounds: bool,
     search: bool,
@@ -2893,6 +2898,7 @@ def install(
     no_tray: bool,
     force: bool,
     as_json: bool,
+    no_codex: bool,
 ):
     """Auto-install skill, agents, commands, and optional hooks.
 
@@ -2960,11 +2966,50 @@ def install(
     _record = _isum.build_record(_d, _prior_version, _ver, _now)
     _isum.write_last_install(_record, home / ".claude" / "jacked-last-install.json")
 
+    # --- Codex pass (auto-detected) ---
+    # Deploy the same skills/commands/rules/gatekeeper into Codex's native
+    # locations (~/.agents/skills, ~/.codex/prompts, ~/.codex/AGENTS.md,
+    # ~/.codex/hooks.json) with its own manifest. Best-effort: a Codex failure
+    # never fails the Claude install.
+    _codex_summary = None
+    if not no_codex:
+        try:
+            from jacked.codex import installer as _cdx
+
+            if _cdx.codex_present():
+                _codex_summary = _cdx.install_codex(
+                    pkg_root,
+                    hook_command=_build_hook_command("security_gatekeeper"),
+                    version=_ver,
+                    now_iso=_now,
+                )
+        except Exception:
+            logger.exception("Codex install pass failed (Claude install unaffected)")
+
     if as_json:
+        if _codex_summary is not None:
+            _record["codex"] = {
+                "skills": _codex_summary.skills,
+                "prompts": _codex_summary.prompts,
+                "rules": _codex_summary.rules,
+                "hooks": _codex_summary.hooks,
+                "removed": _codex_summary.removed,
+            }
         click.echo(json.dumps(_record))
     else:
         console.print("")
         console.print(_isum.render_terminal(_record))
+        if _codex_summary is not None:
+            console.print(
+                f"[green][OK][/green] Codex: {len(_codex_summary.skills)} skills "
+                f"→ ~/.agents/skills, {len(_codex_summary.prompts)} prompts "
+                f"→ ~/.codex/prompts, rules → AGENTS.md, gatekeeper → hooks.json"
+            )
+            if _codex_summary.hooks:
+                console.print(
+                    "[yellow][-][/yellow] Codex gatekeeper hook installed but "
+                    "inactive until you trust it: run [bold]/hooks[/bold] in Codex."
+                )
         # Required-plugin blocker only — the full recommendations now live in
         # `jacked doctor`.
         _warn_required_plugins_missing()
@@ -3060,12 +3105,18 @@ def _run_install(
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
             skill_dir.mkdir(parents=True, exist_ok=True)
-            dst = skill_dir / "SKILL.md"
-            # Use _link_or_copy (symlink in editable mode, copy otherwise).
-            # Plain shutil.copy raises SameFileError if dst is already a
-            # symlink pointing to src — broke the tray-triggered upgrade
-            # flow when a manual symlink from dev/testing was present.
-            _link_or_copy(skill_md, dst)
+            src_skill_root = skill_md.parent
+            # Copy SKILL.md AND every sidecar file (scripts, references/, assets)
+            # — a skill that ships a measure.js etc. is broken without them.
+            # _link_or_copy symlinks in editable mode, copies otherwise (plain
+            # shutil.copy raises SameFileError if dst is already a symlink to src
+            # — broke the tray-triggered upgrade when a dev symlink was present).
+            for src_file in sorted(
+                p for p in src_skill_root.rglob("*") if p.is_file()
+            ):
+                dst = skill_dir / src_file.relative_to(src_skill_root)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                _link_or_copy(src_file, dst)
             skill_count += 1
     if skill_count > 0:
         console.print(f"[green][OK][/green] Installed {skill_count} skills")
@@ -3855,6 +3906,18 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _last_install_path = home / ".claude" / "jacked-last-install.json"
     if _last_install_path.exists():
         _last_install_path.unlink()
+
+    # Remove the Codex artifacts too (best-effort; per the Codex manifest).
+    try:
+        from jacked.codex import installer as _cdx
+
+        _cdx_removed = _cdx.uninstall_codex().get("removed", [])
+        if _cdx_removed:
+            console.print(
+                f"[green][OK][/green] Removed {len(_cdx_removed)} Codex artifacts"
+            )
+    except Exception:
+        logger.exception("Codex uninstall pass failed")
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(
@@ -4971,6 +5034,134 @@ def claude_cmd(account, claude_args):
         claude_args = claude_args[1:]
 
     launch_claude(config_dir, claude_args, db_path=str(db_path))
+
+
+# ── Codex provider commands ──────────────────────────────────────────
+
+
+@main.group(name="codex")
+def codex_group():
+    """Manage OpenAI Codex accounts (add, list, switch, launch)."""
+
+
+@codex_group.command(name="add")
+@click.option(
+    "--make-active", is_flag=True,
+    help="Mark this as the active Codex account after adding.",
+)
+@click.option(
+    "--no-login", is_flag=True,
+    help="Don't run `codex login`; import an already-logged-in account only.",
+)
+def codex_add_cmd(make_active, no_login):
+    """Add (or refresh) the logged-in Codex account in jacked.
+
+    Forces file-based credential storage (so jacked can manage the account),
+    runs `codex login` if you're not signed in, then imports the account's
+    identity. Tokens stay in ~/.codex/auth.json — jacked stores identity only.
+
+    >>> # CLI command: jacked codex add [--make-active] [--no-login]
+    """
+    from jacked.codex.accounts import CodexImportError, add_codex_account
+
+    db = _codex_db()
+    try:
+        acct = add_codex_account(
+            db, run_login=not no_login, make_active=make_active
+        )
+    except CodexImportError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        db.close()
+
+    plan = acct.get("subscription_type") or "?"
+    console.print(
+        f"Added Codex account [bold]{acct['email']}[/bold] "
+        f"(plan {plan}, id {acct['id']})."
+    )
+    if make_active:
+        console.print(
+            "It's now the active Codex account — restart Codex to pick it up."
+        )
+    else:
+        console.print(
+            f"Its usage will show in the dashboard. Make it active with "
+            f"[bold]jacked codex use {acct['id']}[/bold]."
+        )
+
+
+def _codex_db():
+    from jacked.web.database import Database
+
+    return Database(str(Path.home() / ".claude" / "jacked.db"))
+
+
+@codex_group.command(name="list")
+def codex_list_cmd():
+    """List the Codex accounts jacked knows about.
+
+    >>> # CLI command: jacked codex list
+    """
+    db = _codex_db()
+    try:
+        active = db.get_active_account_id("codex")
+        rows = [a for a in db.list_accounts() if a.get("provider") == "codex"]
+    finally:
+        db.close()
+    if not rows:
+        console.print("No Codex accounts yet. Add one with [bold]jacked codex add[/bold].")
+        return
+    for a in rows:
+        mark = "→ " if a["id"] == active else "  "
+        plan = a.get("subscription_type") or "?"
+        console.print(f"{mark}[bold]{a['id']}[/bold]  {a['email']}  ({plan})")
+
+
+@codex_group.command(name="use")
+@click.argument("account_id", type=int)
+def codex_use_cmd(account_id):
+    """Make ACCOUNT_ID the active Codex account (swaps ~/.codex/auth.json).
+
+    Restart Codex afterwards — it caches auth at startup.
+
+    >>> # CLI command: jacked codex use <id>
+    """
+    from jacked.codex.switching import CodexSwapError, swap_codex_account
+
+    db = _codex_db()
+    try:
+        swap_codex_account(db, account_id)
+    except CodexSwapError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        db.close()
+    console.print(
+        f"Active Codex account → [bold]{account_id}[/bold]. "
+        "Restart Codex (CLI/app/IDE) to pick it up — it caches auth at startup."
+    )
+
+
+@codex_group.command(
+    name="launch", context_settings={"ignore_unknown_options": True}
+)
+@click.argument("account_id", type=int)
+@click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
+def codex_launch_cmd(account_id, codex_args):
+    """Launch Codex isolated on ACCOUNT_ID via its own CODEX_HOME.
+
+    Unlike `use`, this does NOT touch the shared root account — it runs Codex in
+    a per-account home, sidestepping the single-file refresh-token race. Extra
+    args pass through to `codex`.
+
+    >>> # CLI command: jacked codex launch <id> [codex args...]
+    """
+    from jacked.codex.switching import CodexSwapError, launch_codex
+
+    try:
+        console.print(f"Launching Codex on account [bold]{account_id}[/bold]...")
+        launch_codex(account_id, codex_args)
+    except CodexSwapError as exc:
+        raise click.ClickException(str(exc))
 
 
 # ── Convenience init command ─────────────────────────────────────────

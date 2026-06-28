@@ -138,6 +138,7 @@ class AccountResponse(BaseModel):
     """Account data with computed fields for API responses."""
 
     id: int
+    provider: str = "claude"
     email: str
     organization_uuid: Optional[str] = None
     organization_name: Optional[str] = None
@@ -380,6 +381,7 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
     # Build response without access_token or refresh_token (never expose)
     return AccountResponse(
         id=row["id"],
+        provider=row.get("provider") or "claude",
         email=row["email"],
         organization_uuid=row.get("organization_uuid") or None,
         organization_name=row.get("organization_name"),
@@ -428,11 +430,40 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
 
 
 @router.post("/accounts/add")
-async def start_add_account(request: Request):
-    """Start OAuth flow to add a new account. Returns flow_id for polling."""
+async def start_add_account(request: Request, provider: str = "claude"):
+    """Add an account.
+
+    Claude (default): starts the Anthropic OAuth flow, returns a flow_id to poll.
+    Codex (``?provider=codex``): forces file-based credential storage and imports
+    the already-logged-in ``~/.codex/auth.json``. If no Codex account is logged
+    in, returns 400 ``needs_login`` so the UI can prompt the user to run
+    ``codex login`` (the browser OAuth can't be driven from the background API).
+    """
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
+
+    if provider == "codex":
+        from jacked.codex.accounts import CodexImportError, add_codex_account
+
+        try:
+            acct = add_codex_account(db, run_login=False)
+        except CodexImportError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {"message": str(exc), "code": "CODEX_LOGIN_REQUIRED"},
+                    "needs_login": True,
+                    "command": "codex login",
+                },
+            )
+        return {
+            "provider": "codex",
+            "imported": True,
+            "account_id": acct["id"],
+            "email": acct["email"],
+            "plan": acct.get("subscription_type"),
+        }
 
     flow = OAuthFlow(db)
     result = await flow.start()
@@ -1133,6 +1164,40 @@ async def use_account(account_id: int, request: Request):
                     "message": "Account has invalid credentials — re-auth first",
                     "code": "ACCOUNT_INVALID",
                 }
+            },
+        )
+
+    # Codex accounts switch by swapping ~/.codex/auth.json (guardrailed), not by
+    # writing the Claude credential stores — and Codex has no CC tokens, so this
+    # branches before the Claude-only checks below.
+    if account.get("provider") == "codex":
+        import asyncio
+
+        from jacked.codex.switching import CodexSwapError, swap_codex_account
+
+        try:
+            # swap_codex_account is SYNC and its file lock sleeps up to seconds;
+            # it shares the swap lock with the async usage poll, so running it
+            # on the event loop would freeze every coroutine (incl. the
+            # lock-holding poll) and deadlock the collision. Off-load it — the
+            # same convention the Claude swap path follows (usage_monitor).
+            result = await asyncio.to_thread(swap_codex_account, db, account_id)
+        except CodexSwapError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": {"message": str(exc), "code": "CODEX_SWAP_FAILED"}},
+            )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "provider": "codex",
+                "account_id": account_id,
+                "restart_required": result.restart_required,
+                "message": (
+                    "Switched the active Codex account. Restart Codex (or the "
+                    "Codex app/IDE) to pick it up — it caches auth at startup."
+                ),
             },
         )
 

@@ -43,8 +43,20 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
     const resetDisplay = resetTime ? formatResetTime(resetTime) : '';
 
     if (compact) {
-        // Narrow label + no reset column → the bar reclaims the space. Reset time
-        // rides on the row title (hover); the white marker already shows position.
+        // Narrow label + bar + percent, then a short reset caption so the
+        // dropdown answers "when does this window reset?" inline (the full
+        // dashboard already shows this per bar). The "resets " prefix is dropped
+        // to stay tight; same-day shows the time ("3:45 PM"), other days add the
+        // date ("Jun 30 3:45 PM"). Full text still rides the row title on hover.
+        // No extra row → the 6-account no-scroll panel fit is preserved.
+        // Only the "resets <time>" form gets a caption; a past/expired window
+        // ("no active window") clamps to a short em-dash so the widest case
+        // can't squeeze the bar — the full text still rides the hover title.
+        const isReset = /^resets\s+/i.test(resetDisplay);
+        const resetShort = isReset ? resetDisplay.replace(/^resets\s+/i, '') : (resetDisplay ? '—' : '');
+        const resetCaption = resetShort
+            ? `<span class="reset-caption text-[10px] text-slate-500 shrink-0 text-right tabular-nums whitespace-nowrap" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetShort)}</span>`
+            : '';
         return `
         <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(label || '')}${resetDisplay ? ' · ' + escapeHtml(resetDisplay) : ''}">
             <span class="text-[10px] text-slate-400 w-5 shrink-0">${escapeHtml(label || '')}</span>
@@ -53,6 +65,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
                 ${markerHtml}
             </div>
             <span class="text-[11px] font-mono w-9 text-right tabular-nums ${pctColor}">${Math.round(pct)}%</span>
+            ${resetCaption}
         </div>
     `;
     }

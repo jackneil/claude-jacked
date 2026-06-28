@@ -573,7 +573,9 @@ def resolve_account(account_ref, db: Database) -> dict:
             )
     elif isinstance(account_ref, str) and "@" in account_ref:
         try:
-            account = db.get_account_by_email(account_ref)
+            # `jacked claude <email>` resolves a Claude account; scope to the
+            # provider so a same-email Codex account never collides.
+            account = db.get_account_by_email(account_ref, provider="claude")
         except ValueError as exc:
             # Ambiguous: multiple orgs for the same email
             raise click.ClickException(str(exc))

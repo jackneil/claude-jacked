@@ -73,6 +73,7 @@ def summarize_account(acct: dict) -> Optional[dict]:
     return {
         "account_id": acct.get("id"),
         "email": acct.get("email"),
+        "provider": acct.get("provider") or "claude",
         "organization_uuid": acct.get("organization_uuid") or None,
         "organization_name": acct.get("organization_name"),
         "five_hour": round(f5, 1),

@@ -179,6 +179,35 @@ body {
     color: #9ca3af;
 }
 
+/* Provider identity (Claude vs Codex) — shared mark from js/util/provider.js.
+   --provider-color is set inline per provider; the chip + left-edge accent
+   carry the brand color so the provider reads at a glance. */
+.provider-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px 1px 6px;
+    border-radius: 9999px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.4;
+    border: 1px solid color-mix(in srgb, var(--provider-color) 45%, transparent);
+    background: color-mix(in srgb, var(--provider-color) 14%, transparent);
+}
+.provider-glyph {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+}
+.provider-label { line-height: 1; }
+/* Left-edge accent on the card itself — the "backdrop" cue. */
+.provider-card { border-left-width: 3px; }
+.provider-card.provider-claude { border-left-color: #a78bfa; }
+.provider-card.provider-codex { border-left-color: #60a5fa; }
+
 /* Delete confirmation inline */
 .delete-confirm {
     animation: fadeSlideIn 200ms ease-out;
