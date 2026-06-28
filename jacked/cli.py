@@ -4973,6 +4973,53 @@ def claude_cmd(account, claude_args):
     launch_claude(config_dir, claude_args, db_path=str(db_path))
 
 
+# ── Codex provider commands ──────────────────────────────────────────
+
+
+@main.group(name="codex")
+def codex_group():
+    """Manage OpenAI Codex accounts (add, list, switch, launch)."""
+
+
+@codex_group.command(name="add")
+@click.option(
+    "--make-active", is_flag=True,
+    help="Mark this as the active Codex account after adding.",
+)
+@click.option(
+    "--no-login", is_flag=True,
+    help="Don't run `codex login`; import an already-logged-in account only.",
+)
+def codex_add_cmd(make_active, no_login):
+    """Add (or refresh) the logged-in Codex account in jacked.
+
+    Forces file-based credential storage (so jacked can manage the account),
+    runs `codex login` if you're not signed in, then imports the account's
+    identity. Tokens stay in ~/.codex/auth.json — jacked stores identity only.
+
+    >>> # CLI command: jacked codex add [--make-active] [--no-login]
+    """
+    from jacked.codex.accounts import CodexImportError, add_codex_account
+    from jacked.web.database import Database
+
+    db_path = Path.home() / ".claude" / "jacked.db"
+    db = Database(str(db_path))
+    try:
+        acct = add_codex_account(
+            db, run_login=not no_login, make_active=make_active
+        )
+    except CodexImportError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        db.close()
+
+    plan = acct.get("subscription_type") or "?"
+    console.print(
+        f"Added Codex account [bold]{acct['email']}[/bold] "
+        f"(plan {plan}, id {acct['id']})."
+    )
+
+
 # ── Convenience init command ─────────────────────────────────────────
 
 

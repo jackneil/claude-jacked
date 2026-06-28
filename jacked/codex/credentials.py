@@ -88,6 +88,58 @@ def credential_store_mode(
     return _DEFAULT_STORE_MODE
 
 
+def _atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
+    """Write ``content`` to ``path`` atomically, preserving the existing mode."""
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cfg-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def ensure_file_storage(
+    home: Optional[Path] = None, env: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Force ``cli_auth_credentials_store = "file"`` in ``config.toml``.
+
+    This is the precondition for jacked to manage a Codex account by swapping
+    ``auth.json``. Idempotent: returns ``True`` if it changed the file, ``False``
+    if storage was already ``"file"``. Preserves the rest of ``config.toml`` and
+    keeps the key at top level (inserted before the first ``[table]`` header).
+    """
+    home = home or codex_home(env)
+    if credential_store_mode(home, env) == "file":
+        return False
+    cfg = home / "config.toml"
+    existing = ""
+    if cfg.exists():
+        try:
+            existing = cfg.read_text(errors="replace")
+        except OSError:
+            existing = ""
+    # Drop any existing top-level key occurrences (commented lines are kept).
+    kept = [ln for ln in existing.splitlines() if not _STORE_KEY_RE.match(ln)]
+    insert_at = next(
+        (i for i, ln in enumerate(kept) if ln.lstrip().startswith("[")), len(kept)
+    )
+    kept.insert(insert_at, 'cli_auth_credentials_store = "file"')
+    content = "\n".join(kept).rstrip("\n") + "\n"
+    _atomic_write(cfg, content)
+    return True
+
+
 def decode_jwt_claims(token: str) -> dict:
     """Decode a JWT payload segment (no signature verification).
 

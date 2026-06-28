@@ -430,11 +430,40 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
 
 
 @router.post("/accounts/add")
-async def start_add_account(request: Request):
-    """Start OAuth flow to add a new account. Returns flow_id for polling."""
+async def start_add_account(request: Request, provider: str = "claude"):
+    """Add an account.
+
+    Claude (default): starts the Anthropic OAuth flow, returns a flow_id to poll.
+    Codex (``?provider=codex``): forces file-based credential storage and imports
+    the already-logged-in ``~/.codex/auth.json``. If no Codex account is logged
+    in, returns 400 ``needs_login`` so the UI can prompt the user to run
+    ``codex login`` (the browser OAuth can't be driven from the background API).
+    """
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
+
+    if provider == "codex":
+        from jacked.codex.accounts import CodexImportError, add_codex_account
+
+        try:
+            acct = add_codex_account(db, run_login=False)
+        except CodexImportError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {"message": str(exc), "code": "CODEX_LOGIN_REQUIRED"},
+                    "needs_login": True,
+                    "command": "codex login",
+                },
+            )
+        return {
+            "provider": "codex",
+            "imported": True,
+            "account_id": acct["id"],
+            "email": acct["email"],
+            "plan": acct.get("subscription_type"),
+        }
 
     flow = OAuthFlow(db)
     result = await flow.start()
