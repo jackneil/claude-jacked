@@ -709,6 +709,29 @@ class TestResolveAccount:
             result = resolve_account("bob@test.com", db)
         assert result["email"] == "bob@test.com"
 
+    def test_rejects_codex_account_by_id(self, tmp_path):
+        """A Codex account must NEVER resolve for `jacked claude` — launching it
+        as Claude Code would overwrite the global keychain with its sentinel."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        codex = db.create_account("cx@test.com", "codex-managed", 4102444800,
+                                  provider="codex", organization_uuid="acct-CX")
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            with pytest.raises(click.ClickException, match="Codex account"):
+                resolve_account(codex["id"], db)
+
+    def test_prepare_account_dir_rejects_codex(self, tmp_path):
+        """Defense-in-depth: prepare_account_dir refuses a Codex account so no
+        caller can drive it into the Claude credential write."""
+        db = _make_db(tmp_path)
+        from jacked.launch import prepare_account_dir
+
+        codex = db.create_account("cx2@test.com", "codex-managed", 4102444800,
+                                  provider="codex", organization_uuid="acct-CX2")
+        with pytest.raises(click.ClickException, match="Codex account"):
+            prepare_account_dir(codex, db)
+
     def test_without_id_uses_active(self, tmp_path):
         """resolve_account(None) reads _jackedAccountId stamp from credential file."""
         db = _make_db(tmp_path)
