@@ -35,6 +35,40 @@ except ImportError:
     _UVICORN_AVAILABLE = False
 
 
+def select_menubar_backend(platform: str, mac_available: bool) -> str:
+    """Choose the status-bar backend for a platform.
+
+    Returns ``"mac"`` only on darwin when the rumps/pyobjc agent is importable;
+    every other case (non-darwin, or darwin without the deps) returns
+    ``"pystray"`` so Windows/Linux behavior is unchanged and macOS degrades
+    gracefully if the native deps somehow aren't present.
+
+    >>> select_menubar_backend("darwin", True)
+    'mac'
+    >>> select_menubar_backend("darwin", False)
+    'pystray'
+    >>> select_menubar_backend("win32", True)
+    'pystray'
+    >>> select_menubar_backend("linux", True)
+    'pystray'
+    """
+    if platform == "darwin" and mac_available:
+        return "mac"
+    return "pystray"
+
+
+def _mac_menubar_available() -> bool:
+    """True when the macOS menu-bar agent (rumps + pyobjc) can be used."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        from jacked.service.menubar_mac import RUMPS_AVAILABLE
+
+        return RUMPS_AVAILABLE
+    except Exception:
+        return False
+
+
 # Icon color schemes per state
 _ICON_COLORS = {
     "running": ("#6366f1", "#8b5cf6"),  # Purple gradient
@@ -851,9 +885,63 @@ class ServiceRunner:
         except Exception:
             pass  # best-effort; fall back to stderr
 
+    def _run_mac_menubar(self) -> None:
+        """macOS path: rumps menu-bar agent on the main thread, uvicorn in a
+        daemon thread. Mirrors the pystray path's preconditions (uvicorn check,
+        port guard, PID file, signal handlers) but hands the main thread to the
+        rumps run loop instead of pystray. The agent reuses THIS runner's
+        uvicorn lifecycle — it never starts a second server."""
+        from jacked.service.menubar_mac import MacMenuBarApp
+
+        if not _UVICORN_AVAILABLE:
+            raise SystemExit(
+                "Service mode requires uvicorn.\n"
+                'Install it with: uv tool install "claude-jacked" --force'
+            )
+        if not is_port_available(self.host, self.port):
+            raise SystemExit(
+                f"Port {self.port} is already in use.\n"
+                "Is another jacked instance running? Check with: jacked service status\n"
+                "Use --port to run on a different port."
+            )
+
+        write_pid(PID_FILE, self.port)
+
+        # Signal-safe: just set the stop event; the agent's stop-watch timer
+        # bridges that to a clean uvicorn shutdown + quit on the main thread.
+        signal.signal(signal.SIGTERM, lambda *_: self._request_stop())
+        signal.signal(signal.SIGINT, lambda *_: self._request_stop())
+
+        from jacked.service.platform import detect_autostart
+
+        self._autostart_enabled = detect_autostart()
+
+        # Start the one uvicorn (daemon thread) and health-check it before the
+        # status item appears, so the first pill reflects real data.
+        self._uvicorn_thread = self._start_uvicorn()
+        if self._wait_for_ready():
+            self._started_at = time.time()
+            logger.info(
+                "Service ready — macOS menu-bar agent (pid=%d, port=%d)",
+                os.getpid(), self.port,
+            )
+        else:
+            logger.error("Service did not become ready; menu-bar pill will show degraded")
+
+        try:
+            MacMenuBarApp(self).run()
+        finally:
+            remove_pid(PID_FILE)
+
     def run(self) -> None:
         """Start the service: tray icon on main thread, uvicorn in background."""
         self._install_tray_file_logger()
+
+        # macOS gets the native menu-bar agent; every other platform keeps the
+        # existing pystray tray below, unchanged.
+        if select_menubar_backend(sys.platform, _mac_menubar_available()) == "mac":
+            return self._run_mac_menubar()
+
         check_tray_deps()
 
         if not _UVICORN_AVAILABLE:

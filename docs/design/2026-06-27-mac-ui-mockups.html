@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jacked · Mac menu-bar + side-panel mockups</title>
+<style>
+  :root{
+    --purple1:#6366f1; --purple2:#8b5cf6;
+    --claude:#d97757; --openai:#10a37f;
+    --green:#34c759; --amber:#ff9f0a; --red:#ff453a;
+    --ink:#f5f5f7; --dim:#a1a1aa; --dim2:#74747e;
+    --panel-bg:rgba(28,28,30,.72);
+    --card:rgba(255,255,255,.055);
+    --hair:rgba(255,255,255,.10);
+    --mono:"SF Mono",ui-monospace,Menlo,monospace;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html{-webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility}
+  body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:#0b0b10; color:var(--ink); line-height:1.45; padding:40px 24px 80px}
+  .wrap{max-width:1480px; margin:0 auto}
+  h1{font-size:26px; font-weight:700; letter-spacing:-.02em}
+  .lede{color:var(--dim); font-size:15px; margin-top:8px; max-width:780px}
+  .badge{display:inline-block; font-size:11px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+    color:#c4b5fd; background:rgba(139,92,246,.16); border:1px solid rgba(139,92,246,.35);
+    padding:3px 9px; border-radius:999px; margin-bottom:14px}
+  section{margin-top:54px}
+  .sec-head{display:flex; align-items:baseline; gap:12px; margin-bottom:6px}
+  .sec-num{font-size:13px; font-weight:700; color:var(--purple2); border:1px solid rgba(139,92,246,.4); border-radius:8px; padding:2px 8px}
+  .sec-title{font-size:19px; font-weight:650; letter-spacing:-.01em}
+  .sec-sub{color:var(--dim); font-size:14px; margin:2px 0 18px 0; max-width:840px}
+  .frame-cap{color:var(--dim); font-size:12.5px; margin-top:10px; text-align:center}
+  .frame-cap b{color:#e7e7ea}
+
+  /* ── unified meter system (5h + 7d, white time-marker) — shared by panel + dropdown ── */
+  .meters{display:flex; flex-direction:column; gap:7px}
+  .m{display:flex; align-items:center; gap:9px}
+  .m-tag{font-family:var(--mono); font-size:9px; font-weight:700; letter-spacing:.05em; color:var(--dim);
+    background:rgba(255,255,255,.07); border:1px solid var(--hair); padding:2px 5px; border-radius:5px;
+    width:30px; text-align:center; flex:none}
+  .track{position:relative; flex:1; height:7px; border-radius:5px; background:rgba(255,255,255,.12);
+    box-shadow:inset 0 1px 1px rgba(0,0,0,.35); overflow:visible}
+  .fill{height:100%; border-radius:5px}
+  .fill.g{background:linear-gradient(90deg,#2bd14e,#34c759); box-shadow:0 0 8px rgba(52,199,89,.45)}
+  .fill.am{background:linear-gradient(90deg,#ffd60a,#ff9f0a); box-shadow:0 0 8px rgba(255,159,10,.5)}
+  .fill.rd{background:linear-gradient(90deg,#ff6961,#ff453a); box-shadow:0 0 9px rgba(255,69,58,.55)}
+  /* the "little white bar" — where you are in the window by TIME (style.css .elapsed-marker) */
+  .elapsed-marker{position:absolute; top:-3px; bottom:-3px; width:2px; background:#fff; border-radius:1px;
+    opacity:.92; z-index:3; box-shadow:0 0 4px rgba(0,0,0,.6)}
+  .pc{font-size:12px; font-weight:750; font-variant-numeric:tabular-nums; width:38px; text-align:right; flex:none}
+  .pc.g{color:#5be07a} .pc.am{color:#ffb340} .pc.rd{color:#ff6b62}
+  .reset{font-size:10px; color:var(--dim2); width:46px; text-align:right; flex:none; font-variant-numeric:tabular-nums}
+
+  /* grouping: same email, different orgs */
+  .g-head{display:flex; align-items:center; gap:8px; margin-bottom:2px}
+  .g-email{font-size:13px; font-weight:700}
+  .shared{margin-left:auto; font-size:9.5px; font-weight:650; color:#a5b4fc; background:rgba(99,102,241,.16);
+    border:1px solid rgba(99,102,241,.4); padding:2px 7px; border-radius:999px}
+  .g-rows{margin-left:8px; padding-left:14px; border-left:2px solid rgba(139,92,246,.3);
+    display:flex; flex-direction:column; gap:12px; margin-top:9px}
+  .orow{position:relative}
+  .orow::before{content:""; position:absolute; left:-16px; top:9px; width:10px; height:2px;
+    background:rgba(139,92,246,.3); border-radius:2px}
+  .o-top{display:flex; align-items:center; gap:7px; margin-bottom:7px}
+  .o-org{font-size:12.5px; font-weight:650}
+  .o-kind{font-size:10.5px; color:var(--dim); font-weight:500}
+  .o-rail-active{position:absolute; left:-16px; top:3px; bottom:3px; width:2px;
+    background:linear-gradient(var(--purple1),var(--purple2)); border-radius:2px}
+
+  /* ── faux mac screen ── */
+  .screen{position:relative; width:1280px; max-width:100%; aspect-ratio:16/10; margin:0 auto;
+    border-radius:14px; overflow:hidden;
+    box-shadow:0 30px 70px -20px rgba(0,0,0,.75), 0 0 0 1px rgba(255,255,255,.06);
+    background:radial-gradient(120% 120% at 78% 8%, #3b2a6b 0%, #241a47 38%, #15122b 70%, #0d0b1c 100%)}
+  .wallglow{position:absolute; inset:0; background:
+     radial-gradient(50% 40% at 20% 90%, rgba(99,102,241,.22), transparent 70%),
+     radial-gradient(40% 35% at 90% 80%, rgba(16,163,127,.10), transparent 70%)}
+  .menubar{position:absolute; top:0; left:0; right:0; height:26px; z-index:40;
+    background:rgba(10,10,14,.42); backdrop-filter:blur(18px) saturate(160%); -webkit-backdrop-filter:blur(18px) saturate(160%);
+    display:flex; align-items:center; gap:18px; padding:0 12px; font-size:13px; color:#eee;
+    border-bottom:1px solid rgba(255,255,255,.06)}
+  .menubar .apple{font-size:14px}
+  .menubar .mb-app{font-weight:700}
+  .menubar .mb-item{color:#e7e7ea; opacity:.92}
+  .menubar .spacer{flex:1}
+  .menubar .mb-right{display:flex; align-items:center; gap:14px; opacity:.95}
+  .tray-pill{display:flex; align-items:center; gap:7px; font-weight:650; font-variant-numeric:tabular-nums;
+    padding:2px 9px; border-radius:7px;
+    background:linear-gradient(135deg, rgba(99,102,241,.30), rgba(139,92,246,.30));
+    box-shadow:0 0 0 1px rgba(139,92,246,.45) inset; cursor:default}
+  .tray-pill .j{width:14px;height:14px;border-radius:4px;display:grid;place-items:center;
+    background:linear-gradient(135deg,var(--purple1),var(--purple2)); color:#fff; font-weight:800; font-size:10px; line-height:1}
+  .dot{width:7px;height:7px;border-radius:50%}
+  .mini-ic{opacity:.85; font-size:13px}
+
+  .win{position:absolute; border-radius:11px; overflow:hidden;
+    box-shadow:0 24px 50px -18px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.05); backdrop-filter:blur(6px)}
+  .win .tb{height:30px; display:flex; align-items:center; gap:7px; padding:0 11px; background:rgba(40,40,46,.92)}
+  .tl{width:11px;height:11px;border-radius:50%}
+  .tl.r{background:#ff5f57} .tl.y{background:#febc2e} .tl.g{background:#28c840}
+  .win .tb .wt{margin-left:8px; font-size:11.5px; color:#c9c9cf}
+  .term{left:60px; top:96px; width:560px; height:330px; background:rgba(18,18,22,.96)}
+  .term .body{padding:14px 16px; font-family:var(--mono); font-size:12px; color:#d4d4d8; line-height:1.7}
+  .term .p{color:#7dd3fc} .term .g{color:#86efac} .term .c{color:#71717a}
+  .editor{left:300px; top:300px; width:620px; height:300px; background:rgba(24,24,30,.96)}
+  .editor .body{padding:14px 16px; font-family:var(--mono); font-size:12px; line-height:1.7}
+  .editor .kw{color:#c792ea} .editor .fn{color:#82aaff} .editor .st{color:#c3e88d} .editor .cm{color:#5c6370}
+
+  /* ── side panel ── */
+  .sidepanel{position:absolute; top:26px; right:0; bottom:0; width:324px; z-index:50;
+    background:var(--panel-bg); backdrop-filter:blur(40px) saturate(180%); -webkit-backdrop-filter:blur(40px) saturate(180%);
+    border-left:1px solid rgba(255,255,255,.12); box-shadow:-22px 0 50px -24px rgba(0,0,0,.7);
+    display:flex; flex-direction:column}
+  .sp-head{display:flex; align-items:center; gap:9px; padding:14px 16px 12px; border-bottom:1px solid var(--hair)}
+  .sp-logo{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;
+    background:linear-gradient(135deg,var(--purple1),var(--purple2)); color:#fff; font-weight:800; font-size:13px}
+  .sp-title{font-size:14px; font-weight:700; letter-spacing:.01em}
+  .sp-title small{display:block; font-weight:500; color:var(--dim); font-size:11px; letter-spacing:.02em}
+  .sp-pin{margin-left:auto; color:var(--dim); font-size:14px}
+  .sp-body{padding:12px; display:flex; flex-direction:column; gap:10px; overflow:auto; flex:1}
+  .acct{background:var(--card); border:1px solid var(--hair); border-radius:13px; padding:11px 12px 12px; position:relative}
+  .a-top{display:flex; align-items:center; gap:8px; margin-bottom:9px}
+  .prov{width:18px;height:18px;border-radius:5px;display:grid;place-items:center; font-size:10px; font-weight:800; color:#fff; flex:none}
+  .prov.claude{background:var(--claude)} .prov.openai{background:var(--openai)}
+  .a-name{font-size:12.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .a-name small{color:var(--dim); font-weight:500}
+  .plan{font-size:10px; font-weight:700; letter-spacing:.03em; padding:2px 7px; border-radius:999px;
+    color:#e9e9ee; background:rgba(255,255,255,.10); flex:none}
+  .tag-active{font-size:9px; font-weight:800; letter-spacing:.06em; color:#c4b5fd; background:rgba(139,92,246,.2);
+    border:1px solid rgba(139,92,246,.45); padding:1px 6px; border-radius:999px; flex:none}
+  .sp-foot{border-top:1px solid var(--hair); padding:10px 13px; display:flex; flex-direction:column; gap:8px}
+  .swap{display:flex; align-items:center; gap:8px; font-size:11.5px; color:#d8d8de}
+  .swap .pulse{width:8px;height:8px;border-radius:50%;background:var(--green); box-shadow:0 0 0 0 rgba(52,199,89,.6)}
+  .swap b{color:#fff}
+  .open-dash{display:flex; align-items:center; justify-content:center; gap:6px; font-size:12px; font-weight:600;
+    color:#fff; padding:7px; border-radius:9px; background:linear-gradient(135deg,var(--purple1),var(--purple2)); cursor:default}
+
+  /* ── dropdown ── */
+  .dd-stage{display:flex; gap:34px; flex-wrap:wrap; align-items:flex-start}
+  .dd-barwrap{position:relative}
+  .mini-menubar{width:372px; height:26px; border-radius:8px 8px 0 0; background:rgba(10,10,14,.6); backdrop-filter:blur(18px);
+    display:flex; align-items:center; padding:0 10px; gap:12px; border:1px solid rgba(255,255,255,.07); border-bottom:none}
+  .mini-menubar .spacer{flex:1}
+  .dropdown{width:372px; border-radius:4px 4px 13px 13px; overflow:hidden;
+    background:rgba(34,34,40,.86); backdrop-filter:blur(44px) saturate(180%); -webkit-backdrop-filter:blur(44px) saturate(180%);
+    border:1px solid rgba(255,255,255,.13); box-shadow:0 30px 60px -18px rgba(0,0,0,.72)}
+  .dd-h{display:flex; align-items:center; padding:11px 14px 8px; font-size:10.5px; font-weight:700;
+    letter-spacing:.07em; color:var(--dim); text-transform:uppercase}
+  .dd-h .col{margin-left:auto; display:flex; gap:14px}
+  .dd-h .col span{width:54px; text-align:center}
+  .sep{height:1px; background:rgba(255,255,255,.09); margin:5px 12px}
+  .dd-acct{padding:9px 14px 11px}
+  .dd-acct:hover{background:rgba(139,92,246,.13)}
+  .dd-group{padding:9px 14px 11px}
+  .dd-action{display:flex; align-items:center; padding:8px 14px; font-size:12.5px; color:#e7e7ea}
+  .dd-action:hover{background:rgba(139,92,246,.18)}
+  .dd-action .key{margin-left:auto; color:var(--dim); font-size:11px}
+  .dd-action.hl{font-weight:600; color:#fff}
+  .check{margin-left:auto; color:var(--green); font-weight:700; font-size:11.5px}
+  .dd-side{max-width:300px; color:var(--dim); font-size:13px}
+  .dd-side b{color:var(--ink)} .dd-side code{font-family:var(--mono); font-size:11.5px; color:#c4b5fd}
+
+  /* ── glance states ── */
+  .states{display:flex; gap:14px; flex-wrap:wrap}
+  .state{background:#15151b; border:1px solid var(--hair); border-radius:12px; padding:16px; flex:1; min-width:220px}
+  .state .bar{height:26px; border-radius:7px; background:rgba(10,10,14,.85); display:inline-flex; align-items:center;
+    gap:7px; padding:0 10px; font-size:13px; font-weight:650; font-variant-numeric:tabular-nums; color:#eee}
+  .state p{color:var(--dim); font-size:12.5px; margin-top:10px}
+  .state code{color:#c4b5fd; font-size:12px}
+
+  /* ── limit diagram ── */
+  .limit-grid{display:grid; grid-template-columns:1fr 1fr; gap:22px; max-width:900px}
+  @media(max-width:760px){.limit-grid{grid-template-columns:1fr}}
+  .mini-desk{height:210px; border-radius:12px; position:relative; overflow:hidden;
+    background:radial-gradient(120% 120% at 80% 10%,#2c2256,#16132c); border:1px solid var(--hair)}
+  .mini-desk .mbar{position:absolute;top:0;left:0;right:0;height:16px;background:rgba(0,0,0,.4)}
+  .mini-win{position:absolute; border-radius:7px; box-shadow:0 8px 20px -8px #000}
+  .mini-panel{position:absolute; top:16px; bottom:0; right:0; width:74px; background:rgba(28,28,30,.8); backdrop-filter:blur(10px);
+    border-left:1px solid rgba(255,255,255,.18); z-index:5; display:flex; align-items:center; justify-content:center}
+  .mini-panel span{writing-mode:vertical-rl; font-size:10px; color:#c4b5fd; font-weight:700; letter-spacing:.1em}
+  .ok{position:absolute; top:10px; left:12px; z-index:6; font-size:12px; font-weight:700; color:var(--green)}
+  .no{position:absolute; top:10px; left:12px; z-index:6; font-size:12px; font-weight:700; color:var(--red)}
+  .verdict{font-size:13px; margin-top:10px}
+  .verdict.good{color:#a7f3d0} .verdict.bad{color:#fca5a5}
+  .cap{color:var(--dim); font-size:12.5px; margin-top:6px}
+
+  .foot-note{margin-top:60px; padding:18px 20px; border:1px dashed var(--hair); border-radius:12px;
+    color:var(--dim); font-size:13px; background:#101016}
+  .foot-note b{color:var(--ink)}
+  .foot-note code{font-family:var(--mono); color:#c4b5fd; font-size:12px}
+  .legend{display:flex; gap:18px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:var(--dim)}
+  .legend span{display:inline-flex; align-items:center; gap:6px}
+  .swatch-line{display:inline-block; width:2px; height:13px; background:#fff; border-radius:1px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="badge">Mockup · not a real screenshot · macOS only</div>
+  <h1>What we could put on your Mac</h1>
+  <p class="lede">A live <b>menu-bar pill</b>, a click-down <b>menu</b>, and a <b>side panel pinned to the right edge</b> —
+  all showing every account at once, Claude <em>and</em> Codex/OpenAI. Each account shows its <b>5-hour</b> and
+  <b>weekly</b> window with the <b>white time-marker</b> from your dashboard, so you can see when you're burning too fast.</p>
+
+  <!-- ============ SECTION 1 — HERO ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">1</span><span class="sec-title">The whole idea, on your desktop</span></div>
+    <p class="sec-sub">The panel sticks to the right edge and stays visible on every Space, floating over your editor and
+    terminal. Same bars as your dashboard — colored fill = quota used, white line = where you are in the window by time.</p>
+
+    <div class="screen">
+      <div class="wallglow"></div>
+      <div class="menubar">
+        <span class="apple"></span>
+        <span class="mb-app">Claude Code</span>
+        <span class="mb-item">File</span><span class="mb-item">Edit</span><span class="mb-item">View</span>
+        <span class="spacer"></span>
+        <div class="mb-right">
+          <div class="tray-pill"><span class="j">J</span><span class="dot" style="background:var(--red)"></span>96% · 78%</div>
+          <span class="mini-ic">⌕</span><span class="mini-ic">◉</span><span class="mini-ic" style="font-size:11px;font-variant-numeric:tabular-nums">100%</span>
+          <span style="font-variant-numeric:tabular-nums">Fri 2:14 PM</span>
+        </div>
+      </div>
+
+      <div class="win term">
+        <div class="tb"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="wt">claude — zsh — 80×24</span></div>
+        <div class="body">
+          <div><span class="p">jack@studio</span> <span class="c">~/Github/claude-jacked</span></div>
+          <div><span class="g">❯</span> claude</div>
+          <div class="c">● Working on auth refactor…</div>
+          <div class="c">● Tests: 2438 passed</div>
+          <div><span class="g">❯</span> <span style="opacity:.6">▋</span></div>
+        </div>
+      </div>
+      <div class="win editor">
+        <div class="tb"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="wt">oauth.py — jacked</span></div>
+        <div class="body">
+          <div><span class="cm"># OAuth PKCE flow</span></div>
+          <div><span class="kw">CLIENT_ID</span> = <span class="st">"9d1c250a-e61b-…"</span></div>
+          <div><span class="kw">async def</span> <span class="fn">exchange_code</span>(self, code):</div>
+          <div>&nbsp;&nbsp;<span class="kw">return await</span> self.<span class="fn">_post</span>(TOKEN_URL)</div>
+        </div>
+      </div>
+
+      <!-- side panel -->
+      <div class="sidepanel">
+        <div class="sp-head">
+          <div class="sp-logo">J</div>
+          <div class="sp-title">jacked <small>Account usage</small></div>
+          <div class="sp-pin">◨</div>
+        </div>
+        <div class="sp-body">
+
+          <!-- grouped: jack@hank.ai across 2 orgs -->
+          <div class="acct">
+            <div class="g-head"><div class="prov claude">A</div><div class="g-email">jack@hank.ai</div><span class="shared">1 login · 2 orgs</span></div>
+            <div class="g-rows">
+              <div class="orow">
+                <div class="o-rail-active"></div>
+                <div class="o-top"><span class="o-org">Hank AI</span><span class="o-kind">· Enterprise</span>
+                  <span class="tag-active">ACTIVE</span><span class="plan" style="margin-left:auto">MAX</span></div>
+                <div class="meters">
+                  <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill g" style="width:62%"></div><div class="elapsed-marker" style="left:52%"></div></div><span class="pc g">62%</span><span class="reset">4:41p</span></div>
+                  <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:41%"></div><div class="elapsed-marker" style="left:58%"></div></div><span class="pc g">41%</span><span class="reset">Mon</span></div>
+                </div>
+              </div>
+              <div class="orow">
+                <div class="o-top"><span class="o-org">Personal</span><span class="o-kind">· individual</span>
+                  <span class="plan" style="margin-left:auto">PRO</span></div>
+                <div class="meters">
+                  <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill g" style="width:12%"></div><div class="elapsed-marker" style="left:33%"></div></div><span class="pc g">12%</span><span class="reset">—</span></div>
+                  <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:9%"></div><div class="elapsed-marker" style="left:44%"></div></div><span class="pc g">9%</span><span class="reset">Wed</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ml-research, saturated -->
+          <div class="acct">
+            <div class="a-top"><div class="prov claude">A</div>
+              <div class="a-name">Hank Research <small>· ml-research@hank.ai</small></div>
+              <span class="plan">MAX</span></div>
+            <div class="meters">
+              <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill rd" style="width:96%"></div><div class="elapsed-marker" style="left:38%"></div></div><span class="pc rd">96%</span><span class="reset">3:08p</span></div>
+              <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill am" style="width:78%"></div><div class="elapsed-marker" style="left:72%"></div></div><span class="pc am">78%</span><span class="reset">Mon</span></div>
+            </div>
+          </div>
+
+          <!-- openai codex -->
+          <div class="acct">
+            <div class="a-top"><div class="prov openai">O</div>
+              <div class="a-name">codex@hank.ai <small>· OpenAI</small></div>
+              <span class="plan">PLUS</span></div>
+            <div class="meters">
+              <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill am" style="width:71%"></div><div class="elapsed-marker" style="left:82%"></div></div><span class="pc am">71%</span><span class="reset">5:20p</span></div>
+              <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:34%"></div><div class="elapsed-marker" style="left:60%"></div></div><span class="pc g">34%</span><span class="reset">Mon</span></div>
+            </div>
+          </div>
+
+        </div>
+        <div class="sp-foot">
+          <div class="swap"><span class="pulse"></span>Auto-swap <b>ON</b> → next: <b>Personal</b></div>
+          <div class="open-dash">↗ Open full dashboard</div>
+        </div>
+      </div>
+    </div>
+    <div class="frame-cap">↑ <b>ml-research</b> is the warning: 5H fill is way past the white line — 96% burned with only 38% of the window gone. The pill goes red to match.</div>
+  </section>
+
+  <!-- ============ SECTION 2 — DROPDOWN ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">2</span><span class="sec-title">Or just click the menu-bar icon</span></div>
+    <p class="sec-sub">Don't want the panel up? Click the pill and the same bars drop down — both windows, the white
+    pace-marker, and same-email/different-org accounts grouped under one login.</p>
+
+    <div class="dd-stage">
+      <div class="dd-barwrap">
+        <div class="mini-menubar">
+          <span class="spacer"></span>
+          <div class="tray-pill"><span class="j">J</span><span class="dot" style="background:var(--red)"></span>96% · 78%</div>
+          <span style="font-size:12px;font-variant-numeric:tabular-nums">2:14 PM</span>
+        </div>
+        <div class="dropdown">
+          <div class="dd-h">Accounts · usage now <span class="col"><span>5-HOUR</span><span>WEEKLY</span></span></div>
+
+          <!-- grouped -->
+          <div class="dd-group">
+            <div class="g-head"><div class="prov claude">A</div><div class="g-email">jack@hank.ai</div><span class="shared">1 login · 2 orgs</span></div>
+            <div class="g-rows">
+              <div class="orow">
+                <div class="o-rail-active"></div>
+                <div class="o-top"><span class="o-org">Hank AI</span><span class="o-kind">· Enterprise</span>
+                  <span class="tag-active">ACTIVE</span><span class="plan" style="margin-left:auto">MAX</span></div>
+                <div class="meters">
+                  <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill g" style="width:62%"></div><div class="elapsed-marker" style="left:52%"></div></div><span class="pc g">62%</span><span class="reset">4:41p</span></div>
+                  <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:41%"></div><div class="elapsed-marker" style="left:58%"></div></div><span class="pc g">41%</span><span class="reset">Mon</span></div>
+                </div>
+              </div>
+              <div class="orow">
+                <div class="o-top"><span class="o-org">Personal</span><span class="o-kind">· individual</span>
+                  <span class="plan" style="margin-left:auto">PRO</span></div>
+                <div class="meters">
+                  <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill g" style="width:12%"></div><div class="elapsed-marker" style="left:33%"></div></div><span class="pc g">12%</span><span class="reset">—</span></div>
+                  <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:9%"></div><div class="elapsed-marker" style="left:44%"></div></div><span class="pc g">9%</span><span class="reset">Wed</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="sep"></div>
+          <div class="dd-acct">
+            <div class="a-top"><div class="prov claude">A</div>
+              <div class="a-name">Hank Research <small>· ml-research@hank.ai</small></div><span class="plan">MAX</span></div>
+            <div class="meters">
+              <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill rd" style="width:96%"></div><div class="elapsed-marker" style="left:38%"></div></div><span class="pc rd">96%</span><span class="reset">3:08p</span></div>
+              <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill am" style="width:78%"></div><div class="elapsed-marker" style="left:72%"></div></div><span class="pc am">78%</span><span class="reset">Mon</span></div>
+            </div>
+          </div>
+
+          <div class="sep"></div>
+          <div class="dd-acct">
+            <div class="a-top"><div class="prov openai">O</div>
+              <div class="a-name">codex@hank.ai <small>· OpenAI</small></div><span class="plan">PLUS</span></div>
+            <div class="meters">
+              <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill am" style="width:71%"></div><div class="elapsed-marker" style="left:82%"></div></div><span class="pc am">71%</span><span class="reset">5:20p</span></div>
+              <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:34%"></div><div class="elapsed-marker" style="left:60%"></div></div><span class="pc g">34%</span><span class="reset">Mon</span></div>
+            </div>
+          </div>
+
+          <div class="sep"></div>
+          <div class="dd-action hl">↗ Open Dashboard<span class="key">⌘D</span></div>
+          <div class="dd-action hl">◨ Toggle Side Panel<span class="key">⌘\</span></div>
+          <div class="dd-action">Auto-swap<span class="check">✓ On</span></div>
+          <div class="sep"></div>
+          <div class="dd-action">＋ Add account…</div>
+          <div class="dd-action">Quit jacked<span class="key">⌘Q</span></div>
+        </div>
+      </div>
+
+      <div class="dd-side">
+        <b>The white line is the whole point.</b><br><br>
+        Colored fill = how much of the window's quota you've used. White line = how far through the window you are
+        <i>by time</i>.<br><br>
+        • Fill <b>past</b> the line → <b style="color:#ff6b62">burning faster than the clock</b> (ml-research: 96% used, 38% of the window gone).<br><br>
+        • Fill <b>behind</b> the line → <b style="color:#5be07a">you'll reset before running out</b> (codex: 71% used, 82% gone).<br><br>
+        Numbers come from <code>/api/analytics/usage-overview</code>; "Add account…" is where an OpenAI/Codex login slots in.
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SECTION 3 — GLANCE STATES ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">3</span><span class="sec-title">Pick how loud the menu bar is</span></div>
+    <p class="sec-sub">Same data, four levels of glance. Tabular digits so the width never jitters as numbers change.</p>
+    <div class="states">
+      <div class="state">
+        <div class="bar"><span class="j" style="width:14px;height:14px;border-radius:4px;display:grid;place-items:center;background:linear-gradient(135deg,var(--purple1),var(--purple2));font-size:9px;font-weight:800">J</span></div>
+        <p><b style="color:var(--ink)">Icon only</b><br>Quiet. Click for detail.</p>
+      </div>
+      <div class="state">
+        <div class="bar"><span class="dot" style="background:var(--red)"></span> 96%</div>
+        <p><b style="color:var(--ink)">Worst account</b><br>One number — your most-saturated account, color-coded.</p>
+      </div>
+      <div class="state">
+        <div class="bar"><span class="j" style="width:14px;height:14px;border-radius:4px;display:grid;place-items:center;background:linear-gradient(135deg,var(--purple1),var(--purple2));font-size:9px;font-weight:800">J</span> 62% · 14%</div>
+        <p><b style="color:var(--ink)">Active acct</b><br>5-hour · weekly for the account in use right now.</p>
+      </div>
+      <div class="state">
+        <div class="bar">▦ 62 <span style="color:var(--red)">96</span> 12 <span style="color:var(--amber)">71</span></div>
+        <p><b style="color:var(--ink)">All accounts</b><br>Every account's 5h%, side by side. Densest glance.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SECTION 4 — THE LIMIT ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">4</span><span class="sec-title">The one honest limit</span></div>
+    <p class="sec-sub">You asked it to "stick to the side." It floats there, always on top, on every Space. What macOS
+    will <b>not</b> let a normal app do is <i>reserve</i> that strip like the Dock, so a maximized window can still
+    slide underneath it. The apps that fake "reservation" replace your Dock or run a permission-hungry window manager —
+    not worth it for a usage strip.</p>
+    <div class="limit-grid">
+      <div>
+        <div class="mini-desk">
+          <span class="ok">✓ What you get</span>
+          <div class="mbar"></div>
+          <div class="mini-win" style="left:14px; top:34px; width:230px; height:150px; background:rgba(40,40,52,.95)"></div>
+          <div class="mini-panel"><span>USAGE</span></div>
+        </div>
+        <div class="verdict good">Floats on top · always visible · every Space ✓</div>
+        <div class="cap">Public AppKit API (verified on current macOS). The panel sits over everything; your windows are untouched.</div>
+      </div>
+      <div>
+        <div class="mini-desk">
+          <span class="no">✗ Not possible</span>
+          <div class="mbar"></div>
+          <div class="mini-win" style="left:14px; top:34px; right:14px; bottom:14px; background:rgba(40,40,52,.95)"></div>
+          <div class="mini-panel" style="opacity:.35"><span>USAGE</span></div>
+        </div>
+        <div class="verdict bad">Reserve the strip so windows can't cover it ✗</div>
+        <div class="cap">No public API for this (no Dock-style "strut"). The maximized window fills the whole screen, under the panel.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SECTION 5 — NOT THIS ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">5</span><span class="sec-title">What we'd skip: a native "desktop widget"</span></div>
+    <p class="sec-sub">macOS desktop / Notification-Center widgets (WidgetKit) sound right but Apple only lets them refresh
+    every <b>15–60 minutes</b> and they can't show your live web dashboard — they'd show stale numbers. The live surface
+    is the menu bar + the floating panel.</p>
+    <div class="states">
+      <div class="state" style="opacity:.7">
+        <div class="bar" style="height:auto;flex-direction:column;align-items:flex-start;gap:4px;padding:12px 14px;border-radius:12px;background:rgba(40,40,52,.8)">
+          <span style="font-size:11px;color:var(--dim)">Claude usage · 1:50 PM</span>
+          <span style="font-size:22px;font-weight:800;font-variant-numeric:tabular-nums">58%</span>
+          <span style="font-size:10px;color:var(--red)">⚠ last updated 24 min ago</span>
+        </div>
+        <p>Looks nice, but it's a snapshot the system throttles. Wrong for "am I about to get rate-limited <i>right now</i>."</p>
+      </div>
+      <div class="state" style="flex:2">
+        <p style="margin:0"><b style="color:var(--ink)">So the plan is:</b></p>
+        <p style="margin-top:8px">✅ <b style="color:var(--ink)">Menu-bar pill</b> — live, updates every few seconds, glanceable from anywhere.<br>
+        ✅ <b style="color:var(--ink)">Floating side panel</b> — your real dashboard bars, pinned right, on every Space.<br>
+        ⏭️ <b style="color:var(--ink)">WidgetKit widget</b> — skip, or add later as a stale "nice to have."</p>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot-note">
+    <b>Reality check.</b> The menu-bar app + floating panel are mostly <b>reuse</b> — your tray code, your local server,
+    and your existing dashboard bars (the <code>.elapsed-marker</code> shown here is copied straight from
+    <code>usage.js</code>) all carry over; the new part is swapping <code>pystray</code> for <code>rumps</code> on Mac
+    (crisp live menu-bar text) and a thin <code>WKWebView</code> panel at <code>127.0.0.1:8321</code>. The
+    <b>OpenAI/Codex</b> account is the separate piece: its login is a clean port of your OAuth flow, but reading its
+    usage rides an undocumented Codex surface.
+    <div class="legend">
+      <span><span class="dot" style="background:var(--green)"></span> &lt;71% healthy</span>
+      <span><span class="dot" style="background:var(--amber)"></span> 71–90% tight</span>
+      <span><span class="dot" style="background:var(--red)"></span> &gt;90% saturated</span>
+      <span><span class="swatch-line"></span> white line = time elapsed in window</span>
+      <span><span class="prov claude" style="width:14px;height:14px;display:inline-grid">A</span> Claude</span>
+      <span><span class="prov openai" style="width:14px;height:14px;display:inline-grid">O</span> OpenAI</span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

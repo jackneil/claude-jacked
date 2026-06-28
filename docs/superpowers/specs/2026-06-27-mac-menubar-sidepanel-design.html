@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spec — macOS menu-bar app + pinned usage side-panel</title>
+
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="draft">
+<meta name="jacked:branch" content="feat/mac-menubar">
+<meta name="jacked:date" content="2026-06-27">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff;
+    --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7;
+    --danger:#b32424; --danger-bg:#fbe9e7; --ok:#1f7a3f; --ok-bg:#e8f4ec;
+    --border:#d8d4cc; --code-bg:#f3efe8; --shadow:0 1px 3px rgba(0,0,0,.06); --radius:6px;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f;
+      --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18;
+      --danger:#ea7670; --danger-bg:#3a1f1c; --ok:#6acd8e; --ok-bg:#1c3327;
+      --border:#2e2e2e; --code-bg:#232323; --shadow:0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing:border-box; }
+  body { font-family:var(--sans); font-size:16px; line-height:1.6; color:var(--fg); background:var(--bg); margin:0; padding:2rem 1rem; }
+  .wrap { max-width:880px; margin:0 auto; }
+  h1 { font-size:2rem; margin:0 0 .25rem; line-height:1.2; }
+  h2 { font-size:1.4rem; margin:2.5rem 0 .75rem; padding-bottom:.35rem; border-bottom:1px solid var(--border); }
+  h3 { font-size:1.1rem; margin:1.5rem 0 .5rem; color:var(--fg-muted); }
+  p { margin:.5rem 0 1rem; }
+  a { color:var(--accent); }
+  .meta { display:flex; flex-wrap:wrap; gap:.5rem 1rem; margin:.5rem 0 2rem; padding:.75rem 1rem;
+    background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); font-size:.9rem; }
+  .meta .kv { display:flex; gap:.35rem; }
+  .meta .k { color:var(--fg-muted); }
+  .meta .v { font-family:var(--mono); }
+  .badge { display:inline-block; padding:.15rem .6rem; border-radius:99px; font-size:.8rem; font-weight:500; line-height:1.4; }
+  .badge.ok{background:var(--ok-bg);color:var(--ok);} .badge.warn{background:var(--warn-bg);color:var(--warn);}
+  .badge.danger{background:var(--danger-bg);color:var(--danger);} .badge.info{background:var(--accent-bg);color:var(--accent);}
+  nav.toc { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:1rem 1.25rem; margin-bottom:2rem; box-shadow:var(--shadow); }
+  nav.toc h2 { margin:0 0 .5rem; font-size:.9rem; text-transform:uppercase; letter-spacing:.05em; color:var(--fg-muted); border:none; padding:0; }
+  nav.toc ol { margin:0; padding-left:1.5rem; }
+  nav.toc li { margin:.15rem 0; }
+  aside.callout { margin:1rem 0; padding:.9rem 1.1rem; border-left:4px solid var(--accent); background:var(--accent-bg); border-radius:0 var(--radius) var(--radius) 0; }
+  aside.callout.warn{border-color:var(--warn);background:var(--warn-bg);} aside.callout.danger{border-color:var(--danger);background:var(--danger-bg);} aside.callout.ok{border-color:var(--ok);background:var(--ok-bg);}
+  aside.callout > :first-child { margin-top:0; } aside.callout > :last-child { margin-bottom:0; }
+  code { font-family:var(--mono); font-size:.92em; background:var(--code-bg); padding:.12em .35em; border-radius:3px; }
+  pre { font-family:var(--mono); font-size:.88rem; background:var(--code-bg); border:1px solid var(--border); border-radius:var(--radius); padding:.9rem 1rem; overflow-x:auto; line-height:1.45; }
+  pre code { background:transparent; padding:0; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; background:var(--bg-card); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow); }
+  th,td { text-align:left; padding:.55rem .8rem; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { background:var(--code-bg); font-weight:600; font-size:.9rem; }
+  tr:last-child td { border-bottom:none; }
+  ul.crit { list-style:none; padding-left:0; }
+  ul.crit li { padding:.3rem 0 .3rem 1.8rem; position:relative; }
+  ul.crit li::before { content:"AC"; position:absolute; left:0; top:.35rem; font-family:var(--mono); font-size:.7rem; font-weight:700; color:var(--accent); background:var(--accent-bg); padding:.05rem .3rem; border-radius:4px; }
+  .diagram { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:1rem; margin:1rem 0; text-align:center; overflow-x:auto; }
+  .diagram pre.mermaid-source { text-align:left; display:none; }
+  .diagram.failed pre.mermaid-source { display:block; }
+  .diagram.failed svg { display:none; }
+  hr { border:none; border-top:1px solid var(--border); margin:2.5rem 0; }
+  @media print { body{background:white;color:black;padding:0;} .wrap{max-width:none;} nav.toc,pre,table,aside.callout,.diagram{break-inside:avoid;} h2,h3{break-after:avoid;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>macOS menu-bar app + pinned usage side-panel</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">draft</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-06-27</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">feat/mac-menubar</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#ac">Acceptance Criteria</a></li>
+    <li><a href="#nongoals">Non-Goals / Out of Scope</a></li>
+    <li><a href="#decision">Key Decision: reuse vs. native</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#files">Files &amp; Interfaces</a></li>
+    <li><a href="#testing">Testing &amp; Verification</a></li>
+    <li><a href="#open">Open Questions</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>On macOS, turn jacked's existing system-tray into a real menu-bar app: a live, glanceable
+<strong>pill</strong> in the menu bar (worst account's 5-hour · weekly %, color-coded), a
+click-down <strong>dropdown</strong> showing every account's two windows, and an optional
+<strong>side panel pinned to the right edge of the screen</strong> that stays visible on every Space —
+so the user never has to hunt for a browser tab to see usage. The dropdown and panel render the
+<em>same</em> usage bars as the dashboard (colored fill = quota used, white time-marker = position in the
+window), so a user can see at a glance when an account is burning faster than the clock.</p>
+
+<aside class="callout info">
+  <strong>Context:</strong> jacked already ships a cross-platform <code>pystray</code> tray
+  (<code>jacked/service/tray.py</code>) whose only real action is "Open Dashboard" → opens a browser at
+  <code>127.0.0.1:8321</code>. The dashboard already draws these exact bars
+  (<code>jacked/data/web/js/components/usage.js</code> → <code>renderUsageBar()</code> with the
+  <code>.elapsed-marker</code> white line). This feature is macOS-only by explicit request; Windows/Linux
+  keep the existing pystray tray untouched.
+</aside>
+
+<h2 id="ac">Acceptance Criteria</h2>
+<p>Each is a done-condition Phase 6 verifies against the running app.</p>
+<ul class="crit">
+  <li>On macOS, starting the jacked service shows a menu-bar item whose <strong>title is live text</strong>
+    reflecting the worst account's <code>5h · 7d</code> %, color-coded (green &lt;71, amber 71–90, red &gt;90),
+    refreshing on an interval — with no browser open.</li>
+  <li>Clicking the menu-bar item opens a <strong>dropdown</strong> showing every account's <strong>5-hour and
+    weekly</strong> windows as the dashboard's bars, each <strong>including the white <code>.elapsed-marker</code></strong>
+    at the time-elapsed position, plus reset time and color coding.</li>
+  <li>Accounts that <strong>share an email but differ by organization</strong> are <strong>grouped under one
+    login header</strong> (with a "N orgs" chip and a connecting rail), each org shown as its own sub-row with
+    its own plan badge and meters; the <strong>active</strong> org is marked.</li>
+  <li>A <strong>"Toggle Side Panel"</strong> action pins a borderless, always-on-top panel to the right screen
+    edge; it is visible across <strong>all Spaces and above full-screen apps</strong>, does <strong>not steal
+    focus</strong>, re-pins correctly on display add/remove/resolution change, and toggling again hides it.</li>
+  <li>The dropdown and the side panel render the <strong>same</strong> compact page (one component); their bars
+    match the live dashboard with <strong>no divergent rendering logic</strong>.</li>
+  <li>Menu actions work: <strong>Open Dashboard</strong>, <strong>Toggle Side Panel</strong>,
+    <strong>Auto-swap</strong> (reflects and toggles current state), <strong>Add account</strong> (launches the
+    existing OAuth flow), <strong>Restart</strong>, <strong>Quit</strong> (cleanly stops uvicorn — no orphaned
+    process, no stuck port).</li>
+  <li>The menu-bar agent <strong>does not start its own server</strong>: it health-checks and connects to the
+    existing <code>ServiceRunner</code>/LaunchAgent-managed uvicorn on <code>127.0.0.1:8321</code>, and shows a
+    clear degraded state if the server is down.</li>
+  <li>Non-macOS platforms keep the existing <code>pystray</code> tray with <strong>no behavioral change</strong>.</li>
+  <li><code>rumps</code> and the required <code>pyobjc</code> frameworks are <strong>darwin-only</strong>
+    dependencies; a Windows/Linux install resolves and runs unaffected.</li>
+  <li>The side panel uses a purpose-built <strong>compact dark-glass theme</strong> (not a shrunken dashboard
+    page) and reuses the existing usage bar component verbatim.</li>
+  <li><code>uv run python -m pytest</code> passes, including new unit tests for the worst-account summary, the
+    account-grouping util, the <code>/panel</code> route, and the platform branch selection.</li>
+</ul>
+
+<h2 id="nongoals">Non-Goals / Out of Scope</h2>
+<p>The scope-creep firewall. This feature explicitly does <strong>NOT</strong>:</p>
+<table>
+  <thead><tr><th>Not doing</th><th>Why / where it lives instead</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Reserve</strong> screen-edge space (Dock-style strut)</td><td>No public macOS API; faking it needs Accessibility window-management. Panel <em>floats</em> on top only. Documented limitation.</td></tr>
+    <tr><td>OpenAI / Codex <strong>account support</strong></td><td>Separate effort with its own spec. The panel is provider-agnostic and will render Codex accounts when that lands, but we do <strong>not</strong> add OpenAI OAuth/usage here. The mockup's Codex row is illustrative only.</td></tr>
+    <tr><td>A native <strong>Swift</strong> app / <code>.app</code> bundle / notarization</td><td>Ships inside the existing <code>uv tool install</code>. A signed downloadable app is a possible future, not this.</td></tr>
+    <tr><td>Windows/Linux menu-bar enhancements</td><td>macOS-only by request; pystray path is frozen, only regression-guarded.</td></tr>
+    <tr><td>A <strong>WidgetKit</strong> desktop / Notification-Center widget</td><td>Throttled to 15–60 min refresh; wrong tool for live usage. Researched and rejected.</td></tr>
+    <tr><td>Re-implementing the usage bars <strong>natively</strong></td><td>Would fork the bar component into a second renderer that drifts. We reuse the web component.</td></tr>
+    <tr><td>New usage <strong>data pipeline</strong></td><td>Reuses existing endpoints/data. No new polling of Anthropic.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="decision">Key Decision: reuse the web bars, native shell around them</h2>
+<p>The rich bars (5h/7d fill, white time-marker, multi-org grouping) render in a <strong>WKWebView</strong>
+that loads a new compact page reusing the dashboard's <code>renderUsageBar()</code> — <em>not</em> redrawn in
+native AppKit. The window/menu-bar <em>behavior</em> (status-item live text, always-on-top, all-Spaces,
+edge-pinning, non-activating) is done natively in PyObjC.</p>
+<p>This was chosen on merit, not ease: native redraw would feel marginally crisper and could use true
+<code>NSVisualEffectView</code> vibrancy, but it forks the bar/marker/threshold/grouping logic into a second
+renderer that drifts on every dashboard change (a tech-debt liability), and the truly-native version is a
+separate Swift app requiring Developer-ID signing + notarization — fragmenting the clean pip/uv install.
+Reuse keeps one source of truth and one distribution. The single real loss (OS vibrancy) is mitigated by a
+deliberate compact dark-glass CSS theme; the mockups prove the opaque-dark treatment looks premium. Logic that
+could drift (e.g. account grouping) is centralized in one shared util so the two surfaces share meaning.</p>
+
+<h2 id="architecture">Architecture</h2>
+<p>One service, platform-appropriate face. The existing <code>ServiceRunner</code> (uvicorn in a daemon
+thread) is unchanged. On macOS the service launcher starts a new <code>rumps</code>-based agent instead of the
+pystray <code>Icon</code>; on other platforms it starts pystray exactly as today. The rumps agent owns the
+status item and, via PyObjC (rumps <em>is</em> PyObjC, so this runs in the same Cocoa run loop), an
+<code>NSPopover</code> (dropdown) and an <code>NSPanel</code> (side panel), each hosting a
+<code>WKWebView</code> pointed at a new compact <code>/panel</code> page. A timer polls a lightweight summary
+endpoint to set the live menu-bar title.</p>
+
+<div class="diagram">
+  <pre class="mermaid">
+flowchart TB
+    subgraph svc["jacked service (one process)"]
+      SR["ServiceRunner\nuvicorn @ 127.0.0.1:8321\n(unchanged)"]
+      subgraph mac["macOS face (new)"]
+        APP["MacMenuBarApp (rumps)\nNSStatusItem + timer"]
+        POP["NSPopover + WKWebView\n(dropdown)"]
+        PAN["NSPanel + WKWebView\n(pinned side panel)"]
+      end
+      WIN["pystray Icon\n(Windows/Linux, unchanged)"]
+    end
+    SR -->|serves| WEB["/panel  (compact page)\nreuses renderUsageBar() + .elapsed-marker\n+ groupAccountsByLogin()"]
+    SR -->|serves| API["/api/analytics/usage-overview\n/api summary  (worst account)"]
+    APP -->|poll summary| API
+    APP -->|live title| TITLE["menu-bar pill\nJ ● 96%·78%"]
+    POP -->|loads| WEB
+    PAN -->|loads| WEB
+    WEB -->|fetch + live update| API
+  </pre>
+  <pre class="mermaid-source">
+flowchart TB
+    SR[ServiceRunner uvicorn 8321] --> WEB[/panel compact page]
+    SR --> API[/api summary + usage-overview]
+    APP[MacMenuBarApp rumps] --> API
+    APP --> TITLE[menu-bar pill]
+    POP[NSPopover WKWebView] --> WEB
+    PAN[NSPanel WKWebView] --> WEB
+    WEB --> API
+  </pre>
+</div>
+
+<h3>Data flow</h3>
+<ul>
+  <li><strong>Pill:</strong> rumps timer → GET summary → compute/read worst account 5h·7d → set
+    <code>NSStatusItem</code> title + color.</li>
+  <li><strong>Dropdown / panel:</strong> WKWebView loads <code>/panel</code> → fetches account + usage data →
+    renders bars via the shared <code>renderUsageBar()</code> and <code>groupAccountsByLogin()</code>, live-updating
+    like the dashboard.</li>
+  <li><strong>Window behavior:</strong> panel is <code>.nonactivatingPanel</code>, status-level,
+    <code>collectionBehavior = canJoinAllSpaces | stationary | fullScreenAuxiliary</code>, pinned to
+    <code>NSScreen.visibleFrame</code> right edge, re-pinned on <code>didChangeScreenParametersNotification</code>.</li>
+</ul>
+
+<h2 id="files">Files &amp; Interfaces</h2>
+<table>
+  <thead><tr><th>File</th><th>New/changed</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/service/menubar_mac.py</code></td><td>new</td><td><code>MacMenuBarApp</code> (rumps) + PyObjC <code>NSPopover</code>/<code>NSPanel</code> hosting WKWebViews; pill timer; menu actions; panel edge-pinning + display-change handling; clean shutdown of uvicorn.</td></tr>
+    <tr><td><code>jacked/service/tray.py</code> / launcher</td><td>changed</td><td>Platform branch: on <code>sys.platform == "darwin"</code> start <code>MacMenuBarApp</code>; else existing pystray <code>Icon</code>. <code>ServiceRunner</code> reused as-is.</td></tr>
+    <tr><td><code>jacked/data/web/panel.html</code></td><td>new</td><td>Compact page (dark-glass theme) hosted in popover + panel.</td></tr>
+    <tr><td><code>jacked/data/web/js/components/panel.js</code></td><td>new</td><td>Renders the compact view by reusing <code>renderUsageBar()</code>; calls the shared grouping util; live-updates.</td></tr>
+    <tr><td><code>jacked/data/web/js/components/usage.js</code></td><td>reused</td><td>Source of truth for <code>renderUsageBar()</code> + <code>.elapsed-marker</code> + elapsed-fraction math. Unchanged (or minimally exposed for reuse).</td></tr>
+    <tr><td><code>jacked/data/web/js/util/account-grouping.js</code></td><td>new</td><td><code>groupAccountsByLogin()</code> — single definition of same-email/different-org grouping, shared by panel (and available to the dashboard).</td></tr>
+    <tr><td><code>jacked/api/routes/…</code></td><td>changed</td><td><code>GET /panel</code> route serving the compact page; a lightweight summary endpoint (or reuse <code>/api/analytics/usage-overview</code>) returning the worst-account figure for the pill.</td></tr>
+    <tr><td><code>jacked/api/main.py</code></td><td>changed</td><td>Mount/serve the new <code>/panel</code> static page alongside existing assets.</td></tr>
+    <tr><td><code>pyproject.toml</code></td><td>changed</td><td>Add <code>rumps</code> + required <code>pyobjc-framework-*</code> (Cocoa, WebKit) as <code>sys_platform == "darwin"</code> deps.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td>changed</td><td>Wire the macOS agent into the existing <code>service</code> launch path; optional <code>jacked menubar</code> entry for manual start.</td></tr>
+    <tr><td><code>tests/unit/service/…</code></td><td>new</td><td>Unit tests: worst-account summary, grouping util behavior (incl. shared-email case), platform-branch selection, <code>/panel</code> route 200 + content.</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warn">
+  <strong>Reuse the running server — never fork a second one.</strong> The agent must connect to the
+  existing uvicorn (LaunchAgent <code>ai.hank.jacked</code> / <code>ServiceRunner</code>), health-check the
+  port, and degrade gracefully if down. Forking a second server collides on port 8321. Preserve the existing
+  graceful-then-force uvicorn shutdown on Quit.
+</aside>
+
+<h2 id="testing">Testing &amp; Verification</h2>
+<ul>
+  <li><strong>Unit (<code>uv run python -m pytest</code>):</strong> worst-account summary computation;
+    <code>groupAccountsByLogin()</code> (single org, shared-email/multi-org, provider mix); platform-branch
+    selects rumps on darwin / pystray elsewhere (mocked <code>sys.platform</code>); <code>/panel</code> returns
+    200 and includes the bar component.</li>
+  <li><strong>CI parity:</strong> replicate the full CI workflow locally before pushing (per repo rule),
+    PASS/FAIL per step.</li>
+  <li><strong>Phase 6 — prove it runs:</strong> <code>/qa</code> on the <code>/panel</code> page (bars + markers +
+    grouping render; live update); manual native check of the menu-bar pill, dropdown, and pinned panel
+    (always-on-top, all-Spaces, non-activating, re-pin on display change, clean Quit). Capture screenshots /
+    output tied to each acceptance criterion.</li>
+</ul>
+
+<h2 id="open">Open Questions</h2>
+<ul>
+  <li>Summary endpoint: reuse <code>/api/analytics/usage-overview</code> for the pill, or add a tiny dedicated
+    <code>/api/menubar-summary</code>? (Lean: reuse if it already yields per-account 5h/7d cheaply; otherwise a
+    1-field endpoint to keep the timer light.) — resolved during planning by reading the endpoint.</li>
+  <li>Does the <strong>dashboard</strong> also adopt <code>groupAccountsByLogin()</code> now (consistency), or
+    only the panel this round? (Lean: ship the shared util, wire the panel; dashboard adoption optional/non-blocking.)</li>
+  <li>Default visibility: does the side panel auto-show on first launch, or stay hidden until toggled? (Lean:
+    hidden by default; remember last state.)</li>
+</ul>
+
+<hr>
+<p style="color:var(--fg-muted); font-size:.85rem; text-align:center;">
+  jacked spec · feeds <code>superpowers:writing-plans</code> → <code>/dc</code> → subagent execution → <code>/qa</code> → <code>/pr</code>.
+</p>
+
+</div>
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({ startOnLoad:true, theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark":"default", flowchart:{curve:"basis"}, securityLevel:"loose" });
+  } catch (err) {
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+</body>
+</html>

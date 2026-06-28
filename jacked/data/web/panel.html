@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>jacked — usage</title>
+<!-- Empty data-URI icon: the panel is a chromeless popover/panel with no
+     favicon; this stops the browser's automatic /favicon.ico request (a 404). -->
+<link rel="icon" href="data:,">
+<link rel="apple-touch-icon" href="data:,">
+
+<!-- Tailwind: renderUsageBar() emits Tailwind utility classes, so we load the
+     same CDN the dashboard uses. Keeps the bars pixel-identical to the dashboard
+     (single source of truth) instead of forking a second renderer. -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<style>
+    /* ---- Compact dark-glass theme (purpose-built, not a shrunk dashboard) ---- */
+    :root {
+        --glass-bg: rgba(17, 20, 26, 0.92);
+        --glass-panel: rgba(30, 35, 45, 0.72);
+        --glass-border: rgba(255, 255, 255, 0.08);
+        --rail: rgba(120, 130, 150, 0.35);
+        --txt: #e8eaed;
+        --txt-muted: #9aa1ad;
+        --txt-dim: #6b7280;
+        --accent: #2dd4bf;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: var(--txt);
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+    }
+    body {
+        background: var(--glass-bg);
+        min-height: 100vh;
+        padding: 10px 12px 14px;
+        /* subtle top sheen for the "glass" feel */
+        background-image: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0) 120px);
+    }
+    .panel-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--txt-dim);
+        margin: 2px 2px 10px;
+    }
+    .panel-title .dot {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 6px var(--accent);
+    }
+
+    /* ---- Login group ---- */
+    .login-group {
+        background: var(--glass-panel);
+        border: 1px solid var(--glass-border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        margin-bottom: 10px;
+        position: relative;
+    }
+    .login-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 2px;
+    }
+    .login-name {
+        font-weight: 600;
+        font-size: 13px;
+        color: var(--txt);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 230px;
+    }
+    .login-email {
+        font-size: 11px;
+        color: var(--txt-muted);
+        margin-bottom: 4px;
+    }
+    .org-chip {
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--accent);
+        background: rgba(45, 212, 191, 0.12);
+        border: 1px solid rgba(45, 212, 191, 0.25);
+        border-radius: 999px;
+        padding: 1px 7px;
+        line-height: 1.5;
+    }
+
+    /* Connecting rail for multi-org logins */
+    .login-group.has-rail .org-rows {
+        margin-left: 8px;
+        padding-left: 12px;
+        border-left: 2px solid var(--rail);
+    }
+
+    /* ---- Org row ---- */
+    .org-row {
+        padding: 7px 0 3px;
+    }
+    .org-row + .org-row {
+        border-top: 1px solid rgba(255,255,255,0.05);
+    }
+    .org-row.is-active {
+        /* active org gets a faint accent wash + left edge marker */
+        margin: 0 -6px;
+        padding: 7px 6px 4px;
+        border-radius: 8px;
+        background: rgba(45, 212, 191, 0.06);
+    }
+    .org-row-head {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-bottom: 5px;
+    }
+    .org-name {
+        font-size: 12px;
+        color: var(--txt);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 170px;
+    }
+    .plan-badge {
+        font-size: 10px;
+        color: var(--txt-muted);
+        background: rgba(255,255,255,0.06);
+        border-radius: 5px;
+        padding: 1px 6px;
+    }
+    .active-badge {
+        font-size: 10px;
+        font-weight: 600;
+        color: #0b1f1c;
+        background: var(--accent);
+        border-radius: 5px;
+        padding: 1px 6px;
+        margin-left: auto;
+    }
+    .org-bars { display: flex; flex-direction: column; gap: 3px; }
+
+    /* ---- Usage bar — copied verbatim from css/style.css so the bars render
+         identically here without pulling the whole dashboard stylesheet. ---- */
+    .usage-bar {
+        position: relative;
+        height: 12px;
+        border-radius: 6px;
+        background-color: #334155;
+        overflow: visible;
+        width: 100%;
+    }
+    .usage-bar .fill {
+        height: 100%;
+        border-radius: 6px;
+        transition: width 0.4s ease, background-color 0.4s ease;
+        min-width: 2px;
+    }
+    .usage-bar .fill.green  { background: linear-gradient(90deg, #16a34a, #22c55e); }
+    .usage-bar .fill.yellow { background: linear-gradient(90deg, #ca8a04, #eab308); }
+    .usage-bar .fill.red    { background: linear-gradient(90deg, #dc2626, #ef4444); }
+    .usage-bar .elapsed-marker {
+        position: absolute;
+        top: -2px;
+        bottom: -2px;
+        width: 2px;
+        background-color: #ffffff;
+        border-radius: 1px;
+        opacity: 0.8;
+        z-index: 2;
+        pointer-events: none;
+    }
+
+    /* ---- States ---- */
+    .panel-loading, .panel-empty, .panel-error {
+        text-align: center;
+        padding: 32px 16px;
+        color: var(--txt-muted);
+    }
+    .panel-empty-title, .panel-error-title { font-weight: 600; color: var(--txt); margin-bottom: 4px; }
+    .panel-empty-sub, .panel-error-sub { font-size: 12px; color: var(--txt-dim); }
+    .panel-error-title { color: #f87171; }
+    .panel-retry {
+        margin-top: 12px;
+        font-size: 12px;
+        color: var(--accent);
+        background: rgba(45, 212, 191, 0.10);
+        border: 1px solid rgba(45, 212, 191, 0.30);
+        border-radius: 7px;
+        padding: 5px 14px;
+        cursor: pointer;
+        transition: background 0.15s ease;
+    }
+    .panel-retry:hover { background: rgba(45, 212, 191, 0.20); }
+    .spinner {
+        width: 20px; height: 20px; margin: 0 auto 10px;
+        border: 2px solid rgba(255,255,255,0.15);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: panel-spin 0.7s linear infinite;
+    }
+    @keyframes panel-spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+    <div class="panel-title"><span class="dot"></span>jacked usage</div>
+    <div id="panel-root">
+        <div class="panel-loading">
+            <div class="spinner"></div>
+            Loading usage…
+        </div>
+    </div>
+
+    <!-- Order matters: helpers → bar component → grouping util → panel renderer -->
+    <script src="/js/utils.js"></script>
+    <script src="/js/components/usage.js"></script>
+    <script src="/js/util/account-grouping.js"></script>
+    <script src="/js/components/panel.js"></script>
+</body>
+</html>

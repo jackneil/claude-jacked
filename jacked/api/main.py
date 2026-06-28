@@ -438,7 +438,7 @@ async def websocket_endpoint(ws: WebSocket):
 
 # --- Include route modules ---
 
-from jacked.api.routes import system, analytics, features, logs, permissions, profiles  # noqa: E402
+from jacked.api.routes import system, analytics, features, logs, permissions, profiles, menubar  # noqa: E402
 from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
 
 # Swap settings router MUST be registered before system router —
@@ -451,6 +451,7 @@ app.include_router(features.router, prefix="/api", tags=["features"])
 app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(permissions.router, prefix="/api", tags=["permissions"])
 app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
+app.include_router(menubar.router, prefix="/api", tags=["menubar"])
 
 # Auth routes (includes credential switching + session queries)
 try:
@@ -484,6 +485,25 @@ if WEB_DIR.exists():
         app.mount("/js", StaticFiles(directory=_js_dir), name="js")
     if _assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=_assets_dir), name="assets")
+
+    @app.get("/panel")
+    async def serve_panel():
+        """Serve the compact usage panel hosted in the macOS popover + side panel.
+
+        Registered before the SPA catch-all so GET /panel returns panel.html
+        (the file has a .html extension, so the catch-all would otherwise miss
+        it and fall back to index.html).
+        """
+        panel_path = WEB_DIR / "panel.html"
+        if panel_path.exists():
+            return FileResponse(
+                panel_path,
+                headers={"Cache-Control": "no-cache, must-revalidate"},
+            )
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error": {"message": "Panel not found", "code": "NOT_FOUND"}},
+        )
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):

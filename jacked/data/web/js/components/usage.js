@@ -4,6 +4,19 @@
  */
 
 /**
+ * Color class for a usage percentage. Single source of truth for the
+ * green/yellow(amber)/red thresholds, shared by renderUsageBar and any other
+ * surface (menu-bar pill, side panel) so a bar and its pill can never disagree.
+ * Mirror of jacked/service/menubar_summary.py::usage_color_class (Python side).
+ * @param {number} percentage - Usage percentage (0-100).
+ * @returns {'green'|'yellow'|'red'}
+ */
+function usageColorClass(percentage) {
+    const pct = Math.max(0, Math.min(100, percentage || 0));
+    return pct >= 90 ? 'red' : (pct >= 71 ? 'yellow' : 'green');
+}
+
+/**
  * Render a usage bar.
  * @param {number} percentage - Usage percentage (0-100).
  * @param {string} resetTime - ISO timestamp or human-readable reset time string.
@@ -13,7 +26,7 @@
  */
 function renderUsageBar(percentage, resetTime, elapsedFraction, label) {
     const pct = Math.max(0, Math.min(100, percentage || 0));
-    const colorClass = pct >= 90 ? 'red' : (pct >= 71 ? 'yellow' : 'green');
+    const colorClass = usageColorClass(pct);
 
     let markerHtml = '';
     if (elapsedFraction !== null && elapsedFraction !== undefined && elapsedFraction >= 0 && elapsedFraction <= 1) {

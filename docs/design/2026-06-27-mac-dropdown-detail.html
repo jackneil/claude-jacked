@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jacked · menu-bar dropdown (5h + 7d, multi-org)</title>
+<style>
+  :root{
+    --purple1:#6366f1; --purple2:#8b5cf6;
+    --claude:#d97757; --openai:#10a37f;
+    --green:#34c759; --amber:#ff9f0a; --red:#ff453a;
+    --ink:#f4f4f7; --dim:#9b9ba6; --dim2:#74747e;
+    --hair:rgba(255,255,255,.10);
+    --mono:"SF Mono",ui-monospace,Menlo,monospace;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html{-webkit-font-smoothing:antialiased}
+  body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:radial-gradient(120% 100% at 75% 0%, #2a2150 0%, #1a1636 40%, #0c0b18 100%);
+    color:var(--ink); line-height:1.45; padding:42px 26px 90px; min-height:100vh}
+  .wrap{max-width:1180px; margin:0 auto}
+  .badge{display:inline-block; font-size:11px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+    color:#c4b5fd; background:rgba(139,92,246,.16); border:1px solid rgba(139,92,246,.35);
+    padding:3px 9px; border-radius:999px; margin-bottom:14px}
+  h1{font-size:25px; font-weight:700; letter-spacing:-.02em}
+  .lede{color:var(--dim); font-size:15px; margin-top:8px; max-width:720px}
+
+  .stage{display:flex; gap:42px; align-items:flex-start; margin-top:38px; flex-wrap:wrap}
+
+  /* mini menu bar above the dropdown */
+  .barwrap{flex:none}
+  .mini-menubar{width:372px; height:26px; border-radius:8px 8px 0 0; background:rgba(10,10,14,.6);
+    backdrop-filter:blur(18px); display:flex; align-items:center; padding:0 10px; gap:12px;
+    border:1px solid rgba(255,255,255,.07); border-bottom:none}
+  .mini-menubar .spacer{flex:1}
+  .tray-pill{display:flex; align-items:center; gap:7px; font-weight:650; font-size:12.5px;
+    font-variant-numeric:tabular-nums; padding:2px 9px; border-radius:7px;
+    background:linear-gradient(135deg, rgba(99,102,241,.32), rgba(139,92,246,.32));
+    box-shadow:0 0 0 1px rgba(139,92,246,.5) inset}
+  .tray-pill .j{width:14px;height:14px;border-radius:4px;display:grid;place-items:center;
+    background:linear-gradient(135deg,var(--purple1),var(--purple2)); color:#fff; font-weight:800; font-size:9px}
+  .dot{width:7px;height:7px;border-radius:50%}
+  .clock{font-size:12px; font-variant-numeric:tabular-nums; color:#e7e7ea}
+
+  /* dropdown shell */
+  .dropdown{width:372px; border-radius:4px 4px 13px 13px; overflow:hidden;
+    background:rgba(34,34,40,.84); backdrop-filter:blur(44px) saturate(180%);
+    -webkit-backdrop-filter:blur(44px) saturate(180%);
+    border:1px solid rgba(255,255,255,.13);
+    box-shadow:0 30px 60px -18px rgba(0,0,0,.75)}
+  .dd-h{display:flex; align-items:center; padding:11px 14px 8px; font-size:10.5px; font-weight:700;
+    letter-spacing:.07em; color:var(--dim); text-transform:uppercase}
+  .dd-h .col{margin-left:auto; display:flex; gap:14px}
+  .dd-h .col span{width:54px; text-align:center}
+  .sep{height:1px; background:rgba(255,255,255,.09); margin:5px 12px}
+
+  /* a single account block */
+  .acct{padding:9px 14px 11px}
+  .acct:hover{background:rgba(139,92,246,.13)}
+  .a-id{display:flex; align-items:center; gap:8px; margin-bottom:8px}
+  .prov{width:19px;height:19px;border-radius:6px;display:grid;place-items:center; font-size:11px;
+    font-weight:800; color:#fff; flex:none}
+  .prov.claude{background:var(--claude)} .prov.openai{background:var(--openai)}
+  .a-name{font-size:13px; font-weight:650; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .a-name .org{font-weight:650}
+  .a-name .em{color:var(--dim); font-weight:500}
+  .plan{font-size:9.5px; font-weight:800; letter-spacing:.04em; padding:2px 7px; border-radius:999px;
+    color:#ececf1; background:rgba(255,255,255,.11); flex:none}
+  .tag-active{font-size:9px; font-weight:800; letter-spacing:.06em; color:#c4b5fd;
+    background:rgba(139,92,246,.22); border:1px solid rgba(139,92,246,.5); padding:1px 6px; border-radius:999px; flex:none}
+
+  /* the pretty dual meter */
+  .meters{display:flex; flex-direction:column; gap:7px}
+  .m{display:flex; align-items:center; gap:9px}
+  .m-tag{font-family:var(--mono); font-size:9px; font-weight:700; letter-spacing:.05em; color:var(--dim);
+    background:rgba(255,255,255,.07); border:1px solid var(--hair); padding:2px 5px; border-radius:5px;
+    width:30px; text-align:center; flex:none}
+  .track{position:relative; flex:1; height:7px; border-radius:5px; background:rgba(255,255,255,.11);
+    box-shadow:inset 0 1px 1px rgba(0,0,0,.35); overflow:visible}
+  /* the "little white bar" — where you are in the window by TIME (from usage.js .elapsed-marker) */
+  .elapsed-marker{position:absolute; top:-3px; bottom:-3px; width:2px; background:#fff; border-radius:1px;
+    opacity:.92; z-index:3; box-shadow:0 0 4px rgba(0,0,0,.6)}
+  .fill{height:100%; border-radius:5px}
+  .fill.g{background:linear-gradient(90deg,#2bd14e,#34c759); box-shadow:0 0 8px rgba(52,199,89,.45)}
+  .fill.am{background:linear-gradient(90deg,#ffd60a,#ff9f0a); box-shadow:0 0 8px rgba(255,159,10,.5)}
+  .fill.rd{background:linear-gradient(90deg,#ff6961,#ff453a); box-shadow:0 0 9px rgba(255,69,58,.55)}
+  .pc{font-size:12px; font-weight:750; font-variant-numeric:tabular-nums; width:38px; text-align:right; flex:none}
+  .pc.g{color:#5be07a} .pc.am{color:#ffb340} .pc.rd{color:#ff6b62}
+  .reset{font-size:10px; color:var(--dim2); width:46px; text-align:right; flex:none; font-variant-numeric:tabular-nums}
+
+  /* grouped (same email, multiple orgs) */
+  .group{padding:9px 14px 11px}
+  .group:hover{background:transparent}
+  .g-head{display:flex; align-items:center; gap:8px; margin-bottom:3px}
+  .g-email{font-size:13px; font-weight:700}
+  .shared{margin-left:auto; font-size:9.5px; font-weight:650; color:#a5b4fc;
+    background:rgba(99,102,241,.16); border:1px solid rgba(99,102,241,.4); padding:2px 7px; border-radius:999px}
+  .g-rows{margin-left:9px; padding-left:15px; border-left:2px solid rgba(139,92,246,.3); display:flex; flex-direction:column; gap:11px; margin-top:8px}
+  .orow{position:relative}
+  .orow::before{content:""; position:absolute; left:-17px; top:10px; width:11px; height:2px;
+    background:rgba(139,92,246,.3); border-radius:2px}
+  .orow:hover{background:transparent}
+  .o-top{display:flex; align-items:center; gap:7px; margin-bottom:7px}
+  .o-org{font-size:12.5px; font-weight:650}
+  .o-kind{font-size:10.5px; color:var(--dim); font-weight:500}
+  .o-rail-active{position:absolute; left:-17px; top:4px; bottom:4px; width:2px;
+    background:linear-gradient(var(--purple1),var(--purple2)); border-radius:2px}
+
+  .dd-action{display:flex; align-items:center; padding:8px 14px; font-size:12.5px; color:#e7e7ea}
+  .dd-action:hover{background:rgba(139,92,246,.18)}
+  .dd-action .key{margin-left:auto; color:var(--dim); font-size:11px}
+  .dd-action.hl{font-weight:600; color:#fff}
+  .check{margin-left:auto; color:var(--green); font-weight:700; font-size:11.5px}
+
+  /* right column explainer */
+  .notes{flex:1; min-width:300px; max-width:430px}
+  .note{background:rgba(255,255,255,.035); border:1px solid var(--hair); border-radius:14px; padding:16px 18px; margin-bottom:14px}
+  .note h3{font-size:14.5px; font-weight:700; margin-bottom:7px; display:flex; align-items:center; gap:8px}
+  .note h3 .pin{width:8px;height:8px;border-radius:50%}
+  .note p{color:var(--dim); font-size:13px; margin-bottom:6px}
+  .note code{font-family:var(--mono); font-size:11.5px; color:#c4b5fd; background:rgba(139,92,246,.12); padding:1px 5px; border-radius:5px}
+  .note ul{margin:6px 0 2px 2px; list-style:none; display:flex; flex-direction:column; gap:7px}
+  .note li{color:var(--dim); font-size:12.5px; padding-left:20px; position:relative}
+  .note li::before{content:""; position:absolute; left:2px; top:6px; width:7px; height:7px; border-radius:2px; background:var(--purple2)}
+  .note li b{color:var(--ink)}
+
+  .legend{display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--dim); margin-top:4px}
+  .legend span{display:inline-flex; align-items:center; gap:6px}
+
+  /* alternate ring style */
+  .alt{margin-top:48px}
+  .alt h2{font-size:18px; font-weight:650; letter-spacing:-.01em}
+  .alt .sub{color:var(--dim); font-size:13.5px; margin:4px 0 18px; max-width:680px}
+  .ring-row{display:flex; gap:18px; flex-wrap:wrap}
+  .ring-card{background:rgba(255,255,255,.04); border:1px solid var(--hair); border-radius:13px;
+    padding:13px 15px; display:flex; align-items:center; gap:13px; min-width:250px}
+  .ring{position:relative; width:48px; height:48px; flex:none}
+  .ring .ctr{position:absolute; inset:0; display:grid; place-items:center; font-size:11px; font-weight:800;
+    font-variant-numeric:tabular-nums}
+  .ring-meta .rn{font-size:12.5px; font-weight:650}
+  .ring-meta .rs{font-size:11px; color:var(--dim)}
+  .ring-key{display:flex; gap:14px; margin-top:14px; font-size:11.5px; color:var(--dim)}
+  .ring-key span{display:inline-flex; align-items:center; gap:6px}
+  .swatch{width:18px;height:6px;border-radius:3px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="badge">Mockup · refined dropdown · macOS only</div>
+  <h1>Menu-bar dropdown — both windows, multi-org aware</h1>
+  <p class="lede">Every account shows its <b>5-hour</b> and <b>weekly</b> window as a separate color-coded meter with
+  its reset time. When two accounts share an email but live in different orgs, they're <b>grouped under one login</b>
+  so you can tell them apart at a glance.</p>
+
+  <div class="stage">
+    <!-- ============ THE DROPDOWN ============ -->
+    <div class="barwrap">
+      <div class="mini-menubar">
+        <span class="spacer"></span>
+        <div class="tray-pill"><span class="j">J</span><span class="dot" style="background:var(--red)"></span>96% · 78%</div>
+        <span class="clock">2:14 PM</span>
+      </div>
+
+      <div class="dropdown">
+        <div class="dd-h">Accounts · usage now <span class="col"><span>5-HOUR</span><span>WEEKLY</span></span></div>
+
+        <!-- GROUPED: same email, two orgs -->
+        <div class="group">
+          <div class="g-head">
+            <div class="prov claude">A</div>
+            <div class="g-email">jack@hank.ai</div>
+            <span class="shared">1 login · 2 orgs</span>
+          </div>
+          <div class="g-rows">
+
+            <div class="orow">
+              <div class="o-rail-active"></div>
+              <div class="o-top"><span class="o-org">Hank AI</span><span class="o-kind">· Enterprise</span>
+                <span class="tag-active">ACTIVE</span><span class="plan" style="margin-left:auto">MAX</span></div>
+              <div class="meters">
+                <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill g" style="width:62%"></div><div class="elapsed-marker" style="left:52%"></div></div><span class="pc g">62%</span><span class="reset">4:41p</span></div>
+                <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:41%"></div><div class="elapsed-marker" style="left:58%"></div></div><span class="pc g">41%</span><span class="reset">Mon</span></div>
+              </div>
+            </div>
+
+            <div class="orow">
+              <div class="o-top"><span class="o-org">Personal</span><span class="o-kind">· individual</span>
+                <span class="plan" style="margin-left:auto">PRO</span></div>
+              <div class="meters">
+                <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill g" style="width:12%"></div><div class="elapsed-marker" style="left:33%"></div></div><span class="pc g">12%</span><span class="reset">—</span></div>
+                <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:9%"></div><div class="elapsed-marker" style="left:44%"></div></div><span class="pc g">9%</span><span class="reset">Wed</span></div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <!-- normal single-org account, saturated -->
+        <div class="acct">
+          <div class="a-id"><div class="prov claude">A</div>
+            <div class="a-name"><span class="org">Hank Research</span> <span class="em">· ml-research@hank.ai</span></div>
+            <span class="plan">MAX</span></div>
+          <div class="meters">
+            <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill rd" style="width:96%"></div><div class="elapsed-marker" style="left:38%"></div></div><span class="pc rd">96%</span><span class="reset">3:08p</span></div>
+            <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill am" style="width:78%"></div><div class="elapsed-marker" style="left:72%"></div></div><span class="pc am">78%</span><span class="reset">Mon</span></div>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <!-- openai / codex account -->
+        <div class="acct">
+          <div class="a-id"><div class="prov openai">O</div>
+            <div class="a-name"><span class="org">codex@hank.ai</span> <span class="em">· OpenAI</span></div>
+            <span class="plan">PLUS</span></div>
+          <div class="meters">
+            <div class="m"><span class="m-tag">5H</span><div class="track"><div class="fill am" style="width:71%"></div><div class="elapsed-marker" style="left:82%"></div></div><span class="pc am">71%</span><span class="reset">5:20p</span></div>
+            <div class="m"><span class="m-tag">7D</span><div class="track"><div class="fill g" style="width:34%"></div><div class="elapsed-marker" style="left:60%"></div></div><span class="pc g">34%</span><span class="reset">Mon</span></div>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+        <div class="dd-action hl">↗ Open Dashboard<span class="key">⌘D</span></div>
+        <div class="dd-action hl">◨ Toggle Side Panel<span class="key">⌘\</span></div>
+        <div class="dd-action">Auto-swap<span class="check">✓ On</span></div>
+        <div class="sep"></div>
+        <div class="dd-action">＋ Add account…</div>
+        <div class="dd-action">Quit jacked<span class="key">⌘Q</span></div>
+      </div>
+    </div>
+
+    <!-- ============ EXPLAINER ============ -->
+    <div class="notes">
+      <div class="note">
+        <h3><span class="pin" style="background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.5)"></span> The white line = your pace</h3>
+        <p>The thin white bar marks <b style="color:var(--ink)">where you are in the window by time</b>. Compare it to the colored fill — that's the read you were missing:</p>
+        <div style="display:flex;align-items:center;gap:9px;margin:10px 0 2px"><span class="m-tag">5H</span>
+          <div class="track" style="height:9px"><div class="fill rd" style="width:96%"></div><div class="elapsed-marker" style="left:38%"></div></div></div>
+        <p style="margin:0 0 0 40px"><b style="color:#ff6b62">Fill past the line → burning faster than the clock.</b> 96% used but only 38% of the window has passed — you'll hit the wall early.</p>
+        <div style="display:flex;align-items:center;gap:9px;margin:12px 0 2px"><span class="m-tag">5H</span>
+          <div class="track" style="height:9px"><div class="fill am" style="width:71%"></div><div class="elapsed-marker" style="left:82%"></div></div></div>
+        <p style="margin:0 0 0 40px"><b style="color:#5be07a">Fill behind the line → you'll reset before running out.</b> 71% used with 82% of the window gone — you're fine.</p>
+      </div>
+      <div class="note">
+        <h3><span class="pin" style="background:var(--purple2)"></span> The pretty part: two windows per account</h3>
+        <p>Each account shows <b style="color:var(--ink)">5H</b> and <b style="color:var(--ink)">7D</b> as their own
+        meter — color-coded green → amber → red by how saturated they are, with the reset time on the right
+        (<code>4:41p</code>, <code>Mon</code>). You see <i>which</i> window is the problem, not just one blended number.</p>
+        <p>The bars read the same fields the panel does: the 5-hour and weekly utilization + <code>resets_at</code>
+        already in your usage data.</p>
+      </div>
+
+      <div class="note">
+        <h3><span class="pin" style="background:#a5b4fc"></span> Same email, different orgs</h3>
+        <p>Your identity key is <code>(email, organization_uuid)</code> — so one login can appear as
+        <b style="color:var(--ink)">two accounts</b> in different orgs, each with its own plan and limits.</p>
+        <ul>
+          <li>Shared email gets <b>one header</b> with a <code>1 login · 2 orgs</code> chip.</li>
+          <li>The <b>org name</b> (Hank AI · Enterprise, Personal) becomes the row label — that's what actually differs.</li>
+          <li>A connecting rail shows they're the <b>same credentials</b>, so you never confuse them or "re-add" one.</li>
+          <li>The <b>active</b> org is marked, since switching changes which org Claude Code uses.</li>
+        </ul>
+      </div>
+
+      <div class="note">
+        <h3><span class="pin" style="background:var(--green)"></span> Reading the colors</h3>
+        <div class="legend">
+          <span><span class="dot" style="background:var(--green)"></span> &lt;70% healthy</span>
+          <span><span class="dot" style="background:var(--amber)"></span> 70–90% tight</span>
+          <span><span class="dot" style="background:var(--red)"></span> &gt;90% saturated</span>
+        </div>
+        <div class="legend" style="margin-top:10px">
+          <span><span class="prov claude" style="width:15px;height:15px;display:inline-grid">A</span> Claude / Anthropic</span>
+          <span><span class="prov openai" style="width:15px;height:15px;display:inline-grid">O</span> Codex / OpenAI</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ ALTERNATE: RING STYLE ============ -->
+  <div class="alt">
+    <h2>Or, denser: a dual-ring per account</h2>
+    <p class="sub">Same two windows, drawn as one compact gauge — <b>outer ring = weekly</b>, <b>inner ring = 5-hour</b>,
+    worst-of-the-two number in the middle. Prettier and tighter if you'd rather keep the dropdown short; the labeled
+    bars above are easier to read precisely — and they carry the white time-marker, which rings can't show cleanly. Your pick.</p>
+    <div class="ring-row">
+
+      <!-- jack / Hank AI -->
+      <div class="ring-card">
+        <div class="ring">
+          <svg width="48" height="48" viewBox="0 0 48 48">
+            <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="4"/>
+            <circle cx="24" cy="24" r="20" fill="none" stroke="#34c759" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="125.6" stroke-dashoffset="74.1" transform="rotate(-90 24 24)"/>
+            <circle cx="24" cy="24" r="13" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="4"/>
+            <circle cx="24" cy="24" r="13" fill="none" stroke="#34c759" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="81.7" stroke-dashoffset="31.0" transform="rotate(-90 24 24)"/>
+          </svg>
+          <div class="ctr" style="color:#5be07a">62%</div>
+        </div>
+        <div class="ring-meta"><div class="rn">Hank AI · Enterprise</div><div class="rs">jack@hank.ai · MAX</div>
+          <div class="rs" style="color:#5be07a">5h 62% · wk 41%</div></div>
+      </div>
+
+      <!-- ml-research saturated -->
+      <div class="ring-card">
+        <div class="ring">
+          <svg width="48" height="48" viewBox="0 0 48 48">
+            <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="4"/>
+            <circle cx="24" cy="24" r="20" fill="none" stroke="#ff9f0a" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="125.6" stroke-dashoffset="27.6" transform="rotate(-90 24 24)"/>
+            <circle cx="24" cy="24" r="13" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="4"/>
+            <circle cx="24" cy="24" r="13" fill="none" stroke="#ff453a" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="81.7" stroke-dashoffset="3.3" transform="rotate(-90 24 24)"/>
+          </svg>
+          <div class="ctr" style="color:#ff6b62">96%</div>
+        </div>
+        <div class="ring-meta"><div class="rn">Hank Research</div><div class="rs">ml-research@hank.ai · MAX</div>
+          <div class="rs" style="color:#ff6b62">5h 96% · wk 78%</div></div>
+      </div>
+
+      <!-- codex -->
+      <div class="ring-card">
+        <div class="ring">
+          <svg width="48" height="48" viewBox="0 0 48 48">
+            <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="4"/>
+            <circle cx="24" cy="24" r="20" fill="none" stroke="#34c759" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="125.6" stroke-dashoffset="82.9" transform="rotate(-90 24 24)"/>
+            <circle cx="24" cy="24" r="13" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="4"/>
+            <circle cx="24" cy="24" r="13" fill="none" stroke="#ff9f0a" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="81.7" stroke-dashoffset="23.7" transform="rotate(-90 24 24)"/>
+          </svg>
+          <div class="ctr" style="color:#ffb340">71%</div>
+        </div>
+        <div class="ring-meta"><div class="rn">codex@hank.ai</div><div class="rs">OpenAI · PLUS</div>
+          <div class="rs" style="color:#ffb340">5h 71% · wk 34%</div></div>
+      </div>
+
+    </div>
+    <div class="ring-key">
+      <span><span class="swatch" style="background:#34c759"></span> outer = weekly (7d)</span>
+      <span><span class="swatch" style="background:#34c759;opacity:.85"></span> inner = 5-hour</span>
+      <span>center = whichever is higher</span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
