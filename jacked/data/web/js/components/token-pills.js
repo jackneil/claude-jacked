@@ -79,9 +79,37 @@ function _renderSinglePill(cfg) {
 }
 
 /**
- * Render both token pills (primary + CC) for an account card.
+ * Codex accounts have no Anthropic "Usage Token" and no Claude Code "CC Token" —
+ * those pills are meaningless here. Show a single signed-in/re-login status
+ * instead (validity = logged in to Codex + the app-server usage works).
+ */
+function _renderCodexPill(acct) {
+    const vs = acct.validation_status;
+    let dot, text, title;
+    if (vs === 'invalid') {
+        dot = 'triangle';
+        text = 're-login';
+        title = 'Signed out of Codex — run `codex login`, then Add Account → Codex';
+    } else if (vs === 'checking') {
+        dot = 'pulse';
+        text = 'checking…';
+        title = 'Checking Codex sign-in';
+    } else {
+        dot = 'filled green';
+        text = 'signed in';
+        title = 'Signed in to Codex';
+    }
+    return `<span class="token-pills-container"><span class="token-pill" title="${escapeHtml(title)}"><span class="pill-dot ${dot}"></span><span class="pill-label">${text}</span></span></span>`;
+}
+
+/**
+ * Render the token pills for an account card. Codex accounts get a single
+ * signed-in pill; Claude accounts get the Usage Token (+ CC Token) pills.
  */
 function renderTokenPills(acct) {
+    if ((acct.provider || 'claude') === 'codex') {
+        return _renderCodexPill(acct);
+    }
     const primaryPill = _renderSinglePill({
         label: PRIMARY_LABEL,
         isPrimary: true,

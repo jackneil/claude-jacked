@@ -1026,6 +1026,39 @@ async def fetch_profile(
         return None
 
 
+def _validate_codex_account(account_id: int, db: Database) -> dict:
+    """Validate a Codex account by its signed-in state (its slot holds a real
+    credential), NOT the Anthropic profile API — Codex tokens aren't Anthropic
+    tokens, so the profile call would always 401 and falsely mark it invalid."""
+    try:
+        from jacked.codex.credentials import read_auth_json
+        from jacked.codex.switching import codex_account_home
+
+        auth = read_auth_json(codex_account_home(account_id))
+        signed_in = bool(auth and (auth.get("tokens") or auth.get("OPENAI_API_KEY")))
+    except Exception:
+        logger.debug("codex validation read failed for %s", account_id, exc_info=True)
+        signed_in = True  # never false-invalidate on a transient read error
+    if signed_in:
+        db.update_account(
+            account_id,
+            validation_status="valid",
+            last_validated_at=int(time.time()),
+            consecutive_failures=0,
+            last_error=None,
+            last_error_at=None,
+        )
+        return {"valid": True, "error": None}
+    db.update_account(
+        account_id,
+        validation_status="invalid",
+        last_validated_at=int(time.time()),
+        last_error="Codex account signed out — run `codex login`",
+        last_error_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return {"valid": False, "error": "Codex signed out"}
+
+
 async def validate_account(account_id: int, db: Database) -> dict:
     """Validate an account by attempting a profile fetch.
 
@@ -1040,6 +1073,13 @@ async def validate_account(account_id: int, db: Database) -> dict:
     account = db.get_account(account_id)
     if not account:
         return {"valid": False, "error": "Account not found"}
+
+    # Codex accounts are NOT Anthropic-token-validated (their stored token is a
+    # sentinel). Validity = signed in to Codex (the account's slot holds a real
+    # credential); hitting the Anthropic profile API would always 401 and
+    # falsely mark them invalid.
+    if (account.get("provider") or "claude") == "codex":
+        return _validate_codex_account(account_id, db)
 
     # Mark as checking
     db.update_account(account_id, validation_status="checking")

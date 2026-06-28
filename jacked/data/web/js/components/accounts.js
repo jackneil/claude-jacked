@@ -216,8 +216,11 @@ function renderActionButtons(acct) {
     // const copyHtml = `<button class="btn-copy-cmd ...">...</button>`;
     const copyHtml = '';
 
-    // Re-auth button (if invalid/expired) — pills also handle this, keep for backward compat
-    const showReauth = status === 'invalid' || status === 'expired';
+    // Re-auth button (if invalid/expired) — pills also handle this, keep for
+    // backward compat. NOT for Codex: its re-auth is `codex login` (the Codex
+    // pill's "re-login" tooltip guides that), not the Claude browser OAuth.
+    const showReauth = (status === 'invalid' || status === 'expired')
+        && (acct.provider || 'claude') !== 'codex';
     let reauthHtml = '';
     if (showReauth) {
         reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;

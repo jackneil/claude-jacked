@@ -89,6 +89,14 @@ def import_codex_account(
     except Exception:  # pragma: no cover - capture is best-effort
         logger.debug("seed_codex_slot failed for account %s", acct.get("id"), exc_info=True)
 
+    # A freshly-imported Codex account is signed in → valid. create_account
+    # defaults to 'unknown', and the Claude Anthropic-token validator would
+    # otherwise mark it 'invalid' (its stored token is a sentinel, not a real
+    # Anthropic token). Codex validity is handled by validate_account's codex
+    # branch (signed-in check) + the app-server usage fetch.
+    db.update_account(acct["id"], validation_status="valid")
+    acct = db.get_account(acct["id"]) or acct
+
     if make_active:
         db.set_active_account_id(acct["id"], provider="codex")
     logger.info("Imported Codex account %s (id=%s)", ident.email, acct.get("id"))

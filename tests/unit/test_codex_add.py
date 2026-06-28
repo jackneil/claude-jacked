@@ -104,6 +104,51 @@ def test_import_does_not_store_live_token_at_rest(db, tmp_path):
     assert "codex-access-token" not in json.dumps(acct)  # the real token is absent
 
 
+def test_import_marks_account_valid(db, tmp_path):
+    """A freshly-imported (signed-in) Codex account is valid — not left 'unknown'
+    where the Anthropic validator would falsely mark it invalid."""
+    home = _home(tmp_path, auth=_auth_json())
+    acct = import_codex_account(db, home=home)
+    assert acct["validation_status"] == "valid"
+
+
+def test_validate_codex_uses_signed_in_state_not_anthropic(db, tmp_path, monkeypatch):
+    """validate_account on a Codex account must NOT hit Anthropic (which would
+    401 on the sentinel token) — it validates by the slot being signed in."""
+    import asyncio
+
+    from jacked.codex.switching import codex_slot_auth_path
+    from jacked.web.auth import validate_account
+
+    base = tmp_path / ".codex"
+    monkeypatch.setenv("CODEX_HOME", str(base))
+    acct = db.create_account("v@x.com", "codex-managed", 9999999999,
+                             provider="codex", organization_uuid="acct-V")
+    db.update_account(acct["id"], validation_status="invalid")  # the bug state
+    slot = codex_slot_auth_path(acct["id"], base)
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    slot.write_text(json.dumps(_auth_json(email="v@x.com")))
+
+    res = asyncio.run(validate_account(acct["id"], db))
+    assert res["valid"] is True
+    assert db.get_account(acct["id"])["validation_status"] == "valid"
+
+
+def test_validate_codex_signed_out_is_invalid(db, tmp_path, monkeypatch):
+    import asyncio
+
+    from jacked.web.auth import validate_account
+
+    base = tmp_path / ".codex"
+    base.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(base))
+    acct = db.create_account("o@x.com", "codex-managed", 9999999999,
+                             provider="codex", organization_uuid="acct-O")
+    res = asyncio.run(validate_account(acct["id"], db))  # no slot -> signed out
+    assert res["valid"] is False
+    assert db.get_account(acct["id"])["validation_status"] == "invalid"
+
+
 def test_import_raises_without_identity(db, tmp_path):
     home = tmp_path / ".codex"
     home.mkdir()
