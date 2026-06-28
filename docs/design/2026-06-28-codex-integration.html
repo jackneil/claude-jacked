@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>jacked × Codex — Dual-Provider Integration Design</title>
+<meta name="jacked:type" content="design">
+<meta name="jacked:status" content="draft">
+<meta name="jacked:branch" content="feat/codex-provider">
+<meta name="jacked:date" content="2026-06-28">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root{
+    --fg:#1a1a1a;--fg-muted:#555;--bg:#fafaf7;--bg-card:#fff;
+    --accent:#2266aa;--accent-bg:#e7f0fa;--warn:#b3681c;--warn-bg:#fcf3e7;
+    --danger:#b32424;--danger-bg:#fbe9e7;--ok:#1f7a3f;--ok-bg:#e8f4ec;
+    --border:#d8d4cc;--code-bg:#f3efe8;--shadow:0 1px 3px rgba(0,0,0,.06);--radius:6px;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;
+    --claude:#d97757;--codex:#10a37f;
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --fg:#e8e6e1;--fg-muted:#a8a5a0;--bg:#161616;--bg-card:#1f1f1f;
+    --accent:#6aa8e8;--accent-bg:#1a2935;--warn:#e0a85b;--warn-bg:#3a2d18;
+    --danger:#ea7670;--danger-bg:#3a1f1c;--ok:#6acd8e;--ok-bg:#1c3327;
+    --border:#2e2e2e;--code-bg:#232323;--shadow:0 1px 3px rgba(0,0,0,.3);
+  }}
+  *{box-sizing:border-box}
+  body{font-family:var(--sans);color:var(--fg);background:var(--bg);line-height:1.6;
+    max-width:1000px;margin:0 auto;padding:2rem 1.5rem 6rem}
+  h1{font-size:1.9rem;line-height:1.2;margin:.2em 0 .1em}
+  h2{font-size:1.35rem;margin-top:2.2rem;border-bottom:2px solid var(--border);padding-bottom:.25em}
+  h3{font-size:1.08rem;margin-top:1.5rem;color:var(--accent)}
+  .sub{color:var(--fg-muted);font-size:.95rem;margin:0 0 1.5rem}
+  code{font-family:var(--mono);background:var(--code-bg);padding:.1em .35em;border-radius:4px;font-size:.86em}
+  pre{background:var(--code-bg);padding:1rem;border-radius:var(--radius);overflow-x:auto;font-size:.84em;border:1px solid var(--border)}
+  pre code{background:none;padding:0}
+  table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.9rem}
+  th,td{border:1px solid var(--border);padding:.5em .7em;text-align:left;vertical-align:top}
+  th{background:var(--accent-bg)}
+  .card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
+    padding:1rem 1.25rem;margin:1rem 0;box-shadow:var(--shadow)}
+  .pill{display:inline-block;font-size:.72rem;font-weight:700;padding:.12em .6em;border-radius:99px;vertical-align:middle}
+  .ok{background:var(--ok-bg);color:var(--ok)}
+  .warn{background:var(--warn-bg);color:var(--warn)}
+  .danger{background:var(--danger-bg);color:var(--danger)}
+  .tag-claude{background:rgba(217,119,87,.16);color:var(--claude);border:1px solid var(--claude)}
+  .tag-codex{background:rgba(16,163,127,.16);color:var(--codex);border:1px solid var(--codex)}
+  .muted{color:var(--fg-muted)}
+  blockquote{border-left:3px solid var(--accent);margin:1rem 0;padding:.3em 1rem;background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}
+  ul.tight li{margin:.2em 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+  a{color:var(--accent)}
+  .foot{margin-top:3rem;font-size:.8rem;color:var(--fg-muted);border-top:1px solid var(--border);padding-top:1rem}
+  @media print{body{max-width:none}pre,table{page-break-inside:avoid}h2{page-break-after:avoid}}
+</style>
+</head>
+<body>
+
+<h1>jacked × Codex — Dual-Provider Integration</h1>
+<p class="sub">Design &amp; grounding doc · 2026-06-28 · branch <code>feat/codex-provider</code> · sources verified against the live Codex CLI <code>0.142.3</code> on this machine and openai/codex <code>main</code></p>
+
+<div class="card">
+<strong>Goal.</strong> Teach jacked — today a Claude-only account monitor/switcher/installer — to treat <strong>OpenAI Codex</strong> as a first-class second provider: add Codex accounts, read Codex usage (5h + weekly windows) in the same UI with a <span class="pill tag-claude">Claude</span>/<span class="pill tag-codex">Codex</span> indicator per account, install jacked's skills/commands into Codex as well as Claude Code, and switch Codex accounts. This doc is the build's grounding; the matching <code>/goal</code> brief references it.
+</div>
+
+<h2>1. Feasibility verdict (the honest version)</h2>
+<table>
+<tr><th>Ask</th><th>Verdict</th><th>Mechanism (grounded)</th></tr>
+<tr>
+  <td><strong>Add Codex accounts</strong></td>
+  <td><span class="pill ok">FEASIBLE</span></td>
+  <td>Drive <code>codex login</code> (PKCE browser OAuth, same UX as Anthropic flow) → force <code>cli_auth_credentials_store=file</code> → read <code>~/.codex/auth.json</code> → decode identity (email/plan/account_id) from the <code>id_token</code> JWT claims. Importing an already-logged-in <code>auth.json</code> is the fallback path.</td>
+</tr>
+<tr>
+  <td><strong>Query Codex usage</strong></td>
+  <td><span class="pill ok">FEASIBLE</span></td>
+  <td>Official, documented path: spawn <code>codex app-server</code> (JSON-RPC), <code>initialize</code>, call <code>account/rateLimits/read</code> → <code>primary</code>=5h, <code>secondary</code>=weekly, each <code>{usedPercent, windowDurationMins, resetsAt}</code>. Maps 1:1 onto jacked's existing five_hour/seven_day cache. <strong>Not</strong> the ToS-risky <code>wham/usage</code> scrape; <strong>not</strong> the rollout-jsonl file (null since gpt-5.4, openai/codex#14880).</td>
+</tr>
+<tr>
+  <td><strong>Claude/Codex UI indicator</strong></td>
+  <td><span class="pill ok">FEASIBLE</span></td>
+  <td>Add a <code>provider</code> field to <code>AccountResponse</code> + the menubar summary; render a small provider mark on each account entry in the web dashboard, the pinned panel/dropdown, and (for the single active account) the menubar pill glyph.</td>
+</tr>
+<tr>
+  <td><strong>Install skills/commands for Codex</strong></td>
+  <td><span class="pill warn">FEASIBLE w/ caveats</span></td>
+  <td>Codex's extensibility converged ~1:1 with Claude Code. Skills → <code>~/.agents/skills/&lt;name&gt;/SKILL.md</code> (same open <code>agentskills.io</code> format; <strong>live path confirmed populated on this machine</strong>). Commands → <code>~/.codex/prompts/*.md</code> (and/or explicit-only skills). Behavioral rules → <code>~/.codex/AGENTS.md</code>. Gatekeeper hooks → <code>~/.codex/hooks.json</code> (same events incl. <code>PermissionRequest</code>) <em>but</em> each hook hits a trust-review gate. Agents are TOML, not MD (conversion).</td>
+</tr>
+<tr>
+  <td><strong>Switch Codex accounts</strong></td>
+  <td><span class="pill warn">FEASIBLE w/ guardrails</span></td>
+  <td>No native multi-account (openai/codex#4432 unmerged). Swap <code>~/.codex/auth.json</code> in file mode <em>or</em> per-account <code>CODEX_HOME</code> isolation (preferred, matches jacked's <code>CLAUDE_CONFIG_DIR</code> pattern). Hard constraints: single-use rotating refresh tokens (#15502/#9634) → capture the live file before swapping out, never replay a stale snapshot; stock Codex caches auth at startup → <strong>restart required</strong>; preserve <code>auth_mode</code>+<code>last_refresh</code> on write.</td>
+</tr>
+</table>
+
+<h2>2. How jacked does it for Claude today (the seams to mirror)</h2>
+<p>Every facet has a single clean chokepoint. The build extends each behind a <code>provider</code> dimension rather than forking parallel code.</p>
+
+<table>
+<tr><th>Subsystem</th><th>Single chokepoint (file:line)</th><th>What it does</th></tr>
+<tr><td>Account model</td><td><code>jacked/web/database.py:38-86</code> (Pydantic) + <code>:201-235</code> (DDL)</td><td>One SQLite <code>accounts</code> table at <code>~/.claude/jacked.db</code>. <code>UNIQUE(email, organization_uuid)</code>; <code>organization_uuid</code> uses <code>""</code> sentinel (not NULL) so upserts work. <strong>No provider column exists.</strong></td></tr>
+<tr><td>Add account (OAuth)</td><td><code>jacked/web/oauth.py:39-56</code> (constants), <code>:195-251</code> (PKCE flow)</td><td>PKCE OAuth against Anthropic, callback on <code>localhost:45100-45199</code>, has a <code>purpose</code> axis ('primary'/'claude_code') but <strong>no provider axis</strong>. Endpoints hardwired to claude.com / api.anthropic.com.</td></tr>
+<tr><td>Usage fetch</td><td><code>jacked/web/auth.py:733</code> <code>fetch_usage()</code>; the provider-specific leaf is <code>:810-832</code></td><td><code>GET https://api.anthropic.com/api/oauth/usage</code> with Bearer + <code>anthropic-beta</code> header → parse <code>five_hour/seven_day {utilization, resets_at}</code> → DB cache (<code>database.py:1147</code>). Pacing/coordinator/429-backoff are already provider-agnostic.</td></tr>
+<tr><td>Credential write / switch</td><td><code>jacked/api/credential_helpers.py:604</code> <code>sync_credential_to_all_stores()</code></td><td>The ONLY credential writer. Builds the <code>{claudeAiOauth, _jackedAccountId}</code> blob (<code>build_oauth_data</code> :540), writes 4 stores: <code>~/.claude/.credentials.json</code>, macOS Keychain <code>Claude Code-credentials</code>, <code>~/.claude.json</code>, per-account dir. Manual swap = <code>routes/auth.py:1093</code>; auto-swap = <code>usage_monitor.py:702</code>.</td></tr>
+<tr><td>Per-account launch</td><td><code>jacked/launch.py</code> (per-account dir via <code>CLAUDE_CONFIG_DIR</code>)</td><td>Seeds <code>~/.claude/accounts/&lt;id&gt;/</code> and runs Claude with <code>CLAUDE_CONFIG_DIR</code> so accounts run concurrently. <strong>Codex analog: <code>CODEX_HOME</code>.</strong></td></tr>
+<tr><td>Installer</td><td><code>jacked/cli.py:2973-3257</code> <code>_run_install()</code> + <code>install_manifest.py:38-44</code> CATEGORIES</td><td>Copies <code>jacked/data/{skills,commands,agents,lenses,templates}</code> into <code>~/.claude/*</code>, injects rules into <code>~/.claude/CLAUDE.md</code>, registers hooks in <code>~/.claude/settings.json</code>. Content-hash manifest at <code>~/.claude/jacked-manifest.json</code> drives idempotency/prune. <code>.claude</code> path is hardcoded at every call site; only <code>_jacked_home()</code> is parameterized. <strong>Known bug: only <code>SKILL.md</code> is copied — skill sidecar files (e.g. <code>aesthetic-dogfood-audit/measure.js</code>) are dropped.</strong></td></tr>
+<tr><td>UI account tags</td><td>dashboard <code>data/web/js/components/accounts.js:247-348</code>; panel <code>panel.js:89-129</code>; pill <code>service/menubar_mac.py:284-308</code></td><td>Cards/rows render from <code>GET /api/auth/accounts</code> → <code>AccountResponse</code> (<code>routes/auth.py:137-177</code>, populated <code>_account_to_response</code> :381-424). Panel popover + pinned panel both load <code>/panel</code>. Pill shows only the active account (drawn "J" glyph, <code>menubar_mac.py:139-143</code>).</td></tr>
+</table>
+
+<h2>3. Codex target — concrete file shapes &amp; endpoints</h2>
+
+<h3>3.1 Auth &amp; credentials — <code>~/.codex/auth.json</code></h3>
+<pre><code>{
+  "OPENAI_API_KEY": null,                  // set only in apikey mode
+  "auth_mode": "chatgpt",                   // apikey | chatgpt | chatgptAuthTokens | ...
+  "tokens": {
+    "id_token":      "&lt;JWT&gt;",               // identity claims live here
+    "access_token":  "&lt;JWT&gt;",
+    "refresh_token": "&lt;token&gt;",             // SINGLE-USE, rotates on refresh
+    "account_id":    "&lt;org/workspace id&gt;"   // the org sentinel analog
+  },
+  "last_refresh": "2026-..Z"
+}</code></pre>
+<ul class="tight">
+<li>Identity is decoded from <code>tokens.id_token</code> (base64url middle segment): <code>email</code>, and under <code>https://api.openai.com/auth</code>: <code>chatgpt_plan_type</code> (plus/pro/team/business/…), <code>chatgpt_user_id</code>, <code>chatgpt_account_id</code>. Use <code>account_id</code> as the org sentinel (normalize to <code>""</code> when absent, mirroring Claude).</li>
+<li><strong>Storage mode matters.</strong> <code>cli_auth_credentials_store = file | keyring | auto</code> in <code>config.toml</code>. On this machine the key is unset (→ <code>auto</code>) but <code>auth.json</code> exists at mode 0600. jacked must <strong>force <code>file</code></strong> (write the key) or it can silently miss keyring-stored creds (Keychain service <code>Codex Auth</code>).</li>
+<li>OAuth: issuer <code>https://auth.openai.com</code>, client_id <code>app_EMoamEEZ73f0CkXaXp7hrann</code> (env-overridable), callback <code>localhost:1455</code>. Refresh when <code>last_refresh</code> &gt; ~8 days or on 401 → rotates the refresh_token.</li>
+</ul>
+
+<h3>3.2 Usage — <code>codex app-server</code> JSON-RPC</h3>
+<pre><code>// 1. spawn: codex app-server   (stdin/stdout JSON-RPC; ~500ms settle after initialize)
+// 2. send: initialize  → initialized
+// 3. call: account/rateLimits/read
+{ "rateLimits": {
+    "primary":   { "usedPercent": 37.0, "windowDurationMins": 300,   "resetsAt": 1782... },  // 5h
+    "secondary": { "usedPercent": 81.0, "windowDurationMins": 10080, "resetsAt": 1782... }   // weekly
+  },
+  "rateLimitResetCredits": { "availableCount": N }   // "banked resets" — Claude has no analog
+}
+// also: account/read → { authMode, planType }    push: account/rateLimits/updated (subscribe instead of poll)</code></pre>
+<p class="muted">Normalize <code>primary→five_hour</code>, <code>secondary→seven_day</code> ({utilization, resets_at}) and feed the unchanged cache columns + menubar. API-key accounts: skip ChatGPT-plan polling (openai/codex#15272); the org Usage/Cost admin API is a separate, later path.</p>
+
+<h3>3.3 Installer targets (live paths on this machine)</h3>
+<table>
+<tr><th>jacked artifact</th><th>Codex target</th><th>Notes</th></tr>
+<tr><td>skill <code>data/skills/&lt;n&gt;/SKILL.md</code></td><td><code>~/.agents/skills/&lt;n&gt;/SKILL.md</code> <span class="pill ok">live, populated</span></td><td>Same open format. Also mirror to <code>~/.codex/skills</code> and verify via <code>/skills</code>; copy sidecar files (fix the SKILL.md-only drop).</td></tr>
+<tr><td>command <code>data/commands/*.md</code></td><td><code>~/.codex/prompts/*.md</code> (or explicit-only skill)</td><td>Prompts invoked <code>/prompts:name</code>; deprecated in favor of skills but functional. Dir absent today → create it.</td></tr>
+<tr><td>rules (<code>jacked_behaviors.md</code>)</td><td>append block to <code>~/.codex/AGENTS.md</code></td><td>Block-delimited like the CLAUDE.md injection; <code>AGENTS.md</code> exists (empty) on this machine.</td></tr>
+<tr><td>gatekeeper hooks</td><td><code>~/.codex/hooks.json</code> (PreToolUse + PermissionRequest)</td><td>Same JSON stdin/stdout contract. <strong>Trust gate:</strong> each hook is hashed and must be approved in <code>/hooks</code> unless managed — surface this, don't silently fail.</td></tr>
+<tr><td>agents <code>data/agents/*.md</code></td><td><code>~/.codex/agents/&lt;n&gt;.toml</code></td><td>Format conversion MD→TOML (<code>name/description/developer_instructions</code>). Lower priority.</td></tr>
+<tr><td>MCP</td><td><code>[mcp_servers.*]</code> in <code>config.toml</code> / <code>codex mcp add</code></td><td>Optional; later.</td></tr>
+</table>
+
+<h3>3.4 Switching — guardrails are mandatory</h3>
+<ul class="tight">
+<li><strong>Preferred:</strong> per-account <code>CODEX_HOME=~/.codex/accounts/&lt;id&gt;</code> isolation (own auth.json + config + sessions). Sidesteps the single-file refresh race entirely. Matches jacked's existing per-account-dir launch pattern.</li>
+<li><strong>In-place active swap</strong> (for "use this account" parity with Claude): (1) force <code>file</code> storage, (2) copy the <em>current live</em> <code>~/.codex/auth.json</code> back into the outgoing account's slot (capture rotated tokens), (3) copy incoming into place <strong>field-complete</strong> (keep <code>auth_mode</code>+<code>last_refresh</code>), (4) require/signal a Codex restart. Refuse to replay a stale snapshot. Single-writer-per-account.</li>
+<li><strong>Usage path is the safe one</strong> (app-server RPC, official) — do not adopt the ToS-risky <code>wham/usage</code> scrape that some community switchers use. jacked runs on several machines: never sync one account's <code>auth.json</code> across machines (rotation invalidates, #15502).</li>
+</ul>
+
+<h2>4. Build plan (milestones — mirror the /goal brief)</h2>
+<ol>
+<li><strong>Provider-aware model + migration.</strong> <code>provider</code> column (default <code>'claude'</code>); rebuild <code>UNIQUE(provider,email,organization_uuid)</code> via the crash-safe table-rebuild pattern (<code>database.py:586-644</code>); thread through Pydantic <code>Account</code>, <code>AccountResponse</code>, <code>create_account</code>, the WS-safe whitelist; make <code>active_account_id</code> per-provider.</li>
+<li><strong>Codex credential/identity module.</strong> Read <code>~/.codex/auth.json</code> (respect <code>$CODEX_HOME</code>), detect file-vs-keyring from <code>config.toml</code>, decode the <code>id_token</code> JWT, normalize <code>account_id</code> as org sentinel. Keyring mode reports "not swappable" rather than silently missing.</li>
+<li><strong>Add a Codex account.</strong> <code>POST /accounts/add?provider=codex</code> + CLI: force file storage, drive <code>codex login</code> (or import the live auth.json), persist a <code>provider='codex'</code> row from decoded identity; idempotent re-add.</li>
+<li><strong>Codex usage fetcher behind provider dispatch.</strong> Refactor the <code>fetch_usage</code> leaf (<code>auth.py:810-832</code>) to dispatch on <code>account.provider</code>; Codex impl drives <code>codex app-server</code> → <code>account/rateLimits/read</code> → normalized five_hour/seven_day; Anthropic path unchanged (regression test green).</li>
+<li><strong>Provider indicator across 3 surfaces.</strong> Surface <code>provider</code> in the JSON; render the Claude/Codex mark in dashboard cards (<code>accounts.js:313</code>), panel/popover rows (<code>panel.js:98/113</code>), and the pill glyph (<code>menubar_mac.py:139-143</code>); keep the 6-account-fit layout; polish per make-interfaces-feel-better.</li>
+<li><strong>Codex switching (guardrailed).</strong> Per-account <code>CODEX_HOME</code> launch (<code>jacked codex &lt;id&gt;</code>) + in-place active-swap with write-back, field-complete write, restart signal, single-writer guard, stale-snapshot refusal.</li>
+<li><strong>Installer Codex target.</strong> Detect Codex (binary / <code>~/.codex</code>); deploy skills→<code>~/.agents/skills</code> (+sidecars), commands→<code>~/.codex/prompts</code>, rules→<code>~/.codex/AGENTS.md</code>, gatekeeper→<code>~/.codex/hooks.json</code>; make the manifest target-aware for idempotent install + uninstall. Verify Codex discovers an installed skill/prompt.</li>
+</ol>
+<p class="muted"><strong>Next (post-run):</strong> Codex auto-swap engine driven by app-server usage tiers; agent MD→TOML export; MCP install into Codex; <code>account/rateLimits/updated</code> push instead of polling; per-model sub-limit + banked-reset affordances in the UI.</p>
+
+<h2>5. Risks &amp; decisions</h2>
+<div class="grid2">
+<div class="card"><strong>Decided</strong><ul class="tight">
+<li>Usage via <strong>app-server RPC</strong> (official) — avoids ToS-risky scraping.</li>
+<li>Add-account via <strong>wrapping <code>codex login</code></strong> (robust) rather than reimplementing OpenAI PKCE in-app — same browser-OAuth UX, less fragility from env-overridable endpoints.</li>
+<li>Switching defaults to <strong><code>CODEX_HOME</code> isolation</strong>; in-place swap is the parity affordance with guardrails.</li>
+<li><code>active_account_id</code> becomes <strong>per-provider</strong> (a user is active on Claude AND Codex simultaneously).</li>
+</ul></div>
+<div class="card"><strong>Watch</strong><ul class="tight">
+<li>UNIQUE-key migration is destructive (table rebuild) — must be transactional + crash-safe.</li>
+<li>Single-use refresh-token rotation — capture-before-swap, never replay stale, never cross-machine sync.</li>
+<li>Codex restart required after swap (no hot reload).</li>
+<li>Hook trust-review gate — auto-install can't silently approve the gatekeeper.</li>
+<li>Skills discovery path has drifted across versions — write both <code>~/.agents/skills</code> + <code>~/.codex/skills</code> and verify.</li>
+<li>Codex model ids (gpt-5.4/5.5, …) are real — do not "fix" them.</li>
+</ul></div>
+</div>
+
+<h2>6. Sources</h2>
+<p class="muted">Codex auth/config/usage/skills/hooks verified against openai/codex <code>main</code> and developers.openai.com (mid-2026); switching behavior from community tools + issues.</p>
+<ul class="tight">
+<li>Auth + auth.json shape: <a href="https://developers.openai.com/codex/auth">developers.openai.com/codex/auth</a>, <a href="https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/storage.rs">login/src/auth/storage.rs</a>, <code>token_data.rs</code>, <code>manager.rs</code>; CI/CD: <a href="https://developers.openai.com/codex/auth/ci-cd-auth">.../ci-cd-auth</a></li>
+<li>Usage RPC: <a href="https://developers.openai.com/codex/app-server/">developers.openai.com/codex/app-server</a>; openai/codex#15281, #12299, #16037; rollout-null bug #14880; <a href="https://ianlpaterson.com/blog/tracking-claude-codex-gemini-quotas-from-one-script/">ianlpaterson.com quota script</a></li>
+<li>Skills/commands/hooks/config: <a href="https://developers.openai.com/codex/skills">/codex/skills</a>, <a href="https://developers.openai.com/codex/custom-prompts">/custom-prompts</a>, <a href="https://developers.openai.com/codex/hooks">/hooks</a>, <a href="https://developers.openai.com/codex/guides/agents-md">/agents-md</a>, <a href="https://developers.openai.com/codex/config-reference">/config-reference</a>, <a href="https://agentskills.io/specification">agentskills.io</a></li>
+<li>Multi-account/switching: openai/codex#4432 (--auth-profile, unmerged), #15502/#9634/#10332 (refresh rotation); tools: <a href="https://github.com/Loongphy/codex-auth">codex-auth</a>, <a href="https://github.com/drogers0/aistat">aistat</a>, <a href="https://github.com/burakdede/aisw">aisw</a></li>
+<li>Prior jacked proposal (unimplemented): <code>docs/plans/2026-03-24-gstack-integration-design.md</code></li>
+</ul>
+
+<p class="foot">Generated for the jacked × Codex build. Grounding for the matching <code>/goal</code> brief; every claim is anchored to a file:line or a cited URL. Verify against the installed Codex version before hardcoding paths — Codex is post-cutoff and evolving.</p>
+
+</body>
+</html>
