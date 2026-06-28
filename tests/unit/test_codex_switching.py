@@ -157,6 +157,40 @@ def test_swap_different_account_not_treated_as_stale(tmp_path, db):
     assert json.loads((base / "auth.json").read_text())["tokens"]["account_id"] == "acct-B"
 
 
+def test_swap_captures_to_live_root_owner_not_tracked_pointer(tmp_path, db):
+    """Hardening: capture the live tokens to the slot of the live auth.json's
+    TRUE owner (e.g. after an out-of-band `codex login`), not jacked's possibly
+    stale tracked pointer."""
+    base = tmp_path / ".codex"
+    a = db.create_account("a@x.com", "t", 9999999999, provider="codex",
+                          organization_uuid="acct-A")
+    z = db.create_account("z@x.com", "t", 9999999999, provider="codex",
+                          organization_uuid="acct-Z")
+    _write(base / "auth.json", _auth("acct-Z", email="z@x.com"))   # live root = Z
+    _write(sw.codex_slot_auth_path(a["id"], base), _auth("acct-A", email="a@x.com"))
+    db.set_active_account_id(999, provider="codex")                 # stale pointer
+
+    result = sw.swap_codex_account(db, a["id"], base=base)
+    # Z's live tokens were filed to Z's slot (its true owner), not slot 999.
+    z_slot = json.loads(sw.codex_slot_auth_path(z["id"], base).read_text())
+    assert z_slot["tokens"]["account_id"] == "acct-Z"
+    assert not sw.codex_slot_auth_path(999, base).exists()
+    assert result.outgoing_id == z["id"]
+
+
+def test_accounts_container_locked_0700(tmp_path):
+    """Hardening: the accounts/ container (created at umask by mkdir) is 0700."""
+    import os
+    import stat
+
+    base = tmp_path / ".codex"
+    _write(base / "auth.json", _auth("acct-X"))
+    sw.seed_codex_slot(5, base)
+    container = base / "accounts"
+    assert stat.S_IMODE(os.stat(container).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(container / "5").st_mode) == 0o700
+
+
 def test_swap_forces_file_storage(tmp_path, db):
     base = tmp_path / ".codex"
     (base).mkdir(parents=True)

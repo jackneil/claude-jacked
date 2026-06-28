@@ -95,6 +95,15 @@ def test_reimport_updates_no_duplicate(db, tmp_path):
     assert len(codex_rows) == 1
 
 
+def test_import_does_not_store_live_token_at_rest(db, tmp_path):
+    """Hardening: the live Codex token must not be written into jacked.db — it's
+    never read back (switching uses auth.json, usage uses app-server)."""
+    home = _home(tmp_path, auth=_auth_json())
+    acct = import_codex_account(db, home=home)
+    assert acct["access_token"] == "codex-managed"
+    assert "codex-access-token" not in json.dumps(acct)  # the real token is absent
+
+
 def test_import_raises_without_identity(db, tmp_path):
     home = tmp_path / ".codex"
     home.mkdir()

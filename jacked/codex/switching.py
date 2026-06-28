@@ -75,12 +75,18 @@ def codex_slot_auth_path(
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".auth-", suffix=".tmp")
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    # Lock down per-account slot dirs AND the accounts/ container (mkdir creates
+    # the container at umask, ~0755). Leave the shared CODEX_HOME root alone —
+    # those are Codex's own perms, not jacked's to change.
+    if parent.parent.name == "accounts":
+        for d in (parent, parent.parent):
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+    fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=".auth-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
@@ -191,9 +197,23 @@ def _parse_refresh(ts: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _find_codex_account_by_org(db, org: str) -> Optional[int]:
+    """Find the Codex account id whose org/workspace sentinel == ``org``."""
+    if not org:
+        return None
+    for a in db.list_accounts():
+        if a.get("provider") == "codex" and (a.get("organization_uuid") or "") == org:
+            return a["id"]
+    return None
+
+
 def _refuse_stale_replay(target: dict, live: Optional[dict]) -> None:
     """Refuse writing ``target`` over ``live`` when it's an OLDER snapshot of the
-    SAME account — Codex would reject the already-rotated refresh token."""
+    SAME account — Codex would reject the already-rotated refresh token.
+
+    Only chatgpt-mode creds carry an account_id (and a rotating refresh token);
+    API-key creds have no account_id and don't rotate, so there's no stale-replay
+    hazard for them and this correctly no-ops."""
     if not live:
         return
     t_id = extract_identity(target).account_id
@@ -237,7 +257,17 @@ def swap_codex_account(
     _validate_field_complete(target_data)
 
     live = _read_json(root_path)
+
+    # Identify the outgoing account from the LIVE auth.json's own identity, not
+    # just jacked's tracked pointer — the user may have run `codex login`
+    # out-of-band, in which case the live (rotated) tokens belong to a different
+    # account and must be filed to ITS slot, not the tracked one. Fall back to
+    # the tracked pointer when the live identity isn't a known Codex account.
     outgoing_id = db.get_active_account_id("codex")
+    if live:
+        live_owner = _find_codex_account_by_org(db, extract_identity(live).account_id)
+        if live_owner is not None:
+            outgoing_id = live_owner
 
     # Stale-replay guard BEFORE any write.
     _refuse_stale_replay(target_data, live)

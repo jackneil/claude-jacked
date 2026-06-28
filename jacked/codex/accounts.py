@@ -58,15 +58,18 @@ def import_codex_account(
 
     auth = read_auth_json(home, env) or {}
     tokens = auth.get("tokens") or {}
-    access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
-    if not access_token:
+    if not (tokens.get("access_token") or auth.get("OPENAI_API_KEY")):
         raise CodexImportError(
             "Codex auth.json has no usable token — run `codex login` first"
         )
 
     acct = db.create_account(
         email=ident.email,
-        access_token=access_token,
+        # Do NOT store the live Codex token: switching reads ~/.codex/auth.json
+        # slots and usage uses the app-server, so a DB copy is never read back —
+        # storing it (especially a non-expiring OPENAI_API_KEY) is needless
+        # secret-at-rest. The column is NOT NULL, so write a non-secret marker.
+        access_token="codex-managed",
         expires_at=CODEX_EXPIRES_SENTINEL,
         # Codex rotates + refreshes its own (single-use) tokens; jacked never
         # replays a refresh token, so we don't store one for Codex.
