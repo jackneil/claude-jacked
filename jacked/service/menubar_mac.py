@@ -113,10 +113,12 @@ def _http_send_json(url: str, method: str, payload: dict | None, timeout: float 
         return json.loads(body) if body else {}
 
 
-def _render_status_icon(color: str) -> "str | None":
+def _render_status_icon(color: str, update: bool = False) -> "str | None":
     """Draw a rounded-rect "J" glyph filled with the status color; return a PNG
-    path (cached per color under ~/.claude). Returns None if rendering fails —
-    the caller then falls back to text only."""
+    path (cached per color+update under ~/.claude). When *update* is set, overlay
+    an "update available" badge (a blue dot with a white ring, top-right) so the
+    menu bar makes a waiting update obvious without opening the menu. Returns None
+    if rendering fails — the caller then falls back to text only."""
     try:
         from PIL import Image, ImageDraw
 
@@ -124,7 +126,7 @@ def _render_status_icon(color: str) -> "str | None":
         from jacked.service.tray import _load_glyph_font
 
         CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-        path = CLAUDE_DIR / f"jacked-menubar-{color}.png"
+        path = CLAUDE_DIR / f"jacked-menubar-{color}{'-upd' if update else ''}.png"
         if path.exists():
             return str(path)
 
@@ -139,10 +141,18 @@ def _render_status_icon(color: str) -> "str | None":
         x = (size - tw) // 2 - bbox[0]
         y = (size - th) // 2 - bbox[1]
         draw.text((x, y), "J", fill="white", font=font)
+        if update:
+            # Update-available badge: blue dot + white ring, top-right corner.
+            # Sized to stay legible when macOS scales the icon to ~18px tall.
+            cx, cy, r = size - 11, 11, 8
+            draw.ellipse([cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2], fill=(255, 255, 255, 255))
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(59, 130, 246, 255))
         img.save(str(path))
         return str(path)
     except Exception:
-        logger.exception("Could not render menu-bar status icon (color=%s)", color)
+        logger.exception(
+            "Could not render menu-bar status icon (color=%s, update=%s)", color, update
+        )
         return None
 
 
@@ -202,7 +212,7 @@ if RUMPS_AVAILABLE:
             self._popover_web = None
             self._screen_observer = None
             self._auto_swap_enabled = False
-            self._current_color = None  # avoid redundant icon writes
+            self._current_icon_key = None  # (color, update) — avoid redundant icon writes
             self._click_handler = None
             self._appkit_menu = None
             self._click_wired = False
@@ -276,14 +286,15 @@ if RUMPS_AVAILABLE:
             "J" icon by its color. Degrade to a gray "J" + em-dash if down."""
             from jacked.service.menubar_summary import menubar_title
 
+            upd = self._update_available()
             try:
                 data = _http_get_json(self._base_url + "/api/menubar-summary")
                 active = data.get("active")
                 self.title = " " + menubar_title(active)
-                self._set_icon((active or {}).get("color") or "gray")
+                self._set_icon((active or {}).get("color") or "gray", upd)
             except Exception:
                 self.title = " —"  # degraded — server unreachable
-                self._set_icon("gray")
+                self._set_icon("gray", upd)
 
             # Keep the Auto-swap checkmark honest.
             try:
@@ -296,18 +307,26 @@ if RUMPS_AVAILABLE:
             # Keep the version line / last-checked / autostart state fresh.
             self._refresh_version_menu()
 
-        def _set_icon(self, color):
-            """Set the colored "J" icon, only when the color actually changed."""
-            if color == self._current_color:
+        def _set_icon(self, color, update=False):
+            """Set the colored "J" icon (+ update badge), only when it changed."""
+            key = (color, update)
+            if key == self._current_icon_key:
                 return
-            path = _render_status_icon(color)
+            path = _render_status_icon(color, update)
             if path:
                 try:
                     self.icon = path
                     self.template = False
-                    self._current_color = color
+                    self._current_icon_key = key
                 except Exception:
                     logger.exception("Could not apply menu-bar icon")
+
+        def _update_available(self):
+            """True when the version check has found a newer release available."""
+            try:
+                return bool(self._runner._version_is_clickable())
+            except Exception:
+                return False
 
         # -- click routing (left = dropdown, right = menu) -------------------
 

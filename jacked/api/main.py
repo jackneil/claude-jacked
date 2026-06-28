@@ -23,6 +23,7 @@ from jacked.api.watchers import (
 from jacked.api.usage_monitor import (
     active_account_poll_loop,
     active_poll_watchdog_loop,
+    all_accounts_refresh_loop,
     full_sweep_loop,
 )
 from jacked.api.log_capture import server_log_buffer
@@ -276,6 +277,7 @@ async def lifespan(app: FastAPI):
     app.state.active_poll_last_respawn_at = 0.0
     active_poll_watchdog_task = asyncio.create_task(active_poll_watchdog_loop(app))
     full_sweep_task = asyncio.create_task(full_sweep_loop(app))
+    all_accounts_refresh_task = asyncio.create_task(all_accounts_refresh_loop(app))
     stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
@@ -285,6 +287,7 @@ async def lifespan(app: FastAPI):
     logger.info("Started active account poll loop (60s)")
     logger.info("Started active poll watchdog (every 60s)")
     logger.info("Started full sweep loop")
+    logger.info("Started all-accounts refresh loop (every 10min)")
     logger.info("Started stuck-checking watchdog (every 60s)")
 
     # Start analytics scanner + live monitor
@@ -309,6 +312,7 @@ async def lifespan(app: FastAPI):
         getattr(app.state, "active_poll_task", active_poll_task),
         active_poll_watchdog_task,
         full_sweep_task,
+        all_accounts_refresh_task,
         stuck_checking_task,
     ]
     if analytics_scan_task is not None:

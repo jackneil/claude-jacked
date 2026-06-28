@@ -226,3 +226,48 @@ out({
     assert result["soon"].endswith("s") and result["soon"].startswith("next ")
     assert result["due"] == "refreshing…"
     assert result["none"] == ""
+
+
+def test_manual_refresh_button_endpoint_and_persisted_cooldown(tmp_path):
+    """The refresh button POSTs the user-initiated bulk refresh, records the
+    timestamp, and the 60s cooldown survives a popover reopen (localStorage)."""
+    result = _run(tmp_path, """
+(async () => {
+function fakeBtn() {
+    return { disabled: false, title: '',
+             classList: { _s: new Set(), add(c){this._s.add(c);}, remove(c){this._s.delete(c);} },
+             _l: {}, addEventListener(e, fn){ this._l[e] = fn; } };
+}
+// No-op setTimeout so the cooldown ticker doesn't keep node alive past exit.
+global.setTimeout = function () { return 0; };
+const store = {};
+global.localStorage = { getItem: (k) => (k in store ? store[k] : null),
+                        setItem: (k, v) => { store[k] = String(v); } };
+let posted = null;
+global.fetch = async (url, opts) => { posted = { url, method: opts && opts.method }; return { ok: true, json: async () => ({}) }; };
+
+let btn = fakeBtn();
+global.document = { getElementById: (id) => (id === 'panel-refresh-btn' ? btn : null) };
+setupRefreshButton();
+const enabledFresh = btn.disabled;          // no prior refresh → enabled
+
+await btn._l.click();                         // click → POST + stamp + cooldown
+const postedAfter = posted;
+const stamped = !!store['jacked_panel_last_refresh'];
+const disabledAfterClick = btn.disabled;
+
+// Reopen: a brand-new button with the recent timestamp must start cooled-down.
+let btn2 = fakeBtn();
+global.document = { getElementById: (id) => (id === 'panel-refresh-btn' ? btn2 : null) };
+setupRefreshButton();
+const cooledOnReopen = btn2.disabled;
+
+out({ enabledFresh, postedAfter, stamped, disabledAfterClick, cooledOnReopen });
+})();
+""")
+    assert result["enabledFresh"] is False
+    assert result["postedAfter"]["url"] == "/api/auth/accounts/refresh-all-usage?user_initiated=true"
+    assert result["postedAfter"]["method"] == "POST"
+    assert result["stamped"] is True
+    assert result["disabledAfterClick"] is True
+    assert result["cooledOnReopen"] is True, "60s cooldown must survive a popover reopen"

@@ -1691,6 +1691,64 @@ async def active_poll_watchdog_loop(app):
 
 
 # -----------------------------------------------------------------------
+# Loop 1b — Non-active account usage refresh (10 min)
+# -----------------------------------------------------------------------
+
+_ALL_ACCOUNTS_REFRESH_INTERVAL = 600  # 10 minutes
+
+
+async def all_accounts_refresh_loop(app):
+    """Refresh usage for NON-active accounts every 10 minutes.
+
+    The active account is kept fresh by active_account_poll_loop (≤5 min); this
+    loop ensures EVERY other account is also refreshed so quota burned on OTHER
+    machines (shared accounts) shows up here — not just the one in use. This is
+    unconditional: unlike full_sweep_loop it does NOT depend on the window
+    keeper being enabled.
+
+    Pacing/safety: fetch_usage enforces its own hard per-account rate-limit
+    ceiling (no 429s), we skip the active account, skip accounts without a CC
+    token, and sleep between accounts. Never crashes — errors are logged per
+    account and per tick.
+    """
+    while True:
+        # Sleep first — at startup the active loop + login already populate caches.
+        await asyncio.sleep(_ALL_ACCOUNTS_REFRESH_INTERVAL)
+        try:
+            db = getattr(app.state, "db", None)
+            if db is None:
+                continue
+            from jacked.web.auth import fetch_usage
+
+            active_id = getattr(app.state, "active_poll_account_id", None)
+            refreshed = 0
+            for acct in db.list_accounts(include_inactive=False):
+                if acct.get("id") == active_id:
+                    continue  # covered (more often) by active_account_poll_loop
+                cc_at = acct.get("cc_access_token")
+                if not cc_at:
+                    continue  # no Claude Code token → can't fetch usage
+                try:
+                    await fetch_usage(acct["id"], db, access_token=cc_at)
+                    refreshed += 1
+                except Exception:
+                    logger.warning(
+                        "All-accounts refresh: fetch_usage failed for account %s",
+                        acct.get("id"), exc_info=True,
+                    )
+                await asyncio.sleep(2)  # pace between accounts
+            if refreshed:
+                logger.info(
+                    "All-accounts refresh: updated %d non-active account(s)", refreshed
+                )
+        except asyncio.CancelledError:
+            logger.info("All-accounts refresh loop cancelled — shutting down")
+            raise
+        except Exception:
+            logger.warning("All-accounts refresh loop error", exc_info=True)
+
+
+# -----------------------------------------------------------------------
 # Loop 2 — Full sweep (configurable interval, default 5min)
 # -----------------------------------------------------------------------
 

@@ -69,7 +69,11 @@ _USAGE_429_ROTATION_INTERVAL = 600
 # ceiling above — polling faster than the ceiling just returns cached data while
 # churning logs, so no tier goes below it.
 _TIER_INTERVALS = {
-    "idle": 600,
+    # The ACTIVE account is polled this often. Floor is 5 min even when idle so a
+    # glanceable pill never drifts more than ~5 min behind on the account you're
+    # using; tightens to 4 min (warning) / 3 min (critical) as it nears a cap.
+    # (Non-active accounts are covered separately by all_accounts_refresh_loop.)
+    "idle": 300,
     "normal": 300,
     "warning": 240,
     "critical": 180,

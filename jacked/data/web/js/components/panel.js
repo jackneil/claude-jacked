@@ -218,10 +218,73 @@ function setupMenuButton() {
     });
 }
 
+// Anthropic complains if you refresh usage more than once a minute, so the
+// manual "refresh all" button is rate-limited to one use per 60s — persisted in
+// localStorage so closing/reopening the popover can't bypass it.
+const REFRESH_COOLDOWN_S = 60;
+
+function _lastManualRefreshAgo() {
+    try {
+        const t = parseFloat(localStorage.getItem('jacked_panel_last_refresh') || '0');
+        return Date.now() / 1000 - t;
+    } catch (e) {
+        return Infinity;
+    }
+}
+
+function startRefreshCooldown(btn, secs) {
+    btn.disabled = true;
+    let rem = Math.ceil(secs);
+    const tick = () => {
+        if (rem <= 0) {
+            btn.disabled = false;
+            btn.title = 'Refresh all accounts now';
+            return;
+        }
+        btn.title = 'Refreshed — wait ' + rem + 's';
+        rem -= 1;
+        setTimeout(tick, 1000);
+    };
+    tick();
+}
+
+async function doManualRefresh(btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.classList.add('spinning');
+    try {
+        await fetch('/api/auth/accounts/refresh-all-usage?user_initiated=true', {
+            method: 'POST',
+            headers: { Accept: 'application/json' },
+        });
+    } catch (e) {
+        /* the server self-throttles (and fetch_usage caps per account); ignore */
+    }
+    try {
+        localStorage.setItem('jacked_panel_last_refresh', String(Date.now() / 1000));
+    } catch (e) {
+        /* private mode / no storage — the in-memory cooldown still applies */
+    }
+    btn.classList.remove('spinning');
+    const c = document.getElementById('panel-root');
+    if (c) loadPanel(c); // pull the freshly-refreshed numbers
+    startRefreshCooldown(btn, REFRESH_COOLDOWN_S);
+}
+
+/** Wire the "⟳ refresh all now" button, honoring a persisted 60s cooldown. */
+function setupRefreshButton() {
+    const btn = document.getElementById('panel-refresh-btn');
+    if (!btn) return;
+    btn.addEventListener('click', () => doManualRefresh(btn));
+    const ago = _lastManualRefreshAgo();
+    if (ago < REFRESH_COOLDOWN_S) startRefreshCooldown(btn, REFRESH_COOLDOWN_S - ago);
+}
+
 function startPanel() {
     const container = document.getElementById('panel-root');
     if (!container) return;
     setupMenuButton();
+    setupRefreshButton();
     loadPanel(container);
     setInterval(() => loadPanel(container), PANEL_REFRESH_MS);
     startCountdownTicker();
@@ -246,5 +309,7 @@ if (typeof module !== 'undefined' && module.exports) {
         panelEmptyHtml,
         panelErrorHtml,
         setupMenuButton,
+        setupRefreshButton,
+        doManualRefresh,
     };
 }

@@ -61,22 +61,26 @@
         background: var(--accent);
         box-shadow: 0 0 6px var(--accent);
     }
-    /* In-panel "⋯" button → opens the native actions menu (right-click equivalent).
-       Hidden unless the native webview bridge is present (so a plain browser /
-       the dashboard never shows a dead button). */
-    .panel-menu-btn {
+    /* Header action buttons: "⟳" (refresh all now) + "⋯" (native actions menu,
+       right-click equivalent). The ⋯ is hidden unless the native webview bridge
+       is present (so a plain browser / dashboard never shows a dead button). */
+    .panel-title-actions { display: flex; align-items: center; gap: 2px; }
+    .panel-icon-btn {
         display: flex; align-items: center; justify-content: center;
         width: 26px; height: 22px; padding: 0;
-        margin: -4px -4px -4px 6px;   /* extend hit area without shifting layout */
-        font-size: 16px; line-height: 1; font-weight: 700;
+        font-size: 15px; line-height: 1; font-weight: 700;
         color: var(--txt-muted); background: transparent;
         border: 1px solid transparent; border-radius: 6px;
         cursor: pointer;
         transition: background 0.12s ease, color 0.12s ease, scale 0.08s ease;
     }
-    .panel-menu-btn:hover { color: var(--txt); background: rgba(255,255,255,0.08); }
-    .panel-menu-btn:active { scale: 0.92; }
-    .panel-menu-btn[hidden] { display: none; }
+    .panel-icon-btn:hover { color: var(--txt); background: rgba(255,255,255,0.08); }
+    .panel-icon-btn:active { scale: 0.92; }
+    .panel-icon-btn[hidden] { display: none; }
+    .panel-icon-btn:disabled { opacity: 0.4; cursor: default; }
+    .panel-icon-btn:disabled:hover { color: var(--txt-muted); background: transparent; }
+    /* Spin the ⟳ while a refresh is in flight. */
+    .panel-icon-btn.spinning { animation: panel-spin 0.7s linear infinite; }
 
     /* ---- Account card (single-org) + login group (multi-org) ---- */
     .acct, .login-group {
@@ -223,7 +227,10 @@
 <body>
     <div class="panel-title">
         <span class="panel-title-label"><span class="dot"></span>jacked usage</span>
-        <button id="panel-menu-btn" class="panel-menu-btn" type="button" title="Menu" aria-label="Open menu" hidden>⋯</button>
+        <span class="panel-title-actions">
+            <button id="panel-refresh-btn" class="panel-icon-btn" type="button" title="Refresh all accounts now" aria-label="Refresh all accounts now">⟳</button>
+            <button id="panel-menu-btn" class="panel-icon-btn" type="button" title="Menu" aria-label="Open menu" hidden>⋯</button>
+        </span>
     </div>
     <div id="panel-root">
         <div class="panel-loading">
