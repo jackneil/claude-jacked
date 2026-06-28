@@ -578,9 +578,10 @@ class ServiceRunner:
             except Exception:
                 logger.exception("Version check failed")
             first = False
-            # Daily background cadence; manual "Check for updates" fires
-            # this method in a one-shot thread which exits after this wait.
-            if self._stop_event.wait(timeout=86400):
+            # Twice-daily background cadence (matches version_check CACHE_TTL) so
+            # the update badge appears within ~12h of a release; manual "Check for
+            # updates" fires this method in a one-shot thread that exits after this wait.
+            if self._stop_event.wait(timeout=43200):
                 return
 
     def _on_check_for_updates(self) -> None:

@@ -100,6 +100,27 @@ def test_mac_menubar_available_matches_platform():
         assert avail is True
 
 
+def test_status_icon_has_update_badge_variant():
+    """_render_status_icon(update=True) is a distinct icon carrying a blue
+    'update available' dot the plain icon lacks."""
+    from jacked.service import menubar_mac
+
+    if not menubar_mac.RUMPS_AVAILABLE:
+        pytest.skip("rumps/pyobjc/PIL unavailable")
+    from PIL import Image
+
+    plain = menubar_mac._render_status_icon("green", update=False)
+    badged = menubar_mac._render_status_icon("green", update=True)
+    assert plain and badged and plain != badged
+
+    raw = Image.open(badged).convert("RGBA").tobytes()
+    has_blue_dot = any(
+        raw[i + 2] > 180 and raw[i + 2] > raw[i] + 60 and raw[i + 2] > raw[i + 1] + 40
+        for i in range(0, len(raw), 4)
+    )
+    assert has_blue_dot, "update badge (blue dot) must be drawn"
+
+
 def test_mac_app_wires_version_update_menu_handlers():
     """Regression guard: the mac agent must keep the version line, click-to-update,
     Check-for-Updates, and Start-on-Login handlers (a prior rebuild dropped them,

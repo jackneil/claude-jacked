@@ -7,7 +7,8 @@ import urllib.request
 from pathlib import Path
 
 VERSION_CACHE = Path.home() / ".claude" / "jacked-version-cache.json"
-CACHE_TTL = 86400  # 24 hours — tray menu has "Check for updates" for on-demand refresh
+CACHE_TTL = 43200  # 12 hours — surfaces the update badge within half a day of a
+                   # release; the tray menu also has "Check for updates" on demand
 CACHE_TTL_PROBE_FAILURE = 3600  # 1 hour — retry sooner after a transient PyPI/network failure
                                 # so the user isn't stuck "no updates available" for a full day
                                 # after a Fastly hiccup. /dc finding #2 on the v0.45.4 review.

@@ -315,7 +315,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.0, critical_5h=90.0,
         )
         assert tier == "idle"
-        assert interval == 600
+        assert interval == 300
 
     def test_normal_moderate_usage(self):
         """Usage 50-70%, low burn -> NORMAL (150s)."""
@@ -403,7 +403,7 @@ class TestUrgencyTier:
             burn_rate_5h=0.0, critical_5h=90.0,
         )
         assert tier == "idle"
-        assert interval == 600
+        assert interval == 300
 
 
 class TestConstants:
