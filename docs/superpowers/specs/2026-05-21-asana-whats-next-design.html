@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Design — Asana integration for /whats-next</title>
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="approved-by-user">
+<meta name="jacked:branch" content="master">
+<meta name="jacked:date" content="2026-05-21">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --danger:#b32424; --danger-bg:#fbe9e7; --ok:#1f7a3f; --ok-bg:#e8f4ec; --border:#d8d4cc; --code-bg:#f3efe8; --radius:6px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --danger:#ea7670; --danger-bg:#3a1f1c; --ok:#6acd8e; --ok-bg:#1c3327; --border:#2e2e2e; --code-bg:#232323; } }
+  *{box-sizing:border-box}
+  body{font-family:var(--sans);font-size:16px;line-height:1.6;color:var(--fg);background:var(--bg);margin:0;padding:2rem 1rem}
+  .wrap{max-width:880px;margin:0 auto}
+  h1{font-size:2rem;margin:0 0 .25rem}
+  h2{font-size:1.4rem;margin:2.5rem 0 .75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}
+  h3{font-size:1.1rem;margin:1.5rem 0 .5rem;color:var(--fg-muted)}
+  code{font-family:var(--mono);font-size:.92em;background:var(--code-bg);padding:.12em .35em;border-radius:3px}
+  pre{font-family:var(--mono);font-size:.85rem;background:var(--code-bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;overflow-x:auto;line-height:1.45}
+  pre code{background:transparent;padding:0}
+  table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--bg-card);border-radius:var(--radius);overflow:hidden}
+  th,td{text-align:left;padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+  th{background:var(--code-bg);font-weight:600;font-size:.9rem}
+  tr:last-child td{border-bottom:none}
+  aside.callout{margin:1rem 0;padding:.9rem 1.1rem;border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}
+  aside.callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  aside.callout.danger{border-color:var(--danger);background:var(--danger-bg)}
+  aside.callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  aside.callout > :first-child{margin-top:0}
+  aside.callout > :last-child{margin-bottom:0}
+  .meta{display:flex;flex-wrap:wrap;gap:.5rem 1rem;margin:.5rem 0 2rem;padding:.75rem 1rem;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
+  .meta .kv{display:flex;gap:.35rem}
+  .meta .k{color:var(--fg-muted)}
+  .meta .v{font-family:var(--mono)}
+  .badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.8rem;font-weight:500}
+  .badge.ok{background:var(--ok-bg);color:var(--ok)}
+  .badge.warn{background:var(--warn-bg);color:var(--warn)}
+  .badge.danger{background:var(--danger-bg);color:var(--danger)}
+  .badge.info{background:var(--accent-bg);color:var(--accent)}
+  nav.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.25rem;margin-bottom:2rem}
+  nav.toc h2{margin:0 0 .5rem;font-size:.9rem;text-transform:uppercase;letter-spacing:.05em;color:var(--fg-muted);border:none;padding:0}
+  nav.toc ol{margin:0;padding-left:1.5rem}
+  nav.toc li{margin:.15rem 0}
+  .diagram{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;margin:1rem 0;text-align:center;overflow-x:auto}
+  .diagram pre.mermaid-source{text-align:left;display:none}
+  .diagram.failed pre.mermaid-source{display:block}
+  .diagram.failed svg{display:none}
+  blockquote{border-left:3px solid var(--border);padding:.2rem 1rem;margin:1rem 0;color:var(--fg-muted);font-style:italic}
+  @media print{body{background:white;color:black;padding:0}.wrap{max-width:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Design — Asana integration for <code>/whats-next</code></h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">approved-by-user</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-05-21</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">master</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#access">Access detection</a></li>
+    <li><a href="#setup">Setup-time wizard</a></li>
+    <li><a href="#runtime">Runtime behavior (Step 3.5)</a></li>
+    <li><a href="#judging">How Opus judges tasks</a></li>
+    <li><a href="#files">File changes</a></li>
+    <li><a href="#yagni">Explicit non-goals (YAGNI)</a></li>
+    <li><a href="#failure">Failure modes</a></li>
+    <li><a href="#open-questions">Open questions</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>
+Extend the jacked tool's <code>/whats-next</code> skill so that Asana tasks assigned to the user become a first-class input source alongside GitHub issues, TODOs, and planning docs. Tasks that touch the current repository are blended into the same tier-ranked recommendation list — Asana origin is metadata on the Evidence line, not a privilege that bumps priority.
+</p>
+
+<aside class="callout">
+  <strong>Design constraint:</strong> Jacked commands are LLM instruction files, not code. This spec describes natural-language guidance Opus will read and apply at runtime — not Python scoring, regex engines, or algorithmic detection. Bash one-liners only where they genuinely gather data (env probes, MCP availability checks, git/gh queries).
+</aside>
+
+<h2 id="architecture">Architecture</h2>
+<p>
+Two layers in the existing jacked architecture. No new top-level slash commands.
+</p>
+
+<ul>
+  <li><strong>Setup layer</strong> — <code>/jacked-setup whats-next</code> grows an Asana detection + discovery phase. It probes for an access method, runs zero-touch discovery, and emits a new <code>## Asana Integration</code> block inside the standalone <code>## Repo Config</code> header it already generates.</li>
+  <li><strong>Runtime layer</strong> — the embedded engine in <code>~/.claude/commands/whats-next.md</code> grows a <code>Step 3.5: Pull Asana signals</code> between the existing GitHub-issue step and lifecycle inference. The step reads the config block, fetches the user's open tasks via the configured access method, and feeds qualifying tasks into the existing Step 5 synthesis pool.</li>
+</ul>
+
+<p>
+Both layers are guarded by the same access-method config: if Asana isn't reachable, the setup wizard writes an install hint and the runtime step is skipped silently. The rest of <code>/whats-next</code> works exactly as it does today.
+</p>
+
+<div class="diagram">
+  <pre class="mermaid">
+flowchart TD
+    A[User runs /jacked-setup whats-next] --> B{Probe Asana access}
+    B -->|MCP available| C1[mcp]
+    B -->|CLI on PATH| C2[cli]
+    B -->|PAT env var| C3[rest-pat]
+    B -->|none| C4[Write install hint to config]
+    C1 --> D[Zero-touch discover workspaces + projects + priority field]
+    C2 --> D
+    C3 --> D
+    D --> E[Write `## Asana Integration` block]
+    C4 --> E
+    E --> F[Repo config committed]
+
+    G[User runs /whats-next] --> H[Read `## Asana Integration` from config]
+    H --> I{Access != none?}
+    I -->|no| J[Skip Step 3.5]
+    I -->|yes| K[Fetch my open tasks via configured access]
+    K --> L[For each task: judge repo-relevance + importance]
+    L --> M[Feed survivors into Step 5 pool]
+    M --> N[Tier-ranked recommendations — Asana blended in]
+    J --> N
+  </pre>
+  <pre class="mermaid-source">
+flowchart TD
+    A[User runs /jacked-setup whats-next] --> B{Probe Asana access}
+    B -->|MCP available| C1[mcp]
+    B -->|CLI on PATH| C2[cli]
+    B -->|PAT env var| C3[rest-pat]
+    B -->|none| C4[Write install hint to config]
+    C1 --> D[Zero-touch discover workspaces + projects + priority field]
+    C2 --> D
+    C3 --> D
+    D --> E[Write `## Asana Integration` block]
+    C4 --> E
+    E --> F[Repo config committed]
+
+    G[User runs /whats-next] --> H[Read `## Asana Integration` from config]
+    H --> I{Access != none?}
+    I -->|no| J[Skip Step 3.5]
+    I -->|yes| K[Fetch my open tasks via configured access]
+    K --> L[For each task: judge repo-relevance + importance]
+    L --> M[Feed survivors into Step 5 pool]
+    M --> N[Tier-ranked recommendations — Asana blended in]
+    J --> N
+  </pre>
+</div>
+
+<h2 id="access">Access detection</h2>
+<p>
+The wizard tries three methods in order and caches the winner in the config. Runtime re-validates the cached choice cheaply and falls through to the next method if the cached one suddenly fails.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Method</th><th>Probe</th><th>Use when</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>mcp</code></td>
+      <td>The Asana plugin directory exists at <code>~/.claude/plugins/marketplaces/*/external_plugins/asana/</code> AND the <code>mcp__claude_ai_Asana__*</code> tools resolve (any <code>authenticate</code> tool present is sufficient to confirm).</td>
+      <td>Default for Claude Code users. OAuth is handled by the plugin so no token management is needed.</td>
+    </tr>
+    <tr>
+      <td><code>cli</code></td>
+      <td><code>command -v asana</code> or <code>command -v asana-cli</code> returns a path; running <code>--version</code> exits 0.</td>
+      <td>User has a community Asana CLI installed. Uncommon but supported.</td>
+    </tr>
+    <tr>
+      <td><code>rest-pat</code></td>
+      <td>Env var <code>ASANA_PERSONAL_ACCESS_TOKEN</code> (or <code>ASANA_TOKEN</code>) is non-empty, and <code>curl -s -H "Authorization: Bearer $TOKEN" https://app.asana.com/api/1.0/users/me</code> returns HTTP 200.</td>
+      <td>Headless, CI, or users who prefer a personal-access-token workflow.</td>
+    </tr>
+    <tr>
+      <td><code>none</code></td>
+      <td>All three probes fail.</td>
+      <td>Wizard writes an install hint block; runtime silently skips Step 3.5.</td>
+    </tr>
+  </tbody>
+</table>
+
+<aside class="callout warn">
+  <strong>Install hint when access is <code>none</code>:</strong> the wizard writes the following into the config block (instead of workspace/project data) so anyone who opens the file later — including teammates who cloned the repo and don't have jacked installed — knows exactly how to enable it. Re-running <code>/jacked-setup whats-next</code> picks up the change.
+  <pre><code>## Asana Integration
+
+- **Access**: none
+- **To enable**: `/plugin install asana` (recommended) — or set `ASANA_PERSONAL_ACCESS_TOKEN` from
+  https://app.asana.com/0/my-apps — or install asana CLI. Then re-run `/jacked-setup whats-next`.</code></pre>
+</aside>
+
+<h2 id="setup">Setup-time wizard</h2>
+<p>
+Three additions to the existing <code>/jacked-setup whats-next</code> instruction body (in <code>jacked/data/commands/jacked-setup.md</code>).
+</p>
+
+<h3>Addition 1 — Access probe block in Step 3 (target-specific analysis)</h3>
+<p>
+Run the three probes from the table above in order. Stop at the first success. Save the winning method name as the <code>Access</code> field. If all three fail, write the install-hint block and skip the rest of the wizard's Asana phase.
+</p>
+
+<h3>Addition 2 — Zero-touch discovery (only if access succeeded)</h3>
+<p>
+Using the chosen access method:
+</p>
+<ol>
+  <li>Fetch the current user's GID (<code>users/me</code>) and cache it in the config — runtime never re-queries this.</li>
+  <li>List the user's workspaces. Show the count to the user.</li>
+  <li>List the projects the user is a member of in each workspace. Show the count.</li>
+  <li>Ask one question: <em>"Track tasks across all N workspaces / M projects, or pick specific projects? [all/pick]"</em> — default <code>all</code>. If <code>pick</code>, present the project list and let the user select.</li>
+</ol>
+
+<h3>Addition 3 — Priority custom-field sniff</h3>
+<p>
+Examine the <code>custom_fields</code> of a sample of selected projects (one or two — Asana custom fields are defined per-project but commonly shared). Look for a field whose name matches <code>Priority</code>, <code>Status</code>, <code>Tier</code>, <code>P0</code>, <code>P1</code>, or similar. If found, save the field's GID and the list of allowed enum values. Do NOT pre-bake a values-to-tier mapping — Opus maps them with judgment at runtime using the existing tier framework.
+</p>
+
+<h3>Emitted config block</h3>
+<pre><code>## Asana Integration
+
+- **Access**: mcp
+- **User GID**: 1200012345678901
+- **Workspaces**:
+  - 9876543210 — Hank
+- **Projects**: all
+  (or, if user picked specific projects:)
+  - 1100001 — Engineering Backlog
+  - 1100002 — Reflexive Roadmap
+- **Priority Field**:
+  - GID: 1199990000
+  - Name: Priority
+  - Values: P0, P1, P2, P3</code></pre>
+
+<aside class="callout">
+  When the user re-runs <code>/jacked-setup whats-next</code>, the wizard reads the existing block (if any), re-probes access, re-asks the all/pick question with the prior choice as default, and overwrites. Same upgrade flow as every other jacked-setup target.
+</aside>
+
+<h2 id="runtime">Runtime behavior (Step 3.5)</h2>
+<p>
+A new step is added to the engine in <code>~/.claude/commands/whats-next.md</code>, placed between current Step 3 (GitHub signals) and Step 4 (lifecycle inference). The instruction body in plain English looks like:
+</p>
+
+<blockquote>
+  <strong>Step 3.5: Pull Asana signals.</strong>
+  Skip this step entirely if <code>## Asana Integration</code> is missing from the config or its <code>Access</code> field is <code>none</code>.
+  Otherwise, using the access method declared in config (MCP / CLI / REST+PAT), fetch open tasks assigned to the configured user GID across the configured workspaces and projects. Pull title, notes (truncated to ~500 chars), due date, project name, section name, the configured priority custom field if any, and the task URL. For each task, judge repo-relevance and importance using the criteria in the next section. Drop tasks with no plausible connection to this repo. Feed the survivors into Step 5's candidate pool with <code>source: "asana"</code> metadata.
+</blockquote>
+
+<p>
+This step is constant-time per task — Opus reads the task content and makes a judgment. There is no scoring formula, no points table, no regex matcher. The full set of tasks for a typical engineer is on the order of dozens, well within Opus's working budget per turn.
+</p>
+
+<h2 id="judging">How Opus judges tasks</h2>
+
+<h3>Repo relevance</h3>
+<p>
+For each task fetched, the engine guidance reads:
+</p>
+<blockquote>
+Read the task title and notes. Decide whether this task is plausibly about the codebase the user is currently working in. Strong evidence: a <code>github.com/&lt;owner&gt;/&lt;repo&gt;</code> URL pointing at this repo (use <code>git remote get-url origin</code> to know the repo), the repo's basename appearing as a discrete word, or specific file paths and module names from this repo being mentioned. Weaker evidence: the Asana project name resembles the repo name, or the task references features and people clearly tied to this codebase. If the task is plainly about something else — an unrelated product, a personal todo, a recurring meeting — drop it. If it's genuinely ambiguous, keep it but mark <em>low confidence</em> on the Evidence line so the user can disambiguate.
+</blockquote>
+
+<h3>Importance</h3>
+<p>
+Slot kept tasks into the same Tier 1-5 framework already used in Step 5 of the engine. The engine guidance reads:
+</p>
+<blockquote>
+Use the priority custom field value (if configured) as the primary tier hint: <code>P0</code> / <code>Blocker</code> → Tier 1, <code>P1</code> / <code>High</code> → Tier 2, <code>P2</code> → Tier 3, <code>P3</code> / <code>Low</code> → Tier 4-5. Shift up one tier if the due date is overdue or within three days. Shift down if the task is parked in a section named <code>Backlog</code>, <code>Icebox</code>, <code>Someday</code>, or similar. For tasks with no priority field and no due date, default to Tier 3 and let your reading of the title and notes inform impact and effort.
+</blockquote>
+
+<aside class="callout warn">
+  Asana origin is metadata for the Evidence line — <code>Asana &lt;task-short-id&gt; in &lt;project&gt;</code> — not a tier bonus. A trivial Asana task (e.g. "Move sticky notes to new board") does not outrank a critical bug surfaced from GitHub issues. The user explicitly called this out during brainstorming.
+</aside>
+
+<h2 id="files">File changes</h2>
+<table>
+  <thead>
+    <tr><th>File</th><th>Change</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>jacked/data/commands/whats-next.md</code></td>
+      <td>Insert new <code>## Step 3.5: Pull Asana signals (if configured)</code> between Step 3 and Step 4. Update the synthesis guidance in Step 5 to acknowledge Asana as a third candidate source alongside GitHub issues and TODOs. Update Step 6's Evidence line examples to show the Asana format.</td>
+    </tr>
+    <tr>
+      <td><code>jacked/data/commands/jacked-setup.md</code></td>
+      <td>Under the <code>### For whats-next:</code> sub-section of Step 3, add the access probe block and zero-touch discovery prompt. Extend the <code>### whats-next standalone template:</code> in Step 5 to include a templated <code>## Asana Integration</code> section (with the install-hint branch for <code>access == none</code>).</td>
+    </tr>
+    <tr>
+      <td><code>tests/</code></td>
+      <td>Add unit tests asserting that the generated standalone config contains a well-formed <code>## Asana Integration</code> block in both the access-found and access-none branches. (Tests will mock the access probes — we do not hit Asana's API in tests.)</td>
+    </tr>
+    <tr>
+      <td><code>README.md</code></td>
+      <td>Add a one-paragraph mention under the <code>/whats-next</code> section noting that Asana tasks blend in when an Asana access method is detected at setup time.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="yagni">Explicit non-goals (YAGNI)</h2>
+<ul>
+  <li><strong>No write-back to Asana</strong> — read-only. We do not complete tasks, post comments, or create subtasks from <code>/whats-next</code>.</li>
+  <li><strong>Assigned-to-me only</strong> — no follower/team scope. The "us" in the original ask resolves to the current jacked user.</li>
+  <li><strong>No background polling</strong> — Asana is queried only when <code>/whats-next</code> is actively invoked.</li>
+  <li><strong>No generic adapter for Linear/Jira/Notion</strong> — Asana-specific guidance lives in the engine file. A second tool would grow a second optional section, not a polymorphic interface.</li>
+  <li><strong>No fuzzy cross-linking</strong> beyond the literal GitHub URL in the task notes. We do not try to merge "GH #42: Fix login" with "Asana: Login broken".</li>
+  <li><strong>No task-list caching</strong> — tasks are fetched fresh every run. The user GID and workspace list are persisted in the <code>## Asana Integration</code> config block written by <code>/jacked-setup whats-next</code>, which is the single source of truth. To refresh, re-run the wizard.</li>
+  <li><strong>No Asana-side label/tag filtering at the API level</strong> — Opus filters by reading task content. If config-driven label filters are needed later, they can be added then.</li>
+</ul>
+
+<h2 id="failure">Failure modes</h2>
+<table>
+  <thead>
+    <tr><th>Scenario</th><th>Behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Wizard run but no access method available</td>
+      <td>Write the install-hint block. Don't fail the setup — the user can still use <code>/whats-next</code> without Asana.</td>
+    </tr>
+    <tr>
+      <td>Runtime: <code>## Asana Integration</code> missing from config</td>
+      <td>Silently skip Step 3.5 (treat the same as opting out).</td>
+    </tr>
+    <tr>
+      <td>Runtime: <code>Access: none</code> in config</td>
+      <td>Silently skip Step 3.5. Print one info line: <code>Asana: not configured — run /jacked-setup whats-next to enable</code>.</td>
+    </tr>
+    <tr>
+      <td>Runtime: configured access fails (auth expired, network down, MCP server hung)</td>
+      <td>Print one warning line: <code>Asana: not reachable (&lt;reason&gt;), skipping</code>. Continue with the rest of <code>/whats-next</code>. Never abort the whole run.</td>
+    </tr>
+    <tr>
+      <td>Runtime: user GID changed (Asana account migration, edge case)</td>
+      <td>If the cached GID returns 404, re-fetch it once with <code>users/me</code> and update the cache. Print one info line about the refresh.</td>
+    </tr>
+    <tr>
+      <td>Task with empty title or notes</td>
+      <td>Drop it. There's no relevance signal to evaluate.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="open-questions">Open questions</h2>
+<ul>
+  <li>Do we add a <code>/jacked-setup whats-next --tune</code> flag for interactive project picking (vs the default zero-touch "all"), or just expect the user to manually edit the config block? Current spec: zero-touch + manual edit; deferred until users ask for the picker.</li>
+  <li>Should the access-probe section live inside the standalone engine body too (so a cloner with no jacked installed can still benefit), or only in the wizard? Current spec: only in the wizard — the standalone command relies on the config-block decision the wizard made. Re-running the wizard is the way to refresh.</li>
+</ul>
+
+<hr style="border:none;border-top:1px solid var(--border);margin:2.5rem 0">
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a> HTML artifact template.
+</p>
+
+</div>
+
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+  } catch (err) {
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>
