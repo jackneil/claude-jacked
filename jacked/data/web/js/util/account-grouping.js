@@ -19,8 +19,12 @@
  * @returns {string}
  */
 function orgLabel(acct) {
-    if (acct.organization_name) return acct.organization_name;
-    if (acct.organization_uuid) return acct.organization_uuid.slice(0, 8) + '…';
+    const name = acct.organization_name;
+    // Anthropic auto-names a personal org "<email>'s Organization" — that's noise
+    // (it just restates the email and overflows narrow UIs), so collapse it to
+    // "Personal". Only a real, user-meaningful org name is shown verbatim.
+    if (name && !/'s Organization$/i.test(name.trim())) return name;
+    if (!name && acct.organization_uuid) return acct.organization_uuid.slice(0, 8) + '…';
     return 'Personal';
 }
 

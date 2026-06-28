@@ -2,11 +2,17 @@
  * jacked — compact usage panel
  *
  * One component rendered into BOTH the menu-bar dropdown (NSPopover) and the
- * pinned side panel (NSPanel). Reuses the dashboard's bar component verbatim
- * (renderUsageBar + .elapsed-marker, usage.js) and the shared grouping util
- * (groupAccountsByLogin, account-grouping.js) so the panel can never diverge
- * from the dashboard. Self-contained fetch — deliberately does NOT pull the
- * full dashboard app.js.
+ * pinned side panel (NSPanel). Reuses the dashboard's bar component (compact
+ * mode of renderUsageBar + .elapsed-marker, usage.js) and the shared grouping
+ * util (groupAccountsByLogin, account-grouping.js) so the panel can never
+ * diverge from the dashboard. Self-contained fetch — deliberately does NOT pull
+ * the full dashboard app.js.
+ *
+ * Layout is tuned for a narrow (~360px) popover with many accounts: the EMAIL
+ * is the primary identifier (it's what distinguishes accounts; display names
+ * collide), single-org logins collapse to one identity line, only multi-org
+ * logins get a header + connecting rail, and each account shows how fresh its
+ * numbers are.
  */
 
 const PANEL_REFRESH_MS = 15000;
@@ -27,49 +33,87 @@ function planLabel(org) {
     return tierMatch ? label + ' ' + tierMatch[1] + 'x' : label;
 }
 
-/** One org sub-row: name + plan + active marker + the two reused usage bars. */
-function buildOrgRowHtml(org) {
+/** Short data-freshness label from usage_cached_at (unix seconds): now/5m/2h/3d. */
+function freshnessLabel(org) {
+    const ts = org.usage_cached_at;
+    if (!ts) return '';
+    const secs = Math.floor(Date.now() / 1000) - ts;
+    if (secs < 60) return 'now';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h';
+    return Math.floor(secs / 86400) + 'd';
+}
+
+/** The two compact usage bars (5h + 7d) for an account/org. */
+function orgBarsHtml(org) {
     const elapsed5h = computeElapsedFraction5h(org.cached_5h_resets_at);
     const elapsed7d = computeElapsedFraction7d(org.cached_7d_resets_at);
-    const bar5h = renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h');
-    const bar7d = renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d');
+    return (
+        renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h', { compact: true }) +
+        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', { compact: true })
+    );
+}
+
+/** Trailing meta on an identity line: plan badge, active marker, freshness age. */
+function orgMetaHtml(org) {
     const plan = planLabel(org);
     const planHtml = plan ? `<span class="plan-badge">${escapeHtml(plan)}</span>` : '';
     const activeHtml = org.isActive
         ? '<span class="active-badge" title="Active in Claude Code">active</span>'
         : '';
-    return `
-        <div class="org-row${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
-            <div class="org-row-head">
-                <span class="org-name" title="${escapeHtml(org.orgLabel)}">${escapeHtml(org.orgLabel)}</span>
-                ${planHtml}
-                ${activeHtml}
-            </div>
-            <div class="org-bars">
-                ${bar5h}
-                ${bar7d}
-            </div>
-        </div>`;
+    const age = freshnessLabel(org);
+    const ageHtml = age
+        ? `<span class="acct-age" title="Usage updated ${escapeHtml(age)} ago">${escapeHtml(age)}</span>`
+        : '';
+    return `${planHtml}${activeHtml}<span class="meta-spacer"></span>${ageHtml}`;
 }
 
-/** One login group: header (+ "N orgs" chip + rail when multi-org) and its org rows. */
-function buildLoginGroupHtml(group) {
-    const orgChip =
-        group.orgCount > 1 ? `<span class="org-chip">${group.orgCount} orgs</span>` : '';
-    const title = group.displayName || group.email;
-    const subEmail =
-        group.displayName ? `<div class="login-email">${escapeHtml(group.email)}</div>` : '';
-    const orgsHtml = group.orgs.map(buildOrgRowHtml).join('');
-    const multi = group.orgCount > 1 ? ' has-rail' : '';
+/** Single-org login → one compact identity line (email-primary) + bars. */
+function buildSingleAccountHtml(group) {
+    const org = group.orgs[0];
+    // Show a real org name inline; "Personal" is implied by a lone account, omit it.
+    const orgTag =
+        org.orgLabel && org.orgLabel !== 'Personal'
+            ? `<span class="org-tag" title="${escapeHtml(org.orgLabel)}">${escapeHtml(org.orgLabel)}</span>`
+            : '';
     return `
-        <section class="login-group${multi}${group.hasActive ? ' has-active' : ''}">
-            <header class="login-header">
-                <span class="login-name" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
-                ${orgChip}
-            </header>
-            ${subEmail}
-            <div class="org-rows">${orgsHtml}</div>
+        <section class="acct${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
+            <div class="acct-head">
+                <span class="acct-email" title="${escapeHtml(group.email)}">${escapeHtml(group.email)}</span>
+                ${orgTag}
+                ${orgMetaHtml(org)}
+            </div>
+            <div class="org-bars">${orgBarsHtml(org)}</div>
         </section>`;
+}
+
+/** Multi-org login → email header (+ "N orgs" chip + rail) and per-org rows. */
+function buildMultiOrgLoginHtml(group) {
+    const rows = group.orgs
+        .map(
+            (org) => `
+            <div class="org-row${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
+                <div class="org-row-head">
+                    <span class="org-name" title="${escapeHtml(org.orgLabel)}">${escapeHtml(org.orgLabel)}</span>
+                    ${orgMetaHtml(org)}
+                </div>
+                <div class="org-bars">${orgBarsHtml(org)}</div>
+            </div>`
+        )
+        .join('');
+    return `
+        <section class="login-group has-rail${group.hasActive ? ' has-active' : ''}">
+            <header class="login-header">
+                <span class="login-name" title="${escapeHtml(group.email)}">${escapeHtml(group.email)}</span>
+                <span class="org-chip">${group.orgCount} orgs</span>
+            </header>
+            <div class="org-rows">${rows}</div>
+        </section>`;
+}
+
+/** One login group — collapsed when single-org, header+rail when multi-org. */
+function buildLoginGroupHtml(group) {
+    return group.orgCount > 1 ? buildMultiOrgLoginHtml(group) : buildSingleAccountHtml(group);
 }
 
 /** Full panel body from grouped accounts (empty state when none). */
@@ -128,8 +172,12 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         buildPanelHtml,
         buildLoginGroupHtml,
-        buildOrgRowHtml,
+        buildSingleAccountHtml,
+        buildMultiOrgLoginHtml,
+        orgBarsHtml,
+        orgMetaHtml,
         planLabel,
+        freshnessLabel,
         panelEmptyHtml,
         panelErrorHtml,
     };

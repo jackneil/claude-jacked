@@ -133,3 +133,39 @@ const html = buildPanelHtml(groupAccountsByLogin([
 out({ hasMarker: html.includes('elapsed-marker') });
 """)
     assert result["hasMarker"] is False
+
+
+def test_single_account_is_email_primary_and_strips_org_noise(tmp_path):
+    """Single-org account collapses to one email-primary line; the noisy
+    "<email>'s Organization" label is gone; freshness age is shown; no chip/rail."""
+    result = _run(tmp_path, """
+const now = Math.floor(Date.now() / 1000);
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 9, email: 'solo@example.com', organization_uuid: 'o1',
+      organization_name: "solo@example.com's Organization", priority: 0,
+      cached_usage_5h: 40, cached_usage_7d: 30, usage_cached_at: now - 300 },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert "acct-email" in html and "solo@example.com" in html
+    assert "'s Organization" not in html, "noisy auto org name must be stripped"
+    assert "Personal" not in html, "a lone personal account shows no redundant 'Personal'"
+    assert "org-chip" not in html and "has-rail" not in html
+    assert "acct-age" in html and ">5m<" in html, "freshness age must render"
+
+
+def test_compact_bars_drop_the_reset_time_column(tmp_path):
+    """The wide dashboard reset column (w-28) is what squeezed the bar — the
+    panel must use compact bars without it (reset moves to the row title)."""
+    result = _run(tmp_path, """
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'a@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 50, cached_usage_7d: 50,
+      cached_5h_resets_at: '2099-01-01T00:00:00Z' },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert "w-28" not in html, "compact bars must not carry the fixed reset-time column"
+    assert "usage-bar" in html and "tabular-nums" in html

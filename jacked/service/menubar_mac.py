@@ -41,6 +41,7 @@ PILL_INTERVAL = 30
 STOP_POLL_INTERVAL = 1.0
 WIRE_RETRY_INTERVAL = 0.4  # poll for the status-item button after launch
 PANEL_WIDTH = 360  # side-panel / popover width in points
+POPOVER_HEIGHT = 600  # dropdown height — fits ~7 accounts without scrolling
 
 # RGB fills for the "J" status icon, keyed by usage color class.
 _ICON_FILL = {
@@ -415,8 +416,8 @@ if RUMPS_AVAILABLE:
             if self._popover is None:
                 pop = NSPopover.alloc().init()
                 pop.setBehavior_(NSPopoverBehaviorTransient)
-                pop.setContentSize_(NSSize(PANEL_WIDTH, 480))
-                web = self._make_webview(PANEL_WIDTH, 480)
+                pop.setContentSize_(NSSize(PANEL_WIDTH, POPOVER_HEIGHT))
+                web = self._make_webview(PANEL_WIDTH, POPOVER_HEIGHT)
                 vc = NSViewController.alloc().init()
                 vc.setView_(web)
                 pop.setContentViewController_(vc)

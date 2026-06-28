@@ -131,3 +131,16 @@ out({
     assert result["named"] == "Acme"
     assert result["uuidOnly"].startswith("org-1234")
     assert result["personal"] == "Personal"
+
+
+def test_org_label_collapses_anthropic_personal_org(tmp_path):
+    """Anthropic's auto "<email>'s Organization" name is noise → 'Personal';
+    a real org name is shown verbatim."""
+    result = _run(tmp_path, """
+out({
+    auto: orgLabel({ organization_name: "jack@x.com's Organization", organization_uuid: 'o1' }),
+    real: orgLabel({ organization_name: 'Hank.ai', organization_uuid: 'o2' }),
+});
+""")
+    assert result["auto"] == "Personal"
+    assert result["real"] == "Hank.ai"
