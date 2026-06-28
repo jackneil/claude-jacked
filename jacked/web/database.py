@@ -39,6 +39,7 @@ class Account(BaseModel):
     """Pydantic v2 model for an account row."""
 
     id: int
+    provider: str = "claude"
     email: str
     organization_uuid: str = ""
     organization_name: Optional[str] = None
@@ -200,6 +201,7 @@ SCHEMA_SQL = """
 -- Account Management Tables
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL DEFAULT 'claude',  -- 'claude' | 'codex' — the account's CLI provider
     email TEXT NOT NULL,
     organization_uuid TEXT DEFAULT '',  -- Sentinel: "" = personal/legacy, non-empty = real org UUID
     organization_name TEXT,
@@ -231,7 +233,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     cc_expires_at INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(email, organization_uuid)
+    UNIQUE(provider, email, organization_uuid)
 );
 
 CREATE TABLE IF NOT EXISTS installations (
@@ -669,6 +671,49 @@ class Database:
                     )
                 except sqlite3.OperationalError:
                     pass
+            # Migration: add `provider` column + provider-scoped uniqueness.
+            # Codex support: the same (email, organization_uuid) can exist under
+            # both 'claude' and 'codex'. SQLite can't ALTER a UNIQUE constraint,
+            # so rebuild the table. This runs AFTER every other accounts
+            # column-add above, so the rebuilt table preserves all columns. The
+            # crash window (DROP accounts before RENAME accounts_new) is covered
+            # by the pre-schema recovery near the top of _init_schema. Placed
+            # BEFORE INDEXES_SQL so idx_accounts_active/idx_accounts_priority are
+            # recreated on the rebuilt table.
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_info_prov = cursor.fetchall()
+            acct_cols_prov = {row[1] for row in acct_info_prov}
+            if "provider" not in acct_cols_prov:
+                conn.execute("DROP TABLE IF EXISTS accounts_new")
+                # Reconstruct the live accounts schema (so this never drifts as
+                # columns are added by earlier migrations), injecting `provider`
+                # and the new composite UNIQUE.
+                col_defs = []
+                for cid, name, ctype, notnull, dflt, pk in acct_info_prov:
+                    if pk:
+                        col_defs.append(
+                            f'"{name}" {ctype or "INTEGER"} PRIMARY KEY AUTOINCREMENT'
+                        )
+                        continue
+                    piece = f'"{name}" {ctype or "TEXT"}'
+                    if notnull:
+                        piece += " NOT NULL"
+                    if dflt is not None:
+                        piece += f" DEFAULT {dflt}"
+                    col_defs.append(piece)
+                col_defs.append("provider TEXT NOT NULL DEFAULT 'claude'")
+                conn.execute(
+                    "CREATE TABLE accounts_new (\n"
+                    + ",\n".join(col_defs)
+                    + ",\nUNIQUE(provider, email, organization_uuid)\n)"
+                )
+                old_cols = ", ".join(f'"{r[1]}"' for r in acct_info_prov)
+                conn.execute(
+                    f"INSERT INTO accounts_new ({old_cols}) "
+                    f"SELECT {old_cols} FROM accounts"
+                )
+                conn.execute("DROP TABLE accounts")
+                conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
             # Migration: add swap outcome tracking to swap_log.
             # status distinguishes committed swaps from pending/failed attempts;
             # residency_seconds is how long the outgoing account was active.
@@ -765,6 +810,7 @@ class Database:
         has_extra_usage: bool = False,
         organization_uuid: str = "",  # Sentinel: "" = personal/legacy, non-empty = real org UUID
         organization_name: Optional[str] = None,
+        provider: str = "claude",  # 'claude' | 'codex' — the account's CLI provider
     ) -> dict:
         """Create a new account or update if (email, organization_uuid) already exists.
 
@@ -804,13 +850,13 @@ class Database:
 
             cursor = conn.execute(
                 """INSERT INTO accounts (
-                    email, organization_uuid, organization_name,
+                    provider, email, organization_uuid, organization_name,
                     access_token, refresh_token, expires_at, display_name,
                     scopes, subscription_type, rate_limit_tier, has_extra_usage,
                     priority, is_active, is_deleted, consecutive_failures,
                     validation_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?)
-                ON CONFLICT(email, organization_uuid) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?)
+                ON CONFLICT(provider, email, organization_uuid) DO UPDATE SET
                     access_token = excluded.access_token,
                     refresh_token = excluded.refresh_token,
                     expires_at = excluded.expires_at,
@@ -826,6 +872,7 @@ class Database:
                     updated_at = excluded.updated_at
                 """,
                 (
+                    provider,
                     email,
                     organization_uuid,
                     organization_name,
@@ -843,10 +890,12 @@ class Database:
                 ),
             )
 
-            # Use compound key for retrieval — safe since UNIQUE(email, organization_uuid)
+            # Use compound key for retrieval — safe since
+            # UNIQUE(provider, email, organization_uuid)
             cursor = conn.execute(
-                "SELECT * FROM accounts WHERE email = ? AND organization_uuid = ?",
-                (email, organization_uuid),
+                "SELECT * FROM accounts WHERE provider = ? AND email = ? "
+                "AND organization_uuid = ?",
+                (provider, email, organization_uuid),
             )
             row = cursor.fetchone()
             return dict(row) if row else {}
@@ -867,37 +916,48 @@ class Database:
             return dict(row) if row else None
 
     def get_account_by_email(
-        self, email: str, organization_uuid: Optional[str] = None,
+        self,
+        email: str,
+        organization_uuid: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Optional[dict]:
-        """Get an account by email (+ optional org), case-insensitive.
+        """Get an account by email (+ optional org/provider), case-insensitive.
 
         When organization_uuid is provided, returns exact match.
         When omitted, returns the single match or raises ValueError
-        if multiple accounts share the same email (different orgs).
+        if multiple accounts share the same email. Pass ``provider`` to scope
+        the lookup to one CLI provider — required to disambiguate a same-email
+        account that exists under both 'claude' and 'codex'.
 
         >>> db = Database(":memory:")
         >>> db.get_account_by_email("nobody@nowhere.com") is None
         True
         """
+        clauses = ["LOWER(email) = LOWER(?)", "is_deleted = 0"]
+        params: list[Any] = [email]
+        if provider is not None:
+            clauses.append("provider = ?")
+            params.append(provider)
         with self._reader() as conn:
             if organization_uuid is not None:
                 cursor = conn.execute(
-                    "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) "
-                    "AND organization_uuid = ? AND is_deleted = 0",
-                    (email, organization_uuid),
+                    f"SELECT * FROM accounts WHERE {' AND '.join(clauses)} "
+                    "AND organization_uuid = ?",
+                    (*params, organization_uuid),
                 )
                 row = cursor.fetchone()
                 return dict(row) if row else None
 
             cursor = conn.execute(
-                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(?) "
-                "AND is_deleted = 0 ORDER BY priority ASC, id ASC",
-                (email,),
+                f"SELECT * FROM accounts WHERE {' AND '.join(clauses)} "
+                "ORDER BY priority ASC, id ASC",
+                tuple(params),
             )
             rows = cursor.fetchall()
             if len(rows) > 1:
                 raise ValueError(
-                    f"Ambiguous: {len(rows)} accounts for {email} — specify by ID or org"
+                    f"Ambiguous: {len(rows)} accounts for {email} — "
+                    "specify by ID, org, or provider"
                 )
             return dict(rows[0]) if rows else None
 
@@ -1461,6 +1521,42 @@ class Database:
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
                 (key, value, now),
             )
+
+    @staticmethod
+    def active_account_setting_key(provider: str = "claude") -> str:
+        """Settings key holding the active account id for ``provider``.
+
+        Claude keeps the legacy bare ``active_account_id`` key for back-compat
+        (no setting migration needed); other providers are namespaced. A user
+        can be active on Claude AND Codex at the same time, so active state is
+        tracked independently per provider.
+
+        >>> Database.active_account_setting_key("claude")
+        'active_account_id'
+        >>> Database.active_account_setting_key("codex")
+        'active_account_id_codex'
+        """
+        return (
+            "active_account_id"
+            if provider == "claude"
+            else f"active_account_id_{provider}"
+        )
+
+    def get_active_account_id(self, provider: str = "claude") -> Optional[int]:
+        """Return the active account id for ``provider`` (None if unset/invalid)."""
+        raw = self.get_setting(self.active_account_setting_key(provider))
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def set_active_account_id(self, account_id: int, provider: str = "claude") -> None:
+        """Set the active account id for ``provider``."""
+        self.set_setting(
+            self.active_account_setting_key(provider), str(int(account_id))
+        )
 
     def list_settings(self) -> list[dict]:
         """List all settings.

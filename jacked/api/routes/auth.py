@@ -138,6 +138,7 @@ class AccountResponse(BaseModel):
     """Account data with computed fields for API responses."""
 
     id: int
+    provider: str = "claude"
     email: str
     organization_uuid: Optional[str] = None
     organization_name: Optional[str] = None
@@ -380,6 +381,7 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
     # Build response without access_token or refresh_token (never expose)
     return AccountResponse(
         id=row["id"],
+        provider=row.get("provider") or "claude",
         email=row["email"],
         organization_uuid=row.get("organization_uuid") or None,
         organization_name=row.get("organization_name"),

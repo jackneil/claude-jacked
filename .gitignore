@@ -91,3 +91,6 @@ nul
 .superpowers/
 tmp/
 /*.png
+
+# Autonomous /goal briefs (scratch, never committed)
+.claude/goals/

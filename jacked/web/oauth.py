@@ -598,7 +598,9 @@ class OAuthFlow:
             old_org_uuid = target.get("organization_uuid", "")
             actual_target_id = self._target_account_id
             if final_org_uuid != old_org_uuid:
-                existing = self.db.get_account_by_email(email, final_org_uuid)
+                existing = self.db.get_account_by_email(
+                    email, final_org_uuid, provider="claude"
+                )
                 if existing:
                     # Redirect: update the matching account, not the target
                     actual_target_id = existing["id"]

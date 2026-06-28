@@ -1036,7 +1036,8 @@ async def active_account_poll_loop(app):
                 # Whitelist safe fields — new DB columns won't leak by default.
                 # Mirrors _account_to_response in routes/auth.py.
                 _WS_SAFE_FIELDS = {
-                    "id", "email", "organization_uuid", "organization_name",
+                    "id", "provider", "email", "organization_uuid",
+                    "organization_name",
                     "display_name", "expires_at", "scopes",
                     "subscription_type", "rate_limit_tier", "has_extra_usage",
                     "priority", "is_active", "is_deleted",
