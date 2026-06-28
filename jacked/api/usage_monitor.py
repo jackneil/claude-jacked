@@ -849,12 +849,15 @@ async def _execute_swap(
 async def active_account_poll_loop(app):
     """Poll the active account with adaptive interval for threshold detection.
 
-    Interval adapts based on urgency tier:
-    - Idle (<50% usage, no burn): 5 min
-    - Normal (<70% or low burn): 2.5 min
-    - Warning (70-85% or projects critical in 15min): 90s
-    - Critical (>85% or projects critical in 5min): 65s
-    ±15% jitter on each tick to prevent sync patterns.
+    Interval adapts based on urgency tier. The tier thresholds + interval
+    values are defined ONCE in jacked.web.auth (compute_urgency_tier +
+    _TIER_INTERVALS) — that is the source of truth; keep this doc in sync:
+    - Idle (5h ≤50%, no burn): 10 min
+    - Normal (5h 50-70%, or low burn): 5 min
+    - Warning (5h 70-85%, or projects critical within 15 min): 4 min
+    - Critical (5h >85%, or projects critical within 5 min): 3 min
+    A 7d window above 80% bumps the tier up one. ±15% jitter on each tick to
+    prevent sync patterns; the interval can clamp tighter near a window reset.
 
     Handles auto-swap decisions, TOCTOU guard, burn-rate tracking with
     decay, and descriptive swap reason strings.  Never crashes — all
