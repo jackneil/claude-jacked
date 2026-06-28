@@ -807,6 +807,14 @@ async def fetch_usage(
     if _retry_depth == 0:
         state["last_fetched_at"] = time.time()
 
+    # Provider dispatch: Codex usage comes from the `codex app-server` JSON-RPC,
+    # not the Anthropic HTTP API. Pacing/backoff/stamping above are
+    # provider-agnostic and already applied; everything below is Anthropic-only.
+    if (account.get("provider") or "claude") == "codex":
+        from jacked.codex.usage import fetch_codex_usage
+
+        return await fetch_codex_usage(account_id, db, state=state)
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
