@@ -276,6 +276,53 @@ def test_route_imports_codex_account(client, db, tmp_path, monkeypatch):
     assert len(codex) == 1
 
 
+def test_reauth_route_rejects_codex(client, db):
+    """POST /accounts/{id}/reauth must not start a Claude OAuth flow for Codex."""
+    acct = db.create_account("r@x.com", "codex-managed", 4102444800,
+                             provider="codex", organization_uuid="acct-R")
+    resp = client.post(f"/api/auth/accounts/{acct['id']}/reauth")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "CODEX_NOT_OAUTH"
+
+
+def test_cc_auth_route_rejects_codex(client, db):
+    """POST /accounts/{id}/authorize-cc — Codex has no Claude Code token."""
+    acct = db.create_account("c@x.com", "codex-managed", 4102444800,
+                             provider="codex", organization_uuid="acct-C")
+    resp = client.post(f"/api/auth/accounts/{acct['id']}/authorize-cc")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "CODEX_NO_CC"
+
+
+def test_delete_route_removes_codex_slot_and_active_pointer(client, db, tmp_path, monkeypatch):
+    """Deleting a Codex account clears its active pointer + removes its slot dir."""
+    from jacked.codex.switching import codex_account_home
+
+    base = tmp_path / ".codex"
+    monkeypatch.setenv("CODEX_HOME", str(base))
+    acct = db.create_account("d@x.com", "codex-managed", 4102444800,
+                             provider="codex", organization_uuid="acct-D")
+    db.set_active_account_id(acct["id"], provider="codex")
+    slot = codex_account_home(acct["id"])
+    slot.mkdir(parents=True, exist_ok=True)
+    (slot / "auth.json").write_text("{}")
+
+    resp = client.delete(f"/api/auth/accounts/{acct['id']}")
+    assert resp.status_code == 200
+    assert db.get_active_account_id("codex") is None  # pointer cleared
+    assert not slot.exists()  # slot removed
+
+
+def test_codex_never_refreshes_against_anthropic(db):
+    """Explicit defense-in-depth: a Codex row never qualifies for token refresh."""
+    from jacked.web.auth import should_refresh, should_refresh_cc
+
+    codex = {"provider": "codex", "refresh_token": "x", "expires_at": 0,
+             "cc_refresh_token": "y", "cc_expires_at": 0}
+    assert should_refresh(codex) is False
+    assert should_refresh_cc(codex) is False
+
+
 def test_route_needs_login_when_absent(client, tmp_path, monkeypatch):
     home = tmp_path / ".codex"
     home.mkdir()

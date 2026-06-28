@@ -498,6 +498,16 @@ async def start_reauth(account_id: int, request: Request):
             content={"error": {"message": "Account not found", "code": "NOT_FOUND"}},
         )
 
+    # Codex accounts don't use the Anthropic OAuth flow — re-auth is `codex login`.
+    if (account.get("provider") or "claude") == "codex":
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": {
+                "message": "Codex accounts re-authenticate with `codex login`, then Add Account → Codex.",
+                "code": "CODEX_NOT_OAUTH",
+            }},
+        )
+
     flow = OAuthFlow(db, purpose="primary", target_account_id=account_id)
     result = await flow.start()
 
@@ -614,10 +624,27 @@ async def delete_account(account_id: int, request: Request):
 
     db.delete_account(account_id)
 
-    # Remove per-account credential dir to prevent orphaned files
-    acct_dir = Path.home() / ".claude" / "accounts" / str(account_id)
-    if acct_dir.exists() and acct_dir.is_dir() and not acct_dir.is_symlink():
-        shutil.rmtree(acct_dir, ignore_errors=True)
+    if (account.get("provider") or "claude") == "codex":
+        # Codex account: clear its active pointer + remove its per-account auth
+        # slot (a Codex account has no ~/.claude credential dir).
+        try:
+            if db.get_active_account_id("codex") == account_id:
+                db.delete_setting(db.active_account_setting_key("codex"))
+        except Exception:
+            logger.debug("clearing codex active pointer failed", exc_info=True)
+        try:
+            from jacked.codex.switching import codex_account_home
+
+            slot_dir = codex_account_home(account_id)
+            if slot_dir.exists() and slot_dir.is_dir() and not slot_dir.is_symlink():
+                shutil.rmtree(slot_dir, ignore_errors=True)
+        except Exception:
+            logger.debug("removing codex slot dir failed", exc_info=True)
+    else:
+        # Remove per-account Claude credential dir to prevent orphaned files
+        acct_dir = Path.home() / ".claude" / "accounts" / str(account_id)
+        if acct_dir.exists() and acct_dir.is_dir() and not acct_dir.is_symlink():
+            shutil.rmtree(acct_dir, ignore_errors=True)
 
     return {"deleted": True, "account_id": account_id}
 
@@ -745,14 +772,15 @@ async def refresh_usage(account_id: int, request: Request):
         )
 
     if usage_data is None:
+        is_codex = (account.get("provider") or "claude") == "codex"
+        msg = (
+            "Failed to read Codex usage — is `codex` installed and signed in?"
+            if is_codex
+            else "Failed to fetch usage from Anthropic API"
+        )
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            content={
-                "error": {
-                    "message": "Failed to fetch usage from Anthropic API",
-                    "code": "USAGE_FETCH_FAILED",
-                }
-            },
+            content={"error": {"message": msg, "code": "USAGE_FETCH_FAILED"}},
         )
 
     # Re-read to get updated cache values
@@ -1107,6 +1135,17 @@ async def start_cc_auth(account_id: int, request: Request):
     account = db.get_account(account_id)
     if not account:
         return _not_found(f"No account with id={account_id}")
+
+    # "CC token" is a Claude Code concept — Codex accounts have none and must not
+    # start an Anthropic OAuth flow.
+    if (account.get("provider") or "claude") == "codex":
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": {
+                "message": "Codex accounts have no Claude Code token to authorize.",
+                "code": "CODEX_NO_CC",
+            }},
+        )
 
     from jacked.web.oauth import OAuthFlow
 

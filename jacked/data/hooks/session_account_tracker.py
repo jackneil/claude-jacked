@@ -100,9 +100,12 @@ def _match_token_to_account(
                     config = json.loads(CLAUDE_CONFIG.read_text(encoding="utf-8"))
                     email = config.get("oauthAccount", {}).get("emailAddress")
                     if email:
+                        # This is a Claude Code session hook — only ever resolve
+                        # a CLAUDE account, never a same-email Codex row.
                         row = conn.execute(
                             "SELECT id, email FROM accounts "
                             "WHERE LOWER(email) = LOWER(?) AND is_deleted = 0 "
+                            "AND COALESCE(provider, 'claude') = 'claude' "
                             "ORDER BY priority ASC, id ASC LIMIT 1",
                             (email,),
                         ).fetchone()

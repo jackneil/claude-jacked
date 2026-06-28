@@ -630,7 +630,14 @@ def should_refresh(account: dict) -> bool:
     True
     >>> should_refresh({"refresh_token": "rt-test", "expires_at": 9999999999})
     False
+    >>> should_refresh({"provider": "codex", "refresh_token": "x", "expires_at": 0})
+    False
     """
+    # Codex tokens are never Anthropic-refreshed (Codex manages its own). This is
+    # already implied by refresh_token being NULL, but gate explicitly so a future
+    # change can't accidentally drive a Codex row into an Anthropic token exchange.
+    if (account.get("provider") or "claude") == "codex":
+        return False
     if not account.get("refresh_token"):
         return False
     return account["expires_at"] < time.time() + REFRESH_BUFFER_SECONDS
@@ -649,7 +656,11 @@ def should_refresh_cc(account: dict) -> bool:
     False
     >>> should_refresh_cc({"cc_refresh_token": "rt", "cc_expires_at": None})
     True
+    >>> should_refresh_cc({"provider": "codex", "cc_refresh_token": "rt", "cc_expires_at": 0})
+    False
     """
+    if (account.get("provider") or "claude") == "codex":
+        return False  # Codex has no Claude Code tokens to refresh
     if not account.get("cc_refresh_token"):
         return False
     cc_expires_at = account.get("cc_expires_at")
