@@ -270,6 +270,10 @@ class ServiceRunner:
         # are muted.
         self._last_check_at: float | None = None
         self._version_check_in_progress: bool = False
+        # True when the most recent MANUAL check couldn't reach PyPI (info None).
+        # Read by the mac menubar to show a "couldn't reach" result, since its
+        # rumps path has no pystray notification.
+        self._last_check_failed: bool = False
         # Wall-clock timestamp when the current uvicorn thread became ready
         # (passed _wait_for_ready). Used by the tray menu so users can verify
         # a Restart click actually took effect — the timestamp shifts on
@@ -616,6 +620,7 @@ class ServiceRunner:
             # Stamp last-checked regardless of PyPI reachability — the user
             # asked for a check; failure or success both happened "just now".
             self._last_check_at = _time.time()
+            self._last_check_failed = info is None
             self._version_check_in_progress = False
 
             if self._icon and not self._stop_event.is_set():

@@ -294,6 +294,44 @@ class TestVersionMenu:
         runner._version_info = {"latest": __version__, "outdated": False}
         assert runner._version_menu_text() == f"v{__version__}"
 
+    def test_manual_check_sets_failed_flag_when_unreachable(self, monkeypatch):
+        """The mac menubar reads _last_check_failed to show 'couldn't reach PyPI'
+        (its rumps path has no pystray notification)."""
+        _skip_if_no_tray()
+        import time
+
+        import jacked.service.tray as tray_mod
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        monkeypatch.setattr(tray_mod, "check_version_cached", lambda *a, **k: None)
+        runner._on_check_for_updates()
+        for _ in range(60):
+            if not runner._version_check_in_progress:
+                break
+            time.sleep(0.05)
+        assert runner._version_check_in_progress is False
+        assert runner._last_check_failed is True
+        assert runner._last_check_at is not None
+
+    def test_manual_check_clears_failed_flag_on_success(self, monkeypatch):
+        _skip_if_no_tray()
+        import time
+
+        import jacked.service.tray as tray_mod
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        monkeypatch.setattr(
+            tray_mod, "check_version_cached",
+            lambda *a, **k: {"latest": "9.9.9", "outdated": True},
+        )
+        runner._on_check_for_updates()
+        for _ in range(60):
+            if not runner._version_check_in_progress:
+                break
+            time.sleep(0.05)
+        assert runner._last_check_failed is False
+        assert runner._version_info == {"latest": "9.9.9", "outdated": True}
+
     def test_version_text_when_outdated(self):
         _skip_if_no_tray()
         from jacked import __version__

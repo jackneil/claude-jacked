@@ -628,18 +628,46 @@ if RUMPS_AVAILABLE:
 
         def _on_check_updates_item(self, _sender):
             """Force a fresh PyPI check now (runs in the runner's own thread),
-            then refresh the menu so the result shows without reopening."""
+            then show the result as a modal alert. The rumps menubar has no
+            pystray icon, so _on_check_for_updates' notify() calls are no-ops
+            here — without this alert the manual check gives NO visible feedback."""
             try:
                 self._runner._on_check_for_updates()
             except Exception:
                 logger.exception("manual update check failed")
-            self._refresh_version_menu()  # shows "Checking PyPI…" immediately
-            # The check runs in a background thread; pull its result in a moment.
-            rumps.Timer(self._after_check_refresh, 3.0).start()
+            self._refresh_version_menu()  # "Checking PyPI…" for the next menu open
+            # Poll until the background check finishes, then alert + refresh.
+            self._check_poll_count = 0
+            rumps.Timer(self._poll_check_result, 0.5).start()
 
-        def _after_check_refresh(self, timer):
+        def _poll_check_result(self, timer):
+            """Re-arm until the manual check completes (~12s cap), then show the
+            outcome as a modal and refresh the menu text."""
+            r = self._runner
+            self._check_poll_count = getattr(self, "_check_poll_count", 0) + 1
+            if getattr(r, "_version_check_in_progress", False) and self._check_poll_count < 24:
+                return
             timer.stop()
             self._refresh_version_menu()
+            try:
+                if getattr(r, "_version_check_in_progress", False):
+                    msg = "Still checking PyPI — give it another moment and try again."
+                elif getattr(r, "_last_check_failed", False):
+                    msg = "Couldn't reach PyPI. Check your connection and try again."
+                else:
+                    info = getattr(r, "_version_info", None) or {}
+                    if info.get("outdated"):
+                        latest = info.get("latest", "?")
+                        msg = (
+                            f"Update available: v{latest}\n\n"
+                            f"You're on v{__version__}. Click the version line "
+                            f"(v{__version__} → v{latest}) in the menu to install it."
+                        )
+                    else:
+                        msg = f"You're up to date — v{__version__} is the latest."
+                rumps.alert(title="Jacked — Check for Updates", message=msg, ok="OK")
+            except Exception:
+                logger.exception("update-check result alert failed")
 
         def _on_toggle_autostart_item(self, _sender):
             try:
