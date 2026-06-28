@@ -9,10 +9,10 @@
  * the full dashboard app.js.
  *
  * Layout is tuned for a narrow (~360px) popover with many accounts: the EMAIL
- * is the primary identifier (it's what distinguishes accounts; display names
- * collide), single-org logins collapse to one identity line, only multi-org
- * logins get a header + connecting rail, and each account shows how fresh its
- * numbers are.
+ * is the primary identifier, single-org logins collapse to one identity line,
+ * only multi-org logins get a header + connecting rail, each account shows how
+ * fresh its numbers are, and the ACTIVE account shows a live countdown to its
+ * next refresh (the backend's real poll schedule, from /api/menubar-summary).
  */
 
 const PANEL_REFRESH_MS = 15000;
@@ -44,6 +44,16 @@ function freshnessLabel(org) {
     return Math.floor(secs / 86400) + 'd';
 }
 
+/** Countdown to the next scheduled refresh (unix seconds): "next 4m" / "next 45s"
+ * / "refreshing…" once due. */
+function formatCountdown(nextAt) {
+    if (!nextAt) return '';
+    const secs = Math.round(nextAt - Date.now() / 1000);
+    if (secs <= 0) return 'refreshing…';
+    if (secs < 60) return 'next ' + secs + 's';
+    return 'next ' + Math.floor(secs / 60) + 'm';
+}
+
 /** The two compact usage bars (5h + 7d) for an account/org. */
 function orgBarsHtml(org) {
     const elapsed5h = computeElapsedFraction5h(org.cached_5h_resets_at);
@@ -54,8 +64,9 @@ function orgBarsHtml(org) {
     );
 }
 
-/** Trailing meta on an identity line: plan badge, active marker, freshness age. */
-function orgMetaHtml(org) {
+/** Trailing meta on an identity line: plan badge, active marker, freshness age,
+ * and — for the active account — a live "next refresh" countdown. */
+function orgMetaHtml(org, nextRefreshAt) {
     const plan = planLabel(org);
     const planHtml = plan ? `<span class="plan-badge">${escapeHtml(plan)}</span>` : '';
     const activeHtml = org.isActive
@@ -65,11 +76,17 @@ function orgMetaHtml(org) {
     const ageHtml = age
         ? `<span class="acct-age" title="Usage updated ${escapeHtml(age)} ago">${escapeHtml(age)}</span>`
         : '';
-    return `${planHtml}${activeHtml}<span class="meta-spacer"></span>${ageHtml}`;
+    let nextHtml = '';
+    if (org.isActive && nextRefreshAt) {
+        nextHtml =
+            `<span class="next-refresh" data-next-at="${nextRefreshAt}"` +
+            ` title="Next automatic usage refresh">${escapeHtml(formatCountdown(nextRefreshAt))}</span>`;
+    }
+    return `${planHtml}${activeHtml}<span class="meta-spacer"></span>${ageHtml}${nextHtml}`;
 }
 
 /** Single-org login → one compact identity line (email-primary) + bars. */
-function buildSingleAccountHtml(group) {
+function buildSingleAccountHtml(group, nextRefreshAt) {
     const org = group.orgs[0];
     // Show a real org name inline; "Personal" is implied by a lone account, omit it.
     const orgTag =
@@ -81,21 +98,21 @@ function buildSingleAccountHtml(group) {
             <div class="acct-head">
                 <span class="acct-email" title="${escapeHtml(group.email)}">${escapeHtml(group.email)}</span>
                 ${orgTag}
-                ${orgMetaHtml(org)}
+                ${orgMetaHtml(org, nextRefreshAt)}
             </div>
             <div class="org-bars">${orgBarsHtml(org)}</div>
         </section>`;
 }
 
 /** Multi-org login → email header (+ "N orgs" chip + rail) and per-org rows. */
-function buildMultiOrgLoginHtml(group) {
+function buildMultiOrgLoginHtml(group, nextRefreshAt) {
     const rows = group.orgs
         .map(
             (org) => `
             <div class="org-row${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
                 <div class="org-row-head">
                     <span class="org-name" title="${escapeHtml(org.orgLabel)}">${escapeHtml(org.orgLabel)}</span>
-                    ${orgMetaHtml(org)}
+                    ${orgMetaHtml(org, nextRefreshAt)}
                 </div>
                 <div class="org-bars">${orgBarsHtml(org)}</div>
             </div>`
@@ -112,14 +129,17 @@ function buildMultiOrgLoginHtml(group) {
 }
 
 /** One login group — collapsed when single-org, header+rail when multi-org. */
-function buildLoginGroupHtml(group) {
-    return group.orgCount > 1 ? buildMultiOrgLoginHtml(group) : buildSingleAccountHtml(group);
+function buildLoginGroupHtml(group, nextRefreshAt) {
+    return group.orgCount > 1
+        ? buildMultiOrgLoginHtml(group, nextRefreshAt)
+        : buildSingleAccountHtml(group, nextRefreshAt);
 }
 
-/** Full panel body from grouped accounts (empty state when none). */
-function buildPanelHtml(groups) {
+/** Full panel body from grouped accounts (empty state when none). nextRefreshAt
+ * is the active account's next scheduled refresh (unix seconds) or null. */
+function buildPanelHtml(groups, nextRefreshAt) {
     if (!groups || groups.length === 0) return panelEmptyHtml();
-    return groups.map(buildLoginGroupHtml).join('');
+    return groups.map((g) => buildLoginGroupHtml(g, nextRefreshAt)).join('');
 }
 
 function panelEmptyHtml() {
@@ -139,21 +159,38 @@ function panelErrorHtml(message) {
         </div>`;
 }
 
-/** Fetch accounts + active credential, group, and render into container. */
+/** Fetch accounts + the menu-bar summary (active id + next-refresh), group, render. */
 async function loadPanel(container) {
     try {
-        const [accounts, active] = await Promise.all([
+        const [accounts, summary] = await Promise.all([
             panelFetch('/api/auth/accounts'),
-            panelFetch('/api/auth/active-credential').catch(() => ({})),
+            panelFetch('/api/menubar-summary').catch(() => ({})),
         ]);
-        const activeId = active && active.account_id != null ? active.account_id : null;
+        const activeId =
+            summary && summary.active_account_id != null ? summary.active_account_id : null;
+        const nextRefreshAt =
+            summary && summary.active && summary.active.next_refresh_at != null
+                ? summary.active.next_refresh_at
+                : null;
         const groups = groupAccountsByLogin(accounts, activeId);
-        container.innerHTML = buildPanelHtml(groups);
+        container.innerHTML = buildPanelHtml(groups, nextRefreshAt);
     } catch (err) {
         container.innerHTML = panelErrorHtml(err && err.message ? err.message : String(err));
         const retry = document.getElementById('panel-retry');
         if (retry) retry.addEventListener('click', () => loadPanel(container));
     }
+}
+
+/** Tick the "next refresh" countdown(s) every second so it rolls down smoothly
+ * between the 15s data reloads. */
+function startCountdownTicker() {
+    setInterval(() => {
+        const els = document.querySelectorAll('[data-next-at]');
+        els.forEach((el) => {
+            const at = parseFloat(el.getAttribute('data-next-at'));
+            if (at) el.textContent = formatCountdown(at);
+        });
+    }, 1000);
 }
 
 /**
@@ -187,6 +224,7 @@ function startPanel() {
     setupMenuButton();
     loadPanel(container);
     setInterval(() => loadPanel(container), PANEL_REFRESH_MS);
+    startCountdownTicker();
 }
 
 if (typeof document !== 'undefined' && document.addEventListener) {
@@ -204,6 +242,7 @@ if (typeof module !== 'undefined' && module.exports) {
         orgMetaHtml,
         planLabel,
         freshnessLabel,
+        formatCountdown,
         panelEmptyHtml,
         panelErrorHtml,
         setupMenuButton,

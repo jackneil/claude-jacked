@@ -198,3 +198,31 @@ out({ noBridge, withBridge });
     assert result["noBridge"] == {"hidden": True, "wired": False}
     assert result["withBridge"]["hidden"] is False
     assert result["withBridge"]["posted"] == "show-menu"
+
+
+def test_next_refresh_countdown_only_on_active_account(tmp_path):
+    """The active account shows a live 'next refresh' countdown; others don't.
+    formatCountdown rolls minutes/seconds and flips to 'refreshing…' when due."""
+    result = _run(tmp_path, """
+const nextAt = Math.floor(Date.now() / 1000) + 185;  // ~3 min out
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 1, email: 'active@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 50, cached_usage_7d: 50 },
+    { id: 2, email: 'other@x.com', organization_uuid: '', priority: 1,
+      cached_usage_5h: 10, cached_usage_7d: 10 },
+], 1), nextAt);
+out({
+    html,
+    nextCount: (html.match(/data-next-at=/g) || []).length,
+    cd: formatCountdown(nextAt),
+    soon: formatCountdown(Math.floor(Date.now()/1000) + 30),
+    due: formatCountdown(Math.floor(Date.now()/1000) - 5),
+    none: formatCountdown(null),
+});
+""")
+    assert "next-refresh" in result["html"]
+    assert result["nextCount"] == 1, "only the active account gets the countdown"
+    assert result["cd"].startswith("next ") and result["cd"].endswith("m")
+    assert result["soon"].endswith("s") and result["soon"].startswith("next ")
+    assert result["due"] == "refreshing…"
+    assert result["none"] == ""
