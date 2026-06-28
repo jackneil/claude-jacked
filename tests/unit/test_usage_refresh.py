@@ -203,7 +203,8 @@ class TestFetchUsage429:
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={"retry-after": "5"})
 
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             result = asyncio.run(fetch_usage(1, db))
 
         assert result is None
@@ -221,7 +222,8 @@ class TestFetchUsage429:
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={"retry-after": "240"})
 
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             asyncio.run(fetch_usage(1, db))
 
         error_msg = db.record_account_error.call_args[0][1]
@@ -236,7 +238,8 @@ class TestFetchUsage429:
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={})
 
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             result = asyncio.run(fetch_usage(1, db))
 
         assert result is None
@@ -250,7 +253,8 @@ class TestFetchUsage429:
         db = _mock_db({"usage_cached_at": None})
         client = _mock_client(429, headers={})
 
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             asyncio.run(fetch_usage(1, db))
 
         error_msg = db.record_account_error.call_args[0][1]
@@ -278,7 +282,11 @@ class TestUsageBackoff:
         db = _mock_db({"usage_cached_at": int(time.time()) - 200})
         client = _mock_client(429, {}, headers={"retry-after": "65"})
 
-        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+        # Isolate pure backoff behavior — stub the 429 refresh attempt (mirrors
+        # the other 429 tests) so the real refresh path doesn't leak an
+        # unawaited coroutine through the mocked httpx client.
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             result = asyncio.run(fetch_usage(1, db))
         assert result is None
 
