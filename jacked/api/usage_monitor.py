@@ -1020,6 +1020,15 @@ async def active_account_poll_loop(app):
                 _last_observed_tiers,
             )
 
+            # Publish the REAL next-poll schedule to app.state so REST callers
+            # (the menu-bar panel's "next refresh in …") read the actual interval
+            # the loop will wait — not a re-guessed tier. next_poll ≈ this tick's
+            # wall-clock + the computed interval.
+            app.state.active_poll_account_id = active_acct_id
+            app.state.active_poll_at = int(time.time())
+            app.state.active_poll_interval = int(_poll_interval)
+            app.state.active_poll_tier = _poll_tier
+
             # Push fresh usage data to connected dashboards so the
             # countdown timer and usage bars update immediately.
             _ws = getattr(app.state, "ws_registry", None)

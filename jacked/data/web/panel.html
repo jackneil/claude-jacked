@@ -140,6 +140,15 @@
         font-size: 10px; color: var(--txt-dim);
         font-variant-numeric: tabular-nums; flex: none;
     }
+    /* "next 4m" countdown on the active account — a touch brighter than the
+       "ago" age, with a dot separator so the two read as: updated · next. */
+    .next-refresh {
+        font-size: 10px; color: var(--txt-muted);
+        font-variant-numeric: tabular-nums; flex: none;
+    }
+    .next-refresh::before {
+        content: "·"; color: var(--txt-dim); margin: 0 4px;
+    }
 
     /* Connecting rail for multi-org logins */
     .login-group.has-rail .org-rows { margin-left: 6px; padding-left: 10px; border-left: 2px solid var(--rail); }

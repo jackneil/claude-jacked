@@ -182,14 +182,14 @@ def db(tmp_path):
         conn.execute(
             """INSERT INTO accounts
                (id, email, access_token, expires_at, is_active, is_deleted,
-                validation_status, cached_usage_5h, cached_usage_7d)
-               VALUES (1, 'low@x.com', 'at1', 1900000000, 1, 0, 'valid', 37, 87)"""
+                validation_status, cached_usage_5h, cached_usage_7d, usage_cached_at)
+               VALUES (1, 'low@x.com', 'at1', 1900000000, 1, 0, 'valid', 37, 87, 1700000000)"""
         )
         conn.execute(
             """INSERT INTO accounts
                (id, email, access_token, expires_at, is_active, is_deleted,
-                validation_status, cached_usage_5h, cached_usage_7d)
-               VALUES (2, 'hot@x.com', 'at2', 1900000000, 1, 0, 'valid', 96, 78)"""
+                validation_status, cached_usage_5h, cached_usage_7d, usage_cached_at)
+               VALUES (2, 'hot@x.com', 'at2', 1900000000, 1, 0, 'valid', 96, 78, 1700000000)"""
         )
     yield db
     db.close()
@@ -240,6 +240,58 @@ def test_endpoint_active_null_when_no_active_account(db):
         data = resp.json()
         assert data["active"] is None
         assert data["account_count"] == 2
+    finally:
+        app.state.db = None
+
+
+def _clear_poll_state(app):
+    for attr in ("active_poll_account_id", "active_poll_at", "active_poll_interval", "active_poll_tier"):
+        try:
+            setattr(app.state, attr, None)
+        except Exception:
+            pass
+
+
+def test_endpoint_next_refresh_from_published_poll_schedule(db):
+    """The active account's next_refresh_at uses the REAL schedule the poll loop
+    published to app.state (last poll time + interval)."""
+    import time as _t
+    from jacked.api.main import app
+
+    app.state.db = db
+    now = int(_t.time())
+    app.state.active_poll_account_id = 1
+    app.state.active_poll_at = now
+    app.state.active_poll_interval = 300
+    app.state.active_poll_tier = "normal"
+    try:
+        with _patch_active(1):
+            client = TestClient(app, raise_server_exceptions=False)
+            data = client.get("/api/menubar-summary").json()
+        assert data["active"]["next_refresh_at"] == now + 300
+        assert data["active"]["poll_interval"] == 300
+        assert data["active"]["poll_tier"] == "normal"
+    finally:
+        _clear_poll_state(app)
+        app.state.db = None
+
+
+def test_endpoint_next_refresh_falls_back_to_tier_estimate(db):
+    """With no published schedule, next_refresh_at = usage_cached_at + the real
+    tier interval (compute_urgency_tier), never a hardcoded guess."""
+    from jacked.api.main import app
+
+    app.state.db = db
+    _clear_poll_state(app)
+    try:
+        with _patch_active(1):
+            client = TestClient(app, raise_server_exceptions=False)
+            data = client.get("/api/menubar-summary").json()
+        a = data["active"]
+        assert a["next_refresh_at"] is not None
+        assert a["poll_interval"] and a["poll_interval"] > 0
+        # internal consistency: next = cached_at(1700000000) + the computed interval
+        assert a["next_refresh_at"] == 1700000000 + a["poll_interval"]
     finally:
         app.state.db = None
 
