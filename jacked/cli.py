@@ -4096,6 +4096,28 @@ def profiles_delete(name: str, yes: bool):
         console.print(f"[yellow]Profile '{name}' not found[/yellow]")
 
 
+@main.command(name="menubar")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
+def menubar(host: str | None, port: int | None):
+    """Start the macOS menu-bar agent in the foreground (manual start).
+
+    macOS only — the live usage pill, dropdown, and pinned side panel. On other
+    platforms use `jacked service start` (pystray tray). Equivalent to
+    `jacked service start` on macOS, but fails fast off darwin so it's an
+    explicit, debuggable entry point.
+    """
+    if sys.platform != "darwin":
+        console.print("[red]`jacked menubar` is macOS-only.[/red] "
+                      "Use `jacked service start` on this platform.")
+        sys.exit(1)
+
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service.tray import ServiceRunner
+
+    ServiceRunner(host=host or DEFAULT_HOST, port=port or DEFAULT_PORT).run()
+
+
 @main.group()
 def service():
     """Manage the jacked background service (tray icon + auto-start)."""
