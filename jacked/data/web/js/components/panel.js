@@ -156,9 +156,35 @@ async function loadPanel(container) {
     }
 }
 
+/**
+ * Wire the in-panel "⋯" button to open the native actions menu (the right-click
+ * equivalent), for users who don't realize they can right-click the icon. It is
+ * only revealed when the WKWebView→native bridge is present, so a plain browser
+ * (QA / the dashboard) never shows a button that would do nothing.
+ */
+function setupMenuButton() {
+    const btn = document.getElementById('panel-menu-btn');
+    if (!btn) return;
+    const bridge =
+        typeof window !== 'undefined' &&
+        window.webkit &&
+        window.webkit.messageHandlers &&
+        window.webkit.messageHandlers.jacked;
+    if (!bridge) return; // not inside the native panel — leave it hidden
+    btn.hidden = false;
+    btn.addEventListener('click', () => {
+        try {
+            window.webkit.messageHandlers.jacked.postMessage('show-menu');
+        } catch (e) {
+            /* bridge went away — nothing to do */
+        }
+    });
+}
+
 function startPanel() {
     const container = document.getElementById('panel-root');
     if (!container) return;
+    setupMenuButton();
     loadPanel(container);
     setInterval(() => loadPanel(container), PANEL_REFRESH_MS);
 }
@@ -180,5 +206,6 @@ if (typeof module !== 'undefined' && module.exports) {
         freshnessLabel,
         panelEmptyHtml,
         panelErrorHtml,
+        setupMenuButton,
     };
 }

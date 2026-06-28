@@ -169,3 +169,32 @@ out({ html });
     html = result["html"]
     assert "w-28" not in html, "compact bars must not carry the fixed reset-time column"
     assert "usage-bar" in html and "tabular-nums" in html
+
+
+def test_menu_button_gated_on_native_bridge(tmp_path):
+    """The in-panel ⋯ button stays hidden in a plain browser (no bridge) and is
+    revealed + posts 'show-menu' only when the WKWebView→native bridge exists."""
+    result = _run(tmp_path, """
+function fakeBtn() { return { hidden: true, _listeners: {}, addEventListener(ev, fn){ this._listeners[ev]=fn; } }; }
+
+// 1) No bridge → stays hidden, no click wiring.
+let btn = fakeBtn();
+global.document = { getElementById: () => btn };
+global.window = {};
+setupMenuButton();
+const noBridge = { hidden: btn.hidden, wired: !!btn._listeners.click };
+
+// 2) Bridge present → revealed + click posts 'show-menu'.
+btn = fakeBtn();
+let posted = null;
+global.document = { getElementById: () => btn };
+global.window = { webkit: { messageHandlers: { jacked: { postMessage: (m) => { posted = m; } } } } };
+setupMenuButton();
+if (btn._listeners.click) btn._listeners.click();
+const withBridge = { hidden: btn.hidden, posted };
+
+out({ noBridge, withBridge });
+""")
+    assert result["noBridge"] == {"hidden": True, "wired": False}
+    assert result["withBridge"]["hidden"] is False
+    assert result["withBridge"]["posted"] == "show-menu"

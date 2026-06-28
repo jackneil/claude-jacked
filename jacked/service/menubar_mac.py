@@ -164,6 +164,24 @@ if RUMPS_AVAILABLE:
             except Exception:
                 logger.exception("status-item click handling failed")
 
+    class _PanelBridge(NSObject):
+        """WKScriptMessageHandler: lets the /panel webview ask the native agent to
+        open the actions menu — so the in-panel ⋯ button reaches the same menu as
+        a right-click, for users who don't realize they can right-click."""
+
+        def initWithApp_(self, app):  # noqa: N802 - objc selector
+            self = objc.super(_PanelBridge, self).init()
+            if self is None:
+                return None
+            self._app = app
+            return self
+
+        def userContentController_didReceiveScriptMessage_(self, _ucc, message):  # noqa: N802
+            try:
+                self._app._on_panel_message(str(message.body()))
+            except Exception:
+                logger.exception("panel bridge message handling failed")
+
     class MacMenuBarApp(rumps.App):
         """The rumps status-bar app + PyObjC popover/panel.
 
@@ -188,6 +206,7 @@ if RUMPS_AVAILABLE:
             self._click_handler = None
             self._appkit_menu = None
             self._click_wired = False
+            self._bridge = None  # WKScriptMessageHandler for the in-panel ⋯ button
 
             self._auto_swap_item = rumps.MenuItem(
                 "Auto-swap", callback=self._on_toggle_auto_swap
@@ -359,12 +378,33 @@ if RUMPS_AVAILABLE:
 
         def _make_webview(self, width, height):
             cfg = WKWebViewConfiguration.alloc().init()
+            # Bridge so the panel's ⋯ button can open the native actions menu.
+            try:
+                if self._bridge is None:
+                    self._bridge = _PanelBridge.alloc().initWithApp_(self)
+                cfg.userContentController().addScriptMessageHandler_name_(
+                    self._bridge, "jacked"
+                )
+            except Exception:
+                logger.exception("Could not install panel→native message bridge")
             web = WKWebView.alloc().initWithFrame_configuration_(
                 NSMakeRect(0, 0, width, height), cfg
             )
             url = NSURL.URLWithString_(self._base_url + "/panel")
             web.loadRequest_(NSURLRequest.requestWithURL_(url))
             return web
+
+        def _on_panel_message(self, body):
+            """Handle a postMessage from the /panel webview (main thread)."""
+            if body == "show-menu":
+                # Close the transient popover first, then open the actions menu at
+                # the status icon — feels like the right-click menu.
+                try:
+                    if self._popover is not None and self._popover.isShown():
+                        self._popover.performClose_(None)
+                except Exception:
+                    pass
+                self._show_actions_menu()
 
         def _ensure_panel(self):
             if self._panel is not None:
