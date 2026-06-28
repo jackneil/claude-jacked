@@ -3,18 +3,20 @@
 The native face of the jacked service on macOS. Replaces the cross-platform
 pystray tray with a real menu-bar app:
 
-* a live **pill** (NSStatusItem title) showing the worst account's 5h·7d %,
-  refreshed on a timer from ``/api/menubar-summary``;
-* an **NSPopover dropdown** and an always-on-top, all-Spaces **NSPanel side
-  panel**, each a ``WKWebView`` pointed at ``/panel`` (the same compact page,
-  so they can never diverge from the dashboard);
-* menu actions: Open Dashboard, Open Usage Dropdown, Toggle Side Panel,
-  Auto-swap (reflects + toggles), Add account, Restart, Quit (clean uvicorn
-  stop).
+* a live **pill**: a "J" icon tinted green/yellow/red by the **active** account's
+  usage, plus that account's ``5h·7d`` % as text — refreshed on a timer from
+  ``/api/menubar-summary``. It tracks the account you're actually using, not the
+  worst account in the fleet.
+* **left-click → an NSPopover dropdown** and a **Toggle Side Panel → always-on-top,
+  all-Spaces NSPanel**, each a ``WKWebView`` at ``/panel`` (same compact page as
+  the dashboard, so they can't diverge);
+* **right-click (or control-click) → the actions menu**: Open Dashboard, Open
+  Usage Dropdown, Toggle Side Panel, Auto-swap, Add account, Restart, Quit
+  (clean uvicorn stop).
 
 It does NOT start its own server: the owning :class:`ServiceRunner` starts the
 single uvicorn on 127.0.0.1:8321 in a daemon thread, and this agent
-health-checks + connects to it, showing a degraded pill if it goes down.
+health-checks + connects to it, showing a degraded (gray) pill if it goes down.
 
 rumps + the pyobjc frameworks are darwin-only deps (see pyproject). Imports are
 guarded so this module is importable (for ``RUMPS_AVAILABLE`` probing) even
@@ -35,13 +37,29 @@ logger = logging.getLogger(__name__)
 # Pill + stop-watch cadence (seconds).
 PILL_INTERVAL = 30
 STOP_POLL_INTERVAL = 1.0
+WIRE_RETRY_INTERVAL = 0.4  # poll for the status-item button after launch
 PANEL_WIDTH = 360  # side-panel / popover width in points
 
+# RGB fills for the "J" status icon, keyed by usage color class.
+_ICON_FILL = {
+    "green": (34, 197, 94),
+    "yellow": (234, 179, 8),
+    "red": (239, 68, 68),
+    "gray": (130, 130, 130),  # degraded / no data
+}
+
 try:
+    import objc
     import rumps
     from AppKit import (
+        NSApp,
         NSApplicationDidChangeScreenParametersNotification,
         NSBackingStoreBuffered,
+        NSEventMaskLeftMouseUp,
+        NSEventMaskRightMouseUp,
+        NSEventModifierFlagControl,
+        NSEventTypeRightMouseUp,
+        NSObject,
         NSPanel,
         NSPopover,
         NSPopoverBehaviorTransient,
@@ -92,7 +110,56 @@ def _http_send_json(url: str, method: str, payload: dict | None, timeout: float 
         return json.loads(body) if body else {}
 
 
+def _render_status_icon(color: str) -> "str | None":
+    """Draw a rounded-rect "J" glyph filled with the status color; return a PNG
+    path (cached per color under ~/.claude). Returns None if rendering fails —
+    the caller then falls back to text only."""
+    try:
+        from PIL import Image, ImageDraw
+
+        from jacked.service import CLAUDE_DIR
+        from jacked.service.tray import _load_glyph_font
+
+        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        path = CLAUDE_DIR / f"jacked-menubar-{color}.png"
+        if path.exists():
+            return str(path)
+
+        fill = _ICON_FILL.get(color, _ICON_FILL["gray"])
+        size = 44  # retina-friendly; macOS scales to the menu-bar height
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle([(3, 3), (size - 4, size - 4)], radius=11, fill=fill)
+        font = _load_glyph_font(26)
+        bbox = draw.textbbox((0, 0), "J", font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (size - tw) // 2 - bbox[0]
+        y = (size - th) // 2 - bbox[1]
+        draw.text((x, y), "J", fill="white", font=font)
+        img.save(str(path))
+        return str(path)
+    except Exception:
+        logger.exception("Could not render menu-bar status icon (color=%s)", color)
+        return None
+
+
 if RUMPS_AVAILABLE:
+
+    class _ClickHandler(NSObject):
+        """Target for the status-item button so we can split left vs. right click."""
+
+        def initWithApp_(self, app):  # noqa: N802 - objc selector
+            self = objc.super(_ClickHandler, self).init()
+            if self is None:
+                return None
+            self._app = app
+            return self
+
+        def onClick_(self, _sender):  # noqa: N802 - objc selector
+            try:
+                self._app._handle_status_click()
+            except Exception:
+                logger.exception("status-item click handling failed")
 
     class MacMenuBarApp(rumps.App):
         """The rumps status-bar app + PyObjC popover/panel.
@@ -103,7 +170,8 @@ if RUMPS_AVAILABLE:
         """
 
         def __init__(self, runner):
-            super().__init__("jacked", title="jacked …", quit_button=None)
+            super().__init__("jacked", title="…", quit_button=None)
+            self.template = False  # show the icon in COLOR, not as a mono template
             self._runner = runner
             self._base_url = f"http://{_loopback(runner.host)}:{runner.port}"
             self._panel = None
@@ -113,6 +181,10 @@ if RUMPS_AVAILABLE:
             self._popover_web = None
             self._screen_observer = None
             self._auto_swap_enabled = False
+            self._current_color = None  # avoid redundant icon writes
+            self._click_handler = None
+            self._appkit_menu = None
+            self._click_wired = False
 
             self._auto_swap_item = rumps.MenuItem(
                 "Auto-swap", callback=self._on_toggle_auto_swap
@@ -139,24 +211,32 @@ if RUMPS_AVAILABLE:
                 )
             )
 
-            # Immediate pill, then a refresh timer + a stop-watch timer.
+            # Immediate pill, then refresh + stop-watch + click-wiring timers.
             self._refresh_pill(None)
             self._pill_timer = rumps.Timer(self._refresh_pill, PILL_INTERVAL)
             self._pill_timer.start()
             self._stop_timer = rumps.Timer(self._check_stop, STOP_POLL_INTERVAL)
             self._stop_timer.start()
+            # The status-item button only exists after the app launches, so wire
+            # the left/right click split from a short poll timer.
+            self._wire_timer = rumps.Timer(self._try_wire_click, WIRE_RETRY_INTERVAL)
+            self._wire_timer.start()
 
         # -- pill ------------------------------------------------------------
 
         def _refresh_pill(self, _timer):
-            """Poll the summary + set the live title; degrade if the server is down."""
+            """Poll the summary; set the active account's % as text and tint the
+            "J" icon by its color. Degrade to a gray "J" + em-dash if down."""
             from jacked.service.menubar_summary import menubar_title
 
             try:
                 data = _http_get_json(self._base_url + "/api/menubar-summary")
-                self.title = menubar_title(data.get("worst"))
+                active = data.get("active")
+                self.title = " " + menubar_title(active)
+                self._set_icon((active or {}).get("color") or "gray")
             except Exception:
-                self.title = "⚠︎ jacked"  # degraded — server unreachable
+                self.title = " —"  # degraded — server unreachable
+                self._set_icon("gray")
 
             # Keep the Auto-swap checkmark honest.
             try:
@@ -166,7 +246,84 @@ if RUMPS_AVAILABLE:
             except Exception:
                 pass
 
-        # -- native windows (M4) --------------------------------------------
+        def _set_icon(self, color):
+            """Set the colored "J" icon, only when the color actually changed."""
+            if color == self._current_color:
+                return
+            path = _render_status_icon(color)
+            if path:
+                try:
+                    self.icon = path
+                    self.template = False
+                    self._current_color = color
+                except Exception:
+                    logger.exception("Could not apply menu-bar icon")
+
+        # -- click routing (left = dropdown, right = menu) -------------------
+
+        def _try_wire_click(self, timer):
+            """Once the status-item button exists, route left-click to the
+            dropdown and right-click to the actions menu. Best-effort: on ANY
+            failure we leave rumps' default menu-on-click behavior intact so the
+            pill is never left dead."""
+            if self._click_wired:
+                timer.stop()
+                return
+            try:
+                si = getattr(self._nsapp, "nsstatusitem", None)
+                button = si.button() if si is not None else None
+                if button is None:
+                    return  # not ready yet; poll again
+                # Capture the NSMenu rumps built, then detach it so the button
+                # fires our action on plain left-click instead of opening it.
+                self._appkit_menu = si.menu()
+                si.setMenu_(None)
+                self._click_handler = _ClickHandler.alloc().initWithApp_(self)
+                button.setTarget_(self._click_handler)
+                button.setAction_("onClick:")
+                button.sendActionOn_(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)
+                self._click_wired = True
+                timer.stop()
+            except Exception:
+                logger.exception(
+                    "Could not wire status-item click split — leaving default menu"
+                )
+                # Re-attach the menu if we detached it, so click still works.
+                try:
+                    si = getattr(self._nsapp, "nsstatusitem", None)
+                    if si is not None and self._appkit_menu is not None:
+                        si.setMenu_(self._appkit_menu)
+                except Exception:
+                    pass
+                timer.stop()
+
+        def _handle_status_click(self):
+            ev = NSApp.currentEvent()
+            is_right = False
+            try:
+                is_right = ev.type() == NSEventTypeRightMouseUp or bool(
+                    ev.modifierFlags() & NSEventModifierFlagControl
+                )
+            except Exception:
+                is_right = False
+            if is_right:
+                self._show_actions_menu()
+            else:
+                self._on_dropdown(None)
+
+        def _show_actions_menu(self):
+            """Pop up the actions menu, then detach it again so the next plain
+            left-click still routes to our handler."""
+            si = getattr(self._nsapp, "nsstatusitem", None)
+            if si is None or self._appkit_menu is None:
+                return
+            si.setMenu_(self._appkit_menu)
+            try:
+                si.button().performClick_(None)  # opens + tracks the menu modally
+            finally:
+                si.setMenu_(None)
+
+        # -- native windows --------------------------------------------------
 
         def _make_webview(self, width, height):
             cfg = WKWebViewConfiguration.alloc().init()
@@ -223,7 +380,7 @@ if RUMPS_AVAILABLE:
                 self._panel_visible = True
 
         def _on_dropdown(self, _sender):
-            """Show the rich /panel as an NSPopover anchored to the status button."""
+            """Toggle the rich /panel as an NSPopover anchored to the status button."""
             if self._popover is None:
                 pop = NSPopover.alloc().init()
                 pop.setBehavior_(NSPopoverBehaviorTransient)
@@ -234,6 +391,9 @@ if RUMPS_AVAILABLE:
                 pop.setContentViewController_(vc)
                 self._popover = pop
                 self._popover_web = web
+            if self._popover.isShown():
+                self._popover.performClose_(None)
+                return
             button = self._status_button()
             if button is None:
                 # No anchor available — fall back to the pinned panel.

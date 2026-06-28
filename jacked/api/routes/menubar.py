@@ -1,26 +1,34 @@
 """Menu-bar summary route.
 
 A single, lightweight endpoint the macOS status-item timer polls to set the
-live pill text. Deliberately tiny so the timer stays cheap — it reuses the same
-account rows the dashboard reads and the pure
-``compute_worst_account_summary`` helper (no rumps/pyobjc here).
+live pill. The pill tracks the **active** account (the one selected in Claude
+Code) — that's the usage the user is actually working against — so we resolve
+the active account via the same 3-layer logic as ``/api/auth/active-credential``
+and summarize it. ``worst`` (worst across all accounts) is included too for a
+fleet-wide glance. Pure summary helpers live in
+``jacked.service.menubar_summary`` (no rumps/pyobjc here).
 """
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 
-from jacked.service.menubar_summary import compute_worst_account_summary
+from jacked.service.menubar_summary import (
+    compute_active_account_summary,
+    compute_worst_account_summary,
+)
 
 router = APIRouter()
 
 
 @router.get("/menubar-summary")
 async def menubar_summary(request: Request):
-    """Worst-account 5h·7d summary for the menu-bar pill.
+    """Active-account 5h·7d summary for the menu-bar pill.
 
-    Returns ``{"worst": {...}|null, "account_count": N}``. ``worst`` is null
-    when no enabled account has usage data yet. A missing DB yields 503 so the
-    agent can show a degraded pill rather than a wrong number.
+    Returns ``{"active": {...}|null, "active_account_id": N|null,
+    "worst": {...}|null, "account_count": N}``. ``active`` is what the pill
+    renders (its ``color`` tints the "J" icon); it's null when no active account
+    is detected or it has no usage yet. A missing DB yields 503 so the agent can
+    show a degraded pill rather than a wrong number.
     """
     db = getattr(request.app.state, "db", None)
     if db is None:
@@ -30,5 +38,24 @@ async def menubar_summary(request: Request):
         )
 
     rows = db.list_accounts(include_inactive=False)
-    summary = compute_worst_account_summary(rows)
-    return {"worst": summary, "account_count": len(rows)}
+
+    # Resolve the active account via the SAME 3-layer matching the
+    # active-credential route uses (stamp → token → email+org), so the pill and
+    # the dashboard never disagree on which account is active.
+    active_id = None
+    try:
+        from jacked.api.routes.auth import get_active_credential
+
+        cred = await get_active_credential(request)
+        active_id = getattr(cred, "account_id", None)
+    except Exception:
+        active_id = None
+
+    active = compute_active_account_summary(rows, active_id)
+    worst = compute_worst_account_summary(rows)
+    return {
+        "active": active,
+        "active_account_id": active_id,
+        "worst": worst,
+        "account_count": len(rows),
+    }
