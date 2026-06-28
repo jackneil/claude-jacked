@@ -205,8 +205,8 @@ body {
 .provider-label { line-height: 1; }
 /* Left-edge accent on the card itself — the "backdrop" cue. */
 .provider-card { border-left-width: 3px; }
-.provider-card.provider-claude { border-left-color: #d97757; }
-.provider-card.provider-codex { border-left-color: #10a37f; }
+.provider-card.provider-claude { border-left-color: #a78bfa; }
+.provider-card.provider-codex { border-left-color: #60a5fa; }
 
 /* Delete confirmation inline */
 .delete-confirm {

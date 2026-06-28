@@ -41,8 +41,8 @@ def test_node_syntax_check():
 
 def test_provider_meta_claude_and_codex(tmp_path):
     r = _run(tmp_path, "out({claude: providerMeta('claude'), codex: providerMeta('codex')});")
-    assert r["claude"]["label"] == "Claude" and r["claude"]["color"] == "#d97757"
-    assert r["codex"]["label"] == "Codex" and r["codex"]["color"] == "#10a37f"
+    assert r["claude"]["label"] == "Claude" and r["claude"]["color"] == "#a78bfa"
+    assert r["codex"]["label"] == "Codex" and r["codex"]["color"] == "#60a5fa"
     assert "<svg" in r["claude"]["svg"] and "<svg" in r["codex"]["svg"]
 
 
@@ -56,6 +56,6 @@ def test_provider_meta_unknown_falls_back_to_claude(tmp_path):
 def test_provider_badge_and_glyph_render(tmp_path):
     r = _run(tmp_path, "out({badge: providerBadge('codex'), glyph: providerGlyph('claude')});")
     assert "provider-badge" in r["badge"] and "provider-codex" in r["badge"]
-    assert "Codex" in r["badge"] and "#10a37f" in r["badge"]
+    assert "Codex" in r["badge"] and "#60a5fa" in r["badge"]
     assert "provider-glyph" in r["glyph"] and "provider-claude" in r["glyph"]
     assert 'title="Claude account"' in r["glyph"]

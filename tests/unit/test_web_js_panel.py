@@ -155,8 +155,8 @@ out({ html });
     html = result["html"]
     assert "provider-glyph" in html
     assert "provider-claude" in html and "provider-codex" in html
-    assert "#d97757" in html  # Claude terracotta
-    assert "#10a37f" in html  # Codex green
+    assert "#a78bfa" in html  # Claude violet
+    assert "#60a5fa" in html  # Codex blue
     assert 'title="Claude account"' in html and 'title="Codex account"' in html
 
 

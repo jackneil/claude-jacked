@@ -96,17 +96,20 @@ function _formatCountdown(seconds) {
 // ---------------------------------------------------------------------------
 async function _confirmAddAccount() {
     return Swal.fire({
-        title: 'Add Account',
+        title: 'Add account',
         html: `Which provider?<br><br>
-               <b>Claude</b> — opens browser tabs to authorize (usage token + Claude Code token).<br><br>
+               <b>Claude</b> — opens browser tabs to authorize (usage + Claude Code tokens).<br><br>
                <b>Codex</b> — imports your signed-in OpenAI Codex account
                (run <code>codex login</code> in a terminal first if you're not signed in).`,
-        icon: 'question',
         showDenyButton: true,
         showCancelButton: true,
         confirmButtonText: 'Claude',
         denyButtonText: 'Codex',
         cancelButtonText: 'Cancel',
+        // SweetAlert's deny button is RED by default — that reads as danger for a
+        // benign choice. Color both buttons with their provider hue instead.
+        confirmButtonColor: '#a78bfa',  // Claude violet
+        denyButtonColor: '#60a5fa',     // Codex blue
     });
 }
 

@@ -116,7 +116,7 @@ def _http_send_json(url: str, method: str, payload: dict | None, timeout: float 
 # Per-provider accent dot drawn on the pill when the active account isn't Claude.
 # RGB tuples mirror the web provider marks (js/util/provider.js).
 _PROVIDER_DOT = {
-    "codex": (16, 163, 127, 255),  # OpenAI green
+    "codex": (96, 165, 250, 255),  # blue (matches the web Codex mark)
 }
 
 

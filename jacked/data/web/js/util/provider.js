@@ -14,8 +14,8 @@ function providerMeta(provider) {
         return {
             key: 'codex',
             label: 'Codex',
-            color: '#10a37f',       // brand — glyph + accent (graphical, 3:1 ok)
-            labelColor: '#5eead4',  // light — label text needs WCAG AA 4.5:1
+            color: '#60a5fa',       // blue — chosen to avoid the green/amber/red
+            labelColor: '#93c5fd',  // usage palette; light shade clears WCAG AA 4.5:1
             // Enclosed hexagon ring: a CLOSED polygon silhouette, deliberately
             // distinct from Claude's open radial spokes so the two are
             // distinguishable by SHAPE alone (color-blind safe), not just color.
@@ -30,8 +30,8 @@ function providerMeta(provider) {
     return {
         key: 'claude',
         label: 'Claude',
-        color: '#d97757',       // brand
-        labelColor: '#f0b49d',  // light — AA label text
+        color: '#a78bfa',       // violet — NOT orange (orange reads as a usage
+        labelColor: '#c4b5fd',  // warning here); light shade clears WCAG AA 4.5:1
         // Anthropic-style sunburst: open radial spokes from center.
         svg:
             '<svg viewBox="0 0 16 16" width="100%" height="100%" stroke="currentColor" ' +
