@@ -8,8 +8,6 @@ the Anthropic fetch_usage path is unchanged for provider='claude'.
 """
 
 import asyncio
-import json
-import os
 import stat
 from datetime import datetime, timezone
 
