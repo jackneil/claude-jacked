@@ -4564,6 +4564,29 @@ class TestCatchAllInstall:
         assert len(gk_hooks) == 1
         assert gk_hooks[0]["matcher"] == ""
 
+    def test_dedup_recognizes_api_bare_path_in_any_location(self):
+        """Regression: the web API writes the gatekeeper as a bare-path command
+        ({python} <...>/jacked/data/hooks/security_gatekeeper.py). The CLI dedup
+        must recognize it WHEREVER the package lives — not only in a checkout
+        named `claude-jacked`. A git worktree or renamed/forked checkout (parent
+        dir != 'claude-jacked') previously slipped past the markers and let the
+        API-then-CLI install append a DUPLICATE gatekeeper hook."""
+        from jacked.cli import _is_jacked_managed_hook_path
+
+        for parent in (
+            "site-packages",          # normal install
+            "claude-jacked",          # editable clone
+            "wf_abc123-d8e-1",        # git worktree dir
+            "my-jacked-fork",         # renamed checkout
+        ):
+            cmd = f"/usr/bin/python3 /Users/x/{parent}/jacked/data/hooks/security_gatekeeper.py"
+            assert _is_jacked_managed_hook_path(cmd), f"unrecognized in {parent}"
+
+        # Still anchored: a user's own script outside jacked/data/hooks/ must NOT match.
+        assert not _is_jacked_managed_hook_path(
+            "/usr/bin/python3 /Users/x/myscripts/security_gatekeeper.py"
+        )
+
 
 # ---------------------------------------------------------------------------
 # MCP tool handling

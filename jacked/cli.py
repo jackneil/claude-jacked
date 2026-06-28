@@ -1652,8 +1652,16 @@ def _jacked_home() -> Path:
 # Anchored to tokens we actually write — won't match a user's unrelated
 # script that happens to share a hook name.
 _JACKED_HOOK_PATH_MARKERS = (
-    "/site-packages/jacked/data/hooks/",   # normal install
-    "/claude-jacked/jacked/data/hooks/",   # editable clone path
+    # Package-relative hooks dir — location-INDEPENDENT so it matches the
+    # bare-path command form ({python} <...>/jacked/data/hooks/<hook>.py) the
+    # web API writes, wherever the package lives: site-packages, an editable
+    # clone, a git worktree, or a renamed checkout. (Subsumes the older
+    # /site-packages/... and /claude-jacked/... anchors, which missed any
+    # checkout dir not named `claude-jacked` — e.g. a worktree — and let the
+    # API-then-CLI install path append a DUPLICATE gatekeeper hook.) Still
+    # anchored to our package layout, so it won't match a user's own
+    # security_gatekeeper.py living outside a jacked/data/hooks/ directory.
+    "/jacked/data/hooks/",
     "jacked\" _hook ",                      # shim form we write: "<path>/jacked" _hook <name>
     "-m jacked _hook ",                     # fallback form (dev without PATH shim)
 )

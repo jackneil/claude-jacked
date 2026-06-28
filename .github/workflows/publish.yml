@@ -56,7 +56,10 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/jacked
+      # Display link only (the OIDC trusted-publisher target comes from the
+      # built artifact's name); point it at the real project, not the unrelated
+      # `jacked` package.
+      url: https://pypi.org/p/claude-jacked
     permissions:
       id-token: write          # OIDC for PyPI Trusted Publishers (scoped to publish job only)
       contents: read

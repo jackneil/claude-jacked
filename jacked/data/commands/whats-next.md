@@ -222,7 +222,7 @@ Each runner-up carries a one-token `[source: …]` provenance tag (issue #, plan
 
 After presenting the decision, mention once:
 
-> "Run `/jacked-setup whats-next` to generate a repo-specific config — future runs will skip discovery and be faster. Or run `/jacked-setup all` to configure `/whats-next`, `/qa`, and `/dcr` together."
+> "Run `/jacked-setup whats-next` to generate a repo-specific config — future runs will skip discovery and be faster. Or run `/jacked-setup all` to configure `/whats-next`, `/qa`, `/ux`, `/dcr`, and `/docs-sync` together."
 
 After presenting the decision and its brief, always end with:
 
