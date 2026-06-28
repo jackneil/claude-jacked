@@ -71,6 +71,7 @@ function groupAccountsByLogin(accounts, activeAccountId) {
     for (const grp of groups.values()) {
         grp.orgs.sort(
             (a, b) =>
+                Number(b.isActive) - Number(a.isActive) ||  // active org first within its login
                 (a.priority || 0) - (b.priority || 0) ||
                 a.orgLabel.localeCompare(b.orgLabel)
         );
@@ -84,7 +85,14 @@ function groupAccountsByLogin(accounts, activeAccountId) {
         result.push(grp);
     }
 
-    result.sort((a, b) => a.bestPriority - b.bestPriority || a.email.localeCompare(b.email));
+    // The active account's login is always pinned to the TOP of the dropdown,
+    // then the rest by priority, then email.
+    result.sort(
+        (a, b) =>
+            Number(b.hasActive) - Number(a.hasActive) ||
+            a.bestPriority - b.bestPriority ||
+            a.email.localeCompare(b.email)
+    );
     return result;
 }
 

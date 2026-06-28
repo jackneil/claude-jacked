@@ -97,6 +97,19 @@ out(groupAccountsByLogin([
     assert result == ["b@x.com", "a@x.com"], "groups sort by best (lowest) priority, then email"
 
 
+def test_active_account_group_pinned_to_top(tmp_path):
+    """The active account's login is ALWAYS first in the dropdown, even when
+    another login has a lower (better) priority."""
+    result = _run(tmp_path, """
+out(groupAccountsByLogin([
+    { id: 1, email: 'low@x.com', organization_uuid: '', priority: 0 },
+    { id: 2, email: 'active@x.com', organization_uuid: '', priority: 5 },
+], 2).map(g => g.email));
+""")
+    assert result[0] == "active@x.com", "active login pinned to top regardless of priority"
+    assert result[1] == "low@x.com"
+
+
 def test_email_case_insensitive_grouping(tmp_path):
     """Same email differing only in case is still one login."""
     result = _run(tmp_path, """

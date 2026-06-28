@@ -293,6 +293,12 @@ if RUMPS_AVAILABLE:
             # the left/right click split from a short poll timer.
             self._wire_timer = rumps.Timer(self._try_wire_click, WIRE_RETRY_INTERVAL)
             self._wire_timer.start()
+            # Pre-warm the dropdown webview shortly after launch (the server is up
+            # by now) so the FIRST tray click opens instantly — the webview has
+            # already loaded /panel + fetched usage by the time it's clicked,
+            # instead of paying WKWebView init + page load + first fetch on click.
+            self._prewarm_timer = rumps.Timer(self._prewarm_dropdown, 1.5)
+            self._prewarm_timer.start()
 
             # Version/update: the pystray path starts this in _setup; the mac path
             # must start it too, or the version line never learns about updates.
@@ -500,18 +506,37 @@ if RUMPS_AVAILABLE:
                 self._panel.orderFrontRegardless()
                 self._panel_visible = True
 
+        def _ensure_popover(self):
+            """Create the dropdown popover + its /panel webview if not made yet.
+            Idempotent; called both at startup (pre-warm) and lazily on click."""
+            if self._popover is not None:
+                return
+            pop = NSPopover.alloc().init()
+            pop.setBehavior_(NSPopoverBehaviorTransient)
+            pop.setContentSize_(NSSize(PANEL_WIDTH, POPOVER_HEIGHT))
+            web = self._make_webview(PANEL_WIDTH, POPOVER_HEIGHT)
+            vc = NSViewController.alloc().init()
+            vc.setView_(web)
+            pop.setContentViewController_(vc)
+            self._popover = pop
+            self._popover_web = web
+
+        def _prewarm_dropdown(self, timer=None):
+            """One-shot: build + load the dropdown webview ahead of the first
+            click. Best-effort — on failure the click falls back to lazy build."""
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+            try:
+                self._ensure_popover()
+            except Exception:
+                logger.exception("dropdown pre-warm failed")
+
         def _on_dropdown(self, _sender):
             """Toggle the rich /panel as an NSPopover anchored to the status button."""
-            if self._popover is None:
-                pop = NSPopover.alloc().init()
-                pop.setBehavior_(NSPopoverBehaviorTransient)
-                pop.setContentSize_(NSSize(PANEL_WIDTH, POPOVER_HEIGHT))
-                web = self._make_webview(PANEL_WIDTH, POPOVER_HEIGHT)
-                vc = NSViewController.alloc().init()
-                vc.setView_(web)
-                pop.setContentViewController_(vc)
-                self._popover = pop
-                self._popover_web = web
+            self._ensure_popover()
             if self._popover.isShown():
                 self._popover.performClose_(None)
                 return
