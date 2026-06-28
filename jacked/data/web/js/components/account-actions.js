@@ -97,7 +97,7 @@ function _formatCountdown(seconds) {
 async function _confirmAddAccount() {
     return Swal.fire({
         title: 'Add Account',
-        html: `Add a new Google account?<br><br>
+        html: `Add a new Claude account?<br><br>
                This opens browser tabs for authorization:<br>
                1. Usage token (for jacked dashboard)<br>
                2. Claude Code token (refresh-capable, for CC sessions)<br><br>
@@ -118,7 +118,7 @@ async function _confirmReauth(email) {
                1. Usage token (for jacked dashboard)<br>
                2. Claude Code token (refresh-capable, for CC sessions)<br><br>
                Complete both to fully authorize this account.<br>
-               Sign in with the same Google account.`,
+               Sign in with the same Claude account.`,
         icon: 'info',
         showCancelButton: true,
         confirmButtonText: 'Authorize',
@@ -131,7 +131,7 @@ async function _confirmCcAuth(email) {
     return Swal.fire({
         title: 'Authorize Claude Code Token?',
         html: `Authorize a separate token for <strong>${escapeHtml(email)}</strong>?<br><br>
-               This opens a browser tab. Sign in with the same Google account.<br><br>
+               This opens a browser tab. Sign in with the same Claude account.<br><br>
                Claude Code uses its own refresh-capable token, independent from the usage token.
                This lets CC sessions refresh without re-authenticating.`,
         icon: 'info',

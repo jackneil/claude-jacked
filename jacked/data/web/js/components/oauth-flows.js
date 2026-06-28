@@ -182,7 +182,7 @@ async function startReauthFlow(accountId, email) {
     textDiv.appendChild(title);
     const subtitle = document.createElement('div');
     subtitle.className = 'text-xs text-blue-300 mt-1';
-    subtitle.textContent = 'A browser window should open. Sign in with the same Google account.';
+    subtitle.textContent = 'A browser window should open. Sign in with the same Claude account.';
     textDiv.appendChild(subtitle);
     banner.appendChild(textDiv);
     statusEl.appendChild(banner);
@@ -328,7 +328,7 @@ async function startCcAuthFlow(accountId, email) {
     textDiv.appendChild(title);
     const subtitle = document.createElement('div');
     subtitle.className = 'text-xs text-orange-300 mt-1';
-    subtitle.textContent = 'A browser window should open. Sign in with the same Google account.';
+    subtitle.textContent = 'A browser window should open. Sign in with the same Claude account.';
     textDiv.appendChild(subtitle);
     banner.appendChild(textDiv);
     statusEl.appendChild(banner);

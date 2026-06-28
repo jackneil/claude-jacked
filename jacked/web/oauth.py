@@ -584,7 +584,7 @@ class OAuthFlow:
                     f"Re-auth target account {self._target_account_id} not found"
                 )
 
-            # Identity check: ensure the user logged in with the same Google account
+            # Identity check: ensure the user logged in with the same Claude account
             if email.lower() != target["email"].lower():
                 raise ValueError(
                     f"Re-auth email ({email}) does not match "
@@ -680,7 +680,7 @@ class OAuthFlow:
         """Store CC (Claude Code) tokens on an existing account.
 
         Identity validation: the CC OAuth flow may authenticate a different
-        Google/email account than the target. We verify the email matches.
+        Claude/email account than the target. We verify the email matches.
         """
         account_id = self._target_account_id
         target = self.db.get_account(account_id)

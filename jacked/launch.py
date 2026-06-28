@@ -195,7 +195,7 @@ def _seed_oauth_account(config_dir: Path, account: dict) -> None:
     exists (Claude Code wrote the richer ~12-field version), preserves all
     fields but ALWAYS corrects emailAddress to match the DB account.  This
     prevents token contamination: if Claude Code re-authenticates as a
-    different Google account inside this per-account dir, the stale email
+    different Claude account inside this per-account dir, the stale email
     is overwritten on next launch so _sync_tokens_from_file() can detect
     the mismatch and block the wrong token from polluting the DB.
     """
@@ -625,7 +625,7 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
             return
 
         # Guard: verify the token still belongs to the expected account.
-        # If Claude Code re-authenticated as a different Google account
+        # If Claude Code re-authenticated as a different Claude account
         # inside this per-account dir, the .claude.json oauthAccount email
         # will no longer match the DB account's email.  Refuse to sync
         # the wrong token — it would contaminate the DB permanently.
