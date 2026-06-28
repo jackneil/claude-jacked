@@ -135,7 +135,7 @@ def test_mac_app_wires_version_update_menu_handlers():
         "_refresh_version_menu",
         "_on_version_click",
         "_on_check_updates_item",
-        "_after_check_refresh",
+        "_poll_check_result",
         "_on_toggle_autostart_item",
     ):
         assert hasattr(cls, handler), f"missing menu handler: {handler}"
