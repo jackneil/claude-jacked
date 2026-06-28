@@ -32,6 +32,8 @@ import urllib.error
 import urllib.request
 import webbrowser
 
+from jacked import __version__
+
 logger = logging.getLogger(__name__)
 
 # Pill + stop-watch cadence (seconds).
@@ -189,6 +191,16 @@ if RUMPS_AVAILABLE:
             self._auto_swap_item = rumps.MenuItem(
                 "Auto-swap", callback=self._on_toggle_auto_swap
             )
+            self._autostart_item = rumps.MenuItem(
+                "Start on Login", callback=self._on_toggle_autostart_item
+            )
+            # Version / update items — wired to the SAME ServiceRunner machinery
+            # the pystray tray uses (version check, click-to-update, last-checked).
+            self._version_item = rumps.MenuItem(f"v{__version__}", callback=None)
+            self._last_check_item = rumps.MenuItem("Last checked: never", callback=None)
+            self._check_updates_item = rumps.MenuItem(
+                "Check for Updates…", callback=self._on_check_updates_item
+            )
             self.menu = [
                 rumps.MenuItem("Open Usage Dropdown", callback=self._on_dropdown),
                 rumps.MenuItem("Toggle Side Panel", callback=self._on_toggle_panel),
@@ -196,9 +208,14 @@ if RUMPS_AVAILABLE:
                 rumps.MenuItem("Open Dashboard", callback=self._on_open_dashboard),
                 rumps.MenuItem("Add Account", callback=self._on_add_account),
                 self._auto_swap_item,
+                self._autostart_item,
                 rumps.separator,
                 rumps.MenuItem("Restart", callback=self._on_restart),
                 rumps.MenuItem("Quit", callback=self._on_quit),
+                rumps.separator,
+                self._version_item,
+                self._last_check_item,
+                self._check_updates_item,
             ]
 
             # Re-pin the panel when displays change (add/remove/resolution).
@@ -221,6 +238,16 @@ if RUMPS_AVAILABLE:
             # the left/right click split from a short poll timer.
             self._wire_timer = rumps.Timer(self._try_wire_click, WIRE_RETRY_INTERVAL)
             self._wire_timer.start()
+
+            # Version/update: the pystray path starts this in _setup; the mac path
+            # must start it too, or the version line never learns about updates.
+            self._refresh_version_menu()
+            self._version_thread = threading.Thread(
+                target=self._runner._check_version,
+                name="jacked-version-check",
+                daemon=True,
+            )
+            self._version_thread.start()
 
         # -- pill ------------------------------------------------------------
 
@@ -245,6 +272,9 @@ if RUMPS_AVAILABLE:
                 self._auto_swap_item.state = 1 if self._auto_swap_enabled else 0
             except Exception:
                 pass
+
+            # Keep the version line / last-checked / autostart state fresh.
+            self._refresh_version_menu()
 
         def _set_icon(self, color):
             """Set the colored "J" icon, only when the color actually changed."""
@@ -317,6 +347,7 @@ if RUMPS_AVAILABLE:
             si = getattr(self._nsapp, "nsstatusitem", None)
             if si is None or self._appkit_menu is None:
                 return
+            self._refresh_version_menu()  # version/last-checked current at open time
             si.setMenu_(self._appkit_menu)
             try:
                 si.button().performClick_(None)  # opens + tracks the menu modally
@@ -436,6 +467,71 @@ if RUMPS_AVAILABLE:
                 sender.state = 1 if self._auto_swap_enabled else 0
             except Exception:
                 logger.exception("Auto-swap toggle failed")
+
+        # -- version / update (parity with the pystray tray) -----------------
+
+        def _refresh_version_menu(self):
+            """Sync the version line, last-checked text, update-clickability, and
+            the Start-on-Login checkmark from the ServiceRunner's state. rumps
+            menu titles aren't lazily re-evaluated, so we push updates here (pill
+            timer + on menu-open + after a manual check)."""
+            r = self._runner
+            try:
+                self._version_item.title = r._version_menu_text()
+                # The version line is clickable only when an update is available.
+                if r._version_is_clickable():
+                    self._version_item.set_callback(self._on_version_click)
+                else:
+                    self._version_item.set_callback(None)
+            except Exception:
+                logger.exception("version line refresh failed")
+            try:
+                self._last_check_item.title = r._last_check_menu_text()
+                # Disable "Check for Updates…" while a check is already running.
+                if getattr(r, "_version_check_in_progress", False):
+                    self._check_updates_item.set_callback(None)
+                else:
+                    self._check_updates_item.set_callback(self._on_check_updates_item)
+            except Exception:
+                logger.exception("last-checked refresh failed")
+            try:
+                from jacked.service.platform import detect_autostart
+
+                self._autostart_item.state = 1 if detect_autostart() else 0
+            except Exception:
+                pass
+
+        def _on_version_click(self, _sender):
+            """User clicked the 'update available' line — run the existing
+            tray updater off the main thread (it spawns the detached updater and
+            stops the service; our stop-watch timer then quits the app)."""
+            threading.Thread(
+                target=self._runner._on_update_click,
+                name="jacked-mac-update",
+                daemon=True,
+            ).start()
+
+        def _on_check_updates_item(self, _sender):
+            """Force a fresh PyPI check now (runs in the runner's own thread),
+            then refresh the menu so the result shows without reopening."""
+            try:
+                self._runner._on_check_for_updates()
+            except Exception:
+                logger.exception("manual update check failed")
+            self._refresh_version_menu()  # shows "Checking PyPI…" immediately
+            # The check runs in a background thread; pull its result in a moment.
+            rumps.Timer(self._after_check_refresh, 3.0).start()
+
+        def _after_check_refresh(self, timer):
+            timer.stop()
+            self._refresh_version_menu()
+
+        def _on_toggle_autostart_item(self, _sender):
+            try:
+                self._runner._on_toggle_autostart()
+            except Exception:
+                logger.exception("Start-on-Login toggle failed")
+            self._refresh_version_menu()
 
         def _on_restart(self, _sender):
             # _on_restart blocks (shutdown + rebind uvicorn); run off the main

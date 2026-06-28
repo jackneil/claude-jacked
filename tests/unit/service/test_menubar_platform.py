@@ -100,6 +100,26 @@ def test_mac_menubar_available_matches_platform():
         assert avail is True
 
 
+def test_mac_app_wires_version_update_menu_handlers():
+    """Regression guard: the mac agent must keep the version line, click-to-update,
+    Check-for-Updates, and Start-on-Login handlers (a prior rebuild dropped them,
+    regressing the pystray tray's update UX). Methods only — GUI behavior is
+    user-verified."""
+    from jacked.service import menubar_mac
+
+    if not menubar_mac.RUMPS_AVAILABLE:
+        pytest.skip("rumps/pyobjc unavailable")
+    cls = menubar_mac.MacMenuBarApp
+    for handler in (
+        "_refresh_version_menu",
+        "_on_version_click",
+        "_on_check_updates_item",
+        "_after_check_refresh",
+        "_on_toggle_autostart_item",
+    ):
+        assert hasattr(cls, handler), f"missing menu handler: {handler}"
+
+
 # ---------------------------------------------------------------------------
 # CLI guard
 # ---------------------------------------------------------------------------
