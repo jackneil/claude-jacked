@@ -2,13 +2,17 @@
 
 Covers the normalizer (against a RECORDED real app-server response), the
 DB cache write (5h/7d percents + ISO reset times land in the same columns the
-Anthropic path uses), and a real subprocess round-trip through a fake
-app-server that speaks the newline-delimited JSON-RPC protocol. Also asserts
-the Anthropic fetch_usage path is unchanged for provider='claude'.
+Anthropic path uses), a real subprocess round-trip through a fake app-server
+that speaks the newline-delimited JSON-RPC protocol, and the web.auth.fetch_usage
+provider DISPATCH (codex accounts route to the Codex leaf — and only the
+account live in the shared root is polled; non-active ones keep their cache).
 """
 
 import asyncio
+import base64
+import json
 import stat
+import sys
 from datetime import datetime, timezone
 
 import pytest
@@ -86,14 +90,15 @@ def db(tmp_path):
     d.close()
 
 
-def test_fetch_codex_usage_writes_cache(db, monkeypatch):
+def test_fetch_codex_usage_writes_cache(db, tmp_path, monkeypatch):
     acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
 
     async def fake_read(**kwargs):
         return RECORDED_RESULT
 
     monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
-    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db))
+    # home=tmp keeps the swap lock out of the real ~/.codex
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
     assert result is not None
 
     row = db.get_account(acct["id"])
@@ -104,26 +109,61 @@ def test_fetch_codex_usage_writes_cache(db, monkeypatch):
     assert row["usage_cached_at"] is not None
 
 
-def test_fetch_codex_usage_records_error_on_failure(db, monkeypatch):
+def test_fetch_codex_usage_records_error_on_failure(db, tmp_path, monkeypatch):
     acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
 
     async def boom(**kwargs):
         raise cu.CodexUsageError("app-server exploded")
 
     monkeypatch.setattr(cu, "read_codex_rate_limits", boom)
-    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db))
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
     assert result is None
     row = db.get_account(acct["id"])
     assert row["last_error"] == "app-server exploded"
     assert row["consecutive_failures"] == 1
 
 
+def test_fetch_codex_usage_all_none_is_soft_failure(db, tmp_path, monkeypatch):
+    """An empty/partial app-server read must NOT stamp the account fresh+valid."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+
+    async def empty(**kwargs):
+        return {"rateLimits": {}}  # no primary/secondary -> all None
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", empty)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is None
+    row = db.get_account(acct["id"])
+    assert row["consecutive_failures"] == 1
+    assert row["cached_usage_5h"] is None  # not stamped with empty data
+
+
+def test_fetch_codex_usage_skips_when_swap_locked(db, tmp_path, monkeypatch):
+    """If a swap holds the lock, the poll skips (returns cached) — no app-server."""
+    from jacked.codex.switching import _codex_swap_lock
+
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    home = tmp_path / ".codex"
+    home.mkdir()
+    called = []
+
+    async def fake_read(**kwargs):
+        called.append(1)
+        return RECORDED_RESULT
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    # Hold the swap lock, then poll — it must skip without spawning app-server.
+    with _codex_swap_lock(home):
+        result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=home))
+    assert result == {"_cached": True}
+    assert called == []
+
+
 # --------------------------------------------------------------------------
 # Real subprocess round-trip through a fake app-server
 # --------------------------------------------------------------------------
 
-_FAKE_CODEX = """#!/usr/bin/env python3
-import sys, json
+_FAKE_CODEX = """import sys, json
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -146,7 +186,9 @@ for line in sys.stdin:
 
 def _write_fake_codex(tmp_path):
     p = tmp_path / "codex_fake.py"
-    p.write_text(_FAKE_CODEX)
+    # Use this interpreter's path in the shebang so the fake runs even when
+    # `python3` isn't on PATH (skip cleanly nowhere — it must work, not error).
+    p.write_text(f"#!{sys.executable}\n{_FAKE_CODEX}")
     p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IRUSR)
     return str(p)
 
@@ -170,11 +212,59 @@ def test_read_rate_limits_missing_binary_raises(tmp_path):
         )
 
 
+def _b64url(o):
+    return base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b"=").decode()
+
+
+def _root_auth(account_id, email):
+    payload = {"email": email, "exp": 9999999999,
+               "https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    sig = base64.urlsafe_b64encode(b"sig").rstrip(b"=").decode()
+    jwt = f"{_b64url({'alg': 'RS256'})}.{_b64url(payload)}.{sig}"
+    return {
+        "OPENAI_API_KEY": None, "auth_mode": "chatgpt",
+        "tokens": {"id_token": jwt, "access_token": "a", "refresh_token": "r",
+                   "account_id": account_id},
+        "last_refresh": "2026-06-27T00:00:00Z",
+    }
+
+
+def test_fetch_usage_dispatches_codex_active_only(db, tmp_path, monkeypatch):
+    """web.auth.fetch_usage routes a codex account to the Codex leaf, but ONLY
+    the account live in the shared root — non-active ones return cached."""
+    from jacked.web import auth as webauth
+
+    webauth._account_usage_state.clear()  # avoid cross-test pacing residue
+    home = tmp_path / ".codex"
+    home.mkdir()
+    a = db.create_account("a@x.com", "codex-managed", 9999999999,
+                          provider="codex", organization_uuid="acct-A")
+    b = db.create_account("b@x.com", "codex-managed", 9999999999,
+                          provider="codex", organization_uuid="acct-B")
+    (home / "auth.json").write_text(json.dumps(_root_auth("acct-A", "a@x.com")))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    called = []
+
+    async def fake_fetch(account_id, db_, state=None):
+        called.append(account_id)
+        return {"ok": True}
+
+    monkeypatch.setattr("jacked.codex.usage.fetch_codex_usage", fake_fetch)
+
+    # Non-active B → cached sentinel, NOT delegated.
+    assert asyncio.run(webauth.fetch_usage(b["id"], db)) == {"_cached": True}
+    assert b["id"] not in called
+    # Active A (live in the root) → delegated to the Codex leaf.
+    assert asyncio.run(webauth.fetch_usage(a["id"], db)) == {"ok": True}
+    assert called == [a["id"]]
+
+
 def test_read_rate_limits_passes_codex_home_env(tmp_path):
     # A fake that echoes CODEX_HOME back as the plan, proving env wiring.
     script = tmp_path / "echo_home.py"
     script.write_text(
-        "#!/usr/bin/env python3\n"
+        f"#!{sys.executable}\n"
         "import sys, json, os\n"
         "for line in sys.stdin:\n"
         "    line=line.strip()\n"

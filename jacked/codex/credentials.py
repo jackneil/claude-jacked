@@ -39,6 +39,11 @@ _STORE_KEY_RE = re.compile(
     r'^\s*cli_auth_credentials_store\s*=\s*["\']?(file|keyring|auto)["\']?'
 )
 
+# A real TOML table / array-of-tables header line, e.g. [a] or [[a.b]] — used to
+# place the key at top level. Deliberately strict (whole line is the header) so a
+# nested-array continuation like `  [1, 2],` is NOT mistaken for a table header.
+_TABLE_HEADER_RE = re.compile(r"^\s*\[\[?[^\[\]]+\]\]?\s*(#.*)?$")
+
 
 def codex_home(env: Optional[Mapping[str, str]] = None) -> Path:
     """Resolve CODEX_HOME (``$CODEX_HOME`` or ``~/.codex``)."""
@@ -102,7 +107,11 @@ def _atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
         with os.fdopen(fd, "w") as f:
             f.write(content)
         os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        # Windows-safe replace (retries if the config file is held open) — reuse
+        # the platform util the Claude credential path already ships.
+        from jacked.api.credential_helpers import _safe_replace
+
+        _safe_replace(tmp, str(path))
         tmp = None
     finally:
         if tmp is not None and os.path.exists(tmp):
@@ -132,7 +141,7 @@ def ensure_file_storage(
     # Drop any existing top-level key occurrences (commented lines are kept).
     kept = [ln for ln in existing.splitlines() if not _STORE_KEY_RE.match(ln)]
     insert_at = next(
-        (i for i, ln in enumerate(kept) if ln.lstrip().startswith("[")), len(kept)
+        (i for i, ln in enumerate(kept) if _TABLE_HEADER_RE.match(ln)), len(kept)
     )
     kept.insert(insert_at, 'cli_auth_credentials_store = "file"')
     content = "\n".join(kept).rstrip("\n") + "\n"

@@ -169,7 +169,9 @@ async def read_codex_rate_limits(
             "app-server",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # DEVNULL, not PIPE: we only read stdout, and an undrained stderr
+            # PIPE can fill the OS buffer (~64KB) and stall the child mid-write.
+            stderr=asyncio.subprocess.DEVNULL,
             env=run_env,
         )
     except (OSError, ValueError) as exc:
@@ -199,6 +201,21 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
+def live_codex_account_id(db, env: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """The jacked Codex account currently live in the shared ~/.codex root, or
+    None. Codex reports usage for whichever account is in the shared auth.json,
+    so ONLY this account may be polled against the root — polling a non-active
+    account there would cache the wrong numbers (and risk rotating its tokens).
+    """
+    from .credentials import extract_identity, read_auth_json
+    from .switching import find_codex_account_id
+
+    auth = read_auth_json(codex_home(env), env)
+    if not auth:
+        return None
+    return find_codex_account_id(db, extract_identity(auth))
+
+
 async def fetch_codex_usage(
     account_id: int,
     db,
@@ -210,23 +227,46 @@ async def fetch_codex_usage(
     """Fetch + normalize + cache Codex usage. Mirrors the Anthropic leaf in
     ``web/auth.fetch_usage`` (same cache columns, same error bookkeeping).
 
-    Returns the raw app-server result on success, ``None`` on failure.
+    Returns the raw app-server result on success, ``None`` on failure, or a
+    ``{"_cached": True}`` sentinel when a swap holds the lock (poll skipped).
     """
-    try:
-        result = await read_codex_rate_limits(
-            home=home, env=env, codex_bin=codex_bin
-        )
-    except CodexUsageError as exc:
-        logger.warning("Codex usage fetch failed for account %s: %s", account_id, exc)
+    # Serialize against swap_codex_account on the shared root: the app-server we
+    # spawn can rotate the root's single-use refresh token, so it must not
+    # overlap a swap (that would lose the rotation, #15502). Non-blocking — if a
+    # swap holds the lock, skip this poll and keep the cached usage.
+    from .switching import _codex_swap_lock
+
+    lock_base = home if home is not None else codex_home(env)
+    with _codex_swap_lock(lock_base, retries=1) as locked:
+        if not locked:
+            logger.debug("Codex usage poll skipped for %s — swap in progress", account_id)
+            return {"_cached": True}
         try:
-            db.record_account_error(account_id, str(exc))
-        except Exception:  # pragma: no cover - bookkeeping must not mask the failure
-            logger.debug("record_account_error failed", exc_info=True)
-        return None
+            result = await read_codex_rate_limits(
+                home=home, env=env, codex_bin=codex_bin
+            )
+        except CodexUsageError as exc:
+            logger.warning(
+                "Codex usage fetch failed for account %s: %s", account_id, exc
+            )
+            try:
+                db.record_account_error(account_id, str(exc))
+            except Exception:  # pragma: no cover - bookkeeping must not mask failure
+                logger.debug("record_account_error failed", exc_info=True)
+            return None
 
     norm = normalize_rate_limits(result)
     five = norm["five_hour"]
     seven = norm["seven_day"]
+    # An all-None read (empty/partial app-server result) is a soft failure — do
+    # NOT stamp it fresh + mark valid, or a degraded read masquerades as healthy.
+    if five["utilization"] is None and seven["utilization"] is None:
+        logger.warning("Codex usage for account %s returned no windows", account_id)
+        try:
+            db.record_account_error(account_id, "codex app-server returned no rate limits")
+        except Exception:  # pragma: no cover
+            logger.debug("record_account_error failed", exc_info=True)
+        return None
     db.update_account_usage_cache(
         account_id,
         five_hour=five["utilization"],

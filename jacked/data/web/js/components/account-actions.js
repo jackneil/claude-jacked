@@ -97,16 +97,16 @@ function _formatCountdown(seconds) {
 async function _confirmAddAccount() {
     return Swal.fire({
         title: 'Add Account',
-        html: `Add a new Claude account?<br><br>
-               This opens browser tabs for authorization:<br>
-               1. Usage token (for jacked dashboard)<br>
-               2. Claude Code token (refresh-capable, for CC sessions)<br><br>
-               Complete both to fully authorize the new account.`,
-        icon: 'info',
+        html: `Which provider?<br><br>
+               <b>Claude</b> — opens browser tabs to authorize (usage token + Claude Code token).<br><br>
+               <b>Codex</b> — imports your signed-in OpenAI Codex account
+               (run <code>codex login</code> in a terminal first if you're not signed in).`,
+        icon: 'question',
+        showDenyButton: true,
         showCancelButton: true,
-        confirmButtonText: 'Add Account',
+        confirmButtonText: 'Claude',
+        denyButtonText: 'Codex',
         cancelButtonText: 'Cancel',
-        focusCancel: true,
     });
 }
 
@@ -196,12 +196,16 @@ function bindAccountEvents() {
             }
             try {
                 const result = await _confirmAddAccount();
-                if (!result.isConfirmed) return;
+                if (!result.isConfirmed && !result.isDenied) return;  // cancelled
                 if (window.jackedState._accountActionInFlight) {
                     showToast('Another action started — please try again', 'warning', 2000);
                     return;
                 }
-                startAddAccountFlow();
+                if (result.isDenied) {
+                    startAddCodexFlow();   // Codex
+                } else {
+                    startAddAccountFlow(); // Claude
+                }
             } catch (err) {
                 console.error('Add account confirmation error:', err);
                 showToast('Something went wrong — please try again', 'error');
@@ -297,8 +301,19 @@ function bindAccountEvents() {
             btn.disabled = true;
             btn.textContent = 'Switching\u2026';
             try {
-                await api.post(`/api/auth/accounts/${id}/use`);
-                showToast(`Switched to ${email}`, 'success');
+                const result = await api.post(`/api/auth/accounts/${id}/use`);
+                // Codex caches auth at startup, so the swap only takes effect
+                // after a restart — surface the server's instruction instead of
+                // a plain "switched" toast that looks like nothing happened.
+                if (result && result.restart_required) {
+                    showToast(
+                        result.message || 'Switched the active Codex account — restart Codex to pick it up.',
+                        'info',
+                        7000,
+                    );
+                } else {
+                    showToast(`Switched to ${email}`, 'success');
+                }
                 await loadActiveCredential();
             } catch (e) {
                 showToast(e.message, 'error');

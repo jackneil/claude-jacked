@@ -49,9 +49,13 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
         // to stay tight; same-day shows the time ("3:45 PM"), other days add the
         // date ("Jun 30 3:45 PM"). Full text still rides the row title on hover.
         // No extra row → the 6-account no-scroll panel fit is preserved.
-        const resetShort = resetDisplay.replace(/^resets\s+/i, '');
+        // Only the "resets <time>" form gets a caption; a past/expired window
+        // ("no active window") clamps to a short em-dash so the widest case
+        // can't squeeze the bar — the full text still rides the hover title.
+        const isReset = /^resets\s+/i.test(resetDisplay);
+        const resetShort = isReset ? resetDisplay.replace(/^resets\s+/i, '') : (resetDisplay ? '—' : '');
         const resetCaption = resetShort
-            ? `<span class="reset-caption text-[10px] text-slate-500 shrink-0 text-right tabular-nums whitespace-nowrap" title="Window ${escapeHtml(resetDisplay)}">${escapeHtml(resetShort)}</span>`
+            ? `<span class="reset-caption text-[10px] text-slate-500 shrink-0 text-right tabular-nums whitespace-nowrap" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetShort)}</span>`
             : '';
         return `
         <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(label || '')}${resetDisplay ? ' · ' + escapeHtml(resetDisplay) : ''}">

@@ -184,6 +184,39 @@ def test_migration_then_codex_coexists_with_same_email(tmp_path):
     assert [r["provider"] for r in rows] == ["claude", "codex"]
 
 
+ACCOUNTS_NEW_DDL = (
+    LEGACY_ACCOUNTS_DDL
+    .replace("CREATE TABLE accounts", "CREATE TABLE accounts_new")
+    .replace(
+        "    email TEXT NOT NULL,",
+        "    provider TEXT NOT NULL DEFAULT 'claude',\n    email TEXT NOT NULL,",
+    )
+    .replace("UNIQUE(email, organization_uuid)", "UNIQUE(provider, email, organization_uuid)")
+)
+
+
+def test_migration_recovers_from_crashed_rebuild(tmp_path):
+    """Simulate a crash between DROP accounts and RENAME accounts_new: an
+    accounts_new (already provider-aware) exists and accounts does NOT. Opening
+    must recover via the pre-schema rename — the crash-safe half of the migration."""
+    db_path = str(tmp_path / "crashed.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(ACCOUNTS_NEW_DDL)  # only accounts_new, no accounts
+    conn.execute(
+        "INSERT INTO accounts_new (provider, email, organization_uuid, access_token, expires_at) "
+        "VALUES ('claude', 'recover@example.com', '', 'tok', 9999999999)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path)  # pre-schema recovery renames accounts_new -> accounts
+    assert "provider" in _columns(db)
+    rows = db.list_accounts()
+    assert len(rows) == 1
+    assert rows[0]["email"] == "recover@example.com"
+    assert rows[0]["provider"] == "claude"
+
+
 def test_migration_idempotent(tmp_path):
     """Re-opening an already-migrated DB must not rebuild or error."""
     db_path = str(tmp_path / "legacy4.db")

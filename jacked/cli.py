@@ -5063,10 +5063,8 @@ def codex_add_cmd(make_active, no_login):
     >>> # CLI command: jacked codex add [--make-active] [--no-login]
     """
     from jacked.codex.accounts import CodexImportError, add_codex_account
-    from jacked.web.database import Database
 
-    db_path = Path.home() / ".claude" / "jacked.db"
-    db = Database(str(db_path))
+    db = _codex_db()
     try:
         acct = add_codex_account(
             db, run_login=not no_login, make_active=make_active
@@ -5081,6 +5079,15 @@ def codex_add_cmd(make_active, no_login):
         f"Added Codex account [bold]{acct['email']}[/bold] "
         f"(plan {plan}, id {acct['id']})."
     )
+    if make_active:
+        console.print(
+            "It's now the active Codex account — restart Codex to pick it up."
+        )
+    else:
+        console.print(
+            f"Its usage will show in the dashboard. Make it active with "
+            f"[bold]jacked codex use {acct['id']}[/bold]."
+        )
 
 
 def _codex_db():

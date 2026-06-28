@@ -14,22 +14,25 @@ function providerMeta(provider) {
         return {
             key: 'codex',
             label: 'Codex',
-            color: '#10a37f',
-            // OpenAI-style knot: three rotated ellipses.
+            color: '#10a37f',       // brand — glyph + accent (graphical, 3:1 ok)
+            labelColor: '#5eead4',  // light — label text needs WCAG AA 4.5:1
+            // Enclosed hexagon ring: a CLOSED polygon silhouette, deliberately
+            // distinct from Claude's open radial spokes so the two are
+            // distinguishable by SHAPE alone (color-blind safe), not just color.
             svg:
                 '<svg viewBox="0 0 16 16" width="100%" height="100%" fill="none" ' +
-                'stroke="currentColor" stroke-width="1.3" aria-hidden="true">' +
-                '<ellipse cx="8" cy="8" rx="2.8" ry="6.2"/>' +
-                '<ellipse cx="8" cy="8" rx="2.8" ry="6.2" transform="rotate(60 8 8)"/>' +
-                '<ellipse cx="8" cy="8" rx="2.8" ry="6.2" transform="rotate(120 8 8)"/>' +
+                'stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">' +
+                '<polygon points="8,1.6 13.5,4.8 13.5,11.2 8,14.4 2.5,11.2 2.5,4.8"/>' +
+                '<circle cx="8" cy="8" r="1.9"/>' +
                 '</svg>',
         };
     }
     return {
         key: 'claude',
         label: 'Claude',
-        color: '#d97757',
-        // Anthropic-style sunburst: tapered rays from center.
+        color: '#d97757',       // brand
+        labelColor: '#f0b49d',  // light — AA label text
+        // Anthropic-style sunburst: open radial spokes from center.
         svg:
             '<svg viewBox="0 0 16 16" width="100%" height="100%" stroke="currentColor" ' +
             'stroke-width="1.5" stroke-linecap="round" aria-hidden="true">' +
@@ -49,14 +52,16 @@ function providerGlyph(provider) {
     );
 }
 
-/** Full badge (logo + label chip) — for the roomier dashboard cards. */
+/** Full badge (logo + label chip) — for the roomier dashboard cards. The glyph
+ * keeps the full brand color (a graphical object, 3:1 is enough); the label text
+ * uses the lighter labelColor so it clears WCAG AA 4.5:1 on the tinted chip. */
 function providerBadge(provider) {
     const m = providerMeta(provider);
     return (
         `<span class="provider-badge provider-${m.key}" title="${m.label} account" ` +
-        `style="--provider-color:${m.color};color:${m.color}">` +
-        `<span class="provider-glyph">${m.svg}</span>` +
-        `<span class="provider-label">${m.label}</span></span>`
+        `style="--provider-color:${m.color}">` +
+        `<span class="provider-glyph" style="color:${m.color}">${m.svg}</span>` +
+        `<span class="provider-label" style="color:${m.labelColor}">${m.label}</span></span>`
     );
 }
 

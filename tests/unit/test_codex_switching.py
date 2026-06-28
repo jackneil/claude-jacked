@@ -178,6 +178,27 @@ def test_swap_captures_to_live_root_owner_not_tracked_pointer(tmp_path, db):
     assert result.outgoing_id == z["id"]
 
 
+def test_swap_captures_empty_org_outgoing_by_email(tmp_path, db):
+    """Capture-first must still fire when the outgoing account has an empty org
+    sentinel (no chatgpt_account_id) and the tracked pointer is unset — resolved
+    by EMAIL, not org. (Regression for the /dcr empty-org token-loss finding.)"""
+    base = tmp_path / ".codex"
+    o = db.create_account("o@x.com", "t", 9999999999, provider="codex",
+                          organization_uuid="")   # outgoing, empty org
+    db.create_account("a@x.com", "t", 9999999999, provider="codex",
+                      organization_uuid="acct-A")
+    a_id = [x["id"] for x in db.list_accounts() if x["email"] == "a@x.com"][0]
+    _write(base / "auth.json", _auth("", email="o@x.com"))  # live root = O, empty org
+    _write(sw.codex_slot_auth_path(a_id, base), _auth("acct-A", email="a@x.com"))
+    # NOTE: no set_active_account_id — the tracked pointer is None on purpose.
+
+    result = sw.swap_codex_account(db, a_id, base=base)
+    assert result.captured_outgoing is True
+    assert result.outgoing_id == o["id"]
+    o_slot = json.loads(sw.codex_slot_auth_path(o["id"], base).read_text())
+    assert o_slot["tokens"]["account_id"] == ""  # the empty-org account's live tokens
+
+
 def test_accounts_container_locked_0700(tmp_path):
     """Hardening: the accounts/ container (created at umask by mkdir) is 0700."""
     import os

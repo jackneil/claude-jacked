@@ -811,8 +811,15 @@ async def fetch_usage(
     # not the Anthropic HTTP API. Pacing/backoff/stamping above are
     # provider-agnostic and already applied; everything below is Anthropic-only.
     if (account.get("provider") or "claude") == "codex":
-        from jacked.codex.usage import fetch_codex_usage
+        from jacked.codex.usage import fetch_codex_usage, live_codex_account_id
 
+        # app-server reports usage for whichever Codex account is live in the
+        # shared ~/.codex root. Polling a NON-active account there would cache
+        # the live account's numbers under the wrong id (and risk rotating its
+        # tokens), so only poll the account currently in the root; the others
+        # keep their last-known cached usage until switched to.
+        if live_codex_account_id(db) != account_id:
+            return {"_cached": True}
         return await fetch_codex_usage(account_id, db, state=state)
 
     try:

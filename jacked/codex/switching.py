@@ -91,7 +91,11 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
         os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        # Windows-safe replace (retries if Codex holds the file open) — reuse
+        # the platform util the Claude credential path already ships.
+        from jacked.api.credential_helpers import _safe_replace
+
+        _safe_replace(tmp, str(path))
         tmp = None
     finally:
         if tmp is not None and os.path.exists(tmp):
@@ -197,28 +201,46 @@ def _parse_refresh(ts: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _find_codex_account_by_org(db, org: str) -> Optional[int]:
-    """Find the Codex account id whose org/workspace sentinel == ``org``."""
-    if not org:
-        return None
+def find_codex_account_id(db, identity) -> Optional[int]:
+    """Match a decoded Codex identity to a stored Codex account id.
+
+    Prefers the org/workspace sentinel (account_id), then falls back to email
+    (case-insensitive) — so personal/no-workspace accounts (account_id == "")
+    still resolve to their slot instead of being silently dropped.
+    """
+    org = identity.account_id
+    email = (identity.email or "").lower()
+    by_email: Optional[int] = None
     for a in db.list_accounts():
-        if a.get("provider") == "codex" and (a.get("organization_uuid") or "") == org:
+        if a.get("provider") != "codex":
+            continue
+        if org and (a.get("organization_uuid") or "") == org:
             return a["id"]
-    return None
+        if email and (a.get("email") or "").lower() == email:
+            by_email = a["id"]
+    return by_email
+
+
+def _same_codex_identity(a, b) -> bool:
+    """Same account across two auth blobs — by account_id when present, else email."""
+    ia, ib = extract_identity(a), extract_identity(b)
+    if ia.account_id and ib.account_id:
+        return ia.account_id == ib.account_id
+    if ia.email and ib.email:
+        return ia.email.lower() == ib.email.lower()
+    return False
 
 
 def _refuse_stale_replay(target: dict, live: Optional[dict]) -> None:
     """Refuse writing ``target`` over ``live`` when it's an OLDER snapshot of the
     SAME account — Codex would reject the already-rotated refresh token.
 
-    Only chatgpt-mode creds carry an account_id (and a rotating refresh token);
-    API-key creds have no account_id and don't rotate, so there's no stale-replay
-    hazard for them and this correctly no-ops."""
+    "Same account" is matched by account_id when present, else by email, so
+    personal accounts (account_id == "") are still protected. API-key creds
+    (no email/id_token, no token rotation) have no stale-replay hazard."""
     if not live:
         return
-    t_id = extract_identity(target).account_id
-    l_id = extract_identity(live).account_id
-    if not t_id or t_id != l_id:
+    if not _same_codex_identity(target, live):
         return  # different account → a normal switch, not a replay
     t_ref = _parse_refresh(target.get("last_refresh"))
     l_ref = _parse_refresh(live.get("last_refresh"))
@@ -256,26 +278,33 @@ def swap_codex_account(
     target_data = _read_json(target_slot)
     _validate_field_complete(target_data)
 
-    live = _read_json(root_path)
-
-    # Identify the outgoing account from the LIVE auth.json's own identity, not
-    # just jacked's tracked pointer — the user may have run `codex login`
-    # out-of-band, in which case the live (rotated) tokens belong to a different
-    # account and must be filed to ITS slot, not the tracked one. Fall back to
-    # the tracked pointer when the live identity isn't a known Codex account.
-    outgoing_id = db.get_active_account_id("codex")
-    if live:
-        live_owner = _find_codex_account_by_org(db, extract_identity(live).account_id)
-        if live_owner is not None:
-            outgoing_id = live_owner
-
-    # Stale-replay guard BEFORE any write.
-    _refuse_stale_replay(target_data, live)
-
     lock_cm = _codex_swap_lock(base) if lock else contextlib.nullcontext(True)
     with lock_cm as locked:
         if lock and not locked:
-            raise CodexSwapError("could not acquire the Codex swap lock (another swap in progress)")
+            raise CodexSwapError(
+                "could not acquire the Codex swap lock (another swap or usage "
+                "poll is in progress) — retry in a moment"
+            )
+
+        # Read the live root INSIDE the lock: a concurrent usage poll boots
+        # `codex app-server` against the root and can rotate the refresh token,
+        # so reading pre-lock risked snapshotting a stale token and losing the
+        # rotation (#15502). The usage poll takes this same lock, so the two are
+        # mutually exclusive on the shared root.
+        live = _read_json(root_path)
+
+        # Identify the outgoing account from the LIVE auth.json's own identity
+        # (org OR email — handles personal/empty-org accounts and an out-of-band
+        # `codex login`), not just jacked's tracked pointer. Fall back to the
+        # tracked pointer when the live identity isn't a known Codex account.
+        outgoing_id = db.get_active_account_id("codex")
+        if live:
+            live_owner = find_codex_account_id(db, extract_identity(live))
+            if live_owner is not None:
+                outgoing_id = live_owner
+
+        # Stale-replay guard BEFORE any write.
+        _refuse_stale_replay(target_data, live)
 
         # 1. CAPTURE the live root into the outgoing account's slot FIRST, so the
         #    tokens Codex rotated while it was active are not lost.
