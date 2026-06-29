@@ -136,9 +136,49 @@ def test_mac_app_wires_version_update_menu_handlers():
         "_on_version_click",
         "_on_check_updates_item",
         "_poll_check_result",
+        "_mac_notify",
         "_on_toggle_autostart_item",
     ):
         assert hasattr(cls, handler), f"missing menu handler: {handler}"
+
+
+def test_osa_quote_escapes_applescript_literals():
+    from jacked.service import menubar_mac
+
+    if not menubar_mac.RUMPS_AVAILABLE:
+        pytest.skip("rumps/pyobjc unavailable")
+    q = menubar_mac.MacMenuBarApp._osa_quote
+    assert q("hi") == '"hi"'
+    assert q('a"b') == '"a\\"b"'      # double-quote escaped
+    assert q("a\\b") == '"a\\\\b"'    # backslash escaped
+
+
+def test_mac_notify_invokes_osascript_display_notification(monkeypatch):
+    """The update banners must go through `osascript display notification`
+    (the only path that works for an unbundled menubar app)."""
+    import subprocess
+    import types
+
+    from jacked.service import menubar_mac
+
+    if not menubar_mac.RUMPS_AVAILABLE:
+        pytest.skip("rumps/pyobjc unavailable")
+
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append((a, k)) or None)
+    # Stand-in self with just the static helper the method needs — avoids
+    # constructing the full rumps app (which would start a status item).
+    fake = types.SimpleNamespace(_osa_quote=menubar_mac.MacMenuBarApp._osa_quote)
+    menubar_mac.MacMenuBarApp._mac_notify(fake, "Update available: v9.9.9", subtitle="click to install")
+
+    assert calls, "osascript was not invoked"
+    argv = calls[0][0][0]
+    assert argv[0] == "osascript" and argv[1] == "-e"
+    script = argv[2]
+    assert "display notification" in script
+    assert "Update available: v9.9.9" in script
+    assert 'with title "Jacked"' in script
+    assert "subtitle" in script
 
 
 # ---------------------------------------------------------------------------

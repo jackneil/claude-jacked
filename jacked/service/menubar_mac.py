@@ -626,48 +626,71 @@ if RUMPS_AVAILABLE:
                 daemon=True,
             ).start()
 
+        @staticmethod
+        def _osa_quote(s):
+            """Quote a value as an AppleScript string literal."""
+            return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+        def _mac_notify(self, message, subtitle=""):
+            """Show a macOS notification banner via osascript.
+
+            The rumps menubar has no pystray icon (so _icon.notify is a no-op),
+            and rumps.notification / NSUserNotification need a bundle id this
+            uv-tool process doesn't have. osascript's `display notification`
+            works for an unbundled CLI app, which is what we are."""
+            import subprocess
+
+            try:
+                script = f'display notification {self._osa_quote(message)} with title "Jacked"'
+                if subtitle:
+                    script += f" subtitle {self._osa_quote(subtitle)}"
+                subprocess.run(
+                    ["osascript", "-e", script],
+                    timeout=5, capture_output=True, check=False,
+                )
+            except Exception:
+                logger.debug("osascript notification failed", exc_info=True)
+
         def _on_check_updates_item(self, _sender):
-            """Force a fresh PyPI check now (runs in the runner's own thread),
-            then show the result as a modal alert. The rumps menubar has no
-            pystray icon, so _on_check_for_updates' notify() calls are no-ops
-            here — without this alert the manual check gives NO visible feedback."""
+            """Force a fresh PyPI check now (runs in the runner's own thread) and
+            surface the result as a macOS banner. The rumps menubar has no
+            pystray icon, so _on_check_for_updates' own notify() calls are no-ops
+            here — we fire the banners from this path instead."""
             try:
                 self._runner._on_check_for_updates()
             except Exception:
                 logger.exception("manual update check failed")
-            self._refresh_version_menu()  # "Checking PyPI…" for the next menu open
-            # Poll until the background check finishes, then alert + refresh.
+            self._mac_notify("Checking PyPI for updates…")
+            self._refresh_version_menu()
+            # Poll until the background check finishes, then notify + refresh.
             self._check_poll_count = 0
             rumps.Timer(self._poll_check_result, 0.5).start()
 
         def _poll_check_result(self, timer):
-            """Re-arm until the manual check completes (~12s cap), then show the
-            outcome as a modal and refresh the menu text."""
+            """Re-arm until the manual check finishes (~12s cap), then notify the
+            outcome as a banner and refresh the menu text."""
             r = self._runner
             self._check_poll_count = getattr(self, "_check_poll_count", 0) + 1
             if getattr(r, "_version_check_in_progress", False) and self._check_poll_count < 24:
                 return
             timer.stop()
             self._refresh_version_menu()
-            try:
-                if getattr(r, "_version_check_in_progress", False):
-                    msg = "Still checking PyPI — give it another moment and try again."
-                elif getattr(r, "_last_check_failed", False):
-                    msg = "Couldn't reach PyPI. Check your connection and try again."
+            if getattr(r, "_version_check_in_progress", False):
+                self._mac_notify("Still checking PyPI — try again in a moment.")
+            elif getattr(r, "_last_check_failed", False):
+                self._mac_notify(
+                    "Couldn't reach PyPI.", subtitle="Check your connection and try again."
+                )
+            else:
+                info = getattr(r, "_version_info", None) or {}
+                if info.get("outdated"):
+                    latest = info.get("latest", "?")
+                    self._mac_notify(
+                        f"Update available: v{latest}",
+                        subtitle=f"You're on v{__version__} — click the version line to install it.",
+                    )
                 else:
-                    info = getattr(r, "_version_info", None) or {}
-                    if info.get("outdated"):
-                        latest = info.get("latest", "?")
-                        msg = (
-                            f"Update available: v{latest}\n\n"
-                            f"You're on v{__version__}. Click the version line "
-                            f"(v{__version__} → v{latest}) in the menu to install it."
-                        )
-                    else:
-                        msg = f"You're up to date — v{__version__} is the latest."
-                rumps.alert(title="Jacked — Check for Updates", message=msg, ok="OK")
-            except Exception:
-                logger.exception("update-check result alert failed")
+                    self._mac_notify(f"You're up to date (v{__version__}).")
 
         def _on_toggle_autostart_item(self, _sender):
             try:
