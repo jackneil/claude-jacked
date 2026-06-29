@@ -2712,3 +2712,55 @@ class TestResetLocksState:
         assert um._emerged_tier_streak == {"tier": None, "count": 0}
         assert um._last_observed_tiers == {}
         assert um._ping_backoff == {}
+
+
+def test_all_accounts_loop_polls_codex_not_just_cc_accounts(monkeypatch):
+    """Regression: all_accounts_refresh_loop skipped every account without a CC
+    token, silently excluding ALL Codex accounts (cc_access_token is always None
+    for Codex) — which left their usage stuck at 0%.
+
+    Runs exactly one loop iteration (cancel on the 2nd top-of-loop sleep) and
+    asserts a Codex account IS polled while a Claude account with no CC token is
+    skipped.
+    """
+    import types
+
+    import jacked.api.usage_monitor as um
+    import jacked.web.auth as auth_mod
+
+    accounts = [
+        {"id": 1, "provider": "claude", "cc_access_token": "cc-1"},  # polled
+        {"id": 2, "provider": "claude", "cc_access_token": None},    # skipped
+        {"id": 3, "provider": "codex", "cc_access_token": None},     # NOW polled
+    ]
+    fake_db = types.SimpleNamespace(list_accounts=lambda **k: accounts)
+    app = types.SimpleNamespace(
+        state=types.SimpleNamespace(db=fake_db, active_poll_account_id=None)
+    )
+    calls = []
+
+    async def fake_fetch(aid, db, access_token=None):
+        calls.append((aid, access_token))
+
+    monkeypatch.setattr(auth_mod, "fetch_usage", fake_fetch)
+
+    tops = {"n": 0}
+
+    async def fake_sleep(seconds):
+        # The top-of-loop wait uses _ALL_ACCOUNTS_REFRESH_INTERVAL; the 2s pace
+        # uses 2. Cancel on the 2nd top-of-loop sleep → exactly one iteration.
+        if seconds == um._ALL_ACCOUNTS_REFRESH_INTERVAL:
+            tops["n"] += 1
+            if tops["n"] >= 2:
+                raise asyncio.CancelledError
+
+    monkeypatch.setattr(um.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(um.all_accounts_refresh_loop(app))
+
+    fetched = [aid for aid, _ in calls]
+    assert 1 in fetched          # claude with CC token → polled
+    assert 2 not in fetched      # claude without CC token → skipped
+    assert 3 in fetched          # codex → polled (the fix)
+    assert (3, None) in calls    # codex polled with no token (app-server path)

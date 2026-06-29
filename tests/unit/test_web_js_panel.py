@@ -141,8 +141,9 @@ out({ hasMarker: html.includes('elapsed-marker') });
 
 
 def test_panel_marks_provider_per_account(tmp_path):
-    """Each panel row carries a provider glyph + provider-* class; Codex and
-    Claude get distinct brand colors so you can tell accounts apart."""
+    """Each panel row carries a provider BADGE (glyph + CODEX/CLAUDE label) +
+    provider-* class; Codex and Claude get distinct colors so you can tell
+    accounts apart at a glance, not just on hover."""
     result = _run(tmp_path, """
 const html = buildPanelHtml(groupAccountsByLogin([
     { id: 1, email: 'claudey@x.com', organization_uuid: '', priority: 0,
@@ -153,7 +154,10 @@ const html = buildPanelHtml(groupAccountsByLogin([
 out({ html });
 """)
     html = result["html"]
+    assert "provider-badge" in html            # labeled badge, not the bare glyph
     assert "provider-glyph" in html
+    assert "provider-label" in html
+    assert ">Claude<" in html and ">Codex<" in html  # visible text labels
     assert "provider-claude" in html and "provider-codex" in html
     assert "#a78bfa" in html  # Claude violet
     assert "#60a5fa" in html  # Codex blue

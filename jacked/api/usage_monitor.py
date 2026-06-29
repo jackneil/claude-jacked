@@ -1708,9 +1708,9 @@ async def all_accounts_refresh_loop(app):
     keeper being enabled.
 
     Pacing/safety: fetch_usage enforces its own hard per-account rate-limit
-    ceiling (no 429s), we skip the active account, skip accounts without a CC
-    token, and sleep between accounts. Never crashes — errors are logged per
-    account and per tick.
+    ceiling (no 429s), we skip the active account, skip Claude accounts without a
+    CC token (Codex accounts have none but are polled via the app-server), and
+    sleep between accounts. Never crashes — errors are logged per account/tick.
     """
     while True:
         # Sleep first — at startup the active loop + login already populate caches.
@@ -1726,11 +1726,20 @@ async def all_accounts_refresh_loop(app):
             for acct in db.list_accounts(include_inactive=False):
                 if acct.get("id") == active_id:
                     continue  # covered (more often) by active_account_poll_loop
+                is_codex = (acct.get("provider") or "claude") == "codex"
                 cc_at = acct.get("cc_access_token")
-                if not cc_at:
-                    continue  # no Claude Code token → can't fetch usage
+                # Claude accounts fetch usage with their CC token; a Claude account
+                # without one can't be polled. Codex usage comes from the
+                # app-server (no token), so it must NOT be skipped here — that
+                # CC-token skip is exactly why Codex usage stayed at 0%.
+                if not is_codex and not cc_at:
+                    continue
                 try:
-                    await fetch_usage(acct["id"], db, access_token=cc_at)
+                    # fetch_usage dispatches on provider; for codex it ignores the
+                    # token and only polls the live codex account (others no-op).
+                    await fetch_usage(
+                        acct["id"], db, access_token=None if is_codex else cc_at
+                    )
                     refreshed += 1
                 except Exception:
                     logger.warning(

@@ -97,7 +97,7 @@ function buildSingleAccountHtml(group, nextRefreshAt) {
     return `
         <section class="acct provider-${provider}${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
             <div class="acct-head">
-                ${providerGlyph(provider)}
+                ${providerBadge(provider)}
                 <span class="acct-email" title="${escapeHtml(group.email)}">${escapeHtml(group.email)}</span>
                 ${orgTag}
                 ${orgMetaHtml(org, nextRefreshAt)}
@@ -113,7 +113,7 @@ function buildMultiOrgLoginHtml(group, nextRefreshAt) {
             (org) => `
             <div class="org-row provider-${org.provider || 'claude'}${org.isActive ? ' is-active' : ''}" data-account-id="${org.id}">
                 <div class="org-row-head">
-                    ${providerGlyph(org.provider || 'claude')}
+                    ${providerBadge(org.provider || 'claude')}
                     <span class="org-name" title="${escapeHtml(org.orgLabel)}">${escapeHtml(org.orgLabel)}</span>
                     ${orgMetaHtml(org, nextRefreshAt)}
                 </div>

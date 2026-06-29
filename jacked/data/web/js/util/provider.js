@@ -3,9 +3,10 @@
  *
  * Single source of truth for the per-account provider mark so the dashboard
  * cards, the menu-bar panel rows, and any future surface render the same
- * brand-colored logo + label and can never disagree (same pattern as the
- * shared renderUsageBar). Brand colors: Claude = Anthropic terracotta,
- * Codex = OpenAI green. Unknown/missing provider falls back to Claude.
+ * colored logo + label and can never disagree (same pattern as the shared
+ * renderUsageBar). Colors: Claude = violet, Codex = blue — deliberately NOT
+ * orange/green/red, which the usage bars use for warning/limit states.
+ * Unknown/missing provider falls back to Claude.
  */
 
 function providerMeta(provider) {
