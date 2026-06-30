@@ -10,7 +10,7 @@ Install extras for additional features:
   uv tool install "claude-jacked[all]"       — everything
 """
 
-__version__ = "0.64.3"
+__version__ = "0.65.0"
 
 
 def _qdrant_available() -> bool:
