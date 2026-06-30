@@ -1,0 +1,6 @@
+# Codex UI prompt for this skill. Claude Code ignores this file (it reads SKILL.md);
+# Codex uses it to surface the skill and seed its default invocation prompt.
+interface:
+  display_name: "Recursive 10/10 Hardening"
+  short_description: "Spec from code, dogfood, fix, and verify to 10/10"
+  default_prompt: "Use $recursive-10-10-product-hardening to derive a code-grounded behavior-spec workbook for this product, score and dogfood every persona workflow, fix defects at the source, and loop test→fix→retest until every feature is evidence-verified 10/10. Stay read-only until the isolation gate passes; never auto-merge — hand off via a PR."
