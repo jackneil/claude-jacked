@@ -1,181 +1,155 @@
 ---
-description: Use when ready to cut a release. Suggests the semver bump from commit history, gates on a local build + twine check + tests BEFORE tagging, pushes, creates the GitHub Release for PyPI publishing, then verifies the version is actually installable from the index.
+description: Use when ready to cut a release. Detects how THIS repo actually ships (PyPI, npm, changesets, CalVer, Cargo, Go tag, or PR-to-main deploy), suggests the semver bump, gates on the repo's OWN build+test before anything irreversible, then publishes/deploys the way that repo really ships and verifies it landed.
 ---
 
-You are the Release Manager. Execute the full release pipeline for claude-jacked.
+> **Note:** If `.claude/commands/release.md` exists in the current repo, that version has pre-filled repo config from `/jacked-setup release` — use it instead of this global file. If it doesn't exist, continue here.
+
+You are the Release Manager. Cut a release for **this** repo — however it actually ships. Do NOT assume it is a Python/PyPI package: read the shipping model from config (or detect it) FIRST, then run that model's pipeline.
+
+## Config Override
+
+If invoked via a local config wrapper (you see a `## Repo Config` section earlier in the prompt), it is **authoritative** — use it, do not re-detect:
+- **Base Branch** → the branch to release from / push to (not a hardcoded `master`).
+- **Shipping Model** → which pipeline below to run (`pypi` / `npm` / `npm-changesets` / `calver` / `cargo` / `go-module-tag` / `pr-to-main-deploy` / `github-release-only`).
+- **Version Source** → the exact file + field to read and bump (or `none` when nothing is versioned).
+- **Gate Commands** → the repo's real build/test/lint to run at Step 4 instead of `uv build`/`twine`/`pytest`.
+- **Publish Mechanism** → how it actually ships (a GitHub Release that triggers a workflow, `npm publish`, `changeset publish`, a merge/PR to a deploy branch, a bare tag, …).
+- **Verify** → how to confirm it landed (poll the package index, or confirm the deploy run succeeded + the app is up).
+
+If no `## Repo Config` is present, auto-detect the model in the next section.
+
+**SAFETY — this command does irreversible things (publishes, tags, deploys):**
+- The config/detected model decides the publish **target**. If the model or target is ambiguous, or you detect more than one plausible target, **STOP and ask** — never guess where to publish or which branch to push.
+- **Never publish to a package index for a repo that has no package** (a private app / `pr-to-main-deploy` repo). Never invent a PyPI/npm step that the repo's own CI doesn't already do.
+- Everything reversible (version bump, gate) happens BEFORE anything irreversible (tag, publish, merge-to-deploy-branch). Never force-push without explicit approval.
+
+## Auto-detect the shipping model (when no Repo Config)
+
+Detect conservatively — read, don't assume:
+
+```bash
+ls pyproject.toml setup.py package.json Cargo.toml go.mod 2>/dev/null   # ecosystem
+ls -d .changeset 2>/dev/null                                            # npm changesets
+ls .github/workflows/ 2>/dev/null
+# What does CI actually DO on release/push/tag? (the source of truth for how it ships)
+grep -rlE 'twine|pypi|gh-action-pypi|npm publish|changeset|cargo publish|railway|vercel|fly\.io|flyctl|deploy' .github/workflows/ 2>/dev/null
+grep -rlE 'on:|release:|push:|tags:|workflow_dispatch:' .github/workflows/ 2>/dev/null
+git remote -v 2>/dev/null; git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'
+```
+
+Map signals → model (priority order; when two genuinely fit, **ask**):
+- `.changeset/` + `package.json` → **npm-changesets** (`changeset version` bumps, `changeset publish` ships).
+- `package.json` + an `npm publish` / `publishConfig` in a workflow → **npm** — but if versions are date-shaped (`2026.318.0`) or a workflow derives the version from the date → **calver**.
+- `pyproject.toml`/`setup.py` + a workflow that publishes to PyPI (twine / OIDC trusted publisher) → **pypi**.
+- `Cargo.toml` + `cargo publish` → **cargo**.
+- `go.mod`, no publish step → **go-module-tag** (the tag itself IS the release; the module proxy serves it).
+- A workflow that **deploys** on push/merge to the base branch (railway/vercel/fly/a deploy step) with NO package publish → **pr-to-main-deploy**: "shipping" = getting the change onto the deploy branch; there is no version bump or index publish, and cutting a package would be wrong.
+- None of the above, but you still want a GitHub Release for notes → **github-release-only** (tag + Release, no publish).
+
+State the detected model and the evidence you based it on. **If unsure, ask before touching anything.**
 
 ## RELEASE PIPELINE
 
-Follow these steps in order. Stop and report if any step fails.
+Run in order. Stop and report if any step fails.
 
-### 1. PRE-FLIGHT CHECKS
-
-Run these checks before anything else:
+### 1. PRE-FLIGHT
 
 ```bash
-# Verify we're on master
-git branch --show-current
-
-# Verify working tree is clean (no uncommitted changes besides version bump)
-git status --short
-
-# Verify gh CLI is authenticated
-gh auth status
+BASE="${BASE_BRANCH:-$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)}"
+git branch --show-current      # should be the base branch (or the branch you're releasing)
+git status --short             # working tree state
+gh auth status                 # GitHub auth (needed for Releases / PR merges)
 ```
-
-**If not on master**: Stop. Ask the user if they want to merge first or release from this branch.
-**If uncommitted changes exist**: List them. Ask the user whether to commit them as part of this release or stash them.
-**If gh not authenticated**: Stop. Tell the user to run `gh auth login`.
+- **Not on the base branch** → stop; ask whether to merge first or release from this branch.
+- **Uncommitted changes** → list them; ask whether to include them in the release or stash.
+- **gh not authenticated** → stop; tell the user to run `gh auth login`.
 
 ### 2. DETERMINE VERSION
 
-Read the current version from `jacked/__init__.py` (the `__version__` line).
+**Skip this step entirely for `calver` (the version is computed, usually date-based — read how from the workflow) and `pr-to-main-deploy` / any `none` Version Source (nothing is versioned — the merge is the ship).**
 
-**Suggest the bump from commit history first.** Find the last tag and scan the commits since it for Conventional Commit signals, then surface a recommendation (the user still picks):
+Otherwise read the current version from the **Version Source**:
+- Config declares it → use that file+field.
+- Else detect: `pyproject.toml` `[project].version` if static; if `dynamic = ["version"]`, follow `[tool.hatch.version].path` (or `grep -rl __version__`) to the real file; `package.json` `version`; `Cargo.toml` `[package].version`. In a monorepo, the versioned artifact may live in a workspace member, not the root — read the member that actually ships.
 
+**Suggest the bump from commit history** (the user still picks):
 ```bash
-# Last release tag (empty on a first release)
 git describe --tags --abbrev=0 2>/dev/null
-# Commits since that tag — look for feat: / fix: / BREAKING CHANGE / "!" markers
-git log "$(git describe --tags --abbrev=0)"..HEAD --oneline
+git log "$(git describe --tags --abbrev=0 2>/dev/null)"..HEAD --oneline 2>/dev/null
 ```
-
-Map the strongest signal to a recommendation: a `BREAKING CHANGE` footer or `type!:` marker → **major**; any `feat:` → **minor**; only `fix:`/`chore:`/`docs:` etc. → **patch**. This is a non-binding suggestion to ground the choice in actual changes, not an auto-decision.
-
-If `$ARGUMENTS` contains a version number (e.g. `0.14.0`), use that. Otherwise ask, leading with the suggestion:
-
-```
-Current version: X.Y.Z
-Commits since vLAST: <N feat, M fix, K breaking>  →  suggested: <patch|minor|major>
-What should the new version be?
-- Patch (X.Y.Z+1) — bug fixes only
-- Minor (X.Y+1.0) — new features, backward compatible
-- Major (X+1.0.0) — breaking changes
-- Custom — specify a version
-```
+`BREAKING CHANGE`/`type!:` → **major**; any `feat:` → **minor**; only `fix:`/`chore:`/`docs:` → **patch**. If `$ARGUMENTS` has a version, use it. Otherwise ask, leading with the suggestion (Patch / Minor / Major / Custom).
 
 ### 3. BUMP VERSION
 
-Edit `jacked/__init__.py` — change `__version__ = "..."` to the new version. Do NOT commit or tag yet — the build/test gate in step 4 must pass first.
+Edit the Version Source to the new version (`__version__`, `[project].version`, `package.json` "version", `Cargo.toml`, etc.). For `npm-changesets`, run the changeset flow instead (`pnpm changeset` → `changeset version`). Do NOT commit or tag yet — the gate (Step 4) must pass first. Skip for `calver`/`none`.
 
-### 4. BUILD + TEST GATE (before anything irreversible)
+### 4. GATE — before anything irreversible
 
-Tagging and the GitHub Release are immutable and the Release is what *triggers* the PyPI publish — so a broken build or failing test must be caught HERE, while everything is still local and reversible. Build the package and run the suite against the bumped tree before you create a tag:
+The tag/Release/publish/deploy are what ship the code, and many repos' CI does NOT run tests on release — so catch a broken build or red test HERE, while everything is still local and reversible. Run the repo's **own** gate:
+- **Config `Gate Commands`** → run exactly those, in order.
+- **Else per model** (run what the repo actually uses — read `package.json` scripts / the CI workflow, don't assume):
+  - `pypi`: `rm -rf dist/ && uv build && uvx twine check dist/* && uv run python -m pytest`
+  - `npm` / `npm-changesets` / `calver`: the repo's real chain, e.g. `pnpm -r typecheck && pnpm -r test && pnpm -r build` (or `npm ci && npm test && npm run build`; turbo repos: `turbo run typecheck test build`).
+  - `cargo`: `cargo build --release && cargo test`.
+  - `go-module-tag`: `go build ./... && go test ./...`.
+  - `pr-to-main-deploy`: run the repo's CI gate locally (the lint/typecheck/test/build the deploy workflow runs) so the merge doesn't break the deploy.
 
+Only when the gate is fully green do you proceed. If it fails, fix the cause and re-run — do NOT tag/publish/merge a red tree.
+
+### 5. CHANGELOG + COMMIT + TAG
+
+If a `CHANGELOG.md` exists (or the README carries a "Version History" section), prepend the new version's delta (grouped Features/Fixes/Other) before committing, so the tagged tree carries its own changelog. Then:
 ```bash
-# Clean build of wheel + sdist (uv build == python -m build for this repo)
-rm -rf dist/
-uv build
-# Metadata/long-description sanity — same check PyPI applies on upload
-uvx twine check dist/*
-# Run the project's tests — publish.yml does NOT run them (see step 7)
-uv run python -m pytest
+git add <version file> <changelog>   # + any other approved changes
+git commit -m "chore: release vX.Y.Z"   # or feat/fix: vX.Y.Z — <summary> for substantive changes
+git tag vX.Y.Z                          # SKIP the tag for pr-to-main-deploy (the merge is the ship; tag only if the repo tags)
 ```
 
-- If `uv build` or `twine check` fails: fix the packaging issue (pyproject, missing files in the wheel, bad README) and re-run. Do NOT tag.
-- If tests fail: stop and report. Do NOT tag a red tree.
-- Only when build + `twine check` + tests are all green do you proceed to commit/tag.
+### 6. PUSH / SHIP
 
-### 5. COMMIT AND TAG
+- **pypi / npm / cargo / go-module-tag / github-release-only:** push the base branch + tag.
+  ```bash
+  git push origin "$BASE" && git push origin vX.Y.Z
+  ```
+- **pr-to-main-deploy:** getting the change onto the deploy branch IS the release. If you're on a feature branch, open a PR to the deploy branch and (once its CI is green) merge with a true merge commit (`gh pr merge --merge`, never `--squash`/`--rebase`/`--admin`); if you're already on the deploy branch with approval, push it. The merge/push triggers the deploy — there is no package to publish.
 
-If a `CHANGELOG.md` exists, prepend a new section for this version (the delta since the last tag, grouped Features/Fixes/Other) BEFORE committing, so the tagged tree carries its own changelog. Then stage and commit the version bump along with any other approved changes:
+If push fails on upstream changes, stop and ask (never force-push without explicit approval).
 
-```bash
-git add jacked/__init__.py
-# git add CHANGELOG.md   # if you updated it
-# Include any other files the user approved in step 1
-git commit -m "chore: bump version to X.Y.Z"
-git tag vX.Y.Z
-```
+### 7. PUBLISH (per model)
 
-If there are substantive code changes to include (not just the version bump), ask the user for a commit message or use the format: `feat: vX.Y.Z — <summary of changes>`
+- **pypi:** create the GitHub Release — this triggers the publish workflow (`gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --latest`). Then watch it: find the run for THIS tag (`gh run list --workflow=<publish>.yml` and select the one whose `headBranch` == `vX.Y.Z` — do not grab a stale prior run) and `gh run watch <id> --exit-status`.
+- **npm / calver:** if a workflow publishes on Release/tag, cut the Release and watch that run as above. If publishing is manual, run the repo's publish (`npm publish` / `pnpm -r publish`) with the right registry/OTP.
+- **npm-changesets:** `pnpm changeset publish` (or let the Changesets Action open/merge the version PR, then publish) — follow the repo's setup; watch the action.
+- **cargo:** `cargo publish` (per crate, in dependency order for a workspace).
+- **go-module-tag:** nothing to publish — the pushed tag is the release. Optionally `gh release create` for notes.
+- **github-release-only:** `gh release create vX.Y.Z --generate-notes --latest`; no index publish.
+- **pr-to-main-deploy:** nothing to publish. **Publishing here = watching the DEPLOY**: find the deploy workflow run triggered by the merge and `gh run watch <id> --exit-status`; a red deploy is a failed release.
 
-### 6. PUSH
+If a publish/deploy run fails: `gh run view <id> --log-failed`, report it, and **never leave a `--latest` Release (or a "shipped" claim) pointing at a version/deploy that isn't actually live** — re-run from Actions (keeps the tag) or delete the Release+tag and re-cut after a fix.
 
-```bash
-git push origin master --tags
-```
+### 8. VERIFY IT LANDED
 
-If push fails due to upstream changes, stop and ask the user how to proceed (rebase, force push, etc.). Never force push without explicit user approval.
+A green workflow means "the job succeeded," not "it's live." Confirm reality:
+- **pypi:** poll the index until the version resolves, then prove installability (derive the name from `pyproject.toml`, don't hardcode):
+  ```bash
+  NAME=$(grep -m1 '^name' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+  curl -fsSL "https://pypi.org/pypi/${NAME}/json" | grep -q '"X.Y.Z"'   # JSON API
+  # and the /simple/ index (what installers resolve) — it can lag the JSON API by a minute
+  # then, from a NEUTRAL dir (outside the repo, to avoid a pinned exclude-newer): uv tool install "${NAME}@X.Y.Z" --force --refresh
+  ```
+- **npm / calver:** `npm view <pkg>@X.Y.Z version` until it resolves (and `npm install` in a throwaway dir for the strong proof).
+- **cargo:** `cargo search <crate>` / crates.io shows the version.
+- **go-module-tag:** `go list -m <module>@vX.Y.Z` resolves via the proxy.
+- **pr-to-main-deploy:** the deploy run is green AND the app is actually up — `curl -fsSItimeout` the production/preview URL (from config or the deploy output) for a 2xx, and sanity-check a health route if one exists. A green deploy job with a 502 site is a failed release.
 
-### 7. VERIFY CI (read this — it is NOT a green test gate here)
-
-This repo's ONLY workflow is `publish.yml`, triggered `on: release: published`. It **builds and publishes — it does NOT run tests or lint.** There is no push/PR CI. So there is nothing to "wait for" on push, and "CI will validate the release" is false here. The local build + test gate in step 4 IS the validation gate — it must have passed before you got here.
-
-```bash
-# Confirm there is genuinely no push-triggered workflow (don't assume — verify)
-gh run list --branch master --limit 3
-```
-
-If a push-triggered workflow DOES exist (someone added test CI), watch it and treat a failure as a hard stop:
-
-```bash
-gh run watch --exit-status            # only if a push run actually started
-gh run view <run-id> --log-failed     # on failure — then stop, do NOT release
-```
-
-If none triggered (the expected state), proceed — step 4 already validated the build and tests locally.
-
-### 8. CREATE GITHUB RELEASE
-
-Optionally categorize the auto-generated notes by adding a `.github/release.yml` (GitHub groups merged PRs by label — Features/Fixes/etc.); without it, `--generate-notes` still lists PRs, contributors, and a full-changelog link.
-
-```bash
-gh release create vX.Y.Z \
-  --title "vX.Y.Z" \
-  --generate-notes \
-  --latest
-```
-
-This triggers `.github/workflows/publish.yml` which:
-1. Builds the package (wheel + sdist)
-2. Publishes to PyPI via OIDC trusted publishing
-
-### 9. VERIFY PYPI PUBLISH
-
-After creating the release, monitor the publish workflow:
-
-```bash
-# Wait a moment for the workflow to trigger
-gh run list --workflow=publish.yml --limit 3
-
-# Watch the publish run
-gh run watch --exit-status
-```
-
-If the publish workflow fails:
-- Show logs: `gh run view <run-id> --log-failed`
-- **The tag and GitHub Release now exist but the version is NOT on PyPI — that is the failure mode this command works to avoid.** Tell the user to fix the cause and either re-run the workflow from the Actions tab (preferred — keeps the tag) or, if the artifact itself is bad, delete the Release + tag and re-cut after a fix. Never just leave a `--latest` Release pointing at a version absent from PyPI.
-
-### 10. VERIFY THE ARTIFACT IS INSTALLABLE
-
-A green workflow means "upload returned OK," not "resolvable from the index" — CDN propagation or a metadata issue can lag. Confirm the version is actually live before declaring success. Derive the project name from `pyproject.toml` (`[project] name`) rather than hardcoding it:
-
-```bash
-NAME=$(grep -m1 '^name' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')   # claude-jacked
-# Poll the index until the new version appears in releases
-curl -fsSL "https://pypi.org/pypi/${NAME}/json" | grep -q '"X.Y.Z"'
-# Optional stronger proof — clean install in a throwaway env:
-uv tool install "${NAME}@X.Y.Z" --force
-```
-
-> Naming caveat to confirm, not assume: `pyproject.toml` declares `name = "claude-jacked"`, but `publish.yml`'s environment url is `https://pypi.org/p/jacked`. If install verification 404s, the Trusted Publisher / project name may be registered under a different name than the wheel — surface this to the user instead of guessing.
-
-Once the version is confirmed resolvable, confirm (use the derived `$NAME`, do not hardcode):
-
-```
-Release vX.Y.Z complete and installable!
-- GitHub: https://github.com/jackneil/claude-jacked/releases/tag/vX.Y.Z
-- PyPI:   https://pypi.org/project/<NAME>/X.Y.Z/
-- Install: uv tool install <NAME>@X.Y.Z
-```
+Then report the concrete artifact: the Release URL, the index/registry URL + install line, or the live app URL — whichever the model produced.
 
 ## HARD RULES
 
-- Never force push without explicit user approval
-- The tag and GitHub Release must NOT outlive a failed PyPI upload — gate on a local build + `twine check` + tests (step 4) BEFORE tagging; this repo's CI does not test for you
-- Never create a release if a real test gate is red — locally in step 4, or a push CI run if one exists
-- Never skip the version bump — PyPI rejects duplicate versions
-- Always verify the publish workflow succeeds AND the version is installable from the index before declaring done
-- Derive the project name from pyproject; don't hardcode PyPI URLs
-- If anything fails, stop and report — do not retry destructively
+- Read the shipping model from config or detect it FIRST; when the model or publish target is ambiguous, STOP and ask. Never guess a publish target or push to the wrong branch.
+- Never publish to a package index for a repo that has no package (pr-to-main-deploy / private app). Never invent a publish step the repo's own CI doesn't do.
+- Reversible before irreversible: gate (build + tests, the repo's OWN) must be green BEFORE any tag/publish/merge-to-deploy. Never tag/ship a red tree.
+- Never force-push without explicit approval. Never `--squash`/`--rebase`/`--admin`-merge a release PR — use a true merge commit.
+- Never skip the version bump for a versioned model (indexes reject duplicate versions) — and never bump for a model that doesn't version (calver/pr-to-main-deploy).
+- A tag/Release must NOT outlive a failed publish/deploy — verify the artifact is actually live/installable (or the deploy is actually up) before declaring done.
+- If anything fails, stop and report — do not retry destructively.
