@@ -8,7 +8,8 @@ If this command was invoked via a local config wrapper (you see a `## Repo Confi
 - **Browser Tool** specified? → Skip Step 1, use the declared tool directly (fall back to detection if unavailable)
 - **Stack** declared? → Skip tech stack inference in Step 2
 - **Dev Server Port** specified? → Use it in Step 3 URL construction (still check `lsof` as fallback)
-- **Component Paths** listed? → Use as focus hints for which pages to prioritize in Step 3
+- **`## Dev Servers`** table present (multi-server / monorepo repo)? → In Step 6, bring up ALL listed servers (a frontend pointed at a dead backend fails silently) before testing — this supersedes a single `Dev Server Port`
+- **Component Paths** listed? → Use as focus hints for which pages to prioritize in Step 3. These may be per-app (e.g. ``apps/desktop/src/...` (desktop)``) when the repo has `apps/*/` — treat each app's paths as scoping hints for the app that owns the changed file
 - **Credential Hints** listed? → Use those variable names in Step 4 credential search
 - **UX Focus Areas** listed? → Emphasize those aspects in your test plan across all agents
 
@@ -159,6 +160,12 @@ After identifying changed files, classify each by impact scope using **filename 
 
 **Important:** When Tier 1 expands the page list to "all pages," the existing agent cap (4 max) and prioritization rules from the Build Test Matrix step still apply. Group pages intelligently and prioritize those most affected by the changes.
 
+### Monorepo Scoping (apps/*/ and packages/* layouts)
+
+In a monorepo (`apps/*/` or `packages/*/` layout), scope Tier classification to the app that OWNS the changed file — the nearest `apps/*/` boundary above it. A `shared/` (or Tier-1) change under `apps/web/` is Tier 1 for **`apps/web` only**, not every app in the repo — don't fan a web-scoped change out across `apps/admin`, `apps/desktop`, etc.
+
+A change under `packages/*` (a shared library consumed by multiple apps) is the exception: enumerate the apps that actually import/consume that package and test EACH consuming app's own URL — not just one. Use each app's per-app **Component Paths** (from the config or `apps/*/` structure) to map the change to the right app URL.
+
 ### Announce Cross-Page Analysis
 
 If no changed files were detected at all:
@@ -271,9 +278,11 @@ and any re-run; you are READ-ONLY at each such step until ALL of (a)–(d) pass.
 (a)–(d) gate above before any mutating interaction (a `localhost` argument clears only check (a),
 never the process-DB / outbound / you-started checks).
 
-**Otherwise**, try to detect a running dev server:
-1. Check conversation context for recently mentioned URLs
-2. Run `lsof -i -P -sTCP:LISTEN | grep -E ':(3000|3001|4200|5000|5173|5174|8000|8080|8765|8888) '`
+**Otherwise**, detect the dev server(s) in this order:
+1. **`## Dev Servers` table declared** (multi-server / monorepo)? → ensure EVERY listed server is up before testing — a frontend whose backend API is dead is the #1 real "looks broken" failure. Start any that aren't listening (honoring each app's "server may be user-managed, don't kill it" note), and respect the (a)–(d) isolation gate above for any server you start. Map each changed file to the app that owns it (nearest `apps/*/` boundary) so agents test on the right app URL.
+2. **Single `Dev Server Port` set** (config or context)? → use it.
+3. Check conversation context for recently mentioned URLs
+4. Run `lsof -i -P -sTCP:LISTEN | grep -E ':(1420|1421|3000|3001|4000|4173|4200|4321|5000|5173|5174|6006|8000|8001|8080|8765|8888) '`
 
 If found, use it. If multiple, ask the user. If none, ask for the URL.
 

@@ -12,6 +12,8 @@ If this command was invoked via a local config wrapper (you see a `## Repo Confi
 - **Browser Tool** specified? → Skip Step 1, use the declared tool directly (fall back to detection if it's unavailable)
 - **Stack** declared? → Skip tech stack inference in Step 2
 - **Dev Server Port** specified? → Use it in Step 4 URL detection (still check `lsof` as fallback)
+- **`## Dev Servers`** table present (multi-server / monorepo repo)? → In Step 4, bring up ALL listed servers (a frontend pointed at a dead backend fails silently) before testing — this supersedes a single `Dev Server Port`
+- **Component Paths** may be per-app (e.g. ``apps/desktop/src/...` (desktop)``) when the repo has `apps/*/` — treat each app's paths as scoping hints for the app that owns the changed file
 - **Credential Hints** listed? → Use those variable names in Step 5 credential search
 - **Framework-Specific Checks** listed? → Add them to Step 6 QA pass (in addition to standard checks)
 
@@ -127,9 +129,11 @@ replay/iterate-until-green re-run; you are READ-ONLY at each such step until ALL
 (a)–(d) gate above before any mutating interaction (a `localhost` argument clears only check (a),
 never the process-DB / outbound / you-started checks).
 
-**Otherwise**, try to detect a running dev server:
-1. Check conversation context for recently mentioned URLs (e.g., `http://localhost:3000`)
-2. Run `lsof -i -P -sTCP:LISTEN | grep -E ':(3000|3001|4200|5000|5173|5174|8000|8080|8765|8888) '` to find common dev server ports
+**Otherwise**, detect the dev server(s) in this order:
+1. **`## Dev Servers` table declared** (multi-server / monorepo)? → ensure EVERY listed server is up before testing — a frontend whose backend API is dead is the #1 real "looks broken" failure. Start any that aren't listening (honoring each app's "server may be user-managed, don't kill it" note), and respect the (a)–(d) isolation gate for any server you start. In a monorepo, map each changed file to the app that owns it (nearest `apps/*/` boundary) so you test on the right server.
+2. **Single `Dev Server Port` set** (config or context)? → use it.
+3. Check conversation context for recently mentioned URLs (e.g., `http://localhost:3000`)
+4. Run `lsof -i -P -sTCP:LISTEN | grep -E ':(1420|1421|3000|3001|4000|4173|4200|4321|5000|5173|5174|6006|8000|8001|8080|8765|8888) '` to find common dev server ports
 
 If a server is found, use it. If multiple are found, ask the user which one. If none found, ask the user for the URL.
 

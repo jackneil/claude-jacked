@@ -8,7 +8,7 @@ description: Use when a branch has code changes that may have made documentation
 
 If this command was invoked via a local config wrapper (you see a `## Repo Config` section earlier in the prompt), use that config to accelerate sync:
 - **Base Branch** specified? → Use it instead of auto-detecting in Step 1
-- **Doc Inventory** listed? → Skip doc discovery in Step 1, use the listed files (validate with `ls` first, skip missing)
+- **Doc Inventory** listed? → Skip doc discovery in Step 1, use the listed files (validate with `ls` first, skip missing). **This also seeds Step 2.5's staleness/symbol-drift sweep** — if the inventory names living-doc locations outside the default set (root `*.md`, `docs/`, `_wiki/`, `CLAUDE.md`/`AGENTS.md`), e.g. `specs/`, `documentation/`, `guides/`, `adr/`, you MUST add them to `DOC_CANDIDATES` there. A config-declared source-of-truth doc must never be silently skipped by the sweep.
 - **Change-to-Doc Map** specified? → Use it in Step 3 instead of the default mapping
 - **Staleness Defaults** specified (age / drift days)? → Use them as the repo-wide defaults in Step 2.5 (a per-doc `ttl_days` frontmatter contract still wins over the repo default). To make this actually take effect, substitute the configured values inline into the Step 2.5a bash: replace `DEFAULT_AGE_DAYS=${DOCS_SYNC_AGE_DAYS:-90}` with the configured age (e.g. `DEFAULT_AGE_DAYS=60`) and `DEFAULT_DRIFT_DAYS=${DOCS_SYNC_DRIFT_DAYS:-30}` with the configured drift, OR export `DOCS_SYNC_AGE_DAYS` / `DOCS_SYNC_DRIFT_DAYS` before running that block so the `${VAR:-default}` expansion picks them up. The `90`/`30` literals are field fallbacks only — when the config supplies values, they must override.
 
@@ -41,8 +41,9 @@ ls _wiki/*.md 2>/dev/null | head -30
 grep -n "^#" CLAUDE.md 2>/dev/null | head -20
 grep -n "^#" AGENTS.md 2>/dev/null | head -20
 
-# docs/ directory
-find docs -name "*.md" -maxdepth 2 2>/dev/null | head -20
+# docs/ and specs/ directories (this project defaults human docs to HTML; sweep both,
+# and go deep — a real spec tree lives at docs/superpowers/specs/, depth 3)
+find docs specs \( -name "*.md" -o -name "*.html" \) 2>/dev/null | head -30
 
 # Other root-level markdown
 ls *.md 2>/dev/null
@@ -114,13 +115,25 @@ Use git's last-commit timestamp throughout (filesystem mtime is unreliable — i
 ```bash
 NOW=$(date +%s)
 
-# Collect candidate doc files (root markdown, docs/, _wiki/, agent-instruction files)
+# Collect candidate doc files (root markdown, docs/, _wiki/, agent-instruction files).
+# IMPORTANT: if the Repo Config ## Doc Inventory (or any doc's `sources:` frontmatter)
+# names living-doc locations OUTSIDE this default set — e.g. specs/, documentation/,
+# guides/, adr/ — add a matching `find` line below BEFORE running, so those docs are
+# swept for staleness AND symbol drift too. Step 1 and Step 3 already honor the
+# inventory; this sweep MUST match it, or config-declared source-of-truth docs are
+# silently skipped (the #1 reported gap).
 DOC_CANDIDATES=$(
   {
-    ls *.md 2>/dev/null
-    find docs -name "*.md" 2>/dev/null
-    find _wiki -name "*.md" 2>/dev/null
+    # Sweep .html alongside .md: this project defaults human docs to HTML, and
+    # several repos keep canonical docs in specs/ or an all-.html docs/ tree —
+    # an .md-only sweep silently skips them.
+    ls *.md *.html 2>/dev/null
+    find docs \( -name "*.md" -o -name "*.html" \) 2>/dev/null
+    find _wiki \( -name "*.md" -o -name "*.html" \) 2>/dev/null
+    find specs \( -name "*.md" -o -name "*.html" \) 2>/dev/null
     find . -maxdepth 4 \( -name "CLAUDE.md" -o -name "AGENTS.md" \) 2>/dev/null
+    # + config-declared doc dirs from ## Doc Inventory — add one per repo, e.g.:
+    # find documentation \( -name "*.md" -o -name "*.html" \) 2>/dev/null
   } | sort -u
 )
 

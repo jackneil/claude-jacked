@@ -75,11 +75,14 @@ Read these files if they exist (skip gracefully if missing):
 Check for common planning files:
 ```bash
 ls ROADMAP.md IMPLEMENTATION_STATUS.md TODO.md BACKLOG.md FEEDBACK_BACKLOG.md GUARDRAILS.md 2>/dev/null
-ls docs/ docs/plans/ docs/specs/ design/ .claude/plans/ 2>/dev/null
-find docs design .claude/plans \( -name "*.md" -o -name "*.html" \) 2>/dev/null | head -20
+# Root-level roadmap/plan/spec/backlog files under any name (case-insensitive) —
+# a real repo keeps its roadmap at specs/10-roadmap-and-ideas.md, not ROADMAP.md.
+ls | grep -iE '(roadmap|plan|spec|backlog)' 2>/dev/null
+ls docs/ docs/plans/ docs/specs/ specs/ rfcs/ planning/ adr/ product/ design/ .claude/plans/ 2>/dev/null
+find docs specs rfcs planning adr product design .claude/plans \( -name "*.md" -o -name "*.html" \) 2>/dev/null | head -40
 ```
 
-**Context budget:** Read at most 10 files, at most 200 lines each. Prioritize:
+**Context budget:** Read at most 10 files, at most 200 lines each (config-declared Planning Artifacts from a Config Override still take precedence over anything found here). Prioritize:
 1. Files containing `ROADMAP`, `STATUS`, `BACKLOG`, `FEEDBACK`, `IMPLEMENTATION` in the name
 2. Files in `.claude/plans/` (in-progress work)
 3. Other docs by recency

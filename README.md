@@ -28,13 +28,13 @@ Install claude-jacked for me. Use AskUserQuestion to ask me which features I wan
 2. Ask me which install tier I want:
    - BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard
    - SEARCH: Everything above + search past Claude sessions across machines (requires Qdrant Cloud)
-   - SECURITY: Everything above + auto-approve safe bash commands (fewer permission prompts)
+   - SECURITY: Everything above + the LLM security gatekeeper enabled (installed by every tier, but disabled by default — this tier turns it on)
    - ALL: Everything
 3. Install based on my choice:
    - BASE: uv tool install claude-jacked && jacked install --force
    - SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
-   - SECURITY: uv tool install claude-jacked && jacked install --force --security
-   - ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
+   - SECURITY: uv tool install claude-jacked && jacked install --force  (then enable the gatekeeper from the dashboard: Settings > Gatekeeper)
+   - ALL: uv tool install "claude-jacked[all]" && jacked install --force  (then enable the gatekeeper from the dashboard)
 4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
 5. Verify with: jacked --help
 6. Launch the dashboard: jacked webux
@@ -63,7 +63,7 @@ Add to your team's Claude Code environment — no Python install needed:
 /plugin install jacked@jacked-marketplace
 ```
 
-Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 26 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 30 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
 
 **Want more?** Add optional extras:
 
@@ -91,7 +91,7 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 ### Toggle Features On and Off
 
-Enable or disable any of the 10 built-in code reviewers and 25 slash commands with one click. Each card shows what it does so you know what you're turning on.
+Enable or disable any of the 10 built-in code reviewers and 30 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
 ![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
 
@@ -118,7 +118,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable any of the 25 slash commands.
+**Commands** — Enable or disable any of the 30 slash commands.
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
 
@@ -156,7 +156,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **26 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/techdebt`, `/audit-rules`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **30 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -310,8 +310,8 @@ source ~/.zshrc   # or ~/.bashrc
 # 3. Verify
 uv --version
 
-# 4. Install jacked + tray icon
-uv tool install "claude-jacked[tray]"
+# 4. Install jacked (tray icon ships by default)
+uv tool install claude-jacked
 
 # 5. Wire up Claude Code hooks + the launchd auto-start + tray
 jacked install
@@ -336,8 +336,8 @@ source ~/.bashrc   # or ~/.zshrc / ~/.profile
 # 3. Verify
 uv --version
 
-# 4. Install jacked
-uv tool install "claude-jacked[tray]"
+# 4. Install jacked (tray icon ships by default)
+uv tool install claude-jacked
 
 # 5. Wire up Claude Code hooks + start the tray
 jacked install
@@ -362,8 +362,8 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 # 3. Verify
 uv --version
 
-# 4. Install jacked
-uv tool install "claude-jacked[tray]"
+# 4. Install jacked (tray icon ships by default)
+uv tool install claude-jacked
 
 # 5. Wire up Claude Code hooks + Startup-folder auto-start + tray
 jacked install
@@ -466,11 +466,14 @@ Approve commands directly from the **Logs** page. Click "Always Allow" on any lo
 
 ### Install / Uninstall
 
+The gatekeeper hook ships with every install (`jacked install --force`) but starts **disabled** — enable it from the dashboard (Settings > Gatekeeper). To install without the hook at all, pass `--no-security`:
+
 ```bash
-jacked install --force --security
+jacked install --force                # gatekeeper hook installed, disabled by default
+jacked install --force --no-security  # skip the gatekeeper hook entirely
 ```
 
-To remove just the security hook:
+To remove just the security hook after the fact:
 ```bash
 jacked uninstall --security
 ```
@@ -600,14 +603,17 @@ Type these directly in Claude Code:
 | `/demo-video` | **Demo Video** — Produces a polished, narrated feature walkthrough video for docs/education from a committed narration script (Playwright recording + timed `say`/TTS voiceover + captions, muxed with ffmpeg) — regenerable when the UI changes |
 | `/whats-next` | **Roadmap Advisor** — Weighs a coverage-matrix read (toward 10/10) plus plans, issues, commits, lifecycle, and (when configured) assigned Asana tasks, then **decides the single highest-leverage initiative** and forges a ready-to-run `/goal` brief (≤4000 chars) for autonomous, tested delivery |
 | `/goal-maker` | **Goal Forge** — Packages the work already in front of you (this conversation, a spec, a plan, an in-flight build) into one overnight-sized `/goal` brief (≤4000 chars) — full scope, TDD, UI/UX + polish gates, evidence-based DONE, plan-ahead `Next:`. Defaults to PR; `merge` arg auto-merges each milestone on green CI |
+| `/bhag` | **Big Hairy Audacious Goal** — Autonomous full-product build-out: drives the entire coverage matrix cell-by-cell and, on a pre-production repo you explicitly authorize, opens a PR and merges each verified improvement to `main` in a loop until built out. Deliberately typed, never auto-triggered; refuses auto-merge on any live-users repo |
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
 | `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
 | `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
 | `/redo` | **Redo** — Scraps the current approach and re-implements cleanly with full hindsight |
+| `/retry` | **Retry** — Recovers from a transient API/rate-limit error: figures out where the turn fell off and resumes only what's needed, without changing the task |
 | `/techdebt` | **Tech Debt** — Scans for TODOs, oversized files, missing tests, dead code |
 | `/audit-rules` | **Audit Rules** — Checks CLAUDE.md for duplicates, contradictions, stale rules |
+| `/cleanup` | **Cleanup** — Verifies git hygiene and safely cleans branches, stashes, stale worktrees, and untracked state. Report-first, confirm-each, never loses work |
 | `/jacked-setup` | **Repo Setup** — Generates repo-specific configs for `/whats-next`, `/qa`, `/ux`, `/dcr`, `/docs-sync` — faster repeat runs |
-| `/freeze` | **Freeze** — Restricts file edits to a single directory, enforced by the security gatekeeper |
+| `/freeze` | **Freeze** — Restricts file edits to a single directory, enforced by the security gatekeeper. Requires the gatekeeper to be **enabled** (Settings > Gatekeeper) — with it disabled (the default), the freeze file is written but not enforced |
 | `/unfreeze` | **Unfreeze** — Removes the edit restriction set by `/freeze` |
 | `/cso` | **Security Audit** — Systematic OWASP Top 10 + STRIDE threat model analysis with confidence-gated findings |
 | `/retro` | **Retrospective** — Git history analysis for contributor metrics, test health, velocity trends |
@@ -716,6 +722,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.67.0** | **Engines stop assuming they're claude-jacked itself: config-declared + HTML docs, and monorepo-aware browser QA.** A fleet audit found the commands hardcoded a single-repo, `docs/`-only, one-dev-server shape. Fixes: (1) **`/docs-sync` + `/whats-next` + `/jacked-setup` doc discovery** now sweeps `.html` alongside `.md` (this project defaults docs to HTML) and probes `specs/`, `guides/`, `rfcs/`, `adr/`, `planning/`, `product/` — not just `docs/`/`_wiki/` — so canonical docs kept in `specs/` or an all-`.html` tree are no longer silently skipped; the `## Doc Inventory`/`## Planning Artifacts` a config generates also seed the staleness sweep. (2) **`/qa` + `/ux` are monorepo-aware**: a new `## Dev Servers` config block brings up **all** required servers before testing (a frontend pointed at a dead backend API was passing as "works"), per-app `Component Paths`, a broadened dev-server port scan (adds 1420/1421 Tauri, 4000, 4173, 4321, 6006, 8001…), and `apps/*/`-scoped blast-radius so a `apps/web` change doesn't fan out across every app. (3) A 3-pass **README accuracy audit** reconciled three inconsistent command counts (25/26 → **30**) and rebuilt the list; fixed a dead `jacked install --force --security` flag (now `--force`; enable the gatekeeper from Settings), the pre-0.41.0 hook-config `python /path` form (→ `"<path>/jacked" _hook …` shims), a nonexistent `/api/permissions/*` route (→ `/api/claude-settings/*`), and stale `[tray]` install extras. |
 | **0.66.0** | **`recursive-10-10-product-hardening` skill ported in (from Codex).** An autonomous product-hardening skill whose distinct move is a **code-derived behavior-spec workbook**: inventory every feature, write each one's expected behavior *from the source* (cited `file:function`), then loop test→fix→retest until every row is evidence-`Verified`. Thin glue over existing capabilities — delegates scoring to `coverage-matrix`, the persona×workflow crawl + `measure.js` to `aesthetic-dogfood-audit`, and the browser toolchain to `/qa`/`/ux` — and carries their UI-isolation fail-closed gate verbatim (it writes fixes against a running app), the backstop philosophy (no success caps; halt only on a no-progress loop, an unsafe step, or an all-blocked worklist), and the evidence-over-assertion + test-integrity rules. Defaults the workbook to HTML (xlsx optional export) and **never auto-merges** — fixes land in the working tree and hand off to `/pr` (continuous matrix auto-merge stays `/bhag`'s job). |
 | **0.65.0** | **Two launch/branding skills bundled in (`launch-post`, `logo-forge`).** `launch-post` (skill) — turns the current repo into a high-performing X/Twitter launch: survey the work for the demoable "wow," draft the main tweet + threaded replies (link in the FIRST reply, never the main tweet), make mandatory media, get explicit human approval, then publish via a hand-rolled OAuth 1.0a poster (`x_post.py`) with chunked video upload. Hardened for distribution: the success URL is now derived from the **authed** account (no hardcoded handle), and `x_post.py` carries PEP 723 inline metadata so `uv run` provisions `requests` with no venv/`pip`. `logo-forge` (skill) — designs an ownable logo set (icon + full favicon set + apple-touch + Open Graph/Twitter social cards) via Higgsfield image models + ImageMagick and deploys it into a target repo (Next.js or static; worktree-safe branch+PR). `og-card.sh` now resolves a bold sans on macOS, Linux (DejaVu/Liberation/Noto or fontconfig), or Windows, and every script fails loud if ImageMagick is missing. Both need their own external setup (X API OAuth 1.0a creds for `launch-post`; the paid Higgsfield CLI for `logo-forge`'s generated-art path). |
 | **0.64.3** | **`fix(codex)`: usage stuck at 0% fixed; Codex vs. Claude made obvious in the account dropdown.** |
@@ -809,9 +816,10 @@ jacked delete <session_id>         # Remove from index
 jacked cleardb                     # Delete all your data
 
 # Setup
-jacked install --force              # Install agents, commands, rules
-jacked install --force --security  # Also add security gatekeeper hook
+jacked install --force              # Install agents, commands, rules, tray + gatekeeper hook (disabled by default)
+jacked install --force --no-security  # Install without the security gatekeeper hook
 jacked install --force --sounds    # Also add sound notifications
+jacked install --force --no-tray   # Install without the tray icon
 jacked uninstall                   # Remove from Claude Code
 jacked uninstall --sounds          # Remove only sounds
 jacked uninstall --security        # Remove only security hook
@@ -845,9 +853,10 @@ jacked service stop                # Stop running service
 jacked service restart             # Restart service
 jacked service status              # Show PID, port, uptime, autostart state
 
-# Slash Commands
-# /dc /dcr /docs-sync /pr /learn /redo /techdebt /audit-rules /qa /ux
-# /swarm /swarm-research /release /whats-next /jacked-setup
+# Slash Commands (30 total)
+# /dc /dcr /docs-sync /pr /learn /redo /retry /techdebt /audit-rules /cleanup
+# /qa /qa-video /demo-video /ux /swarm /swarm-research /release
+# /whats-next /goal-maker /bhag /jacked-setup
 # /freeze /unfreeze /cso /lockdown /retro /canary /benchmark
 # /land-and-deploy /browser-reset
 ```
@@ -887,7 +896,7 @@ The dashboard is a local web application:
 
 All data stays on your machine. The dashboard reads Claude Code's configuration files (`~/.claude/settings.json`, `~/.claude/agents/`, etc.) and provides a visual interface for managing them.
 
-**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`, `/api/profiles/*`, `/api/permissions/*`
+**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`, `/api/profiles/*`, `/api/claude-settings/*` (permissions)
 
 </details>
 
@@ -945,7 +954,7 @@ All data stays on your machine. The dashboard reads Claude Code's configuration 
 <details>
 <summary><strong>Hook Configuration</strong></summary>
 
-The `jacked install` command adds hooks to `~/.claude/settings.json`:
+The `jacked install` command adds hooks to `~/.claude/settings.json`. Since 0.41.0 the QA-suggest and gatekeeper hooks are written as upgrade-safe `jacked _hook <name>` shims (the shim resolves the current handler internally, so the entry survives `uv tool upgrade` and Python version bumps). The session-indexing Stop hook uses the plain `jacked index` command:
 
 ```json
 {
@@ -957,18 +966,18 @@ The `jacked install` command adds hooks to `~/.claude/settings.json`:
       },
       {
         "matcher": "",
-        "hooks": [{"type": "command", "command": "python /path/to/qa_suggest.py", "async": true}]
+        "hooks": [{"type": "command", "command": "\"/path/to/jacked\" _hook qa_suggest", "async": true}]
       }
     ],
     "PreToolUse": [{
       "matcher": "",
-      "hooks": [{"type": "command", "command": "python /path/to/security_gatekeeper.py", "timeout": 30}]
+      "hooks": [{"type": "command", "command": "\"/path/to/jacked\" _hook security_gatekeeper", "timeout": 30}]
     }]
   }
 }
 ```
 
-The PreToolUse matcher is an empty string (catch-all) — the gatekeeper script internally dispatches by tool type and checks the tool registry for per-tool enable/disable settings.
+The PreToolUse matcher is an empty string (catch-all) — the gatekeeper dispatches by tool type internally and checks the tool registry for per-tool enable/disable settings. `jacked install` also registers a `PermissionRequest` hook and lightweight session-tracker hooks (`SessionStart`, `Notification`, `SessionEnd`, `Stop`) that keep the dashboard's account/session views live.
 
 </details>
 
@@ -993,20 +1002,20 @@ Question: "Which jacked features do you want?"
 Options:
 - BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard. No external services needed.
 - SEARCH: Everything in BASE + search past Claude sessions across machines. Requires Qdrant Cloud (~$30/mo).
-- SECURITY: Everything in BASE + auto-approve safe bash commands. Fewer permission prompts.
+- SECURITY: Everything in BASE, then enable the LLM security gatekeeper. The gatekeeper hook ships in every install but is disabled by default; this tier turns it on from the dashboard.
 - ALL: Everything. Requires Qdrant Cloud + Anthropic API key for fastest security evaluation.
 
 PHASE 3 - INSTALL:
 Based on user choice:
 - BASE: uv tool install claude-jacked && jacked install --force
 - SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
-- SECURITY: uv tool install claude-jacked && jacked install --force --security
-- ALL: uv tool install "claude-jacked[all]" && jacked install --force --security
+- SECURITY: uv tool install claude-jacked && jacked install --force   (then enable the gatekeeper in the dashboard: Settings > Gatekeeper)
+- ALL: uv tool install "claude-jacked[all]" && jacked install --force   (then enable the gatekeeper in the dashboard)
 
 PHASE 4 - POST-INSTALL:
 - Launch dashboard: jacked webux
 - If SEARCH or ALL: help set up Qdrant Cloud credentials
-- If SECURITY or ALL: show how to monitor gatekeeper in the dashboard (Logs page)
+- If SECURITY or ALL: enable the gatekeeper (Settings > Gatekeeper) and show how to monitor it in the dashboard (Logs page)
 
 PHASE 5 - VERIFY:
 - jacked --help

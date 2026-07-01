@@ -101,10 +101,11 @@ Run additional analysis based on the target(s) being generated.
 ### For `whats-next`:
 
 ```bash
-# Planning artifacts
+# Planning artifacts (planning docs live beyond docs/ + design/ — several repos keep them under
+# specs/, rfcs/, planning/, adr/, product/. Sweep BOTH *.md and *.html, deep enough for nested trees.)
 ls ROADMAP.md IMPLEMENTATION_STATUS.md TODO.md BACKLOG.md FEEDBACK_BACKLOG.md 2>/dev/null
-ls -d docs docs/plans docs/specs design .claude/plans 2>/dev/null
-find docs design .claude/plans \( -name "*.md" -o -name "*.html" \) -maxdepth 2 2>/dev/null | head -20
+ls -d docs docs/plans docs/specs design specs rfcs planning adr product .claude/plans 2>/dev/null
+find docs design specs rfcs planning adr product .claude/plans \( -name "*.md" -o -name "*.html" \) -maxdepth 3 2>/dev/null | head -30
 ```
 
 ```bash
@@ -173,13 +174,16 @@ grep -l "tailwind\|bootstrap\|bulma\|material-ui\|chakra\|styled-components" pac
 ```
 
 ```bash
-# Component paths
+# Component paths (root AND per-app/per-package for monorepos — apps/*/ and packages/*/)
 ls -d src/components app/components components 2>/dev/null
+ls -d apps/*/src/components apps/*/app/components apps/*/components packages/*/src/components 2>/dev/null
 ```
 
 ```bash
-# Dev server port hints
+# Dev server port hints (root .env + package.json, PLUS per-app package.json "scripts"/ports and
+# per-app env so a monorepo's frontend + backend each surface their own port)
 grep -E "port|PORT" .env .env.local .env.development package.json 2>/dev/null | head -5
+grep -E "port|PORT" apps/*/package.json apps/*/.env apps/*/.env.local packages/*/package.json 2>/dev/null | head -10
 ```
 
 ```bash
@@ -263,11 +267,13 @@ ls .github/workflows/update-wiki.yml .github/workflows/wiki*.yml 2>/dev/null
 # CLAUDE.md sections
 grep -n "^#" CLAUDE.md 2>/dev/null | head -20
 
-# docs/ directory
-find docs -name "*.md" -maxdepth 2 2>/dev/null | head -20
+# Doc directories (canonical docs live in more than docs/ — this project defaults docs to HTML,
+# and several repos keep them under specs/, guides/, rfcs/, etc.). Sweep BOTH *.md and *.html,
+# and go deep enough for nested spec trees (e.g. docs/superpowers/specs/, depth 3).
+find docs specs guides rfcs adr documentation apps/docs \( -name "*.md" -o -name "*.html" \) -maxdepth 3 2>/dev/null | head -40
 
-# Other root-level markdown
-ls *.md 2>/dev/null
+# Other root-level markdown and HTML
+ls *.md *.html 2>/dev/null
 ```
 
 **No-wiki handling:** If no `_wiki/` directory found, note "no wiki" in the config. Do NOT offer to scaffold one during setup — that's a runtime decision.
@@ -399,6 +405,7 @@ description: "Roadmap advisor — standalone (generated <date>; upgrade jacked +
 ## Planning Artifacts
 Validate paths before reading (skip missing ones silently):
 <list each discovered path>
+<Also WRITE the discovered non-default plan dirs (anything beyond the default docs/ + design/ + .claude/plans/ — e.g. a root specs/, rfcs/, planning/) so the standalone whats-next reads them too.>
 
 ## TODO Scan Extensions
 Include: <file extensions for detected languages>
@@ -456,8 +463,19 @@ description: "Browser QA — standalone (generated <date>; upgrade jacked + re-r
 - **Project**: <name>
 - **Stack**: <frontend framework, CSS framework>
 - **Browser Tool**: <Playwright MCP|Claude-in-Chrome|agent-browser|none detected>
-- **Dev Server Port**: <port if detected, or "auto-detect">
-- **Component Paths**: <paths if found>
+- **Dev Server Port**: <SINGLE-APP ONLY: port if detected, or "auto-detect". OMIT this scalar and emit the ## Dev Servers block below instead when more than one server/app is detected.>
+- **Component Paths**: <SINGLE-APP: `paths if found`. MULTI-APP (apps/*/ exist): make per-app, e.g. `apps/desktop/src/...` (desktop), `apps/admin/src/...` (admin)>
+
+<!-- Generated ONLY when more than one server or app is detected (e.g. apps/*/, or a frontend + a
+     backend like FastAPI on :8001). Single-app repos keep the scalar `- **Dev Server Port**` above
+     and OMIT this block entirely. Start ALL listed servers before QA — a frontend pointed at a dead
+     backend fails silently and "looks broken". -->
+## Dev Servers
+Start ALL of these before browser QA — a frontend pointed at a dead backend fails silently and "looks broken":
+| Name | Port | Start command | Role |
+|------|------|---------------|------|
+| desktop | 1420 | `pnpm dev:desktop` | frontend |
+| cloud | 8001 | `cd apps/cloud && uv run uvicorn app.main:app --reload --port 8001` | backend |
 
 ## Credential Hints
 <variable names from env files, or "none found — ask user if login required">
@@ -508,8 +526,19 @@ description: "Parallel UX checks — standalone (generated <date>; upgrade jacke
 - **Project**: <name>
 - **Stack**: <frontend framework, CSS framework>
 - **Browser Tool**: <Playwright MCP|Claude-in-Chrome|agent-browser|none detected>
-- **Dev Server Port**: <port if detected, or "auto-detect">
-- **Component Paths**: <paths if found>
+- **Dev Server Port**: <SINGLE-APP ONLY: port if detected, or "auto-detect". OMIT this scalar and emit the ## Dev Servers block below instead when more than one server/app is detected.>
+- **Component Paths**: <SINGLE-APP: `paths if found`. MULTI-APP (apps/*/ exist): make per-app, e.g. `apps/desktop/src/...` (desktop), `apps/admin/src/...` (admin)>
+
+<!-- Generated ONLY when more than one server or app is detected (e.g. apps/*/, or a frontend + a
+     backend like FastAPI on :8001). Single-app repos keep the scalar `- **Dev Server Port**` above
+     and OMIT this block entirely. Start ALL listed servers before QA — a frontend pointed at a dead
+     backend fails silently and "looks broken". -->
+## Dev Servers
+Start ALL of these before browser QA — a frontend pointed at a dead backend fails silently and "looks broken":
+| Name | Port | Start command | Role |
+|------|------|---------------|------|
+| desktop | 1420 | `pnpm dev:desktop` | frontend |
+| cloud | 8001 | `cd apps/cloud && uv run uvicorn app.main:app --reload --port 8001` | backend |
 
 ## Credential Hints
 <variable names from env files, or "none found — ask user if login required">
@@ -609,11 +638,13 @@ description: "Docs sync — standalone (generated <date>; upgrade jacked + re-ru
 
 ## Doc Inventory
 <list each discovered doc file with detected sections>
+<Also WRITE the discovered non-default doc dirs (anything beyond the default docs/ + _wiki/ — e.g. specs/, guides/, rfcs/) as a "Doc dirs:" line so the standalone docs-sync's Step 2.5 sweep, which reads config-declared dirs and sweeps *.html, picks them up.>
 Examples:
 - README.md (sections: Install, Usage, Features, Config)
 - CLAUDE.md (sections: Architecture, Testing, Env Vars)
 - _wiki/ (N pages, has/no _Sidebar.md)
 - .github/workflows/update-wiki.yml (wiki CI: active/none)
+- Doc dirs: specs/ (12 files, .html), guides/ (4 files, .md)
 
 ## Change-to-Doc Map
 | Change Category | Affected Docs |
