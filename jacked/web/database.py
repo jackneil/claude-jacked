@@ -1235,7 +1235,14 @@ class Database:
             raw_str = json.dumps(raw)
             if len(raw_str) <= 10240:  # 10KB guard
                 updates["cached_usage_raw"] = raw_str
-        return self.update_account(account_id, **updates)
+        ok = self.update_account(account_id, **updates)
+        if ok:
+            # Wake same-process watchers (the menu-bar pill) immediately
+            # instead of leaving them to their slow poll heartbeat.
+            from jacked import usage_events
+
+            usage_events.bump()
+        return ok
 
     def record_account_error(
         self,

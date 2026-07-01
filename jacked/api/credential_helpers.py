@@ -695,3 +695,9 @@ def sync_credential_to_all_stores(
                 account_id,
                 exc,
             )
+
+    # The active account (what the menu-bar pill tracks) just changed —
+    # wake same-process watchers so the pill re-resolves immediately.
+    from jacked import usage_events
+
+    usage_events.bump()

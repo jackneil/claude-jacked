@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 
 # Pill + stop-watch cadence (seconds).
 PILL_INTERVAL = 30
+# Fast in-process change watcher: a 1s timer comparing jacked.usage_events
+# version (an int read — no HTTP/DB). The 30s PILL_INTERVAL poll stays as the
+# heartbeat for writers in OTHER processes (a separately-run `jacked webux`
+# sharing the SQLite file can't bump this process's counter).
+USAGE_WATCH_INTERVAL = 1.0
 STOP_POLL_INTERVAL = 1.0
 WIRE_RETRY_INTERVAL = 0.4  # poll for the status-item button after launch
 PANEL_WIDTH = 360  # side-panel / popover width in points
@@ -287,6 +292,17 @@ if RUMPS_AVAILABLE:
             self._refresh_pill(None)
             self._pill_timer = rumps.Timer(self._refresh_pill, PILL_INTERVAL)
             self._pill_timer.start()
+            # Event-driven pill: usage-cache writes and account switches bump
+            # jacked.usage_events in this same process; watching the counter
+            # updates the pill within ~1s of a dashboard refresh instead of
+            # waiting out the 30s poll.
+            from jacked import usage_events
+
+            self._usage_version = usage_events.version()
+            self._usage_watch_timer = rumps.Timer(
+                self._watch_usage_version, USAGE_WATCH_INTERVAL
+            )
+            self._usage_watch_timer.start()
             self._stop_timer = rumps.Timer(self._check_stop, STOP_POLL_INTERVAL)
             self._stop_timer.start()
             # The status-item button only exists after the app launches, so wire
@@ -341,6 +357,37 @@ if RUMPS_AVAILABLE:
 
             # Keep the version line / last-checked / autostart state fresh.
             self._refresh_version_menu()
+
+        def _watch_usage_version(self, _timer):
+            """Fire a full pill refresh + panel reload when the in-process
+            usage/active-account counter moved. Bumps arriving between ticks
+            coalesce into a single refresh (we compare against last-seen, not
+            count them), so a bulk refresh-all doesn't hammer the server."""
+            from jacked import usage_events
+
+            v = usage_events.version()
+            if v == self._usage_version:
+                return
+            self._usage_version = v
+            self._refresh_pill(None)
+            self._reload_panel_webviews()
+
+        def _reload_panel_webviews(self):
+            """Ask the dropdown/side-panel /panel pages to re-fetch their data.
+
+            WKWebView suspends JS timers while a view is offscreen (closed
+            popover, hidden panel), so the page's own 15s interval can't be
+            trusted to keep it fresh — an explicit evaluateJavaScript runs even
+            when the view is detached. Best-effort: a not-yet-loaded page just
+            no-ops (the guard in the JS snippet)."""
+            js = "window.__panelReload && window.__panelReload()"
+            for web in (self._popover_web, self._panel_web):
+                if web is None:
+                    continue
+                try:
+                    web.evaluateJavaScript_completionHandler_(js, None)
+                except Exception:
+                    logger.debug("panel webview reload nudge failed", exc_info=True)
 
         def _set_icon(self, color, update=False, provider="claude"):
             """Set the colored "J" icon (+ update badge + provider dot), only when
@@ -502,6 +549,8 @@ if RUMPS_AVAILABLE:
                 self._panel.orderOut_(None)
                 self._panel_visible = False
             else:
+                # Same suspended-timers caveat as the dropdown: reload on show.
+                self._reload_panel_webviews()
                 self._reposition_panel()
                 self._panel.orderFrontRegardless()
                 self._panel_visible = True
@@ -547,6 +596,9 @@ if RUMPS_AVAILABLE:
                 return
             from AppKit import NSMinYEdge
 
+            # The pre-warmed webview may have been sitting offscreen with its
+            # JS timers suspended — fetch fresh data the moment it's shown.
+            self._reload_panel_webviews()
             self._popover.showRelativeToRect_ofView_preferredEdge_(
                 button.bounds(), button, NSMinYEdge
             )

@@ -325,6 +325,10 @@ def swap_codex_account(
         "Swapped active Codex account -> %s (outgoing=%s, captured=%s)",
         target_id, outgoing_id, captured,
     )
+    # Active account changed — wake the menu-bar pill's in-process watcher.
+    from jacked import usage_events
+
+    usage_events.bump()
     return CodexSwapResult(
         ok=True,
         target_id=target_id,

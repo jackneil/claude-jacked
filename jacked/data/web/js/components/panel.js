@@ -162,13 +162,19 @@ function panelErrorHtml(message) {
         </div>`;
 }
 
-/** Fetch accounts + the menu-bar summary (active id + next-refresh), group, render. */
+/** Fetch accounts + the menu-bar summary (active id + next-refresh), group, render.
+ * Multiple triggers can race (interval, native reload nudge, visibilitychange) —
+ * a sequence counter drops any fetch that finished after a newer one started, so
+ * a slow stale response never overwrites fresher data. */
+let _loadSeq = 0;
 async function loadPanel(container) {
+    const seq = ++_loadSeq;
     try {
         const [accounts, summary] = await Promise.all([
             panelFetch('/api/auth/accounts'),
             panelFetch('/api/menubar-summary').catch(() => ({})),
         ]);
+        if (seq !== _loadSeq) return; // superseded by a newer load
         const activeId =
             summary && summary.active_account_id != null ? summary.active_account_id : null;
         const nextRefreshAt =
@@ -178,6 +184,7 @@ async function loadPanel(container) {
         const groups = groupAccountsByLogin(accounts, activeId);
         container.innerHTML = buildPanelHtml(groups, nextRefreshAt);
     } catch (err) {
+        if (seq !== _loadSeq) return; // superseded — don't clobber a good render
         container.innerHTML = panelErrorHtml(err && err.message ? err.message : String(err));
         const retry = document.getElementById('panel-retry');
         if (retry) retry.addEventListener('click', () => loadPanel(container));
@@ -291,6 +298,14 @@ function startPanel() {
     loadPanel(container);
     setInterval(() => loadPanel(container), PANEL_REFRESH_MS);
     startCountdownTicker();
+    // WKWebView suspends this page's timers while the popover/panel is
+    // offscreen, so the interval alone goes stale. The native agent calls
+    // __panelReload on show and whenever usage data changes in-process;
+    // visibilitychange covers plain browser tabs regaining focus.
+    window.__panelReload = () => loadPanel(container);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) loadPanel(container);
+    });
 }
 
 if (typeof document !== 'undefined' && document.addEventListener) {
