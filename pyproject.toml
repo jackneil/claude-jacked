@@ -43,7 +43,7 @@ dependencies = [
     # NSPanel hosting WKWebViews at /panel. Windows/Linux keep the existing
     # pystray tray and never resolve or install these (the marker gates them).
     "rumps>=0.4,<1; sys_platform == 'darwin'",
-    "pyobjc-framework-Cocoa>=10,<12; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10,<13; sys_platform == 'darwin'",
     "pyobjc-framework-WebKit>=10,<12; sys_platform == 'darwin'",
 ]
 
