@@ -56,11 +56,17 @@ git log --oneline --since="30 days ago" 2>/dev/null | wc -l
 git log --reverse --format="%ci" -1 2>/dev/null
 ```
 
-Detect version from common manifests:
+Detect version(s) — a monorepo versions per-package and the root may have none:
 ```bash
-grep -r "version" pyproject.toml package.json Cargo.toml go.mod setup.py 2>/dev/null | grep -iE '^\s*version\s*[=:]' | head -5
-grep -r "__version__" --include="*.py" -l 2>/dev/null | head -3
+# Root manifests (a `private`/version-less root, or a `*-tests`/tooling manifest, is NOT the product version)
+grep -rE '^\s*(version|__version__)\s*[=:]' pyproject.toml setup.py Cargo.toml go.mod 2>/dev/null | head -5
+grep -E '"(name|version|private)"' package.json 2>/dev/null | head -5
+# Workspace members — the real versions when the root is private/version-less
+grep -rE '^\s*version\s*[=:]|"version"' apps/*/package.json apps/*/pyproject.toml packages/*/package.json packages/*/Cargo.toml 2>/dev/null | head -10
+grep -rl "__version__" --include="*.py" 2>/dev/null | head -3
+ls -d .changeset releases 2>/dev/null   # changesets / CalVer release history
 ```
+When the root is `private`/version-less or a workspace, use the member versions; if several manifests disagree, trust the one whose `name` matches the repo/product over a `*-tests`/tooling manifest, and treat a `.changeset/` or `releases/` dir as a CalVer/changesets scheme. Lifecycle (Step 4) keys off the **product's** version, not whichever manifest sorted first.
 
 Read these files if they exist (skip gracefully if missing):
 - `README.md` or `README.rst` — product identity and target users
@@ -173,6 +179,8 @@ This is what makes the recommendation *strategic* rather than a to-do scrape. Re
    ```
 2. Otherwise do a **fast inline assessment** grounded in the codebase (no web/competitor research, no artifact): infer personas from RBAC/roles/nav/route-guards and the README's target users; infer domains/stages from configs, enums, module registries, or the core workflow; then read the biggest gaps using the Step 1-4 signals (issues, TODOs, plans) as evidence of where it already hurts. If the product effectively has one user type (a library, a single-user CLI, a personal tool), that's fine — use a 1×N read of that one persona across workflow stages. Do **not** invent personas or domains to fill a grid.
 3. If there's no matrix doc AND the codebase gives too little signal for a confident read (no RBAC/roles, no domain enums, no stated target users, sparse history), say so and offer: *"Run `/coverage-matrix` for a full scored gap analysis (parallel research + competitor benchmarking), then re-run `/whats-next` for a sharper call."* Absence of signal is a finding — never fill it in with invented personas, domains, or scores.
+
+**Monorepo — scope to one product.** If the repo is a workspace / `apps/*/` monorepo (see the version check in Step 1), the read is per-product: assess ONE product (the one the user named, else the primary app), inferring its personas/domains from THAT app — don't blend unrelated apps into one grid. A cross-product initiative is allowed, but name which apps it spans and confirm they share the lever (usually a shared `packages/*`).
 
 **Honesty bar — the inline path is feature-inventory only.** Because you haven't walked the workflow, an inline read is a **capability** read; it cannot honestly call a cell near-10/10 on *experience*. Name no persona, domain, or gap you can't tie to a concrete codebase signal (a role enum, a route guard, a README line, an issue, a TODO). Flag inferred-only judgments as inferred. When the call hinges on whether something is a 7 or a 9, lower your confidence and offer `/coverage-matrix` for a walked, scored read rather than commit big on a guess.
 

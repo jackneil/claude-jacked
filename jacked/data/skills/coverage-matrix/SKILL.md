@@ -51,6 +51,20 @@ digraph coverage_matrix {
 
 ---
 
+## Scope: one product at a time (monorepo check)
+
+The matrix scores ONE product — not a repo. A monorepo holds several independent products (a marketing site, an admin dashboard, a CLI, an API), and they do **not** share a persona×domain grid: blending them averages unrelated apps into one meaningless matrix and yields a "cross-cutting lever" computed across products that share no lever.
+
+Detect a multi-product repo: `pnpm-workspace.yaml`, a `package.json` `workspaces` field, `turbo.json`/`lerna.json`/`nx.json`, a Cargo `[workspace]`, `go.work`, or an `apps/*/` + `packages/*/` layout where each app carries its own manifest and user-facing surface.
+
+- **Single product** → proceed to Step 0 as normal.
+- **Multiple products** → score ONE: the product the user named, else the primary app (main UI / most activity), and confirm it. Discover roles (Step 1) and domains (Step 2) from THAT product's code, routes, and RBAC — not repo-wide. State the scope above the deliverable ("Matrix scoped to `apps/web`").
+- **Asked to cover the whole repo** → produce one matrix PER product (run the steps per product) and present them separately; identify genuine cross-product levers (a shared `packages/*` design system, a shared auth/lifecycle backbone) explicitly — never a single blended grid.
+
+Shared `packages/*` (design system, db, auth) aren't products with personas — they're **levers** that lift multiple products. Handle them in the cross-cutting-lever step (Step 6), not as matrix rows.
+
+---
+
 ## Step 0: Anchor on the Target Outcome
 
 Before discovering a single role or scoring a single cell, name **what "best-in-class" is supposed to MOVE**. Per Teresa Torres' Opportunity Solution Tree, all gap analysis hangs off a measurable outcome at the root — otherwise you optimize feature parity in a vacuum and ship a beautifully-covered matrix that moves no metric and can't be defended to a stakeholder asking "what does this change?"
@@ -73,7 +87,7 @@ Roles are the **user personas** who interact with the product daily. Not job tit
 
 **How to discover (do ALL of these):**
 
-1. **Codebase signals**: Grep for RBAC roles, permission sets, nav menu sections, route guards, user types. Each distinct permission set implies a distinct workflow.
+1. **Codebase signals**: Grep for RBAC roles, permission sets, nav menu sections, route guards, user types. Each distinct permission set implies a distinct workflow. (In a monorepo, grep **within the scoped product's directory** — e.g. `apps/web/` — not the whole repo, so another app's roles don't bleed in.)
 2. **Auth/RBAC inspection**: Read the role definitions, capability sets, and access control lists. Each role cluster = a persona.
 3. **UI inspection**: Different dashboard views, different nav items, different landing pages = different roles.
 4. **Domain research**: Search the web for "what roles exist in [industry]?" Every B2B product has standard personas the industry expects. Compare what you found in the codebase against industry standard roles.
