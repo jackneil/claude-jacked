@@ -47,7 +47,7 @@ If the argument doesn't match any of the above, say: "Unknown target. Valid opti
 
 ## Step 2: Common Repo Analysis
 
-Run these to gather baseline context (all are gatekeeper-safe):
+Run these to gather baseline context (all safe, read-only):
 
 ```bash
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)

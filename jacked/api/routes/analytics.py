@@ -1,4 +1,4 @@
-"""Analytics routes — gatekeeper, agents, hooks, lessons, dashboard."""
+"""Analytics routes — agents, hooks, lessons, usage dashboards."""
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -7,20 +7,11 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from jacked.web import db_analytics
 
 router = APIRouter()
 
 
 # --- Pydantic v2 response models ---
-
-class GatekeeperStats(BaseModel):
-    total_decisions: int = 0
-    approval_rate: float = 0.0
-    method_breakdown: dict[str, int] = {}
-    decision_breakdown: dict[str, int] = {}
-    recent_denials: list[dict] = []
-
 
 class AgentStats(BaseModel):
     total_spawns: int = 0
@@ -75,49 +66,6 @@ def _db_unavailable():
 
 
 # --- Routes ---
-
-@router.get("/gatekeeper", response_model=GatekeeperStats)
-async def gatekeeper_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
-    """Security gatekeeper decision stats -- approval rate, method breakdown."""
-    db = _get_db(request)
-    if db is None:
-        return _db_unavailable()
-
-    cutoff = _get_cutoff_iso(days)
-    all_rows = db.list_gatekeeper_decisions(limit=10000)["rows"]
-    rows = _filter_by_date(all_rows, cutoff)
-
-    total = len(rows)
-    if total == 0:
-        return GatekeeperStats()
-
-    decision_counts: dict[str, int] = {}
-    method_counts: dict[str, int] = {}
-    denials = []
-
-    for r in rows:
-        decision = r.get("decision", "UNKNOWN")
-        method = r.get("method", "UNKNOWN")
-        decision_counts[decision] = decision_counts.get(decision, 0) + 1
-        method_counts[method] = method_counts.get(method, 0) + 1
-        if decision in ("DENY", "DENY_PATTERN"):
-            denials.append({
-                "timestamp": r.get("timestamp"),
-                "command": (r.get("command") or "")[:100],
-                "reason": r.get("reason"),
-            })
-
-    allowed = decision_counts.get("ALLOW", 0)
-    rate = (allowed / total * 100) if total > 0 else 0.0
-
-    return GatekeeperStats(
-        total_decisions=total,
-        approval_rate=round(rate, 1),
-        method_breakdown=method_counts,
-        decision_breakdown=decision_counts,
-        recent_denials=denials[-10:],
-    )
-
 
 @router.get("/agents", response_model=AgentStats)
 async def agent_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
@@ -271,66 +219,6 @@ async def lesson_stats(request: Request, days: int = Query(default=7, ge=1, le=3
 
 
 # --- Dashboard endpoints (new) ---
-
-
-@router.get("/gatekeeper-dashboard")
-async def gatekeeper_dashboard(request: Request, days: int = Query(default=7, ge=1, le=365)):
-    """Combined KPI + time-series + method breakdown for the dashboard."""
-    db = _get_db(request)
-    if db is None:
-        return _db_unavailable()
-
-    kpi = db_analytics.get_kpi_totals(db, days=days)
-    time_series = db_analytics.get_time_series(db, days=days)
-    method_breakdown = db_analytics.get_method_breakdown(db, days=days)
-    token_costs = db_analytics.get_token_cost_summary(db, days=days)
-
-    return {
-        "kpi": kpi,
-        "time_series": time_series,
-        "method_breakdown": method_breakdown,
-        "token_costs": token_costs,
-    }
-
-
-@router.get("/gatekeeper-heatmap")
-async def gatekeeper_heatmap(request: Request, days: int = Query(default=7, ge=1, le=365)):
-    """Raw timestamps for client-side heatmap rendering."""
-    db = _get_db(request)
-    if db is None:
-        return _db_unavailable()
-
-    return {"timestamps": db_analytics.get_heatmap_raw(db, days=days)}
-
-
-@router.get("/gatekeeper-sessions")
-async def gatekeeper_sessions(
-    request: Request,
-    days: int = Query(default=7, ge=1, le=365),
-    limit: int = Query(default=20, ge=1, le=100),
-):
-    """Session risk scores."""
-    db = _get_db(request)
-    if db is None:
-        return _db_unavailable()
-
-    return {"sessions": db_analytics.get_session_risk(db, days=days, limit=limit)}
-
-
-@router.get("/gatekeeper-rules")
-async def gatekeeper_rules(request: Request, days: int = Query(default=7, ge=1, le=365)):
-    """Suggested + hot rules."""
-    db = _get_db(request)
-    if db is None:
-        return _db_unavailable()
-
-    return {
-        "suggested": db_analytics.get_suggested_rules(db, days=days),
-        "hot": db_analytics.get_hot_rules(db, days=days),
-    }
-
-
-# --- Token Usage Analytics ---
 
 
 @router.get("/usage-overview")

@@ -64,7 +64,7 @@ async function loadHookLogsData() {
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
                     </svg>
                     <div class="text-slate-400 text-sm">No hook executions yet</div>
-                    <div class="text-slate-500 text-xs mt-1">Hook runs will appear here as the gatekeeper fires hooks</div>
+                    <div class="text-slate-500 text-xs mt-1">Hook runs will appear here as jacked's hooks fire</div>
                 </div>
                 ${hookTotal > 0 ? renderPagination('hook', hookPage, hookPageSize, hookTotal) : ''}
             `;

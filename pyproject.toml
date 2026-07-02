@@ -48,21 +48,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-search = [
-    "qdrant-client>=1.7,<2",
-]
-security = []  # backwards compat — anthropic is now a core dependency
+# All former extras are retired or folded into core deps. Kept as empty
+# aliases so `uv tool install "claude-jacked[search|security|web|tray|all]"`
+# from old docs/scripts still resolves instead of erroring.
+search = []  # retired in 0.70.0 — Qdrant session search was removed
+security = []  # retired in 0.70.0 — the gatekeeper was removed
 web = []
 tray = []  # backwards compat — pystray/Pillow are now CORE deps (tray on by default)
-all = [
-    "qdrant-client>=1.7,<2",
-]
+all = []
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.3,<10",
     "pytest-cov>=4.0,<8",
-    "qdrant-client>=1.7,<2",
     "websockets>=12.0,<17",
     # Tray extra — without these the entire tray test suite skips (and the
     # @patch(...pystray) tests fail before reaching their skip guard).

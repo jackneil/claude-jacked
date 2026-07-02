@@ -1,6 +1,6 @@
 # claude-jacked
 
-**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar pill — plus a curated set of 30 slash commands and 10 review agents installed into Claude Code, all managed from a web dashboard.
+**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar pill — plus a curated set of 28 slash commands and 10 review agents installed into Claude Code, all managed from a web dashboard.
 
 ![jacked dashboard — accounts](docs/screenshots/dashboard-accounts.png)
 
@@ -11,7 +11,7 @@
 - **Run multiple Claude accounts like one** — Add every account you own, watch each one's 5-hour and 7-day usage live, and let auto-swap rotate to a fresh account before you hit a limit. Works for Codex accounts too. The macOS menu-bar pill shows your active account's usage at a glance, with a dropdown for the whole fleet.
 - **A curated skills suite, one command to install** — `jacked install` puts 30 battle-tested slash commands, 10 review agents, and behavioral rules into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more). Upgrades diff cleanly — added/changed/removed, never touching your own files.
 - **Manage everything from a web dashboard** — Accounts, usage analytics, feature toggles, swap history, logs — all from your browser. No config files, no terminal commands.
-- **Legacy extras, off by default** — An LLM security gatekeeper (largely superseded by Claude Code's native auto permission mode; enable from Settings > Gatekeeper if you still want a second layer) and cross-machine semantic session search (*requires the [search] extra + Qdrant*).
+- **Permission hygiene built in** — `jacked permissions audit` finds (and can prune) dangerously broad Bash wildcards in your Claude Code permission allowlists, and the dashboard's Permissions panel manages allow rules with project vs global scope.
 
 ---
 
@@ -22,22 +22,13 @@
 Paste this into Claude Code and it handles everything:
 
 ```
-Install claude-jacked for me. Use AskUserQuestion to ask me which features I want:
+Install claude-jacked for me:
 
 1. First check if uv and jacked are already installed (if uv is missing: curl -LsSf https://astral.sh/uv/install.sh | sh)
-2. Ask me which install tier I want:
-   - BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard
-   - SEARCH: Everything above + search past Claude sessions across machines (requires Qdrant Cloud)
-   - SECURITY: Everything above + the LLM security gatekeeper enabled (installed by every tier, but disabled by default — this tier turns it on)
-   - ALL: Everything
-3. Install based on my choice:
-   - BASE: uv tool install claude-jacked && jacked install --force
-   - SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
-   - SECURITY: uv tool install claude-jacked && jacked install --force  (then enable the gatekeeper from the dashboard: Settings > Gatekeeper)
-   - ALL: uv tool install "claude-jacked[all]" && jacked install --force  (then enable the gatekeeper from the dashboard)
-4. If I chose SEARCH or ALL, help me set up Qdrant Cloud credentials
-5. Verify with: jacked --help
-6. Launch the dashboard: jacked webux
+2. Install: uv tool install claude-jacked && jacked install --force
+3. Verify with: jacked --help
+4. Launch the dashboard: jacked webux
+5. Walk me through adding my Claude accounts from the Accounts page
 ```
 
 ### Option 2: Manual Install
@@ -63,25 +54,13 @@ Add to your team's Claude Code environment — no Python install needed:
 /plugin install jacked@jacked-marketplace
 ```
 
-Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 30 commands and 10 agents. Does not include the Python-powered features (dashboard, gatekeeper, session search) — use Option 1 or 2 for those.
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 28 commands and 10 agents. Does not include the Python-powered features (dashboard, account management, tray) — use Option 1 or 2 for those.
 
-**Want more?** Add optional extras:
-
-```bash
-# Add session search (needs Qdrant Cloud ~$30/mo)
-uv tool install "claude-jacked[search]" --force && jacked install --force
-
-# Security gatekeeper hook is installed by default but starts disabled —
-# enable it from the dashboard (Settings > Gatekeeper) when you want LLM-evaluated
-# interception layered on top of Claude Code's auto permission mode.
-
-# The background service + system tray icon ship by DEFAULT (auto-start on login) —
-# `jacked install` already started them. Opt out of the icon: jacked install --force --no-tray
-# (The legacy `claude-jacked[tray]` extra still resolves — it's just empty now.)
-
-# Everything (base + search + tray)
-uv tool install "claude-jacked[all]" --force && jacked install --force
-```
+> The background service + system tray icon ship by DEFAULT (auto-start on login) —
+> `jacked install` already started them. Opt out of the icon: `jacked install --force --no-tray`.
+> The legacy `[search]`/`[security]`/`[tray]`/`[all]` extras still resolve as empty aliases,
+> so old install commands don't error — the features they gated were retired in 0.70.0
+> (Qdrant session search) or folded into core (tray).
 
 ---
 
@@ -91,15 +70,9 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 ### Toggle Features On and Off
 
-Enable or disable any of the 10 built-in code reviewers and 30 slash commands with one click. Each card shows what it does so you know what you're turning on.
+Enable or disable any of the 10 built-in code reviewers and 28 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
 ![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
-
-### Monitor Security Decisions
-
-Every tool call the gatekeeper evaluates is logged — bash commands, file operations, web access, and more. See the decision, the method used, the full command, and the LLM's reasoning — all filterable by session and method. Approve commands directly from the log viewer with "Always Allow."
-
-![Gatekeeper Logs](docs/screenshots/dashboard-logs-detail.png)
 
 ### Track Everything
 
@@ -110,23 +83,17 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 <details>
 <summary><strong>More Dashboard Views</strong></summary>
 
-**Security Gatekeeper Configuration** — Configure the multi-tier evaluation pipeline, toggle per-tool interception, choose the LLM model, set the evaluation method, manage API keys, and edit the LLM prompt — all from the Gatekeeper tab.
-
-![Settings — Gatekeeper](docs/screenshots/dashboard-settings-gatekeeper.png)
-
-**Feature Toggles** — Toggle hooks (session indexing, sound notifications) and knowledge documents (behavioral rules, skills, reference docs) on and off.
+**Feature Toggles** — Toggle hooks (sound notifications) and knowledge documents (behavioral rules, skills, reference docs) on and off.
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable any of the 30 slash commands.
+**Commands** — Enable or disable any of the 28 slash commands.
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
 
-**Permissions Panel** — Manage allowed commands with project-level vs global scope. Add new allow rules or promote commands from the log viewer with "Always Allow."
+**Permissions Panel** — Manage allowed commands with project-level vs global scope.
 
-**Security Profiles** — Export, import, and backup your gatekeeper configuration. Share security settings across machines or teams.
-
-**Analytics Dashboard** — Charts, heatmap, command frequency breakdown, and drill-down by session or method.
+**Analytics Dashboard** — Token usage overview, trends, and per-session drill-down, plus agent/hook activity.
 
 </details>
 
@@ -138,12 +105,9 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 - [Web Dashboard](#web-dashboard)
 - [Background Service and Tray Icon](#background-service-and-tray-icon)
 - [Upgrading](#upgrading)
-- [Security Gatekeeper](#security-gatekeeper)
-- [Session Search](#session-search)
 - [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
 - [Sound Notifications](#sound-notifications)
 - [Uninstall / Troubleshooting](#uninstall--troubleshooting)
-- [Cloud Database Setup (Qdrant)](#cloud-database-setup-qdrant)
 - [Version History](#version-history)
 - [Advanced / Technical Reference](#advanced--technical-reference)
 
@@ -156,39 +120,14 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **30 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/freeze`, `/unfreeze`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **28 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
 | **Account Management** | Track Claude accounts, usage limits, subscription status |
 | **Feature Toggles** | Enable/disable any reviewer, command, or hook from the dashboard |
-| **Analytics** | Approval rates, command usage, charts, heatmap, drill-down |
-| **Security Profiles** | Export, import, and backup gatekeeper configurations |
-| **Permissions Management** | "Always Allow" from logs, project-level vs global permission scopes |
-
-### Search Extra (`uv tool install "claude-jacked[search]"`)
-
-| Feature | What It Does |
-|---------|--------------|
-| **Session Search** | Find any past Claude conversation by describing what you were working on |
-| **Cross-Machine Sync** | Start on desktop, continue on laptop — your history follows you |
-| **Team Sharing** | Search your teammates' sessions (with their permission) |
-
-### Security Gatekeeper (installed disabled — enable from Settings > Gatekeeper)
-
-| Feature | What It Does |
-|---------|--------------|
-| **Security Gatekeeper** | Intercepts all tool calls — auto-approves safe ones, blocks dangerous ones, asks about the rest |
-| **Tool Registry** | Per-tool enable/disable toggles from the dashboard (Bash, Read, Edit, Write, Grep, Glob, Web, MCP) |
-| **Shell Injection Defense** | Detects shell operators (`&&`, `|`, `;`, `>`, `` ` ``, `$()`) to prevent chaining attacks |
-| **Path Safety** | Blocks access to sensitive files (`.env`, `.ssh/`, credentials) across all file tools |
-| **Freeze Boundary** | `/freeze <path>` restricts Edit/Write operations to one directory — prevents accidental scope creep during focused work |
-| **File Context Analysis** | Reads referenced scripts and evaluates what code actually does |
-| **Command Categories** | Configurable per-category behavior (allow/ask/evaluate) for network, packages, git, docker, etc. |
-| **Customizable Prompt** | Tune the safety evaluation via the dashboard or `~/.claude/gatekeeper-prompt.txt` |
-| **Permission Audit** | Scans your permission rules for dangerous wildcards that bypass the gatekeeper |
-| **Session-Tagged Logs** | Every decision tagged with session ID for multi-session tracking |
-| **Log Redaction** | Passwords, API keys, and tokens automatically redacted from logs |
+| **Analytics** | Token usage overview + trends, per-session drill-down, agent/hook activity |
+| **Permissions Management** | Permission-rule audit (`jacked permissions audit`), project-level vs global scopes |
 
 ---
 
@@ -202,7 +141,7 @@ jacked webux --no-browser       # Start server without opening browser
 
 The dashboard is a local web app that runs on your machine. All data stays in `~/.claude/jacked.db` — nothing is sent anywhere.
 
-**5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Gatekeeper / Features / Plugins / Claude Code / Advanced / Profiles), Logs, Analytics.
+**5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Features / Plugins / Claude Code / Advanced), Logs, Analytics.
 
 ---
 
@@ -384,11 +323,6 @@ Dashboard is at `http://localhost:8321`. The tray icon's right-click menu has Op
 
 Upgrading later is one command: `jacked upgrade` (from the terminal) or click the Update line in the tray menu. Both auto-detect that you installed via uv and re-use it. Don't have uv anymore? Reinstall it first: same curl/powershell commands as step 1.
 
-Extras:
-- `uv tool install "claude-jacked[search]" --force` — adds Qdrant-backed semantic session search (requires Qdrant Cloud).
-- `uv tool install "claude-jacked[all]" --force` — tray + search together.
-- The security gatekeeper hook is installed by default but starts **disabled** — Claude Code's auto permission mode handles approvals natively. Turn the gatekeeper on from the dashboard (Settings > Gatekeeper) when you want LLM-evaluated interception layered on top.
-
 Requirements: Python 3.10+ (uv will fetch one for you if your system doesn't have a compatible version — you don't need to install Python separately).
 
 ---
@@ -401,7 +335,7 @@ jacked upgrade
 
 That's it. One command. Works on macOS, Linux, and Windows. Does all three things `uv tool install --force` alone doesn't do:
 
-1. `uv tool install "claude-jacked[tray]" --force` — new package on disk
+1. `uv tool install claude-jacked --force` — new package on disk
 2. `jacked install --force` — migrate `settings.json` hooks to the shim form (`jacked _hook <name>`) so they survive Python version bumps
 3. `jacked service restart` — reload the running service with the new code (only if a service is running)
 
@@ -409,8 +343,6 @@ That's it. One command. Works on macOS, Linux, and Windows. Does all three thing
 
 ### Options
 
-- `jacked upgrade --extras search` — upgrade with the `[search]` extra instead of `[tray]` (Qdrant session search)
-- `jacked upgrade --extras all` — everything
 - `jacked upgrade --skip-service` — just swap the package and migrate settings, don't restart the running service
 
 ### Cross-platform notes
@@ -428,142 +360,6 @@ If you're running the background service, you can also click **Update to vX.Y.Z 
 
 ---
 
-## Security Gatekeeper
-
-> **Disabled by default.** Claude Code's auto permission mode now handles approvals natively, so the gatekeeper installs but starts off. Turn it on from the dashboard at **Settings > Gatekeeper** when you want LLM-evaluated interception layered on top of auto mode (or set `gatekeeper.enabled` to `true` in the SQLite settings table). Everything described below applies once you've enabled it.
-
-When enabled, the security gatekeeper intercepts **all tool calls** Claude makes — bash commands, file reads/writes, web access, and MCP tools — and decides whether to auto-approve, block, or ask you. Each tool type gets the appropriate level of scrutiny. Most decisions resolve in under 2 milliseconds.
-
-### How It Works
-
-The hook uses an empty matcher to intercept every tool call, then dispatches by tool type:
-
-- **Bash commands** go through the full multi-tier evaluation chain (see below)
-- **File tools** (Read, Edit, Write, Grep, Glob) get path-safety checks for sensitive files and directories
-- **Web tools** (WebFetch, WebSearch) are auto-approved with audit logging (read-only access)
-- **MCP tools** are auto-approved with audit logging (user opted in via toggle)
-
-Each tool can be individually enabled or disabled from the dashboard via the **tool registry** (Settings > Gatekeeper > Tools).
-
-#### Bash Evaluation Chain
-
-A multi-tier chain, fastest first:
-
-| Tier | Speed | What It Does |
-|------|-------|--------------|
-| **Deny patterns** | <1ms | Blocks dangerous commands with labeled reasons (sudo, rm -rf, reverse shells, DROP, etc.) |
-| **Command categories** | <1ms | Configurable per-category behavior — allow, ask, or evaluate (network, packages, git, docker, etc.) |
-| **Path safety** | <1ms | Blocks bash commands targeting sensitive files (`.env`, `.ssh/`, credentials, keystores) |
-| **Permission rules** | <1ms | Checks commands already approved in your Claude settings |
-| **Local allowlist** | <1ms | Matches safe patterns (specific git/gh/docker/make subcommands, pytest, etc.) |
-| **LLM evaluation** | ~2s | Sends ambiguous commands to an LLM with file context for judgment |
-
-Commands containing shell operators (`&&`, `||`, `;`, `|`, etc.) always go to the LLM — they're never auto-approved by the local allowlist.
-
-#### Always Allow
-
-Approve commands directly from the **Logs** page. Click "Always Allow" on any logged command to add it to your permission rules. Permissions can be scoped to the current project or applied globally.
-
-### Install / Uninstall
-
-The gatekeeper hook ships with every install (`jacked install --force`) but starts **disabled** — enable it from the dashboard (Settings > Gatekeeper). To install without the hook at all, pass `--no-security`:
-
-```bash
-jacked install --force                # gatekeeper hook installed, disabled by default
-jacked install --force --no-security  # skip the gatekeeper hook entirely
-```
-
-To remove just the security hook after the fact:
-```bash
-jacked uninstall --security
-```
-
-### Configuration
-
-Configure the gatekeeper from the **dashboard** (Settings > Gatekeeper tab) or the CLI:
-
-- **LLM model:** Haiku (fastest, cheapest), Sonnet, or Opus
-- **Evaluation method:** API First, CLI First, API Only, or CLI Only
-- **Custom prompt:** Edit the LLM evaluation prompt from the dashboard or via `jacked gatekeeper show`
-
-### Faster LLM Evaluation
-
-With an Anthropic API key, the gatekeeper calls the API directly (~2s) instead of spawning a CLI process (~8s):
-
-```bash
-export ANTHROPIC_API_KEY="sk-..."
-```
-
-Or set the API key in the dashboard under Settings > Gatekeeper > API Key Override.
-
-### Debug Logging
-
-Every decision is logged to `~/.claude/hooks-debug.log`, tagged with session IDs:
-
-```
-2025-02-07T11:36:34 [87fd8847] EVALUATING: ls -la /tmp
-2025-02-07T11:36:34 [87fd8847] LOCAL SAID: YES (0.001s)
-2025-02-07T11:36:34 [87fd8847] DECISION: ALLOW (0.001s)
-```
-
-Or view decisions in the dashboard under **Logs** — filterable, searchable, exportable.
-
-### Permission Audit
-
-If you've set broad permission wildcards in Claude Code (like `Bash(python:*)`), those commands bypass the gatekeeper entirely. The audit catches this:
-
-```bash
-jacked gatekeeper audit           # Scan permission rules
-jacked gatekeeper audit --log     # Also review recent auto-approved commands
-```
-
-Sensitive data (passwords, API keys, tokens) is automatically redacted from all logs.
-
----
-
-## Session Search
-
-Once installed with the `[search]` extra, search your past Claude sessions from within Claude Code.
-
-### Finding Past Work
-
-```
-/jacked user authentication login
-```
-
-```
-Search Results:
-#  Score  User  Age      Repo           Preview
-1  92%    YOU   3d ago   my-app         Implementing JWT auth with refresh tokens...
-2  85%    YOU   2w ago   api-server     Adding password reset flow...
-3  78%    @sam  1w ago   shared-lib     OAuth2 integration with Google...
-```
-
-### Resuming Work from Another Computer
-
-```
-/jacked that shopping cart feature I was building
-```
-
-Claude finds it and you can continue right where you left off.
-
-### Team Sharing
-
-Share knowledge across your team by using the same cloud database:
-
-```bash
-# Everyone uses the same database
-export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://team-cluster.qdrant.io"
-export QDRANT_CLAUDE_SESSIONS_API_KEY="team-api-key"
-
-# Each person sets their own name
-export JACKED_USER_NAME="sarah"
-```
-
-```
-/jacked how did Sam implement the payment system
-```
-
 ### `/recover` — rebuild a crashed session
 
 Opened Claude in a folder whose last session crashed mid-work and you don't know the
@@ -571,7 +367,7 @@ session ID? Run `/recover`. It finds the most-recently-active prior session for 
 current folder from its on-disk transcript, shows you the pick to confirm, then injects
 a budgeted working-state digest (last instruction, todos, recent actions, files touched)
 so you continue right where it died — and prints `claude --resume <id>` for a full native
-continuation. Works on a bare install; no Qdrant/search extra required.
+continuation. Works on a bare install.
 
 It recommends the newest session **with real substance** — a near-empty newest session is skipped (but still offered as an alternate). And if the crashed session was actively driving a `/goal` or `/loop` (which can't be auto-resumed), the digest surfaces that exact command verbatim so you can copy-paste it back into Claude Code to restart it.
 
@@ -613,8 +409,6 @@ Type these directly in Claude Code:
 | `/audit-rules` | **Audit Rules** — Checks CLAUDE.md for duplicates, contradictions, stale rules |
 | `/cleanup` | **Cleanup** — Verifies git hygiene and safely cleans branches, stashes, stale worktrees, and untracked state. Report-first, confirm-each, never loses work |
 | `/jacked-setup` | **Repo Setup** — Generates repo-specific configs for `/whats-next`, `/qa`, `/ux`, `/dcr`, `/docs-sync` — faster repeat runs |
-| `/freeze` | **Freeze** — Restricts file edits to a single directory, enforced by the security gatekeeper. Requires the gatekeeper to be **enabled** (Settings > Gatekeeper) — with it disabled (the default), the freeze file is written but not enforced |
-| `/unfreeze` | **Unfreeze** — Removes the edit restriction set by `/freeze` |
 | `/cso` | **Security Audit** — Systematic OWASP Top 10 + STRIDE threat model analysis with confidence-gated findings |
 | `/retro` | **Retrospective** — Git history analysis for contributor metrics, test health, velocity trends |
 | `/canary` | **Canary** — Post-deploy monitoring with baselines, console errors, performance checks |
@@ -673,48 +467,13 @@ Works on Windows, Mac, and Linux. To remove: `jacked uninstall --sounds`
 jacked uninstall && uv tool uninstall claude-jacked
 ```
 
-Your cloud database stays intact — reinstall anytime without losing history.
+Your local database (`~/.claude/jacked.db`) stays intact — reinstall anytime without losing accounts or history.
 
 ### Common Issues
 
 **"jacked: command not found"** — Run `uv tool update-shell` and restart your terminal.
 
-**Search isn't working** — You need Qdrant Cloud set up first. Ask Claude: `Help me set up Qdrant Cloud for jacked`
-
-**Sessions not showing up** — Run `jacked backfill` to index existing sessions.
-
 **Windows errors** — Claude Code on Windows uses Git Bash, which can have path issues. Ask Claude: `Help me fix jacked path issues on Windows`
-
----
-
-## Cloud Database Setup (Qdrant)
-
-> **Only needed for the `[search]` extra.** The base install works without Qdrant.
-
-1. Install the search extra: `uv tool install "claude-jacked[search]"`
-2. Go to [cloud.qdrant.io](https://cloud.qdrant.io) and create an account
-3. Create a cluster (paid tier ~$30/month required)
-4. Copy your cluster URL and API key
-5. Add to your shell profile:
-
-```bash
-export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"
-export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"
-```
-
-6. Restart terminal and run:
-```bash
-jacked backfill    # Index existing sessions
-jacked status      # Verify connectivity
-```
-
----
-
-## Security Note
-
-**Your conversations are sent to Qdrant Cloud** (if using [search]). This includes everything you and Claude discuss, code snippets, and file paths.
-
-**Recommendations:** Don't paste passwords or API keys in Claude sessions. Keep your Qdrant API key private. For sensitive work, consider self-hosting Qdrant.
 
 ---
 
@@ -722,6 +481,7 @@ jacked status      # Verify connectivity
 
 | Version | Changes |
 |---------|---------|
+| **0.70.0** | **BREAKING: the security gatekeeper and Qdrant session search are removed.** jacked is now squarely what it's actually used as — a multi-account manager + skills suite. Gone: the LLM gatekeeper hook (superseded by Claude Code's native auto permission mode) with its dashboard tab, decision logs, analytics, security profiles, and the `/freeze`+`/unfreeze` commands it enforced; and Qdrant semantic session search (indexer/searcher/retriever, `jacked search/backfill/retrieve/sessions/delete/cleardb/status/configure`, the `/jacked` skill, the `[search]` extra). Migration is automatic and fail-safe: `jacked install` prunes the old gatekeeper PreToolUse/PermissionRequest entries and the session-indexing Stop hook from `~/.claude/settings.json` (Claude and Codex both), and the `jacked _hook` shim now FAILS OPEN (exit 0) for retired hook names so a stale entry can never block tool calls between upgrading the package and running `jacked install`. Old `[search]`/`[security]`/`[all]` extras still resolve as empty aliases. The permission-rule audit survives as `jacked permissions audit [--fix]`; the analytics Gatekeeper tab became an Activity tab (agents / hook health / lessons). Your DB is untouched — legacy `gatekeeper_decisions` rows just stop being read. |
 | **0.69.1** | **`fix(menubar)`: event-driven tray freshness — the pill and `/panel` dropdown update within ~1s of a dashboard usage refresh or account switch.** Two staleness bugs stacked: the pill only re-polled every 30s, and the dropdown/side-panel WKWebViews suspend their JS timers while offscreen, freezing the panel's own 15s reload the moment it closed. Now a stdlib-only in-process change counter (`jacked/usage_events.py`) is bumped by every usage-cache write, Claude credential switch, and Codex swap; the mac agent watches it on a 1s timer (an int compare — no HTTP/DB) and on change refreshes the pill and nudges both `/panel` webviews via `evaluateJavaScript` (which runs even while detached). Webviews also reload on popover/panel show and on `visibilitychange`, with a load-sequence guard so a slow stale response can't overwrite a fresher render. The 30s poll remains as the heartbeat for cross-process writers (a separately-run `webux`). |
 | **0.69.0** | **`/release` ships the way each repo actually ships — no longer hardcoded to claude-jacked/PyPI.** The engine was baked to one pipeline (version in `jacked/__init__.py`, gate `uv build`+`twine`+`pytest`, publish via GitHub-Release→PyPI, push `master`) — so on any other repo it read a nonexistent version and ran the wrong publish. Now it **detects the shipping model** (`pypi` / `npm` / `npm-changesets` / `calver` / `cargo` / `go-module-tag` / `pr-to-main-deploy` / `github-release-only`) from the manifests + what CI actually does, reads/bumps the **real** version source (or none, for CalVer / deploy-on-merge repos), gates on the repo's **own** build+test, then publishes/deploys the right way and verifies it landed (index-installable, or the deploy is green **and** the app URL is actually up). Critically it recognizes **PR-to-main-deploy** repos that have no package at all — the release is getting the change merged so CI deploys it, and it will **never** invent a PyPI/npm publish the repo doesn't do. A new `## Config Override` block + `/jacked-setup release` target let a repo pin its model, gate, and publish mechanism; safety rails stop it dead when the publish target is ambiguous. |
 | **0.68.0** | **`coverage-matrix` + `/whats-next` are monorepo-aware.** Both treated a repo as ONE product, so a monorepo's unrelated apps (marketing site + admin dashboard + API) got blended into a single persona×domain grid and the forged initiative spanned apps that share no lever. Now: `coverage-matrix` opens with a **product-boundary check** (detects `pnpm-workspace.yaml`, a `workspaces` field, `turbo`/`nx`/`lerna`, a Cargo `[workspace]`, `go.work`, or `apps/*/`+`packages/*/`) and scores **one product at a time** — roles/domains discovered from that product's dir, not repo-wide; shared `packages/*` are treated as cross-cutting levers, not matrix rows. `/whats-next` scopes its coverage read + forged `/goal` brief to a single product in a monorepo, and its **version detection** no longer collapses to whichever manifest sorts first — it walks workspace members when the root is `private`/version-less, prefers the manifest whose `name` matches the product over a `*-tests` decoy, and recognizes `.changeset/`/`releases/` (changesets/CalVer). |
@@ -805,43 +565,18 @@ jacked status      # Verify connectivity
 <summary><strong>CLI Command Reference</strong></summary>
 
 ```bash
-# Search
-jacked search "query"              # Search all sessions
-jacked search "query" --mine       # Only your sessions
-jacked search "query" --user name  # Specific teammate
-jacked search "query" --repo path  # Boost specific repo
-
-# Session Management
-jacked sessions                    # List indexed sessions
-jacked retrieve <session_id>       # Get session content
-jacked retrieve <id> --mode full   # Get full transcript
-jacked delete <session_id>         # Remove from index
-jacked cleardb                     # Delete all your data
-
 # Setup
-jacked install --force              # Install agents, commands, rules, tray + gatekeeper hook (disabled by default)
-jacked install --force --no-security  # Install without the security gatekeeper hook
+jacked install --force             # Install skills, agents, commands, rules, tray
 jacked install --force --sounds    # Also add sound notifications
 jacked install --force --no-tray   # Install without the tray icon
 jacked uninstall                   # Remove from Claude Code
 jacked uninstall --sounds          # Remove only sounds
-jacked uninstall --security        # Remove only security hook
-jacked backfill                    # Index all existing sessions
-jacked status                      # Check connectivity
+jacked uninstall --security        # Remove a legacy gatekeeper hook (pre-0.70.0 installs)
 jacked check-version               # Check for newer version
 
-# Security Gatekeeper
-jacked gatekeeper show             # Print current LLM prompt
-jacked gatekeeper reset            # Reset prompt to built-in default
-jacked gatekeeper diff             # Compare custom vs built-in prompt
-jacked gatekeeper audit            # Audit permission rules
-jacked gatekeeper audit --log      # Also scan recent auto-approved commands
-
-# Security Profiles
-jacked profiles list               # List saved profiles
-jacked profiles export <name>      # Export current config as a named profile
-jacked profiles import <path>      # Import a profile from a JSON file
-jacked profiles delete <name>      # Delete a saved profile
+# Permissions
+jacked permissions audit           # Audit permission rules for dangerous wildcards
+jacked permissions audit --fix     # Interactively prune dangerous wildcards
 
 # Dashboard
 jacked webux                       # Open web dashboard
@@ -856,11 +591,11 @@ jacked service stop                # Stop running service
 jacked service restart             # Restart service
 jacked service status              # Show PID, port, uptime, autostart state
 
-# Slash Commands (30 total)
+# Slash Commands (28 total)
 # /dc /dcr /docs-sync /pr /learn /redo /retry /techdebt /audit-rules /cleanup
 # /qa /qa-video /demo-video /ux /swarm /swarm-research /release
 # /whats-next /goal-maker /bhag /jacked-setup
-# /freeze /unfreeze /cso /lockdown /retro /canary /benchmark
+# /cso /lockdown /retro /canary /benchmark
 # /land-and-deploy /browser-reset
 ```
 
@@ -869,21 +604,10 @@ jacked service status              # Show PID, port, uptime, autostart state
 <details>
 <summary><strong>Environment Variables</strong></summary>
 
-**Required (for [search] only):**
-| Variable | Description |
-|----------|-------------|
-| `QDRANT_CLAUDE_SESSIONS_ENDPOINT` | Your Qdrant Cloud URL |
-| `QDRANT_CLAUDE_SESSIONS_API_KEY` | Your Qdrant API key |
-
-**Optional:**
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JACKED_USER_NAME` | git username | Your name for team attribution |
-| `JACKED_TEAMMATE_WEIGHT` | 0.8 | How much to weight teammate results |
-| `JACKED_OTHER_REPO_WEIGHT` | 0.7 | How much to weight other repos |
-| `JACKED_TIME_DECAY_HALFLIFE_WEEKS` | 35 | How fast old sessions lose relevance |
-| `JACKED_HOOK_DEBUG` | (unset) | Set to `1` for verbose security hook logging |
-| `ANTHROPIC_API_KEY` | (unset) | Enables fast (~2s) LLM evaluation in security hook |
+| `JACKED_HOST` | 127.0.0.1 | Dashboard/service bind host |
+| `JACKED_PORT` | 8321 | Dashboard/service bind port |
 
 </details>
 
@@ -899,40 +623,7 @@ The dashboard is a local web application:
 
 All data stays on your machine. The dashboard reads Claude Code's configuration files (`~/.claude/settings.json`, `~/.claude/agents/`, etc.) and provides a visual interface for managing them.
 
-**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`, `/api/profiles/*`, `/api/claude-settings/*` (permissions)
-
-</details>
-
-<details>
-<summary><strong>How It Works (Technical)</strong></summary>
-
-```
-+---------------------------------------------------------+
-|  YOUR MACHINE                                           |
-|                                                         |
-|  Claude Code                                            |
-|  +-- Stop hook -> jacked index (after every response)   |
-|  +-- /jacked skill -> search + load context             |
-|                                                         |
-|  ~/.claude/projects/                                    |
-|  +-- {repo}/                                            |
-|      +-- {session}.jsonl  <-- parsed and indexed        |
-+---------------------------------------------------------+
-                            |
-                            | HTTPS
-                            v
-+---------------------------------------------------------+
-|  QDRANT CLOUD                                           |
-|                                                         |
-|  - Server-side embedding (no local ML needed)           |
-|  - Vectors + transcripts stored                         |
-|  - Accessible from any machine                          |
-+---------------------------------------------------------+
-```
-
-**Indexing:** After each Claude response, a hook automatically indexes the session. The indexer extracts plan files, agent summaries, labels, and user messages.
-
-**Retrieval modes:** `smart` (default), `full`, `plan`, `agents`, `labels`
+**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`, `/api/claude-settings/*` (permissions)
 
 </details>
 
@@ -957,7 +648,7 @@ All data stays on your machine. The dashboard reads Claude Code's configuration 
 <details>
 <summary><strong>Hook Configuration</strong></summary>
 
-The `jacked install` command adds hooks to `~/.claude/settings.json`. Since 0.41.0 the QA-suggest and gatekeeper hooks are written as upgrade-safe `jacked _hook <name>` shims (the shim resolves the current handler internally, so the entry survives `uv tool upgrade` and Python version bumps). The session-indexing Stop hook uses the plain `jacked index` command:
+The `jacked install` command adds hooks to `~/.claude/settings.json`, written as upgrade-safe `jacked _hook <name>` shims (the shim resolves the current handler internally, so the entry survives `uv tool upgrade` and Python version bumps):
 
 ```json
 {
@@ -965,22 +656,14 @@ The `jacked install` command adds hooks to `~/.claude/settings.json`. Since 0.41
     "Stop": [
       {
         "matcher": "",
-        "hooks": [{"type": "command", "command": "jacked index --repo \"$CLAUDE_PROJECT_DIR\"", "async": true}]
-      },
-      {
-        "matcher": "",
         "hooks": [{"type": "command", "command": "\"/path/to/jacked\" _hook qa_suggest", "async": true}]
       }
-    ],
-    "PreToolUse": [{
-      "matcher": "",
-      "hooks": [{"type": "command", "command": "\"/path/to/jacked\" _hook security_gatekeeper", "timeout": 30}]
-    }]
+    ]
   }
 }
 ```
 
-The PreToolUse matcher is an empty string (catch-all) — the gatekeeper dispatches by tool type internally and checks the tool registry for per-tool enable/disable settings. `jacked install` also registers a `PermissionRequest` hook and lightweight session-tracker hooks (`SessionStart`, `Notification`, `SessionEnd`, `Stop`) that keep the dashboard's account/session views live.
+`jacked install` also registers lightweight session-tracker hooks (`SessionStart`, `Notification`, `SessionEnd`, `Stop`) that keep the dashboard's account/session views live — and it prunes hooks from retired features (the pre-0.70.0 security gatekeeper and session-indexing entries) so a stale entry can never block or error.
 
 </details>
 
@@ -990,37 +673,21 @@ The PreToolUse matcher is an empty string (catch-all) — the gatekeeper dispatc
 Copy this into Claude Code for a guided installation:
 
 ```
-Install claude-jacked for me. Use the AskUserQuestion tool to guide me through options.
+Install claude-jacked for me.
 
 PHASE 1 - DIAGNOSTICS:
 - Detect OS (Windows/Mac/Linux)
 - Check: uv --version (if missing: curl -LsSf https://astral.sh/uv/install.sh | sh on Mac/Linux, powershell -c "irm https://astral.sh/uv/install.ps1 | iex" on Windows)
 - Check: jacked --version (to see if already installed)
-- Check ~/.claude/settings.json for existing hooks
 
-PHASE 2 - ASK USER PREFERENCES:
-Use AskUserQuestion with these options:
+PHASE 2 - INSTALL:
+- uv tool install claude-jacked && jacked install --force
 
-Question: "Which jacked features do you want?"
-Options:
-- BASE (Recommended): Smart reviewers, commands, behavioral rules, web dashboard. No external services needed.
-- SEARCH: Everything in BASE + search past Claude sessions across machines. Requires Qdrant Cloud (~$30/mo).
-- SECURITY: Everything in BASE, then enable the LLM security gatekeeper. The gatekeeper hook ships in every install but is disabled by default; this tier turns it on from the dashboard.
-- ALL: Everything. Requires Qdrant Cloud + Anthropic API key for fastest security evaluation.
-
-PHASE 3 - INSTALL:
-Based on user choice:
-- BASE: uv tool install claude-jacked && jacked install --force
-- SEARCH: uv tool install "claude-jacked[search]" && jacked install --force
-- SECURITY: uv tool install claude-jacked && jacked install --force   (then enable the gatekeeper in the dashboard: Settings > Gatekeeper)
-- ALL: uv tool install "claude-jacked[all]" && jacked install --force   (then enable the gatekeeper in the dashboard)
-
-PHASE 4 - POST-INSTALL:
+PHASE 3 - POST-INSTALL:
 - Launch dashboard: jacked webux
-- If SEARCH or ALL: help set up Qdrant Cloud credentials
-- If SECURITY or ALL: enable the gatekeeper (Settings > Gatekeeper) and show how to monitor it in the dashboard (Logs page)
+- Walk me through adding my Claude accounts from the Accounts page
 
-PHASE 5 - VERIFY:
+PHASE 4 - VERIFY:
 - jacked --help
 - jacked webux (confirm dashboard opens)
 ```
@@ -1055,4 +722,4 @@ MIT
 
 ## Credits
 
-Built for [Claude Code](https://claude.ai/code) by Anthropic. Uses [Qdrant](https://qdrant.tech/) for search.
+Built for [Claude Code](https://claude.ai/code) by Anthropic.

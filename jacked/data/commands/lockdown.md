@@ -428,7 +428,7 @@ git log --all --diff-filter=A --name-only --since="365 days ago" -- '.env*' '*.p
 
 ```bash
 # Hardcoded secret patterns — REDACT the matched value before printing.
-# Never print a candidate secret in cleartext to the terminal (it would end up in session logs / Qdrant index).
+# Never print a candidate secret in cleartext to the terminal (it would end up in session logs).
 grep -rEnI "(api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*['\"][^'\"]{20,}['\"]" \
   --include="*.py" --include="*.ts" --include="*.js" --include="*.toml" --include="*.json" --include="*.yml" --include="*.yaml" \
   --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=dist --exclude-dir=build \

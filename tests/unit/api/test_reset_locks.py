@@ -26,7 +26,6 @@ REGISTERED_MODULES: tuple[str, ...] = (
     "jacked.web.auth",
     "jacked.api.routes.features",
     "jacked.api.routes.permissions",
-    "jacked.api.routes.profiles",
     "jacked.api.routes.system",
     "jacked.api.usage_monitor",
     "jacked.web.oauth",
@@ -84,7 +83,6 @@ def test_reset_locks_rebinds_bulk_refresh_lock() -> None:
 _REBIND_CASES: tuple[tuple[str, str], ...] = (
     ("jacked.api.routes.features", "_settings_lock"),
     ("jacked.api.routes.permissions", "_project_settings_lock"),
-    ("jacked.api.routes.profiles", "_profiles_lock"),
     ("jacked.api.routes.system", "_upgrade_lock"),
 )
 

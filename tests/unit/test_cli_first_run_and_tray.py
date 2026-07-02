@@ -115,7 +115,7 @@ def test_install_starts_tray_by_default(tmp_path, monkeypatch):
     monkeypatch.setenv("JACKED_HOME", str(fake_home))
     calls = []
     monkeypatch.setattr(cli, "_setup_tray_autostart", lambda: calls.append(1))
-    r = CliRunner().invoke(main, ["install", "--no-security", "--no-rules"])
+    r = CliRunner().invoke(main, ["install", "--no-rules"])
     assert r.exit_code == 0, r.output
     assert calls == [1]  # tray set up by default
 
@@ -126,7 +126,7 @@ def test_install_no_tray_skips_tray(tmp_path, monkeypatch):
     monkeypatch.setenv("JACKED_HOME", str(fake_home))
     calls = []
     monkeypatch.setattr(cli, "_setup_tray_autostart", lambda: calls.append(1))
-    r = CliRunner().invoke(main, ["install", "--no-security", "--no-rules", "--no-tray"])
+    r = CliRunner().invoke(main, ["install", "--no-rules", "--no-tray"])
     assert r.exit_code == 0, r.output
     assert calls == []  # opted out
 

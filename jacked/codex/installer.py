@@ -1,4 +1,4 @@
-"""Install jacked's skills / commands / rules / gatekeeper into Codex too.
+"""Install jacked's skills / commands / rules into Codex too.
 
 `jacked install` deploys to ~/.claude for Claude Code; this adds a parallel
 Codex pass when Codex is present, writing the native Codex installables:
@@ -8,9 +8,8 @@ Codex pass when Codex is present, writing the native Codex installables:
              carries name+description frontmatter)
 - commands -> ~/.codex/prompts/<name>.md (invoked /prompts:<name> in Codex)
 - rules    -> a managed block in ~/.codex/AGENTS.md (Codex's CLAUDE.md analog)
-- gatekeeper -> ~/.codex/hooks.json PreToolUse + PermissionRequest entries
-             (same JSON contract as Claude Code; jacked's hook fails open, and
-             Codex won't run a hook until it's trusted via `/hooks`)
+- legacy gatekeeper hooks.json entries are PRUNED on install (the
+             gatekeeper was retired in 0.70.0)
 
 A separate manifest (~/.codex/jacked-codex-manifest.json) makes install
 idempotent and uninstall/prune precise — it never touches the Claude manifest.
@@ -37,7 +36,6 @@ _AGENTS_END = "<!-- END jacked behaviors (managed by `jacked install`) -->"
 # install/uninstall can find and replace exactly its own entries.
 _HOOK_MARKERS = ("_hook security_gatekeeper",)
 
-DEFAULT_HOOK_COMMAND = "jacked _hook security_gatekeeper"
 
 
 # ---------------------------------------------------------------------------
@@ -139,27 +137,6 @@ def _is_jacked_hook_group(group: dict) -> bool:
     return False
 
 
-def _install_codex_hooks(path: Path, hook_command: str) -> bool:
-    try:
-        data = json.loads(path.read_text()) if path.exists() else {}
-    except (json.JSONDecodeError, OSError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    hooks = data.setdefault("hooks", {})
-    jacked_group = {
-        "matcher": "Bash",
-        "hooks": [{"type": "command", "command": hook_command}],
-    }
-    for event in ("PreToolUse", "PermissionRequest"):
-        arr = [g for g in hooks.get(event, []) if not _is_jacked_hook_group(g)]
-        arr.append(dict(jacked_group))
-        hooks[event] = arr
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    return True
-
-
 def _remove_codex_hooks(path: Path) -> bool:
     if not path.exists():
         return False
@@ -232,7 +209,6 @@ def install_codex(
     *,
     home: Optional[Path] = None,
     agents_home: Optional[Path] = None,
-    hook_command: str = DEFAULT_HOOK_COMMAND,
     version: str = "0",
     now_iso: str = "",
     env: Optional[Mapping[str, str]] = None,
@@ -268,8 +244,9 @@ def install_codex(
         _install_agents_block(codex_agents_md(home), rules_src.read_text())
         rules_done = True
 
-    # 4. Gatekeeper -> hooks.json.
-    hooks_done = _install_codex_hooks(codex_hooks_json(home), hook_command)
+    # 4. Prune legacy gatekeeper entries from hooks.json (retired in 0.70.0).
+    _remove_codex_hooks(codex_hooks_json(home))
+    hooks_done = False
 
     # Prune artifacts shipped before but not now.
     removed = []

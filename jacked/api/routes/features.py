@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import shutil
-import sys
 from pathlib import Path
 from typing import Literal
 
@@ -30,7 +29,7 @@ RULES_START_PREFIX = "# jacked-behaviors-v"
 RULES_END_MARKER = "# end-jacked-behaviors"
 
 # Valid hook/knowledge names (allowlist)
-VALID_HOOKS = {"security_gatekeeper", "session_indexing", "sounds"}
+VALID_HOOKS = {"sounds"}
 
 
 def _get_valid_skill_names() -> list[str]:
@@ -274,44 +273,6 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
     """Check if a hook is installed in settings.json."""
     hooks = settings.get("hooks", {})
 
-    if hook_name == "security_gatekeeper":
-        # Check if hook entries are registered in settings.json
-        registered = any(
-            "security_gatekeeper" in str(entry)
-            for entry in hooks.get("PreToolUse", [])
-        ) or any(
-            "security_gatekeeper" in str(entry)
-            for entry in hooks.get("PermissionRequest", [])
-        )
-        if not registered:
-            return False
-        # Check DB flag for runtime enabled state.
-        # Direct sqlite3 read to avoid needing Request/db param propagation.
-        import json as _json
-        import sqlite3 as _sqlite3
-        db_path = Path.home() / ".claude" / "jacked.db"
-        if not db_path.exists():
-            return True  # No DB = default enabled
-        try:
-            with _sqlite3.connect(str(db_path), timeout=2.0) as conn:
-                cursor = conn.execute(
-                    "SELECT value FROM settings WHERE key = ?",
-                    ("gatekeeper.enabled",),
-                )
-                row = cursor.fetchone()
-                if row and row[0]:
-                    return _json.loads(row[0]) is not False
-            return True  # No flag = default enabled
-        except Exception:
-            return True  # Fail-open
-
-    if hook_name == "session_indexing":
-        for entry in hooks.get("Stop", []):
-            for h in entry.get("hooks", []):
-                if "jacked" in h.get("command", ""):
-                    return True
-        return False
-
     if hook_name == "sounds":
         for hook_type in ("Notification", "Stop"):
             for entry in hooks.get(hook_type, []):
@@ -386,20 +347,12 @@ async def list_features():
     # Hooks
     hooks = []
     hook_meta = {
-        "security_gatekeeper": {
-            "display_name": "Security Gatekeeper",
-            "description": "LLM-powered command evaluation for auto-approving safe commands",
-        },
-        "session_indexing": {
-            "display_name": "Session Indexing",
-            "description": "Index Claude sessions for semantic search (requires qdrant-client)",
-        },
         "sounds": {
             "display_name": "Sound Notifications",
             "description": "Play sounds on notifications and session completion",
         },
     }
-    for name in ("security_gatekeeper", "session_indexing", "sounds"):
+    for name in ("sounds",):
         meta = hook_meta[name]
         hooks.append({
             "name": name,
@@ -542,35 +495,13 @@ async def _toggle_file_feature(src: Path, dst: Path, enabled: bool, name: str, c
 
 
 async def _toggle_hook(name: str, enabled: bool, db=None):
-    """Enable/disable a hook.
-
-    For security_gatekeeper: writes DB flag (takes effect immediately)
-    and ensures all tool matchers are registered in settings.json.
-    For other hooks: adds/removes entries from settings.json.
-    """
+    """Enable/disable a hook by adding/removing entries in settings.json."""
     async with _settings_lock:
         settings = _read_settings_json()
         if "hooks" not in settings:
             settings["hooks"] = {}
 
-        if name == "security_gatekeeper":
-            # Write DB flag — gatekeeper checks this on every invocation,
-            # so toggle takes effect immediately without restarting Claude Code.
-            if db is not None:
-                import json
-                db.set_setting("gatekeeper.enabled", json.dumps(enabled))
-            # Ensure all known tool matchers are registered (idempotent repair).
-            # Hook entries stay in settings.json permanently — the DB flag
-            # controls whether the hook actually runs.
-            _ensure_gatekeeper_hooks(settings)
-
-        elif name == "session_indexing":
-            if enabled:
-                _enable_session_indexing_hook(settings)
-            else:
-                _disable_session_indexing_hook(settings)
-
-        elif name == "sounds":
+        if name == "sounds":
             if enabled:
                 _enable_sound_hooks(settings)
             else:
@@ -678,98 +609,6 @@ async def _toggle_rules(enabled: bool):
 
 
 # --- Hook enable/disable helpers ---
-
-def _ensure_gatekeeper_hooks(settings: dict):
-    """Ensure a single catch-all gatekeeper hook is registered.
-
-    Uses an empty matcher to intercept ALL tool calls. The gatekeeper decides
-    internally which tools to process vs pass-through based on DB/registry
-    config. Migrates old per-tool entries to catch-all mode. Idempotent.
-    """
-    python_exe = sys.executable
-    if not python_exe or not Path(python_exe).exists():
-        python_exe = shutil.which("python3") or shutil.which("python") or "python"
-
-    script_path = DATA_ROOT / "hooks" / "security_gatekeeper.py"
-    python_path = str(Path(python_exe)).replace("\\", "/")
-    script_str = str(script_path).replace("\\", "/")
-    command_str = f"{python_path} {script_str}"
-
-    if "PreToolUse" not in settings["hooks"]:
-        settings["hooks"]["PreToolUse"] = []
-
-    # Migrate: remove old per-tool gatekeeper entries
-    settings["hooks"]["PreToolUse"] = [
-        h for h in settings["hooks"]["PreToolUse"]
-        if not (
-            "security_gatekeeper" in str(h)
-            and h.get("matcher", "") != ""
-        )
-    ]
-
-    # Check if catch-all already exists and is up to date
-    for entry in settings["hooks"]["PreToolUse"]:
-        if (
-            entry.get("matcher") == ""
-            and "security_gatekeeper" in str(entry)
-        ):
-            # Update command if needed (handles python path changes)
-            for h in entry.get("hooks", []):
-                if h.get("command", "") != command_str:
-                    h["command"] = command_str
-            return
-
-    # Add catch-all entry
-    settings["hooks"]["PreToolUse"].append({
-        "matcher": "",
-        "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
-    })
-
-
-# Keep old name as alias for backwards compatibility with CLI installer
-_enable_security_hook = _ensure_gatekeeper_hooks
-
-
-def _disable_security_hook(settings: dict):
-    """Remove security gatekeeper hook from settings."""
-    for hook_type in ("PreToolUse", "PermissionRequest"):
-        if hook_type in settings.get("hooks", {}):
-            settings["hooks"][hook_type] = [
-                h for h in settings["hooks"][hook_type]
-                if "security_gatekeeper" not in str(h)
-            ]
-
-
-def _enable_session_indexing_hook(settings: dict):
-    """Add session indexing Stop hook."""
-    if "Stop" not in settings["hooks"]:
-        settings["hooks"]["Stop"] = []
-
-    # Check if already installed
-    for entry in settings["hooks"]["Stop"]:
-        for h in entry.get("hooks", []):
-            if "jacked" in h.get("command", ""):
-                return
-
-    settings["hooks"]["Stop"].append({
-        "matcher": "",
-        "hooks": [{
-            "type": "command",
-            "command": 'jacked index --repo "$CLAUDE_PROJECT_DIR"',
-            "async": True,
-        }]
-    })
-
-
-def _disable_session_indexing_hook(settings: dict):
-    """Remove session indexing Stop hook."""
-    if "Stop" not in settings.get("hooks", {}):
-        return
-    settings["hooks"]["Stop"] = [
-        entry for entry in settings["hooks"]["Stop"]
-        if not any("jacked" in h.get("command", "") for h in entry.get("hooks", []))
-    ]
-
 
 def _enable_sound_hooks(settings: dict):
     """Add sound notification hooks."""

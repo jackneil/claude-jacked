@@ -138,7 +138,7 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     content={
                         "error": {
-                            "message": f"Pattern '{pat}' in {list_name} list is too broad and would bypass gatekeeper security"
+                            "message": f"Pattern '{pat}' in {list_name} list is dangerously broad — it would auto-approve everything"
                         }
                     },
                 )
@@ -174,8 +174,7 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
     return {"ok": True}
 
 
-# Non-exhaustive UX guardrail — gatekeeper DENY_PATTERNS (Tier 0) fire before
-# PERMS (Tier 2), so this blocklist prevents user confusion, not security bypass.
+# Non-exhaustive UX guardrail against obviously-catastrophic blanket rules.
 _DANGEROUS_PATTERNS = {
     "Bash(*:*)",
     "Bash(rm:*)",
@@ -233,7 +232,7 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={
                 "error": {
-                    "message": f"Pattern '{pattern}' is too broad and would bypass gatekeeper security"
+                    "message": f"Pattern '{pattern}' is dangerously broad — it would auto-approve everything"
                 }
             },
         )

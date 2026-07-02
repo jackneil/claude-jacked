@@ -2,7 +2,7 @@
 description: Use when you want a playable video recording of a QA/test session plus a synced narrated journey — not just screenshots. For regression evidence, bug reproduction with motion, or a recorded walkthrough. Pass a URL as argument, or let it auto-detect.
 ---
 
-> **Tip:** MCP-based browser tools (Chrome DevTools MCP, Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI (`Bash(npx agent-browser:*)`).
+> **Tip:** MCP-based browser tools (Chrome DevTools MCP, Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly. If using `agent-browser`, pre-approve it once by adding `Bash(npx agent-browser:*)` to your permission allowlist.
 
 You are a QA engineer recording a **video** of a test journey — a playable file plus a video-synced narration — so it can be attached to a bug report or kept as regression evidence. This is `/qa`'s sibling: same kind of UI walk, but the output is *evidence in motion*, not just an issue list.
 

@@ -1,8 +1,8 @@
 /**
  * jacked web dashboard — log viewer (shell + shared helpers)
- * Sub-tabbed view: Gatekeeper | Hooks | Version Checks | Server
+ * Sub-tabbed view: Hooks | Version Checks | Server
  *
- * Sub-tab implementations in logs-gatekeeper.js, logs-hooks.js, logs-version-checks.js, logs-server.js
+ * Sub-tab implementations in logs-hooks.js, logs-version-checks.js, logs-server.js
  */
 
 // ---------------------------------------------------------------------------
@@ -13,7 +13,9 @@ let logsSearch = '';
 let logsActiveSession = 'ALL';
 let logsActiveRepo = 'ALL';
 let logsSessions = [];
-let logsSubTab = localStorage.getItem('jacked_logs_subtab') || 'gatekeeper';
+let logsSubTab = localStorage.getItem('jacked_logs_subtab') || 'hooks';
+// The Gatekeeper sub-tab was removed in 0.70.0 — migrate a stale saved choice.
+if (logsSubTab === 'gatekeeper') logsSubTab = 'hooks';
 
 // Pagination state per sub-tab
 let gkPage = 0, gkPageSize = 50, gkTotal = 0;
@@ -156,11 +158,6 @@ function refreshCurrentLogsSubTab(changedTables) {
     if (window.jackedState.logsInFlight) return;
 
     switch (logsSubTab) {
-        case 'gatekeeper':
-            if (!changedTables || changedTables.includes('gatekeeper_decisions')) {
-                loadSessions(); loadLogsData(true);
-            }
-            break;
         case 'hooks':
             if (!changedTables || changedTables.includes('hook_executions')) {
                 loadHookLogsData();
@@ -203,7 +200,6 @@ function stopLogsFallbackPolling() {
 
 function renderLogs() {
     const tabs = [
-        { id: 'gatekeeper', label: 'Gatekeeper' },
         { id: 'hooks', label: 'Hooks' },
         { id: 'version-checks', label: 'Version Checks' },
         { id: 'server', label: 'Server' },
@@ -262,7 +258,6 @@ function renderSubTab() {
     if (!container) return;
 
     switch (logsSubTab) {
-        case 'gatekeeper': renderGatekeeperSubTab(container); break;
         case 'hooks':      renderHookLogs(container); break;
         case 'version-checks': renderVersionCheckLogs(container); break;
         case 'server': if (typeof renderServerLogs === 'function') renderServerLogs(container); break;

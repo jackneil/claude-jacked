@@ -14,7 +14,7 @@ Rebuild the most-recently-active prior Claude Code session **for the current fol
 **Not this skill:** transient API/rate-limit blip mid-turn -> `retry`. Deliberately saved checkpoint -> `/checkpoint resume`. Topic search across all past sessions/machines -> `/jacked`.
 
 ## Requirements
-Needs a current `jacked` CLI on PATH (a bare install is enough — recovery never needs the Qdrant/`[search]` extra). Handle these two failure cases explicitly; do not work around them by hand-parsing transcripts:
+Needs a current `jacked` CLI on PATH. Handle these two failure cases explicitly; do not work around them by hand-parsing transcripts:
 - **`jacked` not found** -> tell the user to install or repair jacked, then stop.
 - **`jacked recover` reports `No such command 'recover'` / exits 2** -> the on-PATH `jacked` is outdated (it predates this command). Tell the user to upgrade with `uv tool install claude-jacked --force && jacked install`. In a uv-managed repo checkout, `uv run jacked recover ...` runs the current source instead.
 

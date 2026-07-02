@@ -19,7 +19,7 @@ If no `## Repo Config` section is present, run all detection steps normally.
 
 You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each focused on specific UX aspects on specific pages, to validate UI changes fast. This is the browser-testing equivalent of /dcr — multiple agents working simultaneously, each going deep on their assigned area.
 
-> **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly with the jacked gatekeeper. If using `agent-browser`, pre-approve it once via **Always Allow** in the jacked logs UI — this adds `Bash(npx agent-browser:*)` to your allowlist.
+> **Tip:** MCP-based browser tools (Playwright MCP, Claude-in-Chrome) require no bash approval and work instantly. If using `agent-browser`, pre-approve it once by adding `Bash(npx agent-browser:*)` to your permission allowlist.
 
 ## UX CHECK ASPECTS (7 total)
 
@@ -35,7 +35,7 @@ You are the UX Check Dispatcher. You spawn parallel browser-testing agents, each
 
 ## Step 1: Detect Browser Tools
 
-Check which browser automation tools are available. Prefer MCP tools first — they require no bash permissions and work without gatekeeper prompts.
+Check which browser automation tools are available. Prefer MCP tools first — they require no bash permissions or approval prompts.
 
 **Option A — Chrome DevTools MCP (preferred)**: Try calling `mcp__chrome-devtools__list_pages`. If it works, set `browser = "chrome-devtools"`. Use these tools:
 - `mcp__chrome-devtools__navigate_page` → open pages
@@ -72,7 +72,7 @@ Then continue to Option B as fallback.
 **Option C — Claude-in-Chrome**: Try using `mcp__claude-in-chrome__tabs_context_mcp`. If it works, set `browser = "chrome"`.
 
 **Option D — agent-browser CLI**: Run `npx agent-browser --version` via Bash. If it succeeds, set `browser = "agent-browser"`. This reuses your existing browser session — no new windows.
-> Note: `npx` requires a gatekeeper approval prompt unless pre-approved. Add `Bash(npx agent-browser:*)` via the jacked "Always Allow" button to avoid repeated prompts.
+> Note: `npx` requires an approval prompt unless pre-approved. Add `Bash(npx agent-browser:*)` to your permission allowlist to avoid repeated prompts.
 
 **If none are available**: Tell the user:
 ```
@@ -290,7 +290,7 @@ If found, use it. If multiple, ask the user. If none, ask for the URL.
 
 If the app requires authentication to access the areas being tested, search for credentials in `.env` files before asking the user.
 
-**Find the repo root** (`git rev-parse` is auto-approved by the gatekeeper):
+**Find the repo root**:
 ```bash
 git rev-parse --show-toplevel 2>/dev/null || pwd
 ```

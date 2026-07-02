@@ -370,7 +370,7 @@ def chunk_intent_text(
     """
     Chunk intent text into embedding-friendly sizes.
 
-    Qdrant's embedding models have token limits (~512), so we need to
+    Embedding models have token limits (~512), so we need to
     chunk long intent texts.
 
     Args:

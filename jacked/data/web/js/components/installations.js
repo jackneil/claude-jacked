@@ -137,7 +137,7 @@ function renderProjectActivity(projects, total) {
                         <svg class="w-6 h-6 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
                     </div>
                     <h4 class="text-sm font-medium text-white mb-1">No project activity yet</h4>
-                    <p class="text-xs text-slate-400 text-center">Activity will appear here as you use Claude Code with jacked installed.<br>The security gatekeeper, commands, and hooks all log their activity.</p>
+                    <p class="text-xs text-slate-400 text-center">Activity will appear here as you use Claude Code with jacked installed.<br>Commands and hooks log their activity.</p>
                 </div>
             </div>
         `;
@@ -168,18 +168,6 @@ function renderProjectCard(project) {
     const lastActivity = project.last_activity ? timeAgo(project.last_activity) : 'unknown';
 
     let statsHtml = '';
-
-    if (project.gatekeeper_decisions > 0) {
-        const approvalRate = project.gatekeeper_allowed > 0
-            ? ((project.gatekeeper_allowed / project.gatekeeper_decisions) * 100).toFixed(1)
-            : '0.0';
-        statsHtml += `
-            <div class="flex items-center justify-between text-xs">
-                <span class="text-slate-400">Gatekeeper</span>
-                <span class="text-white tabular-nums">${project.gatekeeper_decisions.toLocaleString()} <span class="text-slate-500">(${approvalRate}% approved)</span></span>
-            </div>
-        `;
-    }
 
     if (project.commands_run > 0) {
         statsHtml += `

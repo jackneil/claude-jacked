@@ -84,7 +84,7 @@ def test_cli_install_writes_manifest_and_summary(tmp_path, monkeypatch):
     monkeypatch.setattr("jacked.cli._setup_tray_autostart", lambda: None)
     runner = CliRunner()
     # First install: everything new, manifest + last-install written.
-    r1 = runner.invoke(main, ["install", "--no-security", "--no-rules"])
+    r1 = runner.invoke(main, ["install", "--no-rules"])
     assert r1.exit_code == 0, r1.output
     assert (fake_home / ".claude" / "jacked-manifest.json").exists()
     last = fake_home / ".claude" / "jacked-last-install.json"
@@ -98,7 +98,7 @@ def test_cli_install_writes_manifest_and_summary(tmp_path, monkeypatch):
     assert "What you get" not in r1.output
 
     # Second install (no version change): up to date, no spurious changes.
-    r2 = runner.invoke(main, ["install", "--no-security", "--no-rules"])
+    r2 = runner.invoke(main, ["install", "--no-rules"])
     assert r2.exit_code == 0, r2.output
     assert "up to date" in r2.output.lower()
 
@@ -110,7 +110,7 @@ def test_cli_install_json_emits_record(tmp_path, monkeypatch):
     # Don't let the install integration test register autostart or spawn a tray.
     monkeypatch.setattr("jacked.cli._setup_tray_autostart", lambda: None)
     runner = CliRunner()
-    r = runner.invoke(main, ["install", "--no-security", "--no-rules", "--json"])
+    r = runner.invoke(main, ["install", "--no-rules", "--json"])
     assert r.exit_code == 0, r.output
     import json
     payload = json.loads(r.output.strip().splitlines()[-1])

@@ -6,7 +6,7 @@ You are a **goal-brief forger**. The user already knows what they want built —
 
 `/goal-maker [merge] [focus note or path to a spec/plan]`
 
-> **Tip:** All discovery here uses gatekeeper-safe patterns (grep, git, find, ls, gh, wc) — no bash approval prompts.
+> **Tip:** All discovery here uses safe read-only patterns (grep, git, find, ls, gh, wc) — no bash approval prompts.
 
 ## Step 0: Resolve the merge mode (from the invocation)
 

@@ -11,29 +11,40 @@ class TestHookShim:
         mock_module = MagicMock()
         mock_module.main = MagicMock()
         with patch("importlib.import_module", return_value=mock_module) as mock_import:
-            runner.invoke(main, ["_hook", "security_gatekeeper"], input="{}")
-        mock_import.assert_called_once_with("jacked.data.hooks.security_gatekeeper")
+            runner.invoke(main, ["_hook", "qa_suggest"], input="{}")
+        mock_import.assert_called_once_with("jacked.data.hooks.qa_suggest")
         mock_module.main.assert_called_once()
 
-    def test_unknown_hook_name_rejected_before_import(self):
+    def test_unknown_hook_fails_open_without_import(self):
+        """Retired/unknown hook names must exit 0 (allow) — a stale
+        settings.json entry (e.g. the removed security_gatekeeper wired as
+        PreToolUse) must never block the user's tool calls."""
         from jacked.cli import main
         runner = CliRunner()
         with patch("importlib.import_module") as mock_import:
             result = runner.invoke(main, ["_hook", "nonexistent_xyz"], input="{}")
-        assert result.exit_code != 0
+        assert result.exit_code == 0
         mock_import.assert_not_called()
 
-    def test_path_traversal_rejected(self):
+    def test_retired_gatekeeper_hook_fails_open(self):
+        from jacked.cli import main
+        runner = CliRunner()
+        with patch("importlib.import_module") as mock_import:
+            result = runner.invoke(main, ["_hook", "security_gatekeeper"], input="{}")
+        assert result.exit_code == 0
+        mock_import.assert_not_called()
+
+    def test_path_traversal_never_imports(self):
         from jacked.cli import main
         runner = CliRunner()
         with patch("importlib.import_module") as mock_import:
             result = runner.invoke(main, ["_hook", "../etc"], input="{}")
-        assert result.exit_code != 0
+        assert result.exit_code == 0  # fail open, but never import
         mock_import.assert_not_called()
 
     def test_known_hook_names_accepted(self):
         from jacked.cli import _valid_hook_names
         names = _valid_hook_names()
-        assert "security_gatekeeper" in names
+        assert "security_gatekeeper" not in names  # retired in 0.70.0
         assert "session_account_tracker" in names
         assert "qa_suggest" in names

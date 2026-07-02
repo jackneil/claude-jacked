@@ -7,10 +7,9 @@
 - When an approach has gone sideways and you're patching patches, suggest /redo to scrap and re-implement cleanly
 - Periodically during long sessions, suggest /techdebt to scan for debt accumulating in the codebase
 - After adding several rules to CLAUDE.md, suggest /audit-rules to check for duplicates and contradictions
-- When searching for context from past sessions, use /jacked to search semantic memory before re-exploring from scratch
 - For non-trivial tasks (3+ steps or architectural decisions), enter plan mode first. When a fix feels hacky, step back and redesign.
 - Never mark a task complete without proving it works - run tests, check logs, demonstrate correctness
-- When the user asks about jacked features, gatekeeper, logs, installation, or troubleshooting, read ~/.claude/jacked-reference.md for comprehensive details before answering.
+- When the user asks about jacked features, logs, installation, or troubleshooting, read ~/.claude/jacked-reference.md for comprehensive details before answering.
 - At the start of a session, run `jacked check-version` to see if a newer version is available. If outdated, mention it to the user.
 - After implementing security-sensitive changes (auth, RBAC, multi-tenancy, billing, credential handling), suggest /cso for a proactive security audit before merging.
 - After dependency upgrades, before publishing a package to PyPI/npm, after CI workflow changes, or quarterly, suggest /lockdown to audit the repo against supply-chain attacks (lockfile integrity, CVE/malware scan, Actions SHA-pinning, provenance, secrets). Default is baseline-only; pass `--paranoid` for healthcare/PHI to add stricter controls. `/lockdown fix` batches accepted hardening into a single commit; `/lockdown baseline` installs ongoing CI monitoring. `/lockdown` never modifies dep versions or manifests — CVE findings produce upgrade *commands* the user applies manually. Explicitly add `--workspace=PATH` to see cross-repo blast radius before applying CVE upgrades (the workspace scan is opt-in only and never auto-enabled, even if sibling repos exist).

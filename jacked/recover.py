@@ -5,7 +5,7 @@ Find the most-recently-active prior session for a working directory from the
 raw on-disk transcripts under ~/.claude/projects, and reconstruct a budgeted
 working-state digest so a fresh session can pick up where a crashed one died.
 
-Qdrant-free by design: imports only jacked.transcript + stdlib so /recover
+Self-contained by design: imports only jacked.transcript + stdlib so /recover
 works on a bare install (the moment right after a crash). Never import
 jacked.retriever / jacked.searcher here.
 """

@@ -20,7 +20,7 @@ If no `## Repo Config` section is present, run all discovery steps normally.
 
 > Skip this step entirely if `## Repo Config` was found above.
 
-Run these commands to gather context (all are gatekeeper-safe):
+Run these commands to gather context (all safe, read-only):
 
 ```bash
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)

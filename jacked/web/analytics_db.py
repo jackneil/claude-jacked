@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from jacked.web.db_analytics import MODEL_PRICING
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +77,30 @@ CREATE TABLE IF NOT EXISTS analytics_settings (
     value TEXT
 );
 """
+
+# ---------------------------------------------------------------------------
+# Anthropic API pricing per million tokens (USD)
+# Verify at: https://platform.claude.com/docs/en/about-claude/pricing
+# Last verified: 2026-02-28
+# ---------------------------------------------------------------------------
+
+# Price tiers — single source of truth, mapped by full ID and short alias below.
+_TIER_HAIKU  = {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25}
+_TIER_SONNET = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75}
+_TIER_OPUS   = {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25}
+
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    # Full model IDs (stored in DB model column)
+    "claude-haiku-4-5-20251001": _TIER_HAIKU,
+    "claude-sonnet-4-5-20250929": _TIER_SONNET,
+    "claude-sonnet-4-6": _TIER_SONNET,
+    "claude-opus-4-6": _TIER_OPUS,
+    # Short aliases (fallback for legacy rows without model column)
+    "haiku": _TIER_HAIKU,
+    "sonnet": _TIER_SONNET,
+    "opus": _TIER_OPUS,
+}
+
 
 # ---------------------------------------------------------------------------
 # Opus fallback pricing (used when model is unknown)

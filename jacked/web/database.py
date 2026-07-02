@@ -2,7 +2,7 @@
 
 10 tables across three concerns:
 - Account management: accounts, installations, settings
-- Analytics: gatekeeper_decisions, command_usage, agent_invocations,
+- Analytics: command_usage, agent_invocations,
              hook_executions, lessons, version_checks
 - Session tracking: session_accounts
 
@@ -110,20 +110,6 @@ class Setting(BaseModel):
     key: str
     value: str
     updated_at: Optional[str] = None
-
-
-class GatekeeperDecision(BaseModel):
-    """Pydantic v2 model for a gatekeeper_decisions row."""
-
-    id: int
-    timestamp: str
-    command: Optional[str] = None
-    decision: str
-    method: Optional[str] = None
-    reason: Optional[str] = None
-    elapsed_ms: Optional[float] = None
-    session_id: Optional[str] = None
-    repo_path: Optional[str] = None
 
 
 class CommandUsage(BaseModel):
@@ -257,24 +243,7 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 -- Analytics Tables
-CREATE TABLE IF NOT EXISTS gatekeeper_decisions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    command TEXT,
-    decision TEXT NOT NULL,
-    method TEXT,
-    reason TEXT,
-    elapsed_ms REAL,
-    session_id TEXT,
-    repo_path TEXT,
-    input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    cache_read_tokens INTEGER DEFAULT 0,
-    cache_write_tokens INTEGER DEFAULT 0,
-    model TEXT,
-    trajectory TEXT
-);
-
+-- (gatekeeper_decisions was removed in 0.70.0; old DBs may still carry it)
 CREATE TABLE IF NOT EXISTS command_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     command_name TEXT NOT NULL,
@@ -381,15 +350,12 @@ INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active, is_deleted);
 CREATE INDEX IF NOT EXISTS idx_accounts_priority ON accounts(priority);
 CREATE INDEX IF NOT EXISTS idx_installations_repo ON installations(repo_path);
-CREATE INDEX IF NOT EXISTS idx_gatekeeper_timestamp ON gatekeeper_decisions(timestamp);
-CREATE INDEX IF NOT EXISTS idx_gatekeeper_decision ON gatekeeper_decisions(decision);
 CREATE INDEX IF NOT EXISTS idx_command_usage_name ON command_usage(command_name);
 CREATE INDEX IF NOT EXISTS idx_command_usage_ts ON command_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_agent_invocations_name ON agent_invocations(agent_name);
 CREATE INDEX IF NOT EXISTS idx_hook_executions_type ON hook_executions(hook_type);
 CREATE INDEX IF NOT EXISTS idx_lessons_status ON lessons(status);
 CREATE INDEX IF NOT EXISTS idx_version_checks_ts ON version_checks(timestamp);
-CREATE INDEX IF NOT EXISTS idx_gatekeeper_repo ON gatekeeper_decisions(repo_path);
 CREATE INDEX IF NOT EXISTS idx_command_usage_repo ON command_usage(repo_path);
 CREATE INDEX IF NOT EXISTS idx_hook_executions_repo ON hook_executions(repo_path);
 CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
@@ -517,31 +483,6 @@ class Database:
                         )
                     except sqlite3.OperationalError:
                         pass
-            # Migration: add token tracking + model to gatekeeper_decisions
-            cursor = conn.execute("PRAGMA table_info(gatekeeper_decisions)")
-            cols = {row[1] for row in cursor.fetchall()}
-            for col_name, col_def in [
-                ("input_tokens", "INTEGER DEFAULT 0"),
-                ("output_tokens", "INTEGER DEFAULT 0"),
-                ("cache_read_tokens", "INTEGER DEFAULT 0"),
-                ("cache_write_tokens", "INTEGER DEFAULT 0"),
-                ("model", "TEXT"),
-            ]:
-                if col_name not in cols:
-                    try:
-                        conn.execute(
-                            f"ALTER TABLE gatekeeper_decisions ADD COLUMN {col_name} {col_def}"
-                        )
-                    except sqlite3.OperationalError:
-                        pass
-            # Migration: add trajectory to gatekeeper_decisions
-            if "trajectory" not in cols:
-                try:
-                    conn.execute(
-                        "ALTER TABLE gatekeeper_decisions ADD COLUMN trajectory TEXT"
-                    )
-                except sqlite3.OperationalError:
-                    pass
             # Migration: add CC (Claude Code) token columns for dual-token architecture.
             # Primary tokens are jacked-only; CC tokens are written to credential files
             # for Claude Code. This prevents token rotation conflicts.
@@ -1595,209 +1536,6 @@ class Database:
     # Gatekeeper Decisions
     # ==================================================================
 
-    def record_gatekeeper_decision(
-        self,
-        decision: str,
-        timestamp: Optional[str] = None,
-        command: Optional[str] = None,
-        method: Optional[str] = None,
-        reason: Optional[str] = None,
-        elapsed_ms: Optional[float] = None,
-        session_id: Optional[str] = None,
-        repo_path: Optional[str] = None,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        cache_read_tokens: int = 0,
-        cache_write_tokens: int = 0,
-        model: Optional[str] = None,
-    ) -> int:
-        """Record a gatekeeper decision.
-
-        >>> db = Database(":memory:")
-        >>> rid = db.record_gatekeeper_decision("ALLOW", command="ls")
-        >>> rid > 0
-        True
-        """
-        ts = timestamp or datetime.now(timezone.utc).isoformat()
-        # Truncate command to 1000 chars per design doc
-        if command and len(command) > 1000:
-            command = command[:1000]
-
-        with self._writer() as conn:
-            cursor = conn.execute(
-                """INSERT INTO gatekeeper_decisions
-                   (timestamp, command, decision, method, reason, elapsed_ms,
-                    session_id, repo_path, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, model)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    ts,
-                    command,
-                    decision,
-                    method,
-                    reason,
-                    elapsed_ms,
-                    session_id,
-                    repo_path,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    model,
-                ),
-            )
-            return cursor.lastrowid or 0
-
-    def list_gatekeeper_methods(self) -> list[str]:
-        """Return distinct method values from gatekeeper_decisions.
-
-        >>> db = Database(":memory:")
-        >>> db.list_gatekeeper_methods()
-        []
-        """
-        with self._reader() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT method FROM gatekeeper_decisions WHERE method IS NOT NULL ORDER BY method"
-            ).fetchall()
-            return [r[0] for r in rows]
-
-    def list_gatekeeper_decisions(
-        self,
-        limit: int = 100,
-        offset: int = 0,
-        filters: Optional[dict] = None,
-    ) -> dict:
-        """List recent gatekeeper decisions with server-side filters and pagination.
-
-        Returns ``{"rows": [...], "total": N}`` where total is the
-        filtered count *before* LIMIT/OFFSET.
-
-        ``filters`` keys: session_id, decision, method, command_search, repo_path.
-
-        >>> db = Database(":memory:")
-        >>> db.list_gatekeeper_decisions()
-        {'rows': [], 'total': 0}
-        >>> db.list_gatekeeper_decisions(filters={"decision": "ALLOW"})
-        {'rows': [], 'total': 0}
-        """
-        f = filters or {}
-        conditions: list[str] = []
-        params: list = []
-
-        if f.get("session_id"):
-            conditions.append("session_id = ?")
-            params.append(f["session_id"])
-        if f.get("decision"):
-            conditions.append("decision = ?")
-            params.append(f["decision"])
-        if f.get("method"):
-            conditions.append("method = ?")
-            params.append(f["method"])
-        if f.get("command_search"):
-            conditions.append("command LIKE ?")
-            params.append(f"%{f['command_search']}%")
-        if f.get("repo_path"):
-            conditions.append("LOWER(repo_path) = LOWER(?)")
-            params.append(f["repo_path"])
-
-        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-
-        with self._reader() as conn:
-            total = conn.execute(
-                f"SELECT COUNT(*) FROM gatekeeper_decisions{where}",
-                params,
-            ).fetchone()[0]
-
-            cursor = conn.execute(
-                f"SELECT * FROM gatekeeper_decisions{where} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                params + [limit, offset],
-            )
-            return {"rows": [dict(row) for row in cursor.fetchall()], "total": total}
-
-    def list_gatekeeper_sessions(self, limit: int = 50) -> list[dict]:
-        """Aggregate gatekeeper decisions grouped by session.
-
-        >>> db = Database(":memory:")
-        >>> db.list_gatekeeper_sessions()
-        []
-        """
-        with self._reader() as conn:
-            cursor = conn.execute(
-                """SELECT session_id,
-                          COUNT(*) as total,
-                          SUM(CASE WHEN decision='ALLOW' THEN 1 ELSE 0 END) as allowed,
-                          SUM(CASE WHEN decision='ASK_USER' THEN 1 ELSE 0 END) as asked,
-                          MIN(timestamp) as first_seen,
-                          MAX(timestamp) as last_seen,
-                          repo_path
-                   FROM gatekeeper_decisions
-                   WHERE session_id IS NOT NULL AND session_id != ''
-                   GROUP BY session_id
-                   ORDER BY last_seen DESC
-                   LIMIT ?""",
-                (limit,),
-            )
-            return [dict(row) for row in cursor.fetchall()]
-
-    def purge_gatekeeper_decisions(
-        self,
-        before_iso: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> int:
-        """Delete gatekeeper decisions by age or session. Returns rows deleted.
-
-        >>> db = Database(":memory:")
-        >>> db.purge_gatekeeper_decisions()
-        0
-        >>> db.record_gatekeeper_decision("ALLOW", command="echo hi", method="LOCAL", reason="safe", elapsed_ms=1.0, session_id="sess1", repo_path="/repo")
-        1
-        >>> db.purge_gatekeeper_decisions(session_id="sess1")
-        1
-        >>> db.list_gatekeeper_decisions()
-        {'rows': [], 'total': 0}
-        """
-        with self._writer() as conn:
-            if session_id:
-                cursor = conn.execute(
-                    "DELETE FROM gatekeeper_decisions WHERE session_id = ?",
-                    (session_id,),
-                )
-            elif before_iso:
-                cursor = conn.execute(
-                    "DELETE FROM gatekeeper_decisions WHERE timestamp < ?",
-                    (before_iso,),
-                )
-            else:
-                cursor = conn.execute("DELETE FROM gatekeeper_decisions")
-            return cursor.rowcount
-
-    def export_gatekeeper_decisions(
-        self,
-        session_id: Optional[str] = None,
-        decision: Optional[str] = None,
-    ) -> list[dict]:
-        """Export matching gatekeeper decisions as list of dicts.
-
-        >>> db = Database(":memory:")
-        >>> db.export_gatekeeper_decisions()
-        []
-        """
-        with self._reader() as conn:
-            sql = "SELECT * FROM gatekeeper_decisions WHERE 1=1"
-            params: list = []
-            if session_id:
-                sql += " AND session_id = ?"
-                params.append(session_id)
-            if decision:
-                sql += " AND decision = ?"
-                params.append(decision)
-            sql += " ORDER BY timestamp DESC"
-            return [dict(row) for row in conn.execute(sql, params).fetchall()]
-
-    # ==================================================================
-    # Command Usage
-    # ==================================================================
-
     def record_command_usage(
         self,
         command_name: str,
@@ -1900,7 +1638,7 @@ class Database:
         """Record a hook execution.
 
         >>> db = Database(":memory:")
-        >>> rid = db.record_hook_execution("PreToolUse", hook_name="security_gatekeeper")
+        >>> rid = db.record_hook_execution("PreToolUse", hook_name="qa_suggest")
         >>> rid > 0
         True
         """
@@ -2336,8 +2074,14 @@ class Database:
             Count of sessions reassigned
 
         >>> db = Database(":memory:")
-        >>> db.reassign_sessions(1, 2, "2025-01-01T00:00:00Z")
+        >>> a = db.create_account("a@x.com", "tok", 9999999999)
+        >>> b = db.create_account("b@x.com", "tok", 9999999999)
+        >>> db.reassign_sessions(a["id"], b["id"], "2025-01-01T00:00:00Z")
         0
+        >>> db.reassign_sessions(999, b["id"], "2025-01-01T00:00:00Z")
+        Traceback (most recent call last):
+        ...
+        ValueError: Source account 999 not found
         """
         from_acct = self.get_account(from_account_id)
         to_acct = self.get_account(to_account_id)
@@ -2391,59 +2135,6 @@ class Database:
     # ==================================================================
     # Analytics Query Methods (for API routes)
     # ==================================================================
-
-    def query_gatekeeper_decisions(self, days: int = 30) -> dict:
-        """Aggregate gatekeeper decision stats for the last N days.
-
-        Returns dict with total, by_decision counts, by_method counts,
-        avg_elapsed_ms, and recent decisions.
-
-        >>> db = Database(":memory:")
-        >>> stats = db.query_gatekeeper_decisions()
-        >>> stats["total"]
-        0
-        """
-        with self._reader() as conn:
-            cutoff = f"datetime('now', '-{days} days')"
-
-            cursor = conn.execute(
-                f"SELECT COUNT(*) as total FROM gatekeeper_decisions WHERE timestamp >= {cutoff}"
-            )
-            total = cursor.fetchone()["total"]
-
-            cursor = conn.execute(
-                f"""SELECT decision, COUNT(*) as count
-                    FROM gatekeeper_decisions WHERE timestamp >= {cutoff}
-                    GROUP BY decision"""
-            )
-            by_decision = {row["decision"]: row["count"] for row in cursor.fetchall()}
-
-            cursor = conn.execute(
-                f"""SELECT method, COUNT(*) as count
-                    FROM gatekeeper_decisions WHERE timestamp >= {cutoff}
-                    GROUP BY method"""
-            )
-            by_method = {row["method"]: row["count"] for row in cursor.fetchall()}
-
-            cursor = conn.execute(
-                f"SELECT AVG(elapsed_ms) as avg_ms FROM gatekeeper_decisions WHERE timestamp >= {cutoff}"
-            )
-            avg_ms = cursor.fetchone()["avg_ms"]
-
-            cursor = conn.execute(
-                f"""SELECT * FROM gatekeeper_decisions
-                    WHERE timestamp >= {cutoff}
-                    ORDER BY timestamp DESC LIMIT 50"""
-            )
-            recent = [dict(row) for row in cursor.fetchall()]
-
-            return {
-                "total": total,
-                "by_decision": by_decision,
-                "by_method": by_method,
-                "avg_elapsed_ms": round(avg_ms, 2) if avg_ms else None,
-                "recent": recent,
-            }
 
     def query_command_usage(self, days: int = 30) -> dict:
         """Aggregate command usage stats for the last N days.
@@ -2598,20 +2289,16 @@ class Database:
         activity. Only includes repos with at least one recorded event.
 
         >>> db = Database(":memory:")
-        >>> db.record_gatekeeper_decision("ALLOW", command="ls", repo_path="/repo/a", session_id="s1")
+        >>> db.record_hook_execution("Stop", hook_name="qa_suggest", repo_path="/repo/a", session_id="s1")
         1
-        >>> db.record_gatekeeper_decision("ALLOW", command="cat", repo_path="/repo/a", session_id="s1")
+        >>> db.record_hook_execution("Stop", hook_name="qa_suggest", repo_path="/repo/a", session_id="s2")
         2
-        >>> db.record_gatekeeper_decision("ASK_USER", command="rm -rf /", repo_path="/repo/a", session_id="s2")
-        3
         >>> summary = db.get_project_activity_summary()
         >>> len(summary)
         1
         >>> summary[0]["repo_path"]
         '/repo/a'
-        >>> summary[0]["gatekeeper_decisions"]
-        3
-        >>> summary[0]["gatekeeper_allowed"]
+        >>> summary[0]["hook_executions"]
         2
         >>> summary[0]["unique_sessions"]
         2
@@ -2621,8 +2308,6 @@ class Database:
                 """
                 SELECT
                     repo_path,
-                    SUM(gk_total) as gatekeeper_decisions,
-                    SUM(gk_allowed) as gatekeeper_allowed,
                     SUM(cmd_total) as commands_run,
                     SUM(hook_total) as hook_executions,
                     MAX(last_ts) as last_activity,
@@ -2630,20 +2315,6 @@ class Database:
                     unique_sessions
                 FROM (
                     SELECT REPLACE(repo_path, char(92), '/') as repo_path,
-                           COUNT(*) as gk_total,
-                           SUM(CASE WHEN decision='ALLOW' THEN 1 ELSE 0 END) as gk_allowed,
-                           0 as cmd_total, 0 as hook_total,
-                           MAX(timestamp) as last_ts,
-                           MIN(timestamp) as first_ts,
-                           COUNT(DISTINCT session_id) as unique_sessions
-                    FROM gatekeeper_decisions
-                    WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY REPLACE(repo_path, char(92), '/')
-
-                    UNION ALL
-
-                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
-                           0 as gk_total, 0 as gk_allowed,
                            COUNT(*) as cmd_total, 0 as hook_total,
                            MAX(timestamp) as last_ts,
                            MIN(timestamp) as first_ts,
@@ -2655,7 +2326,6 @@ class Database:
                     UNION ALL
 
                     SELECT REPLACE(repo_path, char(92), '/') as repo_path,
-                           0 as gk_total, 0 as gk_allowed,
                            0 as cmd_total, COUNT(*) as hook_total,
                            MAX(timestamp) as last_ts,
                            MIN(timestamp) as first_ts,

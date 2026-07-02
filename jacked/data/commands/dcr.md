@@ -280,7 +280,7 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
     **Lenses selected ([N] of 11):**
       ✓ Guardrails (always)
       ✓ Security — API routes modified, auth logic touched
-      ✓ Logic & Edge Cases — new conditional branching in gatekeeper
+      ✓ Logic & Edge Cases — new conditional branching in auth flow
       ✓ Testing — new test files added, verifying coverage
       ✓ Performance — database query changes
       ⊘ Access Control — no RBAC or multi-tenant changes

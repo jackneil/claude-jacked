@@ -165,7 +165,6 @@ async def lifespan(app: FastAPI):
         "jacked.web.auth",
         "jacked.api.routes.features",
         "jacked.api.routes.permissions",
-        "jacked.api.routes.profiles",
         "jacked.api.routes.system",
         "jacked.api.usage_monitor",
         "jacked.web.oauth",
@@ -442,7 +441,7 @@ async def websocket_endpoint(ws: WebSocket):
 
 # --- Include route modules ---
 
-from jacked.api.routes import system, analytics, features, logs, permissions, profiles, menubar  # noqa: E402
+from jacked.api.routes import system, analytics, features, logs, permissions, menubar  # noqa: E402
 from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
 
 # Swap settings router MUST be registered before system router —
@@ -454,7 +453,6 @@ app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"]
 app.include_router(features.router, prefix="/api", tags=["features"])
 app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(permissions.router, prefix="/api", tags=["permissions"])
-app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
 app.include_router(menubar.router, prefix="/api", tags=["menubar"])
 
 # Auth routes (includes credential switching + session queries)

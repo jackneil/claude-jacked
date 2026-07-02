@@ -23,4 +23,3 @@ fi
 echo ""
 echo "Done! claude-jacked has been removed."
 echo ""
-echo "Note: Your Qdrant index is still intact if you want to reinstall later."

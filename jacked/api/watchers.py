@@ -112,7 +112,7 @@ async def session_accounts_watch_loop(app, interval: int = 3):
 
 
 async def logs_watch_loop(app, interval: int = 3):
-    """Watch gatekeeper_decisions, hook_executions, version_checks for changes.
+    """Watch hook_executions and version_checks for changes.
 
     Same PRAGMA data_version pattern as session_accounts_watch_loop.
     Broadcasts 'logs_changed' with payload.tables listing which table(s) changed.
@@ -132,7 +132,6 @@ async def logs_watch_loop(app, interval: int = 3):
 
     last_data_version: int | None = None
     last_max_ids: dict[str, int | None] = {
-        "gatekeeper_decisions": None,
         "hook_executions": None,
         "version_checks": None,
     }

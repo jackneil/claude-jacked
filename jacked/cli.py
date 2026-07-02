@@ -11,15 +11,10 @@ import subprocess
 import sys
 import logging
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-
-from jacked.config import SmartForkConfig, get_repo_id
 
 
 console = Console()
@@ -33,38 +28,6 @@ def setup_logging(verbose: bool = False):
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-
-def get_config(quiet: bool = False) -> Optional[SmartForkConfig]:
-    """Load configuration from environment.
-
-    Args:
-        quiet: If True, return None instead of printing error and exiting.
-               Used by hooks that should fail gracefully.
-    """
-    try:
-        return SmartForkConfig.from_env()
-    except ValueError as e:
-        if quiet:
-            return None
-        console.print(f"[red]Configuration error:[/red] {e}")
-        console.print("\nSet these environment variables:")
-        console.print("  QDRANT_CLAUDE_SESSIONS_ENDPOINT=<your-qdrant-url>")
-        console.print("  QDRANT_CLAUDE_SESSIONS_API_KEY=<your-api-key>")
-        sys.exit(1)
-
-
-def _require_search(command_name: str) -> bool:
-    """Check if qdrant-client is installed. If not, print helpful error and return False."""
-    try:
-        import qdrant_client  # noqa: F401
-
-        return True
-    except ImportError:
-        console.print(f"[red]Error:[/red] '{command_name}' requires the search extra.")
-        console.print("\nInstall it with:")
-        console.print(r'  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
-        return False
 
 
 DB_PATH = Path.home() / ".claude" / "jacked.db"
@@ -160,7 +123,6 @@ def _maybe_prompt_first_run(ctx) -> None:
     if _already_installed():
         return
 
-    from rich.panel import Panel
     from rich.text import Text
 
     msg = Text()
@@ -186,426 +148,6 @@ def _maybe_prompt_first_run(ctx) -> None:
 
 
 @main.command()
-@click.argument("session", required=False)
-@click.option("--repo", "-r", help="Repository path (defaults to CLAUDE_PROJECT_DIR)")
-def index(session: Optional[str], repo: Optional[str]):
-    """
-    Index a Claude session to Qdrant.
-
-    If SESSION is not provided, indexes the current session (from CLAUDE_SESSION_ID).
-    Requires: uv tool install "claude-jacked[search]"
-    """
-    import os
-    import time
-
-    _index_start = time.time()
-
-    # Check if qdrant is available
-    try:
-        import qdrant_client  # noqa: F401
-    except ImportError:
-        # If called from Stop hook (CLAUDE_SESSION_ID set), exit silently
-        # If called manually, show helpful message
-        if os.getenv("CLAUDE_SESSION_ID") and not session:
-            sys.exit(0)
-        else:
-            console.print("[red]Error:[/red] 'index' requires the search extra.")
-            console.print("\nInstall it with:")
-            console.print(r'  [bold]uv tool install "claude-jacked\[search]" --force[/bold]')
-            sys.exit(1)
-
-    from jacked.indexer import SessionIndexer
-
-    # Try to get config quietly - if not configured, nudge and exit cleanly
-    config = get_config(quiet=True)
-    if config is None:
-        print("[jacked] Indexing skipped - run 'jacked configure' to set up Qdrant")
-        sys.exit(0)
-
-    indexer = SessionIndexer(config)
-
-    if session:
-        # Index specific session by path or ID
-        session_path = Path(session)
-        if session_path.exists():
-            # It's a file path
-            repo_path = repo or os.getenv("CLAUDE_PROJECT_DIR", "")
-            if not repo_path:
-                console.print(
-                    "[red]Error:[/red] --repo is required when indexing a file path"
-                )
-                sys.exit(1)
-        else:
-            # Assume it's a session ID, find the file
-            if not repo:
-                repo = os.getenv("CLAUDE_PROJECT_DIR")
-            if not repo:
-                console.print(
-                    "[red]Error:[/red] --repo or CLAUDE_PROJECT_DIR is required"
-                )
-                sys.exit(1)
-
-            from jacked.config import get_session_dir_for_repo
-
-            session_dir = get_session_dir_for_repo(config.claude_projects_dir, repo)
-            session_path = session_dir / f"{session}.jsonl"
-            repo_path = repo
-
-            if not session_path.exists():
-                console.print(
-                    f"[red]Error:[/red] Session file not found: {session_path}"
-                )
-                sys.exit(1)
-    else:
-        # Index current session
-        session_id = os.getenv("CLAUDE_SESSION_ID")
-        repo_path = os.getenv("CLAUDE_PROJECT_DIR")
-
-        if not session_id or not repo_path:
-            console.print(
-                "[red]Error:[/red] CLAUDE_SESSION_ID and CLAUDE_PROJECT_DIR not set"
-            )
-            console.print("Provide a session path or run from within a Claude session")
-            sys.exit(1)
-
-        from jacked.config import get_session_dir_for_repo
-
-        session_dir = get_session_dir_for_repo(config.claude_projects_dir, repo_path)
-        session_path = session_dir / f"{session_id}.jsonl"
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task(f"Indexing {session_path.stem}...", total=None)
-
-        result = indexer.index_session(session_path, repo_path)
-
-        progress.remove_task(task)
-
-    if result.get("indexed"):
-        console.print(
-            f"[green][OK][/green] Indexed session {result['session_id']}: "
-            f"{result['plans']}p {result['subagent_summaries']}a "
-            f"{result['summary_labels']}l {result['user_messages']}u {result['chunks']}c"
-        )
-    elif result.get("skipped"):
-        console.print(
-            f"[yellow][-][/yellow] Session {result['session_id']} unchanged, skipped"
-        )
-    else:
-        console.print(f"[red][FAIL][/red] Failed: {result.get('error')}")
-        _log_to_db(
-            "hook_executions",
-            hook_type="Stop",
-            hook_name="session_indexing",
-            session_id=os.getenv("CLAUDE_SESSION_ID", ""),
-            repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
-            success=False,
-            duration_ms=(time.time() - _index_start) * 1000,
-        )
-        sys.exit(1)
-
-    _log_to_db(
-        "hook_executions",
-        hook_type="Stop",
-        hook_name="session_indexing",
-        session_id=os.getenv("CLAUDE_SESSION_ID", ""),
-        repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
-        success=result.get("indexed", False),
-        duration_ms=(time.time() - _index_start) * 1000,
-    )
-
-
-@main.command()
-@click.option("--repo", "-r", help="Filter by repository name pattern")
-@click.option("--force", "-f", is_flag=True, help="Re-index all sessions")
-def backfill(repo: Optional[str], force: bool):
-    """Index all existing Claude sessions. Requires: uv tool install "claude-jacked[search]" """
-    if not _require_search("backfill"):
-        sys.exit(1)
-
-    from jacked.indexer import SessionIndexer
-
-    config = get_config()
-    indexer = SessionIndexer(config)
-
-    console.print(f"Scanning {config.claude_projects_dir}...")
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Indexing sessions...", total=None)
-
-        results = indexer.index_all_sessions(repo_pattern=repo, force=force)
-
-        progress.remove_task(task)
-
-    console.print(
-        f"\n[bold]Results:[/bold]\n"
-        f"  Total:   {results['total']}\n"
-        f"  Indexed: [green]{results['indexed']}[/green]\n"
-        f"  Skipped: [yellow]{results['skipped']}[/yellow]\n"
-        f"  Errors:  [red]{results['errors']}[/red]"
-    )
-
-    _log_to_db("command_usage", command_name="backfill")
-
-
-@main.command()
-@click.argument("query")
-@click.option("--repo", "-r", help="Boost results from this repository path")
-@click.option("--limit", "-n", default=5, help="Maximum results")
-@click.option("--mine", "-m", is_flag=True, help="Only show my sessions")
-@click.option("--user", "-u", help="Only show sessions from this user")
-@click.option(
-    "--type",
-    "-t",
-    "content_types",
-    multiple=True,
-    help="Filter by content type (plan, subagent_summary, summary_label, user_message, chunk)",
-)
-def search(
-    query: str,
-    repo: Optional[str],
-    limit: int,
-    mine: bool,
-    user: Optional[str],
-    content_types: tuple,
-):
-    """Search for sessions by semantic similarity with multi-factor ranking.
-
-    Requires: uv tool install "claude-jacked[search]"
-    """
-    if not _require_search("search"):
-        sys.exit(1)
-
-    import os
-    from jacked.searcher import SessionSearcher
-
-    _log_to_db(
-        "command_usage",
-        command_name="search",
-        repo_path=os.getenv("CLAUDE_PROJECT_DIR", ""),
-        session_id=os.getenv("CLAUDE_SESSION_ID", ""),
-    )
-
-    config = get_config()
-    searcher = SessionSearcher(config)
-
-    # Use current repo if not specified
-    current_repo = repo or os.getenv("CLAUDE_PROJECT_DIR")
-
-    # Convert tuple to list or None
-    type_filter = list(content_types) if content_types else None
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Searching...", total=None)
-
-        results = searcher.search(
-            query,
-            repo_path=current_repo,
-            limit=limit,
-            mine_only=mine,
-            user_filter=user,
-            content_types=type_filter,
-        )
-
-        progress.remove_task(task)
-
-    if not results:
-        console.print("[yellow]No matching sessions found[/yellow]")
-        return
-
-    table = Table(title="Search Results", show_header=True)
-    table.add_column("#", style="dim", width=3)
-    table.add_column("Score", style="cyan", width=6)
-    table.add_column("User", style="yellow", width=10)
-    table.add_column("Age", style="green", width=12)
-    table.add_column("Repo", style="magenta", width=15)
-    table.add_column("Content", style="blue", width=8)
-    table.add_column("Preview")
-
-    for i, result in enumerate(results, 1):
-        # Format relative time
-        if result.timestamp:
-            from datetime import datetime, timezone
-
-            now = datetime.now(timezone.utc)
-            ts = result.timestamp
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            days = (now - ts).days
-            if days == 0:
-                age_str = "today"
-            elif days == 1:
-                age_str = "yesterday"
-            elif days < 7:
-                age_str = f"{days}d ago"
-            elif days < 30:
-                age_str = f"{days // 7}w ago"
-            elif days < 365:
-                age_str = f"{days // 30}mo ago"
-            else:
-                age_str = f"{days // 365}y ago"
-        else:
-            age_str = "?"
-
-        preview = (
-            result.intent_preview[:40] + "..."
-            if len(result.intent_preview) > 40
-            else result.intent_preview
-        )
-        user_display = "YOU" if result.is_own else f"@{result.user_name}"
-
-        # Content indicators
-        indicators = []
-        if result.has_plan:
-            indicators.append("📋")
-        if result.has_agent_summaries:
-            indicators.append("🤖")
-        content_str = " ".join(indicators) if indicators else "-"
-
-        table.add_row(
-            str(i),
-            f"{result.score:.0f}%",
-            user_display,
-            age_str,
-            result.repo_name[:15],
-            content_str,
-            preview,
-        )
-
-    console.print(table)
-    console.print("\n[dim]📋 = has plan file | 🤖 = has agent summaries[/dim]")
-    console.print(
-        "[dim]Use 'jacked retrieve <id> --mode smart' for optimized context (default)[/dim]"
-    )
-    console.print(
-        "[dim]Use 'jacked retrieve <id> --mode full' for complete transcript[/dim]"
-    )
-
-    # Print session IDs for easy copy
-    console.print("\nSession IDs:")
-    for i, result in enumerate(results, 1):
-        console.print(f"  {i}. {result.session_id}")
-
-
-@main.command()
-@click.argument("session_id")
-@click.option("--output", "-o", type=click.Path(), help="Save output to file")
-@click.option("--summary", "-s", is_flag=True, help="Show summary instead of content")
-@click.option(
-    "--mode",
-    "-m",
-    type=click.Choice(["smart", "plan", "labels", "agents", "full"]),
-    default="smart",
-    help="Retrieval mode (default: smart)",
-)
-@click.option(
-    "--max-tokens", "-t", default=15000, help="Max token budget for smart mode"
-)
-@click.option("--inject", "-i", is_flag=True, help="Format for context injection")
-def retrieve(
-    session_id: str,
-    output: Optional[str],
-    summary: bool,
-    mode: str,
-    max_tokens: int,
-    inject: bool,
-):
-    """Retrieve a session's context with smart mode support.
-
-    Requires: uv tool install "claude-jacked[search]"
-    """
-    if not _require_search("retrieve"):
-        sys.exit(1)
-
-    from jacked.retriever import SessionRetriever
-
-    config = get_config()
-    retriever = SessionRetriever(config)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task(f"Retrieving {session_id}...", total=None)
-
-        session = retriever.retrieve(session_id, mode=mode)
-
-        progress.remove_task(task)
-
-    if not session:
-        console.print(f"[red]Session {session_id} not found[/red]")
-        sys.exit(1)
-
-    # Show metadata with content summary
-    tokens = session.content.estimate_tokens()
-    content_parts = []
-    if session.content.plan:
-        content_parts.append(f"Plan: {tokens['plan']} tokens")
-    if session.content.subagent_summaries:
-        content_parts.append(
-            f"Agent summaries: {len(session.content.subagent_summaries)} ({tokens['subagent_summaries']} tokens)"
-        )
-    if session.content.summary_labels:
-        content_parts.append(
-            f"Labels: {len(session.content.summary_labels)} ({tokens['summary_labels']} tokens)"
-        )
-    if session.content.user_messages:
-        content_parts.append(
-            f"User messages: {len(session.content.user_messages)} ({tokens['user_messages']} tokens)"
-        )
-    if session.content.chunks:
-        content_parts.append(
-            f"Transcript chunks: {len(session.content.chunks)} ({tokens['chunks']} tokens)"
-        )
-
-    console.print(
-        Panel(
-            f"Session: {session.session_id}\n"
-            f"Repository: {session.repo_name}\n"
-            f"Machine: {session.machine}\n"
-            f"Age: {session.format_relative_time()}\n"
-            f"Local: {'Yes' if session.is_local else 'No'}\n"
-            f"\nContent available:\n  "
-            + "\n  ".join(content_parts)
-            + f"\n\nEstimated tokens (smart): {tokens['total']}",
-            title="Session Info",
-        )
-    )
-
-    if session.is_local:
-        resume_cmd = retriever.get_resume_command(session)
-        console.print("\n[green][OK] Session exists locally![/green]")
-        console.print(f"To resume natively: [bold]{resume_cmd}[/bold]")
-
-    if summary:
-        text = retriever.get_summary(session)
-    elif inject:
-        text = retriever.format_for_injection(session, mode=mode, max_tokens=max_tokens)
-    else:
-        # Default: format based on mode
-        text = retriever.format_for_injection(session, mode=mode, max_tokens=max_tokens)
-
-    if output:
-        Path(output).write_text(text, encoding="utf-8")
-        console.print(f"\n[green]Saved to {output}[/green]")
-    else:
-        console.print(f"\n[bold]Content (mode={mode}):[/bold]")
-        console.print(text)
-
-
-@main.command()
 @click.option("--cwd", default=None, help="Working directory to recover (default: current dir)")
 @click.option("--exclude", default=None, help="Session id to exclude (the live one)")
 @click.option("--session", "session_id", default=None, help="Recover this specific session id")
@@ -618,7 +160,7 @@ def retrieve(
 def recover(cwd, exclude, session_id, as_digest, limit, depth, budget, as_json):
     """Recover a crashed session for this folder from its on-disk transcript.
 
-    Works on a bare install — no Qdrant/search extra required.
+    Works on a bare install.
     Phase 1: 'jacked recover --json' ranks candidate sessions.
     Phase 2: 'jacked recover --session <id> --digest' prints the injection digest.
     """
@@ -678,173 +220,6 @@ def recover(cwd, exclude, session_id, as_digest, limit, depth, budget, as_json):
                    f"{rec._relative_age(c.last_ts, now)}  [{c.git_branch or '?'}]")
         if c.last_prompt:
             click.echo(f"     last: {c.last_prompt[:120]}")
-
-
-@main.command(name="sessions")
-@click.option("--repo", "-r", help="Filter by repository path")
-@click.option("--limit", "-n", default=20, help="Maximum results")
-def list_sessions(repo: Optional[str], limit: int):
-    """List indexed sessions. Requires: uv tool install "claude-jacked[search]" """
-    if not _require_search("sessions"):
-        sys.exit(1)
-
-    from jacked.client import QdrantSessionClient
-
-    config = get_config()
-    client = QdrantSessionClient(config)
-
-    repo_id = get_repo_id(repo) if repo else None
-    sessions = client.list_sessions(repo_id=repo_id, limit=limit)
-
-    if not sessions:
-        console.print("[yellow]No sessions found[/yellow]")
-        return
-
-    table = Table(title="Indexed Sessions", show_header=True)
-    table.add_column("Session ID", style="cyan")
-    table.add_column("Repository", style="magenta")
-    table.add_column("Machine", style="green")
-    table.add_column("Date", style="dim")
-    table.add_column("Chunks", justify="right")
-
-    for session in sessions:
-        ts = session.get("timestamp", "")
-        date_str = ts[:10] if ts else "?"
-        table.add_row(
-            session.get("session_id", "?")[:36],
-            session.get("repo_name", "?"),
-            session.get("machine", "?"),
-            date_str,
-            str(session.get("chunk_count", 0)),
-        )
-
-    console.print(table)
-
-
-@main.command()
-@click.argument("session_id")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
-def delete(session_id: str, yes: bool):
-    """Delete a session from the index. Requires: uv tool install "claude-jacked[search]" """
-    if not _require_search("delete"):
-        sys.exit(1)
-
-    from jacked.client import QdrantSessionClient
-
-    config = get_config()
-    client = QdrantSessionClient(config)
-
-    if not yes:
-        if not click.confirm(f"Delete session {session_id} from index?"):
-            console.print("Cancelled")
-            return
-
-    client.delete_by_session(session_id)
-    console.print(f"[green][OK][/green] Deleted session {session_id}")
-
-
-@main.command()
-def cleardb():
-    """
-    Delete ALL your indexed data from Qdrant.
-
-    Requires: uv tool install "claude-jacked[search]"
-    """
-    if not _require_search("cleardb"):
-        sys.exit(1)
-
-    from jacked.client import QdrantSessionClient
-
-    config = get_config()
-    client = QdrantSessionClient(config)
-
-    # Show what we're about to delete
-    user_name = config.user_name
-    count = client.count_by_user(user_name)
-
-    if count == 0:
-        console.print(f"[yellow]No data found for user '{user_name}'[/yellow]")
-        return
-
-    console.print(
-        Panel(
-            f"[bold red]WARNING: This will permanently delete ALL your indexed data![/bold red]\n\n"
-            f"User: [cyan]{user_name}[/cyan]\n"
-            f"Points to delete: [red]{count}[/red]\n\n"
-            f"This only affects YOUR data. Teammates' data will be untouched.\n"
-            f"After clearing, run 'jacked backfill' to re-index.",
-            title="Clear Database",
-        )
-    )
-
-    # Require typing confirmation phrase
-    console.print("\n[bold]To confirm, type: DELETE MY DATA[/bold]")
-    confirmation = click.prompt("Confirmation", default="", show_default=False)
-
-    if confirmation != "DELETE MY DATA":
-        console.print("[yellow]Cancelled - confirmation did not match[/yellow]")
-        return
-
-    # Do the delete
-    deleted = client.delete_by_user(user_name)
-    console.print(
-        f"\n[green][OK][/green] Deleted {deleted} points for user '{user_name}'"
-    )
-    console.print("\n[dim]Run 'jacked backfill' to re-index your sessions[/dim]")
-
-
-@main.command()
-def status():
-    """Show indexing health and Qdrant connectivity. Requires: uv tool install "claude-jacked[search]" """
-    if not _require_search("status"):
-        sys.exit(1)
-
-    from jacked.client import QdrantSessionClient
-
-    config = get_config()
-
-    console.print(
-        Panel(
-            f"Endpoint: {config.qdrant_endpoint}\n"
-            f"Collection: {config.collection_name}\n"
-            f"Projects Dir: {config.claude_projects_dir}\n"
-            f"Machine: {config.machine_name}",
-            title="Configuration",
-        )
-    )
-
-    # Check Qdrant connectivity
-    client = QdrantSessionClient(config)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Checking Qdrant...", total=None)
-
-        info = client.get_collection_info()
-
-        progress.remove_task(task)
-
-    if info:
-        console.print(
-            Panel(
-                f"Status: [green]{info['status']}[/green]\n"
-                f"Points: {info['points_count']}\n"
-                f"Segments: {info['segments_count']}\n"
-                f"Indexed Vectors: {info['indexed_vectors_count']}",
-                title="Qdrant Collection",
-            )
-        )
-    else:
-        console.print(
-            Panel(
-                "[red]Collection not found or Qdrant unreachable[/red]\n"
-                "Run 'jacked backfill' to create collection and index sessions",
-                title="Qdrant Status",
-            )
-        )
 
 
 @main.command(name="webux")
@@ -1106,7 +481,7 @@ def check_version():
 @click.option(
     "--extras",
     default="tray",
-    help="Optional extras to install (tray, search, all). Default: tray.",
+    help="Optional extras to install. All former extras are retired/empty aliases; default: tray (empty alias).",
 )
 @click.option(
     "--skip-service",
@@ -1492,8 +867,12 @@ def _hook_shim(name: str):
     Indirection keeps settings.json paths stable across `uv tool upgrade`.
     """
     if name not in _valid_hook_names():
-        click.echo(f"Unknown hook: {name}", err=True)
-        sys.exit(2)
+        # Retired/unknown hooks FAIL OPEN (exit 0): a stale settings.json entry
+        # (e.g. the removed security_gatekeeper wired as PreToolUse) must never
+        # block the user's tool calls between a package upgrade and the
+        # `jacked install` that prunes the entry. Exit 2 would mean "deny".
+        click.echo(f"Unknown hook: {name} (retired? run `jacked install` to prune)", err=True)
+        sys.exit(0)
 
     import importlib
     try:
@@ -1549,73 +928,6 @@ def log(category, name, session_id, repo):
         conn.close()
     except Exception:
         pass
-
-
-@main.command()
-@click.option("--show", "-s", is_flag=True, help="Show current configuration")
-def configure(show: bool):
-    """Show configuration help or current settings."""
-    import os
-
-    if show:
-        # Show current config
-        console.print("[bold]Current Configuration[/bold]\n")
-        try:
-            config = get_config()
-            console.print(
-                Panel(
-                    f"User: [cyan]{config.user_name}[/cyan]\n"
-                    f"Machine: {config.machine_name}\n"
-                    f"Qdrant Endpoint: {config.qdrant_endpoint[:50]}...\n"
-                    f"Collection: {config.collection_name}\n"
-                    f"Projects Dir: {config.claude_projects_dir}\n"
-                    f"\n[bold]Ranking Weights:[/bold]\n"
-                    f"  Teammate weight: {config.teammate_weight}\n"
-                    f"  Other repo weight: {config.other_repo_weight}\n"
-                    f"  Time decay half-life: {config.time_decay_halflife_weeks} weeks",
-                    title="Active Config",
-                )
-            )
-        except Exception as e:
-            console.print(f"[red]Error loading config:[/red] {e}")
-        return
-
-    console.print("[bold]Jacked Configuration[/bold]\n")
-
-    console.print("[bold cyan]Required:[/bold cyan]\n")
-    console.print("  QDRANT_CLAUDE_SESSIONS_ENDPOINT")
-    console.print("    Your Qdrant Cloud endpoint URL\n")
-    console.print("  QDRANT_CLAUDE_SESSIONS_API_KEY")
-    console.print("    Your Qdrant Cloud API key\n")
-
-    console.print("[bold cyan]Team/Identity (Optional):[/bold cyan]\n")
-    console.print("  JACKED_USER_NAME")
-    console.print(
-        "    Your name for session attribution (default: git user.name or system user)"
-    )
-    console.print(
-        f"    Current: {os.getenv('JACKED_USER_NAME', SmartForkConfig._default_user_name())}\n"
-    )
-
-    console.print("[bold cyan]Ranking Weights (Optional):[/bold cyan]\n")
-    console.print("  JACKED_TEAMMATE_WEIGHT")
-    console.print("    Multiplier for teammate sessions vs yours (default: 0.8)\n")
-    console.print("  JACKED_OTHER_REPO_WEIGHT")
-    console.print("    Multiplier for other repos vs current (default: 0.7)\n")
-    console.print("  JACKED_TIME_DECAY_HALFLIFE_WEEKS")
-    console.print("    Weeks until session relevance halves (default: 35)\n")
-
-    console.print("[bold]Example shell profile setup:[/bold]\n")
-    console.print("  # Required")
-    console.print(
-        '  export QDRANT_CLAUDE_SESSIONS_ENDPOINT="https://your-cluster.qdrant.io"'
-    )
-    console.print('  export QDRANT_CLAUDE_SESSIONS_API_KEY="your-api-key"')
-    console.print("")
-    console.print("  # Team setup (optional)")
-    console.print('  export JACKED_USER_NAME="yourname"')
-    console.print("")
-    console.print("[dim]Run 'jacked configure --show' to see current values[/dim]")
 
 
 def _get_data_root() -> Path:
@@ -2317,136 +1629,6 @@ def _verify_session_tracker_hooks(settings: dict):
             )
 
 
-def _ensure_permission_request_hook(existing: dict, command_str: str):
-    """Ensure the gatekeeper is registered for PermissionRequest events."""
-    if "PermissionRequest" not in existing.get("hooks", {}):
-        existing.setdefault("hooks", {})["PermissionRequest"] = []
-    # Only strip jacked-managed entries — leave user custom hooks alone.
-    existing["hooks"]["PermissionRequest"] = [
-        h for h in existing["hooks"]["PermissionRequest"]
-        if not any(
-            _is_jacked_managed_hook_path(inner.get("command", ""))
-            for inner in h.get("hooks", [])
-        )
-    ]
-    existing["hooks"]["PermissionRequest"].append({
-        "matcher": "",
-        "hooks": [{"type": "command", "command": command_str, "timeout": 10}],
-    })
-
-
-def _install_security_hook(existing: dict, settings_path: Path):
-    """Install a single catch-all security gatekeeper PreToolUse hook.
-
-    Uses an empty matcher to intercept ALL tool calls. The gatekeeper script
-    decides internally which tools to process vs pass-through based on the
-    DB/registry config. Migrates old per-tool entries to catch-all mode.
-
-    Handles fresh install, version upgrades, and migration from PermissionRequest.
-    Only rewrites jacked-managed entries — user-custom hooks are left alone.
-    """
-    script_path = _get_data_root() / "hooks" / "security_gatekeeper.py"
-
-    if not script_path.exists():
-        console.print(
-            f"[red][FAIL][/red] Security gatekeeper script not found: {script_path}"
-        )
-        console.print("[yellow]Skipping security gatekeeper installation[/yellow]")
-        return
-
-    command_str = _build_hook_command("security_gatekeeper")
-
-    def _entry_is_jacked_gatekeeper(entry: dict) -> bool:
-        for h in entry.get("hooks", []):
-            cmd = h.get("command", "")
-            if _is_jacked_managed_hook_path(cmd):
-                return True
-        return False
-
-    # Migrate: remove old jacked-managed PermissionRequest gatekeeper hooks
-    if "PermissionRequest" in existing.get("hooks", {}):
-        old_hooks = existing["hooks"]["PermissionRequest"]
-        before = len(old_hooks)
-        existing["hooks"]["PermissionRequest"] = [
-            h for h in old_hooks if not _entry_is_jacked_gatekeeper(h)
-        ]
-        if len(existing["hooks"]["PermissionRequest"]) < before:
-            console.print(
-                "[green][OK][/green] Migrated security hook from PermissionRequest to PreToolUse"
-            )
-
-    if "PreToolUse" not in existing["hooks"]:
-        existing["hooks"]["PreToolUse"] = []
-
-    # Migrate: remove old jacked-managed per-tool gatekeeper entries (non-empty matcher)
-    existing["hooks"]["PreToolUse"] = [
-        h for h in existing["hooks"]["PreToolUse"]
-        if not (
-            _entry_is_jacked_gatekeeper(h)
-            and h.get("matcher", "") != ""
-        )
-    ]
-
-    # Check if jacked catch-all already exists; upgrade its command if needed.
-    for entry in existing["hooks"]["PreToolUse"]:
-        if entry.get("matcher") == "" and _entry_is_jacked_gatekeeper(entry):
-            for h in entry.get("hooks", []):
-                if h.get("command", "") != command_str:
-                    h["command"] = command_str
-
-            _ensure_permission_request_hook(existing, command_str)
-            _write_settings_atomic(settings_path, existing)
-            console.print(
-                "[green][OK][/green] Security gatekeeper hook configured"
-            )
-            return
-
-    # Add catch-all PreToolUse entry
-    existing["hooks"]["PreToolUse"].append({
-        "matcher": "",
-        "hooks": [{"type": "command", "command": command_str, "timeout": 30}],
-    })
-
-    # Also register as PermissionRequest to auto-approve comment-stripped
-    # commands and provide updatedInput (clean command without # comments).
-    _ensure_permission_request_hook(existing, command_str)
-
-    _write_settings_atomic(settings_path, existing)
-    console.print("[green][OK][/green] Installed security gatekeeper (PreToolUse + PermissionRequest)")
-
-    # Clean up stale prompt file from older versions (v0.3.9 and earlier created
-    # this automatically, but it goes stale on upgrades and triggers warnings).
-    # Users who want a custom prompt can create it manually.
-    from jacked.data.hooks import security_gatekeeper as gk
-
-    prompt_path = Path.home() / ".claude" / "gatekeeper-prompt.txt"
-    if prompt_path.exists():
-        try:
-            existing_prompt = prompt_path.read_text(encoding="utf-8").strip()
-            # If it's an unmodified built-in prompt (current or stale), remove it
-            if existing_prompt == gk.SECURITY_PROMPT.strip():
-                prompt_path.unlink()
-                console.print(
-                    "[dim][-][/dim] Removed default gatekeeper prompt (built-in is used automatically)"
-                )
-            else:
-                # Check if it's a stale built-in that's missing required placeholders
-                if not all(
-                    p in existing_prompt
-                    for p in ["{command}", "{cwd}", "{file_context}"]
-                ):
-                    prompt_path.unlink()
-                    console.print(
-                        "[yellow][OK][/yellow] Removed stale gatekeeper prompt (missing required placeholders)"
-                    )
-                else:
-                    console.print(
-                        "[yellow][-][/yellow] Custom gatekeeper prompt detected (not overwriting)"
-                    )
-        except Exception:
-            pass
-
-
 def _remove_security_hook(settings_path: Path) -> bool:
     """Remove jacked security gatekeeper hook. Returns True if removed.
 
@@ -2475,28 +1657,12 @@ def _remove_security_hook(settings_path: Path) -> bool:
     if modified:
         settings_path.write_text(json.dumps(settings, indent=2))
         console.print("[green][OK][/green] Removed security gatekeeper hook")
-        # Clean up default prompt file but preserve genuinely customized ones
-        prompt_path = Path.home() / ".claude" / "gatekeeper-prompt.txt"
+        # The gatekeeper feature is gone — its prompt file is dead config.
+        prompt_path = _jacked_home() / ".claude" / "gatekeeper-prompt.txt"
         if prompt_path.exists():
             try:
-                from jacked.data.hooks import security_gatekeeper as gk
-
-                existing_prompt = prompt_path.read_text(encoding="utf-8").strip()
-                if existing_prompt == gk.SECURITY_PROMPT.strip():
-                    prompt_path.unlink()
-                    console.print("[dim][-][/dim] Removed default gatekeeper prompt")
-                elif not all(
-                    p in existing_prompt
-                    for p in ["{command}", "{cwd}", "{file_context}"]
-                ):
-                    prompt_path.unlink()
-                    console.print(
-                        "[dim][-][/dim] Removed stale gatekeeper prompt (missing placeholders)"
-                    )
-                else:
-                    console.print(
-                        "[yellow][-][/yellow] Keeping custom gatekeeper prompt file"
-                    )
+                prompt_path.unlink()
+                console.print("[dim][-][/dim] Removed gatekeeper prompt file")
             except Exception:
                 pass
         return True
@@ -2857,16 +2023,6 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
 
 @main.command()
 @click.option("--sounds", is_flag=True, help="Install sound notification hooks")
-@click.option(
-    "--search",
-    is_flag=True,
-    help="Install session indexing hook (requires [search] extra)",
-)
-@click.option(
-    "--no-security",
-    is_flag=True,
-    help="Skip installing the security gatekeeper hook (hook is installed but disabled by default)",
-)
 @click.option("--no-rules", is_flag=True, help="Skip behavioral rules in CLAUDE.md")
 @click.option(
     "--no-tray",
@@ -2892,23 +2048,18 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
 )
 def install(
     sounds: bool,
-    search: bool,
-    no_security: bool,
     no_rules: bool,
     no_tray: bool,
     force: bool,
     as_json: bool,
     no_codex: bool,
 ):
-    """Auto-install skill, agents, commands, and optional hooks.
+    """Auto-install skills, agents, commands, rules, and hooks.
 
-    Base install: agents, commands, behavioral rules, /jacked skill,
-    and the security gatekeeper hook (installed disabled — Claude Code's
-    auto permission mode handles approvals natively; turn the gatekeeper on
-    from the dashboard at Settings > Gatekeeper when you want LLM-evaluated
-    interception layered on top).
-    Use --no-security to skip installing the gatekeeper hook entirely.
-    Use --search to add session indexing (requires qdrant-client).
+    Installs the skills/commands/agents suite, behavioral rules, the
+    session-account tracker + QA hooks, and the tray service. Also prunes
+    artifacts from retired features (the security gatekeeper hook and the
+    session-indexing Stop hook) left behind by older versions.
     """
     import json
 
@@ -2928,9 +2079,6 @@ def install(
     _prior_manifest = _mani.load(_manifest_path)
     _prior_version = _prior_manifest.get("version") if _prior_manifest else None
 
-    install_search = search
-    install_security = not no_security
-
     # In --json mode, suppress the per-step "[OK] ..." chatter (and the same
     # chatter emitted by helper functions) so stdout carries only the JSON
     # record. The try/finally guarantees the module-level console is restored
@@ -2948,8 +2096,6 @@ def install(
             no_tray=no_tray,
             force=force,
             as_json=as_json,
-            install_search=install_search,
-            install_security=install_security,
         )
     finally:
         console.quiet = _prev_quiet
@@ -2967,10 +2113,9 @@ def install(
     _isum.write_last_install(_record, home / ".claude" / "jacked-last-install.json")
 
     # --- Codex pass (auto-detected) ---
-    # Deploy the same skills/commands/rules/gatekeeper into Codex's native
-    # locations (~/.agents/skills, ~/.codex/prompts, ~/.codex/AGENTS.md,
-    # ~/.codex/hooks.json) with its own manifest. Best-effort: a Codex failure
-    # never fails the Claude install.
+    # Deploy the same skills/commands/rules into Codex's native locations
+    # (~/.agents/skills, ~/.codex/prompts, ~/.codex/AGENTS.md) with its own
+    # manifest. Best-effort: a Codex failure never fails the Claude install.
     _codex_summary = None
     if not no_codex:
         try:
@@ -2979,7 +2124,6 @@ def install(
             if _cdx.codex_present():
                 _codex_summary = _cdx.install_codex(
                     pkg_root,
-                    hook_command=_build_hook_command("security_gatekeeper"),
                     version=_ver,
                     now_iso=_now,
                 )
@@ -3003,13 +2147,8 @@ def install(
             console.print(
                 f"[green][OK][/green] Codex: {len(_codex_summary.skills)} skills "
                 f"→ ~/.agents/skills, {len(_codex_summary.prompts)} prompts "
-                f"→ ~/.codex/prompts, rules → AGENTS.md, gatekeeper → hooks.json"
+                f"→ ~/.codex/prompts, rules → AGENTS.md"
             )
-            if _codex_summary.hooks:
-                console.print(
-                    "[yellow][-][/yellow] Codex gatekeeper hook installed but "
-                    "inactive until you trust it: run [bold]/hooks[/bold] in Codex."
-                )
         # Required-plugin blocker only — the full recommendations now live in
         # `jacked doctor`.
         _warn_required_plugins_missing()
@@ -3023,8 +2162,6 @@ def _run_install(
     no_rules: bool,
     force: bool,
     as_json: bool,
-    install_search: bool,
-    install_security: bool,
     no_tray: bool = False,
 ) -> None:
     """Run the artifact/hook/rules installation (no manifest, no summary).
@@ -3057,44 +2194,44 @@ def _run_install(
     if "Stop" not in existing["hooks"]:
         existing["hooks"]["Stop"] = []
 
-    # Stop hook for session indexing — only if search extra available
-    if install_search:
-        hook_config_stop = {
-            "matcher": "",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": 'jacked index --repo "$CLAUDE_PROJECT_DIR"',
-                    "async": True,
-                }
-            ],
-        }
-
-        hook_index = None
-        needs_async_update = False
-        for i, hook_entry in enumerate(existing["hooks"]["Stop"]):
-            for h in hook_entry.get("hooks", []):
-                if "jacked" in h.get("command", ""):
-                    hook_index = i
-                    if not h.get("async"):
-                        needs_async_update = True
-                    break
-
-        if hook_index is None:
-            existing["hooks"]["Stop"].append(hook_config_stop)
-            settings_path.parent.mkdir(parents=True, exist_ok=True)
-            settings_path.write_text(json.dumps(existing, indent=2))
-            console.print("[green][OK][/green] Added Stop hook (session indexing)")
-        elif needs_async_update:
-            existing["hooks"]["Stop"][hook_index] = hook_config_stop
-            settings_path.write_text(json.dumps(existing, indent=2))
-            console.print("[green][OK][/green] Updated Stop hook with async: true")
-        else:
-            console.print("[yellow][-][/yellow] Stop hook already configured")
-    else:
+    # Retired-feature prune (0.70.0) — operate on the SHARED `existing` dict
+    # (later hook installers write it back, so a file-only prune would be
+    # clobbered by their stale in-memory copy).
+    _pruned_legacy = []
+    # (a) `jacked index` Stop hook — the retired command would error on
+    # every session stop.
+    _legacy_stop = [
+        e for e in existing["hooks"]["Stop"]
+        if any("jacked index" in h.get("command", "") for h in e.get("hooks", []))
+    ]
+    if _legacy_stop:
+        existing["hooks"]["Stop"] = [
+            e for e in existing["hooks"]["Stop"] if e not in _legacy_stop
+        ]
+        _pruned_legacy.append("session-indexing Stop hook")
+    # (b) security gatekeeper PreToolUse/PermissionRequest entries — a stale
+    # entry would fire `jacked _hook security_gatekeeper` on every tool call.
+    for _ev in ("PreToolUse", "PermissionRequest"):
+        _entries = existing["hooks"].get(_ev, [])
+        _kept = [e for e in _entries if "security_gatekeeper" not in str(e)]
+        if len(_kept) != len(_entries):
+            existing["hooks"][_ev] = _kept
+            _pruned_legacy.append(f"gatekeeper {_ev} hook")
+    if _pruned_legacy:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(existing, indent=2))
         console.print(
-            r"[dim][-][/dim] Skipping session indexing hook (install \[search] extra to enable)"
+            "[green][OK][/green] Removed legacy hooks retired in 0.70.0: "
+            + ", ".join(_pruned_legacy)
         )
+    # The gatekeeper's prompt file is dead config for a removed feature.
+    _gk_prompt = home / ".claude" / "gatekeeper-prompt.txt"
+    if _gk_prompt.exists():
+        try:
+            _gk_prompt.unlink()
+            console.print("[dim][-][/dim] Removed gatekeeper prompt file (feature retired)")
+        except Exception:
+            pass
 
     # Install skills — iterate all skills/*/SKILL.md in data root
     # Claude Code expects skills in subdirectories with SKILL.md
@@ -3204,38 +2341,23 @@ def _run_install(
     if sounds:
         _install_sound_hooks(existing, settings_path)
 
-    # Install security gatekeeper (default — skip with --no-security).
-    # Hook is wired up but the runtime config defaults to enabled=False so
-    # Claude Code's auto permission mode handles approvals until the user
-    # explicitly turns the gatekeeper on from the dashboard.
-    if install_security:
-        _install_security_hook(existing, settings_path)
-        console.print(
-            "[dim]    Gatekeeper is installed disabled by default. "
-            "Toggle it on from Settings > Gatekeeper in the dashboard if you want "
-            "LLM-evaluated interception on top of Claude Code's auto mode.[/dim]"
-        )
-        # Auto-run static permission audit
-        console.print("")
-        audit_results = _scan_permission_rules()
-        if audit_results:
-            warns = [r for r in audit_results if r[1] == "WARN"]
-            if warns:
-                console.print(
-                    f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]"
-                )
-                for pat, _, prefix, reason in warns:
-                    console.print(f"  [red][WARN][/red] {pat} — {reason}")
-                console.print(
-                    "[dim]Run 'jacked gatekeeper audit' for full details, "
-                    "or 'jacked gatekeeper audit --fix' to prune them interactively.[/dim]"
-                )
-            else:
-                console.print("[green][AUDIT] Permission rules look clean[/green]")
-    else:
-        console.print(
-            "[dim][-][/dim] Skipping security gatekeeper (remove --no-security to enable)"
-        )
+    # Static permission audit (independent of the retired gatekeeper).
+    console.print("")
+    audit_results = _scan_permission_rules()
+    if audit_results:
+        warns = [r for r in audit_results if r[1] == "WARN"]
+        if warns:
+            console.print(
+                f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]"
+            )
+            for pat, _, prefix, reason in warns:
+                console.print(f"  [red][WARN][/red] {pat} — {reason}")
+            console.print(
+                "[dim]Run 'jacked permissions audit' for full details, "
+                "or 'jacked permissions audit --fix' to prune them interactively.[/dim]"
+            )
+        else:
+            console.print("[green][AUDIT] Permission rules look clean[/green]")
 
     # Install session-account tracker hooks (always — lightweight, no deps)
     _install_session_tracker_hook(existing, settings_path)
@@ -3749,7 +2871,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
 
     if not yes:
         if not click.confirm(
-            "Remove jacked from Claude Code? (This won't delete your Qdrant index)"
+            "Remove jacked from Claude Code? (Your local database is kept)"
         ):
             console.print("Cancelled")
             return
@@ -3921,250 +3043,14 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
 
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(
-        "\n[dim]Note: Your Qdrant index is still intact. Run 'uv tool uninstall claude-jacked' to fully remove.[/dim]"
+        "\n[dim]Run 'uv tool uninstall claude-jacked' to fully remove the package.[/dim]"
     )
 
 
-@main.group()
-def gatekeeper():
-    """View or customize the security gatekeeper LLM prompt."""
+@main.group(name="permissions")
+def permissions_group():
+    """Audit and prune Claude Code Bash permission rules."""
     pass
-
-
-@gatekeeper.command(name="show")
-def gatekeeper_show():
-    """Print the current gatekeeper LLM prompt."""
-    from jacked.data.hooks.security_gatekeeper import SECURITY_PROMPT, PROMPT_PATH
-
-    if PROMPT_PATH.exists():
-        try:
-            prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
-            console.print(f"[dim]Source: {PROMPT_PATH}[/dim]\n")
-        except Exception:
-            prompt = SECURITY_PROMPT
-            console.print("[dim]Source: built-in (file read failed)[/dim]\n")
-    else:
-        prompt = SECURITY_PROMPT
-        console.print("[dim]Source: built-in default[/dim]\n")
-
-    console.print(prompt)
-
-
-@gatekeeper.command(name="reset")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
-def gatekeeper_reset(yes: bool):
-    """Reset gatekeeper prompt to built-in default."""
-    from jacked.data.hooks.security_gatekeeper import SECURITY_PROMPT, PROMPT_PATH
-
-    if not yes:
-        if PROMPT_PATH.exists():
-            try:
-                current = PROMPT_PATH.read_text(encoding="utf-8").strip()
-                if current == SECURITY_PROMPT.strip():
-                    console.print(
-                        "[yellow]Prompt is already the built-in default[/yellow]"
-                    )
-                    return
-            except Exception:
-                pass
-        if not click.confirm("Reset gatekeeper prompt to built-in default?"):
-            console.print("Cancelled")
-            return
-
-    PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PROMPT_PATH.write_text(SECURITY_PROMPT, encoding="utf-8")
-    console.print("[green][OK][/green] Reset gatekeeper prompt to built-in default")
-    console.print(f"[dim]{PROMPT_PATH}[/dim]")
-
-
-@main.group()
-def profiles():
-    """Manage security profiles -- export, import, list, delete."""
-    pass
-
-
-@profiles.command(name="list")
-def profiles_list():
-    """List saved security profiles."""
-    from jacked.profiles import PROFILE_DIR_NAME, list_profiles
-
-    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
-    items = list_profiles(profiles_dir)
-
-    if not items:
-        console.print("[dim]No saved profiles.[/dim]")
-        return
-
-    table = Table(title="Security Profiles", show_header=True, header_style="bold cyan")
-    table.add_column("Name", style="white")
-    table.add_column("Description", style="dim")
-    table.add_column("Author", style="dim")
-    table.add_column("Version", style="dim")
-    table.add_column("Created", style="dim")
-
-    for p in items:
-        created = p.get("created_at", "")
-        if created:
-            try:
-                from datetime import datetime
-
-                dt = datetime.fromisoformat(created)
-                created = dt.strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                pass
-        table.add_row(
-            p.get("name", "?"),
-            p.get("description", ""),
-            p.get("author", ""),
-            p.get("jacked_version", ""),
-            created,
-        )
-
-    console.print(table)
-
-
-@profiles.command(name="export")
-@click.argument("name")
-@click.option("-d", "--description", default="", help="Profile description")
-def profiles_export(name: str, description: str):
-    """Export current gatekeeper config + rules as a named profile."""
-    import json as _json
-
-    from jacked.profiles import PROFILE_DIR_NAME, export_profile
-    from jacked.web.database import Database
-
-    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
-
-    # Read settings.json
-    settings_path = Path.home() / ".claude" / "settings.json"
-    settings_json: dict = {}
-    if settings_path.exists():
-        try:
-            settings_json = _json.loads(settings_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    try:
-        db = Database()
-    except Exception as e:
-        console.print(f"[red]Cannot open database: {e}[/red]")
-        raise SystemExit(1)
-
-    try:
-        filepath = export_profile(
-            name=name,
-            description=description,
-            author="",
-            db=db,
-            settings_json=settings_json,
-            profiles_dir=profiles_dir,
-        )
-        console.print(f"[green][OK][/green] Profile exported: {filepath}")
-    except Exception as e:
-        console.print(f"[red]Export failed: {e}[/red]")
-        raise SystemExit(1)
-    finally:
-        db.close()
-
-
-@profiles.command(name="import")
-@click.argument("path", type=click.Path(exists=True))
-def profiles_import(path: str):
-    """Import a profile from a JSON file."""
-    import json as _json
-
-    from jacked.profiles import (
-        BACKUP_DIR_NAME,
-        PROFILE_DIR_NAME,
-        import_profile,
-        validate_profile,
-    )
-    from jacked.web.database import Database
-
-    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
-    backup_dir = profiles_dir / BACKUP_DIR_NAME
-
-    # Read profile file
-    try:
-        profile_data = _json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception as e:
-        console.print(f"[red]Cannot read profile: {e}[/red]")
-        raise SystemExit(1)
-
-    # Validate
-    try:
-        warnings = validate_profile(profile_data)
-    except ValueError as e:
-        console.print(f"[red]Validation failed: {e}[/red]")
-        raise SystemExit(1)
-
-    if warnings:
-        console.print("[yellow]Warnings:[/yellow]")
-        for w in warnings:
-            console.print(f"  [yellow]- {w}[/yellow]")
-
-    if not click.confirm("Apply this profile?"):
-        console.print("Cancelled")
-        return
-
-    # Read settings.json
-    settings_path = Path.home() / ".claude" / "settings.json"
-    settings_json: dict = {}
-    if settings_path.exists():
-        try:
-            settings_json = _json.loads(settings_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    def _write_settings(data: dict):
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = settings_path.with_suffix(".json.tmp")
-        tmp.write_text(_json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(settings_path)
-
-    try:
-        db = Database()
-    except Exception as e:
-        console.print(f"[red]Cannot open database: {e}[/red]")
-        raise SystemExit(1)
-
-    try:
-        backup_path, import_warnings = import_profile(
-            profile_data=profile_data,
-            db=db,
-            settings_json=settings_json,
-            write_settings_fn=_write_settings,
-            profiles_dir=profiles_dir,
-            backup_dir=backup_dir,
-        )
-        console.print("[green][OK][/green] Profile imported!")
-        console.print(f"[dim]Backup saved to: {backup_path}[/dim]")
-    except Exception as e:
-        console.print(f"[red]Import failed: {e}[/red]")
-        raise SystemExit(1)
-    finally:
-        db.close()
-
-
-@profiles.command(name="delete")
-@click.argument("name")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
-def profiles_delete(name: str, yes: bool):
-    """Delete a saved profile."""
-    from jacked.profiles import PROFILE_DIR_NAME, delete_profile
-
-    profiles_dir = Path.home() / ".claude" / "jacked" / PROFILE_DIR_NAME
-
-    if not yes:
-        if not click.confirm(f'Delete profile "{name}"?'):
-            console.print("Cancelled")
-            return
-
-    deleted = delete_profile(name, profiles_dir)
-    if deleted:
-        console.print(f"[green][OK][/green] Profile '{name}' deleted")
-    else:
-        console.print(f"[yellow]Profile '{name}' not found[/yellow]")
 
 
 @main.command(name="menubar")
@@ -4480,7 +3366,21 @@ def _scan_permission_rules() -> list[tuple[str, str, str, str]]:
 
     Returns list of (pattern, level, prefix, reason).
     """
-    from jacked.data.hooks.security_gatekeeper import _load_permissions
+    import json
+
+    def _load_permissions(settings_path: Path) -> list[str]:
+        """Bash permission allow patterns from a settings JSON file."""
+        try:
+            if not settings_path.exists():
+                return []
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            return [
+                p
+                for p in data.get("permissions", {}).get("allow", [])
+                if isinstance(p, str) and p.startswith("Bash(")
+            ]
+        except Exception:
+            return []
 
     results = []
     seen = set()
@@ -4574,44 +3474,7 @@ def _prune_dangerous_permissions(
     return total, per_file
 
 
-def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
-    """Parse hooks-debug.log for auto-approved PERMS MATCH commands.
-
-    Finds PERMS MATCH lines and extracts the command from the preceding EVALUATING line.
-    Returns up to `limit` commands (most recent first).
-    """
-    if not log_path.exists():
-        return []
-
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return []
-
-    commands = []
-    for i, line in enumerate(lines):
-        if "PERMS MATCH" in line:
-            # Look backwards for the EVALUATING line
-            for j in range(i - 1, max(i - 5, -1), -1):
-                if "EVALUATING:" in lines[j]:
-                    # Extract command after "EVALUATING: "
-                    idx = lines[j].index("EVALUATING:") + len("EVALUATING:")
-                    cmd = lines[j][idx:].strip()
-                    commands.append(cmd)
-                    break
-
-    # Return most recent N
-    return commands[-limit:]
-
-
-@gatekeeper.command(name="audit")
-@click.option(
-    "--log",
-    "scan_log",
-    is_flag=True,
-    help="Also scan recent auto-approved commands via LLM",
-)
-@click.option("--limit", "-n", default=50, help="Number of recent log entries to scan")
+@permissions_group.command(name="audit")
 @click.option(
     "--fix",
     is_flag=True,
@@ -4623,11 +3486,8 @@ def _parse_log_for_perms_commands(log_path: Path, limit: int = 50) -> list[str]:
     is_flag=True,
     help="With --fix, remove all dangerous wildcards without confirmation.",
 )
-def gatekeeper_audit(scan_log, limit, fix, yes):
+def permissions_audit(fix, yes):
     """Audit permission rules for dangerous wildcards."""
-    import os
-    import json
-    from jacked.data.hooks.security_gatekeeper import LOG_PATH, STATE_PATH
 
     console.print("[bold]Scanning permission rules...[/bold]\n")
 
@@ -4653,10 +3513,8 @@ def gatekeeper_audit(scan_log, limit, fix, yes):
         if level == "WARN":
             console.print(f"  [red][WARN][/red] {pat} — {reason}")
             console.print(
-                f"         Gatekeeper deny patterns won't catch all {prefix} inline code."
-            )
-            console.print(
-                "         Consider removing and letting the gatekeeper evaluate individually.\n"
+                f"         A blanket wildcard auto-approves ANY {prefix} invocation, "
+                "including inline code execution.\n"
             )
             warn_count += 1
         elif level == "INFO":
@@ -4670,10 +3528,10 @@ def gatekeeper_audit(scan_log, limit, fix, yes):
 
     if warn_count > 0 and not fix:
         console.print(
-            "\n[yellow]TIP: Remove dangerous wildcards and let the gatekeeper LLM evaluate them individually.[/yellow]"
+            "\n[yellow]TIP: Remove dangerous wildcards so Claude Code evaluates those commands individually.[/yellow]"
         )
         console.print(
-            "[dim]Run 'jacked gatekeeper audit --fix' to prune them interactively.[/dim]"
+            "[dim]Run 'jacked permissions audit --fix' to prune them interactively.[/dim]"
         )
 
     # --fix: interactive prune of dangerous wildcards
@@ -4734,163 +3592,6 @@ def gatekeeper_audit(scan_log, limit, fix, yes):
                     console.print(
                         "[dim]Backups saved next to each modified file as <name>.bak-YYYYMMDD-HHMMSS.[/dim]"
                     )
-                    console.print(
-                        "[dim]Gatekeeper will now evaluate these commands via LLM on each use.[/dim]"
-                    )
-
-    # Log scanning
-    if scan_log:
-        console.print(
-            f"\n[bold]Scanning last {limit} auto-approved commands from hooks-debug.log...[/bold]\n"
-        )
-
-        commands = _parse_log_for_perms_commands(LOG_PATH, limit=limit)
-        if not commands:
-            console.print("[yellow]No PERMS MATCH entries found in log[/yellow]")
-            console.print(f"[dim]Log path: {LOG_PATH}[/dim]")
-            return
-
-        # Send to LLM for evaluation
-        cmd_list = "\n".join(f"  {i + 1}. {cmd}" for i, cmd in enumerate(commands))
-        audit_prompt = f"""You are a security auditor. Review these {len(commands)} Bash commands that were auto-approved via permission rules (bypassing LLM evaluation).
-
-Flag any that look dangerous — data exfiltration, destructive operations, arbitrary code execution, secret access, etc. Most will be safe.
-
-Commands:
-{cmd_list}
-
-Respond with ONLY a JSON object:
-{{"flagged": [{{"index": 1, "command": "the command", "reason": "brief reason"}}], "safe_count": N}}
-
-If all are safe, return: {{"flagged": [], "safe_count": {len(commands)}}}"""
-
-        console.print(
-            f"[dim]Sending {len(commands)} commands to LLM for review...[/dim]"
-        )
-
-        try:
-            import anthropic
-
-            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-            if not api_key:
-                console.print(
-                    "[red]ANTHROPIC_API_KEY not set — cannot run LLM audit[/red]"
-                )
-                console.print(
-                    "[dim]Set ANTHROPIC_API_KEY or install anthropic SDK[/dim]"
-                )
-                return
-
-            # Use configured model from gatekeeper settings if available
-            audit_model = "claude-haiku-4-5-20251001"
-            try:
-                import sys as _sys
-
-                _gk_dir = str(Path(__file__).resolve().parent / "data" / "hooks")
-                if _gk_dir not in _sys.path:
-                    _sys.path.insert(0, _gk_dir)
-                from security_gatekeeper import _read_gatekeeper_config
-
-                gk_config = _read_gatekeeper_config()
-                audit_model = gk_config["model"]
-                api_key = gk_config["api_key"] or api_key
-            except Exception:
-                pass
-
-            client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
-            response = client.messages.create(
-                model=audit_model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": audit_prompt}],
-            )
-            text = response.content[0].text.strip()
-
-            # Strip markdown fences
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-            parsed = json.loads(text)
-            flagged = parsed.get("flagged", [])
-            safe_count = parsed.get("safe_count", len(commands) - len(flagged))
-
-            if flagged:
-                for item in flagged:
-                    console.print(f"  [red][WARN][/red] {item.get('command', '?')}")
-                    console.print(f"         LLM says: {item.get('reason', '?')}\n")
-            console.print(f"{safe_count}/{len(commands)} commands look safe.")
-            if flagged:
-                console.print(
-                    f"[red]{len(flagged)} commands flagged[/red] — consider tightening your permission rules."
-                )
-            else:
-                console.print("[green]No dangerous commands found.[/green]")
-
-        except ImportError:
-            console.print(
-                "[red]anthropic SDK not installed — cannot run LLM audit[/red]"
-            )
-            console.print(
-                '[dim]Activate it: jacked install --force[/dim]'
-            )
-        except json.JSONDecodeError:
-            console.print(
-                f"[yellow]LLM returned non-JSON response:[/yellow] {text[:200]}"
-            )
-        except Exception as e:
-            console.print(f"[red]LLM audit failed:[/red] {e}")
-
-    # Show counter info
-    if STATE_PATH.exists():
-        try:
-            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            count = state.get("perms_count", 0)
-            if count > 0:
-                console.print(
-                    f"\n[dim]Total permission auto-approvals since last reset: {count}[/dim]"
-                )
-        except Exception:
-            pass
-
-
-@gatekeeper.command(name="diff")
-def gatekeeper_diff():
-    """Show diff between custom prompt and built-in default."""
-    import difflib
-    from jacked.data.hooks.security_gatekeeper import SECURITY_PROMPT, PROMPT_PATH
-
-    if not PROMPT_PATH.exists():
-        console.print(
-            "[yellow]No custom prompt file found — using built-in default[/yellow]"
-        )
-        console.print(f"[dim]Create one at: {PROMPT_PATH}[/dim]")
-        return
-
-    try:
-        custom = PROMPT_PATH.read_text(encoding="utf-8")
-    except Exception as e:
-        console.print(f"[red]Error reading prompt file:[/red] {e}")
-        return
-
-    if custom.strip() == SECURITY_PROMPT.strip():
-        console.print(
-            "[green]No differences — custom prompt matches built-in default[/green]"
-        )
-        return
-
-    diff = difflib.unified_diff(
-        SECURITY_PROMPT.splitlines(keepends=True),
-        custom.splitlines(keepends=True),
-        fromfile="built-in",
-        tofile=str(PROMPT_PATH),
-    )
-    for line in diff:
-        if line.startswith("+") and not line.startswith("+++"):
-            console.print(f"[green]{line.rstrip()}[/green]")
-        elif line.startswith("-") and not line.startswith("---"):
-            console.print(f"[red]{line.rstrip()}[/red]")
-        else:
-            console.print(line.rstrip())
-
 
 # ── Guardrails CLI group ──────────────────────────────────────────────
 

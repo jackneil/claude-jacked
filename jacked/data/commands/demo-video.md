@@ -2,7 +2,7 @@
 description: Use to produce a polished, narrated product demo / walkthrough / how-to video for documentation and education (embed in docs, README, release notes, onboarding). NOT bug evidence — that's /qa-video. Pass the feature/flow to demo, or let it auto-detect.
 ---
 
-> **Tip:** MCP-based browser tools (Chrome DevTools MCP, Playwright MCP) require no bash approval and work instantly with the jacked gatekeeper. For voiceover + muxing you'll want `ffmpeg`; macOS `say` provides offline narration with zero external accounts.
+> **Tip:** MCP-based browser tools (Chrome DevTools MCP, Playwright MCP) require no bash approval and work instantly. For voiceover + muxing you'll want `ffmpeg`; macOS `say` provides offline narration with zero external accounts.
 
 You are producing a **clean, narrated walkthrough video that teaches a feature** for end-user
 documentation — not bug evidence (that's `/qa-video`). The output is something you'd embed in

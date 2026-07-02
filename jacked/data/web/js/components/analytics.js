@@ -7,6 +7,8 @@ let analyticsRange = '7d';
 const RANGE_OPTIONS = { '24h': 1, '7d': 7, '30d': 30, '90d': 90, '1y': 365 };
 
 let analyticsSubTab = localStorage.getItem('jacked_analytics_subtab') || 'usage';
+// The Gatekeeper sub-tab became Activity in 0.70.0 — migrate stale choices.
+if (analyticsSubTab === 'gatekeeper') analyticsSubTab = 'activity';
 
 // --- Collapsed state persistence ---
 
@@ -63,64 +65,12 @@ function _skeleton(h) {
     return `<div class="bg-slate-700 animate-pulse rounded" style="height:${h}px"></div>`;
 }
 
-// --- KPI cards ---
-
-function _renderKpis(kpi, tokenCosts) {
-    if (!kpi || kpi.total_decisions === 0) {
-        return `
-            <div class="flex flex-col items-center justify-center py-16 text-center">
-                <svg class="w-16 h-16 text-slate-600 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
-                </svg>
-                <p class="text-slate-400 text-sm">No gatekeeper data yet — decisions will appear here<br>once the security gatekeeper processes commands.</p>
-            </div>`;
-    }
-
-    const rate = kpi.approval_rate != null ? kpi.approval_rate.toFixed(1) : '0.0';
-    const rateColor = Number(rate) >= 90 ? 'text-green-400' : Number(rate) >= 70 ? 'text-yellow-400' : 'text-red-400';
-    const cov = kpi.rule_coverage != null ? kpi.rule_coverage.toFixed(1) : '0.0';
-
-    // Cost card — only show if there's actual cost data
-    const cost = tokenCosts && tokenCosts.total_cost_usd > 0 ? tokenCosts.total_cost_usd : 0;
-    const totalTokens = tokenCosts ? (tokenCosts.total_input_tokens || 0) + (tokenCosts.total_output_tokens || 0) : 0;
-    const costDisplay = cost > 0 ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}` : '$0.00';
-    const tokenDisplay = totalTokens > 0 ? totalTokens.toLocaleString() : '0';
-
-    return `
-        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
-            <div class="stat-card">
-                <div class="text-2xl font-bold text-white tabular-nums">${(kpi.total_decisions || 0).toLocaleString()}</div>
-                <div class="text-xs text-slate-400 mt-1">Total Decisions</div>
-            </div>
-            <div class="stat-card">
-                <div class="text-2xl font-bold ${rateColor} tabular-nums">${rate}%</div>
-                <div class="text-xs text-slate-400 mt-1">Approval Rate</div>
-            </div>
-            <div class="stat-card">
-                <div class="text-2xl font-bold text-red-400 tabular-nums">${(kpi.denials || 0).toLocaleString()}</div>
-                <div class="text-xs text-slate-400 mt-1">Denials</div>
-            </div>
-            <div class="stat-card">
-                <div class="text-2xl font-bold text-blue-400 tabular-nums">${cov}%</div>
-                <div class="text-xs text-slate-400 mt-1">Rule Coverage</div>
-            </div>
-            <div class="stat-card">
-                <div class="text-2xl font-bold text-amber-400 tabular-nums">${(kpi.api_evaluations || 0).toLocaleString()}</div>
-                <div class="text-xs text-slate-400 mt-1">API Evaluations</div>
-            </div>
-            <div class="stat-card">
-                <div class="text-2xl font-bold text-emerald-400 tabular-nums">${costDisplay}</div>
-                <div class="text-xs text-slate-400 mt-1">API Cost <span class="text-slate-500 tabular-nums">(${tokenDisplay} tok)</span></div>
-            </div>
-        </div>`;
-}
-
 // --- Main render ---
 
 function renderAnalytics() {
     const tabs = [
         { id: 'usage', label: 'Token Usage' },
-        { id: 'gatekeeper', label: 'Gatekeeper' },
+        { id: 'activity', label: 'Activity' },
     ];
 
     const tabHtml = tabs.map(t => `
@@ -146,8 +96,8 @@ async function loadAnalyticsSubTab() {
     const container = document.getElementById('analytics-subtab-content');
     if (!container) return;
 
-    if (analyticsSubTab === 'gatekeeper') {
-        await _loadGatekeeperAnalytics(container);
+    if (analyticsSubTab === 'activity') {
+        await _loadActivityAnalytics(container);
     } else if (analyticsSubTab === 'usage') {
         await _loadUsageAnalytics(container);
     }
@@ -193,9 +143,9 @@ async function _loadUsageAnalytics(container) {
     }
 }
 
-// --- Gatekeeper data loading (moved from former loadAnalyticsData) ---
+// --- Activity data loading (agents / hook health / lessons) ---
 
-async function _loadGatekeeperAnalytics(container) {
+async function _loadActivityAnalytics(container) {
     const rangeButtons = Object.keys(RANGE_OPTIONS).map(r => `
         <button class="analytics-range-btn text-xs px-3 py-1.5 rounded ${analyticsRange === r ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}" data-range="${r}">${r}</button>
     `).join('');
@@ -207,28 +157,23 @@ async function _loadGatekeeperAnalytics(container) {
             </div>
         </div>
         <div id="analytics-content" class="space-y-2">
-            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)} ${_skeleton(80)}</div>
-            ${_section('charts', 'Charts', true, _skeleton(250))}
-            ${_section('heatmap', 'Activity Heatmap', false, _skeleton(200))}
-            ${_section('sessions', 'Session Risk', false, _skeleton(150))}
-            ${_section('rules', 'Rule Intelligence', false, _skeleton(150))}
-            ${_section('agents', 'Agents', false, _skeleton(100))}
+            ${_section('agents', 'Agents', true, _skeleton(100))}
             ${_section('hooks', 'Hook Health', false, _skeleton(100))}
             ${_section('lessons', 'Lessons', false, _skeleton(100))}
         </div>`;
 
-    // Bind range buttons inside the gatekeeper sub-tab
+    // Bind range buttons inside the activity sub-tab
     container.querySelectorAll('.analytics-range-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             analyticsRange = btn.dataset.range;
-            _loadGatekeeperAnalytics(container);
+            _loadActivityAnalytics(container);
         });
     });
 
-    await _loadGatekeeperData();
+    await _loadActivityData();
 }
 
-async function _loadGatekeeperData() {
+async function _loadActivityData() {
     const container = document.getElementById('analytics-content');
     if (!container) return;
 
@@ -236,62 +181,18 @@ async function _loadGatekeeperData() {
     const q = `?days=${days}`;
 
     try {
-        const [dashboard, heatmap, sessions, rules, agents, hooks, lessons] = await Promise.all([
-            api.get(`/api/analytics/gatekeeper-dashboard${q}`).catch(() => null),
-            api.get(`/api/analytics/gatekeeper-heatmap${q}`).catch(() => null),
-            api.get(`/api/analytics/gatekeeper-sessions${q}`).catch(() => null),
-            api.get(`/api/analytics/gatekeeper-rules${q}`).catch(() => null),
+        const [agents, hooks, lessons] = await Promise.all([
             api.get(`/api/analytics/agents${q}`).catch(() => null),
             api.get(`/api/analytics/hooks${q}`).catch(() => null),
             api.get(`/api/analytics/lessons${q}`).catch(() => null),
         ]);
 
-        const kpi = dashboard ? dashboard.kpi : null;
-        const tokenCosts = dashboard ? dashboard.token_costs : null;
-        const hasData = kpi && kpi.total_decisions > 0;
-
-        // KPI cards (or empty state)
-        let html = _renderKpis(kpi, tokenCosts);
-
-        if (hasData) {
-            // Charts section — needs Chart.js
-            let chartsContent = _skeleton(250);
-            if (typeof renderAnalyticsCharts === 'function') {
-                await ensureChartJs();
-                chartsContent = '<div id="analytics-charts-container"></div>';
-            }
-            html += _section('charts', 'Charts', true, chartsContent);
-
-            // Heatmap
-            let heatmapContent = _skeleton(200);
-            if (typeof renderAnalyticsCharts === 'function') {
-                heatmapContent = '<div id="analytics-heatmap-container"></div>';
-            }
-            html += _section('heatmap', 'Activity Heatmap', false, heatmapContent);
-
-            html += _section('sessions', 'Session Risk', false,
-                '<div id="analytics-sessions-container"></div>');
-            html += _section('rules', 'Rule Intelligence', false,
-                '<div id="analytics-rules-container"></div>');
-        }
-
-        // Legacy sections
-        html += _section('agents', 'Agents', false, renderAgentStats(agents));
+        let html = _section('agents', 'Agents', true, renderAgentStats(agents));
         html += _section('hooks', 'Hook Health', false, renderHookStats(hooks));
         html += _section('lessons', 'Lessons', false, renderLessonStats(lessons));
 
         container.innerHTML = html;
-
-        // Bind collapse toggles
         _bindCollapseButtons();
-
-        // Render charts + tables into their containers (after DOM is ready)
-        if (hasData && typeof renderAnalyticsCharts === 'function' && window.Chart) {
-            renderAnalyticsCharts(dashboard, heatmap);
-        }
-        if (hasData && typeof renderAnalyticsTables === 'function') {
-            renderAnalyticsTables(sessions, rules);
-        }
     } catch (e) {
         container.innerHTML = `
             <div class="bg-red-900/30 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200">
@@ -353,7 +254,7 @@ function renderAnalyticsPlaceholder(title) {
 // --- Bind events ---
 
 function bindAnalyticsEvents() {
-    // Bind top-level sub-tab clicks (Token Usage | Gatekeeper)
+    // Bind top-level sub-tab clicks (Token Usage | Activity)
     document.querySelectorAll('.analytics-subtab').forEach(btn => {
         btn.addEventListener('click', () => {
             analyticsSubTab = btn.dataset.subtab;
