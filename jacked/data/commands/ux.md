@@ -359,7 +359,7 @@ Build a matrix of (aspect, page) and assign to 2-4 agents:
 
 **Robustness & States placement:** by default the agent that owns **Interactions** also owns **Robustness & States** (forms and states are tested together). When that agent is already carrying three aspects, hand Robustness to the lightest agent on the same page instead. At the 4-agent cap, never drop it — fold it into the Interactions agent.
 
-**3+ pages:** Group intelligently, cap at 4 agents. Prioritize pages most affected by changes. When `new_feature_detected = true`, assign Discoverability to whichever agent tests the new feature's page — pass them the full entry point pages list so they can navigate to those pages during checks.
+**3+ pages:** Group intelligently, cap at 4 agents (2 on a Mythos-class session — Fable 5 or newer). Prioritize pages most affected by changes. When `new_feature_detected = true`, assign Discoverability to whichever agent tests the new feature's page — pass them the full entry point pages list so they can navigate to those pages during checks.
 
 Use your judgment — adjust grouping based on what changed. Skip aspects that clearly don't apply (e.g., skip Responsive for a purely server-rendered admin page that's never used on mobile).
 
@@ -714,7 +714,7 @@ This command is **read-only** — it detects and reports issues but does NOT fix
 - Detect browser tools FIRST — do not spawn agents without a working browser.
 - Each agent MUST create its own tab before doing anything else.
 - Spawn ALL agents in ONE message (parallel Task calls).
-- Cap at 4 agents maximum to avoid browser contention.
+- Cap at 4 agents maximum to avoid browser contention. **Model-adaptive:** on a Mythos-class session (Fable 5 or newer), cap at 2 agents — consolidate aspects and pages into fewer, bigger assignments; all selected aspects and personas still get covered.
 - Minimum 2 agents — if only 1-2 aspects are relevant, combine into 2 agents anyway for depth.
 - Do NOT ask "should I continue?" after spawning — always collect and report.
 - This command is READ-ONLY — detect and report only. Do NOT fix code or invoke /dcr.

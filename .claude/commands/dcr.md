@@ -195,7 +195,7 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
    Every reviewer MUST have this regardless of their assigned lenses — it informs all review angles.
    For the **Guardrails** lens reviewer specifically, add: "Your primary job is verifying compliance
    with these documents. Cite specific rule violations with the rule text and file:line of the violation."
-10. **Pre-mortem agent** (Wave 1 only): Spawn an additional reviewer with these instructions:
+10. **Pre-mortem agent** (Wave 1 only): Spawn an additional reviewer with these instructions (on a Mythos-class session — Fable 5 or newer — deliver them as a clearly-delimited final section of one reviewer's prompt instead of a separate agent):
     "You are the PRE-MORTEM ANALYST. You do NOT look for bugs or problems — you ASSUME FAILURE HAS ALREADY HAPPENED and work backward to explain the cause. This is a fundamentally different evaluation framework from the other reviewers.
 
     For each assigned failure scenario, write a short post-mortem as if the failure is real:
@@ -351,6 +351,7 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
 4. **Pair** the selected lenses. Each reviewer gets exactly 2.
    - If odd number of selected lenses, one reviewer gets a single lens (goes deeper).
    - Number of reviewers = ceil(selected_lenses / 2). Range: 2-6 reviewers.
+   - **Model-adaptive fan-out:** on a Mythos-class session (Fable 5 or newer), assign 3-4 lenses per reviewer instead of 2 — reviewers = ceil(selected_lenses / 4), range 1-3 — and fold the pre-mortem scenarios into one reviewer's prompt instead of spawning a dedicated pre-mortem agent. A stronger model covers more lenses per pass without losing depth; every selected lens still gets reviewed and the evidence bar is unchanged. On Opus and below, keep 2 lenses per reviewer as written.
 5. **Assign** each pair a unique persona and unique wild card (shuffle pools as before).
 6. **Announce**:
    ```
@@ -383,7 +384,7 @@ Announce format when `frontend_review = true`:
 - Reviewer [M+1] (Frontend Design): Design quality + Aesthetics | via frontend-design skill
 ```
 
-#### PRE-MORTEM ANALYST (Wave 1 only, always spawned)
+#### PRE-MORTEM ANALYST (Wave 1 only — dedicated agent on Opus and below; on a Mythos-class session, fold its scenarios into one reviewer's prompt per the model-adaptive rule)
 
 Spawn an additional reviewer as the pre-mortem agent in the SAME message as all other Wave 1 reviewers:
 - Use `subagent_type: "double-check-reviewer"` (or general-purpose with pre-mortem instructions)

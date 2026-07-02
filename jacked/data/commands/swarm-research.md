@@ -44,6 +44,8 @@ Assess the problem and auto-calibrate agent count and per-agent effort:
 
 Then stop the swarm flow and proceed with a normal plan (or hand back to the user). Coding tasks in particular have fewer truly parallelizable subtasks than open-ended research, so bias toward the smaller tier when unsure.
 
+**Model-adaptive fan-out:** on a Mythos-class session (Fable 5 or newer), calibrate one tier DOWN and hard-cap at 3 research agents — a stronger model extracts the same divergence from fewer perspectives (give each agent two axis assignments instead of one when consolidating), and in Phase 2 run verification + devil's advocacy as ONE combined pressure-test agent rather than two. On Opus and below, use the table as written. Same axes, same evidence bar — fewer bodies.
+
 Announce: "Calibrated: [LEVEL] complexity ([signal]) — spawning [N] research agents (~[X] tool calls each)."
 
 ## DIFFERENTIATION ASSIGNMENT
@@ -201,7 +203,7 @@ If "no convergence" — STOP and present options. Resume when the user chooses.
 
 ## PHASE 2 — VERIFY + ATTACK
 
-Spawn TWO agents in ONE message using parallel Agent tool calls. Both get `subagent_type: "general-purpose"`.
+Spawn TWO agents in ONE message using parallel Agent tool calls. Both get `subagent_type: "general-purpose"`. On a Mythos-class session (Fable 5 or newer), spawn ONE combined pressure-test agent instead — merge both prompts below into a single agent that produces both report formats.
 
 ### Verification Agent Prompt
 

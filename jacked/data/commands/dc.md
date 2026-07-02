@@ -217,6 +217,8 @@ User explicitly requests parallel review of different areas
 
 For each thread, customize the lens focus to that domain while maintaining the core methodology.
 
+**Model-adaptive fan-out:** on a Mythos-class session (Fable 5 or newer), default to a SINGLE reviewer thread — spawn multiple threads only when the change genuinely spans independent surfaces AND the diff is too large for one reviewer to hold. A stronger model produces the second opinion itself; extra parallel instances mostly duplicate findings. On Opus and below, use the multi-thread triggers as written.
+
 ## RALPH WIGGUM STYLE
 
 This means:
@@ -229,7 +231,7 @@ The innocent observation that breaks the whole design
 
 ## PRE-MORTEM ANALYST
 
-In addition to the main reviewer, always spawn a parallel pre-mortem agent. This agent uses a fundamentally different evaluation framework — it does NOT look for bugs but ASSUMES FAILURE HAS ALREADY HAPPENED and works backward to explain the cause.
+In addition to the main reviewer, always run a pre-mortem analysis. On Opus and below, spawn it as a parallel pre-mortem agent; on a Mythos-class session (Fable 5 or newer), fold the assigned failure scenarios into the main reviewer's prompt as a distinct final section instead of a separate agent. The pre-mortem uses a fundamentally different evaluation framework — it does NOT look for bugs but ASSUMES FAILURE HAS ALREADY HAPPENED and works backward to explain the cause.
 
 **Failure scenarios** (assign 2-3, shuffled; no repeats until exhausted):
 

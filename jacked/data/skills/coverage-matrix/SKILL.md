@@ -170,7 +170,7 @@ Score the walked journey on the user's terms (e.g., simple / easy / intuitive / 
 
 **Key principle**: Each stream runs independently and produces its own document. Synthesis happens AFTER all streams complete. This prevents premature convergence.
 
-**Parallelism**: When subagents are available, dispatch one agent per research stream simultaneously. This is the single biggest time savings — 4 streams in parallel takes 1x time, sequentially takes 4x. Even without subagents, keep streams separate and don't let early findings from one stream bias another.
+**Parallelism**: When subagents are available, dispatch one agent per research stream simultaneously. This is the single biggest time savings — 4 streams in parallel takes 1x time, sequentially takes 4x. Even without subagents, keep streams separate and don't let early findings from one stream bias another. **Model-adaptive:** on a Mythos-class session (Fable 5 or newer), use 2 agents with 2 streams each (or run the lightest stream yourself inline) instead of one agent per stream — a stronger model keeps streams unbiased within one agent, and all streams still run.
 
 **Competitor research is mandatory, not optional.** You cannot score "best-in-class" without knowing what class you're in. At minimum, search for the top 5 competitors and what they offer per domain. Marketing pages, G2/Capterra reviews, and analyst reports (KLAS, Gartner, Forrester) are fast sources.
 

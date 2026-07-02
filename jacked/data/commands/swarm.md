@@ -28,6 +28,7 @@ Agent teams are experimental and **OFF by default**. Before anything else:
    - Small (2-3 files): 3 teammates
    - Medium (4-8 files): 4-5 teammates
    - Large (9+ files): 6-8 teammates
+   - **Model-adaptive:** on a Mythos-class session (Fable 5 or newer), size to the bottom of each band (Small: 2, Medium: 3-4, Large: 4-6) — a stronger teammate holds broader file ownership without quality loss, and fewer teammates means fewer integration seams.
    - For large, write-heavy swarms, prefer **git-worktree-per-teammate isolation** over same-tree file ownership — separate worktrees make file conflicts structurally impossible, which is the proven fix at 8+ agents. Same-tree ownership is fine for clean domain splits but gets fragile beyond that.
 
 5. **Spawn teammates with self-contained prompts.** Use the Task/Agent tool with `subagent_type: "general-purpose"` (they need write access). **Teammates do NOT inherit your conversation history** — they only load `CLAUDE.md`, MCP servers, and skills, plus the spawn prompt. So embed everything they need into each prompt:
