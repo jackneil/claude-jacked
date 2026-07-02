@@ -1,7 +1,7 @@
 ---
 description: Verify git hygiene and safely clean branches, stashes, stale worktrees, and untracked state in any repo. Report-first, confirm-each, never loses work.
 argument-hint: "[--dry-run | --auto-safe]"
-model: opus
+model: inherit
 disable-model-invocation: true
 ---
 
