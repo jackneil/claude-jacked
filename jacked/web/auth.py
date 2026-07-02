@@ -83,6 +83,13 @@ _TIER_ORDER = ["idle", "normal", "warning", "critical"]
 # Per-account usage coordinator state
 _account_usage_state: dict[int, dict] = {}
 
+# Per-account throttle for piggybacked profile refreshes (see fetch_usage).
+# Profile metadata (subscription_type, rate_limit_tier) otherwise only updates
+# at account-add and after a token refresh — a parked account whose token never
+# rotates would show a stale plan forever after an upgrade/downgrade.
+_PROFILE_REFRESH_INTERVAL = 6 * 3600  # seconds
+_profile_refreshed_at: dict[int, float] = {}
+
 
 def _update_profile_metadata(account_id: int, data: dict, db) -> None:
     """Update account metadata from a profile API response."""
@@ -863,6 +870,21 @@ async def fetch_usage(
                 # clear_account_errors marks valid, clears last_error, consecutive_failures
                 db.clear_account_errors(account_id)
                 logger.info(f"Usage fetched for account {account_id}")
+
+                # Piggyback a throttled profile refresh so subscription changes
+                # (Pro <-> Max, 5x <-> 20x) reach the dashboard within hours even
+                # if this account's token never rotates. Non-fatal by design.
+                now = time.time()
+                if now - _profile_refreshed_at.get(account_id, 0) > _PROFILE_REFRESH_INTERVAL:
+                    _profile_refreshed_at[account_id] = now  # stamp first — a failing profile API must not retry every poll
+                    try:
+                        await fetch_profile(account_id, db, access_token=token)
+                    except Exception:
+                        logger.debug(
+                            "piggybacked profile refresh failed for account %d",
+                            account_id, exc_info=True,
+                        )
+
                 return data
 
             if resp.status_code in (401, 403):

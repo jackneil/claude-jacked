@@ -285,6 +285,22 @@ async def fetch_codex_usage(
         seven_day_resets_at=seven["resets_at"],
         raw=result,
     )
+    # The rate-limits read carries the CURRENT ChatGPT plan — keep the stored
+    # subscription in sync so an upgrade/downgrade (Plus <-> Pro) shows up on
+    # the dashboard without re-adding the account. (At add time the plan comes
+    # from the id_token claim and was never refreshed before this.)
+    plan = norm.get("plan_type")
+    if plan:
+        try:
+            acct = db.get_account(account_id)
+            if acct and acct.get("subscription_type") != plan:
+                db.update_account(account_id, subscription_type=plan)
+                logger.info(
+                    "Codex account %s plan changed: %s -> %s",
+                    account_id, acct.get("subscription_type"), plan,
+                )
+        except Exception:  # pragma: no cover - bookkeeping must not mask usage
+            logger.debug("codex plan sync failed", exc_info=True)
     try:
         db.clear_account_errors(account_id)
     except Exception:  # pragma: no cover

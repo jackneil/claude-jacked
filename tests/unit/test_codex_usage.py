@@ -283,3 +283,33 @@ def test_read_rate_limits_passes_codex_home_env(tmp_path):
     home.mkdir()
     result = asyncio.run(cu.read_codex_rate_limits(home=home, codex_bin=str(script)))
     assert result["rateLimits"]["planType"] == str(home)
+
+
+def test_fetch_codex_usage_syncs_plan_change(db, tmp_path, monkeypatch):
+    """A ChatGPT plan change (Plus -> Pro) must update subscription_type on
+    the next usage fetch — the plan is otherwise only captured at add time."""
+    acct = db.create_account(
+        "dev@example.com", "tok", cu.time.time() + 99999,
+        provider="codex", subscription_type="plus",
+    )
+
+    async def fake_read(**kwargs):
+        return RECORDED_RESULT  # carries planType "pro"
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert db.get_account(acct["id"])["subscription_type"] == "pro"
+
+
+def test_fetch_codex_usage_plan_unchanged_no_write(db, tmp_path, monkeypatch):
+    acct = db.create_account(
+        "dev@example.com", "tok", cu.time.time() + 99999,
+        provider="codex", subscription_type="pro",
+    )
+
+    async def fake_read(**kwargs):
+        return RECORDED_RESULT
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert db.get_account(acct["id"])["subscription_type"] == "pro"
