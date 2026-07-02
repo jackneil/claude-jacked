@@ -221,7 +221,7 @@ Inject this exclusion list into every reviewer prompt (item 12 above). It is the
 - **Rules explicitly silenced inline** (e.g. `# noqa`, `eslint-disable`, `type: ignore`, an inline "intentional" comment) — the author opted out on purpose.
 - **Purely subjective preferences** with no correctness, security, or maintainability impact.
 
-If you are not certain an issue is real, do not flag it. When genuinely torn on severity, downgrade rather than inflate.
+Beyond this list, do NOT self-filter on certainty: report every issue that could cause incorrect behavior, a security exposure, data loss, a test failure, or a misleading result — including ones you are not fully sure about — with your confidence stated, and let the evidence requirement above (exact `file:line` + concrete trigger) be the gate. An uncertain finding with a concrete `file:line` and trigger is a report; a hunch with no code path is not. When genuinely torn on severity, downgrade rather than inflate.
 
 ## EXECUTION FLOW
 
