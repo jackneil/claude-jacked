@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "claude-jacked"
 dynamic = ["version"]
-description = "Smart reviewers, commands, and session search for Claude Code"
+description = "Multi-account manager + skills suite for Claude Code (and Codex) — live usage tracking, auto account-switching, menu-bar pill, 30 slash commands, web dashboard"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "Jack Neil", email = "jack@jackmd.com" }
 ]
-keywords = ["claude", "ai", "context", "semantic-search", "qdrant"]
+keywords = ["claude", "claude-code", "codex", "account-management", "usage-tracking", "skills"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

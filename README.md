@@ -1,6 +1,6 @@
 # claude-jacked
 
-**A control panel for Claude Code.** Smart reviewers, security automation, session search, and a web dashboard to manage it all — without touching a config file.
+**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar pill — plus a curated set of 30 slash commands and 10 review agents installed into Claude Code, all managed from a web dashboard.
 
 ![jacked dashboard — accounts](docs/screenshots/dashboard-accounts.png)
 
@@ -8,10 +8,10 @@
 
 ## What You Get
 
-- **LLM-evaluated security interception, opt-in** — Claude Code now ships an auto permission mode that handles approvals natively, so the security gatekeeper installs **disabled by default**. Turn it on from the dashboard (Settings > Gatekeeper) when you want a Haiku-backed second layer reviewing every tool call on top of Claude Code's auto mode.
-- **Catch bugs before they ship** — `/dcr` spawns parallel reviewers across 11 lenses (security, performance, logic, observability, data integrity, and more) in recursive waves until everything passes clean. 10 built-in agents, always available.
-- **Find any past conversation** — Search your Claude history by describing what you were working on. Works across machines, works across teammates. *(requires [search] extra)*
-- **Manage everything from a web dashboard** — Toggle features on and off, configure the security system, monitor decisions, track usage — all from your browser. No config files, no terminal commands.
+- **Run multiple Claude accounts like one** — Add every account you own, watch each one's 5-hour and 7-day usage live, and let auto-swap rotate to a fresh account before you hit a limit. Works for Codex accounts too. The macOS menu-bar pill shows your active account's usage at a glance, with a dropdown for the whole fleet.
+- **A curated skills suite, one command to install** — `jacked install` puts 30 battle-tested slash commands, 10 review agents, and behavioral rules into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more). Upgrades diff cleanly — added/changed/removed, never touching your own files.
+- **Manage everything from a web dashboard** — Accounts, usage analytics, feature toggles, swap history, logs — all from your browser. No config files, no terminal commands.
+- **Legacy extras, off by default** — An LLM security gatekeeper (largely superseded by Claude Code's native auto permission mode; enable from Settings > Gatekeeper if you still want a second layer) and cross-machine semantic session search (*requires the [search] extra + Qdrant*).
 
 ---
 
