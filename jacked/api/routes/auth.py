@@ -108,10 +108,18 @@ def reset_locks() -> None:
 
 
 class ModelUsage(BaseModel):
-    """Per-model 7-day usage breakdown."""
+    """Per-model weekly usage cap.
+
+    ``label`` is the provider's display name (e.g. "Fable", "GPT-5.3-Codex-Spark").
+    ``severity`` / ``is_active`` come from Claude's ``limits`` array — ``is_active``
+    flags the single binding constraint (surfaced as the inline binding bar).
+    """
 
     utilization: float = 0
     resets_at: Optional[str] = None
+    label: Optional[str] = None
+    severity: Optional[str] = None
+    is_active: bool = False
 
 
 class ExtraUsage(BaseModel):
@@ -131,6 +139,11 @@ class AccountUsage(BaseModel):
     five_hour_resets_at: Optional[str] = None
     seven_day_resets_at: Optional[str] = None
     per_model: Optional[dict[str, ModelUsage]] = None
+    # The per-model cap to surface inline (under the 5h/7d bars), shown for every
+    # account that reports one at any level: the model the provider flags
+    # is_active, else the highest-utilization model. None only when the account
+    # reports no per-model cap. Selection lives in menubar_summary.binding_model.
+    binding_model: Optional[ModelUsage] = None
     extra_usage: Optional[ExtraUsage] = None
 
 
@@ -238,57 +251,70 @@ class ActiveCredentialResponse(BaseModel):
 
 def _parse_usage_details(
     raw_json: Optional[str],
-) -> tuple[Optional[dict[str, ModelUsage]], Optional[ExtraUsage]]:
-    """Parse cached_usage_raw JSON into per-model dict and ExtraUsage.
+) -> tuple[Optional[dict[str, ModelUsage]], Optional[str], Optional[ExtraUsage]]:
+    """Parse cached_usage_raw JSON into (per_model dict, binding key, ExtraUsage).
+
+    The binding key names the per_model entry to surface as the inline bar (the
+    active or notably-high model), or None. Selection lives in the shared
+    ``menubar_summary.binding_model`` so every surface agrees.
 
     >>> _parse_usage_details(None)
-    (None, None)
+    (None, None, None)
     >>> _parse_usage_details("not json")
-    (None, None)
-    >>> pm, eu = _parse_usage_details('{"seven_day_sonnet": {"utilization": 42.5, "resets_at": "2025-02-08T00:00:00Z"}}')
-    >>> pm["sonnet"].utilization
-    42.5
-    >>> eu is None
-    True
+    (None, None, None)
+    >>> pm, bk, eu = _parse_usage_details('{"seven_day_sonnet": {"utilization": 42.5, "resets_at": "2025-02-08T00:00:00Z"}}')
+    >>> pm["sonnet"].utilization, bk, eu is None
+    (42.5, 'sonnet', True)
+    >>> pm, bk, _ = _parse_usage_details('{"limits": [{"kind": "weekly_scoped", "percent": 92, "severity": "critical", "is_active": true, "scope": {"model": {"display_name": "Fable"}}}]}')
+    >>> pm["fable"].utilization, pm["fable"].label, bk
+    (92.0, 'Fable', 'fable')
     """
     if not raw_json:
-        return None, None
+        return None, None, None
     try:
         data = json.loads(raw_json)
     except (json.JSONDecodeError, TypeError):
-        return None, None
+        return None, None, None
 
-    # Per-model: extract seven_day_* keys
-    per_model: dict[str, ModelUsage] = {}
-    for key in (
-        "seven_day_sonnet",
-        "seven_day_opus",
-        "seven_day_oauth_apps",
-        "seven_day_cowork",
-    ):
-        val = data.get(key)
-        if val is not None and isinstance(val, dict):
-            per_model[key.removeprefix("seven_day_")] = ModelUsage(
-                utilization=val.get("utilization", 0),
-                resets_at=val.get("resets_at"),
+    # Per-model caps — shared parser handles Claude (limits array), Codex
+    # (rateLimitsByLimitId), and legacy seven_day_* fallback. Ordered by
+    # utilization descending; keyed by model slug. Binding selection uses the
+    # same shared rule the WS/menu-bar surfaces use. Wrapped defensively: this
+    # feeds GET /api/auth/accounts, so a single malformed cached payload must
+    # degrade to "no per-model data", never 500 the whole account list.
+    from jacked.service.menubar_summary import binding_model, parse_per_model
+
+    try:
+        parsed = parse_per_model(data)
+        per_model: dict[str, ModelUsage] = {}
+        for m in parsed:
+            per_model[m["key"]] = ModelUsage(
+                utilization=m.get("utilization") or 0,
+                resets_at=m.get("resets_at"),
+                label=m.get("label"),
+                severity=m.get("severity"),
+                is_active=bool(m.get("is_active")),
             )
-        elif val is not None and isinstance(val, (int, float)):
-            per_model[key.removeprefix("seven_day_")] = ModelUsage(utilization=val)
+        bm = binding_model(parsed)
+        binding_key = bm["key"] if bm else None
 
-    # Extra usage credits
-    extra_raw = data.get("extra_usage")
-    extra = None
-    if isinstance(extra_raw, dict):
-        raw_limit = extra_raw.get("monthly_limit")
-        raw_used = extra_raw.get("used_credits")
-        extra = ExtraUsage(
-            is_enabled=extra_raw.get("is_enabled", False),
-            monthly_limit=raw_limit / 100 if raw_limit is not None else None,
-            used_credits=raw_used / 100 if raw_used is not None else None,
-            utilization=extra_raw.get("utilization"),
-        )
+        # Extra usage credits
+        extra_raw = data.get("extra_usage")
+        extra = None
+        if isinstance(extra_raw, dict):
+            raw_limit = extra_raw.get("monthly_limit")
+            raw_used = extra_raw.get("used_credits")
+            extra = ExtraUsage(
+                is_enabled=extra_raw.get("is_enabled", False),
+                monthly_limit=raw_limit / 100 if isinstance(raw_limit, (int, float)) else None,
+                used_credits=raw_used / 100 if isinstance(raw_used, (int, float)) else None,
+                utilization=extra_raw.get("utilization"),
+            )
+    except (TypeError, ValueError, AttributeError, KeyError):
+        logger.warning("Malformed cached_usage_raw — dropping per-model details", exc_info=True)
+        return None, None, None
 
-    return (per_model or None), extra
+    return (per_model or None), binding_key, extra
 
 
 def _build_account_usage(row: dict) -> Optional[AccountUsage]:
@@ -302,13 +328,15 @@ def _build_account_usage(row: dict) -> Optional[AccountUsage]:
     """
     if row.get("cached_usage_5h") is None and row.get("cached_usage_7d") is None:
         return None
-    per_model, extra_usage = _parse_usage_details(row.get("cached_usage_raw"))
+    per_model, binding_key, extra_usage = _parse_usage_details(row.get("cached_usage_raw"))
+    binding = per_model.get(binding_key) if (per_model and binding_key) else None
     return AccountUsage(
         five_hour=row.get("cached_usage_5h", 0) or 0,
         seven_day=row.get("cached_usage_7d", 0) or 0,
         five_hour_resets_at=row.get("cached_5h_resets_at"),
         seven_day_resets_at=row.get("cached_7d_resets_at"),
         per_model=per_model,
+        binding_model=binding,
         extra_usage=extra_usage,
     )
 

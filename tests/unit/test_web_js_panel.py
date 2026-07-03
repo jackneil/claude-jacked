@@ -105,6 +105,40 @@ out({ html });
     assert "Max 20x" in html
 
 
+def test_binding_model_adds_third_compact_bar(tmp_path):
+    # An account whose usage carries a binding_model gets a third compact bar
+    # (the per-model cap, e.g. Fable) under the 5h/7d bars.
+    result = _run(tmp_path, """
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 3, email: 'jack@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 10, cached_usage_7d: 66,
+      usage: { binding_model: { label: 'Fable', utilization: 92,
+                                resets_at: null, severity: 'critical' } } },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert ">5h<" in html and ">7d<" in html
+    assert "Fable" in html, "the binding model label must render as a third bar"
+    assert "92%" in html
+    assert "fill red" in html, "92% Fable → red via shared usageColorClass"
+
+
+def test_no_binding_model_keeps_two_bars(tmp_path):
+    # No binding_model → only the 5h and 7d bars, panel density preserved.
+    result = _run(tmp_path, """
+const html = buildPanelHtml(groupAccountsByLogin([
+    { id: 4, email: 'idle@x.com', organization_uuid: '', priority: 0,
+      cached_usage_5h: 5, cached_usage_7d: 3, usage: {} },
+], null));
+out({ html });
+""")
+    html = result["html"]
+    assert ">5h<" in html and ">7d<" in html
+    # exactly the two window labels — no extra model bar
+    assert html.count("usage-bar") == 2
+
+
 def test_single_org_has_no_chip_or_rail(tmp_path):
     result = _run(tmp_path, """
 const html = buildPanelHtml(groupAccountsByLogin([
