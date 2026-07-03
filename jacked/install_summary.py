@@ -16,7 +16,7 @@ _LABELS = [
 _SYM = {
     "added": ("+", "new", "green"),
     "changed": ("~", "updated", "yellow"),
-    "removed": ("−", "removed", "red"),
+    "removed": ("-", "removed", "red"),
 }
 
 
@@ -42,13 +42,13 @@ def render_terminal(record: dict) -> str:
     lines: list[str] = []
 
     if frm is None:
-        lines.append(f"[bold]Jacked installed[/bold]  —  {to}")
+        lines.append(f"[bold]Jacked installed[/bold]  -  {to}")
     elif frm != to:
-        lines.append(f"[bold]Jacked upgraded[/bold]   {frm} → {to}")
+        lines.append(f"[bold]Jacked upgraded[/bold]   {frm} -> {to}")
     elif changed:
-        lines.append(f"[bold]Jacked {to}[/bold] — files refreshed")
+        lines.append(f"[bold]Jacked {to}[/bold] - files refreshed")
     else:
-        return f"[green]Jacked {to}[/green] — already up to date ({record['unchanged_count']} artifacts unchanged)"
+        return f"[green]Jacked {to}[/green] - already up to date ({record['unchanged_count']} artifacts unchanged)"
 
     lines.append("")
     for cat_key, label in _LABELS:
@@ -61,7 +61,7 @@ def render_terminal(record: dict) -> str:
         lines.append("  (no artifact changes)")
     lines.append(f"  {record['unchanged_count']} unchanged")
     lines.append("")
-    lines.append("→ Restart Claude Code to load changes.")
+    lines.append("-> Restart Claude Code to load changes.")
     return "\n".join(lines)
 
 
