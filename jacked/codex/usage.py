@@ -21,9 +21,10 @@ import logging
 import os
 import shutil
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional
+
+from jacked.service.menubar_summary import _epoch_to_iso
 
 from .credentials import codex_home
 
@@ -37,20 +38,6 @@ _APP_SERVER_TIMEOUT = 12.0
 
 class CodexUsageError(Exception):
     """The codex app-server call failed (no binary, timeout, RPC error)."""
-
-
-def _epoch_to_iso(epoch) -> Optional[str]:
-    """Convert a unix epoch (seconds) to an ISO-8601 UTC string, or None.
-
-    jacked stores reset times as ISO strings (the Anthropic API returns ISO);
-    app-server returns unix epoch seconds, so normalize to match.
-    """
-    if epoch is None:
-        return None
-    try:
-        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
-    except (TypeError, ValueError, OSError, OverflowError):
-        return None
 
 
 def normalize_rate_limits(result: Mapping) -> dict:

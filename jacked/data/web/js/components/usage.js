@@ -59,7 +59,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
             : '';
         return `
         <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(label || '')}${resetDisplay ? ' · ' + escapeHtml(resetDisplay) : ''}">
-            <span class="text-[10px] text-slate-400 w-5 shrink-0">${escapeHtml(label || '')}</span>
+            <span class="text-[10px] text-slate-400 w-10 shrink-0 truncate">${escapeHtml(label || '')}</span>
             <div class="usage-bar flex-1">
                 <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>
                 ${markerHtml}
@@ -72,7 +72,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
 
     return `
         <div class="flex items-center gap-3 mb-1">
-            <span class="text-xs text-slate-400 w-14 shrink-0">${escapeHtml(label || '')}</span>
+            <span class="text-xs text-slate-400 w-14 shrink-0 truncate" title="${escapeHtml(label || '')}">${escapeHtml(label || '')}</span>
             <div class="usage-bar flex-1">
                 <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>
                 ${markerHtml}

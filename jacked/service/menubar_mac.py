@@ -46,7 +46,8 @@ USAGE_WATCH_INTERVAL = 1.0
 STOP_POLL_INTERVAL = 1.0
 WIRE_RETRY_INTERVAL = 0.4  # poll for the status-item button after launch
 PANEL_WIDTH = 360  # side-panel / popover width in points
-POPOVER_HEIGHT = 600  # dropdown height — fits ~7 accounts without scrolling
+POPOVER_HEIGHT = 700  # dropdown height — headroom for a per-model binding row
+# per hot account (~17px each) on top of the 5h/7d bars; scrolls past ~7 accounts
 
 # RGB fills for the "J" status icon, keyed by usage color class.
 _ICON_FILL = {

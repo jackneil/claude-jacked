@@ -19,6 +19,7 @@ panel/dashboard.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 
@@ -157,3 +158,242 @@ def menubar_title(summary: Optional[dict]) -> str:
     five = round(summary.get("five_hour") or 0)
     seven = round(summary.get("seven_day") or 0)
     return f"{five}%·{seven}%"
+
+
+# ---------------------------------------------------------------------------
+# Per-model usage caps
+# ---------------------------------------------------------------------------
+#
+# Both providers report per-model weekly caps in ``cached_usage_raw``, but in
+# different shapes:
+#   - Claude: a ``limits`` array; model caps are the ``weekly_scoped`` entries
+#     whose ``scope.model.display_name`` names the model (e.g. "Fable"). One
+#     entry may carry ``is_active: true`` — the binding constraint.
+#   - Codex: a ``rateLimitsByLimitId`` map; named limits carry a ``limitName``
+#     (e.g. "GPT-5.3-Codex-Spark"). The bare overall ``codex`` entry has no
+#     ``limitName`` and is already covered by the 5h/7d bars.
+# The legacy ``seven_day_<model>`` keys are a fallback for older cached
+# payloads (Anthropic now leaves them null in favor of ``limits``).
+
+_LEGACY_MODEL_LABELS = {
+    "sonnet": "Sonnet",
+    "opus": "Opus",
+    "oauth_apps": "OAuth Apps",
+    "cowork": "Cowork",
+}
+
+
+def _epoch_to_iso(epoch) -> Optional[str]:
+    """Unix epoch seconds → ISO-8601 UTC string, or None if not convertible.
+
+    Canonical home for this helper; also imported by ``jacked/codex/usage.py``,
+    so keep the name stable (a rename must update that import too).
+
+    >>> _epoch_to_iso(None) is None
+    True
+    >>> _epoch_to_iso(0)
+    '1970-01-01T00:00:00+00:00'
+    >>> _epoch_to_iso("nope") is None
+    True
+    """
+    if epoch is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _as_num(v) -> float | int:
+    """Coerce a utilization value to a number; unparseable → 0.
+
+    Provider payloads are external input — a stray string percent ("92") or a
+    null must never reach the ``sorted``/``>=`` comparisons below as a
+    non-number (that would raise TypeError and, on the API path, 500 the
+    accounts endpoint). ``bool`` maps to 0 (it is an int subclass but is never a
+    real utilization).
+
+    >>> _as_num(92), _as_num(42.5), _as_num("92"), _as_num(None), _as_num(True)
+    (92, 42.5, 92.0, 0, 0)
+    """
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return v
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _claude_scoped_models(raw: dict) -> list[dict]:
+    """Claude ``weekly_scoped`` model caps from the ``limits`` array."""
+    out: list[dict] = []
+    limits = raw.get("limits")
+    if not isinstance(limits, list):
+        return out
+    for lim in limits:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        scope = lim.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        label = model.get("display_name") if isinstance(model, dict) else None
+        if not label:
+            continue
+        out.append({
+            "key": str(label).lower(),
+            "label": label,
+            "utilization": _as_num(lim.get("percent")),
+            "resets_at": lim.get("resets_at"),
+            "severity": lim.get("severity"),
+            "is_active": bool(lim.get("is_active")),
+        })
+    return out
+
+
+def _codex_named_models(raw: dict) -> list[dict]:
+    """Codex named per-model limits from ``rateLimitsByLimitId``."""
+    out: list[dict] = []
+    by_limit = raw.get("rateLimitsByLimitId")
+    if not isinstance(by_limit, dict):
+        return out
+    for limit_id, entry in by_limit.items():
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("limitName")
+        if not label:
+            continue  # bare overall limit — already the 5h/7d bars
+        # Prefer the weekly (secondary) window; fall back to primary (5h).
+        window = entry.get("secondary")
+        if not isinstance(window, dict) or window.get("usedPercent") is None:
+            window = entry.get("primary") if isinstance(entry.get("primary"), dict) else {}
+        out.append({
+            "key": str(limit_id).lower(),
+            "label": label,
+            "utilization": _as_num(window.get("usedPercent")),
+            "resets_at": _epoch_to_iso(window.get("resetsAt")),
+            "severity": None,
+            "is_active": False,
+        })
+    return out
+
+
+def _legacy_seven_day_models(raw: dict) -> list[dict]:
+    """Legacy ``seven_day_<model>`` caps — dict OR bare numeric (old payloads)."""
+    out: list[dict] = []
+    for suffix, label in _LEGACY_MODEL_LABELS.items():
+        val = raw.get(f"seven_day_{suffix}")
+        if isinstance(val, dict):
+            out.append({
+                "key": suffix, "label": label,
+                "utilization": _as_num(val.get("utilization")),
+                "resets_at": val.get("resets_at"),
+                "severity": None, "is_active": False,
+            })
+        elif isinstance(val, (int, float)) and not isinstance(val, bool):
+            out.append({
+                "key": suffix, "label": label, "utilization": val,
+                "resets_at": None, "severity": None, "is_active": False,
+            })
+    return out
+
+
+def parse_per_model(raw: Optional[dict]) -> list[dict]:
+    """Extract per-model usage caps from a raw usage payload (Claude or Codex).
+
+    Returns a list of dicts, each shaped
+    ``{"key", "label", "utilization", "resets_at", "severity", "is_active"}``,
+    sorted by utilization descending. Providers are merged with the first
+    source (Claude limits) winning on key collisions; the legacy source only
+    fills keys not already present. Empty list when the payload has no per-model
+    breakdown or is not a dict.
+
+    Claude reports model caps as ``weekly_scoped`` entries in ``limits``:
+
+    >>> claude = {"limits": [
+    ...     {"kind": "weekly_all", "percent": 52, "is_active": False},
+    ...     {"kind": "weekly_scoped", "percent": 92, "severity": "critical",
+    ...      "resets_at": "2026-07-06T05:00:00+00:00", "is_active": True,
+    ...      "scope": {"model": {"id": None, "display_name": "Fable"}}},
+    ... ]}
+    >>> [(m["label"], m["utilization"], m["is_active"]) for m in parse_per_model(claude)]
+    [('Fable', 92, True)]
+
+    Codex reports them in ``rateLimitsByLimitId`` (named limits only; the bare
+    ``codex`` overall entry is skipped):
+
+    >>> codex = {"rateLimitsByLimitId": {
+    ...     "codex": {"primary": {"usedPercent": 2}},
+    ...     "codex_bengalfox": {"limitName": "GPT-5.3-Codex-Spark",
+    ...                          "primary": {"usedPercent": 7}},
+    ... }}
+    >>> [(m["label"], m["utilization"]) for m in parse_per_model(codex)]
+    [('GPT-5.3-Codex-Spark', 7)]
+
+    >>> parse_per_model(None)
+    []
+    """
+    if not isinstance(raw, dict):
+        return []
+
+    out: dict[str, dict] = {}
+    for entry in (
+        *_claude_scoped_models(raw),
+        *_codex_named_models(raw),
+        *_legacy_seven_day_models(raw),
+    ):
+        out.setdefault(entry["key"], entry)  # first source wins per key
+
+    return sorted(out.values(), key=lambda m: m["utilization"], reverse=True)
+
+
+def binding_model(per_model: list[dict]) -> Optional[dict]:
+    """The per-model cap to surface inline (under the 5h/7d bars), or None.
+
+    Shown for every account that reports a per-model cap, regardless of level —
+    users want to always see e.g. their Fable usage, not only when it's near the
+    limit. Selection when an account reports more than one model:
+    1. the entry the provider flags ``is_active`` — THE current binding
+       constraint; else
+    2. the highest-utilization model (``per_model`` is sorted descending).
+
+    None only when the account reports no per-model cap at all.
+
+    >>> binding_model([{"label": "Fable", "utilization": 40, "is_active": True},
+    ...                 {"label": "Sonnet", "utilization": 88, "is_active": False}])["label"]
+    'Fable'
+    >>> binding_model([{"label": "Fable", "utilization": 92, "is_active": False},
+    ...                 {"label": "Sonnet", "utilization": 4, "is_active": False}])["label"]
+    'Fable'
+    >>> binding_model([{"label": "Sonnet", "utilization": 0, "is_active": False}])["label"]
+    'Sonnet'
+    >>> binding_model([]) is None
+    True
+    """
+    for m in per_model:
+        if m.get("is_active"):
+            return m
+    return per_model[0] if per_model else None
+
+
+def binding_model_compact(raw: Optional[dict]) -> Optional[dict]:
+    """Compact binding-model summary for a raw usage payload, for the inline
+    bar's WebSocket payloads. Returns ``{label, utilization, resets_at,
+    severity}`` or None.
+
+    >>> binding_model_compact({"limits": [
+    ...     {"kind": "weekly_scoped", "percent": 92, "severity": "critical",
+    ...      "is_active": True, "scope": {"model": {"display_name": "Fable"}}}]})
+    {'label': 'Fable', 'utilization': 92, 'resets_at': None, 'severity': 'critical'}
+    >>> binding_model_compact({}) is None
+    True
+    """
+    bm = binding_model(parse_per_model(raw))
+    if bm is None:
+        return None
+    return {
+        "label": bm["label"],
+        "utilization": bm["utilization"],
+        "resets_at": bm.get("resets_at"),
+        "severity": bm.get("severity"),
+    }

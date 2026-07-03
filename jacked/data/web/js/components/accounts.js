@@ -121,11 +121,31 @@ function renderPerModelBars(usage) {
 
     let html = '<div class="text-xs text-slate-400 font-medium mb-1.5">7-Day Per-Model Breakdown</div>';
     for (const [key, model] of Object.entries(usage.per_model)) {
-        const label = MODEL_DISPLAY_NAMES[key] || key;
+        // Prefer the provider's display name (e.g. "Fable", "GPT-5.3-Codex-Spark");
+        // fall back to the legacy static map, then the raw key.
+        const label = model.label || MODEL_DISPLAY_NAMES[key] || key;
         const pct = model.utilization || 0;
         html += renderUsageBar(pct, model.resets_at, null, label);
     }
     return html;
+}
+
+/**
+ * Render the inline "binding model" bar shown right under the 5h/7d bars — the
+ * per-model weekly cap the provider flags as the currently-active constraint
+ * (e.g. Fable at 92%). Returns a stable [data-binding-bar] wrapper ALWAYS (empty
+ * inner when there's no binding model) so websocket.js can patch it in place and
+ * the 5h/7d child indexing in _usageUpdateCardDOM stays fixed.
+ */
+function renderBindingBar(acct) {
+    const bm = acct.usage && acct.usage.binding_model;
+    const inner = bm
+        ? renderUsageBar(bm.utilization, bm.resets_at, null, bm.label || 'model')
+        : '';
+    // Title stays on the wrapper (not the inner bar) so it survives websocket.js's
+    // innerHTML swaps and clarifies that this row is a per-model weekly cap, not
+    // another time window like the 5h/7d bars above it.
+    return `<div data-binding-bar title="Per-model weekly usage cap for this account">${inner}</div>`;
 }
 
 /**
@@ -340,6 +360,7 @@ function renderAccountCard(acct, idx, total) {
                     <div class="ml-5" data-usage-container>
                         ${usage5h}
                         ${usage7d}
+                        ${renderBindingBar(acct)}
                         ${renderActiveSessions(acct)}
                         ${detailsHtml}
                     </div>

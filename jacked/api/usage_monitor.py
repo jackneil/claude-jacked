@@ -1055,6 +1055,26 @@ async def active_account_poll_loop(app):
                 safe_acct["_poll_interval"] = int(_poll_interval)
                 safe_acct["_poll_tier"] = _poll_tier
                 safe_acct["_last_poll_at"] = int(time.time())
+                # Compact binding-model cap so the dashboard can surgically
+                # refresh the inline bar (this payload is whitelisted flat
+                # fields, not the full AccountResponse the bulk path sends).
+                try:
+                    from jacked.service.menubar_summary import binding_model_compact
+                    _raw = active_acct.get("cached_usage_raw")
+                    safe_acct["_binding_model"] = binding_model_compact(
+                        json.loads(_raw) if _raw else None
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as _bm_err:
+                    # WARNING, not DEBUG: the service runs at effective INFO, so a
+                    # DEBUG line here would be invisible and a recurring parse
+                    # failure of our own cached payload (schema drift / corruption)
+                    # would silently drop the inline bar every tick. Poll interval
+                    # is minutes, so this can't spam.
+                    logger.warning(
+                        "binding_model_compact failed for account %d: %s",
+                        active_acct_id, _bm_err,
+                    )
+                    safe_acct["_binding_model"] = None
                 await _ws.broadcast(
                     "usage_poll_updated",
                     {

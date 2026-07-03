@@ -313,10 +313,27 @@ function _usageRemoveOverlay(card) {
 function _usageUpdateCardDOM(card, acctData) {
     if (!acctData) return;
 
-    // Merge into window.jackedState.accounts (preserves any client-side fields)
+    // Resolve the binding model from whichever payload shape arrived: the
+    // active-poll payload carries a flat _binding_model; the bulk-refresh
+    // payload is the full response with a nested usage.binding_model.
+    const resolvedBinding = (acctData._binding_model !== undefined)
+        ? acctData._binding_model
+        : ((acctData.usage && acctData.usage.binding_model) || null);
+
+    // Merge into window.jackedState.accounts, then normalize to the nested shape.
+    // The flat poll payload has no `usage` key, so without this fold a later
+    // state-only re-render (e.g. a session-control toggle that doesn't refetch)
+    // would read a stale usage.binding_model and resurrect an old inline bar.
+    // Note: the poll carries only the compact binding_model, not per_model, so
+    // the details-expander list can briefly lag the inline bar until the next
+    // full /api/auth/accounts load — freshest data wins for the surfaced bar.
     if (window.jackedState && window.jackedState.accounts) {
         const idx = window.jackedState.accounts.findIndex(a => a.id === acctData.id);
-        if (idx >= 0) Object.assign(window.jackedState.accounts[idx], acctData);
+        if (idx >= 0) {
+            const acct = window.jackedState.accounts[idx];
+            Object.assign(acct, acctData);
+            acct.usage = Object.assign({}, acct.usage, { binding_model: resolvedBinding });
+        }
     }
 
     // Re-render usage bars using existing renderUsageBar function
@@ -340,6 +357,18 @@ function _usageUpdateCardDOM(card, acctData) {
             const temp7d = document.createElement('div');
             temp7d.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_7d, acctData.cached_7d_resets_at, elapsed7d, '7d limit'));
             if (temp7d.firstElementChild) bar7d.replaceWith(temp7d.firstElementChild);
+        }
+
+        // Inline binding-model bar (the [data-binding-bar] child after 7d). The
+        // active-poll payload carries a flat _binding_model; the bulk-refresh
+        // payload is the full response with a nested usage.binding_model —
+        // accept either. Swapping innerHTML (not the wrapper) keeps the 5h/7d
+        // child indexing above stable.
+        const bindingWrap = usageContainer.querySelector('[data-binding-bar]');
+        if (bindingWrap) {
+            bindingWrap.innerHTML = resolvedBinding
+                ? renderUsageBar(resolvedBinding.utilization, resolvedBinding.resets_at, null, resolvedBinding.label || 'model')
+                : '';
         }
     }
 

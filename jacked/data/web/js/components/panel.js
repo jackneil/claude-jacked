@@ -54,14 +54,21 @@ function formatCountdown(nextAt) {
     return 'next ' + Math.floor(secs / 60) + 'm';
 }
 
-/** The two compact usage bars (5h + 7d) for an account/org. */
+/** The compact usage bars for an account/org: 5h + 7d, plus the per-model cap
+ * (e.g. Fable) whenever the account reports one — shown at any level, so every
+ * account's model usage is visible. Accounts with no per-model cap in their
+ * payload get just the two window bars. */
 function orgBarsHtml(org) {
     const elapsed5h = computeElapsedFraction5h(org.cached_5h_resets_at);
     const elapsed7d = computeElapsedFraction7d(org.cached_7d_resets_at);
-    return (
+    let html =
         renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h', { compact: true }) +
-        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', { compact: true })
-    );
+        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', { compact: true });
+    const bm = org.usage && org.usage.binding_model;
+    if (bm) {
+        html += renderUsageBar(bm.utilization, bm.resets_at, null, bm.label || 'model', { compact: true });
+    }
+    return html;
 }
 
 /** Trailing meta on an identity line: plan badge, active marker, freshness age,
