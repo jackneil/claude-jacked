@@ -17,7 +17,7 @@ Read this when the user asks about jacked features, installation, logs, or troub
 | `~/.claude/CLAUDE.md` | Behavioral rules (between `# jacked-behaviors-v2` markers) |
 | `~/.claude/jacked-reference.md` | This reference doc |
 | `~/.claude/agents/*.md` | 10 specialized review/workflow agents |
-| `~/.claude/commands/*.md` | 6 quick commands (/dc, /pr, /learn, /redo, /techdebt, /audit-rules) |
+| `~/.claude/commands/*.md` | 7 quick commands (/dc, /pr, /learn, /blindspot, /redo, /techdebt, /audit-rules) |
 | `~/.claude/jacked-guardrails/*.md` | Guardrails templates (base + 4 languages) |
 | `~/.claude/jacked-hooks/*.sh` | Git hook templates (installed extensionless) |
 | `~/.claude/jacked-templates/*.html` | HTML scaffolds for human-readable artifacts (plans, specs, research, checkpoints) |
@@ -129,6 +129,7 @@ Language-specific coding standards enforced through templates and git hooks.
 | `/dc` | Double-check reviewer -- auto-detects phase (planning/implementation/post-implementation) |
 | `/pr` | Pull request workflow -- checks status, creates/updates PRs |
 | `/learn` | Distills a lesson from the current session into a CLAUDE.md rule |
+| `/blindspot` | Pre-build discovery pass: surfaces unknown-unknowns, teaches you to prompt well, asks must-have questions |
 | `/redo` | Scraps current approach, preserves work, re-implements with hindsight |
 | `/techdebt` | Scans for TODOs, oversized files, missing tests, dead code |
 | `/audit-rules` | Audits CLAUDE.md for duplicates, contradictions, stale rules |

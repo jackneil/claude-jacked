@@ -7,6 +7,7 @@
 - When an approach has gone sideways and you're patching patches, suggest /redo to scrap and re-implement cleanly
 - Periodically during long sessions, suggest /techdebt to scan for debt accumulating in the codebase
 - After adding several rules to CLAUDE.md, suggest /audit-rules to check for duplicates and contradictions
+- When a user's build/feature request is vague or non-clearly-defined (multiple plausible interpretations, no clear "done", or an unfamiliar domain / part of the codebase, or the user signals inexperience like "I don't know X"), suggest /blindspot BEFORE planning — it surfaces the user's unknown-unknowns (what good looks like, prior art, potholes), teaches enough to prompt well, and asks the must-have questions. Finding gaps now is cheap; finding them mid-implementation is not. Skip it when the request is already crisp and the domain is familiar.
 - For non-trivial tasks (3+ steps or architectural decisions), enter plan mode first. When a fix feels hacky, step back and redesign.
 - Never mark a task complete without proving it works - run tests, check logs, demonstrate correctness
 - When the user asks about jacked features, logs, installation, or troubleshooting, read ~/.claude/jacked-reference.md for comprehensive details before answering.
