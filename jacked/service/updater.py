@@ -587,10 +587,15 @@ def _spawn_windows_tray_updater(
     #   <work step>
     #   if errorlevel 1 (jacked _update_status <phase> failed ... ; exit 1)
     #   jacked _update_status <phase> ok
+    # Status tracking is OBSERVABILITY, not the update itself. A drifted or
+    # crashed `_update_status` shim must NEVER abort the update or leave the
+    # service unstarted — previously this `exit /b 1`'d, so a single status
+    # hiccup could silently kill the whole tray update (service left down, no
+    # further log). Log it and keep going; the real work steps (upgrade,
+    # install, verify) have their own dedicated error handling below.
     DRIFT_GUARD = (
         'if errorlevel 1 (\r\n'
-        '    echo [%date% %time%] ERROR: _update_status shim drifted >> "%LOGFILE%"\r\n'
-        '    exit /b 1\r\n'
+        '    echo [%date% %time%] WARN: _update_status shim returned non-zero (continuing) >> "%LOGFILE%"\r\n'
         ')\r\n'
     )
     batch_body = (
@@ -699,24 +704,42 @@ def _spawn_windows_tray_updater(
     # the job forbids breakaway.
     NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    # Capture the batch's stdout/stderr into the update log. Previously these
+    # were DEVNULL, so if the batch — or any `jacked` subcommand it calls —
+    # crashed or exited non-zero OUTSIDE a `>> %LOGFILE%`-redirected step, it
+    # died SILENTLY (exactly what made this failure impossible to diagnose: the
+    # log stopped dead after the two opening echoes). cmd.exe inherits this
+    # handle and keeps writing to it after the tray parent exits.
+    try:
+        _lf = open(UPDATE_LOG, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        _lf = subprocess.DEVNULL
     _kwargs = dict(
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=_lf,
+        stderr=subprocess.STDOUT,
         close_fds=True,
     )
     try:
-        subprocess.Popen(
-            ["cmd.exe", "/c", batch_path],
-            creationflags=NO_WINDOW | BREAKAWAY,
-            **_kwargs,
-        )
-    except OSError:
-        subprocess.Popen(
-            ["cmd.exe", "/c", batch_path],
-            creationflags=NO_WINDOW,
-            **_kwargs,
-        )
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", batch_path],
+                creationflags=NO_WINDOW | BREAKAWAY,
+                **_kwargs,
+            )
+        except OSError:
+            subprocess.Popen(
+                ["cmd.exe", "/c", batch_path],
+                creationflags=NO_WINDOW,
+                **_kwargs,
+            )
+    finally:
+        # cmd.exe holds its own inherited copy of the handle; close ours.
+        if _lf is not subprocess.DEVNULL:
+            try:
+                _lf.close()
+            except OSError:
+                pass
 
 
 def _cli() -> None:

@@ -17,6 +17,21 @@ from rich.console import Console
 from rich.panel import Panel
 
 
+# Windows legacy consoles (cp1252 / cp437 OEM) can't encode glyphs like → or −;
+# without this, ANY jacked subcommand that prints one dies with
+# UnicodeEncodeError. That crash silently aborted the tray-update batch (a
+# `jacked _update_status`/`jacked install --force` step exits non-zero, the
+# batch's DRIFT_GUARD bails, and the service is never restarted) and made
+# `jacked install` look failed. Degrade unencodable chars to a placeholder
+# instead of raising — ASCII output is unaffected. Belt-and-suspenders with the
+# ASCII-only install summary; this also covers any stray glyph elsewhere.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
 console = Console()
 logger = logging.getLogger(__name__)
 

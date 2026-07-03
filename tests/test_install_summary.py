@@ -25,9 +25,16 @@ def test_render_upgrade_shows_arrow_and_changes():
               agents=CategoryDiff(removed=["legacy.md"], unchanged=["a.md", "b.md"]))
     rec = s.build_record(d, "0.50.0", "0.51.0", "2026-06-17T00:00:00Z")
     out = s.render_terminal(rec)
-    assert "0.50.0" in out and "0.51.0" in out and "→" in out
+    # ASCII "->" not the U+2192 arrow: the Windows legacy console (cp1252/cp437)
+    # can't encode →, and it crashed `jacked install` + silently aborted the
+    # tray-update batch. Keep the summary ASCII-only.
+    assert "0.50.0" in out and "0.51.0" in out and "->" in out
     assert "recover" in out and "whats-next.md" in out and "legacy.md" in out
     assert "Restart Claude Code" in out
+    # Regression lock: the whole rendered summary must encode on a legacy
+    # Windows console (removed-only branch exercised separately below).
+    out.encode("cp1252")
+    assert all(ord(c) < 128 for c in out), "install summary must stay ASCII-only"
 
 
 def test_render_first_install_no_from_version():
