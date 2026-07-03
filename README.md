@@ -1,6 +1,6 @@
 # claude-jacked
 
-**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar pill — plus a curated set of 28 slash commands and 10 review agents installed into Claude Code, all managed from a web dashboard.
+**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar pill — plus a curated set of 29 slash commands and 10 review agents installed into Claude Code, all managed from a web dashboard.
 
 ![jacked dashboard — accounts](docs/screenshots/dashboard-accounts.png)
 
@@ -54,7 +54,7 @@ Add to your team's Claude Code environment — no Python install needed:
 /plugin install jacked@jacked-marketplace
 ```
 
-Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 28 commands and 10 agents. Does not include the Python-powered features (dashboard, account management, tray) — use Option 1 or 2 for those.
+Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 29 commands and 10 agents. Does not include the Python-powered features (dashboard, account management, tray) — use Option 1 or 2 for those.
 
 > The background service + system tray icon ship by DEFAULT (auto-start on login) —
 > `jacked install` already started them. Opt out of the icon: `jacked install --force --no-tray`.
@@ -70,7 +70,7 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 ### Toggle Features On and Off
 
-Enable or disable any of the 10 built-in code reviewers and 28 slash commands with one click. Each card shows what it does so you know what you're turning on.
+Enable or disable any of the 10 built-in code reviewers and 29 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
 ![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
 
@@ -87,7 +87,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 
 ![Settings — Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable any of the 28 slash commands.
+**Commands** — Enable or disable any of the 29 slash commands.
 
 ![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
 
@@ -120,7 +120,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **28 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **29 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/blindspot`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -403,6 +403,7 @@ Type these directly in Claude Code:
 | `/pr` | **Pull Request** — Checks PR status, creates/updates PRs with proper issue linking |
 | `/release` | **Release** — Full release pipeline: bump version, push, CI, GitHub Release, PyPI publish |
 | `/learn` | **Learn** — Distills a lesson from the current session into a CLAUDE.md rule |
+| `/blindspot` | **Blindspot** — Pre-build discovery pass for vague/unfamiliar requests: surfaces your unknown-unknowns (what good looks like, prior art, potholes), teaches enough to prompt well, asks the must-have questions, hands off a sharpened brief |
 | `/redo` | **Redo** — Scraps the current approach and re-implements cleanly with full hindsight |
 | `/retry` | **Retry** — Recovers from a transient API/rate-limit error: figures out where the turn fell off and resumes only what's needed, without changing the task |
 | `/techdebt` | **Tech Debt** — Scans for TODOs, oversized files, missing tests, dead code |
@@ -593,8 +594,8 @@ jacked service stop                # Stop running service
 jacked service restart             # Restart service
 jacked service status              # Show PID, port, uptime, autostart state
 
-# Slash Commands (28 total)
-# /dc /dcr /docs-sync /pr /learn /redo /retry /techdebt /audit-rules /cleanup
+# Slash Commands (29 total)
+# /dc /dcr /docs-sync /pr /learn /blindspot /redo /retry /techdebt /audit-rules /cleanup
 # /qa /qa-video /demo-video /ux /swarm /swarm-research /release
 # /whats-next /goal-maker /bhag /jacked-setup
 # /cso /lockdown /retro /canary /benchmark
