@@ -36,12 +36,12 @@ _AGENTS_END = "<!-- END jacked behaviors (managed by `jacked install`) -->"
 # install/uninstall can find and replace exactly its own entries.
 _HOOK_MARKERS = ("_hook security_gatekeeper",)
 
-# Skills that are Claude-only and must NOT be deployed to Codex. `model-split`
+# Skills that are Claude-only and must NOT be deployed to Codex. `chain-of-command`
 # is a Claude Code model-dispatch policy (Fable plans, Opus codes); Codex has no
 # equivalent multi-model dispatch, so shipping it there is dead weight. Excluded
 # names never enter the Codex skills dict, so they're never written to
 # ~/.agents/skills and never recorded in the Codex manifest.
-_CLAUDE_ONLY_SKILLS = frozenset({"model-split"})
+_CLAUDE_ONLY_SKILLS = frozenset({"chain-of-command"})
 
 
 
