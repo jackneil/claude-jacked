@@ -195,7 +195,7 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
    Every reviewer MUST have this regardless of their assigned lenses — it informs all review angles.
    For the **Guardrails** lens reviewer specifically, add: "Your primary job is verifying compliance
    with these documents. Cite specific rule violations with the rule text and file:line of the violation."
-10. **Pre-mortem agent** (Wave 1 only): Spawn an additional reviewer with these instructions (on a Mythos-class session — Fable 5 or newer — deliver them as a clearly-delimited final section of one reviewer's prompt instead of a separate agent):
+10. **Pre-mortem agent** (Wave 1 only): Spawn an additional, dedicated reviewer with these instructions (on a Fable-class session, spawn it with explicit `model: "opus"` like the other volume reviewers - its value is the independent perspective shift, so do not fold it into another reviewer's prompt):
     "You are the PRE-MORTEM ANALYST. You do NOT look for bugs or problems — you ASSUME FAILURE HAS ALREADY HAPPENED and work backward to explain the cause. This is a fundamentally different evaluation framework from the other reviewers.
 
     For each assigned failure scenario, write a short post-mortem as if the failure is real:
@@ -351,7 +351,7 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
 4. **Pair** the selected lenses. Each reviewer gets exactly 2.
    - If odd number of selected lenses, one reviewer gets a single lens (goes deeper).
    - Number of reviewers = ceil(selected_lenses / 2). Range: 2-6 reviewers.
-   - **Model-adaptive fan-out:** on a Mythos-class session (Fable 5 or newer), assign 3-4 lenses per reviewer instead of 2 — reviewers = ceil(selected_lenses / 4), range 1-3 — and fold the pre-mortem scenarios into one reviewer's prompt instead of spawning a dedicated pre-mortem agent. A stronger model covers more lenses per pass without losing depth; every selected lens still gets reviewed and the evidence bar is unchanged. On Opus and below, keep 2 lenses per reviewer as written.
+   - **Tiered dispatch (Fable-class session - Fable 5 or newer):** reviewers are volume work. Spawn every reviewer with explicit `model: "opus"` and keep the FULL fan-out shape as written above (2 lenses per reviewer, dedicated pre-mortem agent). Fan-out shape follows the model the reviewers RUN ON, not the session model: Opus reviewers need the redundancy, and at Opus pricing the wide net costs about the same as a consolidated Fable one while catching more. The session's Fable budget stays in the parent loop, which is where the judgment already happens: lens selection, finding validation (step 8b), the fix phase, and the verdict. TWO exceptions dispatch on `model: "fable"` (explicit): the **Security** lens, which gets its OWN single-lens reviewer (Fable is materially better at spotting real, exploitable issues in code we own - do not pair Security with another lens on a Fable-class session), and the conditional **Frontend Design** reviewer below (visual-design judgment). On an Opus-or-below session, spawn reviewers with the session's model (never below Opus) and this shape as written.
 5. **Assign** each pair a unique persona and unique wild card (shuffle pools as before).
 6. **Announce**:
    ```
@@ -363,11 +363,13 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
 7. **Spawn all reviewers in ONE message** using parallel Task tool calls.
    - Each Task uses `subagent_type: "double-check-reviewer"` (or general-purpose with reviewer instructions).
    - Each Task prompt includes the spawning instructions above.
+   - **Pass the model explicitly on every spawn** per the tiered-dispatch rule in step 4: `model: "opus"` for standard reviewers and the pre-mortem analyst on a Fable-class session; `model: "fable"` for the Security lens reviewer and the Frontend Design reviewer. Never rely on inheritance - an agent definition's frontmatter `model:` pin silently beats parent inheritance.
 
 #### CONDITIONAL: Frontend Design Reviewer (Wave 1 only)
 
 If `frontend_review = true` (from step 3b), spawn a **5th reviewer** in the SAME message:
 - Use `subagent_type: "general-purpose"`
+- On a Fable-class session, pass `model: "fable"` explicitly - visual-design judgment (do these elements line up, is the spacing right, does it look designed) is one of the two lanes that stays on the top model
 - Prompt MUST start with: "Invoke the frontend-design skill for design context."
 - Assign a dedicated **Frontend Design & Aesthetics** lens (outside the 11 standard lenses)
 - Focus areas: design quality (typography, color, spacing, layout intentionality), visual consistency
@@ -384,7 +386,7 @@ Announce format when `frontend_review = true`:
 - Reviewer [M+1] (Frontend Design): Design quality + Aesthetics | via frontend-design skill
 ```
 
-#### PRE-MORTEM ANALYST (Wave 1 only — dedicated agent on Opus and below; on a Mythos-class session, fold its scenarios into one reviewer's prompt per the model-adaptive rule)
+#### PRE-MORTEM ANALYST (Wave 1 only - always a dedicated agent; on a Fable-class session it dispatches on `model: "opus"` like the other volume reviewers)
 
 Spawn an additional reviewer as the pre-mortem agent in the SAME message as all other Wave 1 reviewers:
 - Use `subagent_type: "double-check-reviewer"` (or general-purpose with pre-mortem instructions)
@@ -438,7 +440,7 @@ to their Lens details (item 3) in the spawn prompt:
    - **Cited location exists** — open the claimed `file:line`; the code it describes is actually there.
    - **Trigger path is real** — the input/state/call path the reviewer cited actually occurs (the "undefined variable" is genuinely undefined here; the race window genuinely exists; the N+1 genuinely fires).
    - **Rule is in-scope and violated** — for a Guardrails/CLAUDE.md finding, the cited rule actually applies to this file and is genuinely broken, not silenced inline.
-   - The evidence each reviewer already attached (item 11) makes this fast. For a large wave you MAY dispatch one cheap READ-ONLY validation subagent per finding, asking only: "is this finding real — yes/no — with the confirming or refuting code." Keep writing and validation separate (don't let the reviewer that raised it grade its own finding).
+   - The evidence each reviewer already attached (item 11) makes this fast. For a large wave you MAY dispatch one cheap READ-ONLY validation subagent per finding (`model: "opus"` on a Fable-class session), asking only: "is this finding real - yes/no - with the confirming or refuting code." Keep writing and validation separate (don't let the reviewer that raised it grade its own finding). Validating findings YOURSELF in the parent loop is the preferred default on a Fable-class session - adjudication is exactly where the top model earns its price.
    - **Drop any finding you cannot confirm.** Record dropped findings in the final report as "unconfirmed — not actioned" with the reason. Never fix a finding you could not validate.
    - LOW findings skip validation (they don't trigger fixes anyway).
    Mirrors Anthropic's per-finding validation pass and dev.to's Gate 5: confirm before acting.
@@ -464,7 +466,7 @@ to their Lens details (item 3) in the spawn prompt:
     - Group `needs_recheck` lenses into pairs (or singles if odd number)
     - Each pair gets a NEW persona (different from wave 1) and NEW wild card
     - Include re-check context in spawn prompt. Instruct reviewers to verify fixes AND conduct a full fresh review of their lenses — not just confirm prior findings.
-15. **Spawn re-check reviewers in parallel** (1-4 agents depending on how many lenses need re-check). Wait for results. → Go to FIX PHASE (step 9).
+15. **Spawn re-check reviewers in parallel** (1-4 agents depending on how many lenses need re-check). The tiered-dispatch rule from step 4 applies to every wave, not just Wave 1: `model: "opus"` for standard re-check reviewers on a Fable-class session, `model: "fable"` when Security is among the re-checked lenses (own reviewer). Wait for results. → Go to FIX PHASE (step 9).
 
 ### REPORTING
 

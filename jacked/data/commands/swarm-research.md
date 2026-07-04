@@ -44,7 +44,7 @@ Assess the problem and auto-calibrate agent count and per-agent effort:
 
 Then stop the swarm flow and proceed with a normal plan (or hand back to the user). Coding tasks in particular have fewer truly parallelizable subtasks than open-ended research, so bias toward the smaller tier when unsure.
 
-**Model-adaptive fan-out:** on a Mythos-class session (Fable 5 or newer), calibrate one tier DOWN and hard-cap at 3 research agents — a stronger model extracts the same divergence from fewer perspectives (give each agent two axis assignments instead of one when consolidating), and in Phase 2 run verification + devil's advocacy as ONE combined pressure-test agent rather than two. On Opus and below, use the table as written. Same axes, same evidence bar — fewer bodies.
+**Tiered dispatch (Fable-class session - Fable 5 or newer):** research agents are volume work - spawn every researcher with explicit `model: "opus"` and use the calibration table AS WRITTEN (full tier, no cap-down: divergence comes from independent perspectives, and Opus researchers at half Fable pricing restore the full spread for about what a consolidated Fable trio costs). The session's Fable budget stays in the parent loop, where the leverage is: framing the problem, judging convergence, and synthesizing the winning plan. On Opus and below, use the table as written with the session's model (never below Opus).
 
 Announce: "Calibrated: [LEVEL] complexity ([signal]) — spawning [N] research agents (~[X] tool calls each)."
 
@@ -203,7 +203,7 @@ If "no convergence" — STOP and present options. Resume when the user chooses.
 
 ## PHASE 2 — VERIFY + ATTACK
 
-Spawn TWO agents in ONE message using parallel Agent tool calls. Both get `subagent_type: "general-purpose"`. On a Mythos-class session (Fable 5 or newer), spawn ONE combined pressure-test agent instead — merge both prompts below into a single agent that produces both report formats.
+Spawn TWO agents in ONE message using parallel Agent tool calls. Both get `subagent_type: "general-purpose"`. On a Fable-class session (Fable 5 or newer), spawn both with explicit `model: "opus"` - adversarial critique is volume work, and two independent attackers beat one merged one; the parent loop (Fable) judges which attacks land when the reports come back.
 
 ### Verification Agent Prompt
 

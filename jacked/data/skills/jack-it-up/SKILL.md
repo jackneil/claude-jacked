@@ -39,6 +39,23 @@ These thoughts mean the work is drifting toward "just get it done":
 | "This review cycle is overkill" | The review found issues last time. Trust the process. |
 | "I'll just keep going in this one thread" (brainstorm + plan + execute all piled up) | Context rot / kitchen-sink session — quality degrades as the window fills. Fix: /clear and re-load the saved spec + plan before continuing. |
 
+## Model Economics - Fable Plans, Opus Swarms
+
+On a Fable-class session (Fable 5 or newer), this cycle auto-applies the **chain-of-command** dispatch policy for its entire duration (no separate invocation needed). The cycle is ~80% dispatched tokens - implementers, per-task reviewers, recursion waves, browser agents - and letting all of that inherit the session model burns top-tier budget on volume work while adding nothing recursion redundancy doesn't already provide.
+
+**The two lanes:**
+
+| Lane | Model | What |
+|------|-------|------|
+| Main loop (you) | Session model (Fable) | Brainstorm, spec, plan, dispatch prompts, judging every result, gate decisions, fixes-with-judgment, final verdicts |
+| Volume dispatches | `model: "opus"`, EXPLICIT on every spawn | Implementer subagents, spec/quality reviewers, dcr/dc reviewer waves, pre-mortem, validators, doc agents, browser-driving, pr-workflow-checker |
+
+**Two dispatch lanes stay on Fable** (explicit `model: "fable"`): security-audit reviewers (Fable is materially better at spotting real vulnerabilities in code we own) and visual-design judgment (does it line up, is it well designed). `/dcr`, `/dc`, and `/ux` carry these rules internally - do not override them back to inherit.
+
+**Why quality goes UP, not down:** recursion's power is independent perspectives, and Opus-priced reviewers restore the full fan-out width (2 lenses per reviewer, dedicated pre-mortem, 4 ux agents) that Fable pricing had consolidated away. Fable-grade judgment still gates everything: the main loop adjudicates every finding before it triggers a fix, reads the diffs before trusting them, and makes every ship/fix/re-run call. More finders, stronger judge, half the price on the volume.
+
+On an Opus-or-below session, dispatch with the session's model (floor is Opus) - the lanes matter only when there is a tier above Opus to protect.
+
 ## The Cycle
 
 ```dot
@@ -136,6 +153,8 @@ Output: A reviewed, clean plan, traced to the spec.
 
 Always use subagent-driven development — a fresh subagent per task with two-stage review (spec compliance, then code quality). Do not use `superpowers:executing-plans` (that is the inline fallback for environments without subagent support).
 
+**Model overlay (Fable-class sessions):** the sub-skill's dispatches follow the Model Economics lanes - every implementer subagent and both per-task reviewers spawn with explicit `model: "opus"` (implementation from a reviewed plan and review-against-spec are volume work). Include in each implementer's prompt: "If this task requires a design decision the plan does not cover, STOP and report back - do not invent architecture." The main loop (Fable) makes that call and re-dispatches.
+
 Implement the plan task by task. Each task follows TDD (test first, implement, verify). Commit after each task.
 
 Output: Working implementation with passing tests.
@@ -170,13 +189,15 @@ A clean `/dc` and green tests mean the code reviews well and the units pass — 
 
 Walk the **acceptance criteria from the Phase-1 spec** one by one against the running system and confirm each passes. Capture the evidence — test output, the exact command and its result, or a screenshot — do not paraphrase it.
 
+**Security cadence:** if the change touched anything security-sensitive (auth, RBAC, multi-tenancy, billing, credential handling) OR no security audit has run on this repo recently, run `/cso` here before shipping - do not wait to be asked. On a Fable-class session its audit judgment runs on Fable per the Model Economics lanes; security review of code we own is one of the two lanes that never gets pushed down to the volume tier.
+
 Do NOT ship on green tests + clean review alone. If verification surfaces a failure, it becomes a finding → back to Phase 4 (execute) → Phase 5 (review) → here again.
 
 Output: The feature, proven to run, with captured evidence tied to each acceptance criterion.
 
 ### Phase 7: Ship It
 
-Invoke `/pr` to create or update the pull request. The `/pr` command runs the `pr-workflow-checker` agent which now includes a **pre-flight verification** phase that automatically checks for:
+Invoke `/pr` to create or update the pull request. On a Fable-class session, the `pr-workflow-checker` agent dispatches with explicit `model: "opus"` (PR mechanics are volume work; the main loop reviews the description before it posts). The `/pr` command runs the `pr-workflow-checker` agent which now includes a **pre-flight verification** phase that automatically checks for:
 
 - Stale stashes (verifies changes are already in HEAD before suggesting drop)
 - Stale worktrees (verifies branch is merged and clean before suggesting removal)
