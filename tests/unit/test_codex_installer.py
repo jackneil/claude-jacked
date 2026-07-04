@@ -71,6 +71,23 @@ def test_install_copies_skill_sidecars(data_root, homes):
     assert (dst / "references" / "notes.md").exists()  # nested sidecar dir too
 
 
+def test_install_excludes_claude_only_skills(data_root, homes):
+    """model-split is a Claude-only model-dispatch policy; the Codex pass must
+    skip it (Codex has no multi-model dispatch), while ordinary skills still land."""
+    ms = data_root / "skills" / "model-split"
+    ms.mkdir(parents=True)
+    (ms / "SKILL.md").write_text(
+        "---\nname: model-split\ndescription: fable plans, opus codes\n---\nbody\n"
+    )
+    summ = _install(data_root, homes)
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    assert not (skills_base / "model-split").exists()
+    assert "model-split" not in summ.skills
+    # the ordinary skill is unaffected by the exclusion
+    assert (skills_base / "demo-skill" / "SKILL.md").exists()
+    assert "demo-skill" in summ.skills
+
+
 def test_install_idempotent_no_changes_second_run(data_root, homes):
     first = _install(data_root, homes)
     assert first.changed is True  # net-new
@@ -203,3 +220,20 @@ def test_claude_install_copies_skill_sidecars(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     sidecar = tmp_path / ".claude" / "skills" / "aesthetic-dogfood-audit" / "measure.js"
     assert sidecar.exists(), "skill sidecar must be installed alongside SKILL.md"
+
+
+def test_claude_install_includes_model_split(tmp_path, monkeypatch):
+    """model-split is a Claude-only skill: it ships to ~/.claude/skills on a real
+    `jacked install` (the Codex exclusion above must not affect the Claude side)."""
+    from click.testing import CliRunner
+
+    from jacked.cli import main
+
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    result = CliRunner().invoke(
+        main,
+        ["install", "--no-tray", "--no-rules", "--no-codex", "--force"],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / ".claude" / "skills" / "model-split" / "SKILL.md").exists(), \
+        "model-split must be installed into Claude Code"

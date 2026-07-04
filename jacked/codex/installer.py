@@ -3,7 +3,7 @@
 `jacked install` deploys to ~/.claude for Claude Code; this adds a parallel
 Codex pass when Codex is present, writing the native Codex installables:
 
-- skills   -> ~/.agents/skills/<name>/   (FULL dir incl. sidecar files — the
+- skills   -> ~/.agents/skills/<name>/   (FULL dir incl. sidecar files: the
              agentskills.io standard Codex discovers; jacked's SKILL.md already
              carries name+description frontmatter)
 - commands -> ~/.codex/prompts/<name>.md (invoked /prompts:<name> in Codex)
@@ -12,7 +12,7 @@ Codex pass when Codex is present, writing the native Codex installables:
              gatekeeper was retired in 0.70.0)
 
 A separate manifest (~/.codex/jacked-codex-manifest.json) makes install
-idempotent and uninstall/prune precise — it never touches the Claude manifest.
+idempotent and uninstall/prune precise; it never touches the Claude manifest.
 """
 
 from __future__ import annotations
@@ -35,6 +35,13 @@ _AGENTS_END = "<!-- END jacked behaviors (managed by `jacked install`) -->"
 # A jacked-managed hook entry is identified by this marker in its command, so
 # install/uninstall can find and replace exactly its own entries.
 _HOOK_MARKERS = ("_hook security_gatekeeper",)
+
+# Skills that are Claude-only and must NOT be deployed to Codex. `model-split`
+# is a Claude Code model-dispatch policy (Fable plans, Opus codes); Codex has no
+# equivalent multi-model dispatch, so shipping it there is dead weight. Excluded
+# names never enter the Codex skills dict, so they're never written to
+# ~/.agents/skills and never recorded in the Codex manifest.
+_CLAUDE_ONLY_SKILLS = frozenset({"model-split"})
 
 
 
@@ -222,10 +229,13 @@ def install_codex(
 
     prior = _load_manifest(home) or {}
 
-    # 1. Skills — full dir copy (sidecars included).
+    # 1. Skills: full dir copy (sidecars included). Claude-only skills are
+    #    skipped so they never land in Codex.
     skills: dict = {}
     for skill_md in sorted((data_root / "skills").glob("*/SKILL.md")):
         name = skill_md.parent.name
+        if name in _CLAUDE_ONLY_SKILLS:
+            continue
         _copy_tree(skill_md.parent, skills_base / name)
         skills[name] = _sha_dir(skill_md.parent)
 
