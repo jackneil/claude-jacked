@@ -48,13 +48,14 @@ On a Fable-class session (Fable 5 or newer), this cycle auto-applies the **chain
 | Lane | Model | What |
 |------|-------|------|
 | Main loop (you) | Session model (Fable) | Brainstorm, spec, plan, dispatch prompts, judging every result, gate decisions, fixes-with-judgment, final verdicts |
-| Volume dispatches | `model: "opus"`, EXPLICIT on every spawn | Implementer subagents, spec/quality reviewers, dcr/dc reviewer waves, pre-mortem, validators, doc agents, browser-driving, pr-workflow-checker |
+| Volume dispatches | `model: "opus"`, EXPLICIT on every spawn | Implementer subagents, spec/quality reviewers, dcr/dc reviewer waves, pre-mortem, validators, doc agents, browser-driving, pr-workflow-checker, comprehension-bearing exploration (tracing behavior, semantic hunts) |
+| Search dispatches | `model: "haiku"` (mechanical) or `model: "sonnet"` (bulk filter), EXPLICIT | Pure locate/sweep: grep/glob fan-out, call-site inventories, "which files import X", convention sweeps, Explore-type agents. Gate: output is pointers/excerpts with zero interpretation AND the consumer reads what comes back (a miss is recoverable). Load-bearing completeness claims get their patterns written by the main loop, or go to Opus. |
 
 **Two dispatch lanes stay on Fable** (explicit `model: "fable"`): security-audit reviewers (Fable is materially better at spotting real vulnerabilities in code we own) and visual-design judgment (does it line up, is it well designed). `/dcr`, `/dc`, and `/ux` carry these rules internally - do not override them back to inherit.
 
 **Why quality goes UP, not down:** recursion's power is independent perspectives, and Opus-priced reviewers restore the full fan-out width (2 lenses per reviewer, dedicated pre-mortem, 4 ux agents) that Fable pricing had consolidated away. Fable-grade judgment still gates everything: the main loop adjudicates every finding before it triggers a fix, reads the diffs before trusting them, and makes every ship/fix/re-run call. More finders, stronger judge, half the price on the volume.
 
-On an Opus-or-below session, dispatch with the session's model (floor is Opus) - the lanes matter only when there is a tier above Opus to protect.
+On an Opus-or-below session, dispatch with the session's model (floor is Opus for anything that understands, judges, or produces) - the Fable/Opus split matters only when there is a tier above Opus to protect. The search lane applies on EVERY session tier: pure locate/sweep hunts go to Haiku/Sonnet regardless of what the main loop runs on, because the deterministic tools carry the recall and Opus adds nothing but cost there.
 
 ## The Cycle
 

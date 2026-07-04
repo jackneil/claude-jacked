@@ -1,6 +1,6 @@
 ---
 name: chain-of-command
-description: Lock in the session model-dispatch policy - the main loop (Fable, or best available) does ALL strategy, planning, understanding, judging, and verification; every dispatched subagent that searches or writes code from an established plan runs on Opus. Use when the user invokes /chain-of-command or says "chain of command", "fable plans, opus codes", "use the model split", "minimize fable usage", or "opus for the grunt work". Applies from invocation until the session ends or the user revokes it.
+description: Lock in the session model-dispatch policy - the main loop (Fable, or best available) does ALL strategy, planning, understanding, judging, and verification; every dispatched subagent that writes code or reviews from an established plan runs on Opus; pure locate/sweep hunts run on Haiku or Sonnet. Use when the user invokes /chain-of-command or says "chain of command", "fable plans, opus codes", "use the model split", "minimize fable usage", or "opus for the grunt work". Applies from invocation until the session ends or the user revokes it.
 ---
 
 # Chain of command: Fable plans, Opus codes
@@ -22,9 +22,14 @@ From this point forward in THIS session, follow this dispatch policy on every ag
 **Opus (`model: "opus"`, passed EXPLICITLY on every dispatch) - all volume work:**
 - Writing or editing code from an established plan or spec
 - Writing tests from a spec, mechanical refactors, migrations, fixture generation
-- Searching/exploring the codebase (locating files, mapping conventions, tracing call paths)
+- Exploration that requires comprehension: tracing call paths to understand behavior, semantic hunts ("find where we handle X"), any search whose STRATEGY needs judgment
 - Recursive/fan-out review passes (dcr-style reviewers, fixers, verify swarms, adversarial refuters) - EXCEPT security audits and UI/design-quality judgment, which stay on Fable (see below)
 - Docs, summaries, and report drafting from material the main loop already vetted
+
+**Cheap tier (`model: "haiku"` or `model: "sonnet"`, explicit) - pure hunting:**
+- `model: "haiku"`: mechanical locate/sweep executing a search SPEC the main loop wrote - grep/glob fan-out, "list every file importing X", call-site inventories, convention sweeps returning paths + line numbers + excerpts. The deterministic tools carry the recall; the model just drives them and collates.
+- `model: "sonnet"`: bulk read-and-filter at scale - "skim these N files, flag the ones touching auth" - where a miss only costs the main loop a few extra reads, never a wrong conclusion.
+- Two tests gate this lane, and BOTH must pass: (1) locate, not comprehend - the output is pointers/excerpts, zero interpretation; (2) the result is verified by consumption - whoever receives it reads what came back, so a miss is recoverable. If a COMPLETENESS claim is load-bearing ("these are ALL the call sites" feeding a migration), the main loop writes the exact patterns (aliases, re-exports, dynamic access) and a cheap agent may execute them - but a cheap agent never DESIGNS that search. When in doubt, it is not just search: use Opus.
 
 ## Stays on Fable even when it looks like delegable review
 
@@ -36,7 +41,7 @@ Two kinds of work read like "review you could hand to Opus" but are Fable-grade 
 ## Hard rules
 
 1. **Pass the model on EVERY dispatch.** `model: "opus"` on Agent tool calls; `model: 'opus'` in Workflow `agent()` opts. NEVER rely on inheritance: an agent definition's frontmatter `model:` pin silently BEATS parent inheritance (this burned us 2026-07-02 with a stale `model: opus` pin; the same mechanism can silently upgrade OR downgrade). Explicit beats assumed, both directions.
-2. **Floor is Opus.** Nothing that understands, judges, or produces runs below Opus. The one carve-out: a pure locate-only lookup (grep/glob "where is X", zero interpretation) may use a cheaper model per the standing CLAUDE.md rule - but when in doubt, it is not "just search"; use Opus.
+2. **Floor is Opus for anything that understands, judges, or produces.** The cheap-tier lane above is not an exception to this - it exists precisely because pure locate/sweep does none of those three. USE it: dispatching a grep fan-out on Opus wastes 5x Haiku's price on work the deterministic tools are doing anyway. But the moment interpretation creeps in, the floor applies - when in doubt, Opus.
 3. **No Fable dispatches for volume work.** Do not pass `model: "fable"` to subagents for code, tests, search, or bulk review - the main loop IS the Fable budget for that, and it does inline anything else that needs Fable-grade judgment. The one exception is the two Fable-grade review kinds above (security audits, UI/design judgment): when they need fan-out, their agents run on Fable, not Opus.
 4. **Verify before trusting.** Everything an Opus agent returns (code, findings, claims of green tests) gets checked by the main loop: read the diff or run the gate yourself before building on it. Opus output is draft until the main loop confirms it.
 5. **Escalate design mid-flight.** Dispatch prompts must tell coding agents: if the task turns out to require a design decision the plan does not cover, STOP and report back rather than inventing architecture. The main loop decides, then re-dispatches.
@@ -46,7 +51,7 @@ Two kinds of work read like "review you could hand to Opus" but are Fable-grade 
 
 - Applies for the remainder of the current session/conversation from the moment this skill is invoked.
 - The user can revoke or amend it at any time ("back to normal models", "all fable") - their live instruction wins.
-- This policy overrides the global "pass model: fable on every dispatch" CLAUDE.md rule for the session, on the user's explicit invocation - that rule's intent (never silently downgrade below Opus, explicit model on every dispatch) stays fully in force.
+- The global CLAUDE.md model-selection rule encodes these same lanes as standing doctrine (as of 2026-07-04); invoking this skill makes them explicit and binding for the session even where that doctrine is absent or stale. The non-negotiables travel with it: never silently downgrade below Opus for work that understands, judges, or produces; explicit model on every dispatch.
 
 ## Acknowledgement
 
