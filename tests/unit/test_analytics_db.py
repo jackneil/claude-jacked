@@ -460,6 +460,72 @@ class TestCostEstimation:
         cost = estimate_cost("claude-opus-4-6", 0, 0, 0, 0)
         assert cost == 0.0
 
+    # --- Sonnet 5 introductory pricing ($2/$10 through 2026-08-31) ---
+
+    def test_sonnet5_intro_pricing_inside_window(self):
+        cost = estimate_cost("claude-sonnet-5", 1_000_000, 1_000_000, 0, 0,
+                             at="2026-07-04T12:00:00Z")
+        # Intro: $2/M in + $10/M out = $12
+        assert cost == pytest.approx(12.0)
+
+    def test_sonnet5_standard_pricing_after_window(self):
+        cost = estimate_cost("claude-sonnet-5", 1_000_000, 1_000_000, 0, 0,
+                             at="2026-09-01T00:00:00Z")
+        # Standard: $3/M in + $15/M out = $18
+        assert cost == pytest.approx(18.0)
+
+    def test_sonnet5_intro_last_day(self):
+        cost = estimate_cost("claude-sonnet-5", 1_000_000, 0, 0, 0,
+                             at="2026-08-31T23:59:59Z")
+        assert cost == pytest.approx(2.0)
+
+    def test_sonnet5_intro_cache_rates(self):
+        cost = estimate_cost("claude-sonnet-5", 0, 0, 1_000_000, 1_000_000,
+                             at="2026-07-04T12:00:00Z")
+        # Intro cache: $0.20/M read + $2.50/M write = $2.70
+        assert cost == pytest.approx(2.70)
+
+    def test_sonnet5_dated_variant_gets_intro_pricing(self):
+        cost = estimate_cost("claude-sonnet-5-20260630", 1_000_000, 0, 0, 0,
+                             at="2026-07-04T12:00:00Z")
+        assert cost == pytest.approx(2.0)
+
+    def test_sonnet_alias_stays_standard(self):
+        """The bare 'sonnet' alias can't be dated to a generation - it keeps
+        standard pricing even inside the intro window."""
+        cost = estimate_cost("sonnet", 1_000_000, 0, 0, 0,
+                             at="2026-07-04T12:00:00Z")
+        assert cost == pytest.approx(3.0)
+
+    def test_sonnet_45_unaffected_by_intro_window(self):
+        cost = estimate_cost("claude-sonnet-4-5-20250929", 1_000_000, 0, 0, 0,
+                             at="2026-07-04T12:00:00Z")
+        assert cost == pytest.approx(3.0)
+
+    # --- Tier inference for future model IDs (version-proofing) ---
+
+    def test_future_fable_infers_fable_tier(self):
+        """A fable model the map hasn't caught up with must NOT fall through
+        to Opus pricing (the 0.71.0 bug class: 2x undercount)."""
+        cost = estimate_cost("claude-fable-6", 1_000_000, 0, 0, 0)
+        assert cost == pytest.approx(10.0)
+
+    def test_mythos_preview_infers_fable_tier(self):
+        cost = estimate_cost("claude-mythos-preview", 1_000_000, 0, 0, 0)
+        assert cost == pytest.approx(10.0)
+
+    def test_future_opus_infers_opus_tier(self):
+        cost = estimate_cost("claude-opus-4-9", 1_000_000, 0, 0, 0)
+        assert cost == pytest.approx(5.0)
+
+    def test_future_haiku_infers_haiku_tier(self):
+        cost = estimate_cost("claude-haiku-5", 1_000_000, 0, 0, 0)
+        assert cost == pytest.approx(1.0)
+
+    def test_truly_unknown_model_still_falls_back_to_opus(self):
+        cost = estimate_cost("some-other-vendor-model", 1_000_000, 0, 0, 0)
+        assert cost == pytest.approx(5.0)
+
 
 # ---------------------------------------------------------------------------
 # File-based DB (not :memory:)

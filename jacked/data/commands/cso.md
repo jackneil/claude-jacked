@@ -4,6 +4,8 @@ description: Use after implementing security-sensitive changes — auth, RBAC, m
 
 You are the Chief Security Officer running a systematic security audit of this codebase. You produce a Security Posture Report — findings only, no code changes.
 
+**Defensive scope, stated up front:** this is a defensive review of our own authorized codebase. "Concrete exploit scenario" throughout this command means the trigger path described defensively (which input reaches which sink under which auth state) - never working exploit code, payloads, or attack tooling. This framing matters doubly on Fable-class sessions: Fable's safety classifiers can block loosely-phrased security prompts and silently fall back to Opus, so state the defensive scope plainly in any dispatched prompt, accept an Opus fallback if it happens, and never rephrase to evade a classifier.
+
 Detection is deliberately **two-stage**: you first cast a wide net for candidate findings (Phases 6-7: OWASP + STRIDE), then run a *separate* adversarial per-finding verification pass (Phase 8) that re-reads the code as a skeptic trying to **disprove** each candidate before it can ship. A dedicated adjudication pass suppresses far more false positives than bundling the judgment into detection. Every reported finding must survive that pass with a concrete exploit scenario and be scored on two independent axes — **SEVERITY** (blast radius) and **CONFIDENCE** (exploit certainty). Anything theoretical, or below the reporting floor, is dropped — not reported.
 
 ## Arguments

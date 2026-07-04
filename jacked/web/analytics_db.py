@@ -90,6 +90,14 @@ _TIER_SONNET = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write
 _TIER_OPUS   = {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25}
 _TIER_FABLE  = {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50}
 
+# Sonnet 5 launched (2026-06-30) with introductory pricing of $2/$10 through
+# 2026-08-31; standard $3/$15 applies from 2026-09-01. Applies ONLY to the
+# claude-sonnet-5 model ID; Sonnet 4.x keeps _TIER_SONNET, and the bare
+# "sonnet" alias stays at standard pricing (legacy rows can't be dated to a
+# specific Sonnet generation, so we price them conservatively).
+_TIER_SONNET5_INTRO = {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write": 2.50}
+_SONNET5_INTRO_END = "2026-09-01"  # first day STANDARD pricing applies (ISO date)
+
 MODEL_PRICING: dict[str, dict[str, float]] = {
     # Full model IDs (stored in DB model column)
     "claude-haiku-4-5-20251001": _TIER_HAIKU,
@@ -122,26 +130,64 @@ _OPUS_PRICING = MODEL_PRICING.get("claude-opus-4-6", {
 # Cost estimation helper
 # ---------------------------------------------------------------------------
 
+def _sonnet5_intro_active(at: str | None) -> bool:
+    """True when the given ISO timestamp (or now, if absent) falls inside the
+    Sonnet 5 introductory-pricing window. ISO date prefixes compare
+    lexicographically, so a string comparison is exact."""
+    ref = str(at)[:10] if at else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return ref < _SONNET5_INTRO_END
+
+
 def estimate_cost(model: str, input_t: int, output_t: int,
-                  cache_read_t: int, cache_create_t: int) -> float:
+                  cache_read_t: int, cache_create_t: int,
+                  at: str | None = None) -> float:
     """Estimate USD cost for a message based on model and token counts.
 
     Looks up the model in MODEL_PRICING. For versioned model IDs like
     ``claude-opus-4-6-20260401``, strips the date suffix and tries again.
-    Unknown models fall back to Opus pricing.
+    Unknown models fall back to Opus pricing. ``at`` is the message's ISO
+    timestamp; it selects date-dependent pricing (Sonnet 5's $2/$10
+    introductory window through 2026-08-31) and defaults to now when absent.
 
     >>> estimate_cost("claude-opus-4-6", 1_000_000, 0, 0, 0)
     5.0
     >>> estimate_cost("unknown-model", 0, 0, 0, 0)
     0.0
+    >>> estimate_cost("claude-sonnet-5", 1_000_000, 0, 0, 0, at="2026-07-04T12:00:00Z")
+    2.0
+    >>> estimate_cost("claude-sonnet-5", 1_000_000, 0, 0, 0, at="2026-09-01T00:00:00Z")
+    3.0
+    >>> estimate_cost("claude-fable-6", 1_000_000, 0, 0, 0)  # future model: tier inferred from name
+    10.0
     """
+    resolved = model
     prices = MODEL_PRICING.get(model)
 
     # Try stripping date suffix: claude-opus-4-6-20260401 -> claude-opus-4-6
     if prices is None:
         parts = model.rsplit("-", 1)
         if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 8:
-            prices = MODEL_PRICING.get(parts[0])
+            resolved = parts[0]
+            prices = MODEL_PRICING.get(resolved)
+
+    # Date-dependent pricing: Sonnet 5 introductory window.
+    if prices is not None and resolved == "claude-sonnet-5" and _sonnet5_intro_active(at):
+        prices = _TIER_SONNET5_INTRO
+
+    # Version-proofing: a model ID the map hasn't caught up with (a future
+    # claude-fable-6, claude-opus-4-9, claude-mythos-preview) infers its tier
+    # from the family name, so a new release never silently misprices a whole
+    # tier (a fable-6 priced as Opus would undercount 2x). Fable/Mythos first:
+    # tier names never co-occur in one ID except hypothetically, and the top
+    # tier is the conservative match.
+    if prices is None:
+        lowered = model.lower()
+        for family, tier in (("fable", _TIER_FABLE), ("mythos", _TIER_FABLE),
+                             ("opus", _TIER_OPUS), ("sonnet", _TIER_SONNET),
+                             ("haiku", _TIER_HAIKU)):
+            if family in lowered:
+                prices = tier
+                break
 
     # Fallback to Opus
     if prices is None:

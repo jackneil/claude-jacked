@@ -68,7 +68,8 @@ def _parse_assistant_message(
         "output_tokens": output_t,
         "cache_read_tokens": cache_read_t,
         "cache_create_tokens": cache_create_t,
-        "estimated_cost_usd": estimate_cost(model, input_t, output_t, cache_read_t, cache_create_t),
+        "estimated_cost_usd": estimate_cost(model, input_t, output_t, cache_read_t, cache_create_t,
+                                            at=record.get("timestamp") or None),
         "is_subagent": 1 if is_subagent else 0,
     }
 

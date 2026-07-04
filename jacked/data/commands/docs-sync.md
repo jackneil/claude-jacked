@@ -301,7 +301,7 @@ If the combined set (branch-affected ∪ audit queue) is empty, say: "Changes do
 
 ## Step 4: Spawn Audit Agents (Multi-Pass Verification)
 
-Spawn one agent per doc file in the combined set. Agents run in parallel - send all Agent tool calls in a single message. **Tiered dispatch:** doc auditing/writing from vetted material is volume work - on a Fable-class session (Fable 5 or newer), spawn every doc agent with explicit `model: "opus"` and keep the one-agent-per-doc shape (the shape follows the model the agents run on; Opus agents doing one focused doc each beats fewer consolidated ones). The parent loop keeps the judgment: reading the agents' reports and deciding what ships. On Opus and below, spawn with the session's model (never below Opus).
+Spawn one agent per doc file in the combined set. Agents run in parallel - send all Agent tool calls in a single message. **Tiered dispatch:** doc auditing/writing from vetted material is volume work - on a Fable-class session (any session model above Opus), spawn every doc agent with explicit `model: "opus"` and keep the one-agent-per-doc shape (the shape follows the model the agents run on; Opus agents doing one focused doc each beats fewer consolidated ones). The parent loop keeps the judgment: reading the agents' reports and deciding what ships. On Opus and below, spawn with the session's model (never below Opus).
 
 **Every agent runs a 3-pass verification protocol** (described inside the agent prompt). This is non-negotiable. Single-pass updates produce confident-sounding-but-wrong docs that mislead future readers.
 

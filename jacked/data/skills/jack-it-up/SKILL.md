@@ -41,7 +41,7 @@ These thoughts mean the work is drifting toward "just get it done":
 
 ## Model Economics - Fable Plans, Opus Swarms
 
-On a Fable-class session (Fable 5 or newer), this cycle auto-applies the **chain-of-command** dispatch policy for its entire duration (no separate invocation needed). The cycle is ~80% dispatched tokens - implementers, per-task reviewers, recursion waves, browser agents - and letting all of that inherit the session model burns top-tier budget on volume work while adding nothing recursion redundancy doesn't already provide.
+On a Fable-class session (any session model above Opus), this cycle auto-applies the **chain-of-command** dispatch policy for its entire duration (no separate invocation needed). The cycle is ~80% dispatched tokens - implementers, per-task reviewers, recursion waves, browser agents - and letting all of that inherit the session model burns top-tier budget on volume work while adding nothing recursion redundancy doesn't already provide.
 
 **The two lanes:**
 
@@ -56,6 +56,8 @@ On a Fable-class session (Fable 5 or newer), this cycle auto-applies the **chain
 **Why quality goes UP, not down:** recursion's power is independent perspectives, and Opus-priced reviewers restore the full fan-out width (2 lenses per reviewer, dedicated pre-mortem, 4 ux agents) that Fable pricing had consolidated away. Fable-grade judgment still gates everything: the main loop adjudicates every finding before it triggers a fix, reads the diffs before trusting them, and makes every ship/fix/re-run call. More finders, stronger judge, half the price on the volume.
 
 On an Opus-or-below session, dispatch with the session's model (floor is Opus for anything that understands, judges, or produces) - the Fable/Opus split matters only when there is a tier above Opus to protect. The search lane applies on EVERY session tier: pure locate/sweep hunts go to Haiku/Sonnet regardless of what the main loop runs on, because the deterministic tools carry the recall and Opus adds nothing but cost there.
+
+**Effort rides along:** where a dispatch mechanism exposes a reasoning-effort knob (Workflow `agent()` opts.effort), volume stages run 'medium', locate/sweep stages 'low', and only the hardest verify/judge stages 'high'+ - xhigh is for capability-sensitive judgment, not boilerplate. Security dispatches are framed defensively (see the /dcr Security lens framing) so Fable's safety classifiers don't bounce legitimate reviews of our own code.
 
 ## The Cycle
 
@@ -197,6 +199,8 @@ Do NOT ship on green tests + clean review alone. If verification surfaces a fail
 Output: The feature, proven to run, with captured evidence tied to each acceptance criterion.
 
 ### Phase 7: Ship It
+
+**Final senior review (main loop, before /pr):** with recursion converged and evidence captured, the main loop performs ONE holistic diff review of the final state - as a senior engineer, not a lens: correctness bugs, hidden coupling, backwards compatibility, missing tests, files that should not have changed, simpler paths. Output: must-fix issues, should-fix issues, ship/no-ship. This is deliberately Fable-grade work done inline (Anthropic's own evidence: a top-model single-shot review of a cheaper model's PR catches real issues in one pass), and it is the last line before the human reviews the code. Must-fix findings loop back to Phase 4; otherwise ship.
 
 Invoke `/pr` to create or update the pull request. On a Fable-class session, the `pr-workflow-checker` agent dispatches with explicit `model: "opus"` (PR mechanics are volume work; the main loop reviews the description before it posts). The `/pr` command runs the `pr-workflow-checker` agent which now includes a **pre-flight verification** phase that automatically checks for:
 

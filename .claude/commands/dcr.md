@@ -351,7 +351,7 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
 4. **Pair** the selected lenses. Each reviewer gets exactly 2.
    - If odd number of selected lenses, one reviewer gets a single lens (goes deeper).
    - Number of reviewers = ceil(selected_lenses / 2). Range: 2-6 reviewers.
-   - **Tiered dispatch (Fable-class session - Fable 5 or newer):** reviewers are volume work. Spawn every reviewer with explicit `model: "opus"` and keep the FULL fan-out shape as written above (2 lenses per reviewer, dedicated pre-mortem agent). Fan-out shape follows the model the reviewers RUN ON, not the session model: Opus reviewers need the redundancy, and at Opus pricing the wide net costs about the same as a consolidated Fable one while catching more. The session's Fable budget stays in the parent loop, which is where the judgment already happens: lens selection, finding validation (step 8b), the fix phase, and the verdict. TWO exceptions dispatch on `model: "fable"` (explicit): the **Security** lens, which gets its OWN single-lens reviewer (Fable is materially better at spotting real, exploitable issues in code we own - do not pair Security with another lens on a Fable-class session), and the conditional **Frontend Design** reviewer below (visual-design judgment). On an Opus-or-below session, spawn reviewers with the session's model (never below Opus) and this shape as written.
+   - **Tiered dispatch (Fable-class session: any session model above Opus):** reviewers are volume work. Spawn every reviewer with explicit `model: "opus"` and keep the FULL fan-out shape as written above (2 lenses per reviewer, dedicated pre-mortem agent). Fan-out shape follows the model the reviewers RUN ON, not the session model: Opus reviewers need the redundancy, and at Opus pricing the wide net costs about the same as a consolidated Fable one while catching more. The session's Fable budget stays in the parent loop, which is where the judgment already happens: lens selection, finding validation (step 8b), the fix phase, and the verdict. TWO exceptions dispatch on `model: "fable"` (explicit): the **Security** lens, which gets its OWN single-lens reviewer (Fable is materially better at spotting real, exploitable issues in code we own - do not pair Security with another lens on a Fable-class session), and the conditional **Frontend Design** reviewer below (visual-design judgment). On an Opus-or-below session, spawn reviewers with the session's model (never below Opus) and this shape as written.
 5. **Assign** each pair a unique persona and unique wild card (shuffle pools as before).
 6. **Announce**:
    ```
@@ -431,6 +431,14 @@ to their Lens details (item 3) in the spawn prompt:
 >   accidentally trigger an unintended action, or miss that the behavior has changed?
 > - **Return / recovery:** After the user takes the action, do they land in the right place?
 >   Is there a clear way to undo or go back?
+
+#### CONDITIONAL: Security Lens Defensive Framing
+
+If any reviewer in this wave is assigned the **Security** lens, prepend this framing to their spawn prompt (verbatim):
+
+> This is a defensive security review of our own authorized codebase. Focus on correctness, authentication boundaries, authorization checks, input validation, secrets handling, and test coverage. Do NOT produce exploit chains, payloads, offensive tooling, or attack instructions. For each finding provide: the affected file:line, why it is risky, a safe remediation, and a safe regression test.
+
+Why: Fable-tier models run behind safety classifiers that can block security-flavored requests and silently fall back to Opus - and loosely-phrased "find vulnerabilities and show how to exploit them" prompts are a known trigger. Defensive framing states the legitimate scope plainly (which is also the output shape we actually want). If the dispatch still falls back to Opus, accept the result - it is at or above the volume-lane tier. NEVER rephrase a prompt to evade or trick a safety classifier; state the defensive scope honestly and let the routing land where it lands.
 
 8. **Wait** for all results.
 

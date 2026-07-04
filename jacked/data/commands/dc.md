@@ -127,7 +127,7 @@ Feed every failure into the merge step as a finding: a failing type-check or com
 
 Once you detect the phase, use the Task tool to spawn double-check-reviewer with these specific instructions.
 
-**Model on every spawn:** on a Fable-class session (Fable 5 or newer), pass `model: "opus"` explicitly on every reviewer and pre-mortem spawn - review fan-out is volume work; the session's Fable budget stays in the parent loop for adjudicating what comes back. Exception: a reviewer whose focus is auth/security dispatches on `model: "fable"` (see MULTI-THREAD SPAWNING). Never rely on inheritance - a frontmatter `model:` pin silently beats it. On Opus and below, spawn with the session's model (never below Opus).
+**Model on every spawn:** on a Fable-class session (any session model above Opus), pass `model: "opus"` explicitly on every reviewer and pre-mortem spawn - review fan-out is volume work; the session's Fable budget stays in the parent loop for adjudicating what comes back. Exception: a reviewer whose focus is auth/security dispatches on `model: "fable"` (see MULTI-THREAD SPAWNING). Never rely on inheritance - a frontmatter `model:` pin silently beats it. On Opus and below, spawn with the session's model (never below Opus).
 
 ### FOR PLANNING PHASE:
 Review this plan with ultrathink depth. Ralph Wiggum style - appear simple but catch everything.
@@ -219,7 +219,7 @@ User explicitly requests parallel review of different areas
 
 For each thread, customize the lens focus to that domain while maintaining the core methodology.
 
-**Tiered dispatch (Fable-class session - Fable 5 or newer):** reviewer threads are volume work - spawn them with explicit `model: "opus"` and use the multi-thread triggers as written (the shape follows the model the reviewers RUN ON, not the session model; Opus reviewers benefit from the parallel redundancy and cost half of Fable per token). The session's Fable budget stays in the parent loop: reading the reports, adjudicating findings, and the verdict. ONE exception: a thread whose domain is auth/security dispatches on `model: "fable"` explicitly - Fable is materially better at spotting real vulnerabilities in code we own. On an Opus-or-below session, spawn threads with the session's model (never below Opus).
+**Tiered dispatch (Fable-class session: any session model above Opus):** reviewer threads are volume work - spawn them with explicit `model: "opus"` and use the multi-thread triggers as written (the shape follows the model the reviewers RUN ON, not the session model; Opus reviewers benefit from the parallel redundancy and cost half of Fable per token). The session's Fable budget stays in the parent loop: reading the reports, adjudicating findings, and the verdict. ONE exception: a thread whose domain is auth/security dispatches on `model: "fable"` explicitly - Fable is materially better at spotting real vulnerabilities in code we own. On an Opus-or-below session, spawn threads with the session's model (never below Opus).
 
 ## RALPH WIGGUM STYLE
 
