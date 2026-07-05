@@ -48,6 +48,20 @@ class TestCreateIcon:
         stopped = create_icon_image("stopped")
         assert unknown.tobytes() == stopped.tobytes()
 
+    def test_update_available_draws_blue_badge_dot(self):
+        """update_available=True paints the blue badge dot (parity with the
+        macOS menu-bar icon). (51, 13) is the badge dot center."""
+        _skip_if_no_tray()
+        from jacked.service.tray import create_icon_image
+        badged = create_icon_image("running", update_available=True)
+        assert badged.getpixel((51, 13)) == (59, 130, 246, 255)
+
+    def test_no_badge_when_update_unavailable(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import create_icon_image
+        plain = create_icon_image("running")
+        assert plain.getpixel((51, 13)) != (59, 130, 246, 255)
+
 
 class TestGlyphFont:
     """Regression: the tray 'J' must render at full size, not the ~10px
@@ -217,6 +231,33 @@ class TestServiceRunner:
         assert mock_server.should_exit is True  # graceful first
         assert mock_server.force_exit is True   # then force
         assert mock_thread.join.call_count == 2  # tried both
+
+
+class TestApplyIcon:
+    """_apply_icon must render the badge whenever an update is available."""
+
+    def test_passes_update_available_true_when_outdated(self):
+        _skip_if_no_tray()
+        import jacked.service.tray as tray_mod
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "9.9.9", "outdated": True}
+        runner._icon = MagicMock()
+        with patch.object(tray_mod, "create_icon_image") as mock_create:
+            runner._apply_icon("running")
+        mock_create.assert_called_once_with("running", update_available=True)
+        assert runner._icon_state == "running"
+
+    def test_passes_update_available_false_when_current(self):
+        _skip_if_no_tray()
+        import jacked.service.tray as tray_mod
+        from jacked.service.tray import ServiceRunner
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.0.1", "outdated": False}
+        runner._icon = MagicMock()
+        with patch.object(tray_mod, "create_icon_image") as mock_create:
+            runner._apply_icon("running")
+        mock_create.assert_called_once_with("running", update_available=False)
 
 
 class TestStartedTimestamp:

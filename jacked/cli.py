@@ -826,12 +826,14 @@ def _valid_hook_names() -> frozenset[str]:
 def _update_status_init_shim(from_version, to_version, method, log_path):
     """Internal: initialize a fresh update-status file.
 
-    Exit 0 on success, 2 on LockBusy (another updater active).
-    The Windows batch checks errorlevel and aborts on 2.
+    Exit 0 on success OR when adopting the tray's pre-init file (metadata
+    written, no phases opened yet — the tray creates it moments before
+    spawning us). Exit 2 only when a REAL updater is in flight (has a phase
+    open). The Windows batch checks errorlevel and aborts on 2.
     """
     from jacked.service import update_status as us_mod
     try:
-        us_mod.init_status(
+        outcome = us_mod.init_or_adopt_status(
             us_mod.UPDATE_STATUS_FILE,
             from_version=from_version,
             to_version=to_version,
@@ -841,6 +843,8 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
     except us_mod.LockBusy as exc:
         click.echo(f"[update-status] lock busy: {exc}", err=True)
         sys.exit(2)
+    if outcome == "adopted":
+        click.echo("[update-status] adopted tray pre-init")
 
 
 @main.command(name="_update_status", hidden=True)
