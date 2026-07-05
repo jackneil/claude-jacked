@@ -81,6 +81,14 @@ jacked lint-hook init [--repo PATH] [--force]        # Install pre-push lint hoo
 python -m jacked                                    # Alternative invocation
 ```
 
+Chain-of-command auto-load (0.76.0+): `jacked install` registers a synchronous
+SessionStart hook (`jacked _hook chain_of_command_context`) that injects the
+chain-of-command dispatch policy (from ~/.claude/skills/chain-of-command/SKILL.md)
+into every new Claude Code session, making the model-dispatch lanes binding from
+the first turn with no /chain-of-command invocation. Disable: toggle the
+chain-of-command skill off in the dashboard (hook goes silent when the skill
+file is absent). `jacked uninstall` removes the hook entry.
+
 Remote dashboard access (0.76.0+): the dashboard binds 127.0.0.1 by default. Any
 `--host` beyond loopback is hardened server-side (no CORS wildcard, same-origin
 WebSocket gate, cross-site write rejection, Host-header validation against DNS

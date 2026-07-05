@@ -1644,6 +1644,93 @@ def _verify_session_tracker_hooks(settings: dict):
             )
 
 
+def _chain_of_command_marker() -> str:
+    """Marker to identify the jacked chain-of-command SessionStart hook."""
+    return "# jacked-chain-of-command"
+
+
+def _install_chain_of_command_hook(existing: dict, settings_path: Path):
+    """Install the SessionStart hook that auto-loads the chain-of-command policy.
+
+    Registers a SINGLE synchronous SessionStart hook that prints the
+    chain-of-command dispatch policy (from
+    ~/.claude/skills/chain-of-command/SKILL.md) into the session context at
+    startup. The entry is SYNCHRONOUS on purpose: async hooks do not inject
+    stdout into the session, and context injection is the whole point.
+
+    The match is anchored to the chain_of_command_context command so this never
+    clobbers the session tracker's own SessionStart entry.
+    """
+    marker = _chain_of_command_marker()
+    script_path = _get_data_root() / "hooks" / "chain_of_command_context.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] Chain-of-command script not found: {script_path}"
+        )
+        console.print("[yellow]Skipping chain-of-command hook installation[/yellow]")
+        return
+
+    command_str = _build_hook_command("chain_of_command_context")
+
+    event_name = "SessionStart"
+    matcher = ""
+    if event_name not in existing["hooks"]:
+        existing["hooks"][event_name] = []
+
+    # Find an existing jacked chain-of-command entry for this event+matcher.
+    # Anchor on the command name so a sibling jacked SessionStart hook (the
+    # session tracker) is never mistaken for ours.
+    hook_index = None
+    needs_upgrade = False
+    for i, hook_entry in enumerate(existing["hooks"][event_name]):
+        if hook_entry.get("matcher", "") != matcher:
+            continue
+        entry_cmd = ""
+        for h in hook_entry.get("hooks", []):
+            entry_cmd = h.get("command", "")
+            break
+        hook_str = str(hook_entry)
+        is_ours = marker in hook_str or (
+            "chain_of_command_context" in entry_cmd
+            and _is_jacked_managed_hook_path(entry_cmd)
+        )
+        if is_ours:
+            hook_index = i
+            for h in hook_entry.get("hooks", []):
+                if h.get("command", "") != command_str:
+                    needs_upgrade = True
+            break
+
+    if hook_index is not None and not needs_upgrade:
+        console.print(
+            "[yellow][-][/yellow] Chain-of-command hook already configured"
+        )
+        return
+
+    # SYNCHRONOUS entry: no "async" key. Async hooks don't inject stdout into
+    # the session context, and injecting the policy is the entire purpose.
+    hook_entry = {
+        "matcher": matcher,
+        "hooks": [
+            {
+                "type": "command",
+                "command": command_str,
+            }
+        ],
+    }
+
+    if hook_index is not None and needs_upgrade:
+        existing["hooks"][event_name][hook_index] = hook_entry
+    else:
+        existing["hooks"][event_name].append(hook_entry)
+
+    _write_settings_atomic(settings_path, existing)
+    console.print(
+        "[green][OK][/green] Installed chain-of-command hook (SessionStart event)"
+    )
+
+
 def _remove_security_hook(settings_path: Path) -> bool:
     """Remove jacked security gatekeeper hook. Returns True if removed.
 
@@ -1726,7 +1813,7 @@ def _install_qa_hook(existing: dict, settings_path: Path):
     Registers a Stop hook that checks git diff for UI file changes
     and suggests running /qa when changes are detected.
 
-    >>> # Smoke test — function exists and is callable
+    >>> # Smoke test: function exists and is callable
     >>> callable(_install_qa_hook)
     True
     """
@@ -1778,7 +1865,7 @@ def _install_qa_hook(existing: dict, settings_path: Path):
 def _remove_qa_hook(settings_path: Path) -> bool:
     """Remove jacked QA suggestion hook. Returns True if removed.
 
-    >>> # Smoke test — function exists and is callable
+    >>> # Smoke test: function exists and is callable
     >>> callable(_remove_qa_hook)
     True
     """
@@ -1800,6 +1887,47 @@ def _remove_qa_hook(settings_path: Path) -> bool:
     if len(settings["hooks"]["Stop"]) < before:
         settings_path.write_text(json.dumps(settings, indent=2))
         console.print("[green][OK][/green] Removed QA suggest hook")
+        return True
+
+    return False
+
+
+def _remove_chain_of_command_hook(settings_path: Path) -> bool:
+    """Remove the jacked chain-of-command SessionStart hook. Returns True if removed.
+
+    Matches only entries whose command is a jacked-managed path AND names the
+    chain_of_command_context hook, so foreign SessionStart hooks (and the
+    jacked session tracker's own SessionStart entry) are left intact.
+
+    >>> # Smoke test: function exists and is callable
+    >>> callable(_remove_chain_of_command_hook)
+    True
+    """
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    if "SessionStart" not in settings.get("hooks", {}):
+        return False
+
+    def _is_ours(entry: dict) -> bool:
+        for h in entry.get("hooks", []):
+            cmd = h.get("command", "")
+            if "chain_of_command_context" in cmd and _is_jacked_managed_hook_path(cmd):
+                return True
+        return False
+
+    before = len(settings["hooks"]["SessionStart"])
+    settings["hooks"]["SessionStart"] = [
+        h for h in settings["hooks"]["SessionStart"] if not _is_ours(h)
+    ]
+
+    if len(settings["hooks"]["SessionStart"]) < before:
+        settings_path.write_text(json.dumps(settings, indent=2))
+        console.print("[green][OK][/green] Removed chain-of-command hook")
         return True
 
     return False
@@ -2377,6 +2505,9 @@ def _run_install(
     # Install session-account tracker hooks (always — lightweight, no deps)
     _install_session_tracker_hook(existing, settings_path)
 
+    # Install chain-of-command auto-load hook (SessionStart context injection)
+    _install_chain_of_command_hook(existing, settings_path)
+
     # Install QA suggestion hook (always — lightweight, no deps)
     _install_qa_hook(existing, settings_path)
 
@@ -2898,6 +3029,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _remove_security_hook(settings_path)
     _remove_session_tracker_hooks(settings_path)
     _remove_qa_hook(settings_path)
+    _remove_chain_of_command_hook(settings_path)
     _remove_chrome_devtools_mcp()
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):
