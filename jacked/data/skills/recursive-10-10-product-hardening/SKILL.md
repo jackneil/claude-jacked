@@ -1,6 +1,6 @@
 ---
 name: recursive-10-10-product-hardening
-description: Use when asked to harden a product to verified 10/10 by first deriving its expected behavior FROM the code and then closing the gap between what the code does and what it should do — inventory every feature, write each feature's code-grounded expected behavior into a canonical behavior-spec workbook, dogfood it in a browser, fix the defects at the source, and loop test→fix→retest until every feature is evidence-verified. Triggers on "harden to 10/10", "drive it to verified 10/10", "behavior spec from the code", "derive expected behavior from the code", "spec the product from its code", "production-hardening pass", "dogfood and fix to 10/10", "build a behavior/feature workbook and verify every row". NOT for read-only scoring or gap-analysis (use coverage-matrix), a single-change QA pass (/qa or /ux), or auto-merging the whole coverage matrix overnight (/bhag).
+description: Use when asked to harden a product to verified 10/10 by first deriving its expected behavior FROM the code and then closing the gap between what the code does and what it should do — inventory every feature, write each feature's code-grounded expected behavior into a canonical behavior-spec workbook, dogfood it in a browser, fix the defects at the source, and loop test→fix→retest until every feature is evidence-verified. Triggers on "harden to 10/10", "drive it to verified 10/10", "behavior spec from the code", "derive expected behavior from the code", "spec the product from its code", "production-hardening pass", "dogfood and fix to 10/10", "build a behavior/feature workbook and verify every row". Also triggers with an auto-merge argument ("$recursive-10-10-product-hardening auto-merge", "with auto-merge") which lands each verified batch to master behind green checks. NOT for read-only scoring or gap-analysis (use coverage-matrix), a single-change QA pass (/qa or /ux), or auto-merging the whole coverage matrix overnight (/bhag).
 ---
 
 # Recursive 10/10 Product Hardening
@@ -28,19 +28,27 @@ Do not claim 10/10 from inspection, intent, wording, or partial tests. Claim it 
 | **Cross-page UX validation** of a multi-component change | **`/ux`** | Parallel agents across fixed aspects × pages × personas; read-only. |
 | A **whole-product dogfood crawl** that *flags* defects | **`aesthetic-dogfood-audit`** | It owns the persona×workflow crawl, `measure.js`, and the four lenses. This skill *invokes* it for the crawl. |
 | **Build a new feature** end-to-end (brainstorm→spec→TDD→PR) | **`jack-it-up`** | Feature-construction lifecycle, not a behavior-coverage audit of an existing app. |
-| **Auto-merge the entire coverage matrix to main, overnight, unattended** | **`/bhag`** | That is a deliberately-named command with a two-gate auto-merge safety model. **This skill never auto-merges** (see Step 0). |
+| **Auto-merge the entire coverage matrix to main, overnight, unattended** | **`/bhag`** | That is a deliberately-named command with a two-gate auto-merge safety model. **This skill never auto-merges by default**; an explicit `auto-merge` argument enables a per-batch merge loop with the same production guard (see Step 0a). |
 
 This skill is **thin glue** over those pieces. Its only genuinely-new content is the **behavior-spec workbook** and the **autonomous fix loop**. Everything else delegates.
 
 ## How this differs from its neighbors
 
-`coverage-matrix` **scores** cells. `/whats-next` **decides** one initiative. `/goal-maker` **forges** a brief for decided work. `/bhag` **loops the whole matrix and auto-merges**. `aesthetic-dogfood-audit`/`/qa`/`/ux` **detect and report** (read-only). This skill's distinct seam: **derive an expected-behavior spec from the code, then harden the gap between actual and spec — fixing in-session and proving each fix with evidence**, ending at a PR rather than an auto-merge.
+`coverage-matrix` **scores** cells. `/whats-next` **decides** one initiative. `/goal-maker` **forges** a brief for decided work. `/bhag` **loops the whole matrix and auto-merges**. `aesthetic-dogfood-audit`/`/qa`/`/ux` **detect and report** (read-only). This skill's distinct seam: **derive an expected-behavior spec from the code, then harden the gap between actual and spec — fixing in-session and proving each fix with evidence**, ending at a PR by default, or landing each verified batch behind green checks when invoked with `auto-merge`.
 
-## Step 0 — Safety, isolation, and the no-auto-merge boundary (precondition)
+## Step 0 — Safety, isolation, and the merge boundary (precondition)
 
 This skill **writes fixes against a running app and edits source**. Two non-negotiable guardrails before any mutation:
 
-**(a) It never auto-merges to main.** Fixes land in the working tree and ship through `/pr` (or the user's chosen branch). Continuous, unattended merge-to-main of the whole matrix is `/bhag`'s job, behind its own safety gates — not this skill's. Never `git push` to main, never `gh pr merge` autonomously.
+**(a) The merge boundary — no auto-merge by DEFAULT; explicit `auto-merge` argument flips it.**
+
+*Default (bare invocation):* fixes land in the working tree and ship through `/pr` (or the user's chosen branch). Never `git push` to main, never `gh pr merge` autonomously. Continuous, unattended merge-to-main of the whole coverage matrix is `/bhag`'s job, behind its own safety gates — not this skill's default.
+
+*Auto-merge mode (the user's invocation contains `auto-merge` / `automerge` / "with auto-merge"):* the user has explicitly authorized landing each verified batch, so do NOT stop at an open PR. The loop per batch becomes: **fix → verify green (tests + evidence) → create PR → wait until checks APPEAR and PASS → merge to master/main → pull fresh master → branch fresh → continue** until zero unverified rows remain or every remaining row is hard-blocked. Rules of the mode:
+- "No checks yet" is NOT green — wait for checks to appear, then pass. A red check on your changes means fix before merge, never merge red. Transient CI/rate-limit failures: back off and retry, per the backstop philosophy.
+- Merge only what the batch verified. Never batch unrelated drive-by changes into an auto-merged PR.
+- **Production guard (same two-gate model as `/bhag`):** on a repo with live users / production deploy-on-merge, REFUSE auto-merge, say so up front, and degrade to safe staged PRs. Pre-production repos the user owns are the intended target.
+- The isolation gate in (b) still applies in full — auto-merge authorizes landing code, not touching unverified environments.
 
 **(b) Browser writes are fail-closed behind the isolation gate.** You are **READ-ONLY until the four checks below all pass**, no matter how you obtained the URL. This is the same gate `aesthetic-dogfood-audit` and `/qa`/`/ux` carry — see `aesthetic-dogfood-audit/SKILL.md` ("Isolate → PROVE it → only THEN go ruthless") for the full version; the compressed four-check form, which you must clear, is:
 
@@ -121,7 +129,7 @@ Exit only when **all** of these hold (generalize to the product's domain):
 - `coverage-matrix` cells claimed at 10 cite direct current evidence.
 - The behavior-spec workbook is current, readable, and matches verified behavior — **final docs reflect verified behavior, not planned intent**.
 
-Then hand off: open a PR with `/pr` (or commit to the user's chosen branch). **Never auto-merge** (Step 0a).
+Then hand off: open a PR with `/pr` (or commit to the user's chosen branch). **Never auto-merge on a bare invocation** — in auto-merge mode the final batch lands like every other batch: PR, checks appear and pass, merge (Step 0a).
 
 ## The behavior-spec workbook
 
@@ -156,7 +164,8 @@ If a repo already designates a canonical workbook/spec/scorecard as source of tr
 | Started clicking Save/Delete before the four-check gate passed | You may have just mutated production. Read-only until Step 0(b) passes in full. |
 | Loosened a test so the suite goes green | That's a BLOCKED condition, not a fix. Revert and fix the real cause. |
 | Stopped because "enough" fixes landed / a turn budget hit | Completed rows are success; success never halts the run. Keep going. |
-| Auto-merged a fix to main | This skill never auto-merges. Hand off via `/pr`. |
+| Auto-merged a fix to main on a BARE invocation | Default is PR handoff; auto-merge requires the explicit `auto-merge` argument (Step 0a). |
+| In auto-merge mode, merged with checks pending or absent | "No checks yet" is not green. Wait for checks to appear AND pass. |
 | Forked the workbook into `spec-v2.html` because editing was annoying | One canonical artifact, updated in place. |
 
 ## Rationalizations to Watch For
@@ -172,13 +181,13 @@ If a repo already designates a canonical workbook/spec/scorecard as source of tr
 ## Quick Reference
 
 ```
-0  Gate:   no auto-merge + clear the 4-check isolation gate (READ-ONLY until it passes)
+0  Gate:   merge mode (default = PR handoff; explicit auto-merge arg = land batches behind green checks) + clear the 4-check isolation gate (READ-ONLY until it passes)
 1  Plan:   inventory method · workbook schema · test strategy · constraints
 2  Spec:   every feature → user story → expected-behavior-from-code (cited) → open Qs   [the new work]
 3  Score:  delegate to coverage-matrix → cells <10 are in scope
 4  Dogfood: delegate to aesthetic-dogfood-audit + /qa toolchain (measure.js, Chrome DevTools/Playwright)
 5  Loop:   test → fix(root cause) → retest → document → self-check → continue   [backstop = stuck-only]
-6  Accept: all evidence agrees → /pr handoff (never auto-merge)
+6  Accept: all evidence agrees → /pr handoff (default) | auto-merge mode: PR → checks pass → merge → fresh master
 Artifact:  one canonical HTML behavior-spec workbook (xlsx optional export), updated in place
 DONE = every feature row Verified with evidence, or genuinely blocked. Success never stops the run.
 ```
