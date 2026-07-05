@@ -238,7 +238,7 @@ def recover(cwd, exclude, session_id, as_digest, limit, depth, budget, as_json):
 
 
 @main.command(name="webux")
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
+@click.option("--host", default="127.0.0.1", help="Host to bind to (0.0.0.0 for remote/Tailscale access; see README Remote Access)")
 @click.option("--port", default=8321, type=int, help="Port to bind to")
 @click.option("--no-browser", is_flag=True, help="Don't auto-open browser")
 @click.option("--reload", is_flag=True, help="Auto-reload on file changes (dev mode)")
@@ -382,7 +382,7 @@ def _spawn_service_detached(host: str, port: int):
 
 
 @main.command(name="start")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 @click.option(
     "--restart", is_flag=True, help="Force a restart even if already healthy."
@@ -3069,7 +3069,7 @@ def permissions_group():
 
 
 @main.command(name="menubar")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def menubar(host: str | None, port: int | None):
     """Start the macOS menu-bar agent in the foreground (manual start).
@@ -3097,7 +3097,7 @@ def service():
 
 
 @service.command(name="start")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_start(host: str | None, port: int | None):
     """Start jacked as a background service with system tray icon."""
@@ -3135,7 +3135,7 @@ def service_stop():
 
 
 @service.command(name="restart")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 @click.option(
     "--foreground",
@@ -3246,7 +3246,7 @@ def service_status():
 
 
 @service.command(name="install")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_install(host: str | None, port: int | None):
     """Configure jacked to start automatically on login, and start it now."""

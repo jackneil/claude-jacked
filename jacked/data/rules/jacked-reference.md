@@ -74,11 +74,21 @@ jacked permissions audit [--fix] [--yes]            # Audit permission rules for
 jacked check-version                                # Check for newer PyPI version
 jacked webux                                        # Launch the web dashboard
 jacked service start                                # Start the tray service (menu-bar pill on macOS)
+jacked service restart --host 0.0.0.0               # Expose dashboard beyond loopback (Tailscale/LAN)
 jacked init [--repo PATH] [--language LANG]          # Set up guardrails + lint hook in project
 jacked guardrails init [--repo PATH] [--force]       # Create JACKED_GUARDRAILS.md from templates
 jacked lint-hook init [--repo PATH] [--force]        # Install pre-push lint hook in .git/hooks/
 python -m jacked                                    # Alternative invocation
 ```
+
+Remote dashboard access (0.76.0+): the dashboard binds 127.0.0.1 by default. Any
+`--host` beyond loopback is hardened server-side (no CORS wildcard, same-origin
+WebSocket gate, cross-site write rejection, Host-header validation against DNS
+rebinding); there is still NO auth layer, so reachability must be restricted at
+the network layer (Tailscale ACL scoped to the port, firewall). Escape hatches:
+`JACKED_ALLOWED_ORIGINS` (extra cross-origin consumers) and `JACKED_ALLOWED_HOSTS`
+(custom DNS names) env vars on the service process. Alternative that needs no
+rebind: `tailscale serve --bg 8321`. See README "Remote Access (Tailscale)".
 
 Retired in 0.70.0: the security gatekeeper (`jacked gatekeeper *`, superseded by
 Claude Code's native auto permission mode) and Qdrant session search

@@ -143,6 +143,30 @@ The dashboard is a local web app that runs on your machine. All data stays in `~
 
 **5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Features / Plugins / Claude Code / Advanced), Logs, Analytics.
 
+### Remote Access (Tailscale)
+
+By default the dashboard binds `127.0.0.1` and is reachable only from the machine it runs on. To reach it from other machines on your tailnet:
+
+```bash
+jacked service restart --host 0.0.0.0   # bind all interfaces now
+jacked service install --host 0.0.0.0   # persist across reboots (bakes into autostart)
+```
+
+Then browse to `http://<machine>:8321` using the MagicDNS short name, the full `<machine>.<tailnet>.ts.net` name, or the Tailscale IP.
+
+The dashboard has **no authentication layer**, so restrict who can reach it at the network layer. A Tailscale ACL scoped to the port does exactly that:
+
+```jsonc
+{ "action": "accept", "src": ["your-laptop", "your-phone"], "dst": ["your-server:8321"] }
+```
+
+A network bind is hardened server-side: CORS is never wildcarded (the frontend is same-origin by construction), WebSocket handshakes enforce same-origin, cross-site state-changing requests are rejected by Origin check, and untrusted `Host` headers are refused (DNS-rebinding guard). Two escape hatches for unusual setups, both comma-separated env vars on the service process:
+
+- `JACKED_ALLOWED_ORIGINS`: extra exact origins (`scheme://host[:port]`) allowed cross-origin API/WebSocket access. Needed behind a reverse proxy that rewrites `Host` to the loopback upstream (symptom: page loads but every write and the live WebSocket fail with 403; `tailscale serve` preserves `Host` and needs nothing).
+- `JACKED_ALLOWED_HOSTS`: extra hostnames accepted in the `Host` header, e.g. a custom DNS name pointing at the machine.
+
+Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bound dashboard to your tailnet over HTTPS with no jacked configuration changes.
+
 ---
 
 ## Background Service and Tray Icon
@@ -482,6 +506,7 @@ Your local database (`~/.claude/jacked.db`) stays intact — reinstall anytime w
 
 | Version | Changes |
 |---------|---------|
+| **0.76.0** | **`feat(dashboard)`: safe remote access over Tailscale - network-bind hardening.** Binding beyond loopback (`--host 0.0.0.0`) no longer flips CORS to `*`, which had let any website open in a browser on a network-allowed machine read and mutate the (unauthenticated) API. The frontend is same-origin by construction, so cross-origin allowance is now loopback-only plus an explicit `JACKED_ALLOWED_ORIGINS` opt-in. New `jacked/api/security.py`: pure-ASGI `HostValidationMiddleware` rejects untrusted `Host` headers on HTTP *and* WebSocket handshakes (DNS-rebinding guard; IP literals, single-label MagicDNS names, `*.ts.net`, `*.local`, `localhost`, and `JACKED_ALLOWED_HOSTS` extras pass) and 403s unsafe-method requests carrying a foreign `Origin` (blind CSRF via non-preflighted form posts). The `/api/ws` gate, previously disabled entirely on a network bind, now enforces same-origin-with-Host or allowlist on every handshake. README gains a "Remote Access (Tailscale)" section: bind commands, ACL example, env knobs, and the `tailscale serve` alternative. |
 | **0.75.0** | **`feat(skills)`: research-hardened dispatch policy + Sonnet 5 intro pricing.** Community/primary-source sweep (July 2026) surfaced three things worth shipping. (1) **Sonnet 5 introductory pricing**: the analytics cost map now charges Sonnet 5 at its real $2/$10 intro rate through 2026-08-31 (then $3/$15 automatically, keyed on each message's timestamp) - it was overcounting Sonnet 5 by 50%; Sonnet 4.x and the undated `sonnet` alias stay at standard rates. (2) **Defensive security framing**: Fable 5 returned (2026-07-01) behind safety classifiers that can block security-flavored prompts and silently fall back to Opus 4.8 - `/dcr`'s Security lens now prepends a defensive-scope preamble to its reviewer prompt (own authorized codebase, no exploit chains, remediation + regression test per finding), `/cso` states the same scope up front, and the policy is explicit: accept an Opus fallback, never rephrase to evade a classifier. (3) **Final senior review**: `jack-it-up` Phase 7 now has the main loop do one holistic senior-engineer diff review (must-fix / should-fix / ship-no-ship) before `/pr` - the last line before human review. Plus an **effort lane**: Workflow `agent()` stages carry effort matched to the lane (volume 'medium', locate/sweep 'low', hardest verify/judge 'high'+). And **version-proofing**: skill/command text now speaks in model tiers ("any session model above Opus"), never versioned names that rot on every release, and the pricing map infers the tier from the family name for model IDs it hasn't caught up with (a future fable-6 prices as Fable tier, not a silent 2x-undercounting Opus fallback). |
 | **0.74.1** | **`fix(skills)`: the search lane actually uses the cheap tier.** The pure-search carve-out was permissive ("may use a lesser model"), so in practice every grep fan-out, call-site inventory, and convention sweep still landed on Opus - and `chain-of-command`'s Opus lane even listed "searching/exploring" outright. Now pure locate/sweep dispatches carry explicit `model: "haiku"` (mechanical sweeps executing patterns the main loop wrote - the deterministic tools carry the recall) or `model: "sonnet"` (bulk read-and-filter where a miss costs a few extra reads), gated by two tests that must BOTH pass: output is pointers/excerpts with zero interpretation, and the consumer reads what comes back so a miss is recoverable. Load-bearing completeness claims ("these are ALL the call sites") get their exact patterns written by the main loop or go to Opus; semantic hunts ("find where we handle X") are comprehension and never leave the Opus lane. Applies on every session tier, wired through `chain-of-command`, `jack-it-up` (new Search dispatches lane), and `/swarm` teammate rules. |
 | **0.74.0** | **`feat(skills)`: tiered dispatch - Fable judges, Opus swarms; new `chain-of-command` skill.** On a Fable-class session, jack-it-up and every spawn-heavy orchestrator were ~80% dispatched tokens all inheriting the session model, billing reviewer waves, implementers, pre-mortems, validators, and doc agents at the Mythos tier (2x Opus per token). New policy across `/dcr`, `/dc`, `/ux`, `/docs-sync`, `/swarm`, `/swarm-research`, and coverage-matrix: volume dispatches carry explicit `model: "opus"`, and the 0.71.0 Mythos consolidation is unwound for those lanes (full 2-lens pairing, dedicated pre-mortem agent, `/ux` back to 4 agents, swarm bands and research tiers as written) - recursion redundancy comes back at half the per-token price. Two lanes stay on explicit `model: "fable"`: the Security lens (own single-lens reviewer; Fable is materially better at real vulnerabilities in code we own) and visual-design judgment (dcr frontend reviewer, `/ux` Visual & Layout agent). The parent loop keeps all Fable-grade judgment: lens selection, finding adjudication, fixes, gate verdicts. `jack-it-up` gains a Model Economics section, a Phase-4 dispatch overlay, and a proactive `/cso` security cadence at the ship gate. Also new: the **`chain-of-command`** skill (`/chain-of-command`, formerly the personal model-split skill) locks the same dispatch policy into any session on demand; it is Claude-only and excluded from the Codex install pass. |

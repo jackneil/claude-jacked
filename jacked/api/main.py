@@ -27,6 +27,11 @@ from jacked.api.usage_monitor import (
     full_sweep_loop,
 )
 from jacked.api.log_capture import server_log_buffer
+from jacked.api.security import (
+    HostValidationMiddleware,
+    build_allowed_origins,
+    origin_allowed,
+)
 from jacked.api.websocket import WebSocketRegistry
 
 logger = logging.getLogger(__name__)
@@ -46,19 +51,6 @@ HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
 SWEEP_PASS_TIMEOUT = 600  # hard cap on a single refresh/heal pass
 LOG_FILE_MAX_BYTES = 5_000_000  # 5 MB
 LOG_FILE_BACKUP_COUNT = 3
-
-
-def _build_allowed_origins(host: str, port: int) -> list[str]:
-    """Build the CORS / WebSocket allowed origins list.
-
-    >>> _build_allowed_origins("127.0.0.1", 8321)
-    ['http://127.0.0.1:8321', 'http://localhost:8321']
-    >>> _build_allowed_origins("0.0.0.0", 8321)
-    ['*']
-    """
-    if host == "0.0.0.0":
-        return ["*"]
-    return [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
 
 
 async def _token_refresh_loop():
@@ -223,7 +215,15 @@ async def lifespan(app: FastAPI):
     port = int(os.environ.get("JACKED_PORT", "8321"))
     app.state.host = host
     app.state.port = port
-    app.state.allowed_origins = _build_allowed_origins(host, port)
+    app.state.allowed_origins = build_allowed_origins(host, port)
+    # Keep the CORS layer consistent with the live allowlist: CORSMiddleware
+    # holds a reference to _cors_origins (an import-time env read), while the
+    # WS gate and CSRF guard evaluate at request time. Refresh in place so an
+    # env change between import and startup (e.g. the tray's in-process
+    # uvicorn restart) cannot make CORS drift from enforcement. Pinned by
+    # test_cors_middleware_honors_in_place_refresh, which fails loudly if a
+    # future Starlette stops honoring in-place mutation.
+    _cors_origins[:] = app.state.allowed_origins
 
     # Wire server log capture (buffer-only until loop/registry set)
     _log_handler = server_log_buffer.handler
@@ -256,9 +256,13 @@ async def lifespan(app: FastAPI):
     if _jacked_logger.getEffectiveLevel() > logging.INFO:
         _jacked_logger.setLevel(logging.INFO)
 
-    if host == "0.0.0.0":
+    if host not in ("127.0.0.1", "localhost", "::1"):
         logger.warning(
-            "Dashboard exposed to network — consider using a VPN or tunnel for security"
+            "Dashboard bound to %s: reachable beyond this machine. Same-origin "
+            "enforcement and Host validation are active, but there is no "
+            "authentication layer. Restrict reachability at the network layer "
+            "(VPN such as Tailscale, firewall, or tailnet ACLs).",
+            host,
         )
 
     # Start background tasks
@@ -348,17 +352,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-_cors_origins = _build_allowed_origins(
+_cors_origins = build_allowed_origins(
     os.environ.get("JACKED_HOST", "127.0.0.1"),
     int(os.environ.get("JACKED_PORT", "8321")),
 )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials="*" not in _cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Outermost: covers HTTP and WebSocket handshakes (DNS-rebinding guard).
+app.add_middleware(HostValidationMiddleware)
 
 
 @app.exception_handler(ValueError)
@@ -391,12 +397,21 @@ async def general_exception_handler(request: Request, exc: Exception):
 @app.websocket("/api/ws")
 async def websocket_endpoint(ws: WebSocket):
     """General-purpose WebSocket event bus."""
-    allowed = getattr(app.state, "allowed_origins", ["*"])
-    if "*" not in allowed:
-        origin = ws.headers.get("origin", "")
-        if not origin or origin == "null" or origin not in allowed:
-            await ws.close(code=4003, reason="Origin not allowed")
-            return
+    # Browsers do not apply CORS to WebSockets; enforce Origin here.
+    # Same-origin with the requested Host (loopback, MagicDNS, LAN IP)
+    # or an explicit allowlist entry; everything else is a cross-site
+    # page trying to ride an allowed machine's network access.
+    allowed = getattr(app.state, "allowed_origins", None)
+    if allowed is None:
+        allowed = build_allowed_origins(
+            os.environ.get("JACKED_HOST", "127.0.0.1"),
+            int(os.environ.get("JACKED_PORT", "8321")),
+        )
+    if not origin_allowed(
+        ws.headers.get("origin", ""), ws.headers.get("host", ""), allowed
+    ):
+        await ws.close(code=4003, reason="Origin not allowed")
+        return
 
     await ws.accept()
 
