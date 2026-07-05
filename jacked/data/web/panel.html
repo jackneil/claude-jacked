@@ -3,6 +3,18 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- Apply the saved color theme before first paint (no flash of the wrong
+     scheme). Unset defaults to America 250; only explicit 'classic' opts out.
+     Key mirrors settings.js / index.html. -->
+<script>
+    (function () {
+        try {
+            if (localStorage.getItem('jacked_color_theme') !== 'classic') {
+                document.documentElement.classList.add('theme-america250');
+            }
+        } catch (e) {}
+    })();
+</script>
 <title>jacked — usage</title>
 <!-- Empty data-URI icon: the panel is a chromeless popover/panel with no
      favicon; this stops the browser's automatic /favicon.ico request (a 404). -->
@@ -36,6 +48,7 @@
     .text-xs { font-size: 0.75rem; line-height: 1rem; }
     .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .tabular-nums { font-variant-numeric: tabular-nums; }
+    .text-slate-100 { color: #f1f5f9; }
     .text-slate-300 { color: #cbd5e1; }
     .text-slate-400 { color: #94a3b8; }
     .text-slate-500 { color: #64748b; }
@@ -247,6 +260,16 @@
         opacity: 0.8;
         z-index: 2;
         pointer-events: none;
+    }
+    /* America 250 theme — mirrors css/style.css so the panel bars restyle in
+       lockstep with the dashboard (green=blue, yellow=white, red=red). The white
+       warning bar would swallow the white marker, so darken it + add a ring. */
+    html.theme-america250 .usage-bar .fill.green  { background: linear-gradient(90deg, #1d4ed8, #3b82f6); }
+    html.theme-america250 .usage-bar .fill.yellow { background: linear-gradient(90deg, #e2e8f0, #ffffff); }
+    html.theme-america250 .usage-bar .fill.red    { background: linear-gradient(90deg, #b91c1c, #ef4444); }
+    html.theme-america250 .usage-bar .elapsed-marker {
+        background-color: #0f172a;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.9);
     }
 
     /* ---- States ---- */

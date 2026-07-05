@@ -789,3 +789,71 @@ body {
     .usage-status-overlay.removing { animation: none; opacity: 0; }
 }
 
+/* ================================================================
+   America 250 theme — red/white/blue account-usage palette
+   ----------------------------------------------------------------
+   2026 is the US semiquincentennial; this is the DEFAULT scheme (the
+   Settings > Appearance toggle flips to 'classic'). Only usage bars, their
+   percent labels, and the sidebar-header decoration are themed — analytics,
+   installation badges, provider dots, and status dots are untouched.
+
+   The semantic fill class names (green/yellow/red) are load-bearing (mirrored
+   in menubar_summary.py + the API) and MUST NOT be renamed. We only repaint
+   them under html.theme-america250:
+     green  = healthy  → blue
+     yellow = warning  → white
+     red    = critical → red (a touch flag-ier than the classic red)
+   Everything here is gated on the html class, so classic mode renders exactly
+   today's UI. Applied early by an inline <head> script in index.html/panel.html
+   to avoid a flash of the wrong scheme.
+   ================================================================ */
+html.theme-america250 .usage-bar .fill.green {
+    background: linear-gradient(90deg, #1d4ed8, #3b82f6);
+}
+
+html.theme-america250 .usage-bar .fill.yellow {
+    background: linear-gradient(90deg, #e2e8f0, #ffffff);
+}
+
+html.theme-america250 .usage-bar .fill.red {
+    background: linear-gradient(90deg, #b91c1c, #ef4444);
+}
+
+/* The classic elapsed marker is white (see .usage-bar .elapsed-marker above);
+   it would vanish on the white warning bar, so darken it + add a white ring. */
+html.theme-america250 .usage-bar .elapsed-marker {
+    background-color: #0f172a;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.9);
+}
+
+/* --- Sidebar-header decoration (index.html) ---
+   Default-hidden so classic mode shows exactly today's header; revealed only
+   under the theme. display:none (not visibility) so nothing reserves space and
+   the layout never shifts when the theme is off. */
+.america-250-badge { display: none; }
+
+html.theme-america250 .america-250-flag {
+    display: inline-flex;
+    align-items: center;
+    line-height: 0;
+}
+
+html.theme-america250 .america-250-years {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+}
+
+html.theme-america250 .america-250-stripe {
+    display: block;
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    background: linear-gradient(90deg,
+        #b22234 0 33.333%,
+        #ffffff 33.333% 66.666%,
+        #3c3b6e 66.666% 100%);
+}
+

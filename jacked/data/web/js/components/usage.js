@@ -17,6 +17,29 @@ function usageColorClass(percentage) {
 }
 
 /**
+ * Tailwind text-color utility for a usage percentage's color class. The bar fill
+ * itself is themed purely in CSS (.usage-bar .fill.<class>), but the percentage
+ * label uses a Tailwind utility class emitted here, so the America 250 theme has
+ * to pick a readable tone per scheme. The semantic class names (green/yellow/red)
+ * stay intact — only the presentation shifts.
+ *   america250: green→slate-300 (blue bar), yellow→slate-100 (white bar reads on
+ *               dark text elsewhere; light label sits beside it), red→red-400.
+ *   classic:    the original green→slate-300 / yellow→yellow-400 / red→red-400.
+ * @param {'green'|'yellow'|'red'} colorClass - Semantic usage color class.
+ * @returns {string} Tailwind text-color utility class.
+ */
+function usageTextClass(colorClass) {
+    // Guard: the node-eval test harness (tests/unit/test_web_js_*.py) runs this
+    // file without a DOM; theme detection is inherently browser-only, so no
+    // document means the classic mapping.
+    if (typeof document !== 'undefined'
+        && document.documentElement.classList.contains('theme-america250')) {
+        return colorClass === 'red' ? 'text-red-400' : colorClass === 'yellow' ? 'text-slate-100' : 'text-slate-300';
+    }
+    return colorClass === 'red' ? 'text-red-400' : colorClass === 'yellow' ? 'text-yellow-400' : 'text-slate-300';
+}
+
+/**
  * Render a usage bar.
  * @param {number} percentage - Usage percentage (0-100).
  * @param {string} resetTime - ISO timestamp or human-readable reset time string.
@@ -32,7 +55,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
     const compact = !!(opts && opts.compact);
     const pct = Math.max(0, Math.min(100, percentage || 0));
     const colorClass = usageColorClass(pct);
-    const pctColor = colorClass === 'red' ? 'text-red-400' : colorClass === 'yellow' ? 'text-yellow-400' : 'text-slate-300';
+    const pctColor = usageTextClass(colorClass);
 
     let markerHtml = '';
     if (elapsedFraction !== null && elapsedFraction !== undefined && elapsedFraction >= 0 && elapsedFraction <= 1) {

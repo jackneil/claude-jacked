@@ -170,7 +170,9 @@ function renderExtraUsageCredits(usage) {
 
     const colorClass = pct >= 90 ? 'red' : (pct >= 71 ? 'yellow' : 'green');
     const barColor = colorClass === 'red' ? 'bg-red-500' : colorClass === 'yellow' ? 'bg-yellow-500' : 'bg-green-500';
-    const textColor = colorClass === 'red' ? 'text-red-400' : colorClass === 'yellow' ? 'text-yellow-400' : 'text-slate-300';
+    // Themed via usageTextClass (usage.js, loaded before this file) so the America
+    // 250 scheme recolors the percent label alongside the CSS-themed bar fill.
+    const textColor = usageTextClass(colorClass);
 
     return `
         <div class="mt-2 pt-2 border-t border-slate-700/30">
