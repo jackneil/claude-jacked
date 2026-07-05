@@ -735,8 +735,10 @@ class TestWindowsBatchPhases:
                 assert idx > last_idx, f"fragment out of order: {frag}"
                 last_idx = idx
 
-            assert 'start "" "http://' in body
-            assert "/update.html" in body
+            # The tray opens the file:// bootstrap now; the batch must not
+            # open any browser tab (it would race a guaranteed-down server).
+            assert 'start "" "http' not in body
+            assert "/update.html" not in body
         finally:
             import os as _os
             try:
@@ -783,9 +785,36 @@ class TestWindowsBatchPhases:
         )
         body = open(mock_popen.call_args[0][0][2]).read()
         try:
-            assert "127.0.0.1:9000/update.html" in body
+            # Port still threaded through the verify step; the batch no longer
+            # opens /update.html itself.
+            assert "/update.html" not in body
             assert "127.0.0.1:9000/api/version" in body
             assert "bind :9000" in body
+        finally:
+            import os as _os
+            try:
+                _os.unlink(mock_popen.call_args[0][0][2])
+            except OSError:
+                pass
+
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.service.updater.find_bin", return_value=r"C:\uv\uv.exe")
+    @patch("subprocess.Popen")
+    def test_batch_never_opens_a_browser(
+        self, mock_popen, mock_find, mock_method, monkeypatch, tmp_path,
+    ):
+        """The tray already opened the file:// bootstrap. The detached batch
+        runs while the service is guaranteed down, so a `start ""` here would
+        only spawn a dead error tab."""
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+        updater._spawn_windows_tray_updater(
+            parent_pid=12345, extras="tray", target_version="0.41.19", port=9000,
+        )
+        body = open(mock_popen.call_args[0][0][2]).read()
+        try:
+            assert 'start "" "http' not in body
         finally:
             import os as _os
             try:

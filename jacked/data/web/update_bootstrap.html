@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>Jacked Update</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+        /* Served from file:// so it cannot race the dying service — the live
+           progress UI lives in the iframe below and self-heals across the
+           update's service downtime. Palette mirrors update.html. */
+        body { font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+               max-width: 900px; margin: 2em auto; padding: 0 1em; color: #e5e7eb;
+               background: #0b1020; }
+        h1 { font-size: 1.2em; margin: 0 0 0.5em; }
+        .status { color: #9ca3af; font-size: 0.9em; margin: 0.5em 0 1em;
+                  padding: 0.6em 0.8em; border-radius: 6px; background: #1f2937; }
+        .status.restarting { background: #78350f; color: #fde68a; }
+        #progress { display: none; width: 100%; height: 80vh; border: 0;
+                    border-radius: 6px; background: #0b1020; }
+        .note { display: none; padding: 1em; border-radius: 6px; margin: 1em 0; }
+        .note.success { background: #064e3b; }
+        .note.recovery { background: #7f1d1d; }
+        .note .row { margin-top: 0.4em; }
+        a.button { display: inline-block; margin-top: 0.7em; padding: 0.5em 1em;
+                   background: #2563eb; color: #fff; text-decoration: none;
+                   border-radius: 4px; }
+        code { background: #111827; padding: 0.1em 0.4em; border-radius: 3px; }
+        .footer { margin-top: 1.5em; font-size: 0.8em; color: #6b7280; }
+        .footer a { color: #60a5fa; }
+    </style>
+</head>
+<body>
+    <h1>Jacked is updating&hellip;</h1>
+    <div class="status" id="status">Connecting to the update service&hellip;</div>
+
+    <div class="note success" id="success">
+        <div>Update complete.</div>
+        <a class="button" id="dash-link" href="#">Open dashboard</a>
+    </div>
+
+    <div class="note recovery" id="recovery">
+        <div>The update service hasn't come back after several minutes.</div>
+        <div class="row">Check the log at <code>~/.claude/jacked-update.log</code>.</div>
+        <div class="row">Then start it manually: <code>jacked service start</code>.</div>
+    </div>
+
+    <iframe id="progress" title="Update progress"></iframe>
+
+    <div class="footer">
+        <a id="direct-link" href="#">Open the progress page directly</a>
+    </div>
+
+    <script>
+    const PORT = __JACKED_PORT__;
+    const BASE = "http://127.0.0.1:" + PORT;
+
+    const statusEl = document.getElementById("status");
+    const iframe = document.getElementById("progress");
+    const successEl = document.getElementById("success");
+    const recoveryEl = document.getElementById("recovery");
+
+    document.getElementById("dash-link").href = BASE + "/";
+    document.getElementById("direct-link").href = BASE + "/update.html";
+
+    // null = unknown, true = reachable, false = down.
+    let up = null;
+    let iframeShown = false;
+    let downSince = null;
+    let recoveryShown = false;
+
+    const RECOVERY_AFTER_MS = 5 * 60 * 1000;
+
+    iframe.addEventListener("load", function () {
+        // Only a real load past a set src counts — the blank initial frame
+        // fires load too and must not reveal an empty iframe.
+        if (!iframe.getAttribute("src")) return;
+        iframeShown = true;
+        iframe.style.display = "block";
+        updateStatus();
+    });
+
+    function reloadIframe() {
+        // Cache-buster forces a fresh GET past any cached "site can't be
+        // reached" error the earlier load may have hit against the dying server.
+        iframe.setAttribute("src", BASE + "/update.html?ts=" + Date.now());
+    }
+
+    function updateStatus() {
+        if (iframeShown && up === true) {
+            statusEl.style.display = "none";
+            return;
+        }
+        statusEl.style.display = "";
+        if (up === false) {
+            statusEl.textContent =
+                "Service is restarting — this page will reconnect automatically…";
+            statusEl.className = "status restarting";
+        } else {
+            statusEl.textContent = "Connecting to the update service…";
+            statusEl.className = "status";
+        }
+    }
+
+    function handleUp() {
+        downSince = null;
+        // A recovery note from a long outage is stale the moment we're back.
+        if (recoveryShown) {
+            recoveryShown = false;
+            recoveryEl.style.display = "none";
+        }
+        if (up !== true) {
+            // down->up transition (first successful ping included): reload the
+            // iframe so a load that raced the dying server is retried.
+            up = true;
+            reloadIframe();
+        }
+        updateStatus();
+    }
+
+    function handleDown() {
+        if (downSince === null) downSince = Date.now();
+        up = false;
+        // Leave the iframe as-is beneath the restarting line.
+        if (!recoveryShown && Date.now() - downSince > RECOVERY_AFTER_MS) {
+            recoveryShown = true;
+            recoveryEl.style.display = "block";
+        }
+        updateStatus();
+    }
+
+    async function ping() {
+        try {
+            // Opaque (no-cors) resolution still proves the socket answered.
+            await fetch(BASE + "/api/version", {mode: "no-cors", cache: "no-store"});
+            handleUp();
+        } catch (_) {
+            handleDown();
+        }
+    }
+
+    window.addEventListener("message", function (event) {
+        if (event.origin !== BASE) return;
+        const d = event.data;
+        if (d && d.jackedUpdateOverall === "succeeded") {
+            successEl.style.display = "block";
+        }
+    });
+
+    updateStatus();
+    ping();
+    setInterval(ping, 1000);
+    </script>
+</body>
+</html>

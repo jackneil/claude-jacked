@@ -571,7 +571,6 @@ def _spawn_windows_tray_updater(
 
     UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
     log_path = str(UPDATE_LOG)
-    progress_url = f"http://127.0.0.1:{port}/update.html"
 
     # Each phase block follows the pattern:
     #   jacked _update_status <phase> in_progress
@@ -595,7 +594,6 @@ def _spawn_windows_tray_updater(
         'set LOGFILE=' + log_path + '\r\n'
         'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ', method ' + method + ') >> "%LOGFILE%"\r\n'
         'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
-        'start "" "' + progress_url + '"\r\n'
         'jacked _update_status_init "' + current_version + '" "' + to_version + '" ' + method + ' --log-path "' + log_path + '"\r\n'
         'if errorlevel 2 (\r\n'
         '    echo Another jacked updater is already in progress. Aborting. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'

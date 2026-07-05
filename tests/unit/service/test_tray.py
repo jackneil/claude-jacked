@@ -741,10 +741,11 @@ class TestOnUpdateClickBreadcrumbs:
     @patch("jacked.service.updater.spawn_updater_from_tray")
     @patch("jacked.service.update_status.init_status")
     def test_init_status_called_before_spawn(
-        self, mock_init, mock_spawn, mock_gate,
+        self, mock_init, mock_spawn, mock_gate, monkeypatch, tmp_path,
     ):
         _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
+        monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
         runner._icon = MagicMock()
@@ -753,10 +754,9 @@ class TestOnUpdateClickBreadcrumbs:
         mock_init.side_effect = lambda *a, **kw: call_order.append("init")
         mock_spawn.side_effect = lambda *a, **kw: call_order.append("spawn")
 
-        with patch("urllib.request.urlopen"):
-            with patch("webbrowser.open"):
-                with patch.object(runner, "_on_stop"):
-                    runner._on_update_click()
+        with patch("webbrowser.open"):
+            with patch.object(runner, "_on_stop"):
+                runner._on_update_click()
 
         assert "init" in call_order
         assert "spawn" in call_order
@@ -774,39 +774,81 @@ class TestOnUpdateClickBreadcrumbs:
         runner._version_info = {"latest": "0.42.0", "outdated": True}
         runner._icon = MagicMock()
         monkeypatch.setattr(updater_mod, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
 
-        with patch("urllib.request.urlopen"):
-            with patch("webbrowser.open"):
-                with patch.object(runner, "_on_stop"):
-                    runner._on_update_click()
+        with patch("webbrowser.open"):
+            with patch.object(runner, "_on_stop"):
+                runner._on_update_click()
 
         log = (tmp_path / "update.log").read_text()
         assert "tray: update clicked" in log
         assert "PID" in log
 
-    def test_pre_warm_uses_127_0_0_1_regardless_of_host(self):
+    def test_bootstrap_targets_loopback_regardless_of_host(self, monkeypatch, tmp_path):
+        """host may be 0.0.0.0 (bind-all), unroutable by clients on Linux. The
+        bootstrap the tray writes must always point the browser at 127.0.0.1."""
         _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
+        monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
         runner = ServiceRunner(host="0.0.0.0", port=8321)
         runner._version_info = {"latest": "0.42.0", "outdated": True}
         runner._icon = MagicMock()
 
-        captured_urls = []
-        def capture_urlopen(url, *a, **kw):
-            captured_urls.append(url)
-            class _R:
-                def __enter__(self): return self
-                def __exit__(self, *a): pass
-            return _R()
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")):
+            with patch("webbrowser.open") as mock_wb:
+                with patch("jacked.service.updater.spawn_updater_from_tray"):
+                    with patch.object(runner, "_on_stop"):
+                        runner._on_update_click()
+
+        content = (tmp_path / "jacked-update-progress.html").read_text(encoding="utf-8")
+        assert "127.0.0.1" in content
+        assert "8321" in content
+        assert "0.0.0.0" not in content
+        assert mock_wb.call_args[0][0].startswith("file:")
+
+    def test_writes_bootstrap_and_opens_file_uri(self, monkeypatch, tmp_path):
+        """Happy path: the substituted bootstrap lands in ~/.claude and the
+        browser is pointed at it via file:// — never the racing port."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
+        runner = ServiceRunner(port=8321)
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
 
         with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")):
-            with patch("urllib.request.urlopen", side_effect=capture_urlopen):
-                with patch("webbrowser.open") as mock_wb:
-                    with patch("jacked.service.updater.spawn_updater_from_tray"):
-                        with patch.object(runner, "_on_stop"):
-                            runner._on_update_click()
+            with patch("webbrowser.open") as mock_wb:
+                with patch("jacked.service.updater.spawn_updater_from_tray"):
+                    with patch.object(runner, "_on_stop"):
+                        runner._on_update_click()
 
-        assert captured_urls
-        assert "127.0.0.1:8321" in captured_urls[0]
-        wb_url = mock_wb.call_args[0][0]
-        assert "127.0.0.1:8321" in wb_url
+        progress = tmp_path / "jacked-update-progress.html"
+        assert progress.exists()
+        content = progress.read_text(encoding="utf-8")
+        assert "__JACKED_PORT__" not in content, "port placeholder not substituted"
+        assert "const PORT = 8321;" in content
+        opened = mock_wb.call_args[0][0]
+        assert opened.startswith("file:")
+        assert "jacked-update-progress.html" in opened
+
+    def test_falls_back_to_http_url_when_template_unreadable(self, monkeypatch, tmp_path):
+        """Template missing/unreadable -> open the port directly (old behavior,
+        minus the pre-warm) rather than leaving the user with nothing."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+        empty_web = tmp_path / "web"
+        empty_web.mkdir()
+        monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
+        monkeypatch.setattr("jacked.api.main.WEB_DIR", empty_web)
+        runner = ServiceRunner(port=8321)
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")):
+            with patch("webbrowser.open") as mock_wb:
+                with patch("jacked.service.updater.spawn_updater_from_tray"):
+                    with patch.object(runner, "_on_stop"):
+                        runner._on_update_click()
+
+        assert not (tmp_path / "jacked-update-progress.html").exists()
+        assert mock_wb.call_args[0][0] == "http://127.0.0.1:8321/update.html"
