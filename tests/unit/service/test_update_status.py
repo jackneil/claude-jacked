@@ -165,6 +165,72 @@ def test_lock_allows_init_after_stale_in_progress(tmp_path):
     init_status(p, from_version="b", to_version="c", method="uv")
 
 
+def test_init_or_adopt_fresh_file_initializes(tmp_path):
+    from jacked.service.update_status import init_or_adopt_status, read_status
+    p = tmp_path / "status.json"
+    outcome = init_or_adopt_status(p, from_version="a", to_version="b", method="uv")
+    assert outcome == "initialized"
+    assert read_status(p)["overall"] == "in_progress"
+
+
+def test_init_or_adopt_over_tray_pre_init_adopts_and_preserves_metadata(tmp_path):
+    from jacked.service.update_status import init_or_adopt_status, read_status
+    p = tmp_path / "status.json"
+    # Tray pre-init writes the real from/to metadata.
+    init_or_adopt_status(p, from_version="0.41.19", to_version="0.41.20", method="uv")
+    # Detached updater races in moments later with a placeholder target.
+    outcome = init_or_adopt_status(p, from_version="0.41.19", to_version="next", method="uv")
+    assert outcome == "adopted"
+    data = read_status(p)
+    # The tray's metadata must survive — no rewrite on adopt.
+    assert data["from_version"] == "0.41.19"
+    assert data["to_version"] == "0.41.20"
+
+
+def test_init_or_adopt_over_open_phase_raises_lockbusy(tmp_path):
+    from jacked.service.update_status import (
+        init_or_adopt_status, init_status, begin_phase, LockBusy,
+    )
+    import pytest
+    p = tmp_path / "status.json"
+    init_status(p, from_version="a", to_version="b", method="uv")
+    begin_phase(p, "installing_package")
+    with pytest.raises(LockBusy):
+        init_or_adopt_status(p, from_version="a", to_version="b", method="uv")
+
+
+def test_init_or_adopt_over_stale_in_progress_initializes(tmp_path):
+    from jacked.service.update_status import (
+        init_or_adopt_status, init_status, STALE_IN_PROGRESS_SECONDS,
+    )
+    p = tmp_path / "status.json"
+    init_status(p, from_version="a", to_version="b", method="uv")
+    old = time.time() - STALE_IN_PROGRESS_SECONDS - 10
+    os.utime(p, (old, old))
+    outcome = init_or_adopt_status(p, from_version="b", to_version="c", method="uv")
+    assert outcome == "initialized"
+
+
+def test_read_stale_in_progress_returns_none(tmp_path):
+    from jacked.service.update_status import (
+        init_status, read_status, STALE_IN_PROGRESS_SECONDS,
+    )
+    p = tmp_path / "status.json"
+    init_status(p, from_version="a", to_version="b", method="uv")
+    old = time.time() - STALE_IN_PROGRESS_SECONDS - 10
+    os.utime(p, (old, old))
+    assert read_status(p) is None
+
+
+def test_read_fresh_in_progress_returns_data(tmp_path):
+    from jacked.service.update_status import init_status, read_status
+    p = tmp_path / "status.json"
+    init_status(p, from_version="a", to_version="b", method="uv")
+    data = read_status(p)
+    assert data is not None
+    assert data["overall"] == "in_progress"
+
+
 def test_api_endpoint_returns_null_when_no_status_file(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from jacked.api.main import app as _app
@@ -219,15 +285,31 @@ def test_cli_update_status_init_accepts_log_path(tmp_path, monkeypatch):
     assert data["log_path"] == "/tmp/foo.log"
 
 
-def test_cli_update_status_init_exits_2_on_lock_busy(tmp_path, monkeypatch):
+def test_cli_update_status_init_exits_2_when_phase_open(tmp_path, monkeypatch):
+    """A REAL updater in flight (phase open) must abort the batch (exit 2)."""
     from click.testing import CliRunner
     from jacked.cli import main
     from jacked.service import update_status as us_mod
     p = tmp_path / "status.json"
-    us_mod.init_status(p, from_version="a", to_version="b", method="uv")  # active
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    us_mod.begin_phase(p, "installing_package")  # a genuinely-active updater
     monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
     result = CliRunner().invoke(main, ["_update_status_init", "a", "b", "uv"])
     assert result.exit_code == 2
+
+
+def test_cli_update_status_init_exits_0_on_tray_pre_init(tmp_path, monkeypatch):
+    """The tray pre-inits the file (no phases); the batch's own init must
+    adopt it and exit 0 rather than deadlocking on its own breadcrumb."""
+    from click.testing import CliRunner
+    from jacked.cli import main
+    from jacked.service import update_status as us_mod
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")  # tray pre-init
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    result = CliRunner().invoke(main, ["_update_status_init", "a", "b", "uv"])
+    assert result.exit_code == 0
+    assert "adopted" in result.output
 
 
 def test_cli_update_status_begin(tmp_path, monkeypatch):

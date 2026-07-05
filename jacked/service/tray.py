@@ -123,11 +123,14 @@ def check_tray_deps() -> None:
         )
 
 
-def create_icon_image(state: str) -> "Image.Image":
+def create_icon_image(state: str, update_available: bool = False) -> "Image.Image":
     """Generate a 64x64 tray icon with a J glyph.
 
     Args:
         state: One of 'running', 'starting', 'stopped'.
+        update_available: When True, draw an update-available badge in the
+            top-right — parity with the macOS menu-bar icon
+            (menubar_mac.render_status_icon).
     """
     colors = _ICON_COLORS.get(state, _ICON_COLORS["stopped"])
     size = 64
@@ -156,6 +159,16 @@ def create_icon_image(state: str) -> "Image.Image":
     x = (size - tw) // 2
     y = (size - th) // 2 - bbox[1]
     draw.text((x, y), "J", fill="white", font=font)
+
+    if update_available:
+        # Same white-ring + blue-dot badge as menubar_mac, scaled for the
+        # 64px canvas (mac uses a 44px canvas).
+        cx, cy, r = size - 13, 13, 10
+        ring = r + 3
+        draw.ellipse(
+            [cx - ring, cy - ring, cx + ring, cy + ring], fill=(255, 255, 255, 255)
+        )
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(59, 130, 246, 255))
 
     return img
 
@@ -263,6 +276,10 @@ class ServiceRunner:
         self._uvicorn_thread: threading.Thread | None = None
         self._uvicorn_server = None
         self._icon: "pystray.Icon | None" = None
+        # Last state passed to _apply_icon, so a version-check refresh can
+        # re-render the current state with the update badge without knowing
+        # whether we're running/starting/stopped.
+        self._icon_state: str = "starting"
         self._autostart_enabled = False
         self._version_info: dict | None = None
         # Visible last-checked timestamp + in-progress flag for the tray menu,
@@ -414,12 +431,22 @@ class ServiceRunner:
             rel = f"{elapsed // 86400}d {(elapsed % 86400) // 3600}h ago"
         return f"Started {clock} ({rel})"
 
+    def _apply_icon(self, state: str) -> None:
+        """Render the tray icon for *state*, adding the update badge when an
+        update is available. Centralizes icon assignment so state + badge
+        can't drift across the several call sites that set the icon."""
+        self._icon_state = state
+        if self._icon is not None:
+            self._icon.icon = create_icon_image(
+                state, update_available=self._version_is_clickable()
+            )
+
     def _on_restart(self):
         if not self._lifecycle_lock.acquire(blocking=False):
             return  # Already restarting or stopping
         try:
             if self._icon:
-                self._icon.icon = create_icon_image("starting")
+                self._apply_icon("starting")
 
             self._shutdown_uvicorn()
 
@@ -430,7 +457,7 @@ class ServiceRunner:
                     self.port,
                 )
                 if self._icon:
-                    self._icon.icon = create_icon_image("stopped")
+                    self._apply_icon("stopped")
                 return
 
             # Retry the bind+ready cycle in case of transient failures
@@ -447,7 +474,7 @@ class ServiceRunner:
                             os.getpid(), self.port, attempt + 1,
                         )
                         if self._icon:
-                            self._icon.icon = create_icon_image("running")
+                            self._apply_icon("running")
                             self._icon.update_menu()
                         return
                     logger.warning(
@@ -465,7 +492,7 @@ class ServiceRunner:
                     self._wait_for_port_free(timeout=5)
             logger.error("Restart failed after 3 attempts: %s", last_err)
             if self._icon:
-                self._icon.icon = create_icon_image("stopped")
+                self._apply_icon("stopped")
         finally:
             self._lifecycle_lock.release()
             # Re-check stop signal in case Ctrl+C / Stop fired during
@@ -576,6 +603,7 @@ class ServiceRunner:
                 self._last_check_at = _time.time()
                 if self._icon and not self._stop_event.is_set():
                     try:
+                        self._apply_icon(self._icon_state)
                         self._icon.update_menu()
                     except Exception:
                         pass  # some pystray backends fail during shutdown
@@ -625,6 +653,7 @@ class ServiceRunner:
 
             if self._icon and not self._stop_event.is_set():
                 try:
+                    self._apply_icon(self._icon_state)
                     self._icon.update_menu()
                 except Exception:
                     pass
@@ -739,7 +768,7 @@ class ServiceRunner:
         try:
             if self._icon:
                 try:
-                    self._icon.icon = create_icon_image("starting")
+                    self._apply_icon("starting")
                     self._icon.notify(
                         f"Updating jacked to v{latest}. If this fails, "
                         f"see ~/.claude/jacked-update-failed.txt",
@@ -847,7 +876,7 @@ class ServiceRunner:
                 "Service ready (pid=%d, port=%d, autostart=%s)",
                 os.getpid(), self.port, self._autostart_enabled,
             )
-            icon.icon = create_icon_image("running")
+            self._apply_icon("running")
             # Force a menu rebuild so the dynamic "Started ..." item
             # picks up the just-set timestamp on first open. Without
             # this, pystray's macOS backend can show "Started: —"
@@ -858,7 +887,7 @@ class ServiceRunner:
             except Exception:
                 logger.debug("update_menu after start failed", exc_info=True)
         else:
-            icon.icon = create_icon_image("stopped")
+            self._apply_icon("stopped")
             remove_pid(PID_FILE)
             icon.notify("Jacked failed to start", "Jacked Service")
 

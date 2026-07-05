@@ -7,10 +7,14 @@ Lifecycle contract:
   1. `init_status()` — clobbers any prior file unless another updater is
      actively in-flight (raises LockBusy). Stale `in_progress` files
      (older than STALE_IN_PROGRESS_SECONDS) are considered abandoned.
+     `init_or_adopt_status()` wraps this to tolerate the tray's own
+     pre-init file (metadata written, no phases opened yet).
   2. `begin_phase` / `end_phase` throughout the update.
   3. `mark_succeeded()` OR end_phase with status="failed" finalizes.
-  4. A `succeeded` file older than STALE_SUCCEEDED_SECONDS is reported as
-     missing by `read_status()` so the UI doesn't resurrect old banners.
+  4. `read_status()` reports as missing (None): a `succeeded` file older
+     than STALE_SUCCEEDED_SECONDS, AND an `in_progress` file older than
+     STALE_IN_PROGRESS_SECONDS (an aborted updater that never finalized),
+     so the UI doesn't resurrect old banners or a zombie "updating" state.
 """
 
 from __future__ import annotations
@@ -64,14 +68,27 @@ def _read_raw(path: Path) -> Optional[dict]:
 
 
 def read_status(path: Path) -> Optional[dict]:
-    """Public read. Returns None on missing, corrupt, or stale-succeeded."""
+    """Public read. Returns None on missing, corrupt, stale-succeeded, or
+    stale-in_progress."""
     data = _read_raw(path)
     if data is None:
         return None
-    if data.get("overall") == "succeeded":
+    overall = data.get("overall")
+    if overall == "succeeded":
         try:
             age = time.time() - path.stat().st_mtime
             if age > STALE_SUCCEEDED_SECONDS:
+                return None
+        except OSError:
+            return None
+    elif overall == "in_progress":
+        # An aborted updater leaves in_progress forever; without this the
+        # dashboard would show a zombie "updating..." banner indefinitely.
+        # init_status already treats a file of this age as abandoned — mirror
+        # that so the read side and the write side agree on staleness.
+        try:
+            age = time.time() - path.stat().st_mtime
+            if age > STALE_IN_PROGRESS_SECONDS:
                 return None
         except OSError:
             return None
@@ -133,6 +150,46 @@ def init_status(
         "log_path": log_path,
     }
     _atomic_write(path, data)
+
+
+def init_or_adopt_status(
+    path: Path,
+    from_version: str,
+    to_version: str,
+    method: str,
+    log_path: Optional[str] = None,
+) -> str:
+    """Init a fresh status file, or adopt the tray's pre-init one.
+
+    The tray pre-creates the status file (metadata, no phases) the instant
+    the user clicks update so the dashboard has something from t=0. The
+    detached updater — POSIX Python or the Windows cmd.exe shim — then races
+    to init again moments later and hits LockBusy on the tray's own
+    seconds-old file. That's not a real collision: a file with no phases and
+    no current_phase is the tray's pre-init, so adopt it without rewriting
+    (its metadata is already correct). A file with an open phase IS a real
+    concurrent updater — re-raise LockBusy so callers refuse.
+
+    Returns ``"initialized"`` (wrote a fresh file) or ``"adopted"`` (reused
+    the tray's pre-init metadata).
+
+    >>> import tempfile
+    >>> from pathlib import Path
+    >>> with tempfile.TemporaryDirectory() as d:
+    ...     p = Path(d) / "status.json"
+    ...     init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
+    ...     init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
+    'initialized'
+    'adopted'
+    """
+    try:
+        init_status(path, from_version, to_version, method, log_path=log_path)
+        return "initialized"
+    except LockBusy:
+        prior = _read_raw(path) or {}
+        if not (prior.get("phases") or []) and prior.get("current_phase") is None:
+            return "adopted"
+        raise
 
 
 def begin_phase(path: Path, phase: str) -> None:
