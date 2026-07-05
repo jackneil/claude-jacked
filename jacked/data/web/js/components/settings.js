@@ -5,6 +5,10 @@
 
 const SETTINGS_TAB_KEY = 'jacked_settings_tab';
 const DEFAULT_TAB = 'agents';
+// Color theme for account-usage bars + labels. Unset defaults to 'america250'
+// (the red/white/blue semiquincentennial scheme); the early-apply <head> snippet
+// in index.html/panel.html reads the same key so the two never disagree.
+const COLOR_THEME_KEY = 'jacked_color_theme';
 
 // --- Main render ---
 
@@ -16,6 +20,10 @@ function _resolveSettingsTab() {
         localStorage.setItem(SETTINGS_TAB_KEY, tab);
     }
     return tab;
+}
+
+function _resolveColorTheme() {
+    return localStorage.getItem(COLOR_THEME_KEY) === 'classic' ? 'classic' : 'america250';
 }
 
 function renderSettings(settings) {
@@ -34,6 +42,7 @@ function renderSettings(settings) {
                 <button class="settings-tab ${savedTab === 'features' ? 'active' : ''}" data-tab="features">Features</button>
                 <button class="settings-tab ${savedTab === 'plugins' ? 'active' : ''}" data-tab="plugins">Plugins</button>
                 <button class="settings-tab ${savedTab === 'claude-code' ? 'active' : ''}" data-tab="claude-code">Claude Code</button>
+                <button class="settings-tab ${savedTab === 'appearance' ? 'active' : ''}" data-tab="appearance">Appearance</button>
                 <button class="settings-tab ${savedTab === 'advanced' ? 'active' : ''}" data-tab="advanced">Advanced</button>
             </div>
 
@@ -99,6 +108,9 @@ async function renderSettingsTab(tabName) {
             break;
         case 'claude-code':
             await renderClaudeCodeTab(container);
+            break;
+        case 'appearance':
+            renderAppearanceTab(container);
             break;
         case 'advanced':
             renderAdvancedTab(container);
@@ -1157,6 +1169,57 @@ async function _loadRawEditor() {
         textarea.value = `Error loading settings: ${e.message}`;
         textarea.disabled = true;
     }
+}
+
+// --- Tab: Appearance ---
+
+// Two-option segmented picker for the account-usage color scheme. Pure client
+// preference (localStorage, no API) — synchronous like renderAdvancedTab.
+function renderAppearanceTab(container) {
+    const theme = _resolveColorTheme();
+
+    // Each option previews its usage-bar palette so the choice is obvious; the
+    // selected one carries a blue ring + "Active" badge.
+    const option = (value, title, desc, swatches) => {
+        const active = theme === value;
+        const swatchHtml = swatches
+            .map(c => `<span class="inline-block w-6 h-2.5 rounded-sm border border-slate-600/50" style="background:${c}"></span>`)
+            .join('');
+        return `
+            <button type="button" class="appearance-option feature-card text-left w-full ${active ? 'ring-2 ring-blue-500 border-blue-500' : ''}" data-theme="${value}" aria-pressed="${active}">
+                <div class="flex items-center gap-2">
+                    <span class="text-sm font-medium text-white">${title}</span>
+                    ${active ? '<span class="badge badge-primary">Active</span>' : ''}
+                </div>
+                <p class="text-xs text-slate-400 mt-1">${desc}</p>
+                <div class="flex items-center gap-1.5 mt-2">${swatchHtml}</div>
+            </button>
+        `;
+    };
+
+    container.innerHTML = `
+        <p class="text-xs text-slate-500 mb-4 text-pretty">Color scheme for account-usage bars and their percentages. Applies instantly and is remembered on this device.</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            ${option('america250', 'America 250', 'Red, white &amp; blue for the 2026 U.S. semiquincentennial — healthy is blue, warning white, critical red.', ['#3b82f6', '#ffffff', '#ef4444'])}
+            ${option('classic', 'Classic', 'The original green / amber / red usage palette.', ['#22c55e', '#eab308', '#ef4444'])}
+        </div>
+    `;
+
+    _bindAppearanceEvents(container);
+}
+
+function _bindAppearanceEvents(container) {
+    container.querySelectorAll('.appearance-option').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const value = btn.dataset.theme;
+            localStorage.setItem(COLOR_THEME_KEY, value);
+            // Bars restyle live via CSS the moment the class flips; the JS-emitted
+            // percent-label classes catch up on the next render of accounts/panel.
+            document.documentElement.classList.toggle('theme-america250', value !== 'classic');
+            showToast(value === 'classic' ? 'Classic theme applied' : 'America 250 theme applied', 'success');
+            renderAppearanceTab(container);
+        });
+    });
 }
 
 // --- Tab: Advanced ---

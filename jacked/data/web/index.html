@@ -3,6 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Apply the saved color theme before first paint to avoid a flash of the
+         wrong scheme. Unset defaults to America 250 (red/white/blue); only an
+         explicit 'classic' opts out. Key mirrors settings.js's COLOR_THEME_KEY. -->
+    <script>
+        (function () {
+            try {
+                if (localStorage.getItem('jacked_color_theme') !== 'classic') {
+                    document.documentElement.classList.add('theme-america250');
+                }
+            } catch (e) {}
+        })();
+    </script>
     <title>jacked — Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
@@ -37,9 +49,52 @@
 
     <!-- Sidebar Navigation -->
     <nav id="sidebar" class="w-56 bg-slate-800 border-r border-slate-700 hidden md:flex md:flex-col min-h-screen fixed left-0 top-0 bottom-0 z-40">
-        <div class="p-4 border-b border-slate-700">
-            <h1 class="text-xl font-bold text-white tracking-tight">jacked</h1>
+        <!-- relative anchors the America 250 accent stripe to the block's bottom edge -->
+        <div class="p-4 border-b border-slate-700 relative">
+            <div class="flex items-center gap-2">
+                <h1 class="text-xl font-bold text-white tracking-tight">jacked</h1>
+                <!-- Inline SVG flag (NOT the 🇺🇸 emoji — Windows renders it as "US"
+                     letters). Simplified: 5 white stripes, blue canton, 9 star dots.
+                     Default-hidden; shown only under html.theme-america250. -->
+                <span class="america-250-badge america-250-flag" aria-hidden="true" title="America 250 theme">
+                    <svg width="22" height="12" viewBox="0 0 190 100" role="img" aria-label="US flag">
+                        <defs>
+                            <clipPath id="a250-flag-clip"><rect width="190" height="100" rx="10"/></clipPath>
+                        </defs>
+                        <g clip-path="url(#a250-flag-clip)">
+                            <rect width="190" height="100" fill="#B22234"/>
+                            <rect y="9.09" width="190" height="9.09" fill="#FFFFFF"/>
+                            <rect y="27.27" width="190" height="9.09" fill="#FFFFFF"/>
+                            <rect y="45.45" width="190" height="9.09" fill="#FFFFFF"/>
+                            <rect y="63.64" width="190" height="9.09" fill="#FFFFFF"/>
+                            <rect y="81.82" width="190" height="9.09" fill="#FFFFFF"/>
+                            <rect width="76" height="54.55" fill="#3C3B6E"/>
+                            <g fill="#FFFFFF">
+                                <circle cx="15" cy="13.6" r="4.5"/>
+                                <circle cx="38" cy="13.6" r="4.5"/>
+                                <circle cx="61" cy="13.6" r="4.5"/>
+                                <circle cx="15" cy="27.3" r="4.5"/>
+                                <circle cx="38" cy="27.3" r="4.5"/>
+                                <circle cx="61" cy="27.3" r="4.5"/>
+                                <circle cx="15" cy="40.9" r="4.5"/>
+                                <circle cx="38" cy="40.9" r="4.5"/>
+                                <circle cx="61" cy="40.9" r="4.5"/>
+                            </g>
+                        </g>
+                    </svg>
+                </span>
+            </div>
             <div id="version-info" class="text-xs text-slate-400 mt-1"></div>
+            <!-- Tricolor semiquincentennial micro-badge — default-hidden. -->
+            <div class="america-250-badge america-250-years text-[10px] mt-1 font-semibold tracking-wide">
+                <span style="color:#ef4444">1776</span>
+                <span class="text-slate-500">·</span>
+                <span style="color:#f8fafc">2026</span>
+                <span class="text-slate-500">—</span>
+                <span style="color:#60a5fa">250 YEARS</span>
+            </div>
+            <!-- 2px red/white/blue accent across the header's bottom edge — default-hidden. -->
+            <div class="america-250-badge america-250-stripe" aria-hidden="true"></div>
         </div>
 
         <div class="flex-1 py-2">
