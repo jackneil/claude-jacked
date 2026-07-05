@@ -777,22 +777,35 @@ class ServiceRunner:
                 except Exception:
                     logger.exception("Icon update during update-click failed")
 
-            # Pre-warm /update.html against loopback regardless of self.host —
-            # self.host may be 0.0.0.0 (bind-all), which clients can't route
-            # to on Linux. The service is always reachable on 127.0.0.1 after
-            # bind.
-            _url = f"http://127.0.0.1:{self.port}/update.html"
+            # Open a file:// bootstrap page that hosts /update.html in a
+            # self-healing iframe. The tray stops the service moments from now,
+            # so a direct browser GET to the port would race the dying server
+            # and land on the browser's own dead error page (no JS, never
+            # recovers). A local file cannot die; it pings 127.0.0.1 and
+            # (re)loads the iframe once the new service binds.
             try:
-                import urllib.request as _ur
-                with _ur.urlopen(_url, timeout=2.0):
-                    pass
+                from jacked.api.main import WEB_DIR
+                from jacked.service import CLAUDE_DIR
+                template = (WEB_DIR / "update_bootstrap.html").read_text(
+                    encoding="utf-8"
+                )
+                CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+                progress_path = CLAUDE_DIR / "jacked-update-progress.html"
+                progress_path.write_text(
+                    template.replace("__JACKED_PORT__", str(self.port)),
+                    encoding="utf-8",
+                )
+                webbrowser.open(progress_path.as_uri())
             except Exception:
-                logger.exception("Pre-warm of update.html failed (continuing)")
-            try:
-                import webbrowser as _wb
-                _wb.open(_url)
-            except Exception:
-                logger.exception("Failed to open update progress page")
+                # Template missing or unwritable — fall back to the port
+                # directly (old behavior, minus the pointless pre-warm).
+                logger.exception(
+                    "Could not open update bootstrap page; using direct URL"
+                )
+                try:
+                    webbrowser.open(f"http://127.0.0.1:{self.port}/update.html")
+                except Exception:
+                    logger.exception("Failed to open update progress page")
 
             # init_status BEFORE the spawn so the status file exists from t=0.
             # If the detached child dies before its own init_status, the UI

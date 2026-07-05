@@ -104,6 +104,13 @@
 
     function renderMeta() {
         const meta = document.getElementById("meta");
+        // Service goes down mid-update (package swap + restart). Show that
+        // instead of a frozen elapsed-time reading. 2s grace absorbs a single
+        // missed poll so it doesn't flap on every transient blip.
+        if (state.serviceDownSince && Date.now() - state.serviceDownSince > 2000) {
+            meta.textContent = "Service restarting \u2014 reconnecting\u2026";
+            return;
+        }
         if (!state.startedAt) {
             meta.textContent = "Waiting for first status update\u2026";
             return;
@@ -195,6 +202,8 @@
             banner.appendChild(makeEl("div", null, "Update complete \u2014 jacked is now v" + v + "."));
             const a = makeEl("a", "button", "Open dashboard");
             a.href = "/";
+            // Break out of the bootstrap iframe so the whole tab navigates.
+            a.target = "_top";
             banner.appendChild(a);
             banner.style.display = "block";
             // Append the added/changed/removed lists below the banner (once).
@@ -221,6 +230,8 @@
                 "Update appears stuck (no progress in >120s). See ~/.claude/jacked-update.log."));
             const a = makeEl("a", "button", "Try the dashboard anyway");
             a.href = "/";
+            // Break out of the bootstrap iframe so the whole tab navigates.
+            a.target = "_top";
             banner.appendChild(a);
             banner.style.display = "block";
         }
@@ -280,6 +291,13 @@
     async function tick() {
         await Promise.all([pollStatus(), pollVersion()]);
         render();
+        // Surface state to a hosting bootstrap frame (harmless standalone —
+        // parent === window). The bootstrap reveals its success note on this.
+        try {
+            window.parent.postMessage(
+                {jackedUpdateOverall: state.overall, jackedCurrentVersion: state.currentVersion},
+                "*");
+        } catch (_) {}
         const targetKnown = state.targetVersion && state.targetVersion !== "next";
         const terminal = state.overall === "succeeded" ||
             state.overall === "failed" ||
