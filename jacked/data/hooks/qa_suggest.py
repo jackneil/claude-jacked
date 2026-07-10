@@ -5,8 +5,13 @@ Detects UI file changes in the current session and suggests running /qa.
 Fires on Stop events only. Uses a temp file for per-session dedup.
 
 Fire-and-forget: runs in a daemon thread so the hook returns quickly.
+
+Runtime-portable: the same script backs Claude Code and Codex. Pass
+`--runtime codex` (the Codex installer wires this into its hooks.json) so the
+suggestion reads `$qa` (the Codex skill invocation) instead of `/qa`.
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -154,7 +159,56 @@ def _mark_suggested(dedup_path: Path) -> bool:
         return False
 
 
-def _handle_stop(session_id: str, cwd: str):
+def _suggestion_message(runtime: str) -> str:
+    """Build the QA-suggestion systemMessage for the given runtime.
+
+    Codex has no `/qa` slash command; skills there are invoked as `$qa`. Claude
+    Code keeps the `/qa` form. Any unrecognized runtime falls back to Claude.
+
+    >>> "/qa" in _suggestion_message("claude")
+    True
+    >>> "$qa" in _suggestion_message("codex")
+    True
+    >>> "/qa" in _suggestion_message("codex")
+    False
+    """
+    if runtime == "codex":
+        return (
+            "UI files were modified in this session. "
+            "Run the $qa skill to browser-test the changes "
+            "(or pass the app URL as its argument)."
+        )
+    return (
+        "UI files were modified in this session. "
+        "Run /qa to browser-test the changes, "
+        "or /qa <url> to specify the app URL."
+    )
+
+
+def _parse_runtime(argv=None) -> str:
+    """Parse the optional `--runtime` flag (default 'claude').
+
+    Tolerant of unknown extra argv (the `jacked _hook` shim may forward stray
+    tokens) and never crashes the hook: an unrecognized value falls back to
+    'claude'. Only 'codex' switches the wording.
+
+    >>> _parse_runtime(["--runtime", "codex"])
+    'codex'
+    >>> _parse_runtime([])
+    'claude'
+    >>> _parse_runtime(["--runtime", "nonsense"])
+    'claude'
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--runtime", default="claude")
+    try:
+        args, _ = parser.parse_known_args(argv)
+    except SystemExit:
+        return "claude"
+    return "codex" if args.runtime == "codex" else "claude"
+
+
+def _handle_stop(session_id: str, cwd: str, runtime: str = "claude"):
     """Handle a Stop event: check for UI changes and emit suggestion."""
     dedup_path = Path(DEDUP_DIR) / f"jacked-qa-{session_id}"
 
@@ -165,21 +219,19 @@ def _handle_stop(session_id: str, cwd: str):
     if not _mark_suggested(dedup_path):
         return
 
-    output = {
-        "systemMessage": (
-            "UI files were modified in this session. "
-            "Run /qa to browser-test the changes, "
-            "or /qa <url> to specify the app URL."
-        )
-    }
+    output = {"systemMessage": _suggestion_message(runtime)}
     print(json.dumps(output), flush=True)
 
 
-def main():
+def main(argv=None):
     """Read hook input from stdin, dispatch in fire-and-forget thread.
+
+    `argv` carries the hook's command-line args (the `jacked _hook qa_suggest
+    [--runtime codex]` shim forwards them); it defaults to sys.argv[1:].
 
     >>> # main() reads stdin — structure is tested via TestMainEndToEnd
     """
+    runtime = _parse_runtime(argv)
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -197,7 +249,7 @@ def main():
 
     t = threading.Thread(
         target=_handle_stop,
-        args=(session_id, cwd),
+        args=(session_id, cwd, runtime),
         daemon=True,
     )
     t.start()

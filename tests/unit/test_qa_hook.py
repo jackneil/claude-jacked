@@ -273,6 +273,66 @@ class TestGetChangedFiles:
         assert "--cached" in second_call_args
 
 
+class TestSuggestionMessageRuntime:
+    """Test the runtime-specific systemMessage wording (Claude vs Codex)."""
+
+    def test_default_message_unchanged(self):
+        """The default (Claude) message keeps the /qa slash-command wording."""
+        from jacked.data.hooks.qa_suggest import _suggestion_message
+
+        msg = _suggestion_message("claude")
+        assert msg == (
+            "UI files were modified in this session. "
+            "Run /qa to browser-test the changes, "
+            "or /qa <url> to specify the app URL."
+        )
+
+    def test_codex_message_uses_dollar_qa_not_slash_qa(self):
+        """Codex has no /qa slash command; skills are invoked as $qa."""
+        from jacked.data.hooks.qa_suggest import _suggestion_message
+
+        msg = _suggestion_message("codex")
+        assert "$qa" in msg
+        assert "/qa" not in msg
+        assert msg == (
+            "UI files were modified in this session. "
+            "Run the $qa skill to browser-test the changes "
+            "(or pass the app URL as its argument)."
+        )
+
+    def test_unknown_runtime_falls_back_to_claude(self):
+        from jacked.data.hooks.qa_suggest import _suggestion_message
+
+        assert _suggestion_message("codex") != _suggestion_message("borg")
+        assert "/qa" in _suggestion_message("borg")
+
+
+class TestParseRuntime:
+    """Test --runtime argv parsing (tolerant, never crashes the hook)."""
+
+    def test_parses_codex(self):
+        from jacked.data.hooks.qa_suggest import _parse_runtime
+
+        assert _parse_runtime(["--runtime", "codex"]) == "codex"
+
+    def test_defaults_to_claude(self):
+        from jacked.data.hooks.qa_suggest import _parse_runtime
+
+        assert _parse_runtime([]) == "claude"
+
+    def test_ignores_unknown_extra_argv(self):
+        """The shim may forward stray tokens; unknowns are ignored, not fatal."""
+        from jacked.data.hooks.qa_suggest import _parse_runtime
+
+        assert _parse_runtime(["_hook", "qa_suggest", "--runtime", "codex"]) == "codex"
+        assert _parse_runtime(["_hook", "qa_suggest"]) == "claude"
+
+    def test_unrecognized_value_falls_back_to_claude(self):
+        from jacked.data.hooks.qa_suggest import _parse_runtime
+
+        assert _parse_runtime(["--runtime", "nonsense"]) == "claude"
+
+
 class TestMainEndToEnd:
     """Test main() with mocked stdin and stdout."""
 
@@ -311,6 +371,34 @@ class TestMainEndToEnd:
         output = json.loads(captured.out)
         assert "systemMessage" in output
         assert "/qa" in output["systemMessage"]
+
+    def test_emits_codex_message_with_runtime_flag(self, tmp_path, capsys):
+        """main(["--runtime", "codex"]) emits the $qa (Codex) wording."""
+        from jacked.data.hooks.qa_suggest import main
+
+        input_data = json.dumps(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "test-session-codex",
+                "cwd": str(tmp_path),
+            }
+        )
+        (tmp_path / ".git").mkdir()
+        dedup_dir = tmp_path / "dedup_dir"
+        dedup_dir.mkdir()
+
+        with patch("sys.stdin") as mock_stdin, patch(
+            "jacked.data.hooks.qa_suggest._get_changed_files",
+            return_value=["src/app.js"],
+        ), patch(
+            "jacked.data.hooks.qa_suggest.DEDUP_DIR", str(dedup_dir)
+        ):
+            mock_stdin.read.return_value = input_data
+            main(["--runtime", "codex"])
+
+        output = json.loads(capsys.readouterr().out)
+        assert "$qa" in output["systemMessage"]
+        assert "/qa" not in output["systemMessage"]
 
     def test_dedup_prevents_second_suggestion(self, tmp_path, capsys):
         """Second call with same session ID should not emit suggestion."""

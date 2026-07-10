@@ -24,8 +24,16 @@ Codex pass when Codex is present, writing the native Codex installables:
              so Codex skills referencing `mcp__chrome-devtools__*` resolve. Never
              fights a user's own chrome-devtools entry and never leaves a broken
              config (parse-checked, byte-restored on failure).
-- legacy gatekeeper hooks.json entries are PRUNED on install (the
-             gatekeeper was retired in 0.70.0)
+- hooks     -> a QA-suggestion Stop entry in ~/.codex/hooks.json invoking the
+             SAME runtime-portable qa_suggest.py hook with `--runtime codex`
+             (so the suggestion reads `$qa`, the Codex skill invocation, not
+             Claude's `/qa`). Marker-identified by `_hook qa_suggest`; replaces
+             ours in place if the command drifts and never touches user entries.
+             Legacy gatekeeper entries are PRUNED on install (the gatekeeper was
+             retired in 0.70.0); install prunes gatekeeper-only so it never
+             clobbers the qa entry it just wrote. Codex requires a one-time
+             /hooks trust for non-managed command hooks; the installer surfaces
+             that step when the entry is newly added.
 
 A separate manifest (~/.codex/jacked-codex-manifest.json) makes install
 idempotent and uninstall/prune precise; it never touches the Claude manifest.
@@ -64,9 +72,19 @@ _MCP_BLOCK_BODY = (
     'args = ["chrome-devtools-mcp@latest", "--autoConnect"]'
 )
 
-# A jacked-managed hook entry is identified by this marker in its command, so
-# install/uninstall can find and replace exactly its own entries.
-_HOOK_MARKERS = ("_hook security_gatekeeper",)
+# A jacked-managed hook entry is identified by a marker substring in its command
+# (present in both the `"jacked" _hook <name>` shim and the `-m jacked _hook
+# <name>` fallback forms _build_hook_command emits), so install/uninstall can
+# find and replace exactly its own entries and never a user's.
+#   - _LEGACY_HOOK_MARKERS: the retired gatekeeper (removed in 0.70.0). Install
+#     prunes with THESE ONLY so it never clobbers the qa entry it just wrote.
+#   - _QA_HOOK_MARKERS: jacked's Codex QA-suggestion Stop hook.
+#   - _HOOK_MARKERS: both, the default for _remove_codex_hooks (uninstall strips
+#     everything jacked ever wrote into hooks.json).
+_LEGACY_HOOK_MARKERS = ("_hook security_gatekeeper",)
+_QA_HOOK_MARKER = "_hook qa_suggest"
+_QA_HOOK_MARKERS = (_QA_HOOK_MARKER,)
+_HOOK_MARKERS = _LEGACY_HOOK_MARKERS + _QA_HOOK_MARKERS
 
 # Skills that are Claude-only and must NOT be deployed to Codex. `chain-of-command`
 # is a Claude Code model-dispatch policy (Fable plans, Opus codes); Codex has no
@@ -485,15 +503,19 @@ def _strip_mcp_block(cfg: Path) -> bool:
 # hooks.json (merge, jacked-owned entries only)
 # ---------------------------------------------------------------------------
 
-def _is_jacked_hook_group(group: dict) -> bool:
+def _is_jacked_hook_group(group: dict, markers: tuple = _HOOK_MARKERS) -> bool:
     for h in group.get("hooks", []):
         cmd = h.get("command", "")
-        if any(m in cmd for m in _HOOK_MARKERS):
+        if any(m in cmd for m in markers):
             return True
     return False
 
 
-def _remove_codex_hooks(path: Path) -> bool:
+def _remove_codex_hooks(path: Path, markers: tuple = _HOOK_MARKERS) -> bool:
+    """Strip jacked-owned hook groups (matching `markers`) from hooks.json,
+    leaving user entries and unknown top-level keys intact. Install passes
+    _LEGACY_HOOK_MARKERS (gatekeeper only, so the just-written qa entry survives);
+    uninstall uses the default (both). Returns True if anything was removed."""
     if not path.exists():
         return False
     try:
@@ -503,7 +525,7 @@ def _remove_codex_hooks(path: Path) -> bool:
     hooks = data.get("hooks", {})
     changed = False
     for event in list(hooks.keys()):
-        kept = [g for g in hooks[event] if not _is_jacked_hook_group(g)]
+        kept = [g for g in hooks[event] if not _is_jacked_hook_group(g, markers)]
         if len(kept) != len(hooks[event]):
             changed = True
         if kept:
@@ -518,6 +540,65 @@ def _remove_codex_hooks(path: Path) -> bool:
     else:
         path.write_text(json.dumps(data, indent=2) + "\n")
     return changed
+
+
+def _codex_qa_hook_command() -> str:
+    """The Stop-hook command jacked writes into Codex's hooks.json.
+
+    Reuses cli's `_build_hook_command` (the SAME upgrade-safe `"jacked" _hook
+    <name>` shim / `"{python}" -m jacked _hook <name>` fallback the Claude side
+    writes) and appends `--runtime codex` so the shared qa_suggest.py hook prints
+    the Codex `$qa` skill invocation instead of Claude's `/qa`. Imported lazily to
+    avoid importing the click CLI at installer-module import time and to keep the
+    find_bin fallback logic in ONE place (no duplication)."""
+    from jacked.cli import _build_hook_command
+
+    return f"{_build_hook_command('qa_suggest')} --runtime codex"
+
+
+def _install_codex_qa_hook(home: Optional[Path] = None) -> bool:
+    """Idempotently ensure Codex's hooks.json Stop event carries jacked's
+    QA-suggest entry.
+
+    The entry is ``{"matcher": "", "hooks": [{"type": "command", "command":
+    "<...> _hook qa_suggest --runtime codex"}]}``. OUR entry is marker-identified
+    by ``_hook qa_suggest`` in its command (like ``_is_jacked_hook_group``): if
+    present with a drifted command it's replaced in place (not duplicated); other
+    entries and unknown top-level keys are never touched. Returns True when our
+    entry is present after the call."""
+    path = codex_hooks_json(home)
+    command = _codex_qa_hook_command()
+
+    data: dict = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text())
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, OSError):
+            data = {}
+
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
+    stop = hooks.get("Stop")
+    if not isinstance(stop, list):
+        stop = []
+        hooks["Stop"] = stop
+
+    entry_hooks = [{"type": "command", "command": command}]
+    for group in stop:
+        if isinstance(group, dict) and _is_jacked_hook_group(group, _QA_HOOK_MARKERS):
+            group.setdefault("matcher", "")
+            group["hooks"] = entry_hooks  # replace ours in place (command may drift)
+            break
+    else:
+        stop.append({"matcher": "", "hooks": entry_hooks})
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +641,7 @@ class CodexInstallSummary:
     agents: list = field(default_factory=list)
     rules: bool = False
     hooks: bool = False
+    hooks_added: bool = False
     mcp: str = ""
     removed: list = field(default_factory=list)
     changed: bool = False
@@ -650,9 +732,21 @@ def install_codex(
     #    "unchanged"/"preexisting"/"skipped-unparseable") is recorded in the manifest.
     mcp_status = ensure_chrome_devtools_mcp(home)
 
-    # 6. Prune legacy gatekeeper entries from hooks.json (retired in 0.70.0).
-    _remove_codex_hooks(codex_hooks_json(home))
-    hooks_done = False
+    # 6. hooks.json: prune the LEGACY gatekeeper entry (retired 0.70.0) with the
+    #    gatekeeper-only markers, then install the QA-suggest Stop hook. Pruning
+    #    with the legacy markers ONLY means the just-installed qa entry is never
+    #    clobbered by the prune, so install and prune don't fight (uninstall
+    #    strips both). hooks_changed folds a real file change from either step
+    #    into `changed`; hooks_added (entry absent before, present after) drives
+    #    the one-time /hooks trust notice cli.py prints.
+    hooks_path = codex_hooks_json(home)
+    _hooks_before = hooks_path.read_text() if hooks_path.exists() else None
+    _qa_present_before = _hooks_before is not None and _QA_HOOK_MARKER in _hooks_before
+    _remove_codex_hooks(hooks_path, markers=_LEGACY_HOOK_MARKERS)
+    hooks_done = _install_codex_qa_hook(home)
+    _hooks_after = hooks_path.read_text() if hooks_path.exists() else None
+    hooks_changed = _hooks_before != _hooks_after
+    hooks_added = hooks_done and not _qa_present_before
 
     # Prune artifacts shipped before but not now.
     removed = []
@@ -680,6 +774,7 @@ def install_codex(
         or prompts != (prior.get("prompts") or {})
         or agents != (prior.get("agents") or {})
         or mcp_status in {"added", "updated"}
+        or hooks_changed
         or bool(removed)
     )
 
@@ -687,7 +782,7 @@ def install_codex(
                     now_iso, mcp_status)
     return CodexInstallSummary(
         skills=list(skills), prompts=list(prompts), agents=list(agents),
-        rules=rules_done, hooks=hooks_done, mcp=mcp_status,
+        rules=rules_done, hooks=hooks_done, hooks_added=hooks_added, mcp=mcp_status,
         removed=removed, changed=changed,
     )
 
@@ -725,8 +820,10 @@ def uninstall_codex(
         removed.append("AGENTS.md block")
     if _strip_mcp_block(codex_config_toml(home)):
         removed.append("config.toml chrome-devtools MCP")
+    # Strip BOTH the qa entry and any legacy gatekeeper entry (default markers),
+    # never a user's own hooks.
     if _remove_codex_hooks(codex_hooks_json(home)):
-        removed.append("hooks.json gatekeeper")
+        removed.append("hooks.json qa_suggest")
 
     mp = manifest_path(home)
     if mp.exists():
