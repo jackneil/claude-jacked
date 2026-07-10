@@ -15,6 +15,10 @@ Codex pass when Codex is present, writing the native Codex installables:
              dir from the skills pass (command content wins).
 - rules    -> a managed block in ~/.codex/AGENTS.md (CLAUDE.md references
              rewritten for Codex + a Codex runtime-adapter section appended)
+- agents   -> ~/.codex/agents/<name>.toml (jacked's Claude Code subagent
+             definitions converted to Codex's native TOML custom-agent format:
+             name/description/developer_instructions, with NO model pin so Codex
+             chooses its own model)
 - legacy gatekeeper hooks.json entries are PRUNED on install (the
              gatekeeper was retired in 0.70.0)
 
@@ -108,6 +112,10 @@ def codex_prompts_dir(home: Optional[Path] = None, env=None) -> Path:
     return (home or codex_home(env)) / "prompts"
 
 
+def codex_agents_dir(home: Optional[Path] = None, env=None) -> Path:
+    return (home or codex_home(env)) / "agents"
+
+
 def codex_agents_md(home: Optional[Path] = None, env=None) -> Path:
     return (home or codex_home(env)) / "AGENTS.md"
 
@@ -126,6 +134,10 @@ def manifest_path(home: Optional[Path] = None, env=None) -> Path:
 
 def _sha_file(f: Path) -> str:
     return "sha256:" + hashlib.sha256(f.read_bytes()).hexdigest()
+
+
+def _sha_text(s: str) -> str:
+    return "sha256:" + hashlib.sha256(s.encode()).hexdigest()
 
 
 def _sha_dir(d: Path) -> str:
@@ -169,21 +181,44 @@ def _write_solo_skill(skill_dir: Path, content: str) -> None:
 def _split_command_frontmatter(text: str) -> tuple[dict, str]:
     """Split a leading `---`-delimited frontmatter block off a command file.
 
-    Returns (meta, body): meta maps each flat `key: value` line to its raw value
-    (right of the first colon, stripped); body is everything after the closing
-    `---` (the whole file verbatim when there is no frontmatter). Line-based on
-    purpose - jacked command frontmatter is flat key/value pairs and PyYAML is
-    not a runtime dependency."""
+    Returns (meta, body): meta maps each flat `key: value` entry to its value;
+    body is everything after the closing `---` (the whole file verbatim when
+    there is no frontmatter). Line-based on purpose - jacked frontmatter is
+    flat key/value pairs and PyYAML is not a runtime dependency. Values in
+    YAML double-quoted scalars may span lines (e.g. double-check-reviewer's
+    description): continuation lines fold to spaces per YAML semantics and the
+    surrounding quote pair is stripped, so consumers see the full clean text
+    instead of a truncated fragment with a stray quote."""
     if not text.startswith("---\n"):
         return {}, text
     end = text.find("\n---\n", 4)
     if end == -1:
         return {}, text
     meta: dict = {}
-    for line in text[4:end].splitlines():
-        if ":" in line and not line.lstrip().startswith("#"):
-            key, _, val = line.partition(":")
-            meta[key.strip()] = val.strip()
+    lines = text[4:end].splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if ":" not in line or line.lstrip().startswith("#"):
+            continue
+        if line[0] in " \t":
+            # Indented continuation of a scalar we didn't consume below (never
+            # a real key in jacked frontmatter) - skip rather than misparse.
+            continue
+        key, _, val = line.partition(":")
+        val = val.strip()
+        # Multi-line double-quoted scalar: consume until the closing quote.
+        # Our frontmatter never uses escaped \" so endswith('"') is safe.
+        if val.startswith('"') and not (len(val) > 1 and val.endswith('"')):
+            parts = [val]
+            while i < len(lines) and not parts[-1].rstrip().endswith('"'):
+                parts.append(lines[i].strip())
+                i += 1
+            val = " ".join(p for p in parts if p)
+        if len(val) > 1 and val[0] == val[-1] == '"':
+            val = val[1:-1]
+        meta[key.strip()] = val.strip()
     return meta, text[end + len("\n---\n"):]
 
 
@@ -208,8 +243,42 @@ def _command_skill_md(cmd: Path) -> str:
     lines = [f"name: {cmd.stem}", f"description: {json.dumps(desc)}"]
     hint = meta.get("argument-hint")
     if hint is not None:
-        lines.append(f"argument-hint: {hint}")
+        # Re-quote: the parser returns clean unquoted values, and a bare
+        # "[--flag]" would parse as a YAML flow sequence, not a string.
+        lines.append(f"argument-hint: {json.dumps(hint)}")
     return "---\n" + "\n".join(lines) + "\n---\n" + body
+
+
+# ---------------------------------------------------------------------------
+# Agent -> Codex custom-agent TOML. jacked ships Claude Code subagent
+# definitions (data/agents/*.md); Codex reads custom agents as TOML.
+# ---------------------------------------------------------------------------
+
+def _agent_toml(agent_md: Path) -> str:
+    """Build the ~/.codex/agents/<stem>.toml content for one Claude subagent.
+
+    Codex custom agents are TOML with required `name` (the agent's stem),
+    `description`, and `developer_instructions` (the agent's system prompt = its
+    markdown body). We split the agent file's `---`-delimited frontmatter (via
+    the generic `_split_command_frontmatter`) from its body, then emit those
+    three as TOML basic strings. json.dumps escaping (\\n, \\", \\\\, \\uXXXX for
+    control chars) is valid TOML basic-string syntax, so it doubles as the TOML
+    string quoter and the whole description/body ship VERBATIM (no truncation).
+    `ensure_ascii=False` is REQUIRED: the default (ascii) escapes astral-plane
+    characters (the emoji real agents use, e.g. 🎯🚀) as UTF-16 surrogate-pair
+    `\\uD83D\\uDE00` escapes, which are valid JSON but NOT valid TOML (a TOML
+    `\\uXXXX` must be a Unicode scalar, never a surrogate half); emitting those
+    chars literally as UTF-8 is valid TOML. Description falls back to the first
+    non-empty body line when the frontmatter omits it. Claude-only `tools:` /
+    `model:` keys are deliberately NOT carried over: no model is pinned so Codex
+    picks its own."""
+    meta, body = _split_command_frontmatter(agent_md.read_text())
+    desc = (meta.get("description") or _first_nonempty_line(body)).strip()
+    return (
+        f"name = {json.dumps(agent_md.stem, ensure_ascii=False)}\n"
+        f"description = {json.dumps(desc, ensure_ascii=False)}\n"
+        f"developer_instructions = {json.dumps(body, ensure_ascii=False)}\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +384,7 @@ def _load_manifest(home: Path) -> Optional[dict]:
 
 
 def _write_manifest(home: Path, version: str, skills: dict, prompts: dict,
-                    rules: bool, hooks: bool, now_iso: str) -> None:
+                    agents: dict, rules: bool, hooks: bool, now_iso: str) -> None:
     p = manifest_path(home)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({
@@ -323,6 +392,7 @@ def _write_manifest(home: Path, version: str, skills: dict, prompts: dict,
         "written_at": now_iso,
         "skills": skills,
         "prompts": prompts,
+        "agents": agents,
         "rules": rules,
         "hooks": hooks,
     }, indent=2) + "\n")
@@ -336,6 +406,7 @@ def _write_manifest(home: Path, version: str, skills: dict, prompts: dict,
 class CodexInstallSummary:
     skills: list = field(default_factory=list)
     prompts: list = field(default_factory=list)
+    agents: list = field(default_factory=list)
     rules: bool = False
     hooks: bool = False
     removed: list = field(default_factory=list)
@@ -357,6 +428,7 @@ def install_codex(
     home = home or codex_home(env)
     skills_base = agents_skills_dir(agents_home)
     prompts_dst = codex_prompts_dir(home)
+    agents_dst = codex_agents_dir(home)
 
     prior = _load_manifest(home) or {}
 
@@ -402,7 +474,24 @@ def install_codex(
         _install_agents_block(codex_agents_md(home), _codex_rules_body(rules_src.read_text()))
         rules_done = True
 
-    # 4. Prune legacy gatekeeper entries from hooks.json (retired in 0.70.0).
+    # 4. Agents -> ~/.codex/agents/<stem>.toml. jacked's Claude Code subagent
+    #    definitions (data/agents/*.md: YAML frontmatter + a markdown-body system
+    #    prompt) are converted to Codex's native TOML custom-agent format via
+    #    _agent_toml (name/description/developer_instructions, NO model pin - Codex
+    #    picks its own). Recorded in the `agents` manifest dict keyed by stem ->
+    #    sha of the GENERATED TOML content, so a changed source OR a changed
+    #    conversion re-hashes and re-writes (consistent with the file-sha keys
+    #    used for skills/prompts, just hashing the produced content).
+    agents: dict = {}
+    agents_src_dir = data_root / "agents"
+    if agents_src_dir.exists():
+        agents_dst.mkdir(parents=True, exist_ok=True)
+        for agent_md in sorted(agents_src_dir.glob("*.md")):
+            content = _agent_toml(agent_md)
+            (agents_dst / f"{agent_md.stem}.toml").write_text(content)
+            agents[agent_md.stem] = _sha_text(content)
+
+    # 5. Prune legacy gatekeeper entries from hooks.json (retired in 0.70.0).
     _remove_codex_hooks(codex_hooks_json(home))
     hooks_done = False
 
@@ -420,17 +509,24 @@ def install_codex(
             if f.exists():
                 f.unlink()
                 removed.append(f"prompts/{name}")
+    for name in (prior.get("agents") or {}):
+        if name not in agents:
+            f = agents_dst / f"{name}.toml"
+            if f.exists():
+                f.unlink()
+                removed.append(f"agents/{name}")
 
     changed = (
         skills != (prior.get("skills") or {})
         or prompts != (prior.get("prompts") or {})
+        or agents != (prior.get("agents") or {})
         or bool(removed)
     )
 
-    _write_manifest(home, version, skills, prompts, rules_done, hooks_done, now_iso)
+    _write_manifest(home, version, skills, prompts, agents, rules_done, hooks_done, now_iso)
     return CodexInstallSummary(
-        skills=list(skills), prompts=list(prompts), rules=rules_done,
-        hooks=hooks_done, removed=removed, changed=changed,
+        skills=list(skills), prompts=list(prompts), agents=list(agents),
+        rules=rules_done, hooks=hooks_done, removed=removed, changed=changed,
     )
 
 
@@ -444,6 +540,7 @@ def uninstall_codex(
     home = home or codex_home(env)
     skills_base = agents_skills_dir(agents_home)
     prompts_dst = codex_prompts_dir(home)
+    agents_dst = codex_agents_dir(home)
     manifest = _load_manifest(home) or {}
     removed: list = []
 
@@ -457,6 +554,11 @@ def uninstall_codex(
         if f.exists():
             f.unlink()
             removed.append(f"prompts/{name}")
+    for name in (manifest.get("agents") or {}):
+        f = agents_dst / f"{name}.toml"
+        if f.exists():
+            f.unlink()
+            removed.append(f"agents/{name}")
     if _strip_agents_block(codex_agents_md(home)):
         removed.append("AGENTS.md block")
     if _remove_codex_hooks(codex_hooks_json(home)):
