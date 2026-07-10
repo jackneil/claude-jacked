@@ -5,12 +5,14 @@ from unittest.mock import patch, MagicMock
 
 
 def _skip_if_no_tray():
-    """Skip test if pystray/Pillow not installed."""
+    """Skip test if pystray/Pillow can't load (not installed, or headless:
+    pystray resolves its GUI backend at import and raises non-ImportError
+    errors like Xlib.error.DisplayNameError when there is no display)."""
     try:
         import pystray  # noqa: F401
         import PIL  # noqa: F401
-    except ImportError:
-        pytest.skip("pystray/Pillow not installed")
+    except Exception:
+        pytest.skip("pystray/Pillow unavailable (missing or headless)")
 
 
 class TestCreateIcon:
@@ -149,7 +151,10 @@ class TestServiceRunner:
         assert hasattr(runner, "_uvicorn_server")
         assert runner._uvicorn_server is None
 
-    @patch("jacked.service.tray.pystray")
+    # create=True: headless boxes never bind tray.pystray (backend resolution
+    # fails without a display), and @patch resolves the target BEFORE the
+    # in-body _skip_if_no_tray() can skip.
+    @patch("jacked.service.tray.pystray", create=True)
     @patch("jacked.service.tray.uvicorn")
     def test_start_uvicorn_thread_is_daemon(self, mock_uvicorn, mock_pystray):
         _skip_if_no_tray()
