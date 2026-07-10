@@ -7,6 +7,7 @@ and the Claude-side fix that now copies skill sidecar files.
 """
 
 import json
+import logging
 import tomllib
 from pathlib import Path
 
@@ -1205,3 +1206,320 @@ def test_clone_website_skill_bundled_with_license_parses_and_ships_to_codex():
 
     # Ships to Codex, unlike the Claude-only skills (chain-of-command, recover).
     assert "clone-website" not in ins._CLAUDE_ONLY_SKILLS
+
+
+# ---------------------------------------------------------------------------
+# Hardening pass (recursive-review findings)
+# ---------------------------------------------------------------------------
+
+# FIX 1: never destroy a user's own ~/.agents/skills/<name> on a name collision.
+
+def test_user_owned_skill_dir_preserved_as_pre_jacked(data_root, homes):
+    """A user owns dirs whose names collide with a jacked skill (demo-skill) and a
+    command-derived skill (dcr). Neither is jacked-owned yet (no prior manifest),
+    so install must back each up to <name>.pre-jacked (user copy intact), record
+    it in summary.preserved, and install its own copy. A SECOND install must NOT
+    re-backup the now-jacked-owned dirs."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    for name in ("demo-skill", "dcr"):
+        d = skills_base / name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: MY OWN {name}\n---\nmine\n"
+        )
+        (d / "my-notes.txt").write_text("do not delete\n")
+
+    summ = _install(data_root, homes)
+
+    for name in ("demo-skill", "dcr"):
+        backup = skills_base / f"{name}.pre-jacked"
+        assert backup.is_dir(), f"{name} user copy must be preserved"
+        assert (backup / "my-notes.txt").read_text() == "do not delete\n"
+        assert "MY OWN" in (backup / "SKILL.md").read_text()
+        assert f"skills/{name}" in summ.preserved
+    # jacked's own content now occupies the real dirs (user content is gone from them)
+    assert "MY OWN" not in (skills_base / "demo-skill" / "SKILL.md").read_text()
+    assert (skills_base / "demo-skill" / "measure.js").exists()  # jacked sidecar landed
+    assert _body_after_frontmatter(
+        (skills_base / "dcr" / "SKILL.md").read_text()
+    ) == "run dcr\n"
+
+    # Second install: dirs are now jacked-owned -> no re-backup; backups untouched.
+    summ2 = _install(data_root, homes)
+    assert summ2.preserved == []
+    for name in ("demo-skill", "dcr"):
+        backup = skills_base / f"{name}.pre-jacked"
+        assert (backup / "my-notes.txt").read_text() == "do not delete\n"
+
+
+def test_wrapper_skill_overwritten_by_command_not_self_preserved(data_root, homes):
+    """Regression: the real data ships BOTH a pointer-wrapper skill and a same-name
+    command (e.g. skills/dcr + commands/dcr.md). Step 1 writes the wrapper, step 2
+    overwrites it with command content IN THE SAME RUN. jacked's own step-1 output
+    must NOT be mistaken for user content and backed up to <name>.pre-jacked just
+    because the (empty) prior manifest hasn't recorded it yet."""
+    # Add a wrapper skill whose name collides with the fixture's dcr.md command.
+    wrapper = data_root / "skills" / "dcr"
+    wrapper.mkdir(parents=True)
+    (wrapper / "SKILL.md").write_text(
+        "---\nname: dcr\ndescription: pointer wrapper\n---\nread the command\n"
+    )
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+
+    summ = _install(data_root, homes)  # fresh: no prior manifest, no user dirs
+
+    # No spurious self-backup of jacked's own wrapper.
+    assert not (skills_base / "dcr.pre-jacked").exists()
+    assert summ.preserved == []
+    # Command content won (precedence), wrapper content is gone.
+    assert _body_after_frontmatter(
+        (skills_base / "dcr" / "SKILL.md").read_text()
+    ) == "run dcr\n"
+
+
+def test_byte_identical_user_dir_not_backed_up(data_root, homes):
+    """If a colliding dir already holds EXACTLY what jacked would install, there's
+    nothing to preserve: no .pre-jacked backup is made and nothing is reported."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    # Pre-place demo-skill byte-identical to the source skill dir.
+    import shutil as _sh
+    _sh.copytree(data_root / "skills" / "demo-skill", skills_base / "demo-skill")
+    summ = _install(data_root, homes)
+    assert "skills/demo-skill" not in summ.preserved
+    assert not (skills_base / "demo-skill.pre-jacked").exists()
+
+
+def test_uninstall_leaves_user_modified_skill_dir(data_root, homes):
+    """Uninstall only rmtrees a skill dir whose CURRENT hash still matches the
+    manifest. A dir the user modified (hash mismatch) is left in place and noted in
+    `skipped`; an untouched dir is still removed."""
+    _install(data_root, homes)
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    dcr = skills_base / "dcr"
+    assert dcr.is_dir()
+    (dcr / "SKILL.md").write_text("I rewrote this myself\n")  # hash now differs
+    out = ins.uninstall_codex(home=homes["home"], agents_home=homes["agents_home"])
+    assert dcr.is_dir()  # left in place, not destroyed
+    assert (dcr / "SKILL.md").read_text() == "I rewrote this myself\n"
+    assert "skills/dcr" in out["skipped"]
+    assert "skills/dcr" not in out["removed"]
+    # an untouched skill is removed normally
+    assert not (skills_base / "demo-skill").exists()
+    assert "skills/demo-skill" in out["removed"]
+
+
+# FIX 2: hooks.json unparseable / non-dict must skip, never clobber.
+
+def test_hooks_unparseable_left_untouched_and_skipped(data_root, homes, caplog):
+    """A hooks.json with a trailing comma (invalid JSON) is left byte-identical;
+    the QA hook is not installed and a warning is logged."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    broken = b'{\n  "hooks": {"Stop": []},\n}\n'  # trailing comma -> invalid
+    hp.write_bytes(broken)
+    with caplog.at_level(logging.WARNING):
+        summ = _install(data_root, homes)
+    assert hp.read_bytes() == broken  # byte-identical: never clobbered
+    assert summ.hooks is False
+    assert "_hook qa_suggest" not in hp.read_text()
+    assert any("did not parse" in r.getMessage() for r in caplog.records)
+
+
+def test_hooks_non_dict_root_left_untouched_and_skipped(data_root, homes, caplog):
+    """A hooks.json whose JSON root is an array (not an object) is left
+    byte-identical; the QA hook is not installed and a warning is logged."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    arr = b'["not", "an", "object"]\n'
+    hp.write_bytes(arr)
+    with caplog.at_level(logging.WARNING):
+        summ = _install(data_root, homes)
+    assert hp.read_bytes() == arr  # byte-identical
+    assert summ.hooks is False
+    assert any("non-object root" in r.getMessage() for r in caplog.records)
+
+
+# FIX 3: every mutable Codex file is written through _atomic_write_text.
+
+def test_mutable_files_written_atomically(data_root, homes, monkeypatch):
+    """AGENTS.md, config.toml, hooks.json, and the manifest are all written via the
+    atomic writer (torn-write safety)."""
+    calls: list[str] = []
+    real = ins._atomic_write_text
+
+    def spy(path, text):
+        calls.append(Path(path).name)
+        return real(path, text)
+
+    monkeypatch.setattr(ins, "_atomic_write_text", spy)
+    _install(data_root, homes)
+    assert "AGENTS.md" in calls
+    assert "config.toml" in calls
+    assert "hooks.json" in calls
+    assert ins.manifest_path(homes["home"]).name in calls
+
+
+# FIX 5: emoji-bearing command description stays YAML-valid (ensure_ascii=False).
+
+def test_command_with_emoji_description_yaml_parses(data_root, homes):
+    """A command whose description carries astral-plane emoji yields a SKILL.md
+    whose frontmatter YAML-parses and round-trips the emoji (lone-surrogate escapes
+    would make strict YAML reject it). The name value is quoted too."""
+    (data_root / "commands" / "shipit.md").write_text(
+        "---\ndescription: \U0001F680 ship it fast \U0001F3AF\n---\ndo the thing\n",
+        encoding="utf-8",
+    )
+    _install(data_root, homes)
+    text = (_skill_dir(homes, "shipit") / "SKILL.md").read_text(encoding="utf-8")
+    assert 'name: "shipit"' in text  # name is now quoted for symmetry
+    meta = _frontmatter(text)  # raises if the YAML is invalid
+    assert meta["name"] == "shipit"
+    assert meta["description"] == "\U0001F680 ship it fast \U0001F3AF"
+
+
+# FIX 6: a generated agent TOML that won't parse is skipped, never written.
+
+def test_agent_toml_with_control_char_skipped(data_root, homes, caplog):
+    """An agent body carrying U+007F (DEL) - which json emits literally but TOML
+    basic strings forbid - produces unparseable TOML, so it is skipped with a
+    warning and no file is written; a clean sibling agent still lands."""
+    (data_root / "agents").mkdir(parents=True, exist_ok=True)
+    (data_root / "agents" / "bad.md").write_text(
+        "---\nname: bad\ndescription: has a control char\n---\nbody with \x7f del\n",
+        encoding="utf-8",
+    )
+    _add_agent(data_root, "good", "fine agent", "clean body\n")
+    with caplog.at_level(logging.WARNING):
+        summ = _install(data_root, homes)
+    agents_dir = ins.codex_agents_dir(homes["home"])
+    assert not (agents_dir / "bad.toml").exists()  # unparseable -> never written
+    assert "bad" not in summ.agents
+    assert "bad" not in _manifest(homes)["agents"]
+    assert (agents_dir / "good.toml").exists()  # clean one still lands
+    assert "good" in summ.agents
+    assert any("bad.md" in r.getMessage() for r in caplog.records)
+
+
+# FIX 8a: marker matching is whole-line; user prose that embeds the marker is safe.
+
+def test_agents_marker_spoof_in_user_prose_preserved(data_root, homes):
+    """A line of user prose that MENTIONS the BEGIN marker as a substring (not as
+    its own line) must not be mistaken for a managed block. A re-install replaces
+    only the real block and keeps the spoof line intact."""
+    _install(data_root, homes)
+    agents_md = ins.codex_agents_md(homes["home"])
+    real = agents_md.read_text(encoding="utf-8")
+    spoof = f"User note: my docs mention {ins._AGENTS_BEGIN} inline, keep it.\n"
+    agents_md.write_text(spoof + real, encoding="utf-8")
+    _install(data_root, homes)  # re-install -> whole-line matching
+    new = agents_md.read_text(encoding="utf-8")
+    assert "User note: my docs mention" in new  # spoof line preserved
+    assert ins._marker_line_count(new, ins._AGENTS_BEGIN) == 1  # only the real block
+    assert "be blunt" in new  # the managed block is still present/refreshed
+
+
+def test_agents_marker_spoof_strip_leaves_user_bytes(data_root, homes):
+    """Stripping the managed block with an embedded-marker prose line present leaves
+    the user prose intact and removes only the real block."""
+    _install(data_root, homes)
+    agents_md = ins.codex_agents_md(homes["home"])
+    real = agents_md.read_text(encoding="utf-8")
+    assert "be blunt" in real
+    spoof = f"User note: docs mention {ins._AGENTS_BEGIN} inline.\n"
+    agents_md.write_text(spoof + "\n" + real, encoding="utf-8")
+    assert ins._strip_agents_block(agents_md) is True
+    left = agents_md.read_text(encoding="utf-8")
+    assert "User note: docs mention" in left  # user prose kept
+    assert ins._AGENTS_BEGIN in left           # the inline mention survives
+    assert "be blunt" not in left              # real managed block stripped
+
+
+def test_mcp_marker_spoof_strip_leaves_user_bytes(homes):
+    """config.toml strip is whole-line anchored: a comment mentioning the MCP BEGIN
+    marker as a substring survives; only the real marked TOML table is removed."""
+    home = _mkhome(homes)
+    cfg = ins.codex_config_toml(homes["home"])
+    ins.ensure_chrome_devtools_mcp(home)
+    real = cfg.read_text(encoding="utf-8")
+    spoof = f"# doc mentions {ins._MCP_BEGIN} inline\n"
+    cfg.write_text(spoof + "\n" + real, encoding="utf-8")
+    assert ins._strip_mcp_block(cfg) is True
+    left = cfg.read_text(encoding="utf-8")
+    assert "# doc mentions" in left                       # user comment kept
+    assert ins._MCP_BEGIN in left                          # inline mention survives
+    assert "[mcp_servers.chrome-devtools]" not in left     # real table removed
+
+
+def test_mcp_duplicate_marker_lines_skipped(homes):
+    """Two whole-line BEGIN markers (an unexpected count) make ensure_* skip rather
+    than risk clobbering: the file is left untouched and the status is
+    skipped-unparseable."""
+    home = _mkhome(homes)
+    cfg = ins.codex_config_toml(homes["home"])
+    doubled = f"{ins._MCP_BEGIN}\n{ins._MCP_BEGIN}\n{ins._MCP_END}\n"
+    cfg.write_bytes(doubled.encode())
+    status = ins.ensure_chrome_devtools_mcp(home)
+    assert status == "skipped-unparseable"
+    assert cfg.read_bytes() == doubled.encode()  # untouched
+
+
+# FIX 8c: manifest-supplied names that aren't safe path components are rejected.
+
+def test_unsafe_manifest_names_not_honored_on_prune(data_root, homes):
+    """A prior manifest carrying a traversal-y skill name (../evil) must never drive
+    a delete outside the target dir during the install prune pass."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    outsider = skills_base.parent / "evil"
+    outsider.mkdir(parents=True)
+    (outsider / "keep.txt").write_text("must survive\n")
+    ins._write_manifest(
+        homes["home"], "0.9",
+        {"../evil": "sha256:whatever"}, {}, {}, False, False, "before",
+    )
+    _install(data_root, homes)  # prune iterates prior skills incl. the bad name
+    assert (outsider / "keep.txt").read_text() == "must survive\n"  # untouched
+
+
+# FIX 8 LOW test gaps
+
+def test_command_skill_no_frontmatter_description_fallback(data_root, homes):
+    """A command with no frontmatter at all: description falls back to the first
+    non-empty body line and the body passes through verbatim."""
+    (data_root / "commands" / "plain.md").write_text(
+        "Just a plain command body.\nMore lines.\n", encoding="utf-8"
+    )
+    _install(data_root, homes)
+    text = (_skill_dir(homes, "plain") / "SKILL.md").read_text(encoding="utf-8")
+    meta = _frontmatter(text)
+    assert meta["name"] == "plain"
+    assert meta["description"] == "Just a plain command body."
+    assert _body_after_frontmatter(text) == "Just a plain command body.\nMore lines.\n"
+
+
+def test_corrupt_prior_manifest_does_not_crash_and_prune_noops(data_root, homes):
+    """A corrupt (unparseable) prior manifest is treated as empty: install does not
+    crash, prunes nothing, and writes a fresh valid manifest."""
+    mp = ins.manifest_path(homes["home"])
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    mp.write_text("{not valid json,,", encoding="utf-8")
+    summ = _install(data_root, homes)  # must not raise
+    assert summ.removed == []          # nothing to prune from a corrupt prior
+    assert "demo-skill" in summ.skills  # normal install still happens
+    assert _manifest(homes)["skills"]   # fresh manifest written
+
+
+def test_empty_data_root_installs_nothing_cleanly(homes, tmp_path):
+    """An empty data root yields no skills/prompts/agents and no rules block, with
+    an empty (but valid) manifest, and does not raise."""
+    empty = tmp_path / "empty-data"
+    empty.mkdir()
+    summ = ins.install_codex(
+        empty, home=homes["home"], agents_home=homes["agents_home"],
+        version="1.0", now_iso="now",
+    )
+    assert summ.skills == [] and summ.prompts == [] and summ.agents == []
+    assert summ.rules is False
+    manifest = _manifest(homes)
+    assert manifest["skills"] == {}
+    assert manifest["prompts"] == {}
+    assert manifest["agents"] == {}

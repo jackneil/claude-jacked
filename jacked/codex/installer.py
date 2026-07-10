@@ -44,7 +44,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,23 +56,98 @@ from .credentials import codex_home
 
 logger = logging.getLogger(__name__)
 
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write `text` to `path` as UTF-8 via a temp file + os.replace.
+
+    Mirrors cli._write_settings_atomic: write to a sibling temp file, flush +
+    os.fsync, then os.replace onto the target so a process killed mid-write can
+    never leave a half-written Codex file (AGENTS.md, config.toml, hooks.json,
+    manifest). Cleans up the temp file if anything fails.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _is_safe_name(name: str) -> bool:
+    """True iff `name` is a single, safe path component (no separators, no
+    traversal). Manifest-supplied artifact names are joined onto real dirs during
+    prune/uninstall; a name like ``../foo`` or ``a/b`` must never be honored."""
+    if not isinstance(name, str) or name in ("", ".", ".."):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    return Path(name).name == name
+
+
+def _marker_line_count(text: str, marker: str) -> int:
+    """How many lines of `text` are EXACTLY `marker` (stripped). Whole-line
+    matching so user prose that merely embeds the marker substring never counts."""
+    return sum(1 for line in text.splitlines() if line.strip() == marker)
+
+
+def _extract_block(
+    text: str, begin: str, end: str
+) -> Optional[tuple[str, str, str]]:
+    """Split `text` around jacked's whole-line-delimited ``begin``..``end`` block.
+
+    Returns ``(pre, block, post)`` where `block` is the marker-to-marker text
+    (markers inclusive, verbatim with line endings) and `pre`/`post` are the text
+    before/after it. Returns None when `begin`/`end` are not each present EXACTLY
+    once as their own lines, or `end` precedes `begin` - the caller then warns and
+    skips, so a marker embedded in user prose (or a duplicated/half marker) can
+    never trigger an edit that clobbers user content."""
+    if _marker_line_count(text, begin) != 1 or _marker_line_count(text, end) != 1:
+        return None
+    lines = text.splitlines(keepends=True)
+    bi = next(i for i, ln in enumerate(lines) if ln.strip() == begin)
+    ei = next(i for i, ln in enumerate(lines) if ln.strip() == end)
+    if ei < bi:
+        return None
+    return "".join(lines[:bi]), "".join(lines[bi:ei + 1]), "".join(lines[ei + 1:])
+
 _AGENTS_BEGIN = "<!-- BEGIN jacked behaviors (managed by `jacked install`) -->"
 _AGENTS_END = "<!-- END jacked behaviors (managed by `jacked install`) -->"
 
 # chrome-devtools MCP block markers + body. The block is a marker-wrapped
 # `[mcp_servers.chrome-devtools]` TOML table appended to ~/.codex/config.toml. Its
 # command/args MIRROR the Claude side (`_install_chrome_devtools_mcp` in
-# jacked/cli.py: `npx chrome-devtools-mcp@latest --autoConnect`) so the same server
-# backs both CLIs and Codex skills referencing `mcp__chrome-devtools__*` resolve.
-# The markers delimit exactly jacked's own entry so install can replace it and
-# uninstall can strip it without touching a user's own chrome-devtools table.
+# jacked/cli.py) so the same server backs both CLIs and Codex skills referencing
+# `mcp__chrome-devtools__*` resolve. The markers delimit exactly jacked's own entry
+# so install can replace it and uninstall can strip it without touching a user's
+# own chrome-devtools table.
 _MCP_BEGIN = "# BEGIN jacked chrome-devtools MCP (managed by `jacked install`)"
 _MCP_END = "# END jacked chrome-devtools MCP"
-_MCP_BLOCK_BODY = (
-    "[mcp_servers.chrome-devtools]\n"
-    'command = "npx"\n'
-    'args = ["chrome-devtools-mcp@latest", "--autoConnect"]'
-)
+
+
+def _mcp_block_body() -> str:
+    """The `[mcp_servers.chrome-devtools]` TOML table body, built from the SAME
+    npx package + autoConnect args the Claude side registers (cli.py's
+    ``CHROME_DEVTOOLS_NPX_PACKAGE`` / ``CHROME_DEVTOOLS_MODES["autoConnect"]``), so
+    the two CLIs never drift on the version/flags. Imported lazily to keep the
+    click CLI out of installer-module import time (like `_codex_qa_hook_command`)."""
+    from jacked.cli import CHROME_DEVTOOLS_MODES, CHROME_DEVTOOLS_NPX_PACKAGE
+
+    args = [CHROME_DEVTOOLS_NPX_PACKAGE, *CHROME_DEVTOOLS_MODES["autoConnect"]]
+    return (
+        "[mcp_servers.chrome-devtools]\n"
+        'command = "npx"\n'
+        f"args = {json.dumps(args)}"
+    )
 
 # A jacked-managed hook entry is identified by a marker substring in its command
 # (present in both the `"jacked" _hook <name>` shim and the `-m jacked _hook
@@ -191,6 +268,67 @@ def _sha_dir(d: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
+def _sha_solo_skill(content: str) -> str:
+    """The `_sha_dir` value a solo skill dir (only ``SKILL.md`` holding `content`)
+    will hash to once written, computed without touching disk. Mirrors `_sha_dir`
+    for a single UTF-8 ``SKILL.md`` so a pre-write byte-identity check is exact."""
+    h = hashlib.sha256()
+    h.update(b"SKILL.md")
+    h.update(content.encode("utf-8"))
+    return "sha256:" + h.hexdigest()
+
+
+def _is_jacked_owned(
+    name: str, prior_manifest: Mapping, this_run: Optional[Mapping] = None
+) -> bool:
+    """True iff overwriting `name` is replacing jacked's own copy, not the user's.
+
+    Jacked-owned means recorded as a jacked skill in the PRIOR manifest, OR
+    already written by an earlier pass of the CURRENT run (`this_run` is the
+    in-progress skills dict). The second case matters because step 1 writes a
+    pointer-wrapper skill dir that step 2 (command-derived skill) then overwrites
+    within the same install: without it, step 2 would mistake jacked's own
+    step-1 output for user content and back it up as a spurious `.pre-jacked`."""
+    if name in (prior_manifest.get("skills") or {}):
+        return True
+    return this_run is not None and name in this_run
+
+
+def _preserve_user_skill_dir(
+    target: Path, expected_hash: str, name: str,
+    prior_manifest: Mapping, preserved: list,
+    this_run: Optional[Mapping] = None,
+) -> None:
+    """Never destroy a user's OWN ~/.agents/skills/<name> on a name collision.
+
+    ~/.agents/skills is a shared surface; a user may own a dir whose name collides
+    with a jacked skill/command stem (pr, release, dcr, ...). Before jacked
+    overwrites `target`, if the dir exists, is NOT already jacked-owned (per the
+    prior manifest or written earlier this run via `this_run`), and is not already
+    byte-identical to what we'd install, move it aside to ``<target>.pre-jacked``
+    (replacing any stale backup first) so the user's copy survives. Records
+    ``skills/<name>`` in `preserved`. The caller then writes jacked's copy into
+    the now-vacant path."""
+    if not (target.exists() or target.is_symlink()):
+        return
+    if _is_jacked_owned(name, prior_manifest, this_run):
+        return
+    if (target.is_dir() and not target.is_symlink()
+            and _sha_dir(target) == expected_hash):
+        return  # already exactly what we'd install -> no clobber, no backup
+    backup = target.with_name(target.name + ".pre-jacked")
+    if backup.exists() or backup.is_symlink():
+        if backup.is_dir() and not backup.is_symlink():
+            shutil.rmtree(backup)
+        else:
+            backup.unlink()
+    shutil.move(str(target), str(backup))
+    logger.warning(
+        "preserved your existing ~/.agents/skills/%s as %s.pre-jacked", name, name
+    )
+    preserved.append(f"skills/{name}")
+
+
 def _copy_tree(src: Path, dst: Path) -> None:
     """Replace dst with an exact copy of src (no stale sidecars left behind)."""
     if dst.exists() or dst.is_symlink():
@@ -212,7 +350,7 @@ def _write_solo_skill(skill_dir: Path, content: str) -> None:
         else:
             skill_dir.unlink()
     skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(content)
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -280,15 +418,25 @@ def _command_skill_md(cmd: Path) -> str:
     line, trimmed and quoted via json.dumps so colons/quotes stay a valid YAML
     scalar), and passes through `argument-hint` when the command declares one.
     The body below is the command's content verbatim after its own frontmatter
-    (the whole file when it has none)."""
-    meta, body = _split_command_frontmatter(cmd.read_text())
+    (the whole file when it has none).
+
+    ``ensure_ascii=False`` is REQUIRED on every json.dumps here (same reason as
+    `_agent_toml`): the default escapes astral-plane emoji as UTF-16 surrogate
+    pairs (``\\uD83D\\uDE00``), which strict YAML rejects as a lone surrogate.
+    Emitting the chars literally as UTF-8 keeps the double-quoted YAML scalar
+    valid. `name` is quoted too, for symmetry and to survive stems YAML would
+    otherwise choke on."""
+    meta, body = _split_command_frontmatter(cmd.read_text(encoding="utf-8"))
     desc = (meta.get("description") or _first_nonempty_line(body)).strip()
-    lines = [f"name: {cmd.stem}", f"description: {json.dumps(desc)}"]
+    lines = [
+        f"name: {json.dumps(cmd.stem, ensure_ascii=False)}",
+        f"description: {json.dumps(desc, ensure_ascii=False)}",
+    ]
     hint = meta.get("argument-hint")
     if hint is not None:
         # Re-quote: the parser returns clean unquoted values, and a bare
         # "[--flag]" would parse as a YAML flow sequence, not a string.
-        lines.append(f"argument-hint: {json.dumps(hint)}")
+        lines.append(f"argument-hint: {json.dumps(hint, ensure_ascii=False)}")
     return "---\n" + "\n".join(lines) + "\n---\n" + body
 
 
@@ -315,7 +463,7 @@ def _agent_toml(agent_md: Path) -> str:
     non-empty body line when the frontmatter omits it. Claude-only `tools:` /
     `model:` keys are deliberately NOT carried over: no model is pinned so Codex
     picks its own."""
-    meta, body = _split_command_frontmatter(agent_md.read_text())
+    meta, body = _split_command_frontmatter(agent_md.read_text(encoding="utf-8"))
     desc = (meta.get("description") or _first_nonempty_line(body)).strip()
     return (
         f"name = {json.dumps(agent_md.stem, ensure_ascii=False)}\n"
@@ -349,29 +497,47 @@ def _codex_rules_body(text: str) -> str:
 
 def _install_agents_block(path: Path, body: str) -> None:
     block = f"{_AGENTS_BEGIN}\n{body.strip()}\n{_AGENTS_END}\n"
-    existing = path.read_text() if path.exists() else ""
-    if _AGENTS_BEGIN in existing and _AGENTS_END in existing:
-        pre = existing.split(_AGENTS_BEGIN)[0].rstrip("\n")
-        post = existing.split(_AGENTS_END, 1)[1].lstrip("\n")
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    begin_ct = _marker_line_count(existing, _AGENTS_BEGIN)
+    end_ct = _marker_line_count(existing, _AGENTS_END)
+    if begin_ct == 0 and end_ct == 0:
+        new = (existing.rstrip("\n") + "\n\n" + block) if existing.strip() else block
+    else:
+        extracted = _extract_block(existing, _AGENTS_BEGIN, _AGENTS_END)
+        if extracted is None:
+            logger.warning(
+                "unexpected jacked marker layout in %s (begin=%d, end=%d); leaving "
+                "it untouched rather than risk clobbering your content",
+                path, begin_ct, end_ct,
+            )
+            return
+        pre, _block, post = extracted
+        pre = pre.rstrip("\n")
+        post = post.lstrip("\n")
         parts = [p for p in (pre, block.rstrip("\n"), post) if p]
         new = "\n\n".join(parts).rstrip("\n") + "\n"
-    else:
-        new = (existing.rstrip("\n") + "\n\n" + block) if existing.strip() else block
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new)
+    _atomic_write_text(path, new)
 
 
 def _strip_agents_block(path: Path) -> bool:
     if not path.exists():
         return False
-    existing = path.read_text()
-    if _AGENTS_BEGIN not in existing or _AGENTS_END not in existing:
+    existing = path.read_text(encoding="utf-8")
+    extracted = _extract_block(existing, _AGENTS_BEGIN, _AGENTS_END)
+    if extracted is None:
+        if _marker_line_count(existing, _AGENTS_BEGIN) or _marker_line_count(
+            existing, _AGENTS_END
+        ):
+            logger.warning(
+                "unexpected jacked marker layout in %s; leaving it untouched", path
+            )
         return False
-    pre = existing.split(_AGENTS_BEGIN)[0].rstrip("\n")
-    post = existing.split(_AGENTS_END, 1)[1].lstrip("\n")
+    pre, _block, post = extracted
+    pre = pre.rstrip("\n")
+    post = post.lstrip("\n")
     parts = [p for p in (pre, post) if p]
     new = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
-    path.write_text(new)
+    _atomic_write_text(path, new)
     return True
 
 
@@ -381,16 +547,18 @@ def _strip_agents_block(path: Path) -> bool:
 
 def _mcp_block() -> str:
     """The full marker-wrapped block, marker-to-marker plus a trailing newline."""
-    return f"{_MCP_BEGIN}\n{_MCP_BLOCK_BODY}\n{_MCP_END}\n"
+    return f"{_MCP_BEGIN}\n{_mcp_block_body()}\n{_MCP_END}\n"
 
 
 def _write_mcp_verified(cfg: Path, new_text: str, original: Optional[bytes],
                         status: str) -> str:
-    """Write `new_text`, then parse-check the result with tomllib. On failure,
-    restore the file to `original` bytes exactly (or delete it when we created it,
-    i.e. original is None) and return "skipped-unparseable" - never leave a broken
-    config. On success return `status`."""
-    cfg.write_text(new_text)
+    """Atomically write `new_text`, then parse-check the result with tomllib. On
+    failure, restore the file to `original` bytes exactly (or delete it when we
+    created it, i.e. original is None) and return "skipped-unparseable" - never
+    leave a broken config. On success return `status`. The atomic write and the
+    post-write parse-check are complementary: the first prevents a torn file, the
+    second guarantees the (whole) file we produced is valid TOML."""
+    _atomic_write_text(cfg, new_text)
     try:
         tomllib.loads(new_text)
     except tomllib.TOMLDecodeError:
@@ -431,7 +599,7 @@ def ensure_chrome_devtools_mcp(
     home = home or codex_home(env)
     cfg = codex_config_toml(home)
     block = _mcp_block()
-    desired_block = f"{_MCP_BEGIN}\n{_MCP_BLOCK_BODY}\n{_MCP_END}"
+    desired_block = f"{_MCP_BEGIN}\n{_mcp_block_body()}\n{_MCP_END}"
 
     # Missing config.toml -> create it containing only our marked block.
     if not cfg.exists():
@@ -440,7 +608,7 @@ def ensure_chrome_devtools_mcp(
 
     original = cfg.read_bytes()
     try:
-        text = original.decode()
+        text = original.decode("utf-8")
         parsed = tomllib.loads(text)
     except (UnicodeDecodeError, tomllib.TOMLDecodeError):
         logger.warning(
@@ -449,16 +617,27 @@ def ensure_chrome_devtools_mcp(
         )
         return "skipped-unparseable"
 
-    # Our marked block already present -> replace in place iff its body drifted.
-    # (A duplicate user chrome-devtools table alongside ours would be a TOML
-    # duplicate-key error and never reach here - it'd fail the parse above.)
-    if _MCP_BEGIN in text and _MCP_END in text:
-        pre, _, rest = text.partition(_MCP_BEGIN)
-        current_inner, _, post = rest.partition(_MCP_END)
-        current_block = f"{_MCP_BEGIN}{current_inner}{_MCP_END}"
-        if current_block == desired_block:
+    # Our marked block already present (whole-line markers) -> replace in place iff
+    # its body drifted. Whole-line matching so a marker embedded in a user string
+    # can't be mistaken for our block. (A duplicate user chrome-devtools table
+    # alongside ours would be a TOML duplicate-key error and never reach here.)
+    begin_ct = _marker_line_count(text, _MCP_BEGIN)
+    end_ct = _marker_line_count(text, _MCP_END)
+    if begin_ct or end_ct:
+        extracted = _extract_block(text, _MCP_BEGIN, _MCP_END)
+        if extracted is None:
+            logger.warning(
+                "unexpected jacked chrome-devtools marker layout in %s (begin=%d, "
+                "end=%d); leaving it untouched and skipping registration",
+                cfg, begin_ct, end_ct,
+            )
+            return "skipped-unparseable"
+        pre, current_block, post = extracted
+        if current_block.rstrip("\n") == desired_block:
             return "unchanged"
-        return _write_mcp_verified(cfg, pre + desired_block + post, original, "updated")
+        return _write_mcp_verified(
+            cfg, pre + desired_block + "\n" + post, original, "updated"
+        )
 
     # A user's OWN (unmarked) chrome-devtools entry -> never fight it.
     if "chrome-devtools" in (parsed.get("mcp_servers") or {}):
@@ -480,20 +659,26 @@ def _strip_mcp_block(cfg: Path) -> bool:
     if not cfg.exists():
         return False
     try:
-        text = cfg.read_text()
+        text = cfg.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    if _MCP_BEGIN not in text or _MCP_END not in text:
+    extracted = _extract_block(text, _MCP_BEGIN, _MCP_END)
+    if extracted is None:
+        if _marker_line_count(text, _MCP_BEGIN) or _marker_line_count(text, _MCP_END):
+            logger.warning(
+                "unexpected jacked chrome-devtools marker layout in %s; leaving it "
+                "untouched", cfg,
+            )
         return False
-    before = text.split(_MCP_BEGIN, 1)[0]
-    after = text.split(_MCP_END, 1)[1]
-    if before.endswith("\n\n"):          # the blank-line separator we appended
-        before = before[:-2]
-    if after.startswith("\n"):           # our block's own trailing newline
-        after = after[1:]
-    new_text = before + after
+    # `_extract_block` already consumed the block's own trailing newline into
+    # `block`, so `post` is clean; drop the blank-line separator install inserted
+    # before the block (which lives at the tail of `pre`).
+    pre, _block, post = extracted
+    if pre.endswith("\n\n"):
+        pre = pre[:-2]
+    new_text = pre + post
     if new_text:
-        cfg.write_text(new_text)
+        _atomic_write_text(cfg, new_text)
     else:
         cfg.unlink()                     # only our block existed -> jacked-created
     return True
@@ -519,10 +704,15 @@ def _remove_codex_hooks(path: Path, markers: tuple = _HOOK_MARKERS) -> bool:
     if not path.exists():
         return False
     try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return False
+    if not isinstance(data, dict):
+        # A non-object root is not ours to rewrite; leave it byte-untouched.
         return False
     hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return False
     changed = False
     for event in list(hooks.keys()):
         kept = [g for g in hooks[event] if not _is_jacked_hook_group(g, markers)]
@@ -538,7 +728,7 @@ def _remove_codex_hooks(path: Path, markers: tuple = _HOOK_MARKERS) -> bool:
     if not data:
         path.unlink()
     else:
-        path.write_text(json.dumps(data, indent=2) + "\n")
+        _atomic_write_text(path, json.dumps(data, indent=2) + "\n")
     return changed
 
 
@@ -565,18 +755,33 @@ def _install_codex_qa_hook(home: Optional[Path] = None) -> bool:
     by ``_hook qa_suggest`` in its command (like ``_is_jacked_hook_group``): if
     present with a drifted command it's replaced in place (not duplicated); other
     entries and unknown top-level keys are never touched. Returns True when our
-    entry is present after the call."""
+    entry is present after the call.
+
+    If hooks.json exists but is unparseable (bad JSON - including a trailing
+    comma - or a non-UTF-8 file) OR its root is not a JSON object, we DO NOT
+    write: warn and return False, leaving the user's file byte-identical (mirrors
+    ``ensure_chrome_devtools_mcp``'s skipped-unparseable contract). Clobbering
+    every user hook to force ours in would be worse than skipping."""
     path = codex_hooks_json(home)
     command = _codex_qa_hook_command()
 
     data: dict = {}
     if path.exists():
         try:
-            loaded = json.loads(path.read_text())
-            if isinstance(loaded, dict):
-                data = loaded
-        except (json.JSONDecodeError, OSError):
-            data = {}
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            logger.warning(
+                "Codex hooks.json at %s did not parse (%s); leaving it untouched "
+                "and skipping the QA hook", path, exc,
+            )
+            return False
+        if not isinstance(loaded, dict):
+            logger.warning(
+                "Codex hooks.json at %s has a non-object root; leaving it untouched "
+                "and skipping the QA hook", path,
+            )
+            return False
+        data = loaded
 
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
@@ -596,8 +801,7 @@ def _install_codex_qa_hook(home: Optional[Path] = None) -> bool:
     else:
         stop.append({"matcher": "", "hooks": entry_hooks})
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
+    _atomic_write_text(path, json.dumps(data, indent=2) + "\n")
     return True
 
 
@@ -608,17 +812,15 @@ def _install_codex_qa_hook(home: Optional[Path] = None) -> bool:
 def _load_manifest(home: Path) -> Optional[dict]:
     p = manifest_path(home)
     try:
-        return json.loads(p.read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
         return None
 
 
 def _write_manifest(home: Path, version: str, skills: dict, prompts: dict,
                     agents: dict, rules: bool, hooks: bool, now_iso: str,
                     mcp: str = "") -> None:
-    p = manifest_path(home)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({
+    _atomic_write_text(manifest_path(home), json.dumps({
         "version": version,
         "written_at": now_iso,
         "skills": skills,
@@ -644,6 +846,7 @@ class CodexInstallSummary:
     hooks_added: bool = False
     mcp: str = ""
     removed: list = field(default_factory=list)
+    preserved: list = field(default_factory=list)
     changed: bool = False
 
 
@@ -665,18 +868,26 @@ def install_codex(
     agents_dst = codex_agents_dir(home)
 
     prior = _load_manifest(home) or {}
+    preserved: list = []
 
     # 1. Skills: full dir copy (sidecars included). Claude-only skills are
     #    skipped so they never land in Codex. This runs FIRST so any pointer-
     #    wrapper skill dir is in place before step 2 overwrites the ones that
     #    have a same-name command (precedence rule: command content wins).
+    #    Before overwriting a target, `_preserve_user_skill_dir` moves aside any
+    #    NON-jacked dir that collides with a skill name (shared ~/.agents/skills),
+    #    so a user's own dir is never silently destroyed.
     skills: dict = {}
     for skill_md in sorted((data_root / "skills").glob("*/SKILL.md")):
         name = skill_md.parent.name
         if name in _CLAUDE_ONLY_SKILLS:
             continue
+        expected = _sha_dir(skill_md.parent)
+        _preserve_user_skill_dir(
+            skills_base / name, expected, name, prior, preserved
+        )
         _copy_tree(skill_md.parent, skills_base / name)
-        skills[name] = _sha_dir(skill_md.parent)
+        skills[name] = expected
 
     # 2. Commands -> prompts AND command-derived skills. Claude-only commands are
     #    skipped so they never land in Codex (and the prune loop below deletes any
@@ -696,7 +907,14 @@ def install_codex(
             shutil.copy(cmd, prompts_dst / cmd.name)
             prompts[cmd.name] = _sha_file(cmd)
             skill_dir = skills_base / cmd.stem
-            _write_solo_skill(skill_dir, _command_skill_md(cmd))
+            content = _command_skill_md(cmd)
+            # this_run=skills: a wrapper dir step 1 wrote this run is jacked's own,
+            # not user content, so overwriting it must not spawn a .pre-jacked.
+            _preserve_user_skill_dir(
+                skill_dir, _sha_solo_skill(content), cmd.stem, prior, preserved,
+                this_run=skills,
+            )
+            _write_solo_skill(skill_dir, content)
             skills[cmd.stem] = _sha_dir(skill_dir)
 
     # 3. Rules -> AGENTS.md block. The body is authored for Claude Code, so it is
@@ -705,7 +923,10 @@ def install_codex(
     rules_done = False
     rules_src = data_root / "rules" / "jacked_behaviors.md"
     if rules_src.exists():
-        _install_agents_block(codex_agents_md(home), _codex_rules_body(rules_src.read_text()))
+        _install_agents_block(
+            codex_agents_md(home),
+            _codex_rules_body(rules_src.read_text(encoding="utf-8")),
+        )
         rules_done = True
 
     # 4. Agents -> ~/.codex/agents/<stem>.toml. jacked's Claude Code subagent
@@ -722,7 +943,19 @@ def install_codex(
         agents_dst.mkdir(parents=True, exist_ok=True)
         for agent_md in sorted(agents_src_dir.glob("*.md")):
             content = _agent_toml(agent_md)
-            (agents_dst / f"{agent_md.stem}.toml").write_text(content)
+            # Parse-check before writing (mirrors the MCP verify): never persist a
+            # TOML that Codex can't load. A stray control char in the source body
+            # (e.g. U+007F, which json emits literally but TOML basic strings
+            # forbid) would otherwise ship a broken agent file.
+            try:
+                tomllib.loads(content)
+            except tomllib.TOMLDecodeError:
+                logger.warning(
+                    "generated Codex agent TOML for %s did not parse; skipping it",
+                    agent_md.name,
+                )
+                continue
+            _atomic_write_text(agents_dst / f"{agent_md.stem}.toml", content)
             agents[agent_md.stem] = _sha_text(content)
 
     # 5. chrome-devtools MCP -> a marker-wrapped [mcp_servers.chrome-devtools] table
@@ -740,30 +973,36 @@ def install_codex(
     #    into `changed`; hooks_added (entry absent before, present after) drives
     #    the one-time /hooks trust notice cli.py prints.
     hooks_path = codex_hooks_json(home)
-    _hooks_before = hooks_path.read_text() if hooks_path.exists() else None
+    _hooks_before = (
+        hooks_path.read_text(encoding="utf-8") if hooks_path.exists() else None
+    )
     _qa_present_before = _hooks_before is not None and _QA_HOOK_MARKER in _hooks_before
     _remove_codex_hooks(hooks_path, markers=_LEGACY_HOOK_MARKERS)
     hooks_done = _install_codex_qa_hook(home)
-    _hooks_after = hooks_path.read_text() if hooks_path.exists() else None
+    _hooks_after = (
+        hooks_path.read_text(encoding="utf-8") if hooks_path.exists() else None
+    )
     hooks_changed = _hooks_before != _hooks_after
     hooks_added = hooks_done and not _qa_present_before
 
-    # Prune artifacts shipped before but not now.
+    # Prune artifacts shipped before but not now. Manifest-supplied names are
+    # validated as single safe path components before being joined onto real dirs
+    # (a malformed name never drives a delete outside the target dir).
     removed = []
     for name in (prior.get("skills") or {}):
-        if name not in skills:
+        if name not in skills and _is_safe_name(name):
             d = skills_base / name
             if d.is_dir():
                 shutil.rmtree(d, ignore_errors=True)
                 removed.append(f"skills/{name}")
     for name in (prior.get("prompts") or {}):
-        if name not in prompts:
+        if name not in prompts and _is_safe_name(name):
             f = prompts_dst / name
             if f.exists():
                 f.unlink()
                 removed.append(f"prompts/{name}")
     for name in (prior.get("agents") or {}):
-        if name not in agents:
+        if name not in agents and _is_safe_name(name):
             f = agents_dst / f"{name}.toml"
             if f.exists():
                 f.unlink()
@@ -783,7 +1022,7 @@ def install_codex(
     return CodexInstallSummary(
         skills=list(skills), prompts=list(prompts), agents=list(agents),
         rules=rules_done, hooks=hooks_done, hooks_added=hooks_added, mcp=mcp_status,
-        removed=removed, changed=changed,
+        removed=removed, preserved=preserved, changed=changed,
     )
 
 
@@ -800,18 +1039,37 @@ def uninstall_codex(
     agents_dst = codex_agents_dir(home)
     manifest = _load_manifest(home) or {}
     removed: list = []
+    skipped: list = []
 
-    for name in (manifest.get("skills") or {}):
+    # Skills: only rmtree a dir whose CURRENT content still hashes to what the
+    # manifest recorded (i.e. jacked wrote it and the user hasn't replaced it). If
+    # the user recreated/edited it under the same name, LEAVE it and note it, so
+    # uninstall never destroys a dir that is no longer jacked's.
+    for name, recorded in (manifest.get("skills") or {}).items():
+        if not _is_safe_name(name):
+            continue
         d = skills_base / name
-        if d.is_dir():
+        if not d.is_dir():
+            continue
+        if isinstance(recorded, str) and _sha_dir(d) == recorded:
             shutil.rmtree(d, ignore_errors=True)
             removed.append(f"skills/{name}")
+        else:
+            logger.warning(
+                "leaving Codex skill dir %s in place: its content no longer matches "
+                "what jacked installed (you likely modified or recreated it)", d,
+            )
+            skipped.append(f"skills/{name}")
     for name in (manifest.get("prompts") or {}):
+        if not _is_safe_name(name):
+            continue
         f = prompts_dst / name
         if f.exists():
             f.unlink()
             removed.append(f"prompts/{name}")
     for name in (manifest.get("agents") or {}):
+        if not _is_safe_name(name):
+            continue
         f = agents_dst / f"{name}.toml"
         if f.exists():
             f.unlink()
@@ -828,4 +1086,4 @@ def uninstall_codex(
     mp = manifest_path(home)
     if mp.exists():
         mp.unlink()
-    return {"removed": removed}
+    return {"removed": removed, "skipped": skipped}
