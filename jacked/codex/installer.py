@@ -38,10 +38,30 @@ _HOOK_MARKERS = ("_hook security_gatekeeper",)
 
 # Skills that are Claude-only and must NOT be deployed to Codex. `chain-of-command`
 # is a Claude Code model-dispatch policy (Fable plans, Opus codes); Codex has no
-# equivalent multi-model dispatch, so shipping it there is dead weight. Excluded
-# names never enter the Codex skills dict, so they're never written to
-# ~/.agents/skills and never recorded in the Codex manifest.
-_CLAUDE_ONLY_SKILLS = frozenset({"chain-of-command"})
+# equivalent multi-model dispatch, so shipping it there is dead weight. `recover`'s
+# entire purpose is recovering crashed CLAUDE CODE sessions: it reads
+# ~/.claude/projects transcripts via `jacked recover` and ends with `claude
+# --resume`, so it's useless and misleading inside Codex. Excluded names never
+# enter the Codex skills dict, so they're never written to ~/.agents/skills and
+# never recorded in the Codex manifest.
+_CLAUDE_ONLY_SKILLS = frozenset({"chain-of-command", "recover"})
+
+# Commands that are Claude-only and must NOT be deployed to Codex prompts. Each is
+# wired to Claude Code machinery Codex has no analog for:
+#   swarm.md         - Claude Code's experimental agent teams (the Task/Agent tool +
+#                      SendMessage, gated by CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS in
+#                      settings.json).
+#   goal-maker.md    - forges briefs for Claude Code's built-in /goal
+#                      completion-condition engine.
+#   browser-reset.md - diagnoses Claude Code's MCP plumbing (Claude log paths, the
+#                      `claude mcp` CLI, plugin MCP servers).
+#   jacked-setup.md  - generates a repo-local .claude/commands + .claude/skills
+#                      layout that Codex never reads.
+# Excluded names never enter the Codex prompts dict, so they're never written to
+# ~/.codex/prompts and never recorded in the Codex manifest.
+_CLAUDE_ONLY_COMMANDS = frozenset(
+    {"swarm.md", "goal-maker.md", "browser-reset.md", "jacked-setup.md"}
+)
 
 
 
@@ -239,11 +259,14 @@ def install_codex(
         _copy_tree(skill_md.parent, skills_base / name)
         skills[name] = _sha_dir(skill_md.parent)
 
-    # 2. Commands -> prompts.
+    # 2. Commands -> prompts. Claude-only commands are skipped so they never
+    #    land in Codex (and the prune loop below deletes any prior copies).
     prompts: dict = {}
     if (data_root / "commands").exists():
         prompts_dst.mkdir(parents=True, exist_ok=True)
         for cmd in sorted((data_root / "commands").glob("*.md")):
+            if cmd.name in _CLAUDE_ONLY_COMMANDS:
+                continue
             shutil.copy(cmd, prompts_dst / cmd.name)
             prompts[cmd.name] = _sha_file(cmd)
 
