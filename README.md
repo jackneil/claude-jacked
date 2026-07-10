@@ -1,6 +1,6 @@
 # claude-jacked
 
-**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar app with a full fleet panel one click away. Plus a curated set of 29 slash commands, 24 skills, and 10 review agents installed into Claude Code, all managed from a web dashboard.
+**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar app with a full fleet panel one click away. Plus a curated set of 29 slash commands, 25 skills, and 10 review agents installed into Claude Code, all managed from a web dashboard.
 
 <table>
 <tr>
@@ -15,7 +15,7 @@
 
 - **Run multiple Claude accounts like one.** Add every account you own, watch each one's 5-hour, 7-day, and per-model usage live, and let auto-swap rotate to a fresh account before you hit a limit. Works for Codex accounts too, side by side with Claude.
 - **A menu-bar app that actually earns its pixels.** A live pill shows your active account's usage next to the clock (`18%·4%`, tinted green/yellow/red). Left-click drops the whole fleet down in a compact panel: every account, every org, per-model caps, reset times, and who's active. Right-click for actions, or pin the panel to your screen edge. It refreshes within about a second of any account switch or usage change, and it tells you when a new jacked version ships: a badge on the icon, a notification banner, and a one-click update.
-- **A curated skills suite, one command to install.** `jacked install` puts 29 battle-tested slash commands, 24 skills, and 10 review agents into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills). When Codex is installed too, the same pass deploys the suite into Codex's native formats: skills into `~/.agents/skills`, commands as both prompts and command-derived skills, the behavioral rules (Codex-adapted) into `~/.codex/AGENTS.md`, the 10 review agents as Codex TOML custom agents, the chrome-devtools MCP server, and a `$qa` suggestion hook, with a few Claude-only helpers held back and everything tracked in a Codex manifest so `jacked uninstall` reverses it. Upgrades diff cleanly: added/changed/removed, never touching your own files.
+- **A curated skills suite, one command to install.** `jacked install` puts 29 battle-tested slash commands, 25 skills, and 10 review agents into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills) and a website-cloning skill adapted with credit from [JCodesMore's ai-website-cloner-template](https://github.com/JCodesMore/ai-website-cloner-template). When Codex is installed too, the same pass deploys the suite into Codex's native formats: skills into `~/.agents/skills`, commands as both prompts and command-derived skills, the behavioral rules (Codex-adapted) into `~/.codex/AGENTS.md`, the 10 review agents as Codex TOML custom agents, the chrome-devtools MCP server, and a `$qa` suggestion hook, with a few Claude-only helpers held back and everything tracked in a Codex manifest so `jacked uninstall` reverses it. Upgrades diff cleanly: added/changed/removed, never touching your own files.
 - **Manage everything from a web dashboard.** Accounts, usage analytics, feature toggles, appearance themes, swap history, logs, all from your browser. No config files, no terminal commands.
 - **Permission hygiene built in.** `jacked permissions audit` finds (and can prune) dangerously broad Bash wildcards in your Claude Code permission allowlists, and the dashboard's Permissions panel manages allow rules with project vs global scope.
 
@@ -131,7 +131,7 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
 | **29 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/blindspot`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
-| **24 Skills** | Engines and knowledge packs behind the commands, plus standalone ones: `jack-it-up`, `coverage-matrix`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
+| **25 Skills** | Engines and knowledge packs behind the commands, plus standalone ones: `jack-it-up`, `coverage-matrix`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `clone-website`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -485,12 +485,12 @@ Use the double-check reviewer to review what we just built
 
 ### Skills
 
-Alongside the commands, `jacked install` ships 24 skills: knowledge packs and engines Claude invokes by name or picks up automatically when the task fits. Many power the commands above; the rest stand alone.
+Alongside the commands, `jacked install` ships 25 skills: knowledge packs and engines Claude invokes by name or picks up automatically when the task fits. Many power the commands above; the rest stand alone.
 
 | Group | Skills |
 |-------|--------|
 | **Review & QA engines** | `dcr` (recursive multi-lens review), `qa`, `ux`, `qa-video`, `aesthetic-dogfood-audit` (drive the whole app as every persona and judge function + finish) |
-| **Autonomous delivery** | `whats-next`, `coverage-matrix` (persona x domain gap scoring), `jack-it-up` (full brainstorm-plan-build-review cycle), `recursive-10-10-product-hardening`, `swarm-research`, `checkpoint`, `recover` |
+| **Autonomous delivery** | `whats-next`, `coverage-matrix` (persona x domain gap scoring), `jack-it-up` (full brainstorm-plan-build-review cycle), `clone-website` (reverse-engineer a site you own or are authorized to reproduce, dispatching parallel builder agents in worktrees), `recursive-10-10-product-hardening`, `swarm-research`, `checkpoint`, `recover` |
 | **Design engineering** | `emil-design-eng` (UI polish + animation craft rules), `review-animations` (strict motion review with a non-negotiable standards bar), `animation-vocabulary` (name that effect), `apple-design` (fluid, physical motion and Apple's design principles, translated for the web) |
 | **Docs & branding** | `docs-sync`, `demo-video`, `launch-post`, `logo-forge`, `claude-md-optimizer` |
 | **Ops & infrastructure** | `deploy-to-railway`, `lockdown` (supply-chain audit), `chain-of-command` (session model-dispatch policy: top model plans and judges, Opus does volume work, cheap tiers do pure search) |
