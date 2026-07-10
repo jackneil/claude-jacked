@@ -6,7 +6,13 @@ Codex pass when Codex is present, writing the native Codex installables:
 - skills   -> ~/.agents/skills/<name>/   (FULL dir incl. sidecar files: the
              agentskills.io standard Codex discovers; jacked's SKILL.md already
              carries name+description frontmatter)
-- commands -> ~/.codex/prompts/<name>.md (invoked /prompts:<name> in Codex)
+- commands -> BOTH ~/.codex/prompts/<name>.md (invoked /prompts:<name> in Codex)
+             AND ~/.agents/skills/<stem>/SKILL.md. OpenAI deprecated the
+             ~/.codex/prompts surface on 2026-01-22 in favor of skills, so each
+             non-excluded command is also emitted as a command-derived skill; the
+             prompts copy stays for back-compat during the deprecation window. A
+             command-derived skill OVERWRITES any same-name pointer-wrapper skill
+             dir from the skills pass (command content wins).
 - rules    -> a managed block in ~/.codex/AGENTS.md (Codex's CLAUDE.md analog)
 - legacy gatekeeper hooks.json entries are PRUNED on install (the
              gatekeeper was retired in 0.70.0)
@@ -118,6 +124,72 @@ def _copy_tree(src: Path, dst: Path) -> None:
         else:
             dst.unlink()
     shutil.copytree(src, dst)
+
+
+def _write_solo_skill(skill_dir: Path, content: str) -> None:
+    """Replace skill_dir with a single-file skill (only SKILL.md).
+
+    Mirrors _copy_tree's replace semantics so a prior pointer-wrapper copy (and
+    any of its sidecars) is wiped, leaving nothing stale behind."""
+    if skill_dir.exists() or skill_dir.is_symlink():
+        if skill_dir.is_dir() and not skill_dir.is_symlink():
+            shutil.rmtree(skill_dir)
+        else:
+            skill_dir.unlink()
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(content)
+
+
+# ---------------------------------------------------------------------------
+# Command -> Codex skill (OpenAI deprecated ~/.codex/prompts on 2026-01-22 in
+# favor of the agentskills.io skills surface, so every non-excluded command is
+# also emitted as a skill)
+# ---------------------------------------------------------------------------
+
+def _split_command_frontmatter(text: str) -> tuple[dict, str]:
+    """Split a leading `---`-delimited frontmatter block off a command file.
+
+    Returns (meta, body): meta maps each flat `key: value` line to its raw value
+    (right of the first colon, stripped); body is everything after the closing
+    `---` (the whole file verbatim when there is no frontmatter). Line-based on
+    purpose - jacked command frontmatter is flat key/value pairs and PyYAML is
+    not a runtime dependency."""
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, text
+    meta: dict = {}
+    for line in text[4:end].splitlines():
+        if ":" in line and not line.lstrip().startswith("#"):
+            key, _, val = line.partition(":")
+            meta[key.strip()] = val.strip()
+    return meta, text[end + len("\n---\n"):]
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _command_skill_md(cmd: Path) -> str:
+    """Build the SKILL.md content that ships a command as a Codex skill.
+
+    Generated frontmatter carries `name` (the command's stem), `description`
+    (the command's own frontmatter description, else its first non-empty body
+    line, trimmed and quoted via json.dumps so colons/quotes stay a valid YAML
+    scalar), and passes through `argument-hint` when the command declares one.
+    The body below is the command's content verbatim after its own frontmatter
+    (the whole file when it has none)."""
+    meta, body = _split_command_frontmatter(cmd.read_text())
+    desc = (meta.get("description") or _first_nonempty_line(body)).strip()
+    lines = [f"name: {cmd.stem}", f"description: {json.dumps(desc)}"]
+    hint = meta.get("argument-hint")
+    if hint is not None:
+        lines.append(f"argument-hint: {hint}")
+    return "---\n" + "\n".join(lines) + "\n---\n" + body
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +322,9 @@ def install_codex(
     prior = _load_manifest(home) or {}
 
     # 1. Skills: full dir copy (sidecars included). Claude-only skills are
-    #    skipped so they never land in Codex.
+    #    skipped so they never land in Codex. This runs FIRST so any pointer-
+    #    wrapper skill dir is in place before step 2 overwrites the ones that
+    #    have a same-name command (precedence rule: command content wins).
     skills: dict = {}
     for skill_md in sorted((data_root / "skills").glob("*/SKILL.md")):
         name = skill_md.parent.name
@@ -259,8 +333,15 @@ def install_codex(
         _copy_tree(skill_md.parent, skills_base / name)
         skills[name] = _sha_dir(skill_md.parent)
 
-    # 2. Commands -> prompts. Claude-only commands are skipped so they never
-    #    land in Codex (and the prune loop below deletes any prior copies).
+    # 2. Commands -> prompts AND command-derived skills. Claude-only commands are
+    #    skipped so they never land in Codex (and the prune loop below deletes any
+    #    prior copies). OpenAI deprecated ~/.codex/prompts on 2026-01-22 in favor
+    #    of skills, so each non-excluded command is ALSO written as a skill; the
+    #    prompts copy stays for back-compat during the deprecation window. The
+    #    command-derived skill runs after step 1 and overwrites any same-name
+    #    pointer-wrapper dir, leaving only the generated SKILL.md, and is recorded
+    #    in the SAME `skills` manifest dict (keyed by stem) so a changed command
+    #    changes the hash and a removed command is pruned like any other skill.
     prompts: dict = {}
     if (data_root / "commands").exists():
         prompts_dst.mkdir(parents=True, exist_ok=True)
@@ -269,6 +350,9 @@ def install_codex(
                 continue
             shutil.copy(cmd, prompts_dst / cmd.name)
             prompts[cmd.name] = _sha_file(cmd)
+            skill_dir = skills_base / cmd.stem
+            _write_solo_skill(skill_dir, _command_skill_md(cmd))
+            skills[cmd.stem] = _sha_dir(skill_dir)
 
     # 3. Rules -> AGENTS.md block.
     rules_done = False

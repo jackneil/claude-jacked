@@ -7,8 +7,10 @@ and the Claude-side fix that now copies skill sidecar files.
 """
 
 import json
+from pathlib import Path
 
 import pytest
+import yaml
 
 from jacked.codex import installer as ins
 
@@ -59,6 +61,31 @@ def _add_command(data_root, name):
     (data_root / "commands" / name).write_text(f"---\ndescription: {name}\n---\nrun\n")
 
 
+def _body_after_frontmatter(text):
+    """Everything after a leading ---...--- frontmatter block (whole text if none).
+
+    Generic splitter used to compare a generated SKILL.md's body against a
+    command's body without coupling to the installer's internals."""
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return text
+    return text[end + len("\n---\n"):]
+
+
+def _frontmatter(text):
+    """Parse the leading ---...--- YAML frontmatter block of `text` into a dict."""
+    assert text.startswith("---\n"), text[:40]
+    end = text.find("\n---\n", 4)
+    assert end != -1, text[:80]
+    return yaml.safe_load(text[4:end])
+
+
+def _skill_dir(homes, name):
+    return ins.agents_skills_dir(homes["agents_home"]) / name
+
+
 # --------------------------------------------------------------------------
 # install lands every artifact at the right Codex path
 # --------------------------------------------------------------------------
@@ -75,7 +102,9 @@ def test_install_lands_all_artifacts(data_root, homes):
     # gatekeeper hooks are no longer installed (retired in 0.70.0)
     assert not ins.codex_hooks_json(homes["home"]).exists() or \
         "security_gatekeeper" not in ins.codex_hooks_json(homes["home"]).read_text()
-    assert summ.skills == ["demo-skill"] and summ.prompts == ["dcr.md"]
+    # commands now ALSO ship as Codex skills (see below), so the command dcr.md
+    # yields a `dcr` skill alongside the ordinary demo-skill.
+    assert summ.skills == ["demo-skill", "dcr"] and summ.prompts == ["dcr.md"]
     assert summ.rules and not summ.hooks
 
 
@@ -194,6 +223,134 @@ def test_install_replaces_stale_sidecars(data_root, homes):
     _install(data_root, homes)
     dst = ins.agents_skills_dir(homes["agents_home"]) / "demo-skill"
     assert not (dst / "measure.js").exists()
+
+
+# --------------------------------------------------------------------------
+# commands ALSO ship as Codex skills (OpenAI deprecated ~/.codex/prompts on
+# 2026-01-22 in favor of the agentskills.io skills surface)
+# --------------------------------------------------------------------------
+
+def test_command_ships_as_skill_frontmatter_and_body(data_root, homes):
+    """Every non-excluded command yields ~/.agents/skills/<stem>/SKILL.md whose
+    frontmatter parses as YAML (name == stem, non-empty description) and whose
+    body is byte-identical to the command's content after its own frontmatter.
+    The ~/.codex/prompts copy is still written (unchanged back-compat behavior)."""
+    _add_command(data_root, "release.md")  # a second, non-excluded command
+    _install(data_root, homes)
+    prompts_dst = ins.codex_prompts_dir(homes["home"])
+    for stem, cmd_name in (("dcr", "dcr.md"), ("release", "release.md")):
+        skill_md = _skill_dir(homes, stem) / "SKILL.md"
+        assert skill_md.exists()
+        text = skill_md.read_text()
+        meta = _frontmatter(text)
+        assert meta["name"] == stem
+        assert isinstance(meta["description"], str) and meta["description"].strip()
+        cmd_text = (data_root / "commands" / cmd_name).read_text()
+        assert _body_after_frontmatter(text) == _body_after_frontmatter(cmd_text)
+        # prompt still written for back-compat during the deprecation window
+        assert (prompts_dst / cmd_name).exists()
+
+
+def test_command_skill_passes_through_argument_hint(data_root, homes):
+    """A command that declares `argument-hint` has it carried onto the skill
+    frontmatter (and parses as valid YAML)."""
+    (data_root / "commands" / "cleanup.md").write_text(
+        '---\ndescription: clean up\nargument-hint: "[--dry-run | --auto-safe]"\n'
+        "model: inherit\n---\ndo cleanup\n"
+    )
+    _install(data_root, homes)
+    meta = _frontmatter((_skill_dir(homes, "cleanup") / "SKILL.md").read_text())
+    assert meta["name"] == "cleanup"
+    assert meta["argument-hint"] == "[--dry-run | --auto-safe]"
+    assert "model" not in meta  # only name/description/argument-hint pass through
+
+
+def test_command_skill_overwrites_pointer_wrapper(data_root, homes):
+    """A pointer-wrapper skill AND a same-name command in the data root: after
+    install the skill dir holds ONLY the command-derived SKILL.md (no stale
+    wrapper sidecars), and manifest["skills"][name] tracks the command content
+    (changes when the command changes, not the wrapper)."""
+    wrapper = data_root / "skills" / "dcr"
+    wrapper.mkdir(parents=True)
+    (wrapper / "SKILL.md").write_text(
+        "---\nname: dcr\ndescription: pointer wrapper\n---\n"
+        "read ~/.claude/commands/dcr.md\n"
+    )
+    (wrapper / "references").mkdir()
+    (wrapper / "references" / "stale.md").write_text("stale sidecar\n")
+    # the fixture already carries command dcr.md (body "run dcr\n")
+    _install(data_root, homes)
+    dst = _skill_dir(homes, "dcr")
+    assert sorted(p.name for p in dst.iterdir()) == ["SKILL.md"]  # sidecar gone
+    text = (dst / "SKILL.md").read_text()
+    assert _body_after_frontmatter(text) == "run dcr\n"  # command body, not wrapper
+    assert "pointer wrapper" not in text
+    # manifest reflects the command-derived content and changes with the command
+    before = _manifest(homes)["skills"]["dcr"]
+    (data_root / "commands" / "dcr.md").write_text(
+        "---\ndescription: review\n---\nrun dcr DIFFERENTLY\n"
+    )
+    _install(data_root, homes)
+    assert _manifest(homes)["skills"]["dcr"] != before
+
+
+def test_excluded_commands_produce_no_skill(data_root, homes):
+    """Claude-only commands (swarm etc.) yield neither a prompt nor a skill dir."""
+    for name in ("swarm.md", "goal-maker.md", "browser-reset.md", "jacked-setup.md"):
+        _add_command(data_root, name)
+    _install(data_root, homes)
+    manifest = _manifest(homes)
+    for stem in ("swarm", "goal-maker", "browser-reset", "jacked-setup"):
+        assert not _skill_dir(homes, stem).exists()
+        assert stem not in manifest["skills"]
+    assert (_skill_dir(homes, "dcr") / "SKILL.md").exists()  # ordinary one lands
+    assert "dcr" in manifest["skills"]
+
+
+def test_prune_removes_command_skill_and_prompt(data_root, homes):
+    """Deleting a command from the data root prunes BOTH its prompt and its
+    command-derived skill, and reports both in summary.removed."""
+    _add_command(data_root, "foo.md")
+    _install(data_root, homes)
+    prompts_dst = ins.codex_prompts_dir(homes["home"])
+    assert (_skill_dir(homes, "foo") / "SKILL.md").exists()
+    assert (prompts_dst / "foo.md").exists()
+    (data_root / "commands" / "foo.md").unlink()
+    summ = _install(data_root, homes)
+    assert "prompts/foo.md" in summ.removed
+    assert "skills/foo" in summ.removed
+    assert not _skill_dir(homes, "foo").exists()
+    assert not (prompts_dst / "foo.md").exists()
+
+
+def test_uninstall_removes_command_derived_skills(data_root, homes):
+    """Uninstall (manifest-driven) removes command-derived skills too."""
+    _install(data_root, homes)
+    assert (_skill_dir(homes, "dcr") / "SKILL.md").exists()
+    out = ins.uninstall_codex(home=homes["home"], agents_home=homes["agents_home"])
+    assert not _skill_dir(homes, "dcr").exists()
+    assert "skills/dcr" in out["removed"]
+
+
+def test_real_commands_generate_parseable_skill_frontmatter():
+    """Integration guard against the REAL data/commands: every non-excluded
+    command's _command_skill_md yields frontmatter yaml.safe_load parses with a
+    name matching the stem and a non-empty description."""
+    import jacked
+
+    cmd_dir = Path(jacked.__file__).parent / "data" / "commands"
+    cmds = sorted(cmd_dir.glob("*.md"))
+    assert cmds, "real jacked data/commands must be present"
+    checked = 0
+    for cmd in cmds:
+        if cmd.name in ins._CLAUDE_ONLY_COMMANDS:
+            continue
+        meta = _frontmatter(ins._command_skill_md(cmd))
+        assert meta.get("name") == cmd.stem, cmd.name
+        assert isinstance(meta.get("description"), str) and meta["description"].strip(), \
+            cmd.name
+        checked += 1
+    assert checked  # sanity: we actually exercised real commands
 
 
 # --------------------------------------------------------------------------
