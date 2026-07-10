@@ -1,17 +1,23 @@
 # claude-jacked
 
-**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar pill — plus a curated set of 29 slash commands and 10 review agents installed into Claude Code, all managed from a web dashboard.
+**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar app with a full fleet panel one click away. Plus a curated set of 29 slash commands, 24 skills, and 10 review agents installed into Claude Code, all managed from a web dashboard.
 
-![jacked dashboard — accounts](docs/screenshots/dashboard-accounts.png)
+<table>
+<tr>
+<td width="60%"><img src="docs/screenshots/dashboard-accounts.png" alt="jacked dashboard: every account with live 5h/7d and per-model usage"></td>
+<td width="40%"><img src="docs/screenshots/tray-panel.png" alt="menu-bar dropdown panel: the whole fleet, one click from the menu bar"></td>
+</tr>
+</table>
 
 ---
 
 ## What You Get
 
-- **Run multiple Claude accounts like one** — Add every account you own, watch each one's 5-hour and 7-day usage live, and let auto-swap rotate to a fresh account before you hit a limit. Works for Codex accounts too. The macOS menu-bar pill shows your active account's usage at a glance, with a dropdown for the whole fleet.
-- **A curated skills suite, one command to install** — `jacked install` puts 30 battle-tested slash commands, 10 review agents, and behavioral rules into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more). Upgrades diff cleanly — added/changed/removed, never touching your own files.
-- **Manage everything from a web dashboard** — Accounts, usage analytics, feature toggles, swap history, logs — all from your browser. No config files, no terminal commands.
-- **Permission hygiene built in** — `jacked permissions audit` finds (and can prune) dangerously broad Bash wildcards in your Claude Code permission allowlists, and the dashboard's Permissions panel manages allow rules with project vs global scope.
+- **Run multiple Claude accounts like one.** Add every account you own, watch each one's 5-hour, 7-day, and per-model usage live, and let auto-swap rotate to a fresh account before you hit a limit. Works for Codex accounts too, side by side with Claude.
+- **A menu-bar app that actually earns its pixels.** A live pill shows your active account's usage next to the clock (`18%·4%`, tinted green/yellow/red). Left-click drops the whole fleet down in a compact panel: every account, every org, per-model caps, reset times, and who's active. Right-click for actions, or pin the panel to your screen edge. It refreshes within about a second of any account switch or usage change, and it tells you when a new jacked version ships: a badge on the icon, a notification banner, and a one-click update.
+- **A curated skills suite, one command to install.** `jacked install` puts 29 battle-tested slash commands, 24 skills, and 10 review agents into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills). Upgrades diff cleanly: added/changed/removed, never touching your own files.
+- **Manage everything from a web dashboard.** Accounts, usage analytics, feature toggles, appearance themes, swap history, logs, all from your browser. No config files, no terminal commands.
+- **Permission hygiene built in.** `jacked permissions audit` finds (and can prune) dangerously broad Bash wildcards in your Claude Code permission allowlists, and the dashboard's Permissions panel manages allow rules with project vs global scope.
 
 ---
 
@@ -72,28 +78,32 @@ The web dashboard ships with every install. Run `jacked webux` to open it.
 
 Enable or disable any of the 10 built-in code reviewers and 29 slash commands with one click. Each card shows what it does so you know what you're turning on.
 
-![Settings — Agents](docs/screenshots/dashboard-settings-agents.png)
+![Settings - Agents](docs/screenshots/dashboard-settings-agents.png)
 
 ### Track Everything
 
-Approval rates, which evaluation methods are being used, command frequency, and system health — all at a glance.
+Token usage and estimated cost per session, agent activity, hook health, and command frequency, all at a glance. The Activity view below shows which review agents ran and whether every hook is executing cleanly.
 
-![Analytics](docs/screenshots/dashboard-analytics.png)
+![Analytics - Activity](docs/screenshots/dashboard-analytics.png)
 
 <details>
 <summary><strong>More Dashboard Views</strong></summary>
 
-**Feature Toggles** — Toggle hooks (sound notifications) and knowledge documents (behavioral rules, skills, reference docs) on and off.
+**Feature Toggles** - Toggle hooks (sound notifications) and knowledge documents (behavioral rules, skills, reference docs) on and off.
 
-![Settings — Features](docs/screenshots/dashboard-settings-features.png)
+![Settings - Features](docs/screenshots/dashboard-settings-features.png)
 
-**Commands** — Enable or disable any of the 29 slash commands.
+**Commands** - Enable or disable any of the 29 slash commands.
 
-![Settings — Commands](docs/screenshots/dashboard-settings-commands.png)
+![Settings - Commands](docs/screenshots/dashboard-settings-commands.png)
 
-**Permissions Panel** — Manage allowed commands with project-level vs global scope.
+**Appearance** - Pick the usage-bar color scheme: America 250 (red, white & blue for the 2026 semiquincentennial, the default) or Classic green/amber/red. Applies instantly to the dashboard and the menu-bar panel.
 
-**Analytics Dashboard** — Token usage overview, trends, and per-session drill-down, plus agent/hook activity.
+![Settings - Appearance](docs/screenshots/dashboard-settings-appearance.png)
+
+**Permissions Panel** - Manage allowed commands with project-level vs global scope.
+
+**Analytics Dashboard** - Token usage overview, trends, and per-session drill-down, plus agent/hook activity.
 
 </details>
 
@@ -121,6 +131,7 @@ Approval rates, which evaluation methods are being used, command frequency, and 
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
 | **29 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/blindspot`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **24 Skills** | Engines and knowledge packs behind the commands, plus standalone ones: `jack-it-up`, `coverage-matrix`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard — manage everything from your browser |
@@ -141,7 +152,7 @@ jacked webux --no-browser       # Start server without opening browser
 
 The dashboard is a local web app that runs on your machine. All data stays in `~/.claude/jacked.db` — nothing is sent anywhere.
 
-**5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Features / Plugins / Claude Code / Advanced), Logs, Analytics.
+**5 pages:** Accounts, Installations, Settings (tabbed: Agents / Commands / Features / Plugins / Claude Code / Appearance / Advanced), Logs, Analytics.
 
 ### Remote Access (Tailscale)
 
@@ -171,7 +182,9 @@ Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bo
 
 ## Background Service and Tray Icon
 
-Here's the deal: if you don't want to remember to run `jacked webux` every time, run it as a background service instead. You get a purple "J" in the macOS menu bar (or Windows system tray) that stays out of your way until you need it.
+Here's the deal: if you don't want to remember to run `jacked webux` every time, run it as a background service instead. On macOS you get a live usage pill in the menu bar with the whole fleet one click away; on Windows and Linux you get a "J" in the system tray that stays out of your way until you need it.
+
+![macOS menu bar - the jacked pill next to the clock](docs/screenshots/menubar-pill.png)
 
 ### Install
 
@@ -182,15 +195,26 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 
 `jacked install` already registers login-autostart and starts the tray — no separate `jacked service install/start` needed. `pystray` and `Pillow` are core dependencies now, so the icon "just works" out of the base package. Don't want it? `jacked install --force --no-tray`.
 
-### What You Get
+### What You Get (macOS menu bar)
 
-- **Purple "J" in your menu bar / system tray** — always-on dashboard, one click away.
-- **Right-click menu:** Open Dashboard, Restart, Stop, Start on Login toggle, current version label (e.g. `v0.41.2 -> v0.42.0 (update)` when outdated), and **Check for updates...** to force a fresh PyPI poll on demand.
-- **Auto-start on login** — `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/ai.hank.jacked.plist`) or a Windows startup VBS script. Service runs on reboot too.
-- **Crash recovery, not nag-ware** — KeepAlive is scoped to `SuccessfulExit=false`, so a clean stop from the tray or CLI *won't* trigger a respawn. Only actual crashes come back.
-- **One-click upgrades** — when a newer version hits PyPI, the version item flips to a clickable `v{current} -> v{latest} (update)`. Click it and jacked runs the full upgrade sequence (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced mid-update.
-- **CLI equivalent** — `jacked upgrade` does the same three-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
-- **Recovery file** — if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
+- **A live usage pill, always visible.** The menu-bar item is a colored "J" plus your active account's usage as `5h%·7d%` (e.g. `18%·4%`). The J tints green, yellow, or red on the worse of the two windows, so a glance at the clock tells you whether you're about to hit a limit. It tracks the account that is actually active in Claude Code, and a small dot marks the corner when the active account is a Codex account.
+- **Left-click: the fleet dropdown.** A compact panel (the screenshot up top) drops down with every account you've added: 5h and 7d bars with reset times, per-model caps (your Fable or Codex model usage inline), plan badges, multi-org accounts grouped under one login, an `active` badge with a live countdown to the next usage refresh, and a refresh-all button. It's pre-warmed, so it opens instantly.
+- **Pin it as a side panel.** "Toggle Side Panel" docks the same panel to the right edge of your screen, floating above other windows and on every Space, for a permanent fleet view while you work.
+- **Right-click: the actions menu.** Open Usage Dropdown, Toggle Side Panel, Open Dashboard, Add Account, an Auto-swap toggle, Start on Login, Restart, Quit, the version line, "Last checked", and **Check for updates...** to force a fresh PyPI poll on demand.
+- **It never goes stale.** The pill and panel update within about one second of any usage refresh, account switch, or Codex swap (an in-process change counter, no polling lag), with a 30-second heartbeat backstop and a 10-minute background refresh across the whole fleet.
+- **Update notifications you'll actually see.** When a new version ships: a blue badge appears on the J icon, a macOS notification banner fires, and the version line in the menu flips to a clickable `v{current} -> v{latest} (update)`. One click runs the full upgrade (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced, with a live progress page in your browser that reconnects on its own while the service restarts.
+
+### On Windows and Linux
+
+- **System tray icon** ("J", colored by service state) with the same right-click menu essentials: Open Dashboard, Restart, Stop, Start on Login, version line, and Check for updates.
+- **The full update flow**: the icon badge, native tray notifications, the clickable one-click update, and the browser progress page all work the same as on macOS. The usage pill, dropdown panel, and side panel are macOS-only today.
+
+### Service behavior
+
+- **Auto-start on login** - `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/ai.hank.jacked.plist`) or a Windows startup VBS script. Service runs on reboot too.
+- **Crash recovery, not nag-ware** - KeepAlive is scoped to `SuccessfulExit=false`, so a clean stop from the tray or CLI *won't* trigger a respawn. Only actual crashes come back.
+- **CLI equivalent** - `jacked upgrade` does the same three-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
+- **Recovery file** - if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
 
 ### Commands
 
@@ -459,6 +483,20 @@ These work automatically when Claude thinks they'd help, or you can ask for them
 Use the double-check reviewer to review what we just built
 ```
 
+### Skills
+
+Alongside the commands, `jacked install` ships 24 skills: knowledge packs and engines Claude invokes by name or picks up automatically when the task fits. Many power the commands above; the rest stand alone.
+
+| Group | Skills |
+|-------|--------|
+| **Review & QA engines** | `dcr` (recursive multi-lens review), `qa`, `ux`, `qa-video`, `aesthetic-dogfood-audit` (drive the whole app as every persona and judge function + finish) |
+| **Autonomous delivery** | `whats-next`, `coverage-matrix` (persona x domain gap scoring), `jack-it-up` (full brainstorm-plan-build-review cycle), `recursive-10-10-product-hardening`, `swarm-research`, `checkpoint`, `recover` |
+| **Design engineering** | `emil-design-eng` (UI polish + animation craft rules), `review-animations` (strict motion review with a non-negotiable standards bar), `animation-vocabulary` (name that effect), `apple-design` (fluid, physical motion and Apple's design principles, translated for the web) |
+| **Docs & branding** | `docs-sync`, `demo-video`, `launch-post`, `logo-forge`, `claude-md-optimizer` |
+| **Ops & infrastructure** | `deploy-to-railway`, `lockdown` (supply-chain audit), `chain-of-command` (session model-dispatch policy: top model plans and judges, Opus does volume work, cheap tiers do pure search) |
+
+The four design-engineering skills are adapted from [Emil Kowalski](https://emilkowal.ski)'s excellent [emilkowalski/skills](https://github.com/emilkowalski/skills) (MIT), built on his years of design-engineering work and his course at [animations.dev](https://animations.dev/). They teach Claude the craft details agents usually get wrong: easing choice, spring parameters, interruptibility, `prefers-reduced-motion`, and when the right animation is no animation. jacked's `/dcr` frontend reviewer automatically pulls in `review-animations` when a diff touches motion code.
+
 ### QA Browser Testing
 
 The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.
@@ -506,6 +544,8 @@ Your local database (`~/.claude/jacked.db`) stays intact — reinstall anytime w
 
 | Version | Changes |
 |---------|---------|
+| **0.78.0** | **`feat(theme)`: America 250 usage colors (red, white, and blue) with a Classic toggle.** For the semiquincentennial the new default theme repaints the usage bars patriotic: healthy=blue, warning=white, critical=red (red stays bad, so nobody relearns that instinct on the 4th). The sidebar gains an inline-SVG flag (not the flag emoji, which Windows renders as the bare letters "US"), a "1776 - 2026 - 250 YEARS" badge, and a tricolor accent stripe. Settings > Appearance holds the toggle (America 250 or Classic), saved per-device in localStorage and applied before first paint in both the dashboard and the compact panel so there's no flash of the wrong scheme. The semantic color classes (green/yellow/red) stay load-bearing across `menubar_summary.py` and the API; only the presentation shifts. The white warning bar would have swallowed the white elapsed-time marker, so the theme darkens and rings it. Also shipped: **`fix(update-ux)`: a self-healing `file://` bootstrap for the tray update progress page.** The tray used to open `http://127.0.0.1:8321/update.html` and then immediately kill the server, so the browser's first GET landed on a corpse and the user stared at "site can't be reached" (Windows made it worse by opening a second guaranteed-dead tab from the updater batch). Now the tray writes a self-contained bootstrap page to `~/.claude` and opens it as `file://`, a page that physically cannot fail to load: it pings `/api/version` (no-cors, so it pokes no holes in the origin allowlist), shows an honest amber "service is restarting" banner while the server is down, and hosts the real `update.html` in an iframe it force-reloads on every down-to-up transition, falling back to the old direct URL if the template is missing. `update.html` now actually renders the service-down state it was already tracking and ignoring, posts its status to the parent frame, and targets `_top` on its dashboard links so they escape the iframe; the batch opens nothing. |
+| **0.77.0** | **`fix(windows)`: tray update stops deadlocking on its own lock file, plus a cross-platform update badge.** Every Windows tray update was a coin flip between nothing happening and the tray dying. The tray pre-inits the update-status file so the progress page has data from t=0, then spawns the cmd.exe updater batch whose first move is `jacked _update_status_init`, which saw the tray's own ~2-second-old `in_progress` file, cried LockBusy, and exited 2, aborting the batch before it upgraded OR restarted the service. The POSIX updater had an adopt-the-pre-init carve-out from day one; the Windows shim never got the memo. The logic is now hoisted into `update_status.init_or_adopt_status()` with both paths pointed at it so they can't drift apart again. Second fix: Windows and Linux now get the same white-ring + blue-dot update badge macOS already drew on the tray icon (`create_icon_image()` renders it and the version-check paths re-render when `outdated` flips), instead of a hint buried in right-click menu text you'd never see. Bonus: `read_status()` now treats a >5min-stale `in_progress` file as abandoned (matching the rule `init_status` already used), so an aborted updater can no longer leave a zombie "updating..." banner on the dashboard forever. |
 | **0.76.0** | **`feat(dashboard)`: safe remote access over Tailscale - network-bind hardening.** Binding beyond loopback (`--host 0.0.0.0`) no longer flips CORS to `*`, which had let any website open in a browser on a network-allowed machine read and mutate the (unauthenticated) API. The frontend is same-origin by construction, so cross-origin allowance is now loopback-only plus an explicit `JACKED_ALLOWED_ORIGINS` opt-in. New `jacked/api/security.py`: pure-ASGI `HostValidationMiddleware` rejects untrusted `Host` headers on HTTP *and* WebSocket handshakes (DNS-rebinding guard; IP literals, single-label MagicDNS names, `*.ts.net`, `*.local`, `localhost`, and `JACKED_ALLOWED_HOSTS` extras pass) and 403s unsafe-method requests carrying a foreign `Origin` (blind CSRF via non-preflighted form posts). The `/api/ws` gate, previously disabled entirely on a network bind, now enforces same-origin-with-Host or allowlist on every handshake. README gains a "Remote Access (Tailscale)" section: bind commands, ACL example, env knobs, and the `tailscale serve` alternative. Also: a shipped **writing-style behavior** - never em-dashes in public/user-facing content (UI copy, marketing, legal docs, end-user docs); internal code/docs exempt. And: **chain-of-command auto-load** - `jacked install` now registers a synchronous SessionStart hook (`jacked _hook chain_of_command_context`) that injects the chain-of-command dispatch policy into every new Claude Code session's context, so the model split (best-tier judgment, Opus volume work, cheap-tier pure search) is binding from the first turn without typing `/chain-of-command`. Toggle off by disabling the chain-of-command skill in the dashboard (the hook goes silent when the skill file is absent); `jacked uninstall` removes the hook entry. |
 | **0.75.0** | **`feat(skills)`: research-hardened dispatch policy + Sonnet 5 intro pricing.** Community/primary-source sweep (July 2026) surfaced three things worth shipping. (1) **Sonnet 5 introductory pricing**: the analytics cost map now charges Sonnet 5 at its real $2/$10 intro rate through 2026-08-31 (then $3/$15 automatically, keyed on each message's timestamp) - it was overcounting Sonnet 5 by 50%; Sonnet 4.x and the undated `sonnet` alias stay at standard rates. (2) **Defensive security framing**: Fable 5 returned (2026-07-01) behind safety classifiers that can block security-flavored prompts and silently fall back to Opus 4.8 - `/dcr`'s Security lens now prepends a defensive-scope preamble to its reviewer prompt (own authorized codebase, no exploit chains, remediation + regression test per finding), `/cso` states the same scope up front, and the policy is explicit: accept an Opus fallback, never rephrase to evade a classifier. (3) **Final senior review**: `jack-it-up` Phase 7 now has the main loop do one holistic senior-engineer diff review (must-fix / should-fix / ship-no-ship) before `/pr` - the last line before human review. Plus an **effort lane**: Workflow `agent()` stages carry effort matched to the lane (volume 'medium', locate/sweep 'low', hardest verify/judge 'high'+). And **version-proofing**: skill/command text now speaks in model tiers ("any session model above Opus"), never versioned names that rot on every release, and the pricing map infers the tier from the family name for model IDs it hasn't caught up with (a future fable-6 prices as Fable tier, not a silent 2x-undercounting Opus fallback). |
 | **0.74.1** | **`fix(skills)`: the search lane actually uses the cheap tier.** The pure-search carve-out was permissive ("may use a lesser model"), so in practice every grep fan-out, call-site inventory, and convention sweep still landed on Opus - and `chain-of-command`'s Opus lane even listed "searching/exploring" outright. Now pure locate/sweep dispatches carry explicit `model: "haiku"` (mechanical sweeps executing patterns the main loop wrote - the deterministic tools carry the recall) or `model: "sonnet"` (bulk read-and-filter where a miss costs a few extra reads), gated by two tests that must BOTH pass: output is pointers/excerpts with zero interpretation, and the consumer reads what comes back so a miss is recoverable. Load-bearing completeness claims ("these are ALL the call sites") get their exact patterns written by the main loop or go to Opus; semantic hunts ("find where we handle X") are comprehension and never leave the Opus lane. Applies on every session tier, wired through `chain-of-command`, `jack-it-up` (new Search dispatches lane), and `/swarm` teammate rules. |
@@ -642,6 +682,9 @@ jacked service status              # Show PID, port, uptime, autostart state
 |----------|---------|-------------|
 | `JACKED_HOST` | 127.0.0.1 | Dashboard/service bind host |
 | `JACKED_PORT` | 8321 | Dashboard/service bind port |
+| `JACKED_ALLOWED_ORIGINS` | (unset) | Comma-separated extra origins (`scheme://host[:port]`) allowed cross-origin API/WebSocket access on a network bind (see Remote Access) |
+| `JACKED_ALLOWED_HOSTS` | (unset) | Comma-separated extra hostnames accepted in the `Host` header (DNS-rebinding guard escape hatch) |
+| `JACKED_HOME` | `~` | Redirects where jacked looks for the `.claude` home dir (used by tests and unusual setups) |
 
 </details>
 
@@ -657,7 +700,7 @@ The dashboard is a local web application:
 
 All data stays on your machine. The dashboard reads Claude Code's configuration files (`~/.claude/settings.json`, `~/.claude/agents/`, etc.) and provides a visual interface for managing them.
 
-**API endpoints:** `/api/health`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`, `/api/claude-settings/*` (permissions)
+**API endpoints:** `/api/health`, `/api/version`, `/api/features`, `/api/settings/*`, `/api/auth/*`, `/api/analytics/*`, `/api/logs/*`, `/api/claude-settings/*` (permissions), `/api/installations`, `/api/menubar-summary`, `/api/update/status`, `/api/ws` (live updates WebSocket), plus `/panel` (the compact usage page the menu-bar dropdown and side panel render)
 
 </details>
 
@@ -697,7 +740,7 @@ The `jacked install` command adds hooks to `~/.claude/settings.json`, written as
 }
 ```
 
-`jacked install` also registers lightweight session-tracker hooks (`SessionStart`, `Notification`, `SessionEnd`, `Stop`) that keep the dashboard's account/session views live — and it prunes hooks from retired features (the pre-0.70.0 security gatekeeper and session-indexing entries) so a stale entry can never block or error.
+`jacked install` also registers lightweight session-tracker hooks (`SessionStart`, `UserPromptSubmit`, `Notification`, `SessionEnd`, `Stop`) that keep the dashboard's account/session views live, plus a `SessionStart` hook (`jacked _hook chain_of_command_context`) that injects the chain-of-command dispatch policy into every new session's context (toggle it off by disabling the chain-of-command skill in the dashboard). It prunes hooks from retired features (the pre-0.70.0 security gatekeeper and session-indexing entries) so a stale entry can never block or error.
 
 </details>
 
@@ -757,3 +800,5 @@ MIT
 ## Credits
 
 Built for [Claude Code](https://claude.ai/code) by Anthropic.
+
+The design-engineering skills (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) come from [Emil Kowalski](https://emilkowal.ski)'s [emilkowalski/skills](https://github.com/emilkowalski/skills) (MIT), distilled from his work at Vercel and Linear and his course at [animations.dev](https://animations.dev/). Bundled with credit and thanks; each skill directory carries his license.
