@@ -13,7 +13,8 @@ Codex pass when Codex is present, writing the native Codex installables:
              prompts copy stays for back-compat during the deprecation window. A
              command-derived skill OVERWRITES any same-name pointer-wrapper skill
              dir from the skills pass (command content wins).
-- rules    -> a managed block in ~/.codex/AGENTS.md (Codex's CLAUDE.md analog)
+- rules    -> a managed block in ~/.codex/AGENTS.md (CLAUDE.md references
+             rewritten for Codex + a Codex runtime-adapter section appended)
 - legacy gatekeeper hooks.json entries are PRUNED on install (the
              gatekeeper was retired in 0.70.0)
 
@@ -69,6 +70,25 @@ _CLAUDE_ONLY_COMMANDS = frozenset(
     {"swarm.md", "goal-maker.md", "browser-reset.md", "jacked-setup.md"}
 )
 
+# Appended (verbatim, reviewed production copy) to the rules body when it lands
+# in Codex's AGENTS.md. The behaviors + shipped skills speak Claude Code
+# vocabulary; this section maps that vocabulary to Codex's native equivalents at
+# runtime. It deliberately keeps one "CLAUDE.md" (the final mapping bullet), so
+# the CLAUDE.md->AGENTS.md rename in `_codex_rules_body` runs on the SOURCE body
+# only, before this adapter is appended.
+_CODEX_ADAPTER = """\
+## Codex runtime adapter (managed by `jacked install`)
+
+The behaviors above and the jacked skills in ~/.agents/skills were authored for Claude Code. Running under Codex, map Claude vocabulary to your native equivalents:
+
+- Slash commands are skills here: a reference to `/dcr`, `/qa`, `/pr`, etc. means the same-name skill in ~/.agents/skills - invoke it as `$dcr`, `$qa`, ... (or via `/skills`).
+- "Task tool" / "Agent tool" / `subagent_type: "..."` means your subagent mechanism: spawn parallel subagents natively. Custom agent definitions live in ~/.codex/agents/*.toml. Where a named Claude agent (e.g. double-check-reviewer) is unavailable, inline its described role into the subagent prompt.
+- Claude model dispatch (`model: "opus"`, `"fable"`, `"sonnet"`, `"haiku"`) does not apply: ignore Anthropic model names and pick your own model/reasoning effort per task - cheap and fast for mechanical sweeps, strongest for judgment and review.
+- Browser tooling: `mcp__plugin_playwright_playwright__*` tools and Claude-in-Chrome do not exist here. Use the MCP servers from your own config (~/.codex/config.toml); `mcp__chrome-devtools__*` names resolve once a `chrome-devtools` MCP server is registered. Where instructions say `claude mcp add ...`, use `codex mcp add ...`.
+- File references to ~/.claude/commands/<name>.md: the same content ships at ~/.agents/skills/<name>/SKILL.md.
+- "Plan mode" exists here too (the `plan` permission mode) - use it where the behaviors call for it.
+- Where a rule or skill says CLAUDE.md, your instruction file is AGENTS.md (~/.codex/AGENTS.md globally, the repo's AGENTS.md per project).
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +215,25 @@ def _command_skill_md(cmd: Path) -> str:
 # ---------------------------------------------------------------------------
 # AGENTS.md block (idempotent)
 # ---------------------------------------------------------------------------
+
+def _codex_rules_body(text: str) -> str:
+    """Adapt the Claude-authored rules body for Codex before it lands in AGENTS.md.
+
+    Rewrites every `CLAUDE.md` reference to `AGENTS.md` (Codex's instruction
+    file), collapses the `AGENTS.md`, `AGENTS.md` duplicate the rename creates in
+    the Markdown-exceptions filename enumeration (the source lists both names)
+    back to a single `AGENTS.md` with the rest of that line intact, then appends
+    the runtime-adapter section that maps the remaining Claude vocabulary in the
+    behaviors + shipped skills to Codex's native equivalents. The rename runs on
+    the source body only: the adapter's own single `CLAUDE.md` mention is
+    intentional (it tells the agent that `CLAUDE.md` means `AGENTS.md`) and stays
+    verbatim. Case-sensitive on purpose, so lowercase `~/.claude/...` paths are
+    untouched."""
+    body = text.replace("CLAUDE.md", "AGENTS.md")
+    body = body.replace("`AGENTS.md`, `AGENTS.md`", "`AGENTS.md`")  # backticked dup (real data)
+    body = body.replace("AGENTS.md, AGENTS.md", "AGENTS.md")        # bare dup, just in case
+    return body.rstrip("\n") + "\n\n" + _CODEX_ADAPTER
+
 
 def _install_agents_block(path: Path, body: str) -> None:
     block = f"{_AGENTS_BEGIN}\n{body.strip()}\n{_AGENTS_END}\n"
@@ -354,11 +393,13 @@ def install_codex(
             _write_solo_skill(skill_dir, _command_skill_md(cmd))
             skills[cmd.stem] = _sha_dir(skill_dir)
 
-    # 3. Rules -> AGENTS.md block.
+    # 3. Rules -> AGENTS.md block. The body is authored for Claude Code, so it is
+    #    adapted for Codex first (CLAUDE.md refs rewritten to AGENTS.md + a
+    #    runtime-adapter section appended); block markers / idempotency unchanged.
     rules_done = False
     rules_src = data_root / "rules" / "jacked_behaviors.md"
     if rules_src.exists():
-        _install_agents_block(codex_agents_md(home), rules_src.read_text())
+        _install_agents_block(codex_agents_md(home), _codex_rules_body(rules_src.read_text()))
         rules_done = True
 
     # 4. Prune legacy gatekeeper entries from hooks.json (retired in 0.70.0).

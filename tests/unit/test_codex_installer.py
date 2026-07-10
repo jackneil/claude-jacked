@@ -369,6 +369,156 @@ def test_agents_block_idempotent_and_preserves_user_content(data_root, homes):
 
 
 # --------------------------------------------------------------------------
+# M4: Codex rules-body adapter (_codex_rules_body / _CODEX_ADAPTER)
+#
+# The rules body was authored for Claude Code: it maintains CLAUDE.md and the
+# shipped skills speak Claude vocabulary. For Codex the body's CLAUDE.md refs
+# are rewritten to AGENTS.md and a runtime-adapter section is appended.
+# --------------------------------------------------------------------------
+
+# A crafted rules body carrying the two Claude tokens the rewrite targets: bare
+# CLAUDE.md references and the `CLAUDE.md`, `AGENTS.md` filename enumeration the
+# real behaviors list (the rename turns that pair into a duplicate to collapse).
+# Also a lowercase ~/.claude path, which must survive untouched.
+_RULES_WITH_CLAUDE = (
+    "# jacked behaviors\n"
+    "- Maintain your CLAUDE.md as the rules file; graduate lessons to CLAUDE.md.\n"
+    "- Markdown exceptions: Claude-instruction files `CLAUDE.md`, `AGENTS.md`, `lessons.md`.\n"
+    "- read ~/.claude/jacked-reference.md for details.\n"
+)
+
+
+def _real_rules_text():
+    import jacked
+
+    return (Path(jacked.__file__).parent / "data" / "rules" / "jacked_behaviors.md").read_text()
+
+
+def _rewritten_source(out):
+    """The rewritten source body: everything before the appended adapter section.
+
+    The adapter is appended verbatim and deliberately keeps one CLAUDE.md (its
+    "CLAUDE.md means AGENTS.md" mapping line), so the no-CLAUDE.md guarantee is
+    about the rewritten SOURCE, not the constant adapter."""
+    return out.split(ins._CODEX_ADAPTER)[0]
+
+
+def test_codex_rules_body_rewrites_claude_md():
+    """Every CLAUDE.md in the source body becomes AGENTS.md; the lowercase
+    ~/.claude path is untouched (only the uppercase instruction-file token is
+    renamed, not lowercase directory paths)."""
+    out = ins._codex_rules_body(_RULES_WITH_CLAUDE)
+    source = _rewritten_source(out)
+    assert "CLAUDE.md" not in source                    # all four renamed
+    assert "Maintain your AGENTS.md as the rules file" in source
+    assert "~/.claude/jacked-reference.md" in source     # lowercase path preserved
+
+
+def test_codex_rules_body_collapses_duplicate_enumeration():
+    """The `CLAUDE.md`, `AGENTS.md` enumeration collapses to a single `AGENTS.md`
+    after the rename, keeping the rest of the line intact (lessons.md still there)."""
+    out = ins._codex_rules_body(_RULES_WITH_CLAUDE)
+    assert "`AGENTS.md`, `AGENTS.md`" not in out          # backticked dup gone
+    assert "AGENTS.md, AGENTS.md" not in out              # bare dup gone too
+    assert "`AGENTS.md`, `lessons.md`" in out             # enumeration otherwise intact
+
+
+def test_codex_rules_body_appends_adapter_verbatim():
+    """The adapter is appended verbatim, blank-line separated, as the tail of the
+    output; spot-check a few of its exact mapping phrases."""
+    out = ins._codex_rules_body(_RULES_WITH_CLAUDE)
+    assert out.endswith(ins._CODEX_ADAPTER)               # adapter is the tail
+    assert "\n\n" + ins._CODEX_ADAPTER in out             # separated by a blank line
+    assert "## Codex runtime adapter" in out
+    assert "spawn parallel subagents natively" in out
+    assert "ignore Anthropic model names" in out
+    assert "use `codex mcp add ...`" in out
+
+
+def test_codex_rules_body_real_data_guard():
+    """Against the REAL jacked_behaviors.md: the rewritten source body carries no
+    CLAUDE.md and no duplicate enumeration, the output ends with the adapter, and
+    the ONLY CLAUDE.md left is the adapter's intentional mapping line."""
+    out = ins._codex_rules_body(_real_rules_text())
+    assert "CLAUDE.md" not in _rewritten_source(out)      # source refs all renamed
+    assert "`AGENTS.md`, `AGENTS.md`" not in out
+    assert "AGENTS.md, AGENTS.md" not in out
+    assert out.rstrip("\n").endswith(ins._CODEX_ADAPTER.rstrip("\n"))
+    # the adapter deliberately keeps exactly one CLAUDE.md (the mapping line)
+    assert out.count("CLAUDE.md") == ins._CODEX_ADAPTER.count("CLAUDE.md") == 1
+
+
+# --------------------------------------------------------------------------
+# M4: adapter lands in the installed AGENTS.md managed block
+# --------------------------------------------------------------------------
+
+def _install_with_claude_rules(data_root, homes):
+    (data_root / "rules" / "jacked_behaviors.md").write_text(_RULES_WITH_CLAUDE)
+    return _install(data_root, homes)
+
+
+def test_installed_agents_block_contains_adapter(data_root, homes):
+    """The installed managed block carries the runtime-adapter section (heading +
+    key mapping lines) after the rewritten rules body."""
+    _install_with_claude_rules(data_root, homes)
+    agents_md = ins.codex_agents_md(homes["home"]).read_text()
+    assert ins._AGENTS_BEGIN in agents_md and ins._AGENTS_END in agents_md
+    assert "## Codex runtime adapter" in agents_md
+    assert "spawn parallel subagents natively" in agents_md
+    assert "use `codex mcp add ...`" in agents_md
+    assert "Maintain your AGENTS.md as the rules file" in agents_md  # body rewritten
+
+
+def test_installed_agents_block_no_source_claude_md_leak(data_root, homes):
+    """No source-derived CLAUDE.md survives into the installed AGENTS.md and no
+    duplicate enumeration artifact remains; the only CLAUDE.md is the adapter's
+    single intentional mapping line."""
+    _install_with_claude_rules(data_root, homes)
+    agents_md = ins.codex_agents_md(homes["home"]).read_text()
+    assert "`AGENTS.md`, `AGENTS.md`" not in agents_md
+    assert "AGENTS.md, AGENTS.md" not in agents_md
+    assert agents_md.count("CLAUDE.md") == ins._CODEX_ADAPTER.count("CLAUDE.md") == 1
+
+
+def test_installed_adapter_idempotent(data_root, homes):
+    """Installing twice leaves exactly one managed block AND one adapter section
+    (no growth)."""
+    _install_with_claude_rules(data_root, homes)
+    _install(data_root, homes)  # second run, rules already CLAUDE-flavored
+    agents_md = ins.codex_agents_md(homes["home"]).read_text()
+    assert agents_md.count(ins._AGENTS_BEGIN) == 1
+    assert agents_md.count(ins._AGENTS_END) == 1
+    assert agents_md.count("## Codex runtime adapter") == 1
+
+
+def test_installed_adapter_preserves_user_content(data_root, homes):
+    """Pre-existing user content outside the managed block survives the transform,
+    and the adapter section lands alongside it."""
+    agents_md = ins.codex_agents_md(homes["home"])
+    agents_md.parent.mkdir(parents=True, exist_ok=True)
+    agents_md.write_text("# My own rules\nnever delete me\n")
+    _install_with_claude_rules(data_root, homes)
+    text = agents_md.read_text()
+    assert "never delete me" in text               # user content survives
+    assert "## Codex runtime adapter" in text        # adapter present
+
+
+def test_uninstall_strips_adapter(data_root, homes):
+    """Uninstall strips the whole managed block, adapter section included, while
+    keeping user content."""
+    agents_md = ins.codex_agents_md(homes["home"])
+    agents_md.parent.mkdir(parents=True, exist_ok=True)
+    agents_md.write_text("# Mine\nkeep\n")
+    _install_with_claude_rules(data_root, homes)
+    assert "## Codex runtime adapter" in agents_md.read_text()
+    ins.uninstall_codex(home=homes["home"], agents_home=homes["agents_home"])
+    text = agents_md.read_text()
+    assert "## Codex runtime adapter" not in text    # adapter gone
+    assert ins._AGENTS_BEGIN not in text
+    assert "keep" in text                            # user content kept
+
+
+# --------------------------------------------------------------------------
 # hooks.json merge preserves user hooks
 # --------------------------------------------------------------------------
 
