@@ -319,6 +319,7 @@ If `frontend_review = true` (from step 3b), spawn a **5th reviewer** in the SAME
 - Use `subagent_type: "general-purpose"`
 - On a Fable-class session, pass `model: "fable"` explicitly - visual-design judgment (do these elements line up, is the spacing right, does it look designed) is one of the two lanes that stays on the top model
 - Prompt MUST start with: "Invoke the frontend-design skill for design context."
+- If the diff also touches motion/animation code (CSS `transition:`/`animation:`/`@keyframes`/animated `transform`, Motion/Framer Motion imports, spring configs, gesture/drag handlers), the prompt MUST additionally say: "Invoke the review-animations skill and judge every animation against its ten non-negotiable standards; pull exact curves/durations from its STANDARDS.md instead of approximating." The emil-design-eng and apple-design skills carry the underlying craft rules (easing choice, spring parameters, interruptibility, reduced-motion) when a finding needs deeper justification. If review-animations is not available, fall back to the focus areas below.
 - Assign a dedicated **Frontend Design & Aesthetics** lens (outside the 11 standard lenses)
 - Focus areas: design quality (typography, color, spacing, layout intentionality), visual consistency
   (does new code match or improve the existing aesthetic?), motion/animation (purposeful and performant?),
