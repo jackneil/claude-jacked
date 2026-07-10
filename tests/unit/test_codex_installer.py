@@ -1363,6 +1363,8 @@ def test_bare_string_in_stop_list_preserved_not_crashing(data_root, homes):
 @pytest.mark.parametrize("group", [
     '{"matcher": "", "hooks": null}',   # inner hooks null (non-iterable)
     '{"matcher": "", "hooks": 5}',      # inner hooks scalar
+    '{"matcher": "", "hooks": [{"type": "command", "command": null}]}',  # command null
+    '{"matcher": "", "hooks": [{"type": "command", "command": 5}]}',     # command int
 ])
 def test_non_iterable_inner_hooks_does_not_crash(data_root, homes, group):
     """A Stop list holding a proper dict group whose inner "hooks" value is a
