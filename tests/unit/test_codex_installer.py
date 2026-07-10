@@ -1167,3 +1167,41 @@ def test_prior_manifest_without_mcp_key_is_backward_compatible(data_root, homes)
     summ = _install(data_root, homes)          # must not raise
     assert summ.mcp == "added"                 # config.toml is fresh this run
     assert _manifest(homes)["mcp"] == "added"
+
+
+# ---------------------------------------------------------------------------
+# Vendored clone-website skill (asserts on the REAL bundled data/, not the
+# synthetic data_root fixture). Vendored from JCodesMore/ai-website-cloner-
+# template (MIT) with two jacked adaptations; ships to Codex like any skill.
+# ---------------------------------------------------------------------------
+
+_CLONE_WEBSITE_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "jacked" / "data" / "skills" / "clone-website"
+)
+
+
+def test_clone_website_skill_bundled_with_license_parses_and_ships_to_codex():
+    """The vendored clone-website skill is a well-formed bundled skill: SKILL.md
+    plus a LICENSE sidecar (MIT vendoring), parseable YAML frontmatter naming the
+    skill with an em-dash-free description, both jacked adaptations present in the
+    body, and NOT held back from Codex."""
+    skill_md = _CLONE_WEBSITE_DIR / "SKILL.md"
+    assert skill_md.exists(), "jacked/data/skills/clone-website/SKILL.md must exist"
+    assert (_CLONE_WEBSITE_DIR / "LICENSE").exists(), (
+        "vendored skill must ship its MIT LICENSE sidecar"
+    )
+
+    text = skill_md.read_text(encoding="utf-8")
+    meta = _frontmatter(text)  # raises if the frontmatter is not valid YAML
+    assert meta["name"] == "clone-website"
+    desc = meta["description"]
+    assert desc and desc.strip(), "description must be non-empty"
+    assert "—" not in desc, "description must not contain an em-dash (U+2014)"
+
+    body = _body_after_frontmatter(text)
+    assert "Authorization gate" in body        # jacked Pre-Flight 0 addition
+    assert "bootstrap the base project" in body  # jacked Pre-Flight 3 addition
+
+    # Ships to Codex, unlike the Claude-only skills (chain-of-command, recover).
+    assert "clone-website" not in ins._CLAUDE_ONLY_SKILLS
