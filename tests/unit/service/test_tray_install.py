@@ -47,6 +47,9 @@ class TestSetupTrayAutostart:
     def test_registers_and_starts_with_tray_extra(self, monkeypatch):
         import jacked.cli as cli
         monkeypatch.setattr(cli, "_tray_extra_installed", lambda: True)
+        # Pin the display gate too - on a headless runner (Linux CI, no
+        # $DISPLAY) the real _is_headless() short-circuits this branch.
+        monkeypatch.setattr(cli, "_is_headless", lambda: False)
         captured = {}
 
         def fake_ensure(host, port, *, label="Service"):
@@ -56,6 +59,15 @@ class TestSetupTrayAutostart:
         cli._setup_tray_autostart()
         assert captured["label"] == "Tray"
         assert captured["port"]  # DEFAULT_PORT threaded through
+
+    def test_skips_on_headless_environment(self, monkeypatch):
+        import jacked.cli as cli
+        monkeypatch.setattr(cli, "_tray_extra_installed", lambda: True)
+        monkeypatch.setattr(cli, "_is_headless", lambda: True)
+        calls = []
+        monkeypatch.setattr(cli, "_ensure_autostart_and_running", lambda *a, **k: calls.append(a))
+        cli._setup_tray_autostart()
+        assert calls == []  # headless -> no autostart, no tray spawn
 
 
 # ---------------------------------------------------------------------------
