@@ -706,7 +706,9 @@ def _is_jacked_hook_group(group: dict, markers: tuple = _HOOK_MARKERS) -> bool:
         return False
     for h in inner:
         cmd = h.get("command", "") if isinstance(h, dict) else ""
-        if any(m in cmd for m in markers):
+        # A present-but-non-string `command` (null/int/bool) is not ours; `.get`
+        # only defaults a MISSING key, so guard the value type before `in`.
+        if isinstance(cmd, str) and any(m in cmd for m in markers):
             return True
     return False
 
