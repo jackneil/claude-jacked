@@ -805,3 +805,179 @@ def test_claude_install_includes_chain_of_command(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert (tmp_path / ".claude" / "skills" / "chain-of-command" / "SKILL.md").exists(), \
         "chain-of-command must be installed into Claude Code"
+
+
+# --------------------------------------------------------------------------
+# M6: chrome-devtools MCP registration in ~/.codex/config.toml. jacked
+# auto-installs a `chrome-devtools` MCP server for Claude Code (npx
+# chrome-devtools-mcp@latest --autoConnect); the Codex pass mirrors that server
+# via a marker-wrapped `[mcp_servers.chrome-devtools]` TOML append so Codex
+# skills referencing mcp__chrome-devtools__* resolve. Never fights a user's own
+# entry; never leaves a broken config.
+# --------------------------------------------------------------------------
+
+def _cfg(homes):
+    return ins.codex_config_toml(homes["home"])
+
+
+def _mkhome(homes):
+    homes["home"].mkdir(parents=True, exist_ok=True)
+    return homes["home"]
+
+
+def test_mcp_fresh_config_created(homes):
+    """No config.toml -> jacked creates one holding only our marked block; it
+    parses, mcp_servers.chrome-devtools carries the SAME npx args as the Claude
+    side, and the status is 'added'."""
+    home = _mkhome(homes)
+    status = ins.ensure_chrome_devtools_mcp(home)
+    assert status == "added"
+    cfg = _cfg(homes)
+    text = cfg.read_text()
+    assert ins._MCP_BEGIN in text and ins._MCP_END in text
+    data = tomllib.loads(text)
+    srv = data["mcp_servers"]["chrome-devtools"]
+    assert srv["command"] == "npx"
+    assert srv["args"] == ["chrome-devtools-mcp@latest", "--autoConnect"]
+
+
+def test_mcp_appends_preserving_user_config(homes):
+    """An existing user config (a [mcp_servers.other] table + arbitrary top-level
+    keys) keeps its bytes as an exact prefix; our block is appended, the combined
+    file parses, and the status is 'added'."""
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    user = (
+        'model = "gpt-5"\n'
+        'approval_policy = "on-request"\n'
+        "\n"
+        "[mcp_servers.other]\n"
+        'command = "other-server"\n'
+        'args = ["--flag"]\n'
+    )
+    cfg.write_bytes(user.encode())
+    status = ins.ensure_chrome_devtools_mcp(home)
+    assert status == "added"
+    new_bytes = cfg.read_bytes()
+    assert new_bytes.startswith(user.encode())  # user content byte-for-byte prefix
+    data = tomllib.loads(cfg.read_text())        # combined file parses
+    assert data["model"] == "gpt-5"
+    assert "other" in data["mcp_servers"]
+    assert data["mcp_servers"]["chrome-devtools"]["command"] == "npx"
+
+
+def test_mcp_preexisting_unmarked_entry_untouched(homes):
+    """A user's OWN (unmarked) chrome-devtools entry is never fought: the file is
+    byte-untouched and the status is 'preexisting'."""
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    user = (
+        "[mcp_servers.chrome-devtools]\n"
+        'command = "npx"\n'
+        'args = ["chrome-devtools-mcp", "--browserUrl", "http://localhost:9222"]\n'
+    )
+    cfg.write_bytes(user.encode())
+    before = cfg.read_bytes()
+    status = ins.ensure_chrome_devtools_mcp(home)
+    assert status == "preexisting"
+    assert cfg.read_bytes() == before          # byte-untouched
+    assert ins._MCP_BEGIN not in cfg.read_text()  # we never added our block
+
+
+def test_mcp_second_run_unchanged_single_block(homes):
+    """Two runs leave EXACTLY one marked block and the second returns 'unchanged'."""
+    home = _mkhome(homes)
+    assert ins.ensure_chrome_devtools_mcp(home) == "added"
+    assert ins.ensure_chrome_devtools_mcp(home) == "unchanged"
+    text = _cfg(homes).read_text()
+    assert text.count(ins._MCP_BEGIN) == 1
+    assert text.count(ins._MCP_END) == 1
+
+
+def test_mcp_updates_changed_marked_block(homes):
+    """A marked block whose body drifted is replaced in place ('updated'), the new
+    args land, and user content around the block is preserved."""
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    stale = (
+        'model = "gpt-5"\n\n'
+        + ins._MCP_BEGIN + "\n"
+        + "[mcp_servers.chrome-devtools]\n"
+        + 'command = "npx"\n'
+        + 'args = ["OLD-ARGS"]\n'
+        + ins._MCP_END + "\n"
+    )
+    cfg.write_bytes(stale.encode())
+    status = ins.ensure_chrome_devtools_mcp(home)
+    assert status == "updated"
+    text = cfg.read_text()
+    data = tomllib.loads(text)
+    assert data["mcp_servers"]["chrome-devtools"]["args"] == [
+        "chrome-devtools-mcp@latest", "--autoConnect"
+    ]
+    assert data["model"] == "gpt-5"            # surrounding user content preserved
+    assert text.count(ins._MCP_BEGIN) == 1
+
+
+def test_mcp_unparseable_config_untouched(homes):
+    """A config.toml tomllib can't parse is left byte-untouched; status is
+    'skipped-unparseable' (never touch, never break the user's file)."""
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    broken = b"this is = = not valid toml [[[\n"
+    cfg.write_bytes(broken)
+    status = ins.ensure_chrome_devtools_mcp(home)
+    assert status == "skipped-unparseable"
+    assert cfg.read_bytes() == broken
+
+
+def test_mcp_uninstall_restores_user_config_byte_identical(homes):
+    """Install onto a user config, then uninstall: our marked block is gone, the
+    user content is byte-identical, and it's reported in removed."""
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    user = 'model = "gpt-5"\n\n[mcp_servers.other]\ncommand = "other"\n'
+    cfg.write_bytes(user.encode())
+    ins.ensure_chrome_devtools_mcp(home)
+    assert ins._MCP_BEGIN in cfg.read_text()   # our block present after install
+    out = ins.uninstall_codex(home=home, agents_home=homes["agents_home"])
+    assert "config.toml chrome-devtools MCP" in out["removed"]
+    assert cfg.read_bytes() == user.encode()   # byte-identical restore
+
+
+def test_mcp_uninstall_never_removes_unmarked_user_entry(homes):
+    """Uninstall strips ONLY our marked block: a user's own unmarked chrome-devtools
+    entry is never removed and the file stays byte-untouched."""
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    user = '[mcp_servers.chrome-devtools]\ncommand = "npx"\nargs = ["custom"]\n'
+    cfg.write_bytes(user.encode())
+    assert ins.ensure_chrome_devtools_mcp(home) == "preexisting"
+    out = ins.uninstall_codex(home=home, agents_home=homes["agents_home"])
+    assert cfg.read_bytes() == user.encode()   # untouched
+    assert "config.toml chrome-devtools MCP" not in out["removed"]
+
+
+def test_mcp_recorded_in_manifest_and_summary(data_root, homes):
+    """install_codex records the MCP status in the manifest under 'mcp' and on the
+    summary; the first run is 'added' and folds into changed."""
+    first = _install(data_root, homes)
+    assert first.mcp == "added"
+    assert first.changed is True
+    assert _manifest(homes)["mcp"] == "added"
+    second = _install(data_root, homes)
+    assert second.mcp == "unchanged"
+    assert second.changed is False             # unchanged MCP doesn't force changed
+
+
+def test_prior_manifest_without_mcp_key_is_backward_compatible(data_root, homes):
+    """A PRIOR manifest lacking the 'mcp' key loads without crashing; the fresh run
+    registers the MCP and records the new status."""
+    ins.manifest_path(homes["home"]).parent.mkdir(parents=True, exist_ok=True)
+    ins.manifest_path(homes["home"]).write_text(json.dumps({
+        "version": "0.9", "written_at": "before",
+        "skills": {}, "prompts": {}, "agents": {}, "rules": False, "hooks": False,
+    }))
+    summ = _install(data_root, homes)          # must not raise
+    assert summ.mcp == "added"                 # config.toml is fresh this run
+    assert _manifest(homes)["mcp"] == "added"

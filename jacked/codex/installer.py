@@ -19,6 +19,11 @@ Codex pass when Codex is present, writing the native Codex installables:
              definitions converted to Codex's native TOML custom-agent format:
              name/description/developer_instructions, with NO model pin so Codex
              chooses its own model)
+- MCP      -> a marker-wrapped `[mcp_servers.chrome-devtools]` table appended to
+             ~/.codex/config.toml (the SAME npx server the Claude side registers),
+             so Codex skills referencing `mcp__chrome-devtools__*` resolve. Never
+             fights a user's own chrome-devtools entry and never leaves a broken
+             config (parse-checked, byte-restored on failure).
 - legacy gatekeeper hooks.json entries are PRUNED on install (the
              gatekeeper was retired in 0.70.0)
 
@@ -32,6 +37,7 @@ import hashlib
 import json
 import logging
 import shutil
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
@@ -42,6 +48,21 @@ logger = logging.getLogger(__name__)
 
 _AGENTS_BEGIN = "<!-- BEGIN jacked behaviors (managed by `jacked install`) -->"
 _AGENTS_END = "<!-- END jacked behaviors (managed by `jacked install`) -->"
+
+# chrome-devtools MCP block markers + body. The block is a marker-wrapped
+# `[mcp_servers.chrome-devtools]` TOML table appended to ~/.codex/config.toml. Its
+# command/args MIRROR the Claude side (`_install_chrome_devtools_mcp` in
+# jacked/cli.py: `npx chrome-devtools-mcp@latest --autoConnect`) so the same server
+# backs both CLIs and Codex skills referencing `mcp__chrome-devtools__*` resolve.
+# The markers delimit exactly jacked's own entry so install can replace it and
+# uninstall can strip it without touching a user's own chrome-devtools table.
+_MCP_BEGIN = "# BEGIN jacked chrome-devtools MCP (managed by `jacked install`)"
+_MCP_END = "# END jacked chrome-devtools MCP"
+_MCP_BLOCK_BODY = (
+    "[mcp_servers.chrome-devtools]\n"
+    'command = "npx"\n'
+    'args = ["chrome-devtools-mcp@latest", "--autoConnect"]'
+)
 
 # A jacked-managed hook entry is identified by this marker in its command, so
 # install/uninstall can find and replace exactly its own entries.
@@ -122,6 +143,10 @@ def codex_agents_md(home: Optional[Path] = None, env=None) -> Path:
 
 def codex_hooks_json(home: Optional[Path] = None, env=None) -> Path:
     return (home or codex_home(env)) / "hooks.json"
+
+
+def codex_config_toml(home: Optional[Path] = None, env=None) -> Path:
+    return (home or codex_home(env)) / "config.toml"
 
 
 def manifest_path(home: Optional[Path] = None, env=None) -> Path:
@@ -333,6 +358,130 @@ def _strip_agents_block(path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# chrome-devtools MCP block in config.toml (marker-wrapped TOML append)
+# ---------------------------------------------------------------------------
+
+def _mcp_block() -> str:
+    """The full marker-wrapped block, marker-to-marker plus a trailing newline."""
+    return f"{_MCP_BEGIN}\n{_MCP_BLOCK_BODY}\n{_MCP_END}\n"
+
+
+def _write_mcp_verified(cfg: Path, new_text: str, original: Optional[bytes],
+                        status: str) -> str:
+    """Write `new_text`, then parse-check the result with tomllib. On failure,
+    restore the file to `original` bytes exactly (or delete it when we created it,
+    i.e. original is None) and return "skipped-unparseable" - never leave a broken
+    config. On success return `status`."""
+    cfg.write_text(new_text)
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError:
+        if original is None:
+            cfg.unlink()
+        else:
+            cfg.write_bytes(original)
+        logger.warning(
+            "chrome-devtools MCP write to %s produced unparseable TOML; "
+            "restored the original and skipped registration", cfg,
+        )
+        return "skipped-unparseable"
+    return status
+
+
+def ensure_chrome_devtools_mcp(
+    home: Optional[Path] = None, env: Optional[Mapping[str, str]] = None
+) -> str:
+    """Register jacked's chrome-devtools MCP server in Codex's config.toml.
+
+    Deterministic, marker-wrapped TOML append (never `codex mcp add`). Returns one
+    of:
+      - "added"               config.toml was missing (created with just our block)
+                              OR it parses, has no chrome-devtools entry, and our
+                              block was appended at EOF.
+      - "updated"             our marked block was present but its body drifted, so
+                              it was replaced in place.
+      - "unchanged"           our marked block was present and already current.
+      - "preexisting"         the config parses and already has an mcp_servers.
+                              chrome-devtools entry OUTSIDE our markers (the user's
+                              own) - file left byte-untouched; we never fight it.
+      - "skipped-unparseable" config.toml exists but tomllib can't parse it (left
+                              untouched) OR a write produced broken TOML (restored).
+
+    Existing content is preserved byte-for-byte before an appended block, and any
+    write is parse-checked with the original bytes restored on failure.
+    """
+    home = home or codex_home(env)
+    cfg = codex_config_toml(home)
+    block = _mcp_block()
+    desired_block = f"{_MCP_BEGIN}\n{_MCP_BLOCK_BODY}\n{_MCP_END}"
+
+    # Missing config.toml -> create it containing only our marked block.
+    if not cfg.exists():
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        return _write_mcp_verified(cfg, block, None, "added")
+
+    original = cfg.read_bytes()
+    try:
+        text = original.decode()
+        parsed = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        logger.warning(
+            "Codex config.toml at %s did not parse; leaving it untouched and "
+            "skipping chrome-devtools MCP registration", cfg,
+        )
+        return "skipped-unparseable"
+
+    # Our marked block already present -> replace in place iff its body drifted.
+    # (A duplicate user chrome-devtools table alongside ours would be a TOML
+    # duplicate-key error and never reach here - it'd fail the parse above.)
+    if _MCP_BEGIN in text and _MCP_END in text:
+        pre, _, rest = text.partition(_MCP_BEGIN)
+        current_inner, _, post = rest.partition(_MCP_END)
+        current_block = f"{_MCP_BEGIN}{current_inner}{_MCP_END}"
+        if current_block == desired_block:
+            return "unchanged"
+        return _write_mcp_verified(cfg, pre + desired_block + post, original, "updated")
+
+    # A user's OWN (unmarked) chrome-devtools entry -> never fight it.
+    if "chrome-devtools" in (parsed.get("mcp_servers") or {}):
+        return "preexisting"
+
+    # Parses, no entry -> append our block at EOF, separated by a blank line,
+    # preserving existing content byte-for-byte as the prefix (append only).
+    new_text = block if not text else text + "\n\n" + block
+    return _write_mcp_verified(cfg, new_text, original, "added")
+
+
+def _strip_mcp_block(cfg: Path) -> bool:
+    """Strip ONLY jacked's marked chrome-devtools block from config.toml, leaving
+    the rest byte-identical (the exact inverse of the append in
+    ``ensure_chrome_devtools_mcp``: drop the ``\\n\\n`` separator install inserted
+    before the block and the block's own trailing newline). A user's own unmarked
+    entry is never touched. Returns True if a block was removed. If nothing but our
+    block remained, the (jacked-created) file is deleted."""
+    if not cfg.exists():
+        return False
+    try:
+        text = cfg.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if _MCP_BEGIN not in text or _MCP_END not in text:
+        return False
+    before = text.split(_MCP_BEGIN, 1)[0]
+    after = text.split(_MCP_END, 1)[1]
+    if before.endswith("\n\n"):          # the blank-line separator we appended
+        before = before[:-2]
+    if after.startswith("\n"):           # our block's own trailing newline
+        after = after[1:]
+    new_text = before + after
+    if new_text:
+        cfg.write_text(new_text)
+    else:
+        cfg.unlink()                     # only our block existed -> jacked-created
+    return True
+
+
+# ---------------------------------------------------------------------------
 # hooks.json (merge, jacked-owned entries only)
 # ---------------------------------------------------------------------------
 
@@ -384,7 +533,8 @@ def _load_manifest(home: Path) -> Optional[dict]:
 
 
 def _write_manifest(home: Path, version: str, skills: dict, prompts: dict,
-                    agents: dict, rules: bool, hooks: bool, now_iso: str) -> None:
+                    agents: dict, rules: bool, hooks: bool, now_iso: str,
+                    mcp: str = "") -> None:
     p = manifest_path(home)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({
@@ -395,6 +545,7 @@ def _write_manifest(home: Path, version: str, skills: dict, prompts: dict,
         "agents": agents,
         "rules": rules,
         "hooks": hooks,
+        "mcp": mcp,
     }, indent=2) + "\n")
 
 
@@ -409,6 +560,7 @@ class CodexInstallSummary:
     agents: list = field(default_factory=list)
     rules: bool = False
     hooks: bool = False
+    mcp: str = ""
     removed: list = field(default_factory=list)
     changed: bool = False
 
@@ -491,7 +643,14 @@ def install_codex(
             (agents_dst / f"{agent_md.stem}.toml").write_text(content)
             agents[agent_md.stem] = _sha_text(content)
 
-    # 5. Prune legacy gatekeeper entries from hooks.json (retired in 0.70.0).
+    # 5. chrome-devtools MCP -> a marker-wrapped [mcp_servers.chrome-devtools] table
+    #    in config.toml, mirroring the Claude side's npx server so Codex skills that
+    #    reference mcp__chrome-devtools__* resolve. Never fights a user's own entry
+    #    and never leaves a broken config. The returned status ("added"/"updated"/
+    #    "unchanged"/"preexisting"/"skipped-unparseable") is recorded in the manifest.
+    mcp_status = ensure_chrome_devtools_mcp(home)
+
+    # 6. Prune legacy gatekeeper entries from hooks.json (retired in 0.70.0).
     _remove_codex_hooks(codex_hooks_json(home))
     hooks_done = False
 
@@ -520,13 +679,16 @@ def install_codex(
         skills != (prior.get("skills") or {})
         or prompts != (prior.get("prompts") or {})
         or agents != (prior.get("agents") or {})
+        or mcp_status in {"added", "updated"}
         or bool(removed)
     )
 
-    _write_manifest(home, version, skills, prompts, agents, rules_done, hooks_done, now_iso)
+    _write_manifest(home, version, skills, prompts, agents, rules_done, hooks_done,
+                    now_iso, mcp_status)
     return CodexInstallSummary(
         skills=list(skills), prompts=list(prompts), agents=list(agents),
-        rules=rules_done, hooks=hooks_done, removed=removed, changed=changed,
+        rules=rules_done, hooks=hooks_done, mcp=mcp_status,
+        removed=removed, changed=changed,
     )
 
 
@@ -561,6 +723,8 @@ def uninstall_codex(
             removed.append(f"agents/{name}")
     if _strip_agents_block(codex_agents_md(home)):
         removed.append("AGENTS.md block")
+    if _strip_mcp_block(codex_config_toml(home)):
+        removed.append("config.toml chrome-devtools MCP")
     if _remove_codex_hooks(codex_hooks_json(home)):
         removed.append("hooks.json gatekeeper")
 

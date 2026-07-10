@@ -2285,6 +2285,7 @@ def install(
                 "agents": _codex_summary.agents,
                 "rules": _codex_summary.rules,
                 "hooks": _codex_summary.hooks,
+                "mcp": _codex_summary.mcp,
                 "removed": _codex_summary.removed,
             }
         click.echo(json.dumps(_record))
@@ -2292,11 +2293,16 @@ def install(
         console.print("")
         console.print(_isum.render_terminal(_record))
         if _codex_summary is not None:
+            _mcp_suffix = (
+                ", chrome-devtools MCP → config.toml"
+                if _codex_summary.mcp in ("added", "updated")
+                else ""
+            )
             console.print(
                 f"[green][OK][/green] Codex: {len(_codex_summary.skills)} skills "
                 f"→ ~/.agents/skills, {len(_codex_summary.prompts)} prompts "
                 f"→ ~/.codex/prompts, {len(_codex_summary.agents)} agents "
-                f"→ ~/.codex/agents, rules → AGENTS.md"
+                f"→ ~/.codex/agents, rules → AGENTS.md{_mcp_suffix}"
             )
         # Required-plugin blocker only — the full recommendations now live in
         # `jacked doctor`.
