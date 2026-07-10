@@ -65,6 +65,21 @@
 <strong>Goal.</strong> Teach jacked — today a Claude-only account monitor/switcher/installer — to treat <strong>OpenAI Codex</strong> as a first-class second provider: add Codex accounts, read Codex usage (5h + weekly windows) in the same UI with a <span class="pill tag-claude">Claude</span>/<span class="pill tag-codex">Codex</span> indicator per account, install jacked's skills/commands into Codex as well as Claude Code, and switch Codex accounts. This doc is the build's grounding; the matching <code>/goal</code> brief references it.
 </div>
 
+<div class="card" style="border-left:3px solid var(--warn)">
+<strong><span class="pill warn">STATUS UPDATE · 2026-07-10</span></strong>
+<p>This is the original design/grounding doc (2026-06-28). The Codex install pass was rebuilt and shipped afterward (PRs #65-#71); several installer targets below have since changed. For what jacked actually installs into Codex today, see the <em>Codex Integration</em> section of <code>jacked/data/rules/jacked-reference.md</code> and the authoritative source, <code>jacked/codex/installer.py</code>. Deltas from the plan below:</p>
+<ul class="tight">
+<li><strong>No gatekeeper.</strong> The security gatekeeper was retired product-wide in 0.70.0, so nothing installs a gatekeeper hook into Codex. Instead a single QA-suggestion Stop hook ships to <code>~/.codex/hooks.json</code> (the runtime-portable <code>qa_suggest</code> hook with <code>--runtime codex</code>, so the suggestion reads <code>$qa</code>); it still needs a one-time <code>/hooks</code> trust.</li>
+<li><strong>Commands ship twice.</strong> Each non-excluded command ships as BOTH a <code>~/.codex/prompts/*.md</code> prompt AND a command-derived skill at <code>~/.agents/skills/&lt;stem&gt;/SKILL.md</code> (command content replaces the same-name pointer-wrapper skill). OpenAI deprecated the prompts surface on 2026-01-22, so the prompts copy is back-compat only.</li>
+<li><strong>Skills.</strong> Full skill dirs (sidecars included) copy to <code>~/.agents/skills</code> only; the SKILL.md-only drop is fixed and there is no <code>~/.codex/skills</code> mirror.</li>
+<li><strong>Rules are Codex-adapted.</strong> The AGENTS.md block rewrites <code>CLAUDE.md</code> references to <code>AGENTS.md</code> and appends a "Codex runtime adapter" section mapping Claude vocabulary (Task tool to subagents, model lanes ignored, <code>$skill</code> invocations, MCP names, plan mode).</li>
+<li><strong>Agents shipped.</strong> The 10 review agents convert to <code>~/.codex/agents/&lt;name&gt;.toml</code> (no model pin); no longer "lower priority."</li>
+<li><strong>MCP shipped.</strong> The chrome-devtools MCP server is registered via a jacked-managed marker block in <code>~/.codex/config.toml</code>; no longer "optional; later."</li>
+<li><strong>Claude-only exclusions.</strong> Skills <code>chain-of-command</code> and <code>recover</code>, and commands <code>swarm</code>, <code>goal-maker</code>, <code>browser-reset</code>, <code>jacked-setup</code> never ship to Codex; upgrades prune prior copies.</li>
+<li><strong>Manifest.</strong> A dedicated <code>~/.codex/jacked-codex-manifest.json</code> (skills/prompts/agents/mcp/hooks) drives idempotency and a complete <code>jacked uninstall</code> reversal.</li>
+</ul>
+</div>
+
 <h2>1. Feasibility verdict (the honest version)</h2>
 <table>
 <tr><th>Ask</th><th>Verdict</th><th>Mechanism (grounded)</th></tr>

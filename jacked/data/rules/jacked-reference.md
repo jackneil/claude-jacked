@@ -17,7 +17,7 @@ Read this when the user asks about jacked features, installation, logs, or troub
 | `~/.claude/CLAUDE.md` | Behavioral rules (between `# jacked-behaviors-v2` markers) |
 | `~/.claude/jacked-reference.md` | This reference doc |
 | `~/.claude/agents/*.md` | 10 specialized review/workflow agents |
-| `~/.claude/commands/*.md` | 7 quick commands (/dc, /pr, /learn, /blindspot, /redo, /techdebt, /audit-rules) |
+| `~/.claude/commands/*.md` | Slash commands (29 total; the 7 quick ones detailed under Quick Commands below: /dc, /pr, /learn, /blindspot, /redo, /techdebt, /audit-rules) |
 | `~/.claude/jacked-guardrails/*.md` | Guardrails templates (base + 4 languages) |
 | `~/.claude/jacked-hooks/*.sh` | Git hook templates (installed extensionless) |
 | `~/.claude/jacked-templates/*.html` | HTML scaffolds for human-readable artifacts (plans, specs, research, checkpoints) |
@@ -102,6 +102,35 @@ Retired in 0.70.0: the security gatekeeper (`jacked gatekeeper *`, superseded by
 Claude Code's native auto permission mode) and Qdrant session search
 (`jacked search/backfill/status/configure`, the `/jacked` skill, the `[search]`
 extra). `jacked install` prunes their hooks from settings.json automatically.
+
+## Codex Integration
+
+When Codex is present (the `codex` binary is on PATH, or a `~/.codex` home exists),
+`jacked install` runs a second pass that deploys jacked into Codex's native formats
+alongside the Claude Code install. It is idempotent, tracked by its own manifest,
+and fully reversed by `jacked uninstall`.
+
+What ships to Codex:
+
+| jacked artifact | Codex target | Notes |
+|------|------|------|
+| Skills | `~/.agents/skills/<name>/` | Full directory copy (sidecar files included), the agentskills.io format Codex discovers. |
+| Commands | `~/.codex/prompts/<name>.md` AND `~/.agents/skills/<stem>/SKILL.md` | OpenAI deprecated `~/.codex/prompts` on 2026-01-22 in favor of skills, so each non-excluded command also ships as a command-derived skill; the prompts copy stays for back-compat during the deprecation window. The command-derived skill replaces the same-name thin pointer-wrapper skill (command content wins). |
+| Rules | managed block in `~/.codex/AGENTS.md` | The Claude-authored behaviors, adapted for Codex: `CLAUDE.md` references rewritten to `AGENTS.md`, plus a "Codex runtime adapter" section that maps Claude vocabulary to Codex equivalents (slash commands to `$skill` invocations, the Task/Agent tool to native subagents, Claude model lanes ignored, `mcp__chrome-devtools__*` names, plan mode). |
+| Review agents | `~/.codex/agents/<name>.toml` | The 10 review agents converted to Codex custom-agent TOML (`name`, `description`, `developer_instructions`), with no model pin so Codex picks its own. |
+| chrome-devtools MCP | jacked-managed marker block in `~/.codex/config.toml` | Registers the same npx server the Claude side uses, so Codex skills referencing `mcp__chrome-devtools__*` resolve. A user's own chrome-devtools entry is never touched, and a write that would break the TOML is rolled back. |
+| QA-suggest hook | `~/.codex/hooks.json` (Stop event) | The runtime-portable `qa_suggest` hook with `--runtime codex`, so the suggestion reads `$qa` (the Codex skill invocation) instead of `/qa`. Codex requires a one-time trust for this hook: run `/hooks` inside Codex to approve it (the installer prints this reminder when the entry is newly added). |
+
+Claude-only artifacts excluded from Codex: the `chain-of-command` and `recover`
+skills, and the `swarm`, `goal-maker`, `browser-reset`, and `jacked-setup`
+commands (each is wired to Claude Code machinery Codex has no analog for).
+Upgrades prune any previously-shipped copies of these.
+
+Manifest and uninstall: everything above is recorded in
+`~/.codex/jacked-codex-manifest.json` (skills, prompts, agents, mcp, hooks), which
+keeps the Codex install idempotent and lets `jacked uninstall` remove exactly what
+jacked wrote, never a user's own entries. The Claude manifest
+(`~/.claude/jacked-manifest.json`) is separate and untouched.
 
 ## Guardrails System
 
