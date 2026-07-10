@@ -44,6 +44,21 @@ def _install(data_root, homes, **kw):
     )
 
 
+def _manifest(homes):
+    """The Codex manifest as written by the last install (skills/prompts dicts)."""
+    return json.loads(ins.manifest_path(homes["home"]).read_text())
+
+
+def _add_skill(data_root, name, desc="a skill"):
+    d = data_root / "skills" / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\nbody\n")
+
+
+def _add_command(data_root, name):
+    (data_root / "commands" / name).write_text(f"---\ndescription: {name}\n---\nrun\n")
+
+
 # --------------------------------------------------------------------------
 # install lands every artifact at the right Codex path
 # --------------------------------------------------------------------------
@@ -83,9 +98,76 @@ def test_install_excludes_claude_only_skills(data_root, homes):
     skills_base = ins.agents_skills_dir(homes["agents_home"])
     assert not (skills_base / "chain-of-command").exists()
     assert "chain-of-command" not in summ.skills
+    assert "chain-of-command" not in _manifest(homes)["skills"]  # never recorded
     # the ordinary skill is unaffected by the exclusion
     assert (skills_base / "demo-skill" / "SKILL.md").exists()
     assert "demo-skill" in summ.skills
+
+
+def test_install_excludes_recover_and_chain_of_command(data_root, homes):
+    """Both Claude-only skills are skipped by the Codex pass: chain-of-command (a
+    Claude model-dispatch policy) and recover (recovers crashed CLAUDE CODE sessions
+    from ~/.claude/projects). Neither lands on disk nor in the manifest; an ordinary
+    skill still does."""
+    _add_skill(data_root, "chain-of-command", "fable plans, opus codes")
+    _add_skill(data_root, "recover", "recover a crashed Claude Code session")
+    summ = _install(data_root, homes)
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    manifest = _manifest(homes)
+    for name in ("chain-of-command", "recover"):
+        assert not (skills_base / name).exists()          # absent from dir
+        assert name not in summ.skills
+        assert name not in manifest["skills"]             # absent from manifest
+    # the ordinary skill lands, in both dir and manifest
+    assert (skills_base / "demo-skill" / "SKILL.md").exists()
+    assert "demo-skill" in summ.skills and "demo-skill" in manifest["skills"]
+
+
+def test_install_excludes_claude_only_commands(data_root, homes):
+    """swarm / goal-maker / browser-reset / jacked-setup are wired to Claude Code
+    machinery Codex has no analog for; the Codex pass must skip them. Only ordinary
+    commands land in ~/.codex/prompts and in manifest["prompts"]."""
+    for name in ("swarm.md", "goal-maker.md", "browser-reset.md", "jacked-setup.md"):
+        _add_command(data_root, name)
+    summ = _install(data_root, homes)
+    prompts_dst = ins.codex_prompts_dir(homes["home"])
+    manifest = _manifest(homes)
+    for name in ("swarm.md", "goal-maker.md", "browser-reset.md", "jacked-setup.md"):
+        assert not (prompts_dst / name).exists()          # absent from prompts dir
+        assert name not in summ.prompts
+        assert name not in manifest["prompts"]            # absent from manifest
+    # the ordinary command lands, in both prompts dir and manifest
+    assert (prompts_dst / "dcr.md").exists()
+    assert "dcr.md" in summ.prompts and "dcr.md" in manifest["prompts"]
+
+
+def test_install_prunes_stale_now_excluded_artifacts(data_root, homes):
+    """Upgrade path: a skill/command that jacked shipped before but now excludes must
+    have its previously-installed copy DELETED, be reported in summary.removed, and be
+    gone from the fresh manifest, even though the (now-excluded) source still exists."""
+    # A prior install had recover + swarm.md on disk and in the manifest.
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    prompts_dst = ins.codex_prompts_dir(homes["home"])
+    (skills_base / "recover").mkdir(parents=True)
+    (skills_base / "recover" / "SKILL.md").write_text("stale\n")
+    prompts_dst.mkdir(parents=True, exist_ok=True)
+    (prompts_dst / "swarm.md").write_text("stale\n")
+    ins._write_manifest(
+        homes["home"], "0.9",
+        {"recover": "sha256:stale"}, {"swarm.md": "sha256:stale"},
+        False, False, "before",
+    )
+    # The sources still exist but are now Claude-only, so they must be pruned.
+    _add_skill(data_root, "recover", "recover a crashed Claude Code session")
+    _add_command(data_root, "swarm.md")
+    summ = _install(data_root, homes)
+    assert "skills/recover" in summ.removed
+    assert "prompts/swarm.md" in summ.removed
+    assert not (skills_base / "recover").exists()
+    assert not (prompts_dst / "swarm.md").exists()
+    manifest = _manifest(homes)
+    assert "recover" not in manifest["skills"]
+    assert "swarm.md" not in manifest["prompts"]
 
 
 def test_install_idempotent_no_changes_second_run(data_root, homes):
