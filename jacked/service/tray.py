@@ -19,12 +19,22 @@ from jacked.version_check import check_version_cached
 
 logger = logging.getLogger(__name__)
 
+# PIL and pystray are guarded separately: icon rendering is pure Pillow and
+# works headless (menubar_mac borrows _load_glyph_font), while pystray needs
+# a display — it resolves its GUI backend at import time, and on a headless
+# box (no $DISPLAY) that raises Xlib.error.DisplayNameError, not ImportError.
 try:
-    import pystray
     from PIL import Image, ImageDraw, ImageFont
 
-    _TRAY_AVAILABLE = True
+    _PIL_AVAILABLE = True
 except ImportError:
+    _PIL_AVAILABLE = False
+
+try:
+    import pystray
+
+    _TRAY_AVAILABLE = _PIL_AVAILABLE
+except Exception:
     _TRAY_AVAILABLE = False
 
 try:
