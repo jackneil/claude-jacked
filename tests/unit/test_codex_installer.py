@@ -1355,8 +1355,29 @@ def test_bare_string_in_stop_list_preserved_not_crashing(data_root, homes):
 
     data = json.loads(hp.read_text())
     assert "a-bare-string" in data["hooks"]["Stop"]        # user entry survived
-    assert any(isinstance(g, dict) and "_hook qa_suggest" in g["hooks"][0]["command"]
+    assert any(isinstance(g, dict) and isinstance(g.get("hooks"), list)
+               and g["hooks"] and "_hook qa_suggest" in g["hooks"][0]["command"]
                for g in data["hooks"]["Stop"])              # jacked entry added
+
+
+@pytest.mark.parametrize("group", [
+    '{"matcher": "", "hooks": null}',   # inner hooks null (non-iterable)
+    '{"matcher": "", "hooks": 5}',      # inner hooks scalar
+])
+def test_non_iterable_inner_hooks_does_not_crash(data_root, homes, group):
+    """A Stop list holding a proper dict group whose inner "hooks" value is a
+    non-list scalar (null/int) must NOT crash the install (it previously raised
+    TypeError from _is_jacked_hook_group and aborted the whole Codex pass). The
+    malformed group is preserved and jacked appends its own entry."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text('{"hooks": {"Stop": [' + group + ']}}')
+
+    summ = _install(data_root, homes)  # must not raise
+
+    assert summ.skills and summ.rules  # whole pass completed
+    stop = json.loads(hp.read_text())["hooks"]["Stop"]
+    assert len(stop) == 2  # malformed group preserved + jacked entry appended
 
 
 def test_byte_identical_user_dir_not_backed_up(data_root, homes):
