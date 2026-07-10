@@ -8,6 +8,7 @@ and the Claude-side fix that now copies skill sidecar files.
 
 import json
 import logging
+import shutil
 import tomllib
 from pathlib import Path
 
@@ -198,9 +199,12 @@ def test_install_prunes_stale_now_excluded_artifacts(data_root, homes):
     (skills_base / "recover" / "SKILL.md").write_text("stale\n")
     prompts_dst.mkdir(parents=True, exist_ok=True)
     (prompts_dst / "swarm.md").write_text("stale\n")
+    # Record the REAL dir hash so the prune hash-gate sees jacked's own unmodified
+    # copy (the user hasn't edited it) and proceeds to delete the now-excluded skill.
     ins._write_manifest(
         homes["home"], "0.9",
-        {"recover": "sha256:stale"}, {"swarm.md": "sha256:stale"}, {},
+        {"recover": ins._sha_dir(skills_base / "recover")},
+        {"swarm.md": "sha256:stale"}, {},
         False, False, "before",
     )
     # The sources still exist but are now Claude-only, so they must be pruned.
@@ -1275,6 +1279,84 @@ def test_wrapper_skill_overwritten_by_command_not_self_preserved(data_root, home
     assert _body_after_frontmatter(
         (skills_base / "dcr" / "SKILL.md").read_text()
     ) == "run dcr\n"
+
+
+def test_preserve_does_not_clobber_existing_pre_jacked_backup(data_root, homes):
+    """A user owns BOTH ~/.agents/skills/demo-skill AND a pre-existing
+    demo-skill.pre-jacked (e.g. their own dir, or a prior preservation orphaned by
+    an uninstall). The new backup must NOT overwrite the existing .pre-jacked;
+    it falls back to .pre-jacked-2 so no earlier copy is silently destroyed."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    d = skills_base / "demo-skill"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: demo-skill\ndescription: mine now\n---\nnow\n")
+    old_backup = skills_base / "demo-skill.pre-jacked"
+    old_backup.mkdir()
+    (old_backup / "SKILL.md").write_text("PRECIOUS EARLIER BACKUP\n")
+
+    _install(data_root, homes)
+
+    # The earlier backup is untouched; the new one took the next free suffix.
+    assert (old_backup / "SKILL.md").read_text() == "PRECIOUS EARLIER BACKUP\n"
+    assert (skills_base / "demo-skill.pre-jacked-2" / "SKILL.md").read_text() \
+        == "---\nname: demo-skill\ndescription: mine now\n---\nnow\n"
+
+
+def test_install_prune_keeps_user_modified_dropped_skill(data_root, homes):
+    """Upgrade path: jacked shipped `demo-skill` before, the user edited it, and the
+    new data root no longer ships it. Install-prune must NOT rmtree a dir whose
+    content no longer matches the manifest hash (same hash-gate as uninstall) -
+    this runs automatically on every upgrade, a higher-exposure path than uninstall."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    # First install records demo-skill in the manifest.
+    _install(data_root, homes)
+    assert (skills_base / "demo-skill" / "SKILL.md").exists()
+    # User edits their copy, then jacked stops shipping demo-skill.
+    (skills_base / "demo-skill" / "SKILL.md").write_text("USER EDIT\n")
+    shutil.rmtree(data_root / "skills" / "demo-skill")
+
+    summ = _install(data_root, homes)
+
+    assert (skills_base / "demo-skill" / "SKILL.md").read_text() == "USER EDIT\n"
+    assert "skills/demo-skill" not in summ.removed
+    assert "skills/demo-skill" in summ.preserved
+
+
+@pytest.mark.parametrize("payload", [
+    '{"hooks": {"Stop": "a-string"}}',   # Stop not a list
+    '{"hooks": {"Stop": 5}}',            # Stop an int
+    '{"hooks": {"Stop": {"k": "v"}}}',   # Stop an object
+    '{"hooks": "not-an-object"}',        # hooks not an object
+])
+def test_malformed_hooks_shape_left_untouched(data_root, homes, payload):
+    """hooks.json that is valid JSON but whose hooks/Stop value is the wrong TYPE
+    must NOT crash the install and must be left byte-identical - the whole Codex
+    pass previously aborted (AttributeError/TypeError) on these."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text(payload)
+
+    summ = _install(data_root, homes)  # must not raise
+
+    assert hp.read_text() == payload  # byte-identical
+    # The rest of the Codex pass still landed.
+    assert summ.skills and summ.rules
+
+
+def test_bare_string_in_stop_list_preserved_not_crashing(data_root, homes):
+    """A Stop LIST that contains a non-dict entry (a bare string) is a valid list,
+    so jacked appends its own entry rather than skipping - but must NOT crash on
+    the bare entry and must preserve it."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text('{"hooks": {"Stop": ["a-bare-string"]}}')
+
+    _install(data_root, homes)  # must not raise
+
+    data = json.loads(hp.read_text())
+    assert "a-bare-string" in data["hooks"]["Stop"]        # user entry survived
+    assert any(isinstance(g, dict) and "_hook qa_suggest" in g["hooks"][0]["command"]
+               for g in data["hooks"]["Stop"])              # jacked entry added
 
 
 def test_byte_identical_user_dir_not_backed_up(data_root, homes):

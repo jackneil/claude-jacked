@@ -57,21 +57,21 @@ from .credentials import codex_home
 logger = logging.getLogger(__name__)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Atomically write `text` to `path` as UTF-8 via a temp file + os.replace.
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomically write `data` to `path` via a sibling temp file + os.replace.
 
-    Mirrors cli._write_settings_atomic: write to a sibling temp file, flush +
-    os.fsync, then os.replace onto the target so a process killed mid-write can
-    never leave a half-written Codex file (AGENTS.md, config.toml, hooks.json,
-    manifest). Cleans up the temp file if anything fails.
+    Mirrors cli._write_settings_atomic: write to a temp file, flush + os.fsync,
+    then os.replace onto the target so a process killed mid-write can never leave
+    a half-written Codex file (AGENTS.md, config.toml, hooks.json, manifest, or
+    a restore-to-original). Cleans up the temp file if anything fails.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -81,6 +81,11 @@ def _atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write `text` to `path` as UTF-8 (see `_atomic_write_bytes`)."""
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def _is_safe_name(name: str) -> bool:
@@ -316,15 +321,17 @@ def _preserve_user_skill_dir(
     if (target.is_dir() and not target.is_symlink()
             and _sha_dir(target) == expected_hash):
         return  # already exactly what we'd install -> no clobber, no backup
+    # Never clobber a backup that already exists (it may be the user's own, or a
+    # prior preservation): pick the first free `.pre-jacked[-N]` suffix so no
+    # earlier preserved copy is silently destroyed.
     backup = target.with_name(target.name + ".pre-jacked")
-    if backup.exists() or backup.is_symlink():
-        if backup.is_dir() and not backup.is_symlink():
-            shutil.rmtree(backup)
-        else:
-            backup.unlink()
+    n = 2
+    while backup.exists() or backup.is_symlink():
+        backup = target.with_name(f"{target.name}.pre-jacked-{n}")
+        n += 1
     shutil.move(str(target), str(backup))
     logger.warning(
-        "preserved your existing ~/.agents/skills/%s as %s.pre-jacked", name, name
+        "preserved your existing ~/.agents/skills/%s as %s", name, backup.name
     )
     preserved.append(f"skills/{name}")
 
@@ -565,7 +572,7 @@ def _write_mcp_verified(cfg: Path, new_text: str, original: Optional[bytes],
         if original is None:
             cfg.unlink()
         else:
-            cfg.write_bytes(original)
+            _atomic_write_bytes(cfg, original)
         logger.warning(
             "chrome-devtools MCP write to %s produced unparseable TOML; "
             "restored the original and skipped registration", cfg,
@@ -689,8 +696,12 @@ def _strip_mcp_block(cfg: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def _is_jacked_hook_group(group: dict, markers: tuple = _HOOK_MARKERS) -> bool:
+    # A hand-malformed hooks.json can carry non-dict group entries (a bare
+    # string in the list); treat anything that isn't our shape as not-ours.
+    if not isinstance(group, dict):
+        return False
     for h in group.get("hooks", []):
-        cmd = h.get("command", "")
+        cmd = h.get("command", "") if isinstance(h, dict) else ""
         if any(m in cmd for m in markers):
             return True
     return False
@@ -715,13 +726,21 @@ def _remove_codex_hooks(path: Path, markers: tuple = _HOOK_MARKERS) -> bool:
         return False
     changed = False
     for event in list(hooks.keys()):
-        kept = [g for g in hooks[event] if not _is_jacked_hook_group(g, markers)]
-        if len(kept) != len(hooks[event]):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            # A non-list event value isn't our shape; leave it byte-untouched.
+            continue
+        kept = [g for g in groups if not _is_jacked_hook_group(g, markers)]
+        if len(kept) != len(groups):
             changed = True
         if kept:
             hooks[event] = kept
         else:
             del hooks[event]
+    # Nothing of ours was present: leave the file byte-identical (don't reformat
+    # the user's JSON just for having looked at it).
+    if not changed:
+        return False
     if not hooks:
         data.pop("hooks", None)
     # If the file is now just an empty object jacked created, remove it.
@@ -783,14 +802,29 @@ def _install_codex_qa_hook(home: Optional[Path] = None) -> bool:
             return False
         data = loaded
 
+    # A PRESENT-but-wrong-type "hooks"/"Stop" is a malformed structure we don't
+    # own; leave it byte-untouched rather than replacing (and dropping) it. An
+    # ABSENT key is fine to create.
     hooks = data.get("hooks")
-    if not isinstance(hooks, dict):
+    if hooks is None:
         hooks = {}
         data["hooks"] = hooks
+    elif not isinstance(hooks, dict):
+        logger.warning(
+            "Codex hooks.json at %s has a non-object 'hooks' value; leaving it "
+            "untouched and skipping the QA hook", path,
+        )
+        return False
     stop = hooks.get("Stop")
-    if not isinstance(stop, list):
+    if stop is None:
         stop = []
         hooks["Stop"] = stop
+    elif not isinstance(stop, list):
+        logger.warning(
+            "Codex hooks.json at %s has a non-list 'Stop' value; leaving it "
+            "untouched and skipping the QA hook", path,
+        )
+        return False
 
     entry_hooks = [{"type": "command", "command": command}]
     for group in stop:
@@ -989,12 +1023,25 @@ def install_codex(
     # validated as single safe path components before being joined onto real dirs
     # (a malformed name never drives a delete outside the target dir).
     removed = []
-    for name in (prior.get("skills") or {}):
-        if name not in skills and _is_safe_name(name):
-            d = skills_base / name
-            if d.is_dir():
-                shutil.rmtree(d, ignore_errors=True)
-                removed.append(f"skills/{name}")
+    for name, recorded in (prior.get("skills") or {}).items():
+        if name in skills or not _is_safe_name(name):
+            continue
+        d = skills_base / name
+        if not d.is_dir():
+            continue
+        # Same hash-gate as uninstall: only delete a dir whose content still
+        # matches what jacked installed. A user who edited/recreated a now-
+        # dropped skill keeps it (upgrade runs this automatically, so it's a
+        # higher-exposure path than an explicit uninstall).
+        if isinstance(recorded, str) and _sha_dir(d) == recorded:
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(f"skills/{name}")
+        else:
+            logger.warning(
+                "leaving Codex skill dir %s in place: it no longer matches what "
+                "jacked installed (you likely modified or recreated it)", d,
+            )
+            preserved.append(f"skills/{name}")
     for name in (prior.get("prompts") or {}):
         if name not in prompts and _is_safe_name(name):
             f = prompts_dst / name
