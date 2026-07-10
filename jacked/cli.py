@@ -1949,6 +1949,11 @@ def _remove_chain_of_command_hook(settings_path: Path) -> bool:
     return False
 
 
+# Single source of truth for the chrome-devtools MCP npx package spec. The Codex
+# installer (jacked/codex/installer._mcp_block_body) imports this + the autoConnect
+# args below so the two CLIs never drift on the version/flags they register.
+CHROME_DEVTOOLS_NPX_PACKAGE = "chrome-devtools-mcp@latest"
+
 CHROME_DEVTOOLS_MODES: dict[str, list[str]] = {
     "autoConnect": ["--autoConnect"],
     "browserUrl": ["--browserUrl", "http://127.0.0.1:9222"],
@@ -2028,7 +2033,7 @@ def _install_chrome_devtools_mcp(force: bool = False) -> None:
 
     add = _run_claude_mcp(
         "add", "-s", "user", "chrome-devtools", "--",
-        "npx", "chrome-devtools-mcp@latest", "--autoConnect",
+        "npx", CHROME_DEVTOOLS_NPX_PACKAGE, *CHROME_DEVTOOLS_MODES["autoConnect"],
         timeout=30,
     )
     if add is None:
@@ -2102,7 +2107,7 @@ def _set_chrome_devtools_mcp_mode(mode: str) -> tuple[bool, str]:
 
     # Re-add with new mode
     add_args = ["add", "-s", "user", "chrome-devtools", "--",
-                "npx", "chrome-devtools-mcp@latest"] + CHROME_DEVTOOLS_MODES[mode]
+                "npx", CHROME_DEVTOOLS_NPX_PACKAGE] + CHROME_DEVTOOLS_MODES[mode]
     add = _run_claude_mcp(*add_args, timeout=30)
 
     if add is not None and add.returncode == 0:
@@ -2112,7 +2117,7 @@ def _set_chrome_devtools_mcp_mode(mode: str) -> tuple[bool, str]:
     if had_existing:
         _run_claude_mcp(
             "add", "-s", "user", "chrome-devtools", "--",
-            "npx", "chrome-devtools-mcp@latest", *prev_mode_args,
+            "npx", CHROME_DEVTOOLS_NPX_PACKAGE, *prev_mode_args,
             timeout=30,
         )
     error = add.stderr.strip() if add else "timed out or claude CLI not found"
@@ -2276,6 +2281,7 @@ def install(
     # (~/.agents/skills, ~/.codex/prompts, ~/.codex/AGENTS.md) with its own
     # manifest. Best-effort: a Codex failure never fails the Claude install.
     _codex_summary = None
+    _codex_failed = False
     if not no_codex:
         try:
             from jacked.codex import installer as _cdx
@@ -2288,6 +2294,7 @@ def install(
                 )
         except Exception:
             logger.exception("Codex install pass failed (Claude install unaffected)")
+            _codex_failed = True
 
     if as_json:
         if _codex_summary is not None:
@@ -2299,28 +2306,47 @@ def install(
                 "hooks": _codex_summary.hooks,
                 "mcp": _codex_summary.mcp,
                 "removed": _codex_summary.removed,
+                "preserved": _codex_summary.preserved,
+                "changed": _codex_summary.changed,
             }
+        elif _codex_failed:
+            _record["codex"] = {"failed": True}
         click.echo(json.dumps(_record))
     else:
         console.print("")
         console.print(_isum.render_terminal(_record))
         if _codex_summary is not None:
-            _mcp_suffix = (
-                ", chrome-devtools MCP → config.toml"
-                if _codex_summary.mcp in ("added", "updated")
-                else ""
-            )
+            _mcp = _codex_summary.mcp
+            if _mcp in ("added", "updated"):
+                _mcp_suffix = ", chrome-devtools MCP → config.toml"
+            elif _mcp == "preexisting":
+                _mcp_suffix = ", chrome-devtools MCP (kept your existing entry)"
+            elif _mcp == "skipped-unparseable":
+                _mcp_suffix = ", chrome-devtools MCP skipped (config.toml unparseable)"
+            else:
+                _mcp_suffix = ""
             console.print(
                 f"[green][OK][/green] Codex: {len(_codex_summary.skills)} skills "
                 f"→ ~/.agents/skills, {len(_codex_summary.prompts)} prompts "
                 f"→ ~/.codex/prompts, {len(_codex_summary.agents)} agents "
                 f"→ ~/.codex/agents, rules → AGENTS.md{_mcp_suffix}"
             )
+            for _item in _codex_summary.preserved:
+                _name = _item.split("/", 1)[-1]
+                console.print(
+                    f"[yellow][!][/yellow] Codex: preserved your existing "
+                    f"~/.agents/{_item} as {_name}.pre-jacked"
+                )
             if _codex_summary.hooks_added:
                 console.print(
                     "[yellow][!][/yellow] Codex requires one-time hook trust - "
                     "run /hooks inside Codex to approve the jacked QA hook."
                 )
+        elif _codex_failed:
+            console.print(
+                "[yellow][WARN][/yellow] Codex pass failed (see logs); "
+                "Claude install unaffected."
+            )
         # Required-plugin blocker only — the full recommendations now live in
         # `jacked doctor`.
         _warn_required_plugins_missing()
@@ -3209,10 +3235,17 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     try:
         from jacked.codex import installer as _cdx
 
-        _cdx_removed = _cdx.uninstall_codex().get("removed", [])
+        _cdx_out = _cdx.uninstall_codex()
+        _cdx_removed = _cdx_out.get("removed", [])
+        _cdx_kept = _cdx_out.get("skipped", [])
         if _cdx_removed:
             console.print(
                 f"[green][OK][/green] Removed {len(_cdx_removed)} Codex artifacts"
+            )
+        if _cdx_kept:
+            console.print(
+                f"[yellow][!][/yellow] Kept {len(_cdx_kept)} Codex skill dir(s) you "
+                f"modified: {', '.join(_cdx_kept)}"
             )
     except Exception:
         logger.exception("Codex uninstall pass failed")
