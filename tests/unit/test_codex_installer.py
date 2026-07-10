@@ -7,6 +7,7 @@ and the Claude-side fix that now copies skill sidecar files.
 """
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,19 @@ def _add_skill(data_root, name, desc="a skill"):
 
 def _add_command(data_root, name):
     (data_root / "commands" / name).write_text(f"---\ndescription: {name}\n---\nrun\n")
+
+
+def _add_agent(data_root, name, desc, body):
+    """Write a frontmattered Claude subagent .md (name/description + markdown body).
+
+    Includes Claude-only `tools:` / `model:` keys so tests can assert the Codex
+    TOML never carries them over."""
+    d = data_root / "agents"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.md").write_text(
+        f"---\nname: {name}\ndescription: {desc}\n"
+        "tools: All tools\nmodel: inherit\n---\n" + body
+    )
 
 
 def _body_after_frontmatter(text):
@@ -183,7 +197,7 @@ def test_install_prunes_stale_now_excluded_artifacts(data_root, homes):
     (prompts_dst / "swarm.md").write_text("stale\n")
     ins._write_manifest(
         homes["home"], "0.9",
-        {"recover": "sha256:stale"}, {"swarm.md": "sha256:stale"},
+        {"recover": "sha256:stale"}, {"swarm.md": "sha256:stale"}, {},
         False, False, "before",
     )
     # The sources still exist but are now Claude-only, so they must be pruned.
@@ -351,6 +365,171 @@ def test_real_commands_generate_parseable_skill_frontmatter():
             cmd.name
         checked += 1
     assert checked  # sanity: we actually exercised real commands
+
+
+# --------------------------------------------------------------------------
+# Agents -> ~/.codex/agents/<stem>.toml (Codex custom-agent TOMLs). jacked ships
+# Claude Code subagent definitions (data/agents/*.md); Codex reads TOML with
+# name/description/developer_instructions and NO model pin (Codex picks its own).
+# --------------------------------------------------------------------------
+
+# A body that stresses TOML escaping: a double quote, a literal backslash, and a
+# triple-backtick fence must all round-trip verbatim through json.dumps quoting.
+_AGENT_BODY = (
+    'You review "code" with care.\n'
+    "A Windows path C:\\\\Users and a regex \\d+ stay intact.\n"
+    "```python\nprint('fence')\n```\n"
+)
+
+
+def test_agents_ship_as_codex_tomls(data_root, homes):
+    """Two synthetic agents -> two TOMLs under the codex home's agents dir; each
+    parses with tomllib and carries non-empty name/description/developer_instructions,
+    name == stem, and developer_instructions == the markdown body verbatim (quotes,
+    backslashes, and a code fence all survive the escaping)."""
+    _add_agent(data_root, "reviewer", "reviews code", _AGENT_BODY)
+    _add_agent(data_root, "planner", "plans work", "Plan it.\n")
+    summ = _install(data_root, homes)
+    agents_dir = ins.codex_agents_dir(homes["home"])
+    for stem, desc, body in (
+        ("reviewer", "reviews code", _AGENT_BODY),
+        ("planner", "plans work", "Plan it.\n"),
+    ):
+        toml_path = agents_dir / f"{stem}.toml"
+        assert toml_path.exists()
+        data = tomllib.loads(toml_path.read_text())
+        assert data["name"] == stem
+        assert isinstance(data["description"], str) and data["description"].strip()
+        assert data["description"] == desc
+        assert data["developer_instructions"] == body  # verbatim, not truncated
+        assert stem in summ.agents
+
+
+def test_agent_toml_omits_tools_and_model(data_root, homes):
+    """The generated TOML carries ONLY name/description/developer_instructions:
+    the Claude-only `tools:` / `model:` frontmatter keys are never pinned (Codex
+    picks its own model)."""
+    _add_agent(data_root, "reviewer", "reviews code", "Do the review.\n")
+    _install(data_root, homes)
+    toml_path = ins.codex_agents_dir(homes["home"]) / "reviewer.toml"
+    data = tomllib.loads(toml_path.read_text())
+    assert set(data) == {"name", "description", "developer_instructions"}
+    assert "tools" not in data and "model" not in data
+    assert "model" not in toml_path.read_text()  # no model pin anywhere in the file
+
+
+def test_agent_toml_description_fallback_to_first_body_line(data_root, homes):
+    """An agent with no `description` frontmatter falls back to the first non-empty
+    body line."""
+    (data_root / "agents").mkdir(parents=True, exist_ok=True)
+    (data_root / "agents" / "nodesc.md").write_text(
+        "---\nname: nodesc\n---\n\nFirst real line.\nSecond line.\n"
+    )
+    _install(data_root, homes)
+    data = tomllib.loads(
+        (ins.codex_agents_dir(homes["home"]) / "nodesc.toml").read_text()
+    )
+    assert data["description"] == "First real line."
+
+
+def test_agents_recorded_in_manifest_and_summary(data_root, homes):
+    """The manifest gains an `agents` dict listing the shipped agents, and the
+    summary's `agents` list matches."""
+    _add_agent(data_root, "reviewer", "reviews code", "Review.\n")
+    _add_agent(data_root, "planner", "plans work", "Plan.\n")
+    summ = _install(data_root, homes)
+    manifest = _manifest(homes)
+    assert set(manifest["agents"]) == {"reviewer", "planner"}
+    assert set(summ.agents) == {"reviewer", "planner"}
+
+
+def test_agents_prune_on_source_removal(data_root, homes):
+    """An agent shipped before but whose source is deleted has its TOML removed,
+    is reported in summary.removed as `agents/<name>`, and is gone from the manifest."""
+    _add_agent(data_root, "reviewer", "reviews code", "Review.\n")
+    _install(data_root, homes)
+    agents_dir = ins.codex_agents_dir(homes["home"])
+    assert (agents_dir / "reviewer.toml").exists()
+    (data_root / "agents" / "reviewer.md").unlink()
+    summ = _install(data_root, homes)
+    assert "agents/reviewer" in summ.removed
+    assert not (agents_dir / "reviewer.toml").exists()
+    assert "reviewer" not in _manifest(homes)["agents"]
+
+
+def test_uninstall_removes_agent_tomls(data_root, homes):
+    """Uninstall (manifest-driven) removes the agent TOMLs it installed."""
+    _add_agent(data_root, "reviewer", "reviews code", "Review.\n")
+    _install(data_root, homes)
+    agents_dir = ins.codex_agents_dir(homes["home"])
+    assert (agents_dir / "reviewer.toml").exists()
+    out = ins.uninstall_codex(home=homes["home"], agents_home=homes["agents_home"])
+    assert not (agents_dir / "reviewer.toml").exists()
+    assert "agents/reviewer" in out["removed"]
+
+
+def test_agents_idempotent_no_changes_second_run(data_root, homes):
+    """Agents are folded into the changed computation: a second unchanged install
+    still reports changed=False."""
+    _add_agent(data_root, "reviewer", "reviews code", _AGENT_BODY)
+    first = _install(data_root, homes)
+    assert first.changed is True
+    second = _install(data_root, homes)
+    assert second.changed is False
+
+
+def test_real_agents_generate_parseable_tomls():
+    """Integration guard against the REAL data/agents: every shipped agent .md
+    produces TOML tomllib parses with all 3 required fields non-empty. >= 10 today
+    so the assert doesn't rot when agents are added."""
+    import jacked
+
+    agents_dir = Path(jacked.__file__).parent / "data" / "agents"
+    agents = sorted(agents_dir.glob("*.md"))
+    assert len(agents) >= 10, f"expected >= 10 real agents, found {len(agents)}"
+    for agent_md in agents:
+        data = tomllib.loads(ins._agent_toml(agent_md))
+        assert data["name"] == agent_md.stem, agent_md.name
+        assert isinstance(data["description"], str) and data["description"].strip(), \
+            agent_md.name
+        assert isinstance(data["developer_instructions"], str) and \
+            data["developer_instructions"].strip(), agent_md.name
+        # No stray YAML quote chars left on the value edges (the multi-line
+        # quoted-scalar path strips the surrounding pair).
+        assert not data["description"].startswith('"'), agent_md.name
+        assert not data["description"].endswith('"'), agent_md.name
+
+
+def test_multiline_quoted_description_parses_fully():
+    """double-check-reviewer's description is a YAML double-quoted scalar spanning
+    many lines. The line-folding path must return the FULL text (continuation
+    lines folded to spaces, quote pair stripped) - a regression here silently
+    truncates the description to its first physical line."""
+    import jacked
+
+    agent_md = Path(jacked.__file__).parent / "data" / "agents" / "double-check-reviewer.md"
+    meta, _ = ins._split_command_frontmatter(agent_md.read_text())
+    desc = meta["description"]
+    assert len(desc) > 1000, len(desc)          # full scalar, not the first line
+    assert not desc.startswith('"') and not desc.endswith('"')
+    assert desc.endswith("</example>")           # the scalar's real final text
+    # Continuation lines must not have been misparsed as frontmatter keys.
+    assert set(meta) <= {"name", "description", "model", "color", "tools", "argument-hint"}, sorted(meta)
+
+
+def test_prior_manifest_without_agents_key_is_backward_compatible(data_root, homes):
+    """A PRIOR manifest lacking the `agents` key loads without crashing and prunes
+    no agents (nothing was shipped before)."""
+    # Hand-write a legacy manifest with no `agents` key (older jacked shape).
+    ins.manifest_path(homes["home"]).parent.mkdir(parents=True, exist_ok=True)
+    ins.manifest_path(homes["home"]).write_text(json.dumps({
+        "version": "0.9", "written_at": "before",
+        "skills": {}, "prompts": {}, "rules": False, "hooks": False,
+    }))
+    _add_agent(data_root, "reviewer", "reviews code", "Review.\n")
+    summ = _install(data_root, homes)  # must not raise
+    assert not any(r.startswith("agents/") for r in summ.removed)
+    assert "reviewer" in _manifest(homes)["agents"]
 
 
 # --------------------------------------------------------------------------

@@ -2282,6 +2282,7 @@ def install(
             _record["codex"] = {
                 "skills": _codex_summary.skills,
                 "prompts": _codex_summary.prompts,
+                "agents": _codex_summary.agents,
                 "rules": _codex_summary.rules,
                 "hooks": _codex_summary.hooks,
                 "removed": _codex_summary.removed,
@@ -2294,7 +2295,8 @@ def install(
             console.print(
                 f"[green][OK][/green] Codex: {len(_codex_summary.skills)} skills "
                 f"→ ~/.agents/skills, {len(_codex_summary.prompts)} prompts "
-                f"→ ~/.codex/prompts, rules → AGENTS.md"
+                f"→ ~/.codex/prompts, {len(_codex_summary.agents)} agents "
+                f"→ ~/.codex/agents, rules → AGENTS.md"
             )
         # Required-plugin blocker only — the full recommendations now live in
         # `jacked doctor`.
