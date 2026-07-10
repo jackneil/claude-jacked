@@ -697,10 +697,14 @@ def _strip_mcp_block(cfg: Path) -> bool:
 
 def _is_jacked_hook_group(group: dict, markers: tuple = _HOOK_MARKERS) -> bool:
     # A hand-malformed hooks.json can carry non-dict group entries (a bare
-    # string in the list); treat anything that isn't our shape as not-ours.
+    # string in the list) or a non-list inner "hooks" value (null/scalar);
+    # treat anything that isn't our shape as not-ours.
     if not isinstance(group, dict):
         return False
-    for h in group.get("hooks", []):
+    inner = group.get("hooks")
+    if not isinstance(inner, list):
+        return False
+    for h in inner:
         cmd = h.get("command", "") if isinstance(h, dict) else ""
         if any(m in cmd for m in markers):
             return True
