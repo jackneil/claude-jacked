@@ -1456,7 +1456,11 @@ def test_mutable_files_written_atomically(data_root, homes, monkeypatch):
         calls.append(Path(path).name)
         return real(path, text)
 
+    # The atomic writer moved to jacked.codex._fsutil and is imported into both
+    # the installer facade (manifest write) and _managed (AGENTS.md / config.toml /
+    # hooks.json writes); patch both resolution sites so the spy sees every write.
     monkeypatch.setattr(ins, "_atomic_write_text", spy)
+    monkeypatch.setattr("jacked.codex._managed._atomic_write_text", spy)
     _install(data_root, homes)
     assert "AGENTS.md" in calls
     assert "config.toml" in calls
