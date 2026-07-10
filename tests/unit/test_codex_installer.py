@@ -113,13 +113,15 @@ def test_install_lands_all_artifacts(data_root, homes):
     # rules -> AGENTS.md block
     agents_md = ins.codex_agents_md(homes["home"]).read_text()
     assert ins._AGENTS_BEGIN in agents_md and "be blunt" in agents_md
-    # gatekeeper hooks are no longer installed (retired in 0.70.0)
-    assert not ins.codex_hooks_json(homes["home"]).exists() or \
-        "security_gatekeeper" not in ins.codex_hooks_json(homes["home"]).read_text()
+    # legacy gatekeeper hooks are no longer installed (retired in 0.70.0), but
+    # the QA-suggest Stop hook IS installed now.
+    hooks_text = ins.codex_hooks_json(homes["home"]).read_text()
+    assert "security_gatekeeper" not in hooks_text
+    assert "_hook qa_suggest" in hooks_text
     # commands now ALSO ship as Codex skills (see below), so the command dcr.md
     # yields a `dcr` skill alongside the ordinary demo-skill.
     assert summ.skills == ["demo-skill", "dcr"] and summ.prompts == ["dcr.md"]
-    assert summ.rules and not summ.hooks
+    assert summ.rules and summ.hooks
 
 
 def test_install_copies_skill_sidecars(data_root, homes):
@@ -719,6 +721,190 @@ def test_hooks_merge_preserves_user_hooks(data_root, homes):
     assert any("./mine.sh" in h["command"]
                for g in data["hooks"].get("PostToolUse", []) for h in g["hooks"])
     assert "security_gatekeeper" not in json.dumps(data)  # legacy entry pruned
+
+
+# --------------------------------------------------------------------------
+# QA-suggest Stop hook in ~/.codex/hooks.json (Codex parity for /qa -> $qa)
+#
+# jacked installs a QA-suggestion Stop hook into Claude Code; the Codex pass
+# installs the SAME runtime-portable hook with `--runtime codex` so the
+# suggestion reads `$qa` (the Codex skill invocation) instead of `/qa`. Our
+# entry is marker-identified by `_hook qa_suggest` in its command; the command
+# is built by cli's _build_hook_command (the SAME upgrade-safe shim / -m fallback
+# the Claude side writes). Install prunes ONLY the legacy gatekeeper (never its
+# own just-written qa entry); uninstall strips both.
+# --------------------------------------------------------------------------
+
+def _hooks(homes):
+    """Parse ~/.codex/hooks.json (the whole object)."""
+    return json.loads(ins.codex_hooks_json(homes["home"]).read_text())
+
+
+def _qa_groups(homes):
+    """Every Stop group whose command carries the jacked qa_suggest marker."""
+    stop = _hooks(homes).get("hooks", {}).get("Stop", [])
+    return [
+        g for g in stop
+        if any("_hook qa_suggest" in h.get("command", "") for h in g.get("hooks", []))
+    ]
+
+
+def test_qa_hook_entry_created_with_exact_schema(data_root, homes):
+    """A single Stop entry is written with the exact jacked schema, and its
+    command reuses the shim form + the `--runtime codex` flag."""
+    _install(data_root, homes)
+    groups = _qa_groups(homes)
+    assert len(groups) == 1
+    group = groups[0]
+    assert set(group) == {"matcher", "hooks"}
+    assert group["matcher"] == ""
+    assert len(group["hooks"]) == 1
+    hook = group["hooks"][0]
+    assert set(hook) == {"type", "command"}
+    assert hook["type"] == "command"
+    # command is the upgrade-safe shim/-m form + the codex runtime flag
+    assert hook["command"].endswith(" _hook qa_suggest --runtime codex")
+
+
+def test_qa_hook_command_uses_build_hook_command_shim(data_root, homes):
+    """The command matches cli._build_hook_command('qa_suggest') + the runtime
+    flag (no duplicated find_bin fallback logic)."""
+    from jacked.cli import _build_hook_command
+
+    _install(data_root, homes)
+    expected = _build_hook_command("qa_suggest") + " --runtime codex"
+    assert _qa_groups(homes)[0]["hooks"][0]["command"] == expected
+
+
+def test_qa_hook_idempotent_single_entry_and_unchanged(data_root, homes):
+    """Two installs leave EXACTLY one qa entry and the second run reports
+    changed=False when nothing else changed."""
+    first = _install(data_root, homes)
+    assert first.changed is True
+    assert first.hooks is True
+    second = _install(data_root, homes)
+    assert len(_qa_groups(homes)) == 1
+    assert second.changed is False
+    assert second.hooks is True
+
+
+def test_qa_hook_manifest_records_hooks_true(data_root, homes):
+    """The Codex manifest flips hooks -> True once the qa hook is installed."""
+    _install(data_root, homes)
+    assert _manifest(homes)["hooks"] is True
+
+
+def test_qa_hook_preserves_user_entries_and_unknown_keys(data_root, homes):
+    """Installing the qa hook preserves the user's own hook groups AND any
+    unknown top-level keys in hooks.json; it only appends its own Stop group."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text(json.dumps({
+        "version": 2,                       # unknown top-level key must survive
+        "hooks": {
+            "PostToolUse": [
+                {"matcher": "Bash",
+                 "hooks": [{"type": "command", "command": "./mine.sh"}]}
+            ],
+            "Stop": [
+                {"matcher": "",
+                 "hooks": [{"type": "command", "command": "./user-stop.sh"}]}
+            ],
+        },
+    }))
+    _install(data_root, homes)
+    data = _hooks(homes)
+    assert data["version"] == 2             # unknown key preserved
+    # user's own PostToolUse + Stop entries untouched
+    assert any(h.get("command") == "./mine.sh"
+               for g in data["hooks"]["PostToolUse"] for h in g["hooks"])
+    assert any(h.get("command") == "./user-stop.sh"
+               for g in data["hooks"]["Stop"] for h in g["hooks"])
+    # exactly one jacked qa entry was appended alongside the user's Stop entry
+    assert len(_qa_groups(homes)) == 1
+    assert len(data["hooks"]["Stop"]) == 2
+
+
+def test_qa_hook_replaced_in_place_when_command_drifts(data_root, homes):
+    """A stale jacked qa entry (old command) is replaced in place, not
+    duplicated; user entries in the same event are left intact."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text(json.dumps({"hooks": {"Stop": [
+        {"matcher": "", "hooks": [{"type": "command", "command": "./user-stop.sh"}]},
+        {"matcher": "", "hooks": [{"type": "command",
+                                   "command": "/old/path/jacked _hook qa_suggest"}]},
+    ]}}))
+    _install(data_root, homes)
+    groups = _qa_groups(homes)
+    assert len(groups) == 1                                   # replaced, not duped
+    assert groups[0]["hooks"][0]["command"].endswith(" --runtime codex")
+    data = _hooks(homes)
+    assert any(h.get("command") == "./user-stop.sh"
+               for g in data["hooks"]["Stop"] for h in g["hooks"])  # user kept
+
+
+def test_install_time_prune_does_not_remove_qa_entry(data_root, homes):
+    """install_codex prunes the LEGACY gatekeeper before installing the qa hook;
+    the prune must use gatekeeper-only markers so it never clobbers the qa entry
+    on a re-install. After two installs a legacy entry is gone but qa survives."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "", "hooks": [{"type": "command",
+                                   "command": "jacked _hook security_gatekeeper"}]}
+    ]}}))
+    _install(data_root, homes)
+    _install(data_root, homes)               # second pass runs prune-then-install
+    assert len(_qa_groups(homes)) == 1       # qa entry never pruned by itself
+    assert "security_gatekeeper" not in ins.codex_hooks_json(homes["home"]).read_text()
+
+
+def test_qa_hook_newly_added_flagged_only_when_new(data_root, homes):
+    """summary.hooks_added is True the first install (drives the /hooks trust
+    notice) and False on an unchanged re-install."""
+    first = _install(data_root, homes)
+    assert first.hooks_added is True
+    second = _install(data_root, homes)
+    assert second.hooks_added is False
+
+
+def test_uninstall_strips_qa_and_legacy_but_not_user_entries(data_root, homes):
+    """Uninstall strips jacked's qa entry AND any legacy gatekeeper entry, but
+    never a user's own hook; it reports 'hooks.json qa_suggest' in removed."""
+    hp = ins.codex_hooks_json(homes["home"])
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text(json.dumps({"hooks": {
+        "PostToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "./mine.sh"}]}
+        ],
+        "PreToolUse": [
+            {"matcher": "", "hooks": [{"type": "command",
+                                       "command": "jacked _hook security_gatekeeper"}]}
+        ],
+    }}))
+    _install(data_root, homes)               # installs qa, prunes gatekeeper
+    assert len(_qa_groups(homes)) == 1
+    out = ins.uninstall_codex(home=homes["home"], agents_home=homes["agents_home"])
+    assert "hooks.json qa_suggest" in out["removed"]
+    data = json.loads(hp.read_text())
+    assert "qa_suggest" not in json.dumps(data)          # ours stripped
+    assert "security_gatekeeper" not in json.dumps(data)  # legacy stripped
+    assert "./mine.sh" in json.dumps(data)                # user hook survives
+
+
+def test_prior_manifest_without_hooks_key_is_backward_compatible(data_root, homes):
+    """A PRIOR manifest lacking the 'hooks' key loads without crashing; the fresh
+    run installs the qa hook and records hooks=True."""
+    ins.manifest_path(homes["home"]).parent.mkdir(parents=True, exist_ok=True)
+    ins.manifest_path(homes["home"]).write_text(json.dumps({
+        "version": "0.9", "written_at": "before",
+        "skills": {}, "prompts": {}, "agents": {}, "rules": False,
+    }))
+    summ = _install(data_root, homes)        # must not raise
+    assert summ.hooks is True
+    assert _manifest(homes)["hooks"] is True
+    assert len(_qa_groups(homes)) == 1
 
 
 # --------------------------------------------------------------------------

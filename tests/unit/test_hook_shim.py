@@ -15,6 +15,31 @@ class TestHookShim:
         mock_import.assert_called_once_with("jacked.data.hooks.qa_suggest")
         mock_module.main.assert_called_once()
 
+    def test_forwards_extra_argv_to_hook_main(self):
+        """`jacked _hook qa_suggest --runtime codex` must reach the hook's
+        main() as argv (the Codex QA hook reads --runtime)."""
+        from jacked.cli import main
+        runner = CliRunner()
+        mock_module = MagicMock()
+        mock_module.main = MagicMock()
+        with patch("importlib.import_module", return_value=mock_module):
+            result = runner.invoke(
+                main, ["_hook", "qa_suggest", "--runtime", "codex"], input="{}"
+            )
+        assert result.exit_code == 0, result.output
+        mock_module.main.assert_called_once_with(["--runtime", "codex"])
+
+    def test_no_extra_argv_calls_main_with_no_args(self):
+        """Hooks invoked without extra argv are still called as main() (no args),
+        so no-parameter hook mains keep working."""
+        from jacked.cli import main
+        runner = CliRunner()
+        mock_module = MagicMock()
+        mock_module.main = MagicMock()
+        with patch("importlib.import_module", return_value=mock_module):
+            runner.invoke(main, ["_hook", "session_account_tracker"], input="{}")
+        mock_module.main.assert_called_once_with()
+
     def test_unknown_hook_fails_open_without_import(self):
         """Retired/unknown hook names must exit 0 (allow) — a stale
         settings.json entry (e.g. the removed security_gatekeeper wired as

@@ -875,13 +875,20 @@ def _update_status_succeed_shim():
     us_mod.mark_succeeded(us_mod.UPDATE_STATUS_FILE)
 
 
-@main.command(name="_hook", hidden=True)
+@main.command(
+    name="_hook",
+    hidden=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
 @click.argument("name")
-def _hook_shim(name: str):
+@click.argument("hook_args", nargs=-1, type=click.UNPROCESSED)
+def _hook_shim(name: str, hook_args: tuple):
     """Internal: dispatch to a hook handler by name.
 
-    Called by Claude Code hooks via `jacked _hook <name>`. The handler's
-    main() reads hook input from stdin as usual.
+    Called by Claude Code / Codex hooks via `jacked _hook <name> [args...]`.
+    The handler's main() reads hook input from stdin as usual; any extra argv
+    after the name (e.g. `--runtime codex`) is forwarded to main() so
+    runtime-portable hooks (qa_suggest) can adapt their output.
 
     Indirection keeps settings.json paths stable across `uv tool upgrade`.
     """
@@ -904,7 +911,12 @@ def _hook_shim(name: str):
         click.echo(f"Hook has no main(): {name}", err=True)
         sys.exit(2)
 
-    module.main()
+    # Forward extra argv only when present, so no-parameter hook mains keep
+    # working (they're always invoked without extra args).
+    if hook_args:
+        module.main(list(hook_args))
+    else:
+        module.main()
 
 
 @main.command()
@@ -2304,6 +2316,11 @@ def install(
                 f"→ ~/.codex/prompts, {len(_codex_summary.agents)} agents "
                 f"→ ~/.codex/agents, rules → AGENTS.md{_mcp_suffix}"
             )
+            if _codex_summary.hooks_added:
+                console.print(
+                    "[yellow][!][/yellow] Codex requires one-time hook trust - "
+                    "run /hooks inside Codex to approve the jacked QA hook."
+                )
         # Required-plugin blocker only — the full recommendations now live in
         # `jacked doctor`.
         _warn_required_plugins_missing()
