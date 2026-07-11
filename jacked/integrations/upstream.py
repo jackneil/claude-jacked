@@ -19,9 +19,15 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CACHE_PATH = Path.home() / ".claude" / "jacked-reach-upstream-cache.json"
 CACHE_TTL = 43200  # 12h, matches version_check
 CACHE_TTL_PROBE_FAILURE = 3600  # 1h retry after a transient failure
+
+
+def _cache_path(home: Path | None) -> Path:
+    """Cache under the runner's home so a home-injected (isolated/test) runner
+    never reads or writes the real user's ``~/.claude`` (LOW-3)."""
+    base = home if home is not None else Path.home()
+    return base / ".claude" / "jacked-reach-upstream-cache.json"
 
 
 def _api_url(upstream: str, branch: str) -> Optional[str]:
@@ -60,9 +66,9 @@ def _fetch_head_sha(upstream: str, branch: str, timeout: float) -> Optional[str]
         return None
 
 
-def _read_cache(now: float) -> Optional[dict]:
+def _read_cache(cache_path: Path, now: float) -> Optional[dict]:
     try:
-        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
     checked = data.get("checked_at")
@@ -74,12 +80,12 @@ def _read_cache(now: float) -> Optional[dict]:
     return data
 
 
-def _write_cache(payload: dict) -> None:
+def _write_cache(cache_path: Path, payload: dict) -> None:
     try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE_PATH.with_suffix(".json.tmp")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(CACHE_PATH)
+        tmp.replace(cache_path)
     except OSError as e:
         logger.debug("could not write reach upstream cache: %s", e)
 
@@ -91,16 +97,23 @@ def check_upstream(
     branch: str = "main",
     now: float,
     timeout: float = 3.0,
+    home: Path | None = None,
 ) -> Optional[dict]:
     """Return ``{head_sha, behind, checked_at}`` or ``None`` when unknown.
 
     ``behind`` is True when upstream's branch head differs from the pinned SHA.
     ``now`` is injected (the runtime forbids argless clocks in some contexts and
-    it keeps this testable). Cached per pinned SHA; a differing cache key forces
-    a refresh so a pin bump re-checks immediately.
+    it keeps this testable). Cached per pinned SHA under ``home`` (the runner's,
+    so an isolated run never touches the real ``~/.claude``); a differing cache
+    key forces a refresh so a pin bump re-checks immediately.
     """
-    cached = _read_cache(now)
+    cache_path = _cache_path(home)
+    cached = _read_cache(cache_path, now)
     if cached and cached.get("pinned_sha") == pinned_sha:
+        # A cached PROBE FAILURE (head_sha None) must report None, not a false
+        # "not behind" — same rule as the fresh path below.
+        if not cached.get("head_sha"):
+            return None
         return {
             "head_sha": cached.get("head_sha"),
             "behind": cached.get("behind"),
@@ -114,7 +127,7 @@ def check_upstream(
         "behind": (head is not None and head != pinned_sha),
         "checked_at": now,
     }
-    _write_cache(payload)
+    _write_cache(cache_path, payload)
     if head is None:
         # Unknown upstream state — do not assert "up to date"; report None so the
         # UI can say "could not check" rather than a false "current".

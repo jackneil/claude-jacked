@@ -242,3 +242,22 @@ class TestPinHardening:
         data["channels"]["twitter"]["backends"] = [{"kind": "npm", "spec": "--evil@1.0.0"}]
         with pytest.raises(PinFileError, match="may not start with"):
             load_pin(_write_pin(tmp_path, data))
+
+
+class TestPinHardening2:
+    @pytest.mark.parametrize("spec,ok", [
+        ("git+https://github.com/x/y.git@" + "a"*40, True),
+        ("git+ssh://git@github.com/x/y.git@" + "a"*40, False),
+        ("git+file:///tmp/y@" + "a"*40, False),
+    ])
+    def test_pipx_git_requires_https(self, spec, ok):
+        assert _spec_is_exactly_pinned("pipx-git", spec) is ok
+
+    @pytest.mark.parametrize("spec,ok", [
+        ("pkg@1.2.3-rc.1+build.5", True),
+        ("pkg@1.2.3+b", True),
+        ("pkg@1.2.3-beta.1", True),
+        ("pkg@1.2", False),
+    ])
+    def test_npm_combined_semver(self, spec, ok):
+        assert _spec_is_exactly_pinned("npm", spec) is ok

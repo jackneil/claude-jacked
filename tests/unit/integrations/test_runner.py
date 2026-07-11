@@ -732,6 +732,9 @@ class TestChannelRepin:
             runner.update()
         # the twitter backend (pipx -> uv tool install twitter-cli==1.2.3) re-ran
         assert _has(rec.calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"] and "twitter-cli==1.2.3" in c)
+        # and the recorded specs SURVIVE the final _write_state (not wiped)
+        state = json.loads((home / ".claude" / "jacked-reach-state.json").read_text())
+        assert state["channel_specs"]["twitter"] == ["twitter-cli==1.2.3"]
 
     def test_enable_channel_partial_failure_does_not_record(self, tmp_path):
         """A failing backend raises before the channel is recorded."""
@@ -832,10 +835,11 @@ class TestHashPreflight:
         rec = Recorder(home)
         with patched(rec):
             runner.install()
-        # a `uv pip install --require-hashes -r <constraints>` ran BEFORE the tool install
+        # a `uv pip install --require-hashes -r <reqs>` ran BEFORE the tool install
+        # (the -r target is a stripped deps-only copy, so just assert -r + a .txt)
         pre = _find(rec.calls, lambda c: c[:3] == ["/fake/uv", "pip", "install"])
         assert "--require-hashes" in pre
-        assert any(a.endswith("agent-reach-constraints.txt") for a in pre)
+        assert "-r" in pre and pre[pre.index("-r") + 1].endswith(".txt")
         # ordering: the pre-flight precedes the uv tool install
         pre_idx = rec.calls.index(pre)
         tool_idx = rec.calls.index(_find(rec.calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"]))
@@ -900,3 +904,62 @@ class TestUnexpectedFiles:
         ok, drift = runner._verify_skill_hashes(runner._load_pin())
         assert ok
         assert not any(d["status"] == "unexpected" for d in drift)
+
+    def test_symlinked_dir_is_flagged_unexpected(self, tmp_path):
+        """A symlinked subdir (rglob does not recurse it) must be flagged, or a
+        payload behind it hides forever -- the V5 vector M2 targets."""
+        runner, fs, home = make_runner(tmp_path)
+        skill = home / ".claude" / "skills" / "agent-reach"
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        (evil / "SKILL.md").write_bytes(b"# injected\n")
+        (skill / "sub").symlink_to(evil, target_is_directory=True)
+        ok, drift = runner._verify_skill_hashes(runner._load_pin())
+        assert not ok
+        assert any(d["status"] == "unexpected" and d["file"] == "sub" for d in drift)
+
+    def test_symlinked_file_is_flagged_unexpected(self, tmp_path):
+        runner, fs, home = make_runner(tmp_path)
+        skill = home / ".claude" / "skills" / "agent-reach"
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        target = tmp_path / "outside.md"
+        target.write_bytes(b"x\n")
+        (skill / "references" / "link.md").symlink_to(target)
+        ok, drift = runner._verify_skill_hashes(runner._load_pin())
+        assert not ok
+        assert any(d["status"] == "unexpected" and d["file"] == "references/link.md" for d in drift)
+
+
+class TestOverrideCompile:
+    def test_override_compile_excludes_agent_reach_root(self, tmp_path):
+        """The override constraints compile must pass --no-emit-package agent-reach
+        so the un-hashable git+ root is dropped and --require-hashes can pass."""
+        runner, fs, home = make_runner(tmp_path)
+        captured = []
+
+        def side(cmd, **kw):
+            captured.append(list(cmd))
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            runner.set_override("e" * 40, ack=True)
+        compile_cmd = _find(captured, lambda c: c[:3] == ["/fake/uv", "pip", "compile"])
+        assert "--generate-hashes" in compile_cmd
+        assert compile_cmd[compile_cmd.index("--no-emit-package") + 1] == "agent-reach"
+
+
+def test_strip_unhashable_requirements(tmp_path):
+    """A direct VCS/URL requirement block is dropped; hashed deps are kept."""
+    from jacked.integrations._util import _strip_unhashable_requirements
+    src = tmp_path / "c.txt"
+    src.write_text(
+        "# comment\n"
+        "agent-reach @ git+https://x/y@" + "a" * 40 + "\n"
+        "feedparser==6.0.12 \\\n    --hash=sha256:" + "b" * 64 + "\n",
+        encoding="utf-8",
+    )
+    dst = _strip_unhashable_requirements(src, tmp_path / "out.txt")
+    text = dst.read_text()
+    assert "git+" not in text
+    assert "feedparser==6.0.12" in text and "--hash=" in text

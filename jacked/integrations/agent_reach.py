@@ -197,9 +197,10 @@ class AgentReachRunner:
         }
 
     def status(self) -> dict:
-        """Full status dict. A PURE READ: never writes or unlinks (override
-        auto-clear happens only in mutating paths), so a dashboard poll cannot
-        mutate state. Outbound only: `agent-reach doctor` + cached upstream check."""
+        """Full status dict. Never mutates persisted install state: the override
+        auto-clear happens only in mutating paths, so a dashboard poll can't clear
+        an override or touch the state file. (The upstream check maintains its own
+        best-effort cache file.) Outbound only: `agent-reach doctor` + that check."""
         pin = self._load_pin()
         state = self._read_state()
         installed = state is not None
@@ -236,7 +237,7 @@ class AgentReachRunner:
             "doctor_error": doctor_error,
             "channels": channels_status(pin, self._existing_channels()),
             "upstream_check": reach_upstream.check_upstream(
-                pin.commit_sha, pin.upstream, now=time.time()
+                pin.commit_sha, pin.upstream, now=time.time(), home=self._home
             ),
             "pin": {
                 "version_label": pin.version_label,
@@ -267,17 +268,24 @@ class AgentReachRunner:
                 "agent-reach is not installed; run 'jacked reach install' before enabling channels"
             )
 
-        installed_specs: list[str] = []
-        for backend in channel.backends:
-            if not backend.is_installable:
-                logger.info("channel %s: skipping manual backend (%s)", name, backend.note)
-                continue
-            self._run(self._channel_install_cmd(backend), timeout=NETWORK_TIMEOUT)
-            installed_specs.append(backend.spec)
-
+        installed_specs = self._install_channel_backends(channel)
+        # Always record on explicit enable (even a note-only channel with no
+        # installable backend), so the channel shows as enabled.
         self._record_channel(name, installed_specs)
         logger.info("reach: channel %s enabled (%s)", name, ", ".join(installed_specs) or "no-op")
         return configure_hint(name)
+
+    def _install_channel_backends(self, channel) -> list[str]:
+        """Install every installable backend of a channel at its pinned spec;
+        return the specs installed (note-only backends are skipped)."""
+        specs: list[str] = []
+        for backend in channel.backends:
+            if not backend.is_installable:
+                logger.info("channel %s: skipping manual backend (%s)", channel.name, backend.note)
+                continue
+            self._run(self._channel_install_cmd(backend), timeout=NETWORK_TIMEOUT)
+            specs.append(backend.spec)
+        return specs
 
     def remove(self) -> dict:
         """Uninstall, delete skill dirs, strip rules, clear override; verify residue.
@@ -380,12 +388,7 @@ class AgentReachRunner:
             if channel is None:
                 logger.warning("reach: enabled channel %s not in current pin; skipping re-pin", name)
                 continue
-            specs: list[str] = []
-            for backend in channel.backends:
-                if not backend.is_installable:
-                    continue
-                self._run(self._channel_install_cmd(backend), timeout=NETWORK_TIMEOUT)
-                specs.append(backend.spec)
+            specs = self._install_channel_backends(channel)
             if specs:
                 self._record_channel(name, specs)
                 logger.info("reach: re-pinned channel %s (%s)", name, ", ".join(specs))

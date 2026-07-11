@@ -137,9 +137,13 @@ def compile_constraints(
         tmp.write(req_line)
         tmp.close()
         # --generate-hashes so the override path also gets artifact-hash pinning
-        # (the runner's require-hashes pre-flight enforces it).
-        run([uv, "pip", "compile", "--generate-hashes", tmp.name, "-o", str(out_path)],
-            timeout=NETWORK_TIMEOUT)
+        # (the runner's require-hashes pre-flight enforces it). --no-emit-package
+        # agent-reach drops the un-hashable VCS root line from the output (a git+
+        # ref can't carry a --hash), leaving a deps-only, fully-hashed file that
+        # `uv pip install --require-hashes` accepts; agent-reach itself is
+        # integrity-pinned by its commit SHA in the tool-install URL.
+        run([uv, "pip", "compile", "--generate-hashes", "--no-emit-package", "agent-reach",
+             tmp.name, "-o", str(out_path)], timeout=NETWORK_TIMEOUT)
     finally:
         try:
             os.unlink(tmp.name)

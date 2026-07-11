@@ -33,7 +33,9 @@ _HEX40 = re.compile(r"[0-9a-fA-F]{40}")
 # fullmatch-only (see _spec_is_exactly_pinned) so a range/partial/`||` spec such as
 # `1.2`, `1.2.x`, or `1.2.3 || 2.0.0` is rejected: the whole V3 posture is that a
 # channel backend pins to ONE resolvable version, never a floating range.
-_EXACT_SEMVER = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?")
+_EXACT_SEMVER = re.compile(
+    r"\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?"
+)
 
 
 class PinFileError(ValueError):
@@ -229,7 +231,9 @@ def _spec_is_exactly_pinned(kind: str, spec: str) -> bool:
         version = version.strip()
         return bool(_EXACT_SEMVER.fullmatch(version))
     if kind == "pipx-git":
-        if not spec.startswith("git+") or "@" not in spec:
+        # git+https only (same transport-restriction rationale as the upstream
+        # field): never git+ssh/git+file/git+ext, which land bare in the uv argv.
+        if not spec.startswith("git+https://") or "@" not in spec:
             return False
         sha = spec.rsplit("@", 1)[1]
         return bool(_HEX40.fullmatch(sha))

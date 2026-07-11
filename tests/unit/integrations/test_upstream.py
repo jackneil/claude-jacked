@@ -1,20 +1,33 @@
 """Unit tests for the agent-reach upstream freshness check (offline)."""
 
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from jacked.integrations import upstream as up
 
+# Captured before any monkeypatch so the scoping test can exercise the real fn.
+_ORIG_CACHE_PATH = up._cache_path
 
 PIN = "b" * 40
 HEAD = "e" * 40
 UPSTREAM = "https://github.com/Panniantong/Agent-Reach"
 
 
+def test_cache_path_is_scoped_to_injected_home(tmp_path):
+    # _cache_path derives from home (LOW-3): an injected home keeps the cache out
+    # of the real ~/.claude; None falls back to the real home.
+    assert _ORIG_CACHE_PATH(tmp_path / "injected") == \
+        tmp_path / "injected" / ".claude" / "jacked-reach-upstream-cache.json"
+    assert _ORIG_CACHE_PATH(None) == Path.home() / ".claude" / "jacked-reach-upstream-cache.json"
+
+
 @pytest.fixture(autouse=True)
 def _tmp_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr(up, "CACHE_PATH", tmp_path / "reach-upstream-cache.json")
+    # Route the cache to a tmp file regardless of the home passed in, so no test
+    # touches a real ~/.claude.
+    monkeypatch.setattr(up, "_cache_path", lambda home: tmp_path / "reach-upstream-cache.json")
 
 
 def test_api_url_mapping():
@@ -47,6 +60,17 @@ def test_cache_hit_avoids_second_fetch():
         up.check_upstream(PIN, UPSTREAM, now=1000.0)
         up.check_upstream(PIN, UPSTREAM, now=1000.0 + 60)  # within TTL
     assert fetch.call_count == 1
+
+
+def test_cached_probe_failure_returns_none_not_false_current():
+    """A cached probe FAILURE (head_sha None) within TTL must report None, not a
+    false {behind: False} 'up to date'."""
+    with mock.patch.object(up, "_fetch_head_sha", return_value=None) as fetch:
+        first = up.check_upstream(PIN, UPSTREAM, now=1000.0)   # caches the failure
+        second = up.check_upstream(PIN, UPSTREAM, now=1000.0 + 60)  # cache hit
+    assert first is None
+    assert second is None
+    assert fetch.call_count == 1  # served from cache, not re-fetched
 
 
 def test_pin_bump_invalidates_cache():

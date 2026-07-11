@@ -38,13 +38,18 @@ def existing_channels(home: Path) -> list[str]:
 
 
 def write_state(home: Path, *, installed_sha: str, override_active: bool, channels_enabled: list[str]) -> None:
-    atomic_write_json(state_path(home), {
+    # Read-modify-write: update the install-managed keys but PRESERVE any others
+    # (e.g. channel_specs recorded by record_channel), so a re-pin during the same
+    # install() is not wiped by the final write, and no key is silently dropped.
+    state = read_state(home) or {}
+    state.update({
         "installed_sha": installed_sha,
         "installed_at": now_iso(),
         "skill_hashes_verified": True,
         "channels_enabled": list(channels_enabled),
         "override_active": bool(override_active),
     })
+    atomic_write_json(state_path(home), state)
 
 
 def delete_state(home: Path) -> None:

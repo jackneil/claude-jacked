@@ -181,16 +181,47 @@ def hash_preflight(constraints_path: Path, run) -> None:
 
     uv = _shutil.which("uv") or "uv"
     with _tempfile.TemporaryDirectory(prefix="reach-hash-preflight-") as tmp:
+        # --require-hashes rejects a file if ANY requirement lacks a hash. A direct
+        # VCS/URL requirement (e.g. an `agent-reach @ git+...` root that an older
+        # override compile emitted) can't be hashed, so strip such lines to a
+        # deps-only file for the check -- the VCS root is integrity-pinned by its
+        # commit SHA in the actual tool-install URL, and its deps still get hashed.
+        checked = _strip_unhashable_requirements(constraints_path, Path(tmp) / "reqs.txt")
         venv = Path(tmp) / "venv"
         run([uv, "venv", str(venv)], timeout=120)
         # --require-hashes forces uv to verify every artifact's sha256 against the
         # vendored constraints; a mismatch raises out of `run`.
         run(
             [uv, "pip", "install", "--python", str(venv), "--require-hashes",
-             "-r", str(constraints_path)],
+             "-r", str(checked)],
             timeout=600,
         )
     logger.info("reach: artifact hash pre-flight passed (%s)", constraints_path.name)
+
+
+def _strip_unhashable_requirements(src: Path, dst: Path) -> Path:
+    """Copy ``src`` to ``dst`` dropping any direct VCS/URL requirement (which can't
+    carry a --hash and would break --require-hashes). A logical requirement spans
+    its backslash-continuation lines; a VCS/URL root has no --hash in its block, so
+    the whole block is dropped. Returns ``dst``."""
+    lines = src.read_text(encoding="utf-8").splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        block = [lines[i]]
+        while block[-1].rstrip("\n").endswith("\\") and i + 1 < len(lines):
+            i += 1
+            block.append(lines[i])
+        i += 1
+        joined = "".join(block)
+        stripped = joined.lstrip()
+        is_comment_or_blank = stripped.startswith("#") or not stripped.strip()
+        is_direct_url = ("git+" in joined) or (" @ http" in joined) or stripped.startswith(("http://", "https://"))
+        if is_direct_url and not is_comment_or_blank:
+            continue
+        out.extend(block)
+    dst.write_text("".join(out), encoding="utf-8")
+    return dst
 
 
 def run_doctor() -> tuple[dict | None, str | None]:
@@ -328,14 +359,28 @@ def verify_skill_hashes(home: Path, relpaths, skill_hashes: dict[str, str]) -> t
                 ok = False
             else:
                 drift.append(drift_entry(skill_dir, name, "ok", expected_repr, actual))
-        # Enumerate the ACTUAL directory contents: any file the pin does not name
+        # Enumerate the ACTUAL directory contents: any entry the pin does not name
         # is UNEXPECTED. Without this, an install/tamper that drops an EXTRA file
         # (e.g. a nested sub/SKILL.md Claude Code registers as a new skill) would
         # pass verification and hide forever -- the V5 prompt-injection vector.
         for f in sorted(skill_dir.rglob("*")):
-            if not f.is_file():
-                continue
             rel_name = f.relative_to(skill_dir).as_posix()
+            # A SYMLINK is flagged before is_file() (which follows the link):
+            # rglob does not recurse a symlinked DIR, so files behind it would
+            # otherwise be invisible; upstream writes only regular files, so any
+            # symlink (or fifo/socket) in a skill dir is illegitimate.
+            if f.is_symlink():
+                drift.append(drift_entry(skill_dir, rel_name, "unexpected", None, "symlink"))
+                ok = False
+                continue
+            if f.is_dir():
+                continue
+            if not f.is_file():
+                # A non-regular, non-dir entry (fifo/socket/device) is not a
+                # legitimate skill file either.
+                drift.append(drift_entry(skill_dir, rel_name, "unexpected", None, "non-regular"))
+                ok = False
+                continue
             if rel_name not in expected_map:
                 drift.append(drift_entry(skill_dir, rel_name, "unexpected", None, sha256_file(f)))
                 ok = False
