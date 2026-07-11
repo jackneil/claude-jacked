@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/Panniantong/Agent-Reach",
+  "commit_sha": "e825f6740d24c6c315c3b0dc41907e6c87ff39a5",
+  "version_label": "1.5.0",
+  "vetted_at": "2026-07-11",
+  "constraints_file": "agent-reach-constraints.txt",
+  "skill_hashes": {
+    "SKILL.md": "e6b1cfd553132933feed966acbd9e2f8f65d17f9fcbeeaf452dc5d7ef7d77c39",
+    "SKILL_en.md": "7f7da09f52b8f88d1c438725e94c7335a04a6af45bdf33cae637456f2b1a321a",
+    "references/career.md": "e70badf6c860a55cc049c15cc5cef31ca0fa2a2ae9ae1f72ade24b91844c1a2f",
+    "references/dev.md": "f6f91107557eacf1d28a023d597eb5a61353a8a6ede286c3c0a4888d274df9fe",
+    "references/search.md": "8eabfb645505148ea32e22e372c6d5a48615fba2e2f00eb8590e07464833851b",
+    "references/social.md": "9d046e55d2284a21fbfc8f522135af947d11e9ca4aa96cc119fe9708fb22883c",
+    "references/video.md": "0f01f9da6a81ca0939f86df3ad05212829dc28999d89b2895d6d1f640ad9c43e",
+    "references/web.md": "2495c2e290508b5b98337db679d5b2ff30314aa5b20243c7ff44486a72c3eff2"
+  },
+  "channels": {
+    "twitter": {
+      "backends": [
+        {
+          "kind": "pipx",
+          "spec": "twitter-cli==0.8.5"
+        }
+      ]
+    },
+    "xiaoyuzhou": {
+      "backends": [
+        {
+          "note": "agent-reach installs a local transcribe script; no external package."
+        }
+      ]
+    },
+    "xiaohongshu": {
+      "backends": [
+        {
+          "kind": "npm",
+          "spec": "@jackwener/opencli@1.8.6"
+        },
+        {
+          "note": "Legacy xhs-cli is an optional fallback; upstream no longer auto-installs it."
+        }
+      ]
+    },
+    "reddit": {
+      "backends": [
+        {
+          "kind": "npm",
+          "spec": "@jackwener/opencli@1.8.6"
+        },
+        {
+          "kind": "pipx-git",
+          "spec": "git+https://github.com/public-clis/rdt-cli.git@5e4fb3720d5c174e976cd425ccc3b879d52cac66"
+        }
+      ]
+    },
+    "facebook": {
+      "backends": [
+        {
+          "kind": "npm",
+          "spec": "@jackwener/opencli@1.8.6"
+        }
+      ]
+    },
+    "instagram": {
+      "backends": [
+        {
+          "kind": "npm",
+          "spec": "@jackwener/opencli@1.8.6"
+        }
+      ]
+    },
+    "bilibili": {
+      "backends": [
+        {
+          "kind": "pipx",
+          "spec": "bilibili-cli==0.6.2"
+        }
+      ]
+    },
+    "opencli": {
+      "backends": [
+        {
+          "kind": "npm",
+          "spec": "@jackwener/opencli@1.8.6"
+        },
+        {
+          "note": "Chrome extension ildkmabpimmkaediidaifkhjpohdnifk is manual; Chrome forbids auto-install."
+        }
+      ]
+    },
+    "search": {
+      "backends": [
+        {
+          "kind": "npm",
+          "spec": "mcporter@0.12.3"
+        }
+      ]
+    },
+    "xueqiu": {
+      "backends": [
+        {
+          "note": "Cookie-only channel; no install step."
+        }
+      ]
+    },
+    "linkedin": {
+      "backends": [
+        {
+          "note": "Manual setup; no auto-install."
+        }
+      ]
+    }
+  }
+}
