@@ -7,6 +7,7 @@ import pytest
 
 from jacked.integrations.pinfile import (
     PinFileError,
+    _spec_is_exactly_pinned,
     load_pin,
 )
 
@@ -192,3 +193,52 @@ class TestRejections:
         # sanity: the valid fixture itself is not accidentally rejected
         data = copy.deepcopy(_valid_pin_dict())
         load_pin(_write_pin(tmp_path, data))
+
+
+class TestExactPinValidator:
+    """The npm/pipx spec validator enforces EXACT versions (V3): a range, a
+    partial, a `.x`, or a `||` compound must be rejected, else npm/uv could
+    resolve a floating version at enable-channel time."""
+
+    @pytest.mark.parametrize("spec", [
+        "@jackwener/opencli@1.8.6", "mcporter@0.12.3", "pkg@1.2.3", "pkg@1.2.3-beta.1",
+    ])
+    def test_npm_exact_accepted(self, spec):
+        assert _spec_is_exactly_pinned("npm", spec) is True
+
+    @pytest.mark.parametrize("spec", [
+        "mcporter@1.2", "pkg@1.2.x", "pkg@1.2.3 || 2.0.0", "pkg@latest", "pkg@1.x",
+        "pkg@^1.2.3", "pkg@~1.2.3", "pkg@>=1.0.0", "pkg",
+    ])
+    def test_npm_inexact_rejected(self, spec):
+        assert _spec_is_exactly_pinned("npm", spec) is False
+
+    @pytest.mark.parametrize("spec", ["twitter-cli==0.8.5", "bilibili-cli==0.6.2"])
+    def test_pipx_exact_accepted(self, spec):
+        assert _spec_is_exactly_pinned("pipx", spec) is True
+
+    @pytest.mark.parametrize("spec", [
+        "pkg==1.2", "pkg==1.2.x", "pkg>=1.0.0", "pkg==1.2.3,<2", "pkg==1.2.3 || 2",
+    ])
+    def test_pipx_inexact_rejected(self, spec):
+        assert _spec_is_exactly_pinned("pipx", spec) is False
+
+    def test_a_range_backend_fails_pin_load(self, tmp_path):
+        data = copy.deepcopy(_valid_pin_dict())
+        data["channels"]["twitter"]["backends"] = [{"kind": "npm", "spec": "pkg@1.2.x"}]
+        with pytest.raises(PinFileError):
+            load_pin(_write_pin(tmp_path, data))
+
+
+class TestPinHardening:
+    def test_non_https_upstream_rejected(self, tmp_path):
+        data = copy.deepcopy(_valid_pin_dict())
+        data["upstream"] = "ext::sh -c 'evil'"
+        with pytest.raises(PinFileError, match="https"):
+            load_pin(_write_pin(tmp_path, data))
+
+    def test_dash_leading_channel_spec_rejected(self, tmp_path):
+        data = copy.deepcopy(_valid_pin_dict())
+        data["channels"]["twitter"]["backends"] = [{"kind": "npm", "spec": "--evil@1.0.0"}]
+        with pytest.raises(PinFileError, match="may not start with"):
+            load_pin(_write_pin(tmp_path, data))

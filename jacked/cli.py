@@ -4158,21 +4158,12 @@ def _reach_runner():
     strings). The DB handle is short-lived and closed on exit, mirroring the
     Codex CLI verbs.
     """
-    from jacked.integrations.agent_reach import AgentReachRunner
+    from jacked.integrations import AgentReachRunner, reach_db_accessors
     from jacked.web.database import Database
 
     db = Database(str(Path.home() / ".claude" / "jacked.db"))
     try:
-        def _get(key):
-            return db.get_setting(key)
-
-        def _set(key, value):
-            if value is None:
-                db.delete_setting(key)
-            else:
-                db.set_setting(key, value)
-
-        yield AgentReachRunner(_get, _set)
+        yield AgentReachRunner(*reach_db_accessors(db))
     finally:
         db.close()
 
@@ -4254,8 +4245,26 @@ def reach_update_cmd(override_ref, unvetted_ok):
             _reach_guard(runner.update)
             console.print("[green][OK][/green] Reinstalled at the override SHA.")
         else:
-            _reach_guard(runner.update)
-            console.print("[green][OK][/green] agent-reach reinstalled at the vetted pin.")
+            result = _reach_guard(runner.update)
+            if result.get("override_active"):
+                short = (result.get("installed_sha") or "?")[:12]
+                console.print(
+                    f"[yellow][OK][/yellow] agent-reach reinstalled at the UNVETTED "
+                    f"override {short}. Run 'jacked reach clear-override' to return to the vetted pin."
+                )
+            else:
+                console.print("[green][OK][/green] agent-reach reinstalled at the vetted pin.")
+
+
+@reach_group.command(name="clear-override")
+def reach_clear_override_cmd():
+    """Clear a break-glass override and reinstall at the vetted pin.
+
+    >>> # CLI command: jacked reach clear-override
+    """
+    with _reach_runner() as runner:
+        _reach_guard(runner.clear_override)
+    console.print("[green][OK][/green] Override cleared. Reverted to the vetted pin.")
 
 
 @reach_group.command(name="remove")
@@ -4271,8 +4280,14 @@ def reach_remove_cmd(yes):
             abort=True,
         )
     with _reach_runner() as runner:
-        _reach_guard(runner.remove)
-    console.print("[green][OK][/green] agent-reach removed.")
+        result = _reach_guard(runner.remove)
+    residue = (result or {}).get("residue") or []
+    if residue:
+        console.print("[yellow][WARN][/yellow] agent-reach removed, but residue remains:")
+        for item in residue:
+            console.print(f"  - {item}")
+    else:
+        console.print("[green][OK][/green] agent-reach removed.")
 
 
 @reach_group.command(name="enable-channel")

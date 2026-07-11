@@ -21,7 +21,7 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool
 
-from jacked.integrations.agent_reach import AgentReachRunner
+from jacked.integrations import AgentReachRunner, reach_db_accessors
 from jacked.integrations._util import ReachUserError
 
 logger = logging.getLogger(__name__)
@@ -58,17 +58,7 @@ def _runner(request: Request) -> AgentReachRunner | None:
     db = getattr(request.app.state, "db", None)
     if db is None:
         return None
-
-    def _get(key: str):
-        return db.get_setting(key)
-
-    def _set(key: str, value):
-        if value is None:
-            db.delete_setting(key)
-        else:
-            db.set_setting(key, value)
-
-    return AgentReachRunner(_get, _set)
+    return AgentReachRunner(*reach_db_accessors(db))
 
 
 async def _run_op(request: Request, op_name: str) -> JSONResponse | dict:
@@ -98,9 +88,8 @@ async def get_agent_reach(request: Request):
     except Exception as exc:  # noqa: BLE001
         logger.exception("agent-reach status failed")
         return _error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc), "REACH_STATUS_ERROR")
-    # upstream_check is the update-availability field; GitHub polling is a
-    # later milestone, so it is an explicit null for now (not omitted).
-    return {**result, "upstream_check": None}
+    # runner.status() carries upstream_check (cached GitHub freshness) directly.
+    return result
 
 
 @router.post("/agent-reach/install")

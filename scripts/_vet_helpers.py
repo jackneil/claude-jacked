@@ -107,7 +107,11 @@ def resolve_ref_to_sha(upstream: str, ref: str, *, timeout: float = 30.0) -> str
     if SHA_RE.match(ref.strip().lower()):
         return ref.strip().lower()
 
-    proc = run_checked(["git", "ls-remote", upstream, ref], timeout=timeout)
+    # Match the runner's guard: reject a dash-leading ref (git argument injection)
+    # and terminate options with '--' so a ref can't be reparsed as a flag.
+    if not ref or ref.startswith("-"):
+        raise VetError(f"invalid ref {ref!r}: a ref may not start with '-'")
+    proc = run_checked(["git", "ls-remote", upstream, "--", ref], timeout=timeout)
     by_ref: dict[str, str] = {}
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
@@ -294,17 +298,17 @@ def _validate_backend(channel: str, backend: dict) -> None:
         )
     if not isinstance(spec, str) or not spec.strip():
         raise VetError(f"channel {channel!r}: backend spec must be a non-empty string")
-    if kind == "npm":
-        # scoped (@scope/name@ver) or plain (name@ver): must carry a version.
-        body = spec[1:] if spec.startswith("@") else spec
-        if "@" not in body:
-            raise VetError(f"channel {channel!r}: npm spec must pin a version (name@version): {spec!r}")
-    elif kind == "pipx":
-        if "==" not in spec:
-            raise VetError(f"channel {channel!r}: pipx spec must pin an exact version (name==version): {spec!r}")
-    elif kind == "pipx-git":
-        if not spec.startswith("git+") or "@" not in spec:
-            raise VetError(f"channel {channel!r}: pipx-git spec must be git+URL@SHA: {spec!r}")
+    if spec.startswith("-"):
+        raise VetError(f"channel {channel!r}: {kind} spec may not start with '-': {spec!r}")
+    # Reuse the LOADER's exact-pin validator so vet and load never drift: a pin
+    # the loader would reject at runtime must fail vetting here first.
+    from jacked.integrations.pinfile import _spec_is_exactly_pinned
+
+    if not _spec_is_exactly_pinned(kind, spec):
+        raise VetError(
+            f"channel {channel!r}: {kind} spec {spec!r} is not exactly pinned "
+            f"(npm '@<x.y.z>', pipx '==<x.y.z>', pipx-git '@<40-hex-sha>')"
+        )
 
 
 def validate_pin(pin: dict) -> None:

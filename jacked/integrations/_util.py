@@ -7,11 +7,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jacked.winproc import NO_WINDOW
+
+logger = logging.getLogger(__name__)
+
 _UV_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+# Local (non-network) subprocess budget for the doctor probe.
+_DOCTOR_TIMEOUT = 30
 
 # Upstream configure hints surfaced after a channel is enabled. jacked never runs
 # the login/cookie step itself; it points the user at it. Cookie-based platforms
@@ -66,6 +76,16 @@ class ReachUserError(RuntimeError):
     missing ack) — the API maps it to 422; genuine execution failures stay 500."""
 
 
+class ReachDoctorShapeError(RuntimeError):
+    """`agent-reach doctor --json` returned a shape we do not recognize (an
+    upstream contract change). Surfaced as a doctor_error so the UI shows "could
+    not read channel health" rather than a silently blank or garbage table."""
+
+
+#: Keys that mark a value as a per-channel doctor entry in the slug-keyed shape.
+_DOCTOR_CHANNEL_KEYS = ("active_backend", "status", "backends", "name", "tier")
+
+
 def channels_status(pin, enabled: list[str]) -> list[dict]:
     """The pin's channel table as UI-ready dicts with per-channel enabled flags."""
     enabled_set = set(enabled)
@@ -91,28 +111,120 @@ def normalize_doctor(raw: object) -> dict | None:
     "name" upstream is a localized display name, so the slug becomes our "name"
     and theirs is kept as "display_name". "message" doubles as the fix hint.
     A payload that already carries a "channels" list passes through untouched.
+
+    Raises :class:`ReachDoctorShapeError` on any OTHER shape (a top-level list, an
+    envelope, a future contract change) so the caller surfaces a doctor_error
+    instead of rendering a blank or garbage channel table. ``None`` in, ``None`` out.
     """
     if raw is None:
         return None
     if isinstance(raw, dict) and isinstance(raw.get("channels"), list):
         return raw
-    if not isinstance(raw, dict):
-        return {"channels": [], "raw": raw}
-    channels = []
-    for slug, info in raw.items():
-        if not isinstance(info, dict):
-            continue
-        channels.append({
-            "name": slug,
-            "display_name": info.get("name"),
-            "active_backend": info.get("active_backend"),
-            "status": info.get("status"),
-            "hint": info.get("message"),
-            "tier": info.get("tier"),
-            "backends": info.get("backends"),
-        })
-    channels.sort(key=lambda c: (c["tier"] if isinstance(c["tier"], int) else 99, c["name"]))
-    return {"channels": channels}
+    # The slug-keyed shape: a dict whose values are ALL per-channel dicts. An
+    # envelope like {"schema": 2, "channels": {...}} fails this (a non-dict value),
+    # as does a top-level list, so an unrecognized shape raises rather than
+    # silently normalizing to empty/garbage.
+    if (
+        isinstance(raw, dict)
+        and raw
+        and all(
+            isinstance(info, dict) and any(k in info for k in _DOCTOR_CHANNEL_KEYS)
+            for info in raw.values()
+        )
+    ):
+        channels = [
+            {
+                "name": slug,
+                "display_name": info.get("name"),
+                "active_backend": info.get("active_backend"),
+                "status": info.get("status"),
+                "hint": info.get("message"),
+                "tier": info.get("tier"),
+                "backends": info.get("backends"),
+            }
+            for slug, info in raw.items()
+        ]
+        channels.sort(key=lambda c: (c["tier"] if isinstance(c["tier"], int) else 99, c["name"]))
+        return {"channels": channels}
+    raise ReachDoctorShapeError(
+        f"unrecognized doctor --json shape: {type(raw).__name__}"
+    )
+
+
+def constraints_have_hashes(constraints_path: Path) -> bool:
+    """True if the constraints file carries per-artifact ``--hash=`` entries."""
+    try:
+        return "--hash=" in constraints_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def hash_preflight(constraints_path: Path, run) -> None:
+    """Enforce the vendored artifact hashes before the real install.
+
+    ``uv tool install -c`` does NOT enforce hashes from a constraints file
+    (verified, uv 0.10.2), but ``uv pip install --require-hashes`` DOES. So we
+    do a real hash-checked install of agent-reach's fully-pinned dependency
+    closure into a throwaway venv: uv downloads each artifact and verifies its
+    sha256 against the vendored hash. A poisoned same-version artifact on PyPI
+    fails here and the caller aborts BEFORE the tool install runs and before the
+    agent-reach CLI is ever invoked. No-op if the constraints carry no hashes
+    (older pin) -- callers still get version pinning, just not artifact pinning.
+
+    ``run`` is the runner's subprocess helper (raises on nonzero).
+    """
+    if not constraints_have_hashes(constraints_path):
+        logger.warning("reach: constraints carry no artifact hashes; skipping hash pre-flight")
+        return
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    uv = _shutil.which("uv") or "uv"
+    with _tempfile.TemporaryDirectory(prefix="reach-hash-preflight-") as tmp:
+        venv = Path(tmp) / "venv"
+        run([uv, "venv", str(venv)], timeout=120)
+        # --require-hashes forces uv to verify every artifact's sha256 against the
+        # vendored constraints; a mismatch raises out of `run`.
+        run(
+            [uv, "pip", "install", "--python", str(venv), "--require-hashes",
+             "-r", str(constraints_path)],
+            timeout=600,
+        )
+    logger.info("reach: artifact hash pre-flight passed (%s)", constraints_path.name)
+
+
+def run_doctor() -> tuple[dict | None, str | None]:
+    """Best-effort `agent-reach doctor --json`, canonicalized. Never raises.
+
+    Returns ``(doctor, error)``: the normalized ``{"channels": [...]}`` blob and
+    None on success, or ``(None, reason)`` when the CLI is absent, exits nonzero,
+    emits invalid JSON, or returns an unrecognized shape (see normalize_doctor).
+    """
+    ar = shutil.which("agent-reach")
+    if not ar:
+        return None, "agent-reach CLI not found on PATH"
+    try:
+        proc = subprocess.run(
+            [ar, "doctor", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=_DOCTOR_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"agent-reach doctor failed to run: {e}"
+    if proc.returncode != 0:
+        return None, f"agent-reach doctor exited {proc.returncode}: {stderr_excerpt(proc.stderr)}"
+    try:
+        return normalize_doctor(json.loads(proc.stdout)), None
+    except json.JSONDecodeError as e:
+        return None, (
+            f"agent-reach doctor emitted invalid JSON: {e}; output began: {proc.stdout[:200]!r}"
+        )
+    except ReachDoctorShapeError as e:
+        logger.warning("reach doctor: %s", e)
+        return None, str(e)
 
 
 def sha256_file(p: Path) -> str:
@@ -216,6 +328,17 @@ def verify_skill_hashes(home: Path, relpaths, skill_hashes: dict[str, str]) -> t
                 ok = False
             else:
                 drift.append(drift_entry(skill_dir, name, "ok", expected_repr, actual))
+        # Enumerate the ACTUAL directory contents: any file the pin does not name
+        # is UNEXPECTED. Without this, an install/tamper that drops an EXTRA file
+        # (e.g. a nested sub/SKILL.md Claude Code registers as a new skill) would
+        # pass verification and hide forever -- the V5 prompt-injection vector.
+        for f in sorted(skill_dir.rglob("*")):
+            if not f.is_file():
+                continue
+            rel_name = f.relative_to(skill_dir).as_posix()
+            if rel_name not in expected_map:
+                drift.append(drift_entry(skill_dir, rel_name, "unexpected", None, sha256_file(f)))
+                ok = False
     if dirs_checked == 0:
         drift.append(drift_entry(None, "*", "missing", None, None))
         ok = False

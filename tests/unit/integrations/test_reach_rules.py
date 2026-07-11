@@ -22,7 +22,6 @@ from jacked.codex._managed import (
     install_reach_agents_block,
     strip_reach_agents_block,
 )
-from jacked.integrations import rules
 from jacked.integrations.rules import (
     REACH_RULES_END,
     REACH_RULES_START,
@@ -36,7 +35,6 @@ from jacked.integrations.rules import (
 
 # Reuse the runner harness verbatim rather than re-deriving it.
 from tests.unit.integrations.test_runner import (
-    PIN_SHA,
     Recorder,
     make_runner,
     patched,
@@ -279,9 +277,10 @@ class TestCodexWrappers:
 
 class TestRunnerHook:
     def _codex_home(self, tmp_path, monkeypatch) -> Path:
-        codex_home = tmp_path / "codexhome"
-        codex_home.mkdir()  # exists -> Codex "present" for the runner's best-effort pass
-        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        # The runner scopes Codex under its INJECTED home (make_runner uses
+        # tmp_path/home), so Codex "present" means <home>/.codex exists.
+        codex_home = tmp_path / "home" / ".codex"
+        codex_home.mkdir(parents=True)
         return codex_home
 
     def test_install_places_rules_and_remove_strips(self, tmp_path, monkeypatch):

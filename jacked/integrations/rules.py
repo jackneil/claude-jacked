@@ -22,10 +22,16 @@ whole-line marker-extract-or-bail primitives the rest of the codebase uses.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Mapping, Optional
 
-from jacked.codex._fsutil import _extract_block, _marker_line_count, codex_present
+from jacked.codex._fsutil import (
+    _atomic_write_text,
+    _extract_block,
+    _marker_line_count,
+    codex_present,
+)
 from jacked.codex._managed import install_reach_agents_block, strip_reach_agents_block
 
 logger = logging.getLogger(__name__)
@@ -65,15 +71,6 @@ def _block(body: str) -> str:
     return f"{REACH_RULES_START}\n{body}\n{REACH_RULES_END}"
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Atomically write UTF-8 `text` (write a sibling .tmp, then replace) so a
-    process killed mid-write never leaves CLAUDE.md half-written."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-
 def _append(existing: str, block: str) -> str:
     """Append `block` to `existing` with clean blank-line handling (mirrors
     ``cli._install_behavioral_rules``): a blank line separates prior content from
@@ -85,6 +82,31 @@ def _append(existing: str, block: str) -> str:
     if existing.endswith("\n"):
         return existing + "\n" + block + "\n"
     return existing + "\n\n" + block + "\n"
+
+
+def preflight_reach_rules(home: Path | str) -> None:
+    """Raise :class:`ReachRulesError` if CLAUDE.md already has a corrupt reach-rules
+    marker layout, WITHOUT writing anything.
+
+    Called at the very start of an install so a hand-broken/duplicated marker
+    layout fails fast, before the expensive, side-effecting network steps (a later
+    fatal raise would otherwise leave the uv env + skill dirs written but no state
+    file). A clean file, an absent file, or a well-formed existing block all pass.
+    """
+    path = _claude_md(home)
+    if not path.exists():
+        return
+    existing = path.read_text(encoding="utf-8")
+    start_ct = _marker_line_count(existing, REACH_RULES_START)
+    end_ct = _marker_line_count(existing, REACH_RULES_END)
+    if start_ct == 0 and end_ct == 0:
+        return
+    if _extract_block(existing, REACH_RULES_START, REACH_RULES_END) is None:
+        raise ReachRulesError(
+            f"CLAUDE.md at {path} has a corrupted jacked reach-rules marker layout "
+            f"(start x{start_ct}, end x{end_ct}); fix it by hand, then retry. "
+            f"Markers: '{REACH_RULES_START}' .. '{REACH_RULES_END}'."
+        )
 
 
 def install_reach_rules(home: Path | str) -> str:
@@ -167,13 +189,30 @@ def remove_reach_rules(home: Path | str) -> bool:
 # Codex ~/.codex/AGENTS.md (best-effort)
 # --------------------------------------------------------------------------- #
 
-def install_reach_rules_codex(env: Optional[Mapping[str, str]] = None) -> str:
+def _codex_env(scope_home: Path | str | None, env: Optional[Mapping[str, str]]) -> Optional[Mapping[str, str]]:
+    """Env used to resolve Codex's dir. When the runner has an INJECTED home
+    (``scope_home`` given, i.e. tests/isolation), override ``CODEX_HOME`` to
+    ``<home>/.codex`` so BOTH the presence check and the write land under that
+    home and never touch a developer's real ``~/.codex``. On a real run
+    (``scope_home is None``) return ``env`` unchanged so a user's own
+    ``CODEX_HOME`` is respected."""
+    if scope_home is None:
+        return env
+    base = dict(env) if env is not None else dict(os.environ)
+    base["CODEX_HOME"] = str(Path(scope_home) / ".codex")
+    return base
+
+
+def install_reach_rules_codex(
+    scope_home: Path | str | None = None, env: Optional[Mapping[str, str]] = None
+) -> str:
     """Best-effort install of the reach rules block into Codex's AGENTS.md.
 
     Skipped when Codex is not present (so no stray ``~/.codex`` is created). Any
     failure is logged and swallowed: a Codex problem must never fail the main
     agent-reach install. Returns "installed" / "skipped" / "error".
     """
+    env = _codex_env(scope_home, env)
     try:
         if not codex_present(env):
             return "skipped"
@@ -184,11 +223,14 @@ def install_reach_rules_codex(env: Optional[Mapping[str, str]] = None) -> str:
         return "error"
 
 
-def remove_reach_rules_codex(env: Optional[Mapping[str, str]] = None) -> str:
+def remove_reach_rules_codex(
+    scope_home: Path | str | None = None, env: Optional[Mapping[str, str]] = None
+) -> str:
     """Best-effort strip of the reach rules block from Codex's AGENTS.md.
 
     Returns "removed" / "absent" / "skipped" / "error". Never raises.
     """
+    env = _codex_env(scope_home, env)
     try:
         if not codex_present(env):
             return "skipped"

@@ -102,3 +102,43 @@ def test_enable_channel_prints_configure_hint():
     assert result.exit_code == 0
     assert "Authenticate with" in result.output
     runner.enable_channel.assert_called_once_with("twitter")
+
+
+def test_clear_override_verb_calls_runner():
+    runner = MagicMock()
+    with _patch_runner(runner):
+        result = CliRunner().invoke(main, ["reach", "clear-override"])
+    assert result.exit_code == 0
+    runner.clear_override.assert_called_once()
+    assert "vetted pin" in result.output.lower()
+
+
+def test_update_reports_unvetted_when_override_active():
+    """Plain `reach update` while an override is active must NOT claim the vetted
+    pin: update() reinstalls at the override, so the message says UNVETTED."""
+    runner = MagicMock()
+    runner.update.return_value = {"override_active": True, "installed_sha": "d" * 40}
+    with _patch_runner(runner):
+        result = CliRunner().invoke(main, ["reach", "update"])
+    assert result.exit_code == 0
+    assert "UNVETTED" in result.output
+    assert "clear-override" in result.output
+
+
+def test_update_reports_vetted_pin_when_no_override():
+    runner = MagicMock()
+    runner.update.return_value = {"override_active": False, "installed_sha": "e" * 40}
+    with _patch_runner(runner):
+        result = CliRunner().invoke(main, ["reach", "update"])
+    assert result.exit_code == 0
+    assert "vetted pin" in result.output.lower()
+
+
+def test_remove_reports_residue():
+    runner = MagicMock()
+    runner.remove.return_value = {"removed": True, "residue": ["agent-reach binary still on PATH"]}
+    with _patch_runner(runner):
+        result = CliRunner().invoke(main, ["reach", "remove", "--yes"])
+    assert result.exit_code == 0
+    assert "residue" in result.output.lower()
+    assert "binary still on PATH" in result.output

@@ -118,7 +118,14 @@ def compile_constraints(repo_dir: Path, out_name: str, *, exclude_newer: str | N
     Compiles to a stable RELATIVE filename inside the clone (cwd=repo_dir) so the
     header uv embeds is deterministic across machines (no absolute scratch path).
     """
-    cmd = ["uv", "pip", "compile", "pyproject.toml", "--universal", "-o", out_name]
+    # --generate-hashes pins each dep to its exact ARTIFACT sha256, not just its
+    # version. This is what closes the same-version artifact-swap vector (PyPI
+    # permits ADDING a wheel to an already-published version): the runner enforces
+    # these hashes with a `uv pip install --require-hashes` pre-flight, since
+    # `uv tool install -c` does NOT enforce constraint-file hashes (verified,
+    # uv 0.10.2). See jacked/integrations/agent_reach._hash_preflight.
+    cmd = ["uv", "pip", "compile", "pyproject.toml", "--universal",
+           "--generate-hashes", "-o", out_name]
     if exclude_newer:
         cmd += ["--exclude-newer", exclude_newer]
     run_checked(cmd, cwd=repo_dir, timeout=timeout)

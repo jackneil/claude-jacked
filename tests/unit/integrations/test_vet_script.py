@@ -343,3 +343,26 @@ def test_resolve_channels_layout_drift_raises_clean(tmp_path):
     (repo / "agent_reach" / "cli.py").write_text("_RDT_GIT_SOURCE = \"git+x@y\"\n", encoding="utf-8")
     with pytest.raises(vh.VetError, match="layout differs"):
         vas.resolve_channels(repo)
+
+
+def test_vet_validator_rejects_range_spec_in_lockstep_with_loader():
+    """The vet-side backend validator must reject exactly what the LOADER rejects
+    (it reuses the loader's _spec_is_exactly_pinned), so vetting can never emit a
+    pin the loader would refuse at runtime."""
+    import pytest as _pytest
+    # a range spec must fail vet validation
+    with _pytest.raises(vh.VetError):
+        vh._validate_backend("twitter", {"kind": "npm", "spec": "pkg@1.2.x"})
+    with _pytest.raises(vh.VetError):
+        vh._validate_backend("twitter", {"kind": "pipx", "spec": "pkg==1.2.3 || 2.0"})
+    # a dash-leading spec is rejected before install
+    with _pytest.raises(vh.VetError):
+        vh._validate_backend("twitter", {"kind": "npm", "spec": "--evil@1.0.0"})
+    # an exact spec passes
+    vh._validate_backend("twitter", {"kind": "npm", "spec": "pkg@1.2.3"})
+
+
+def test_vet_resolve_ref_rejects_option_like_ref():
+    import pytest as _pytest
+    with _pytest.raises(vh.VetError):
+        vh.resolve_ref_to_sha("https://example.invalid", "--upload-pack=evil")

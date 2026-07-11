@@ -7,58 +7,28 @@ user-facing, so it uses commas/colons/parens instead of em-dashes.
 """
 from __future__ import annotations
 
-# Keys that mark a per-channel doctor entry when there is no explicit
-# ``channels`` container to iterate.
-_CHANNEL_KEYS = ("active_backend", "backend", "ok", "status", "healthy")
-
-
-def _ok_str(ok: object) -> str:
-    if isinstance(ok, bool):
-        return "yes" if ok else "no"
-    if ok is None:
-        return "-"
-    return str(ok)
-
-
-def _channel_row(name: object, info: dict) -> tuple[str, str, str]:
-    backend = info.get("active_backend") or info.get("backend") or "-"
-    ok = info.get("ok")
-    if ok is None:
-        ok = info.get("healthy")
-    if ok is None:
-        ok = info.get("status")
-    return (str(name), str(backend), _ok_str(ok))
-
-
 def _doctor_rows(doctor: object) -> list[tuple[str, str, str]]:
-    """Normalize the upstream ``doctor --json`` blob into (channel, backend, ok).
+    """Rows of (channel, active_backend, status) from the doctor blob.
 
-    Best effort: the ``--json`` output is the source of truth, so we tolerate a
-    ``channels`` list, a ``channels`` mapping, or a top-level channel-shaped
-    mapping, and skip anything that does not look like a channel entry.
+    ``runner.status()`` always canonicalizes doctor to ``{"channels": [...]}`` (or
+    None) via ``_util.normalize_doctor`` before it reaches here, so this consumes
+    exactly that shape and nothing else.
     """
     if not isinstance(doctor, dict):
         return []
-    channels = doctor.get("channels")
     rows: list[tuple[str, str, str]] = []
-    if isinstance(channels, list):
-        for item in channels:
-            if isinstance(item, dict):
-                name = item.get("channel") or item.get("name") or "?"
-                rows.append(_channel_row(name, item))
-    elif isinstance(channels, dict):
-        for name, info in channels.items():
-            if isinstance(info, dict):
-                rows.append(_channel_row(name, info))
-    else:
-        for name, info in doctor.items():
-            if isinstance(info, dict) and any(k in info for k in _CHANNEL_KEYS):
-                rows.append(_channel_row(name, info))
+    for info in doctor.get("channels") or []:
+        if not isinstance(info, dict):
+            continue
+        name = str(info.get("name") or "?")
+        backend = str(info.get("active_backend") or "-")
+        state = str(info.get("status") or "-")
+        rows.append((name, backend, state))
     return rows
 
 
 def _render_table(rows: list[tuple[str, str, str]]) -> list[str]:
-    header = ("channel", "active_backend", "ok")
+    header = ("channel", "active_backend", "status")
     all_rows = [header, *rows]
     widths = [max(len(r[i]) for r in all_rows) for i in range(3)]
     out = []

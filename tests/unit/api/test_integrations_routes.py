@@ -32,8 +32,10 @@ _STATUS_FIXTURE = {
     "sha_matches": True,
     "drift": [],
     "override": {"active": False, "sha": None, "ack": False, "at": None},
-    "doctor": {"channels": [{"channel": "twitter", "active_backend": "twitter-cli", "ok": True}]},
+    "doctor": {"channels": [{"name": "twitter", "active_backend": "twitter-cli", "status": "ok"}]},
     "doctor_error": None,
+    "channels": [],
+    "upstream_check": {"head_sha": "e825f6740d24c6c315c3b0dc41907e6c87ff39a5", "behind": False, "checked_at": 1},
     "pin": {"version_label": "1.5.0", "vetted_at": "2026-07-11", "short_sha": "e825f6740d24"},
 }
 
@@ -73,8 +75,8 @@ def test_get_returns_runner_status_shape():
     assert body["installed"] is True
     assert body["pin"]["version_label"] == "1.5.0"
     assert body["override"]["active"] is False
-    # ...plus the update-availability stub field.
-    assert body["upstream_check"] is None
+    # ...including the upstream freshness field the runner now populates.
+    assert body["upstream_check"]["behind"] is False
 
 
 def test_install_runs_off_thread():

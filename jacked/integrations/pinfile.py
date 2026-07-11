@@ -29,7 +29,11 @@ KNOWN_SCHEMA_VERSIONS = frozenset({1})
 VALID_BACKEND_KINDS = frozenset({"npm", "pipx", "pipx-git"})
 
 _HEX40 = re.compile(r"[0-9a-fA-F]{40}")
-_NPM_VERSION = re.compile(r"\d+\.\d+")  # semver-ish core: rejects @latest / tags
+# An EXACT semver: major.minor.patch with an optional -prerelease / +build tail.
+# fullmatch-only (see _spec_is_exactly_pinned) so a range/partial/`||` spec such as
+# `1.2`, `1.2.x`, or `1.2.3 || 2.0.0` is rejected: the whole V3 posture is that a
+# channel backend pins to ONE resolvable version, never a floating range.
+_EXACT_SEMVER = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?")
 
 
 class PinFileError(ValueError):
@@ -118,6 +122,10 @@ def _validate(raw: dict, source_path: Path) -> PinFile:
         )
 
     upstream = _require_str(raw, "upstream", source_path)
+    # Enforce https so a tampered in-wheel pin cannot point git ls-remote / the
+    # install URL at an exotic transport (ext::, file://, ssh with a command).
+    if not upstream.startswith("https://"):
+        raise PinFileError(f"upstream must be an https URL; got {upstream!r}")
     constraints_file = _require_str(raw, "constraints_file", source_path)
 
     skill_hashes = raw.get("skill_hashes")
@@ -183,6 +191,11 @@ def _validate_backend(channel: str, raw: object) -> ChannelBackend:
     spec = raw.get("spec")
     if not isinstance(spec, str) or not spec.strip():
         raise PinFileError(f"channel {channel!r} {kind} backend is missing a 'spec'")
+    # A dash-leading spec would be parsed as an OPTION by npm/uv (argument
+    # injection), the same shape guarded on the break-glass ref. Reject it here
+    # even though the pin is vendored; the spec lands bare in the install argv.
+    if spec.startswith("-"):
+        raise PinFileError(f"channel {channel!r} {kind} spec may not start with '-': {spec!r}")
     if not _spec_is_exactly_pinned(kind, spec):
         raise PinFileError(
             f"channel {channel!r} {kind} spec {spec!r} is not exactly pinned "
@@ -192,19 +205,29 @@ def _validate_backend(channel: str, raw: object) -> ChannelBackend:
 
 
 def _spec_is_exactly_pinned(kind: str, spec: str) -> bool:
+    # A whitespace/`||` compound is never an exact pin regardless of kind (npm
+    # `a || b`, a pip environment marker, etc.), so reject it up front.
+    if any(c.isspace() for c in spec) or "||" in spec:
+        return False
     if kind == "npm":
         # Strip a single leading '@' scope marker, then require a '@<version>'
-        # tail whose version looks like a real semver (not a tag such as @latest).
+        # tail that is an EXACT semver (fullmatch) — `@latest`, `@1.2`, `@1.2.x`
+        # all fail, so npm cannot resolve a floating version at enable time.
         body = spec[1:] if spec.startswith("@") else spec
         if "@" not in body:
             return False
         version = body.rsplit("@", 1)[1]
-        return bool(_NPM_VERSION.match(version))
+        return bool(_EXACT_SEMVER.fullmatch(version))
     if kind == "pipx":
-        if "==" not in spec:
+        # Exactly one `==` operator, then an exact version (no `,` compound range,
+        # no `.x`, no trailing operators).
+        if spec.count("==") != 1:
             return False
-        version = spec.split("==", 1)[1].strip()
-        return bool(version) and version[0].isdigit()
+        name, _, version = spec.partition("==")
+        if not name.strip():
+            return False
+        version = version.strip()
+        return bool(_EXACT_SEMVER.fullmatch(version))
     if kind == "pipx-git":
         if not spec.startswith("git+") or "@" not in spec:
             return False

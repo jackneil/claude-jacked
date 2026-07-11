@@ -442,14 +442,29 @@ class TestOverride:
         assert st["doctor"] is None
         assert st["doctor_error"]
 
-    def test_status_auto_clears_stale_override(self, tmp_path):
-        # override SHA == shipped pin SHA -> auto-clear (spec Trust Model)
+    def test_status_reports_satisfied_override_inactive_without_mutating(self, tmp_path):
+        # override SHA == shipped pin SHA. status() is a PURE READ: it reports the
+        # override inactive but must NOT clear the persisted keys (that would be a
+        # GET-with-writes outside the lock). The cleanup happens in mutating paths.
         runner, fs, home = make_runner(
             tmp_path, settings={"reach_override_sha": PIN_SHA, "reach_override_ack": "true"}
         )
         with patched(lambda cmd, **kw: CP(cmd, 0, "", ""), which_map={}):
             st = runner.status()
         assert st["override"]["active"] is False
+        # A read did not delete the key:
+        assert fs.get("reach_override_sha") == PIN_SHA
+
+    def test_install_auto_clears_satisfied_override(self, tmp_path):
+        # The mutating path (install/update) DOES clear a satisfied override.
+        runner, fs, home = make_runner(
+            tmp_path, settings={"reach_override_sha": PIN_SHA, "reach_override_ack": "true"}
+        )
+        with patched(Recorder(home)):
+            result = runner.install()
+        # override == pin, so install resolves to the vetted pin and clears it.
+        assert result["override_active"] is False
+        assert result["installed_sha"] == PIN_SHA
         assert fs.get("reach_override_sha") is None
 
     def test_override_ignored_without_ack_flag(self, tmp_path):
@@ -486,7 +501,7 @@ class TestEnableChannel:
         calls = []
         with patched(lambda cmd, **kw: (calls.append(list(cmd)), CP(cmd, 0, "", ""))[1]):
             hint = runner.enable_channel("twitter")
-        assert ["/fake/uv", "tool", "install", "twitter-cli==1.2.3"] in calls
+        assert ["/fake/uv", "tool", "install", "--", "twitter-cli==1.2.3"] in calls
         assert hint
         state = json.loads((home / ".claude" / "jacked-reach-state.json").read_text())
         assert "twitter" in state["channels_enabled"]
@@ -497,7 +512,7 @@ class TestEnableChannel:
         calls = []
         with patched(lambda cmd, **kw: (calls.append(list(cmd)), CP(cmd, 0, "", ""))[1]):
             runner.enable_channel("opencli")
-        assert ["/fake/npm", "install", "-g", "@jackwener/opencli@0.5.1"] in calls
+        assert ["/fake/npm", "install", "-g", "--", "@jackwener/opencli@0.5.1"] in calls
         # note-only backend produced no command
         assert not _has(calls, lambda c: "chrome" in " ".join(c).lower())
 
@@ -511,6 +526,7 @@ class TestEnableChannel:
             "/fake/uv",
             "tool",
             "install",
+            "--",
             f"git+https://github.com/public-clis/rdt-cli.git@{REDDIT_GIT_SHA}",
         ] in calls
 
@@ -622,3 +638,265 @@ class TestStatusRemove:
         with patched(lambda cmd, **kw: CP(cmd, 0, "", ""), which_map={}):
             runner.remove()  # no uv / agent-reach on PATH -> no crash
         assert not (home / ".claude" / "jacked-reach-state.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# break-glass INSTALL path (the unvetted-code half of the invariant)
+# --------------------------------------------------------------------------- #
+
+class TestBreakGlassInstall:
+    def test_install_uses_override_sha_and_override_constraints(self, tmp_path):
+        """With an active override, install() must build the uv git URL at the
+        OVERRIDE sha and point -c at the override constraints file, not the pin."""
+        override_sha = "d" * 40
+        runner, fs, home = make_runner(
+            tmp_path, settings={"reach_override_sha": override_sha, "reach_override_ack": "true"}
+        )
+        # The override constraints file must exist for install to proceed.
+        (home / ".claude").mkdir(parents=True, exist_ok=True)
+        (home / ".claude" / "jacked-reach-override-constraints.txt").write_text("# pinned\n")
+        rec = Recorder(home)
+        with patched(rec):
+            result = runner.install()
+        assert result["override_active"] is True
+        assert result["installed_sha"] == override_sha
+        uv_install = _find(rec.calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"])
+        assert "--safe" not in uv_install  # (that flag is on the agent-reach step)
+        assert f"agent-reach @ git+{UPSTREAM}@{override_sha}" in uv_install
+        ci = uv_install.index("-c")
+        assert uv_install[ci + 1].endswith("jacked-reach-override-constraints.txt")
+        # the agent-reach step still carries --safe
+        ar = _find(rec.calls, lambda c: c[0] == "/fake/agent-reach" and "install" in c)
+        assert "--safe" in ar
+
+
+# --------------------------------------------------------------------------- #
+# annotated-tag ref resolution
+# --------------------------------------------------------------------------- #
+
+class TestRefResolution:
+    def test_annotated_tag_resolves_to_peeled_commit(self, tmp_path):
+        """An annotated tag makes ls-remote emit two lines; the peeled (^{})
+        commit SHA must win over the tag-object SHA (which uv can't install)."""
+        runner, fs, home = make_runner(tmp_path)
+        tag_obj = "a" * 40
+        commit = "e" * 40
+
+        def side(cmd, **kw):
+            if cmd[0] == "/fake/git" and "ls-remote" in cmd:
+                out = f"{tag_obj}\trefs/tags/v1.5.0\n{commit}\trefs/tags/v1.5.0^{{}}\n"
+                return CP(cmd, 0, out, "")
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            runner.set_override("v1.5.0", ack=True)
+        assert fs.get("reach_override_sha") == commit  # peeled commit, not tag object
+
+    def test_ls_remote_uses_separator(self, tmp_path):
+        runner, fs, home = make_runner(tmp_path)
+        captured = []
+
+        def side(cmd, **kw):
+            captured.append(list(cmd))
+            if cmd[0] == "/fake/git" and "ls-remote" in cmd:
+                return CP(cmd, 0, f"{'e'*40}\trefs/heads/main\n", "")
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            runner.set_override("main", ack=True)
+        ls = _find(captured, lambda c: c[:2] == ["/fake/git", "ls-remote"])
+        assert ls[-2:] == ["--", "main"]
+
+
+# --------------------------------------------------------------------------- #
+# channel re-pin on update + version recording
+# --------------------------------------------------------------------------- #
+
+class TestChannelRepin:
+    def test_enable_records_installed_specs(self, tmp_path):
+        runner, fs, home = make_runner(tmp_path)
+        _mark_installed(home)
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        with patched(lambda cmd, **kw: CP(cmd, 0, "", "")):
+            runner.enable_channel("twitter")
+        state = json.loads((home / ".claude" / "jacked-reach-state.json").read_text())
+        assert state["channel_specs"]["twitter"] == ["twitter-cli==1.2.3"]
+
+    def test_update_repins_enabled_channels(self, tmp_path):
+        """After an update (reinstall), each enabled channel's pinned backend is
+        re-installed so it follows a pin bump instead of drifting."""
+        runner, fs, home = make_runner(tmp_path)
+        _mark_installed(home, channels=["twitter"])
+        rec = Recorder(home)
+        with patched(rec):
+            runner.update()
+        # the twitter backend (pipx -> uv tool install twitter-cli==1.2.3) re-ran
+        assert _has(rec.calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"] and "twitter-cli==1.2.3" in c)
+
+    def test_enable_channel_partial_failure_does_not_record(self, tmp_path):
+        """A failing backend raises before the channel is recorded."""
+        runner, fs, home = make_runner(tmp_path)
+        _mark_installed(home)
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+
+        def side(cmd, **kw):
+            if "install" in cmd and "-g" in cmd:  # npm backend
+                return CP(cmd, 1, "", "EACCES")
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            with pytest.raises(RuntimeError):
+                runner.enable_channel("opencli")
+        state = json.loads((home / ".claude" / "jacked-reach-state.json").read_text())
+        assert "opencli" not in state.get("channels_enabled", [])
+
+
+# --------------------------------------------------------------------------- #
+# remove verification + preflight + clear_override(installed)
+# --------------------------------------------------------------------------- #
+
+class TestRemoveAndPreflight:
+    def test_remove_deletes_skill_dirs_even_without_binary(self, tmp_path):
+        """A bare `uv tool uninstall` leaves the skill dirs; remove() deletes them
+        itself so a tampered SKILL.md can't survive (V5)."""
+        runner, fs, home = make_runner(tmp_path)
+        _mark_installed(home)
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach",
+                             Path(".agents") / "skills" / "agent-reach"])
+        # agent-reach binary absent (which_map has no agent-reach)
+        with patched(lambda cmd, **kw: CP(cmd, 0, "", ""),
+                     which_map={"uv": "/fake/uv"}):
+            result = runner.remove()
+        assert not (home / ".claude" / "skills" / "agent-reach").exists()
+        assert not (home / ".agents" / "skills" / "agent-reach").exists()
+        assert result["residue"] == []
+
+    def test_remove_reports_residue(self, tmp_path):
+        """If the binary is still on PATH after uninstall, remove() reports it."""
+        runner, fs, home = make_runner(tmp_path)
+        _mark_installed(home)
+        # agent-reach stays resolvable -> residue includes the binary note.
+        with patched(lambda cmd, **kw: CP(cmd, 0, "", ""),
+                     which_map={"uv": "/fake/uv", "agent-reach": "/fake/agent-reach"}):
+            result = runner.remove()
+        assert any("binary still on PATH" in r for r in result["residue"])
+
+    def test_install_preflights_corrupt_marker_before_side_effects(self, tmp_path):
+        """A corrupt reach-marker layout in CLAUDE.md fails install FAST, before
+        any uv/agent-reach subprocess runs (no half-install)."""
+        from jacked.integrations.rules import ReachRulesError
+
+        runner, fs, home = make_runner(tmp_path)
+        (home / ".claude").mkdir(parents=True, exist_ok=True)
+        # start marker with no end -> orphaned/corrupt
+        (home / ".claude" / "CLAUDE.md").write_text("# jacked-reach-rules-v1\nstray\n")
+        calls = []
+        with patched(lambda cmd, **kw: (calls.append(list(cmd)), CP(cmd, 0, "uv 0.10.2\n" if "--version" in cmd else "", ""))[1]):
+            with pytest.raises(ReachRulesError):
+                runner.install()
+        # only the uv --version gate may have run; no install/agent-reach side effects
+        assert not _has(calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"])
+        assert not _has(calls, lambda c: c[0] == "/fake/agent-reach")
+        assert not (home / ".claude" / "jacked-reach-state.json").exists()
+
+    def test_clear_override_when_installed_reinstalls_at_pin(self, tmp_path):
+        runner, fs, home = make_runner(
+            tmp_path, settings={"reach_override_sha": "d" * 40, "reach_override_ack": "true"}
+        )
+        _mark_installed(home)
+        rec = Recorder(home)
+        with patched(rec):
+            runner.clear_override()
+        assert fs.get("reach_override_sha") is None
+        # reinstalled at the shipped pin (not the former override)
+        assert _has(rec.calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"]
+                    and f"agent-reach @ git+{UPSTREAM}@{PIN_SHA}" in c)
+
+
+# --------------------------------------------------------------------------- #
+# SEC-M1: artifact hash pre-flight (require-hashes enforcement)
+# --------------------------------------------------------------------------- #
+
+class TestHashPreflight:
+    def _hashed_runner(self, tmp_path):
+        """A runner whose constraints file carries --hash entries."""
+        runner, fs, home = make_runner(tmp_path)
+        pin = runner._load_pin()
+        pin.constraints_path().write_text(
+            "idna==3.10 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8"
+        )
+        return runner, fs, home
+
+    def test_hashed_constraints_run_require_hashes_preflight(self, tmp_path):
+        runner, fs, home = self._hashed_runner(tmp_path)
+        rec = Recorder(home)
+        with patched(rec):
+            runner.install()
+        # a `uv pip install --require-hashes -r <constraints>` ran BEFORE the tool install
+        pre = _find(rec.calls, lambda c: c[:3] == ["/fake/uv", "pip", "install"])
+        assert "--require-hashes" in pre
+        assert any(a.endswith("agent-reach-constraints.txt") for a in pre)
+        # ordering: the pre-flight precedes the uv tool install
+        pre_idx = rec.calls.index(pre)
+        tool_idx = rec.calls.index(_find(rec.calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"]))
+        assert pre_idx < tool_idx
+
+    def test_preflight_failure_aborts_before_tool_install(self, tmp_path):
+        runner, fs, home = self._hashed_runner(tmp_path)
+        calls = []
+
+        def side(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:2] == ["/fake/uv", "--version"]:
+                return CP(cmd, 0, "uv 0.10.2\n", "")
+            # the require-hashes pip install fails (simulated hash mismatch)
+            if cmd[:3] == ["/fake/uv", "pip", "install"]:
+                return CP(cmd, 1, "", "Hash mismatch for idna==3.10")
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            with pytest.raises(RuntimeError):
+                runner.install()
+        # the tool install never ran, and no state file was written
+        assert not _has(calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"])
+        assert not (home / ".claude" / "jacked-reach-state.json").exists()
+
+    def test_no_hash_constraints_skips_preflight(self, tmp_path):
+        # default fixture constraints ("# fully pinned") carry no --hash
+        runner, fs, home = make_runner(tmp_path)
+        rec = Recorder(home)
+        with patched(rec):
+            runner.install()
+        assert not _has(rec.calls, lambda c: c[:3] == ["/fake/uv", "pip", "install"])
+
+
+# --------------------------------------------------------------------------- #
+# SEC-M2: verify flags UNEXPECTED files (V5 extra-file blind spot)
+# --------------------------------------------------------------------------- #
+
+class TestUnexpectedFiles:
+    def test_extra_file_flagged_unexpected(self, tmp_path):
+        runner, fs, home = make_runner(tmp_path)
+        skill = home / ".claude" / "skills" / "agent-reach"
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        (skill / "references" / "evil.md").write_bytes(b"payload\n")
+        ok, drift = runner._verify_skill_hashes(runner._load_pin())
+        assert not ok
+        assert any(d["status"] == "unexpected" and d["file"] == "references/evil.md" for d in drift)
+
+    def test_nested_skill_md_flagged_unexpected(self, tmp_path):
+        runner, fs, home = make_runner(tmp_path)
+        skill = home / ".claude" / "skills" / "agent-reach"
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        (skill / "sub").mkdir()
+        (skill / "sub" / "SKILL.md").write_bytes(b"# injected skill\n")
+        ok, drift = runner._verify_skill_hashes(runner._load_pin())
+        assert not ok
+        assert any(d["status"] == "unexpected" and d["file"] == "sub/SKILL.md" for d in drift)
+
+    def test_clean_install_has_no_unexpected(self, tmp_path):
+        runner, fs, home = make_runner(tmp_path)
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        ok, drift = runner._verify_skill_hashes(runner._load_pin())
+        assert ok
+        assert not any(d["status"] == "unexpected" for d in drift)
