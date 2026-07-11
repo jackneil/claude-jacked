@@ -132,6 +132,65 @@ keeps the Codex install idempotent and lets `jacked uninstall` remove exactly wh
 jacked wrote, never a user's own entries. The Claude manifest
 (`~/.claude/jacked-manifest.json`) is separate and untouched.
 
+## Agent Reach integration
+
+Agent Reach is an upstream MIT capability layer that gives coding agents read and
+search access to platforms like Twitter/X, Reddit, YouTube transcripts, Bilibili,
+XiaoHongShu, LinkedIn, web, and RSS through upstream CLIs. jacked manages it as an
+external integration (the second one, after Chrome DevTools MCP): default off,
+opt-in per machine, and locked down so a poisoned upstream release or transitive
+dependency cannot reach the machine. It is installed, inspected, and removed
+through the `jacked reach` command group or the dashboard Integrations tab.
+
+CLI verbs:
+
+| Command | What it does |
+|---------|--------------|
+| `jacked reach install` | Install Agent Reach at the vetted pin (safe mode, skill hashes verified). |
+| `jacked reach status [--json]` | Show install state, pinned SHA and version, override state, skill drift, and channel/doctor health. |
+| `jacked reach update [--override-ref REF --unvetted-ok]` | Reinstall at the vetted pin, or set a break-glass override to an unvetted upstream ref. |
+| `jacked reach enable-channel <name>` | Install a channel's pinned backends, then print the upstream login/config step to run. |
+| `jacked reach remove [--yes]` | Uninstall Agent Reach, delete jacked's state, and clear any override. |
+
+Dashboard: the Integrations tab (Settings) holds the Agent Reach card (install
+state, pinned version and short SHA, vetted date, doctor channel table, drift
+warning, and the break-glass section) alongside the Chrome DevTools MCP widget.
+
+Where state lives:
+
+| Location | Owner | Contents |
+|----------|-------|----------|
+| `~/.claude/jacked-reach-state.json` | jacked | Installed SHA, install time, enabled channels, override-active flag. |
+| `~/.claude/skills/agent-reach/`, `~/.agents/skills/agent-reach/`, `~/.openclaw/skills/agent-reach/` | upstream installer | The skill payload jacked hash-verifies against the pin after every install. |
+| `~/.agent-reach/` | upstream | Agent Reach's own config and channel data (jacked does not manage it). |
+| DB `settings` keys `reach_override_sha`, `reach_override_ack`, `reach_override_at` | jacked | Break-glass override state (protected keys the generic settings endpoint cannot rewrite). |
+
+Supply-chain posture: jacked installs Agent Reach only from a vendored pin, an
+immutable commit SHA plus a fully pinned transitive constraints file shipped in
+jacked's source, so nothing resolves to a moving target at install time. Every
+install runs upstream's installer in safe mode (no curl-to-shell NodeSource
+setup, no apt keyring writes, no unprompted global npm installs) and then
+verifies the installed skill files against sha256 hashes in the pin, rolling back
+on any mismatch. Optional channels install only the exact pinned backend versions
+from the pin's channel table, never a freestyle npm or pipx install.
+
+Troubleshooting basics:
+
+- **Drift warning**: `status` and the dashboard show a drift row when installed
+  skill file hashes no longer match the pin, which means a skill file changed
+  after install (possible tampering or a manual edit). Reinstall with
+  `jacked reach update` to restore the vetted files, or remove and reinstall.
+- **Remove is safe**: `jacked reach remove` tolerates a partial or absent install.
+  It uninstalls the tool, deletes jacked's state file, strips jacked's rules
+  overlay, and clears any override, leaving no residue. It is safe to run even if
+  an install half-failed.
+- **Doctor**: `status` embeds `agent-reach doctor --json` (per-channel active
+  backend, status, and fix hint). A doctor failure is surfaced as a doctor error,
+  not a fatal jacked error.
+- **uv requirement**: install needs uv >= 0.5.0 for `uv tool install -c` on a
+  git and SHA source. An older uv fails the version gate with a clear message;
+  upgrade uv (`uv self update` or reinstall) and retry.
+
 ## Guardrails System
 
 Language-specific coding standards enforced through templates and git hooks.
