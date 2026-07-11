@@ -1001,7 +1001,7 @@ def test_claude_install_includes_chain_of_command(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 # M6: chrome-devtools MCP registration in ~/.codex/config.toml. jacked
 # auto-installs a `chrome-devtools` MCP server for Claude Code (npx
-# chrome-devtools-mcp@latest --autoConnect); the Codex pass mirrors that server
+# chrome-devtools-mcp@<pinned> --autoConnect); the Codex pass mirrors that server
 # via a marker-wrapped `[mcp_servers.chrome-devtools]` TOML append so Codex
 # skills referencing mcp__chrome-devtools__* resolve. Never fights a user's own
 # entry; never leaves a broken config.
@@ -1029,7 +1029,11 @@ def test_mcp_fresh_config_created(homes):
     data = tomllib.loads(text)
     srv = data["mcp_servers"]["chrome-devtools"]
     assert srv["command"] == "npx"
-    assert srv["args"] == ["chrome-devtools-mcp@latest", "--autoConnect"]
+    from jacked.cli import CHROME_DEVTOOLS_NPX_PACKAGE
+    assert srv["args"] == [CHROME_DEVTOOLS_NPX_PACKAGE, "--autoConnect"]
+    # Pinned to an exact version, never the floating @latest tag (supply-chain).
+    assert "@latest" not in CHROME_DEVTOOLS_NPX_PACKAGE
+    assert srv["args"][0].startswith("chrome-devtools-mcp@")
 
 
 def test_mcp_appends_preserving_user_config(homes):
@@ -1103,11 +1107,42 @@ def test_mcp_updates_changed_marked_block(homes):
     assert status == "updated"
     text = cfg.read_text()
     data = tomllib.loads(text)
+    from jacked.cli import CHROME_DEVTOOLS_NPX_PACKAGE
     assert data["mcp_servers"]["chrome-devtools"]["args"] == [
-        "chrome-devtools-mcp@latest", "--autoConnect"
+        CHROME_DEVTOOLS_NPX_PACKAGE, "--autoConnect"
     ]
     assert data["model"] == "gpt-5"            # surrounding user content preserved
     assert text.count(ins._MCP_BEGIN) == 1
+
+
+def test_mcp_upgrades_stale_latest_block_to_pinned(homes):
+    """A previously-installed marked block still on the legacy `@latest` spec is
+    detected as drifted and rewritten in place to the EXACT pinned package on
+    reinstall - the supply-chain upgrade path for existing Codex users. A user's
+    own unmarked entry is out of scope here (covered by the preexisting tests)."""
+    from jacked.cli import CHROME_DEVTOOLS_NPX_PACKAGE
+
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    stale = (
+        ins._MCP_BEGIN + "\n"
+        + "[mcp_servers.chrome-devtools]\n"
+        + 'command = "npx"\n'
+        + 'args = ["chrome-devtools-mcp@latest", "--autoConnect"]\n'
+        + ins._MCP_END + "\n"
+    )
+    cfg.write_bytes(stale.encode())
+    assert "@latest" in cfg.read_text()        # precondition: stale entry present
+
+    status = ins.ensure_chrome_devtools_mcp(home)
+    assert status == "updated"
+    text = cfg.read_text()
+    assert "@latest" not in text               # floating tag is gone
+    data = tomllib.loads(text)
+    assert data["mcp_servers"]["chrome-devtools"]["args"] == [
+        CHROME_DEVTOOLS_NPX_PACKAGE, "--autoConnect"
+    ]
+    assert text.count(ins._MCP_BEGIN) == 1      # replaced in place, not duplicated
 
 
 def test_mcp_unparseable_config_untouched(homes):

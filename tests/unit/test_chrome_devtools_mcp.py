@@ -1,11 +1,13 @@
 """Unit tests for Chrome DevTools MCP management functions."""
 
+import re
 import subprocess
 from unittest import mock
 
 
 from jacked.cli import (
     CHROME_DEVTOOLS_MODES,
+    CHROME_DEVTOOLS_NPX_PACKAGE,
     _get_chrome_devtools_mcp_status,
     _install_chrome_devtools_mcp,
     _remove_chrome_devtools_mcp,
@@ -255,3 +257,171 @@ class TestModesConstant:
 
     def test_launch_has_no_flags(self):
         assert CHROME_DEVTOOLS_MODES["launch"] == []
+
+
+# ---------------------------------------------------------------------------
+# Supply-chain: pinned version + stale-@latest upgrade (M6)
+# ---------------------------------------------------------------------------
+
+
+def _add_calls(calls):
+    return [c for c in calls if c and c[0] == "add"]
+
+
+class TestPinnedVersionAndUpgrade:
+    def test_constant_is_pinned_not_latest(self):
+        """The npx package spec is an EXACT semver, never the floating @latest tag
+        that npx would resolve (and could poison) at agent runtime."""
+        assert CHROME_DEVTOOLS_NPX_PACKAGE != "chrome-devtools-mcp@latest"
+        assert "@latest" not in CHROME_DEVTOOLS_NPX_PACKAGE
+        assert re.fullmatch(r"chrome-devtools-mcp@\d+\.\d+\.\d+", CHROME_DEVTOOLS_NPX_PACKAGE)
+
+    def test_fresh_install_command_uses_pinned_version(self):
+        """A fresh install's `claude mcp add` command carries the exact pinned
+        package and NOT @latest."""
+        get_result = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+        add_result = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return get_result if args[0] == "get" else add_result
+
+        with mock.patch("jacked.cli._run_claude_mcp", side_effect=fake_run):
+            _install_chrome_devtools_mcp()
+
+        adds = _add_calls(calls)
+        assert len(adds) == 1
+        assert CHROME_DEVTOOLS_NPX_PACKAGE in adds[0]
+        assert "@latest" not in " ".join(adds[0])
+
+    def test_stale_latest_entry_upgraded_in_place_without_force(self):
+        """A jacked-managed entry still running @latest is treated as STALE and
+        upgraded (remove + re-add pinned) even WITHOUT --force, and the existing
+        connection mode is preserved."""
+        get_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="Command: npx\nArgs: chrome-devtools-mcp@latest --autoConnect",
+            stderr="",
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return get_result if args[0] == "get" else ok
+
+        with mock.patch("jacked.cli._run_claude_mcp", side_effect=fake_run):
+            _install_chrome_devtools_mcp(force=False)
+
+        assert any(c[0] == "remove" for c in calls), "stale entry should be removed"
+        adds = _add_calls(calls)
+        assert len(adds) == 1
+        assert CHROME_DEVTOOLS_NPX_PACKAGE in adds[0]
+        assert "@latest" not in " ".join(adds[0])
+        assert "--autoConnect" in adds[0]        # mode preserved across upgrade
+
+    def test_old_pin_upgraded_in_place_without_force(self):
+        """A jacked-managed entry on an OLDER pinned version is also stale and
+        upgraded to the current pin without --force."""
+        get_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="Args: chrome-devtools-mcp@1.0.0 --autoConnect", stderr="",
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return get_result if args[0] == "get" else ok
+
+        with mock.patch("jacked.cli._run_claude_mcp", side_effect=fake_run):
+            _install_chrome_devtools_mcp(force=False)
+
+        assert any(c[0] == "remove" for c in calls)
+        adds = _add_calls(calls)
+        assert len(adds) == 1
+        assert CHROME_DEVTOOLS_NPX_PACKAGE in adds[0]
+
+    def test_current_pinned_entry_skipped_without_force(self):
+        """An entry already on the exact pinned spec is left alone: only `get` runs,
+        no remove/re-add."""
+        get_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=f"Args: {CHROME_DEVTOOLS_NPX_PACKAGE} --autoConnect", stderr="",
+        )
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return get_result
+
+        with mock.patch("jacked.cli._run_claude_mcp", side_effect=fake_run):
+            _install_chrome_devtools_mcp(force=False)
+
+        assert [c[0] for c in calls] == ["get"]
+
+    def test_foreign_entry_left_untouched_without_force(self):
+        """A user's OWN chrome-devtools server running a different package is never
+        rewritten: only `get` runs, no remove/re-add."""
+        get_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="Command: npx\nArgs: @acme/my-devtools-server --port 9000",
+            stderr="",
+        )
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return get_result
+
+        with mock.patch("jacked.cli._run_claude_mcp", side_effect=fake_run):
+            _install_chrome_devtools_mcp(force=False)
+
+        assert [c[0] for c in calls] == ["get"]
+
+    def test_upgrade_preserves_browserurl_mode(self):
+        """Upgrading a stale entry keeps a non-default (browserUrl) mode instead of
+        resetting it to autoConnect."""
+        get_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="Args: chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222",
+            stderr="",
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return get_result if args[0] == "get" else ok
+
+        with mock.patch("jacked.cli._run_claude_mcp", side_effect=fake_run):
+            _install_chrome_devtools_mcp(force=False)
+
+        adds = _add_calls(calls)
+        assert len(adds) == 1
+        assert "--browserUrl" in adds[0]
+        assert "--autoConnect" not in adds[0]
+
+    def test_force_reinstall_uses_pinned_version(self):
+        """--force removes the old entry and re-adds it at the pinned spec (never
+        @latest), regardless of what was there before."""
+        get_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="Args: chrome-devtools-mcp@latest --autoConnect", stderr="",
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return get_result if args[0] == "get" else ok
+
+        with mock.patch("jacked.cli._run_claude_mcp", side_effect=fake_run):
+            _install_chrome_devtools_mcp(force=True)
+
+        assert any(c[0] == "remove" for c in calls)
+        adds = _add_calls(calls)
+        assert len(adds) == 1
+        assert CHROME_DEVTOOLS_NPX_PACKAGE in adds[0]
+        assert "@latest" not in " ".join(adds[0])

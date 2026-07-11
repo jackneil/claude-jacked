@@ -1949,10 +1949,18 @@ def _remove_chain_of_command_hook(settings_path: Path) -> bool:
     return False
 
 
-# Single source of truth for the chrome-devtools MCP npx package spec. The Codex
-# installer (jacked/codex/installer._mcp_block_body) imports this + the autoConnect
-# args below so the two CLIs never drift on the version/flags they register.
-CHROME_DEVTOOLS_NPX_PACKAGE = "chrome-devtools-mcp@latest"
+# Single source of truth for the chrome-devtools MCP npx package. The Codex
+# installer (jacked/codex/_managed._mcp_block_body) imports CHROME_DEVTOOLS_NPX_PACKAGE
+# + the autoConnect args below so the two CLIs never drift on the version/flags
+# they register.
+#
+# PINNED to an EXACT version, deliberately NOT `@latest`: npx resolves a floating
+# tag at agent runtime, so a poisoned chrome-devtools-mcp release would be pulled
+# straight into a running agent (supply-chain hole). Bump this in a jacked release
+# after vetting the new version; on reinstall, jacked upgrades an existing entry
+# still on `@latest` (or an older pin) to this exact spec in place.
+CHROME_DEVTOOLS_MCP_PACKAGE = "chrome-devtools-mcp"
+CHROME_DEVTOOLS_NPX_PACKAGE = f"{CHROME_DEVTOOLS_MCP_PACKAGE}@1.5.0"
 
 CHROME_DEVTOOLS_MODES: dict[str, list[str]] = {
     "autoConnect": ["--autoConnect"],
@@ -2017,29 +2025,92 @@ def _run_claude_plugin(
         return None
 
 
+def _chrome_devtools_entry_state(get_output: str) -> str:
+    """Classify an existing ``chrome-devtools`` server (from a ``claude mcp get``
+    stdout) by the npx package spec it runs, so install can leave a current entry
+    alone, upgrade a stale jacked-managed one in place, and never rewrite a user's
+    own custom chrome-devtools server.
+
+      - "current"  runs the exact pinned ``CHROME_DEVTOOLS_NPX_PACKAGE``.
+      - "stale"    runs the ``chrome-devtools-mcp`` npx package at a DIFFERENT spec
+                   (an older pin, or the legacy ``@latest``) - jacked's own entry,
+                   just outdated; safe to upgrade to the pinned version.
+      - "foreign"  does not run ``chrome-devtools-mcp`` at all - a user's own
+                   chrome-devtools server we must not touch. (The server NAME
+                   ``chrome-devtools`` lacks the ``-mcp`` suffix, so the header
+                   never false-matches the package check.)
+    """
+    if CHROME_DEVTOOLS_NPX_PACKAGE in get_output:
+        return "current"
+    if CHROME_DEVTOOLS_MCP_PACKAGE in get_output:
+        return "stale"
+    return "foreign"
+
+
+def _chrome_devtools_mode_args(get_output: str) -> list[str]:
+    """The connection-mode flags the existing ``chrome-devtools`` entry uses
+    (parsed from a ``claude mcp get`` stdout), so a version upgrade re-adds with
+    the SAME mode instead of silently resetting a user's browserUrl/headless/launch
+    choice back to autoConnect. An entry with no recognized flag is launch mode
+    (no flags), preserved as such."""
+    for _mode, args in CHROME_DEVTOOLS_MODES.items():
+        if args and args[0] in get_output:
+            return list(args)
+    return []
+
+
 def _install_chrome_devtools_mcp(force: bool = False) -> None:
-    """Install Chrome DevTools MCP server (user-scoped via ``claude mcp add``)."""
+    """Install or upgrade the Chrome DevTools MCP server (user-scoped via
+    ``claude mcp add``), always at the pinned ``CHROME_DEVTOOLS_NPX_PACKAGE``.
+
+    With ``--force`` an existing entry is removed and re-added at the pinned spec.
+    Without ``--force`` an already-configured entry is touched ONLY when it is
+    jacked's own and STALE (running an older pin or the legacy ``@latest``), in
+    which case it is upgraded in place; a current entry is left alone and a user's
+    own custom chrome-devtools server is never rewritten. The entry's existing
+    connection mode is preserved across an upgrade."""
     result = _run_claude_mcp("get", "chrome-devtools")
     already_installed = result is not None and result.returncode == 0
+    get_output = result.stdout if (already_installed and result.stdout) else ""
 
     if already_installed and not force:
-        console.print("[yellow][-][/yellow] Chrome DevTools MCP already configured")
-        return
+        state = _chrome_devtools_entry_state(get_output)
+        if state == "current":
+            console.print("[yellow][-][/yellow] Chrome DevTools MCP already configured")
+            return
+        if state == "foreign":
+            console.print(
+                "[yellow][-][/yellow] Chrome DevTools MCP: keeping your existing "
+                "custom entry (not jacked-managed)"
+            )
+            return
+        console.print(
+            "[cyan][~][/cyan] Upgrading Chrome DevTools MCP to pinned "
+            f"{CHROME_DEVTOOLS_NPX_PACKAGE}"
+        )
 
-    if already_installed and force:
+    # Preserve the mode an existing entry already uses on an upgrade; a fresh
+    # install defaults to autoConnect.
+    mode_args = (
+        _chrome_devtools_mode_args(get_output)
+        if already_installed
+        else list(CHROME_DEVTOOLS_MODES["autoConnect"])
+    )
+
+    if already_installed:
         rm = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
         if rm is None or rm.returncode != 0:
             console.print("[yellow][WARN][/yellow] Could not remove existing Chrome DevTools MCP — attempting overwrite")
 
     add = _run_claude_mcp(
         "add", "-s", "user", "chrome-devtools", "--",
-        "npx", CHROME_DEVTOOLS_NPX_PACKAGE, *CHROME_DEVTOOLS_MODES["autoConnect"],
+        "npx", CHROME_DEVTOOLS_NPX_PACKAGE, *mode_args,
         timeout=30,
     )
     if add is None:
         console.print("[red][FAIL][/red] Chrome DevTools MCP setup failed (claude CLI not found or timed out)")
     elif add.returncode == 0:
-        console.print("[green][OK][/green] Chrome DevTools MCP configured (autoConnect)")
+        console.print("[green][OK][/green] Chrome DevTools MCP configured")
         console.print("[dim]     Requires Chrome 144+ with remote debugging enabled[/dim]")
         console.print("[dim]     Enable at: chrome://inspect/#remote-debugging[/dim]")
     else:
