@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from jacked.api.routes import integrations, system
+from jacked.integrations._util import ReachUserError
 from jacked.integrations.agent_reach import (
     SETTING_OVERRIDE_ACK,
     SETTING_OVERRIDE_AT,
@@ -97,7 +98,7 @@ def test_install_runs_off_thread():
 
 def test_unknown_channel_returns_422():
     client, runner = _reach_client()
-    runner.enable_channel.side_effect = RuntimeError(
+    runner.enable_channel.side_effect = ReachUserError(
         "unknown channel 'bogus'; valid channels: reddit, search, twitter"
     )
     with patch.object(integrations, "AgentReachRunner", return_value=runner):
@@ -106,6 +107,32 @@ def test_unknown_channel_returns_422():
     body = resp.json()
     assert body["error"]["code"] == "REACH_CHANNEL_ERROR"
     assert "unknown channel" in body["error"]["message"]
+
+
+def test_channel_execution_failure_returns_500():
+    """A real subprocess/install failure is a server error, not a 422: only
+    user-correctable ReachUserError maps to 422."""
+    client, runner = _reach_client()
+    runner.enable_channel.side_effect = RuntimeError("npm install exited 1: EACCES")
+    with patch.object(integrations, "AgentReachRunner", return_value=runner):
+        resp = client.post(f"{REACH_BASE}/channels/twitter")
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "REACH_CHANNEL_FAILED"
+
+
+def test_override_bad_ref_returns_422():
+    """An unresolvable ref is client-correctable: 422, not 500."""
+    client, runner = _reach_client()
+    runner.set_override.side_effect = ReachUserError(
+        "could not resolve ref 'no-such-branch' against https://example.com/repo"
+    )
+    with patch.object(integrations, "AgentReachRunner", return_value=runner):
+        resp = client.put(
+            f"{REACH_BASE}/override",
+            json={"ref": "no-such-branch", "confirm_unvetted": True},
+        )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "REACH_BAD_REF"
 
 
 @pytest.mark.parametrize(

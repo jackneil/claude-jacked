@@ -472,6 +472,20 @@ class TestStatusRemove:
         assert st["drift"] == []
         assert st["sha_matches"] is False
 
+    def test_status_includes_channel_table(self, tmp_path):
+        """status() exposes the pin's channel table with per-channel enabled
+        flags so the dashboard can render enable buttons + pinned specs."""
+        runner, fs, home = make_runner(tmp_path)
+        _mark_installed(home, channels=["twitter"])
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        with patched(lambda cmd, **kw: CP(cmd, 0, "", ""), which_map={}):
+            st = runner.status()
+        by_name = {c["name"]: c for c in st["channels"]}
+        assert by_name["twitter"]["enabled"] is True
+        specs = [b["spec"] for b in by_name["twitter"]["backends"]]
+        assert any(s and "==" in s for s in specs)  # exact pin surfaces verbatim
+        assert all(c["enabled"] is False for n, c in by_name.items() if n != "twitter")
+
     def test_status_doctor_json_passthrough(self, tmp_path):
         runner, fs, home = make_runner(tmp_path)
         _mark_installed(home)

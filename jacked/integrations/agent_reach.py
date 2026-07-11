@@ -7,12 +7,10 @@ constraints file, and post-install hash verification of the skill files. Nothing
 resolves at install time and ``--safe`` is never omitted, so a poisoned upstream
 release or transitive dep cannot reach the machine.
 
-Break-glass override persistence is *injected* -- the runner takes
-``get_setting``/``set_setting`` callables so the API layer owns the DB and the
-CLI passes real DB accessors; this module never imports the DB. Subprocess
-discipline: explicit arg lists (no ``shell=True``), a timeout on every call,
-captured output, an explicit failure check per step; the post-install hash verify
-is what proves the install landed intact (exit codes are never trusted alone).
+Break-glass override persistence is *injected* (get_setting/set_setting
+callables; this module never imports the DB). Subprocess discipline: arg lists
+only, a timeout on every call, explicit failure checks; the post-install hash
+verify proves the install landed intact (exit codes are never trusted alone).
 """
 from __future__ import annotations
 
@@ -27,7 +25,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from jacked.integrations._util import (
+    ReachUserError,
     atomic_write_json,
+    channels_status,
     configure_hint,
     format_drift,
     now_iso,
@@ -199,6 +199,7 @@ class AgentReachRunner:
             },
             "doctor": doctor,
             "doctor_error": doctor_error,
+            "channels": channels_status(pin, self._existing_channels()),
             "pin": {
                 "version_label": pin.version_label,
                 "vetted_at": pin.vetted_at,
@@ -221,10 +222,10 @@ class AgentReachRunner:
         channel = pin.channels.get(name)
         if channel is None:
             valid = ", ".join(sorted(pin.channels)) or "(none)"
-            raise RuntimeError(f"unknown channel {name!r}; valid channels: {valid}")
+            raise ReachUserError(f"unknown channel {name!r}; valid channels: {valid}")
 
         if self._read_state() is None:
-            raise RuntimeError(
+            raise ReachUserError(
                 "agent-reach is not installed; run 'jacked reach install' before enabling channels"
             )
 
@@ -260,7 +261,7 @@ class AgentReachRunner:
         any other ref is resolved via ``git ls-remote``.
         """
         if not ack:
-            raise RuntimeError(
+            raise ReachUserError(
                 "break-glass override requires explicit acknowledgement (ack=True): "
                 "this installs UNVETTED upstream code"
             )
@@ -369,7 +370,7 @@ class AgentReachRunner:
         proc = self._run([git, "ls-remote", upstream, ref], timeout=NETWORK_TIMEOUT)
         lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
         if not lines:
-            raise RuntimeError(f"could not resolve ref {ref!r} against {upstream}")
+            raise ReachUserError(f"could not resolve ref {ref!r} against {upstream}")
         sha = lines[0].split()[0]
         if not _HEX40.fullmatch(sha):
             raise RuntimeError(f"git ls-remote returned an unexpected sha for {ref!r}: {sha!r}")

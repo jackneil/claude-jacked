@@ -61,6 +61,27 @@ def truthy(value: object) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
+class ReachUserError(RuntimeError):
+    """A user-correctable reach error (unknown channel, not installed, bad ref,
+    missing ack) — the API maps it to 422; genuine execution failures stay 500."""
+
+
+def channels_status(pin, enabled: list[str]) -> list[dict]:
+    """The pin's channel table as UI-ready dicts with per-channel enabled flags."""
+    enabled_set = set(enabled)
+    return [
+        {
+            "name": name,
+            "enabled": name in enabled_set,
+            "backends": [
+                {"kind": b.kind, "spec": b.spec, "note": b.note}
+                for b in channel.backends
+            ],
+        }
+        for name, channel in sorted(pin.channels.items())
+    ]
+
+
 def sha256_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 

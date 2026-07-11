@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool
 
 from jacked.integrations.agent_reach import AgentReachRunner
+from jacked.integrations._util import ReachUserError
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +130,12 @@ async def enable_channel(name: str, request: Request):
     async with _reach_lock:
         try:
             hint = await asyncio.to_thread(runner.enable_channel, name)
-        except Exception as exc:  # noqa: BLE001
+        except ReachUserError as exc:
             # Unknown channel and "not installed yet" are client-correctable.
             return _error(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc), "REACH_CHANNEL_ERROR")
+        except Exception as exc:  # noqa: BLE001 - a real execution failure
+            logger.exception("agent-reach enable_channel(%s) failed", name)
+            return _error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc), "REACH_CHANNEL_FAILED")
     return {"ok": True, "channel": name, "hint": hint}
 
 
@@ -156,6 +160,9 @@ async def set_override(body: OverrideRequest, request: Request):
     async with _reach_lock:
         try:
             result = await asyncio.to_thread(runner.set_override, body.ref, ack=True)
+        except ReachUserError as exc:
+            # An unresolvable ref is client-correctable, not a server failure.
+            return _error(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc), "REACH_BAD_REF")
         except Exception as exc:  # noqa: BLE001
             logger.exception("agent-reach set_override failed")
             return _error(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc), "REACH_OVERRIDE_ERROR")
