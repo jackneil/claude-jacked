@@ -131,6 +131,36 @@ picks the locale winner (`SKILL.md` or `SKILL_en.md`) and writes it **as**
 pin, expect both `SKILL.md` and `SKILL_en.md` hashes to be present — that is
 correct, not a duplicate. Do not hand-strip one; the verifier depends on both.
 
+## Channel backends: what is and isn't locked
+
+Optional channel backends (twitter-cli, OpenCLI, bili-cli, rdt-cli, mcporter) are
+pinned to an **exact version** in the pin's channel table, and `jacked reach
+enable-channel` installs exactly that version (never `@latest`, never a range —
+the pin-file validator rejects anything non-exact). `jacked reach update` also
+re-installs each enabled channel's pinned backend, so a pin bump carries the
+channel backends to their new vetted versions instead of leaving them at the
+version installed at first enable.
+
+What is **not** locked: the channel backends' own **transitive dependencies**.
+The core agent-reach install is transitive-locked via `-c <constraints>`, but a
+channel backend's deps resolve at install time. This is a real and deliberate
+limitation, not an oversight:
+
+- **npm globals cannot take a pip-style constraints file.** `npm install -g
+  pkg@ver` resolves the package's transitive tree per its own semver ranges;
+  there is no `-c` equivalent for a global install, and `npm ci` needs a project
+  lockfile that a `-g` install does not use.
+- Locking only the pipx/uv channel backends (twitter-cli, bili-cli, rdt-cli) and
+  not the npm ones (OpenCLI powers most channels) would be an asymmetric
+  half-measure that implies more coverage than it delivers.
+
+The mitigation is that channels are **opt-in** (nothing is enabled by default),
+the backend package version is pinned from the vetted table, and the rules line
+steers agents to install backends only via `jacked reach enable-channel`. Do not
+claim channel transitive-dependency locking in release notes; if a full per-backend
+lock becomes worth the complexity later, it is a future hardening, not a
+regression to fix.
+
 ## Break-glass reality
 
 Users can override the shipped pin to any upstream ref:

@@ -150,6 +150,7 @@ CLI verbs:
 | `jacked reach status [--json]` | Show install state, pinned SHA and version, override state, skill drift, and channel/doctor health. |
 | `jacked reach update [--override-ref REF --unvetted-ok]` | Reinstall at the vetted pin, or set a break-glass override to an unvetted upstream ref. |
 | `jacked reach enable-channel <name>` | Install a channel's pinned backends, then print the upstream login/config step to run. |
+| `jacked reach clear-override` | Clear a break-glass override and reinstall at the vetted pin. |
 | `jacked reach remove [--yes]` | Uninstall Agent Reach, delete jacked's state, and clear any override. |
 
 Dashboard: the Integrations tab (Settings) holds the Agent Reach card (install
@@ -172,7 +173,12 @@ install runs upstream's installer in safe mode (no curl-to-shell NodeSource
 setup, no apt keyring writes, no unprompted global npm installs) and then
 verifies the installed skill files against sha256 hashes in the pin, rolling back
 on any mismatch. Optional channels install only the exact pinned backend versions
-from the pin's channel table, never a freestyle npm or pipx install.
+from the pin's channel table (re-pinned on every update), never a freestyle npm or
+pipx install. The channel backend version is pinned, but its transitive
+dependencies are not constraint-locked (npm globals cannot take a constraints
+file); channels are opt-in and installed only from the vetted table. `status` also
+carries a cached upstream freshness check so a stale pin surfaces a signal rather
+than silently rotting behind upstream fixes.
 
 Troubleshooting basics:
 
@@ -181,9 +187,13 @@ Troubleshooting basics:
   after install (possible tampering or a manual edit). Reinstall with
   `jacked reach update` to restore the vetted files, or remove and reinstall.
 - **Remove is safe**: `jacked reach remove` tolerates a partial or absent install.
-  It uninstalls the tool, deletes jacked's state file, strips jacked's rules
-  overlay, and clears any override, leaving no residue. It is safe to run even if
-  an install half-failed.
+  It uninstalls the tool, deletes the skill dirs itself, strips jacked's rules
+  overlay, and clears any override, then verifies no residue remains and reports
+  any leftover. It is safe to run even if an install half-failed.
+- **Break-glass override**: `jacked reach update --override-ref REF --unvetted-ok`
+  installs an unvetted upstream ref (still SHA-locked and constraint-locked).
+  While active, `status` and the dashboard show an UNVETTED badge. Return to the
+  vetted pin with `jacked reach clear-override`.
 - **Doctor**: `status` embeds `agent-reach doctor --json` (per-channel active
   backend, status, and fix hint). A doctor failure is surfaced as a doctor error,
   not a fatal jacked error.
