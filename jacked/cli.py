@@ -5,6 +5,7 @@ Provides command-line interface for indexing, searching, and
 retrieving Claude Code sessions.
 """
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -4143,6 +4144,148 @@ def codex_launch_cmd(account_id, codex_args):
         launch_codex(account_id, codex_args)
     except CodexSwapError as exc:
         raise click.ClickException(str(exc))
+
+
+# ── Agent-reach integration ──────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def _reach_runner():
+    """Yield an AgentReachRunner wired to real DB setting accessors.
+
+    Break-glass override state must survive across invocations, so the setter
+    maps a None value to a row delete (Database.set_setting only stores
+    strings). The DB handle is short-lived and closed on exit, mirroring the
+    Codex CLI verbs.
+    """
+    from jacked.integrations.agent_reach import AgentReachRunner
+    from jacked.web.database import Database
+
+    db = Database(str(Path.home() / ".claude" / "jacked.db"))
+    try:
+        def _get(key):
+            return db.get_setting(key)
+
+        def _set(key, value):
+            if value is None:
+                db.delete_setting(key)
+            else:
+                db.set_setting(key, value)
+
+        yield AgentReachRunner(_get, _set)
+    finally:
+        db.close()
+
+
+def _reach_guard(fn, *args, **kwargs):
+    """Run a runner op, turning its error into a clean non-zero CLI failure."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        raise click.ClickException(str(exc))
+
+
+@main.group(name="reach")
+def reach_group():
+    """Manage the agent-reach external integration (install, status, channels)."""
+
+
+@reach_group.command(name="install")
+def reach_install_cmd():
+    """Install agent-reach at the vetted pin (safe mode, skill hashes verified).
+
+    >>> # CLI command: jacked reach install
+    """
+    with _reach_runner() as runner:
+        result = _reach_guard(runner.install)
+    short = (result.get("installed_sha") or "?")[:12]
+    unvetted = " (UNVETTED override)" if result.get("override_active") else ""
+    console.print(f"[green][OK][/green] agent-reach installed at [bold]{short}[/bold]{unvetted}")
+    console.print("Skill file hashes verified against the vetted pin.")
+
+
+@reach_group.command(name="status")
+@click.option("--json", "as_json", is_flag=True, help="Emit runner.status() as JSON.")
+def reach_status_cmd(as_json):
+    """Show install state, pin, override, skill drift, and channel health.
+
+    >>> # CLI command: jacked reach status [--json]
+    """
+    import json
+
+    with _reach_runner() as runner:
+        status = _reach_guard(runner.status)
+    if as_json:
+        click.echo(json.dumps(status, indent=2, default=str))
+        return
+    from jacked.integrations._cli_render import render_status
+
+    console.print(render_status(status), markup=False, highlight=False)
+
+
+@reach_group.command(name="update")
+@click.option(
+    "--override-ref", "override_ref", default=None,
+    help="Break-glass: install this upstream ref instead of the vetted pin.",
+)
+@click.option(
+    "--unvetted-ok", is_flag=True,
+    help="Required with --override-ref: acknowledges installing UNVETTED upstream code.",
+)
+def reach_update_cmd(override_ref, unvetted_ok):
+    """Re-install at the authoritative pin, or set a break-glass override.
+
+    Without --override-ref this reinstalls at the currently vetted pin. With
+    --override-ref REF you must also pass --unvetted-ok, because a break-glass
+    override installs upstream code jacked has not vetted.
+
+    >>> # CLI command: jacked reach update [--override-ref REF --unvetted-ok]
+    """
+    if override_ref and not unvetted_ok:
+        raise click.ClickException(
+            "--override-ref installs UNVETTED upstream code and requires "
+            "--unvetted-ok to proceed. Re-run with --unvetted-ok if you accept that risk."
+        )
+    with _reach_runner() as runner:
+        if override_ref:
+            result = _reach_guard(runner.set_override, override_ref, ack=True)
+            short = (result.get("override_sha") or override_ref)[:12]
+            console.print(f"[yellow]Break-glass override set to {short} (UNVETTED).[/yellow]")
+            _reach_guard(runner.update)
+            console.print("[green][OK][/green] Reinstalled at the override SHA.")
+        else:
+            _reach_guard(runner.update)
+            console.print("[green][OK][/green] agent-reach reinstalled at the vetted pin.")
+
+
+@reach_group.command(name="remove")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def reach_remove_cmd(yes):
+    """Uninstall agent-reach, delete jacked state, and clear any override.
+
+    >>> # CLI command: jacked reach remove [--yes]
+    """
+    if not yes:
+        click.confirm(
+            "Remove agent-reach (uninstall the tool, delete skill dirs, clear override)?",
+            abort=True,
+        )
+    with _reach_runner() as runner:
+        _reach_guard(runner.remove)
+    console.print("[green][OK][/green] agent-reach removed.")
+
+
+@reach_group.command(name="enable-channel")
+@click.argument("name")
+def reach_enable_channel_cmd(name):
+    """Install a channel's pinned backends, then print its configure step.
+
+    >>> # CLI command: jacked reach enable-channel <name>
+    """
+    with _reach_runner() as runner:
+        hint = _reach_guard(runner.enable_channel, name)
+    console.print(f"[green][OK][/green] Channel [bold]{name}[/bold] enabled.")
+    console.print(hint)
 
 
 # ── Convenience init command ─────────────────────────────────────────

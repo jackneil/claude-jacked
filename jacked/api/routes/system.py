@@ -14,6 +14,11 @@ from pydantic import BaseModel
 
 from jacked.findbin import find_bin
 from jacked.install_summary import DEFAULT_LAST_INSTALL_PATH as _LAST_INSTALL_PATH
+from jacked.integrations.agent_reach import (
+    SETTING_OVERRIDE_ACK as _REACH_OVERRIDE_ACK,
+    SETTING_OVERRIDE_AT as _REACH_OVERRIDE_AT,
+    SETTING_OVERRIDE_SHA as _REACH_OVERRIDE_SHA,
+)
 from jacked.service import update_status as _update_status_mod
 
 logger = logging.getLogger(__name__)
@@ -913,6 +918,11 @@ _PROTECTED_SETTING_KEYS = {
     "window_keeper_active_end",
     "window_keeper_prewake",
     "auto_swap_paused_until",
+    # agent-reach break-glass override keys — the runner owns these; the generic
+    # settings endpoint must never set them (a forged UNVETTED override).
+    _REACH_OVERRIDE_SHA,
+    _REACH_OVERRIDE_ACK,
+    _REACH_OVERRIDE_AT,
 }
 
 

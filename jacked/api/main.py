@@ -156,6 +156,7 @@ async def lifespan(app: FastAPI):
         "jacked.api.routes.auth",
         "jacked.web.auth",
         "jacked.api.routes.features",
+        "jacked.api.routes.integrations",
         "jacked.api.routes.permissions",
         "jacked.api.routes.system",
         "jacked.api.usage_monitor",
@@ -456,16 +457,18 @@ async def websocket_endpoint(ws: WebSocket):
 
 # --- Include route modules ---
 
-from jacked.api.routes import system, analytics, features, logs, permissions, menubar  # noqa: E402
+from jacked.api.routes import system, analytics, features, integrations, logs, permissions, menubar  # noqa: E402
 from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
 
 # Swap settings router MUST be registered before system router —
 # system.py has a catch-all PUT /settings/{key} that would steal
-# the swap-settings routes otherwise.
+# the swap-settings routes otherwise. The integrations router lives under
+# /api/integrations, a distinct prefix the catch-all never matches.
 app.include_router(swap_settings_router, prefix="/api/settings", tags=["settings"])
 app.include_router(system.router, prefix="/api", tags=["system"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(features.router, prefix="/api", tags=["features"])
+app.include_router(integrations.router, prefix="/api/integrations", tags=["integrations"])
 app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(permissions.router, prefix="/api", tags=["permissions"])
 app.include_router(menubar.router, prefix="/api", tags=["menubar"])
