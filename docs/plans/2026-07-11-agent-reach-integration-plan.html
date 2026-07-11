@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent-Reach Integration — Implementation Plan</title>
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="in-progress">
+<meta name="jacked:branch" content="feature/agent-reach-integration">
+<meta name="jacked:date" content="2026-07-11">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --border:#d8d4cc; --code-bg:#f3efe8; --shadow:0 1px 3px rgba(0,0,0,.06); --radius:6px; --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --border:#2e2e2e; --code-bg:#232323; --shadow:0 1px 3px rgba(0,0,0,.3); } }
+  * { box-sizing:border-box; } body { font-family:var(--sans); font-size:16px; line-height:1.6; color:var(--fg); background:var(--bg); margin:0; padding:2rem 1rem; }
+  .wrap { max-width:880px; margin:0 auto; } h1 { font-size:2rem; margin:0 0 .25rem; } h2 { font-size:1.4rem; margin:2.5rem 0 .75rem; padding-bottom:.35rem; border-bottom:1px solid var(--border); }
+  p { margin:.5rem 0 1rem; } code { font-family:var(--mono); font-size:.92em; background:var(--code-bg); padding:.12em .35em; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; background:var(--bg-card); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow); }
+  th, td { text-align:left; padding:.55rem .8rem; border-bottom:1px solid var(--border); vertical-align:top; } th { background:var(--code-bg); font-weight:600; font-size:.9rem; } tr:last-child td { border-bottom:none; }
+  aside.callout { margin:1rem 0; padding:.9rem 1.1rem; border-left:4px solid var(--warn); background:var(--warn-bg); border-radius:0 var(--radius) var(--radius) 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Agent-Reach Integration — Implementation Plan</h1>
+<p>Execution mapping for the approved spec (<code>docs/plans/2026-07-11-agent-reach-integration-design.html</code> — design detail, threat model V1-V7, schemas live there). Branch <code>feature/agent-reach-integration</code>. One commit per green milestone.</p>
+
+<aside class="callout"><strong>Session conventions (verified in-repo 2026-07-11):</strong> CLI = <code>click</code> group in <code>jacked/cli.py:92</code> (add <code>reach</code> as a click sub-group). Tests live in <code>tests/unit/</code>; web JS is tested by Python string-assertion tests (<code>test_web_js_*.py</code> — brittle on exact class strings, so write assertions on stable markers). <code>tests/unit/test_chrome_devtools_mcp.py</code> is the direct model for M6. Test cmd: <code>uv run python -m pytest</code>. Never bare pip; never restart the user's live webux (QA on scratch-HOME :8399).</aside>
+
+<h2>Milestone map</h2>
+<table>
+<thead><tr><th>M</th><th>Deliverable</th><th>Files</th><th>Tests (new)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Vet pipeline; run it to produce the initial vendored pin. Script: resolve ref→full SHA (git ls-remote), fetch tree @SHA, diff vs current pin, <code>uv pip compile</code> constraints, <code>uvx pip-audit</code>/<code>uvx osv-scanner</code> over locked set, sha256 SKILL.md/SKILL_en.md/references, channel version table (npm view / pipx spec), emit report + pin JSON + constraints. Split helpers to keep &lt;500 lines/file.</td><td><code>scripts/vet_agent_reach.py</code> (+ <code>scripts/_vet_helpers.py</code> if needed), <code>jacked/data/integrations/agent-reach.json</code>, <code>jacked/data/integrations/agent-reach-constraints.txt</code></td><td><code>tests/unit/integrations/test_vet_script.py</code> — offline fixture git repo (tmp_path): resolve/diff/hash/emit paths; schema round-trip</td></tr>
+<tr><td>2</td><td>Runner: <code>install()</code> (uv-version gate ≥0.5 w/ clear error; <code>uv tool install -c &lt;constraints&gt; 'agent-reach @ git+…@SHA'</code>; <code>agent-reach install --safe --env=auto</code>; post-verify skill hashes vs pin, roll back on mismatch; state → <code>~/.claude/jacked-reach-state.json</code>), <code>status()</code> (pin/override match, drift re-hash, <code>doctor --json</code> passthrough, cached upstream check), <code>update()</code>, <code>enable_channel()</code> (pin-table validated), <code>remove()</code>, <code>set_override(ref)</code>/<code>clear_override()</code> (ls-remote resolve, fresh compile, DB settings + ack). Pin-file loader/validator in <code>jacked/integrations/pinfile.py</code>. No shell=True; timeouts; explicit failure checks.</td><td><code>jacked/integrations/{__init__,agent_reach,pinfile}.py</code></td><td><code>tests/unit/integrations/test_runner.py</code>, <code>test_pinfile.py</code> — mocked subprocess asserts <code>--safe</code>/<code>-c</code>/SHA in every install; drift match/mismatch/missing; override state machine; uv gate</td></tr>
+<tr><td>3</td><td>CLI <code>jacked reach install|status|update|remove|enable-channel NAME [--override-ref REF] [--json]</code> (thin click wrappers). API routes per spec table; async via <code>asyncio.to_thread</code>; module lock + <code>reset_locks()</code>; register router in <code>api/main.py</code>; add override keys to <code>_PROTECTED_SETTING_KEYS</code>.</td><td><code>jacked/cli.py</code>, <code>jacked/api/routes/integrations.py</code>, <code>jacked/api/main.py</code>, <code>jacked/api/routes/system.py</code></td><td><code>tests/unit/api/test_integrations_routes.py</code> — unknown channel 422; override w/o <code>confirm_unvetted</code> 422; protected keys rejected via generic settings; reset_locks tuple test picks up module</td></tr>
+<tr><td>4</td><td>Integrations tab in settings.js (tab bar + switch) + <code>components/integrations.js</code> card: pin+vetted date, UNVETTED badge, doctor table (active_backend), channel buttons w/ pinned versions + burner warning, break-glass ack checkbox, missing-prereqs list, install/update/remove w/ progress + confirm. Move chrome-devtools widget here from Claude Code tab. Script tags in index.html. tabular-nums; real loading/empty/error states; UI copy em-dash-free.</td><td><code>jacked/data/web/js/components/integrations.js</code>, <code>settings.js</code>, <code>index.html</code></td><td><code>tests/unit/test_web_js_integrations.py</code> — stable-marker assertions (ids/data-attrs, not styling classes)</td></tr>
+<tr><td>5</td><td>Reach rules line: separate marker pair (<code># jacked-reach-rules</code> / <code># end-jacked-reach-rules</code>) so it toggles independently of the main behaviors block; installed by runner install(), removed by remove(); Claude <code>~/.claude/CLAUDE.md</code> + Codex managed AGENTS.md block via <code>codex/_managed.py</code> discipline. Content per spec §5.</td><td><code>jacked/data/rules/reach_rules.md</code>, runner, <code>codex/_managed.py</code></td><td><code>tests/unit/integrations/test_reach_rules.py</code> — install/remove idempotent both harnesses; orphaned-marker refusal</td></tr>
+<tr><td>6</td><td>Pin chrome-devtools MCP: constant → exact version (vetted via <code>npm view chrome-devtools-mcp version</code> at implementation time); idempotent re-add upgrades <code>@latest</code> entries (force path exists); Codex reads same constants (verified — no second change site).</td><td><code>jacked/cli.py:1955</code> area</td><td>extend <code>tests/unit/test_chrome_devtools_mcp.py</code> — no <code>@latest</code> in built config; stale-entry upgrade</td></tr>
+<tr><td>7</td><td>Live E2E on this machine (real network, no mocks): install → verify both skill dirs + hash match → status --json → remove → no residue. Transcript pasted into run log/PR.</td><td>—</td><td>manual evidence (not CI)</td></tr>
+<tr><td>8</td><td>Docs + gates: maintenance doc (bump procedure = run vet script → review report → commit pin files in PR); jacked-reference.md section; full pytest; /qa; /cso; /dcr; open PR (NOT merged).</td><td><code>docs/agent-reach-maintenance.md</code>, <code>jacked/data/rules/jacked-reference.md</code></td><td>full suite + gates</td></tr>
+</tbody>
+</table>
+
+<h2>Dispatch strategy</h2>
+<p>Per session chain-of-command: main loop (Fable) authors specs/prompts, verifies every diff, runs gates; coding milestones dispatch to Opus agents with explicit escalation instructions (stop and report on any design decision the spec doesn't cover). M1+M2 sequential (M2 consumes M1's pin schema); M3 after M2 (imports runner); M4 after M3 (calls API); M5/M6 parallelizable after M2. /cso security review runs on Fable per policy. Live E2E (M7) runs from the main loop, never delegated.</p>
+</div>
+</body>
+</html>
