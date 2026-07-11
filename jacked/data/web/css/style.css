@@ -256,6 +256,12 @@ body {
     animation: spin 600ms linear infinite;
 }
 
+.spinner-sm {
+    width: 14px;
+    height: 14px;
+    border-width: 2px;
+}
+
 @keyframes spin {
     to {
         transform: rotate(360deg);

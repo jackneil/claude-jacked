@@ -92,9 +92,9 @@ function _reachCardHtml(status) {
     const vettedAt = escapeHtml(pin.vetted_at || 'unknown');
     const pinLine = `
         <div class="text-xs text-slate-500 mt-2">
-            Vetted pin ${pinLabel}
+            Vetted pin <span class="text-slate-400">${pinLabel}</span>
             ${pinShort ? `<code class="text-slate-400 tabular-nums">${pinShort}</code>` : ''}
-            <span class="text-slate-600">·</span> vetted <span class="tabular-nums">${vettedAt}</span>
+            <span class="text-slate-600">·</span> vetted <span class="text-slate-400 tabular-nums">${vettedAt}</span>
         </div>
     `;
 
@@ -118,7 +118,7 @@ function _reachCardHtml(status) {
 
             ${_reachOverrideNoticeHtml(override, pin)}
             ${_reachActionsHtml(installed)}
-            <div id="reach-op-error" class="hidden mt-3 p-2 bg-red-900/30 border border-red-700/50 rounded text-xs text-red-300"></div>
+            <div id="reach-op-error" class="hidden mt-3 p-2 bg-red-900/30 border border-red-700 rounded text-xs text-red-300"></div>
 
             ${_reachDriftHtml(drift)}
             ${installed ? _reachDoctorHtml(status.doctor, status.doctor_error) : ''}
@@ -133,7 +133,7 @@ function _reachOverrideNoticeHtml(override, pin) {
     const short = escapeHtml(_reachShort(override.sha));
     const pinLabel = escapeHtml((pin && pin.version_label) || 'the shipped pin');
     return `
-        <div class="mt-4 p-3 bg-red-900/25 border border-red-700/60 rounded">
+        <div class="mt-4 p-3 bg-red-900/30 border border-red-700 rounded">
             <div class="flex items-center flex-wrap gap-2">
                 <span class="badge badge-danger">Unvetted</span>
                 <code class="text-xs text-red-200 tabular-nums">${short}</code>
@@ -284,7 +284,7 @@ function _reachChannelRowHtml(ch, installed) {
         : '';
     const action = ch.enabled
         ? `<span class="badge badge-success shrink-0">Enabled</span>`
-        : `<button class="reach-channel-enable text-xs px-3 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded transition active:scale-[0.96] disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+        : `<button class="reach-channel-enable text-xs px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded transition active:scale-[0.96] disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
                    data-channel="${escapeHtml(name)}" ${installed ? '' : 'disabled'}
                    ${installed ? '' : 'title="Install Agent Reach first"'}>Enable</button>`;
     return `
@@ -312,7 +312,7 @@ function _reachBreakGlassHtml(override, pin) {
         : '';
     return `
         <details class="mt-5 border-t border-slate-700 pt-4">
-            <summary class="text-xs font-semibold text-slate-400 uppercase tracking-wider cursor-pointer select-none">Break-glass override (advanced)</summary>
+            <summary class="text-xs font-semibold text-slate-400 uppercase tracking-wider cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">Break-glass override (advanced)</summary>
             <div class="mt-3 space-y-3">
                 <p class="text-xs text-slate-500 text-pretty">
                     Escape hatch: install a specific upstream ref that jacked has not vetted. Use this only when a
@@ -401,7 +401,7 @@ async function _reachRunOp(container, op) {
     const origLabel = clicked ? clicked.textContent : '';
     btns.forEach(b => { b.disabled = true; });
     if (clicked) {
-        clicked.innerHTML = `<span class="inline-flex items-center gap-2"><span class="spinner" style="width:14px;height:14px;border-width:2px;"></span>${_reachOpLabel(op)}</span>`;
+        clicked.innerHTML = `<span class="inline-flex items-center gap-2"><span class="spinner spinner-sm"></span>${_reachOpLabel(op)}</span>`;
     }
     const errEl = document.getElementById('reach-op-error');
     if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
@@ -425,10 +425,11 @@ async function _reachEnableChannel(container, name, btn) {
     if (btn) { btn.disabled = true; btn.textContent = 'Enabling...'; }
     try {
         const res = await api.post(`/api/integrations/agent-reach/channels/${encodeURIComponent(name)}`, {}, { timeout: 300000 });
-        const hintSlot = container.querySelector(`[data-channel-hint="${name}"]`);
-        if (hintSlot && res && res.hint) hintSlot.textContent = res.hint;
-        if (btn) { btn.textContent = 'Enabled'; btn.classList.add('opacity-60'); }
-        showToast(`${name} channel enabled`, 'success');
+        const hint = (res && res.hint) ? String(res.hint) : '';
+        showToast(hint ? `${name} channel enabled. ${hint}` : `${name} channel enabled`, 'success');
+        // Re-render from fresh status so the row shows the canonical enabled
+        // state (green badge + check icon) instead of a dead grayed-out button.
+        await _loadReachCard(container);
     } catch (e) {
         if (btn) { btn.disabled = false; btn.textContent = 'Enable'; }
         showToast(e.message || 'Enable failed', 'error');
@@ -473,12 +474,12 @@ async function _reachClearOverride(container) {
 
 function _reachBrowserToolsHtml() {
     return `
-        <div class="border-t border-slate-700 pt-5">
+        <div class="feature-card">
             <div class="flex items-center gap-2 mb-1">
                 <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
-                <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider">Browser Tools</h3>
+                <span class="text-sm font-semibold text-white">Browser Tools</span>
             </div>
-            <p class="text-xs text-slate-500 mb-3">Chrome DevTools MCP powers <code class="text-slate-300">/qa</code> and <code class="text-slate-300">/ux</code> browser testing. Requires <span class="text-emerald-400">Chrome 144+</span> with remote debugging enabled.</p>
+            <p class="text-xs text-slate-400 mb-3">Chrome DevTools MCP powers <code class="text-slate-300">/qa</code> and <code class="text-slate-300">/ux</code> browser testing. Requires <span class="text-emerald-400">Chrome 144+</span> with remote debugging enabled.</p>
             <div id="cdp-mcp-status" class="p-3 bg-slate-900/50 rounded border border-slate-700/50">
                 <div class="flex items-center justify-between">
                     <div class="min-w-0 flex-1">
