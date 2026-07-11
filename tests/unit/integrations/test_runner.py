@@ -14,6 +14,7 @@ from unittest import mock
 
 import pytest
 
+from jacked.integrations._util import ReachUserError
 from jacked.integrations.agent_reach import AgentReachRunner
 
 UPSTREAM = "https://github.com/Panniantong/Agent-Reach"
@@ -364,12 +365,38 @@ class TestOverride:
                 return CP(cmd, 0, f"{resolved}\trefs/heads/main\n", "")
             return CP(cmd, 0, "", "")
 
-        with patched(side):
+        captured = []
+
+        def side_capture(cmd, **kw):
+            captured.append(list(cmd))
+            return side(cmd, **kw)
+
+        with patched(side_capture):
             out = runner.set_override("main", ack=True)
         assert out["override_sha"] == resolved
         assert fs.get("reach_override_sha") == resolved
         assert fs.get("reach_override_ack") == "true"
         assert fs.get("reach_override_at")
+        # ls-remote must place the ref AFTER a '--' separator so a ref can never
+        # be reparsed as a git option.
+        ls = _find(captured, lambda c: c[:2] == ["/fake/git", "ls-remote"])
+        assert ls[-2:] == ["--", "main"]
+
+    def test_set_rejects_option_like_ref(self, tmp_path):
+        """Defense-in-depth: a ref starting with '-' (git argument injection) is
+        refused before any git subprocess runs."""
+        runner, fs, home = make_runner(tmp_path)
+        calls = []
+
+        def side(cmd, **kw):
+            calls.append(list(cmd))
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            with pytest.raises(ReachUserError, match="may not start with"):
+                runner.set_override("--upload-pack=evil", ack=True)
+        assert not _has(calls, lambda c: c[:2] == ["/fake/git", "ls-remote"])
+        assert fs.get("reach_override_sha") is None  # nothing persisted
 
     def test_set_accepts_raw_sha_without_git(self, tmp_path):
         runner, fs, home = make_runner(tmp_path)

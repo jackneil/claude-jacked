@@ -367,8 +367,14 @@ class AgentReachRunner:
     def _resolve_ref(self, upstream: str, ref: str) -> str:
         if _HEX40.fullmatch(ref):
             return ref.lower()
+        # Defense-in-depth: a ref beginning with '-' would be parsed by git as an
+        # OPTION rather than a ref (argument injection). Reject it before it ever
+        # reaches the ls-remote argv, and end the option list with '--' so no ref
+        # can be reinterpreted as a flag.
+        if not ref or ref.startswith("-"):
+            raise ReachUserError(f"invalid ref {ref!r}: a ref may not start with '-'")
         git = self._require_bin("git")
-        proc = self._run([git, "ls-remote", upstream, ref], timeout=NETWORK_TIMEOUT)
+        proc = self._run([git, "ls-remote", upstream, "--", ref], timeout=NETWORK_TIMEOUT)
         lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
         if not lines:
             raise ReachUserError(f"could not resolve ref {ref!r} against {upstream}")
