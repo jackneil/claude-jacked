@@ -37,6 +37,7 @@ from jacked.integrations._util import (
     verify_skill_hashes,
 )
 from jacked.integrations.pinfile import ChannelBackend, PinFile, load_pin
+from jacked.integrations import rules as reach_rules
 from jacked.winproc import NO_WINDOW
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,13 @@ class AgentReachRunner:
                 "(possible tampering) -- rolled back. Details: " + format_drift(drift)
             )
 
+        # Install jacked's reach rules overlay AFTER hash verification. The Claude
+        # side is fatal (config integrity) and raises on a corrupt CLAUDE.md; the
+        # Codex side is best-effort. Done before _write_state so a rules failure
+        # leaves no state file and a retry (both are idempotent) heals it.
+        reach_rules.install_reach_rules(self._home)
+        reach_rules.install_reach_rules_codex()
+
         self._write_state(
             installed_sha=authoritative_sha,
             override_active=override_active,
@@ -237,6 +245,10 @@ class AgentReachRunner:
         uv = shutil.which("uv")
         if uv:
             self._run([uv, "tool", "uninstall", "agent-reach"], timeout=LOCAL_TIMEOUT, check=False)
+        # Strip jacked's reach rules overlay from CLAUDE.md + Codex AGENTS.md.
+        # Both are tolerant of absence; the Codex side never raises.
+        reach_rules.remove_reach_rules(self._home)
+        reach_rules.remove_reach_rules_codex()
         self._delete_state()
         # Clear override AFTER state is gone so it does not trigger a reinstall.
         self.clear_override()

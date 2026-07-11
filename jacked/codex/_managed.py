@@ -14,6 +14,7 @@ from ._fsutil import (
     _atomic_write_text,
     _extract_block,
     _marker_line_count,
+    codex_agents_md,
     codex_config_toml,
     codex_hooks_json,
 )
@@ -24,16 +25,31 @@ logger = logging.getLogger(__name__)
 _AGENTS_BEGIN = "<!-- BEGIN jacked behaviors (managed by `jacked install`) -->"
 _AGENTS_END = "<!-- END jacked behaviors (managed by `jacked install`) -->"
 
+# agent-reach rules block markers. This is a SEPARATE marker pair from the main
+# behaviors block above, so `jacked reach` install/remove manages exactly its own
+# overlay in AGENTS.md without disturbing the jacked-install behaviors block (or a
+# user's own content). Both blocks flow through the same marker-extract-or-bail
+# helpers (`_install_md_block`/`_strip_md_block`).
+_REACH_BEGIN = "<!-- BEGIN jacked agent-reach rules (managed by `jacked reach`) -->"
+_REACH_END = "<!-- END jacked agent-reach rules (managed by `jacked reach`) -->"
 
-def _install_agents_block(path: Path, body: str) -> None:
-    block = f"{_AGENTS_BEGIN}\n{body.strip()}\n{_AGENTS_END}\n"
+
+def _install_md_block(path: Path, begin: str, end: str, body: str) -> None:
+    """Idempotently install a marker-wrapped ``begin``..``end`` block into `path`.
+
+    Fresh file (or no markers present): append the block, preserving existing
+    content byte-for-byte as the prefix. Our block already present: replace it in
+    place iff its body drifted. An ambiguous marker layout (orphaned or duplicated
+    marker) is left byte-untouched with a warning rather than risking a clobber -
+    the same extract-or-bail discipline the whole Codex writer path uses."""
+    block = f"{begin}\n{body.strip()}\n{end}\n"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    begin_ct = _marker_line_count(existing, _AGENTS_BEGIN)
-    end_ct = _marker_line_count(existing, _AGENTS_END)
+    begin_ct = _marker_line_count(existing, begin)
+    end_ct = _marker_line_count(existing, end)
     if begin_ct == 0 and end_ct == 0:
         new = (existing.rstrip("\n") + "\n\n" + block) if existing.strip() else block
     else:
-        extracted = _extract_block(existing, _AGENTS_BEGIN, _AGENTS_END)
+        extracted = _extract_block(existing, begin, end)
         if extracted is None:
             logger.warning(
                 "unexpected jacked marker layout in %s (begin=%d, end=%d); leaving "
@@ -49,15 +65,16 @@ def _install_agents_block(path: Path, body: str) -> None:
     _atomic_write_text(path, new)
 
 
-def _strip_agents_block(path: Path) -> bool:
+def _strip_md_block(path: Path, begin: str, end: str) -> bool:
+    """Strip ONLY the marker-wrapped ``begin``..``end`` block from `path`, leaving
+    the rest byte-identical. Returns True if a block was removed. An ambiguous
+    marker layout is left untouched (warning) - never guess-repaired."""
     if not path.exists():
         return False
     existing = path.read_text(encoding="utf-8")
-    extracted = _extract_block(existing, _AGENTS_BEGIN, _AGENTS_END)
+    extracted = _extract_block(existing, begin, end)
     if extracted is None:
-        if _marker_line_count(existing, _AGENTS_BEGIN) or _marker_line_count(
-            existing, _AGENTS_END
-        ):
+        if _marker_line_count(existing, begin) or _marker_line_count(existing, end):
             logger.warning(
                 "unexpected jacked marker layout in %s; leaving it untouched", path
             )
@@ -69,6 +86,36 @@ def _strip_agents_block(path: Path) -> bool:
     new = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
     _atomic_write_text(path, new)
     return True
+
+
+def _install_agents_block(path: Path, body: str) -> None:
+    _install_md_block(path, _AGENTS_BEGIN, _AGENTS_END, body)
+
+
+def _strip_agents_block(path: Path) -> bool:
+    return _strip_md_block(path, _AGENTS_BEGIN, _AGENTS_END)
+
+
+def install_reach_agents_block(
+    body: str, home: Optional[Path] = None, env: Optional[Mapping[str, str]] = None
+) -> None:
+    """Install jacked's agent-reach rules block into Codex's AGENTS.md.
+
+    Best-effort by contract: the caller (the reach runner) treats a failure here
+    as non-fatal. `body` is the shared rules text (jacked ships it once, both the
+    Claude CLAUDE.md and this Codex block wrap the same content in their own
+    markers). An unparseable/ambiguous AGENTS.md is left untouched, never
+    clobbered (see ``_install_md_block``)."""
+    _install_md_block(codex_agents_md(home, env), _REACH_BEGIN, _REACH_END, body)
+
+
+def strip_reach_agents_block(
+    home: Optional[Path] = None, env: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Strip jacked's agent-reach rules block from Codex's AGENTS.md, leaving the
+    main behaviors block and any user content byte-identical. Returns True if a
+    block was removed."""
+    return _strip_md_block(codex_agents_md(home, env), _REACH_BEGIN, _REACH_END)
 
 
 # chrome-devtools MCP block markers + body. The block is a marker-wrapped
