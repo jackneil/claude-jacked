@@ -54,7 +54,7 @@ class FakeSettings:
             self.data[key] = value
 
 
-def _pin_dict(commit_sha=PIN_SHA):
+def _pin_dict(commit_sha=PIN_SHA, skill_hashes=None):
     return {
         "schema_version": 1,
         "upstream": UPSTREAM,
@@ -62,7 +62,7 @@ def _pin_dict(commit_sha=PIN_SHA):
         "version_label": "v1.5.0",
         "vetted_at": "2026-07-11",
         "constraints_file": "agent-reach-constraints.txt",
-        "skill_hashes": dict(SKILL_HASHES),
+        "skill_hashes": dict(skill_hashes if skill_hashes is not None else SKILL_HASHES),
         "channels": {
             "twitter": {"backends": [{"kind": "pipx", "spec": "twitter-cli==1.2.3"}]},
             "opencli": {
@@ -80,11 +80,11 @@ def _pin_dict(commit_sha=PIN_SHA):
     }
 
 
-def make_runner(tmp_path, settings=None, commit_sha=PIN_SHA):
+def make_runner(tmp_path, settings=None, commit_sha=PIN_SHA, skill_hashes=None):
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     pin_path = data_dir / "agent-reach.json"
-    pin_path.write_text(json.dumps(_pin_dict(commit_sha)), encoding="utf-8")
+    pin_path.write_text(json.dumps(_pin_dict(commit_sha, skill_hashes)), encoding="utf-8")
     (data_dir / "agent-reach-constraints.txt").write_text("# fully pinned\n", encoding="utf-8")
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True, exist_ok=True)
@@ -302,6 +302,36 @@ class TestDriftVerify:
         ok, drift = runner._verify_skill_hashes(runner._load_pin())
         assert not ok
 
+    def test_locale_selected_skill_md_verifies(self, tmp_path):
+        """Regression for the live-E2E failure (2026-07-11): the pin hashes BOTH
+        source variants (SKILL.md + SKILL_en.md), but upstream's installer writes
+        the locale-selected winner AS SKILL.md and never installs a file named
+        SKILL_en.md. Either variant's content in the installed SKILL.md must
+        verify, and the absent SKILL_en.md must NOT count as missing."""
+        zh = b"# zh skill\n"
+        en = b"# en skill\n"
+        ref = b"ref\n"
+        hashes = {
+            "SKILL.md": hashlib.sha256(zh).hexdigest(),
+            "SKILL_en.md": hashlib.sha256(en).hexdigest(),
+            "references/twitter.md": hashlib.sha256(ref).hexdigest(),
+        }
+        runner, fs, home = make_runner(tmp_path, skill_hashes=hashes)
+        target = home / ".claude" / "skills" / "agent-reach"
+        (target / "references").mkdir(parents=True, exist_ok=True)
+        (target / "references" / "twitter.md").write_bytes(ref)
+
+        for variant in (en, zh):  # English locale writes en; Chinese writes zh
+            (target / "SKILL.md").write_bytes(variant)
+            ok, drift = runner._verify_skill_hashes(runner._load_pin())
+            assert ok, drift
+            assert not any(d["file"] == "SKILL_en.md" for d in drift)
+
+        (target / "SKILL.md").write_bytes(b"tampered\n")
+        ok, drift = runner._verify_skill_hashes(runner._load_pin())
+        assert not ok
+        assert any(d["file"] == "SKILL.md" and d["status"] == "mismatch" for d in drift)
+
     def test_both_dirs_verified(self, tmp_path):
         runner, fs, home = make_runner(tmp_path)
         _place_skills(
@@ -486,7 +516,42 @@ class TestStatusRemove:
         assert any(s and "==" in s for s in specs)  # exact pin surfaces verbatim
         assert all(c["enabled"] is False for n, c in by_name.items() if n != "twitter")
 
-    def test_status_doctor_json_passthrough(self, tmp_path):
+    def test_status_doctor_real_shape_normalized(self, tmp_path):
+        """Upstream doctor --json (v1.5.0, verified live) is a dict keyed by
+        channel slug, NOT {"channels": [...]}: status() must normalize it so the
+        dashboard/CLI tables render real rows. Upstream's localized "name"
+        becomes display_name; "message" becomes the hint."""
+        runner, fs, home = make_runner(tmp_path)
+        _mark_installed(home)
+        _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
+        doctor_payload = {
+            "github": {"active_backend": "gh CLI", "backends": ["gh CLI"],
+                       "message": "fully available", "name": "GitHub repos",
+                       "status": "ok", "tier": 0},
+            "twitter": {"active_backend": None, "backends": ["twitter-cli", "OpenCLI"],
+                        "message": "Twitter CLI not installed", "name": "Twitter/X",
+                        "status": "warn", "tier": 1},
+        }
+
+        def side(cmd, **kw):
+            if cmd[0] == "/fake/agent-reach" and "doctor" in cmd:
+                return CP(cmd, 0, json.dumps(doctor_payload), "")
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            st = runner.status()
+        assert st["installed"] is True
+        assert st["sha_matches"] is True
+        assert st["doctor_error"] is None
+        chans = st["doctor"]["channels"]
+        assert [c["name"] for c in chans] == ["github", "twitter"]  # tier-sorted
+        gh = chans[0]
+        assert gh["active_backend"] == "gh CLI"
+        assert gh["status"] == "ok"
+        assert gh["hint"] == "fully available"
+        assert gh["display_name"] == "GitHub repos"
+
+    def test_status_doctor_canonical_shape_passes_through(self, tmp_path):
         runner, fs, home = make_runner(tmp_path)
         _mark_installed(home)
         _place_skills(home, [Path(".claude") / "skills" / "agent-reach"])
@@ -499,8 +564,6 @@ class TestStatusRemove:
 
         with patched(side):
             st = runner.status()
-        assert st["installed"] is True
-        assert st["sha_matches"] is True
         assert st["doctor"] == doctor_payload
         assert st["doctor_error"] is None
         assert all(d["status"] == "ok" for d in st["drift"])

@@ -28,6 +28,7 @@ from jacked.integrations._util import (
     ReachUserError,
     atomic_write_json,
     channels_status,
+    normalize_doctor,
     configure_hint,
     format_drift,
     now_iso,
@@ -441,7 +442,7 @@ class AgentReachRunner:
         if proc.returncode != 0:
             return None, f"agent-reach doctor exited {proc.returncode}: {stderr_excerpt(proc.stderr)}"
         try:
-            return json.loads(proc.stdout), None
+            return normalize_doctor(json.loads(proc.stdout)), None
         except json.JSONDecodeError as e:
             return None, f"agent-reach doctor emitted invalid JSON: {e}"
 
