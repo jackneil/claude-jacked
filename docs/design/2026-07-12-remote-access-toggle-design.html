@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Remote Access GUI Toggle — Design Spec</title>
+
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="approved">
+<meta name="jacked:branch" content="feature/remote-access-toggle">
+<meta name="jacked:date" content="2026-07-12">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--sans); font-size: 16px; line-height: 1.6; color: var(--fg); background: var(--bg); margin: 0; padding: 2rem 1rem; }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin: 0 0 .25rem; line-height: 1.2; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; padding-bottom: .35rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; color: var(--fg-muted); }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+  .meta { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin: .5rem 0 2rem; padding: .75rem 1rem; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); font-size: .9rem; }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+  .badge { display: inline-block; padding: .15rem .6rem; border-radius: 99px; font-size: .8rem; font-weight: 500; line-height: 1.4; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.danger { background: var(--danger-bg); color: var(--danger); }
+  .badge.info { background: var(--accent-bg); color: var(--accent); }
+  nav.toc { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.25rem; margin-bottom: 2rem; box-shadow: var(--shadow); }
+  nav.toc h2 { margin: 0 0 .5rem; font-size: .9rem; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-muted); border: none; padding: 0; }
+  nav.toc ol { margin: 0; padding-left: 1.5rem; }
+  nav.toc li { margin: .15rem 0; }
+  aside.callout { margin: 1rem 0; padding: .9rem 1.1rem; border-left: 4px solid var(--accent); background: var(--accent-bg); border-radius: 0 var(--radius) var(--radius) 0; }
+  aside.callout.warn { border-color: var(--warn); background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok { border-color: var(--ok); background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child { margin-bottom: 0; }
+  code { font-family: var(--mono); font-size: .92em; background: var(--code-bg); padding: .12em .35em; border-radius: 3px; }
+  pre { font-family: var(--mono); font-size: .88rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: .9rem 1rem; overflow-x: auto; line-height: 1.45; }
+  pre code { background: transparent; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; background: var(--bg-card); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
+  th, td { text-align: left; padding: .55rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; font-size: .9rem; }
+  tr:last-child td { border-bottom: none; }
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li { padding: .25rem 0; display: flex; align-items: flex-start; gap: .6rem; }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+  .diagram { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; margin: 1rem 0; text-align: center; overflow-x: auto; }
+  .diagram pre.mermaid-source { text-align: left; display: none; }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+  blockquote { border-left: 3px solid var(--border); padding: .2rem 1rem; margin: 1rem 0; color: var(--fg-muted); font-style: italic; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Remote Access GUI Toggle</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge ok">approved</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-07-12</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">feature/remote-access-toggle</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#decisions">Decisions Already Made</a></li>
+    <li><a href="#bugs">Pre-existing Bugs This Fixes</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#bind">Bind Resolution (jacked/service/bind.py)</a></li>
+    <li><a href="#detection">Tailscale IP Detection</a></li>
+    <li><a href="#storage">Storage and API</a></li>
+    <li><a href="#restart">Restart Mechanics</a></li>
+    <li><a href="#frontend">Frontend (Settings &gt; Advanced)</a></li>
+    <li><a href="#autostart">Autostart Artifacts and Migration</a></li>
+    <li><a href="#security">Security Posture</a></li>
+    <li><a href="#files">File Structure</a></li>
+    <li><a href="#testing">Testing Plan</a></li>
+    <li><a href="#milestones">Milestones</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>A <strong>Remote access</strong> card on the dashboard's Settings &gt; Advanced tab: a master toggle
+(<em>Allow remote access</em>) plus a scope picker (<em>Tailscale only</em>, recommended/default, vs
+<em>All interfaces</em>). Flipping it persists to the settings DB and immediately restarts the service
+with the new bind. The settings DB becomes the single source of truth for the bind host; CLI
+<code>--host</code> becomes a one-shot explicit override that is never persisted. Autostart artifacts stop
+baking <code>--host</code>, so reboots and upgrades honor whatever the GUI last said.</p>
+
+<aside class="callout info">
+  <strong>Context:</strong> Jack will never remember <code>jacked service restart --host 0.0.0.0</code>.
+  Approach A ("Settings DB as the single source of truth, host resolved at boot") was chosen over
+  plist-rewriting (state duplication/drift) and a tailscale-serve wrapper (can't express "all interfaces").
+  All integration points below were verified against the actual code on 2026-07-12 by a 4-agent recon
+  pass plus first-hand spot checks.
+</aside>
+
+<h2 id="decisions">Decisions Already Made (do not re-litigate)</h2>
+<table>
+  <thead><tr><th>Decision</th><th>Choice</th></tr></thead>
+  <tbody>
+    <tr><td>Exposure scope</td><td>Both, as a GUI choice: "Tailscale only" (loopback + 100.x, default, recommended badge) and "All interfaces" (0.0.0.0, loud warning styling).</td></tr>
+    <tr><td>When the bind change applies</td><td>Immediately: persist, then self-restart. "Restarting…" overlay, health-poll back in.</td></tr>
+    <tr><td>Source of truth</td><td>Settings DB. Precedence: explicit CLI <code>--host</code> (one-shot, never persisted) &gt; DB setting &gt; loopback default.</td></tr>
+    <tr><td>Placement</td><td>Settings &gt; Advanced tab. NOT the Features tab: features (<code>jacked/api/routes/features.py</code>) toggle Claude Code assets on disk; this is jacked's own server runtime.</td></tr>
+    <tr><td>Confirm dialogs</td><td>Enable shows the real security story (no auth layer, Tailscale ACL is the access control). "All interfaces" gets a louder variant. Remote-origin + turning OFF gets a lockout warning.</td></tr>
+    <tr><td>No new dependencies</td><td>Tailscale detection is stdlib + optional <code>tailscale</code> CLI shell-out. No psutil/netifaces.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="bugs">Pre-existing Bugs This Fixes (verified first-hand)</h2>
+<ul>
+  <li><strong>Upgrade reverts the bind:</strong> <code>jacked install</code> has no <code>--host</code> flag and
+  unconditionally regenerates autostart with <code>DEFAULT_HOST</code>
+  (<code>_setup_tray_autostart</code> → <code>_ensure_autostart_and_running(DEFAULT_HOST, DEFAULT_PORT)</code>,
+  <code>cli.py:2692-2708</code>). Both upgrade paths (<code>system.py:_do_upgrade</code> runs
+  <code>jacked install --force</code>; tray updater at <code>updater.py:300-322</code> likewise) therefore
+  silently revert a user's <code>0.0.0.0</code> plist to loopback on every upgrade.</li>
+  <li><strong><code>service restart --host X</code> is a silent no-op on macOS when a plist is loaded:</strong>
+  <code>native_restart()</code> runs <code>launchctl kickstart -k</code> (<code>platform.py:21-60</code>), which reuses
+  launchd's in-memory plist definition and ignores the new host; <code>cli.py:3364-3377</code> returns early on
+  native-path success.</li>
+  <li><strong><code>install_autostart</code> never unloads before <code>launchctl load</code></strong>
+  (<code>platform.py:245-261</code>): rewriting the plist over an already-loaded label silently keeps the old
+  in-memory definition until reboot. Fix: bootout-then-bootstrap (or unload/load) so plist changes take effect.</li>
+</ul>
+
+<h2 id="architecture">Architecture</h2>
+<div class="diagram">
+  <pre class="mermaid">
+flowchart TD
+    GUI[Settings &gt; Advanced card] -- PUT /api/settings/remote-access --> DB[(settings table\nremote_access_enabled\nremote_access_scope)]
+    GUI -- POST /api/settings/remote-access/restart --> RS[restart: execv POSIX /\ndetached respawn Windows]
+    RS --> BOOT[service boot]
+    CLI[explicit --host flag\none-shot override] --> RES
+    BOOT --> RES[resolve_bind in jacked/service/bind.py\nflag &gt; DB &gt; loopback]
+    DB --> RES
+    RES --> DET[Tailscale IP detection\nUDP route trick + CLI fallback]
+    RES --> SOCK[pre-bound socket set\nSO_REUSEADDR]
+    SOCK --> UV[uvicorn Server.run sockets=...]
+    RES --> ENV[JACKED_HOST env\nCORS/CSRF/lifespan]
+  </pre>
+  <pre class="mermaid-source">
+flowchart TD
+    GUI[Settings &gt; Advanced card] -- PUT /api/settings/remote-access --> DB[(settings table)]
+    GUI -- POST /api/settings/remote-access/restart --> RS[restart]
+    RS --> BOOT[service boot]
+    CLI[explicit --host flag] --> RES
+    BOOT --> RES[resolve_bind: flag &gt; DB &gt; loopback]
+    DB --> RES
+    RES --> DET[Tailscale IP detection]
+    RES --> SOCK[pre-bound socket set]
+    SOCK --> UV[uvicorn Server.run sockets=...]
+    RES --> ENV[JACKED_HOST env]
+  </pre>
+</div>
+
+<h2 id="bind">Bind Resolution — new module <code>jacked/service/bind.py</code></h2>
+<pre><code>resolve_bind(cli_host: str | None, port: int) -> BindPlan
+# precedence: explicit CLI --host (one-shot, never persisted)
+#             > DB setting (remote_access_enabled/scope) > loopback default
+# BindPlan: mode ('loopback'|'tailscale'|'all'), sockets spec,
+#           primary_host (feeds JACKED_HOST), tailscale_ip | None,
+#           fallback_reason: str | None (tailscale requested but not detected)</code></pre>
+<ul>
+  <li><strong>Socket sets are mutually exclusive</strong> (avoid EADDRINUSE overlap):
+  loopback → <code>[127.0.0.1]</code>; tailscale → <code>[127.0.0.1, 100.x]</code>; all → <code>[0.0.0.0]</code> alone
+  (never 0.0.0.0 plus another socket on the same port).</li>
+  <li>Sockets pre-bound with <code>SO_REUSEADDR</code>, created fresh per (re)start, handed to uvicorn.
+  <strong>Verified:</strong> uvicorn 0.46.0 <code>Server.run(sockets=[...])</code> and <code>Server.serve(sockets=[...])</code>
+  both accept socket lists.</li>
+  <li><strong>Both launch sites move to the socket path:</strong> tray
+  <code>ServiceRunner._start_uvicorn</code> (<code>tray.py:310-326</code>, currently <code>uvicorn.Config(host=...)</code> +
+  <code>server.run()</code> in a daemon thread → becomes <code>server.run(sockets=...)</code>, minimal change to the
+  threading model) and <code>webux</code> (<code>cli.py:240-277</code>, currently <code>uvicorn.run(host=...)</code> →
+  same <code>Config</code>/<code>Server.run(sockets=...)</code> shape). <code>webux --reload</code> stays single-host
+  CLI-only (uvicorn's reloader subprocess can't inherit pre-bound sockets); document in help text.</li>
+  <li><strong>Readiness/port checks must follow the socket set:</strong> <code>ServiceRunner._wait_for_ready</code>
+  (<code>tray.py:336</code>), <code>_wait_for_port_free</code> (<code>tray.py:359</code>), and
+  <code>is_port_available(self.host, ...)</code> (<code>tray.py:1011</code>) currently target <code>self.host</code>;
+  they must target the resolved sockets (and never hard-fail the boot on a vanished pinned IP; see detection fallback).
+  <code>_service_http_ok</code> (<code>cli.py:280-309</code>) already always probes loopback and stays as-is.</li>
+  <li><strong><code>JACKED_HOST</code> env channel</strong> (read by lifespan <code>main.py:214-218</code>, CSRF guard
+  <code>security.py:266-270</code>, import-time CORS <code>main.py:355</code>): set to the primary non-loopback host
+  when remote is on (the 100.x IP, or 0.0.0.0), loopback otherwise. The lifespan refreshes
+  <code>_cors_origins</code> in place (<code>main.py:226</code>), so a restart picks everything up.</li>
+  <li><strong>Argv stops lying:</strong> <code>_spawn_service_detached</code> (<code>cli.py:334</code>) currently bakes
+  <code>--host</code> into the service argv unconditionally (<code>svc_args = ["service","start","--host",host,...]</code>);
+  it must pass <code>--host</code> ONLY when the user explicitly typed one (thread explicit-ness through
+  <code>jacked start</code>, whose click default is already <code>None</code>, <code>cli.py:385</code>). This is what makes
+  <code>os.execv(sys.argv[0], sys.argv)</code> (<code>system.py:805</code>) re-resolve from the DB on upgrade restarts.
+  The <code>webux</code> click decorator's hardcoded default <code>"127.0.0.1"</code> (<code>cli.py:241</code>) becomes
+  <code>None</code> so "no flag" is distinguishable from "explicit loopback".</li>
+</ul>
+
+<h2 id="detection">Tailscale IP Detection (stdlib-only)</h2>
+<ul>
+  <li>Primary: connected UDP socket to <code>100.100.100.100:80</code> (Tailscale's service IP; UDP connect sends no
+  packets), <code>getsockname()</code> yields the local address; accept only if inside <code>100.64.0.0/10</code>
+  (use <code>ipaddress</code>).</li>
+  <li>Fallback: shell out to <code>tailscale ip -4</code> (use <code>winproc.NO_WINDOW</code> on Windows; short timeout;
+  tolerate missing binary).</li>
+  <li>Both fail → <strong>bind loopback only, log loudly, record <code>fallback_reason</code></strong> so the GUI status
+  line shows "Remote access is on, but Tailscale wasn't detected at startup; currently loopback only."
+  Never silently widen to 0.0.0.0; never crash the boot. Re-detect on every restart. No live interface-watcher:
+  Tailscale node IPs are stable by design; the status line plus re-apply-on-restart covers it.</li>
+</ul>
+
+<h2 id="storage">Storage and API</h2>
+<ul>
+  <li>Settings keys: <code>remote_access_enabled</code>, <code>remote_access_scope</code>
+  (<code>"tailscale"</code> | <code>"all"</code>) in the existing settings table
+  (<code>jacked/web/database.py:239-243</code>; <code>get_setting</code>/<code>set_setting</code> at 1444-1533 are sync,
+  usable at boot outside any request: <code>Database().get_setting(...)</code>, DB path <code>~/.claude/jacked.db</code>).</li>
+  <li>Add both keys to <code>_PROTECTED_SETTING_KEYS</code> (<code>system.py:902-916</code>) so the generic
+  <code>PUT /api/settings/{key}</code> can't clobber them.</li>
+  <li>New router <code>jacked/api/routes/settings_remote.py</code> copying the <code>settings_swap.py</code> pattern
+  (Pydantic model + validation). <strong>Register before <code>system.router</code> in <code>main.py</code></strong>
+  (like <code>swap_settings_router</code> at <code>main.py:465</code>) or system's catch-all PUT steals the routes.</li>
+  <li><code>GET /api/settings/remote-access</code> → <code>{enabled, scope, effective: {addresses: [...],
+  tailscale_ip, fallback_reason}}</code>. <code>effective</code> reflects what the server ACTUALLY bound at startup
+  (BindPlan stored on <code>app.state</code>) so the UI never lies about live state.</li>
+  <li><code>PUT /api/settings/remote-access</code> → validates + persists, returns the same shape.</li>
+  <li><code>POST /api/settings/remote-access/restart</code> → broadcasts <code>restart_started</code> WS event,
+  sleeps ~1.5s to flush, restarts (below). Separate from PUT so save and apply stay distinct (mirrors upgrade).</li>
+</ul>
+
+<h2 id="restart">Restart Mechanics</h2>
+<ul>
+  <li><strong>POSIX:</strong> <code>os.execv(sys.argv[0], sys.argv)</code>, same proven pattern as
+  <code>_do_upgrade</code> (<code>system.py:779-805</code>). PID unchanged, launchd KeepAlive stays happy. No argv
+  surgery needed once argv no longer carries <code>--host</code>.</li>
+  <li><strong>Windows:</strong> <code>os.execv</code> is spawn-and-exit emulation (PID changes, orphans the tray).
+  Reuse the updater's detached-respawn pattern (<code>updater.py:106-109, 365, 686-695</code> /
+  <code>cli._spawn_service_detached</code>): spawn detached <code>jacked service start</code> (no <code>--host</code>),
+  which waits for the port to free, then exit the current process.</li>
+  <li>Frontend reuses the upgrade modal + <code>_startHealthPolling</code> (<code>header.js:128-140</code>:
+  "Restarting…", poll <code>GET /api/health</code> every 1.5s, <code>location.reload()</code> on ok, 30s deadline).
+  WS handler map (<code>websocket.js:473-489</code>) gains <code>restart_started</code> wired to the same modal
+  functions.</li>
+  <li><strong>Lockout case:</strong> when <code>window.location.hostname</code> is not loopback
+  (<code>127.0.0.1</code>/<code>localhost</code>/<code>::1</code>) and the action disables remote access (or a scope
+  change drops the current origin), the confirm dialog warns the user is cutting themselves off, and after
+  confirming, the modal shows a terminal "reopen from the machine itself" message instead of health-polling forever.</li>
+</ul>
+
+<h2 id="frontend">Frontend (Settings &gt; Advanced)</h2>
+<ul>
+  <li>Vanilla JS, no bundler: <code>jacked/data/web/js/components/settings.js</code> (tab bar at 40-46,
+  <code>renderAdvancedTab</code> at 1227). Copy the auto-swap settings pattern
+  (<code>auto-swap.js:131-133, 753-799</code>: checkbox → debounced save → <code>api.put</code> → toast), NOT the
+  features toggle (that PUTs <code>/api/features/...</code>).</li>
+  <li>Card contents: master toggle, scope radio pair (Tailscale only = default with "recommended" badge; All
+  interfaces = danger styling), live status line from <code>effective</code> ("Listening on 127.0.0.1 +
+  100.64.12.7 (Tailscale)" / fallback warning state), and the URL hint (MagicDNS name / IP) when remote is active.</li>
+  <li>Confirm dialog copy carries the real exposure story; "All interfaces" variant is explicitly loud (unauthenticated
+  dashboard incl. account switching + upgrade endpoint reachable by anyone on the LAN; Tailscale ACL example pointer).
+  No em-dashes in any user-facing copy (use commas/colons/parens; plain hyphen if a dash is unavoidable).</li>
+  <li>Follow existing dashboard styling; press/hover feedback, real loading/error states on the card (it fetches
+  <code>GET /api/settings/remote-access</code> on tab render).</li>
+</ul>
+
+<h2 id="autostart">Autostart Artifacts and Migration</h2>
+<ul>
+  <li>Drop the <code>--host</code> pair (keep <code>--port</code>) from <code>_generate_launchd_plist</code>
+  (<code>platform.py:149-194</code>, bake at 171-174) and <code>_generate_windows_vbs</code>
+  (<code>platform.py:197-219</code>, bakes at BOTH 213-214 and 217-218). <code>install_autostart</code>
+  (<code>platform.py:231</code>) loses its <code>host</code> param; update ALL bake sites:
+  <code>tray.py:592</code> (<code>_on_toggle_autostart</code> passes <code>self.host</code>),
+  <code>cli.py:3449</code> (<code>service_install</code>), <code>_ensure_autostart_and_running</code>, and
+  <code>ensure_native_lifecycle</code>'s in-process <code>install_autostart()</code> call (<code>platform.py:117</code>).</li>
+  <li><strong>Fix the launchctl caching bug:</strong> <code>install_autostart</code> becomes
+  bootout-then-bootstrap (tolerate "not loaded" on bootout) so a rewritten plist actually takes effect.</li>
+  <li><strong>Data-preserving migration:</strong> when <code>jacked install --force</code> (which every upgrade runs)
+  or service boot finds an existing plist/VBS with a baked <code>--host</code>: parse the host out FIRST and copy it
+  into the DB (<code>0.0.0.0</code> → enabled+all; a 100.64.0.0/10 IP → enabled+tailscale; loopback → leave settings
+  untouched/disabled), THEN regenerate host-free and reload. Existing <code>service install --host 0.0.0.0</code>
+  users keep their bind instead of losing it.</li>
+  <li><strong>CLI parity:</strong> <code>jacked service install --host X</code> and
+  <code>jacked service restart --host X</code> now write the DB setting (X=0.0.0.0 → enabled+all;
+  X in 100.64/10 or X omitted-but-remote-was-on → respect scope; X=127.0.0.1 → disabled), then restart.
+  This makes them finally work reliably on macOS (native_restart's kickstart now picks up the DB on boot).
+  Update the flag help text: the GUI toggle is the primary interface.</li>
+  <li>Linux: no artifact is generated today (<code>platform.py:222-228, 270-274</code>); the DB read at
+  <code>service start</code> makes the toggle work there automatically. Docs: systemd-unit authors must not bake
+  <code>--host</code> in their own unit's ExecStart.</li>
+</ul>
+
+<h2 id="security">Security Posture</h2>
+<ul>
+  <li><strong>No <code>security.py</code> trust-model changes needed (verified):</strong>
+  <code>host_header_allowed</code> already accepts IP literals + <code>*.ts.net</code> + single-label MagicDNS names
+  (<code>security.py:135-162</code>); <code>origin_allowed</code>'s same-origin fallthrough
+  (<code>security.py:165-197</code>) means pages served from <code>http://100.x:8321</code> or MagicDNS FQDNs pass
+  WS origin (<code>main.py:397-414</code>) and CSRF (<code>security.py:260-280</code>) checks unchanged.
+  <code>build_allowed_origins</code> never wildcards (<code>security.py:75-90</code>).</li>
+  <li>Lifespan's existing non-loopback warning log (<code>main.py:259-266</code>) stays; add the
+  tailscale-fallback-to-loopback log line.</li>
+  <li>Dialog copy = the real exposure story. Tailscale ACL example stays in README.</li>
+  <li>After implementation: security review pass (auth-adjacent surface: a GUI control that widens network
+  exposure + a restart endpoint) before merge. /cso must report no high/critical findings.</li>
+</ul>
+
+<h2 id="files">File Structure</h2>
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/service/bind.py</code></td><td>NEW: resolve_bind, BindPlan, socket-set construction, tailscale detection.</td></tr>
+    <tr><td><code>jacked/api/routes/settings_remote.py</code></td><td>NEW: GET/PUT remote-access, POST restart.</td></tr>
+    <tr><td><code>jacked/api/main.py</code></td><td>Register new router before system router; store BindPlan on app.state.</td></tr>
+    <tr><td><code>jacked/api/routes/system.py</code></td><td>Protected keys += remote_access_*.</td></tr>
+    <tr><td><code>jacked/service/tray.py</code></td><td>_start_uvicorn → sockets; readiness checks follow socket set; _on_toggle_autostart drops host.</td></tr>
+    <tr><td><code>jacked/service/platform.py</code></td><td>Generators drop --host; install_autostart bootout/bootstrap; migration parser.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td>webux/start/service host defaults → None + resolve_bind; _spawn_service_detached conditional --host; service install/restart write DB.</td></tr>
+    <tr><td><code>jacked/data/web/js/components/settings.js</code></td><td>Remote access card on Advanced tab.</td></tr>
+    <tr><td><code>jacked/data/web/js/websocket.js</code>, <code>header.js</code></td><td>restart_started event → restart modal/polling; lockout terminal state.</td></tr>
+    <tr><td><code>tests/…</code></td><td>See Testing Plan.</td></tr>
+    <tr><td><code>README.md</code></td><td>Remote Access section rewritten GUI-first; CLI as alternative.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="testing">Testing Plan</h2>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> <code>resolve_bind</code> precedence matrix: flag &gt; DB &gt; default; explicit flag never persists.</li>
+  <li><input type="checkbox" disabled> Socket-set construction per mode incl. 0.0.0.0 exclusivity (never 0.0.0.0 + another socket same port).</li>
+  <li><input type="checkbox" disabled> Tailscale detection: mocked UDP route trick, mocked CLI fallback, both-fail → loopback + fallback_reason logged (never wider, never crash).</li>
+  <li><input type="checkbox" disabled> Migration parser: plist/VBS with baked 0.0.0.0 / 100.x / 127.0.0.1 / no host → correct DB writes, host-free regeneration.</li>
+  <li><input type="checkbox" disabled> Settings router: validation, protected-key guard on generic PUT, effective-state shape.</li>
+  <li><input type="checkbox" disabled> Restart path selection: POSIX execv vs Windows detached respawn (mock sys.platform).</li>
+  <li><input type="checkbox" disabled> Multi-socket integration: <code>Server.serve(sockets=[two pre-bound loopback sockets on different ports])</code> against the real app; both answer /api/health (proves the serving model without a tailnet in CI).</li>
+  <li><input type="checkbox" disabled> <code>test_network_security.py</code> extensions: Host/Origin cases for a concrete 100.x:8321 (some exist at :94/:152); effective-state endpoint.</li>
+  <li><input type="checkbox" disabled> Frontend JS via node-harness pattern (<code>tests/unit/test_web_js_swap_ui.py</code>): render, save flow, confirm-dialog branches, lockout branch.</li>
+  <li><input type="checkbox" disabled> Full CI replication locally (<code>uv run python -m pytest</code>) before push.</li>
+</ul>
+
+<h2 id="milestones">Milestones (build order)</h2>
+<ol>
+  <li><code>bind.py</code>: resolve_bind + BindPlan + socket sets + tailscale detection, fully unit-tested.</li>
+  <li>Serving paths: tray + webux on <code>Server.run(sockets=...)</code>; JACKED_HOST fed from BindPlan; readiness checks fixed; multi-socket integration test green.</li>
+  <li>API: settings_remote router (GET/PUT/restart) + protected keys + restart mechanics (POSIX/Windows) + restart_started WS event.</li>
+  <li>Frontend: Advanced-tab card, dialogs, status line, lockout guard, restart overlay; JS tests.</li>
+  <li>Autostart: generators drop --host, bootout/bootstrap fix, data-preserving migration, CLI parity (service install/restart write DB).</li>
+  <li>Docs: README Remote Access rewritten GUI-first; CLI help text updated.</li>
+  <li>Gates: full local CI, browser QA of the flow, security review, code review; PR.</li>
+</ol>
+
+<hr>
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a>
+  HTML artifact template. Edit freely.
+</p>
+
+</div>
+
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+  } catch (err) {
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>
