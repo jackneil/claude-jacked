@@ -172,12 +172,13 @@ function _startHealthPolling() {
                 clearInterval(_healthPollInterval);
                 _healthPollInterval = null;
                 location.reload();
+                return;  // reload in flight; don't fall through to the deadline branch
             }
         } catch (_) { /* server not up yet */ }
         if (Date.now() > deadline) {
             clearInterval(_healthPollInterval);
             _healthPollInterval = null;
-            _showUpgradeError('Restart is taking longer than expected \u2014 you may need to restart jacked manually.');
+            _showUpgradeError('Restart is taking longer than expected. You may need to restart jacked manually.');
         }
     }, 1500);
 }

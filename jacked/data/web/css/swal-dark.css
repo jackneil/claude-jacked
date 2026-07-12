@@ -60,8 +60,9 @@
     background: #b91c1c !important;
 }
 
-/* Restore a severity-true warning icon (the generic slate override above mutes
-   the `icon: 'warning'` that the danger dialogs rely on). */
+/* Restore a severity-true warning icon (the generic slate `.swal2-icon` rule
+   further down mutes the `icon: 'warning'` the danger dialogs rely on; this
+   wins on specificity). */
 .swal2-icon.swal2-warning {
     border-color: #f59e0b !important;
     color: #f59e0b !important;
@@ -77,8 +78,8 @@
 }
 
 .swal2-checkbox input {
-    accent-color: #dc2626;
-    margin-inline-end: 0.5rem;
+    accent-color: #dc2626 !important;
+    margin-inline-end: 0.5rem !important;
 }
 
 .swal2-validation-message {

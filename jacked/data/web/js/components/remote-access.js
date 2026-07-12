@@ -184,7 +184,7 @@ function _remoteAccessStatusHTML(effective, port) {
             ? `<span class="font-mono text-slate-200">${escapeHtml(a)}</span> <span class="text-slate-400">(Tailscale)</span>`
             : `<span class="font-mono text-slate-200">${escapeHtml(a)}</span>`
     );
-    const listening = parts.join('<span class="text-slate-500"> + </span>');
+    const listening = parts.join('<span class="text-slate-400"> + </span>');
 
     // Indent the URL hint to line up under the status text (icon w-3.5 + gap-2
     // = 22px), so the status block has one clean left edge instead of two.

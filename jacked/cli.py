@@ -443,7 +443,7 @@ def _spawn_service_detached(host: str | None, port: int):
 
 
 @main.command(name="start")
-@click.option("--host", default=None, help="Host to bind (one-shot override; default: the dashboard Remote access setting, else 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
+@click.option("--host", default=None, help="Host to bind for this launch (ignored once Remote access is configured in the dashboard, which is then authoritative; default 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 @click.option(
     "--restart", is_flag=True, help="Force a restart even if already healthy."
@@ -3334,7 +3334,7 @@ def permissions_group():
 
 
 @main.command(name="menubar")
-@click.option("--host", default=None, help="Host to bind (one-shot override; default: the dashboard Remote access setting, else 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
+@click.option("--host", default=None, help="Host to bind for this launch (ignored once Remote access is configured in the dashboard, which is then authoritative; default 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def menubar(host: str | None, port: int | None):
     """Start the macOS menu-bar agent in the foreground (manual start).
@@ -3454,11 +3454,16 @@ def _resolve_service_start_host(typed_host: str | None) -> str | None:
             # host, or a crash-respawn could silently re-expose (or hide) the
             # dashboard against the user's saved choice until the next reboot.
             if typed_host is not None and remote_access_configured():
-                console.print(
-                    f"[dim]Ignoring stale --host {typed_host} from a "
-                    "pre-migration autostart replay; the bind resolves from the "
-                    "settings DB.[/dim]"
+                msg = (
+                    f"Ignoring stale --host {typed_host} from a pre-migration "
+                    "autostart replay; the bind resolves from the settings DB."
                 )
+                console.print(f"[dim]{msg}[/dim]")
+                # Also log it: this is the one decision that flips network
+                # exposure, and on a launchd crash-respawn stdout goes to
+                # /dev/null. logger.warning lands in the service log once the
+                # process is up, giving a durable audit trail of the ignore.
+                logger.warning(msg)
                 return None
             return typed_host
         status = migrate_baked_host_to_db(baked)
@@ -3491,7 +3496,7 @@ def service():
 
 
 @service.command(name="start")
-@click.option("--host", default=None, help="Host to bind (one-shot override; default: the dashboard Remote access setting, else 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
+@click.option("--host", default=None, help="Host to bind for this launch (ignored once Remote access is configured in the dashboard, which is then authoritative; default 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_start(host: str | None, port: int | None):
     """Start jacked as a background service with system tray icon."""
