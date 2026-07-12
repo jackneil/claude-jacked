@@ -453,7 +453,8 @@ class AgentReachRunner:
         return version
 
     def _run(
-        self, cmd: list[str], *, timeout: int, check: bool = True
+        self, cmd: list[str], *, timeout: int, check: bool = True, cwd: str | None = None,
+        env: dict | None = None,
     ) -> subprocess.CompletedProcess:
         logger.debug("agent-reach: %s", " ".join(cmd))
         try:
@@ -464,6 +465,8 @@ class AgentReachRunner:
                 timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=NO_WINDOW,
+                cwd=cwd,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             # Surface whatever the hung command printed before the timeout — the

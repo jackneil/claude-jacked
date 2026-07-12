@@ -845,6 +845,32 @@ class TestHashPreflight:
         tool_idx = rec.calls.index(_find(rec.calls, lambda c: c[:3] == ["/fake/uv", "tool", "install"]))
         assert pre_idx < tool_idx
 
+    def test_preflight_runs_isolated_from_ambient_uv_project(self, tmp_path, monkeypatch):
+        """The pre-flight uv commands must run from a neutral cwd with a project-
+        isolated env, or `uv pip install` discovers jacked's own pyproject/uv.lock
+        and its dependency pins conflict with agent-reach's (real install-breaker,
+        only reproduces through the CLI's `uv run` context)."""
+        monkeypatch.setenv("VIRTUAL_ENV", "/some/jacked/.venv")
+        monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/some/env")
+        runner, fs, home = self._hashed_runner(tmp_path)
+        seen = {}
+
+        def side(cmd, **kw):
+            if cmd[:3] == ["/fake/uv", "pip", "install"]:
+                seen["cwd"] = kw.get("cwd")
+                seen["env"] = kw.get("env")
+            if len(cmd) >= 2 and cmd[0].endswith("uv") and cmd[1] == "--version":
+                return CP(cmd, 0, "uv 0.10.2\n", "")
+            if cmd[0].endswith("agent-reach") and "install" in cmd:
+                Recorder(home)._place_skills()
+            return CP(cmd, 0, "", "")
+
+        with patched(side):
+            runner.install()
+        assert seen["cwd"]  # a neutral cwd was passed (not the repo)
+        assert "VIRTUAL_ENV" not in seen["env"]
+        assert not any(k.startswith("UV_") for k in seen["env"])
+
     def test_preflight_failure_aborts_before_tool_install(self, tmp_path):
         runner, fs, home = self._hashed_runner(tmp_path)
         calls = []

@@ -179,6 +179,8 @@ def hash_preflight(constraints_path: Path, run) -> None:
     import shutil as _shutil
     import tempfile as _tempfile
 
+    import os as _os
+
     uv = _shutil.which("uv") or "uv"
     with _tempfile.TemporaryDirectory(prefix="reach-hash-preflight-") as tmp:
         # --require-hashes rejects a file if ANY requirement lacks a hash. A direct
@@ -188,13 +190,19 @@ def hash_preflight(constraints_path: Path, run) -> None:
         # commit SHA in the actual tool-install URL, and its deps still get hashed.
         checked = _strip_unhashable_requirements(constraints_path, Path(tmp) / "reqs.txt")
         venv = Path(tmp) / "venv"
-        run([uv, "venv", str(venv)], timeout=120)
+        # Run ISOLATED from any ambient uv project/venv: cwd is the temp dir (not
+        # jacked's repo, whose pyproject/uv.lock would otherwise impose jacked's
+        # OWN dependency pins and conflict with agent-reach's), and VIRTUAL_ENV /
+        # UV_* are dropped so uv targets only the fresh --python venv.
+        env = {k: v for k, v in _os.environ.items()
+               if k != "VIRTUAL_ENV" and not k.startswith("UV_")}
+        run([uv, "venv", str(venv)], timeout=120, cwd=tmp, env=env)
         # --require-hashes forces uv to verify every artifact's sha256 against the
         # vendored constraints; a mismatch raises out of `run`.
         run(
             [uv, "pip", "install", "--python", str(venv), "--require-hashes",
-             "-r", str(checked)],
-            timeout=600,
+             "--no-config", "-r", str(checked)],
+            timeout=600, cwd=tmp, env=env,
         )
     logger.info("reach: artifact hash pre-flight passed (%s)", constraints_path.name)
 
