@@ -65,7 +65,47 @@ def test_no_handler_calls_execv(monkeypatch):
     restart_mod.restart_service_now()
     assert len(calls) == 1
     argv0, argv = calls[0]
+    prog, expected_argv = restart_mod._exec_target()
+
+    assert argv0 == prog
+    assert argv == expected_argv
+
+
+def test_exec_target_console_script(monkeypatch, tmp_path):
+    """An executable argv[0] (console-script launch) is re-exec'd verbatim."""
     import sys
 
-    assert argv0 == sys.argv[0]
-    assert argv == sys.argv
+    script = tmp_path / "jacked"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(script), "webux", "--port", "8399"])
+    prog, argv = restart_mod._exec_target()
+    assert prog == str(script)
+    assert argv == [str(script), "webux", "--port", "8399"]
+
+
+def test_exec_target_python_dash_m(monkeypatch, tmp_path):
+    """`python -m jacked` launches (argv[0] = __main__.py, no exec bit) re-exec
+    through the interpreter; execv'ing __main__.py directly raises OSError and
+    strands the dashboard on the old bind."""
+    import sys
+
+    main_py = tmp_path / "__main__.py"
+    main_py.write_text("")
+    monkeypatch.setattr(sys, "argv", [str(main_py), "webux", "--port", "8399"])
+    prog, argv = restart_mod._exec_target()
+    assert prog == sys.executable
+    assert argv == [sys.executable, "-m", "jacked", "webux", "--port", "8399"]
+
+
+def test_exec_target_nonexecutable_argv0(monkeypatch, tmp_path):
+    """A non-executable argv[0] of any name falls back to the interpreter."""
+    import sys
+
+    blob = tmp_path / "jacked"
+    blob.write_text("")
+    blob.chmod(0o644)
+    monkeypatch.setattr(sys, "argv", [str(blob), "service", "start"])
+    prog, argv = restart_mod._exec_target()
+    assert prog == sys.executable
+    assert argv == [sys.executable, "-m", "jacked", "service", "start"]

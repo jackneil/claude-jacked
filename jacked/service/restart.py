@@ -68,4 +68,20 @@ def restart_service_now() -> None:
             )
         return
     # No handler: full process replacement (webux foreground path).
-    os.execv(sys.argv[0], sys.argv)
+    prog, argv = _exec_target()
+    os.execv(prog, argv)
+
+
+def _exec_target() -> tuple[str, list[str]]:
+    """The (program, argv) pair for the execv process replacement.
+
+    ``sys.argv[0]`` is directly executable for console-script launches
+    (``jacked webux``), but under ``python -m jacked`` it is the package's
+    ``__main__.py``, which has no shebang and no exec bit; execv'ing it raises
+    OSError inside the restart thread and strands the dashboard on the old
+    bind. In that case re-exec through the interpreter with ``-m jacked``.
+    """
+    argv0 = sys.argv[0]
+    if os.path.basename(argv0) == "__main__.py" or not os.access(argv0, os.X_OK):
+        return sys.executable, [sys.executable, "-m", "jacked", *sys.argv[1:]]
+    return argv0, list(sys.argv)
