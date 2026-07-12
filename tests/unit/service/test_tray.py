@@ -941,3 +941,55 @@ class TestOnUpdateClickBreadcrumbs:
 
         assert not (tmp_path / "jacked-update-progress.html").exists()
         assert mock_wb.call_args[0][0] == "http://127.0.0.1:8321/update.html"
+
+
+class TestRestartHandlerRegistration:
+    """ServiceRunner.run() registers its in-process restart handler for the
+    whole run lifetime and unregisters it on exit — the seam the settings API's
+    POST /remote-access/restart uses to restart via _on_restart (same PID)
+    instead of os.execv."""
+
+    def test_run_registers_during_and_unregisters_after(self, monkeypatch):
+        _skip_if_no_tray()
+        from jacked.service import restart as restart_mod
+        from jacked.service.tray import ServiceRunner
+
+        restart_mod.set_restart_handler(None)
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+
+        captured = {}
+
+        def _fake_icon_run(setup=None):
+            # We're now inside run(): the handler must already be registered.
+            captured["during"] = restart_mod.get_restart_handler()
+
+        icon_instance = MagicMock()
+        icon_instance.run.side_effect = _fake_icon_run
+
+        # Force the pystray (non-mac) branch and stub out every side-effecting
+        # boundary so run() executes without a real server, tray, or signals.
+        monkeypatch.setattr(
+            "jacked.service.tray.select_menubar_backend", lambda *a, **k: "pystray"
+        )
+        monkeypatch.setattr(
+            "jacked.service.tray.is_port_available", lambda *a, **k: True
+        )
+        monkeypatch.setattr("jacked.service.tray.write_pid", lambda *a, **k: None)
+        monkeypatch.setattr("jacked.service.tray.remove_pid", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "jacked.service.platform.detect_autostart", lambda: False
+        )
+
+        import jacked.service.tray as tray_mod
+        monkeypatch.setattr(tray_mod.signal, "signal", lambda *a, **k: None)
+
+        fake_pystray = MagicMock()
+        fake_pystray.Icon.return_value = icon_instance
+        monkeypatch.setattr(tray_mod, "pystray", fake_pystray, raising=False)
+
+        runner.run()
+
+        # Registered before the run loop, and it was OUR runner's handler.
+        assert captured.get("during") == runner._on_restart
+        # Unregistered on exit (run()'s finally).
+        assert restart_mod.get_restart_handler() is None

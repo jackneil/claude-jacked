@@ -98,6 +98,26 @@ class BindPlan:
         }
 
 
+# Module-level active-plan registry. The serving paths (tray
+# ``ServiceRunner._start_uvicorn`` and the ``webux`` non-reload path) publish
+# the BindPlan they ACTUALLY bound here, so the settings API can report live
+# effective state instead of guessing. Plain module global with no lock: there
+# is only ever one writer (whichever serving path is currently up), and the
+# reader (the settings route) just needs the last-published value.
+_active_plan: BindPlan | None = None
+
+
+def set_active_plan(plan: BindPlan | None) -> None:
+    """Publish the BindPlan the server actually bound (``None`` clears it)."""
+    global _active_plan
+    _active_plan = plan
+
+
+def get_active_plan() -> BindPlan | None:
+    """The BindPlan the server last bound, or ``None`` if nothing is serving."""
+    return _active_plan
+
+
 def _loopback_plan(port: int) -> BindPlan:
     return BindPlan(
         mode="loopback",

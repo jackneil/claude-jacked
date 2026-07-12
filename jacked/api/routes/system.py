@@ -913,6 +913,10 @@ _PROTECTED_SETTING_KEYS = {
     "window_keeper_active_end",
     "window_keeper_prewake",
     "auto_swap_paused_until",
+    # Bind host is a security decision — only the dedicated remote-access
+    # endpoint (with its restart flow) may write these, never the generic PUT.
+    "remote_access_enabled",
+    "remote_access_scope",
 }
 
 

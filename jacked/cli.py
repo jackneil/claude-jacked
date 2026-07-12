@@ -284,9 +284,11 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
     # Normal path: resolve the bind plan (explicit --host > DB setting >
     # loopback), pre-bind its sockets, and hand them to uvicorn. JACKED_HOST
     # (dynamic CORS / WebSocket origin / CSRF) comes from the plan's primary host.
-    from jacked.service.bind import create_sockets, resolve_bind
+    from jacked.service.bind import create_sockets, resolve_bind, set_active_plan
 
     plan = resolve_bind(host, port)
+    # Publish the live plan so the settings API reports the real effective bind.
+    set_active_plan(plan)
     _os.environ["JACKED_HOST"] = plan.primary_host
     _os.environ["JACKED_PORT"] = str(port)
 

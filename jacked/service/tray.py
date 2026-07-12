@@ -330,11 +330,18 @@ class ServiceRunner:
         dying invisibly inside the daemon thread the way ``server.run()`` used
         to. uvicorn then ``listen()``s the pre-bound sockets we hand it.
         """
-        from jacked.service.bind import create_sockets, resolve_bind
+        from jacked.service.bind import (
+            create_sockets,
+            resolve_bind,
+            set_active_plan,
+        )
 
         plan = resolve_bind(self.cli_host, self.port)
         self.bind_plan = plan
         self.host = plan.primary_host
+        # Publish the live plan so the settings API's effective-state view
+        # reflects what we actually bound (re-published on every restart).
+        set_active_plan(plan)
 
         os.environ["JACKED_HOST"] = plan.primary_host
         os.environ["JACKED_PORT"] = str(self.port)
@@ -1064,6 +1071,20 @@ class ServiceRunner:
         """Start the service: tray icon on main thread, uvicorn in background."""
         self._install_tray_file_logger()
 
+        # Register the in-process restart handler for the WHOLE run lifetime,
+        # so the settings API's POST /remote-access/restart can apply a bind
+        # change via _on_restart (same PID, tray survives) instead of execv.
+        # Shared across both backends below; the finally unregisters on exit.
+        from jacked.service.restart import set_restart_handler
+
+        set_restart_handler(self._on_restart)
+        try:
+            return self._run()
+        finally:
+            set_restart_handler(None)
+
+    def _run(self) -> None:
+        """Backend dispatch for :meth:`run` (wrapped there for handler setup)."""
         # macOS gets the native menu-bar agent; every other platform keeps the
         # existing pystray tray below, unchanged.
         if select_menubar_backend(sys.platform, _mac_menubar_available()) == "mac":

@@ -283,14 +283,23 @@ flowchart TD
 </ul>
 
 <h2 id="restart">Restart Mechanics</h2>
+<aside class="callout ok">
+  <strong>Refined during implementation (M3):</strong> because <code>_start_uvicorn</code> re-resolves the DB on
+  every start (M2), the tray service applies a bind change with an <strong>in-process uvicorn restart</strong>
+  (the existing <code>_on_restart</code>: lifecycle lock, port-free wait, retrying start). Same PID, tray survives,
+  no port-free race, identical on every platform. Process replacement is only the fallback for the runner-less
+  <code>webux</code> foreground path. Seam: <code>jacked/service/restart.py</code>
+  (<code>set_restart_handler</code> / <code>restart_service_now</code>); the handler call is wrapped in
+  <code>except BaseException</code> + loud log so a <code>SystemExit</code> from a bind conflict on the daemon
+  thread can never kill the dashboard silently.
+</aside>
 <ul>
-  <li><strong>POSIX:</strong> <code>os.execv(sys.argv[0], sys.argv)</code>, same proven pattern as
-  <code>_do_upgrade</code> (<code>system.py:779-805</code>). PID unchanged, launchd KeepAlive stays happy. No argv
-  surgery needed once argv no longer carries <code>--host</code>.</li>
-  <li><strong>Windows:</strong> <code>os.execv</code> is spawn-and-exit emulation (PID changes, orphans the tray).
-  Reuse the updater's detached-respawn pattern (<code>updater.py:106-109, 365, 686-695</code> /
-  <code>cli._spawn_service_detached</code>): spawn detached <code>jacked service start</code> (no <code>--host</code>),
-  which waits for the port to free, then exit the current process.</li>
+  <li><strong>Service/tray (all platforms):</strong> in-process restart via the registered
+  <code>_on_restart</code> handler, as above. No execv, no PID churn, no detached respawn needed.</li>
+  <li><strong>webux foreground (no handler registered):</strong> <code>os.execv(sys.argv[0], sys.argv)</code>,
+  the upgrade flow's proven pattern (<code>system.py:779-805</code>); argv no longer carries <code>--host</code>,
+  so the fresh process re-resolves from the DB. Windows execv is spawn-and-exit emulation, acceptable here
+  because there is no tray to orphan.</li>
   <li>Frontend reuses the upgrade modal + <code>_startHealthPolling</code> (<code>header.js:128-140</code>:
   "Restarting…", poll <code>GET /api/health</code> every 1.5s, <code>location.reload()</code> on ok, 30s deadline).
   WS handler map (<code>websocket.js:473-489</code>) gains <code>restart_started</code> wired to the same modal
