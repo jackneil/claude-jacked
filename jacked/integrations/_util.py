@@ -217,7 +217,10 @@ def _strip_unhashable_requirements(src: Path, dst: Path) -> Path:
         stripped = joined.lstrip()
         is_comment_or_blank = stripped.startswith("#") or not stripped.strip()
         is_direct_url = ("git+" in joined) or (" @ http" in joined) or stripped.startswith(("http://", "https://"))
-        if is_direct_url and not is_comment_or_blank:
+        # Drop ONLY blocks that genuinely can't be hash-checked. A plain-https
+        # artifact CAN carry a --hash (uv verifies it), so keep those -- else a
+        # future URL dep would be silently installed unverified by the tool step.
+        if is_direct_url and not is_comment_or_blank and "--hash=" not in joined:
             continue
         out.extend(block)
     dst.write_text("".join(out), encoding="utf-8")

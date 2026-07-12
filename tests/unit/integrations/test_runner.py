@@ -963,3 +963,18 @@ def test_strip_unhashable_requirements(tmp_path):
     text = dst.read_text()
     assert "git+" not in text
     assert "feedparser==6.0.12" in text and "--hash=" in text
+
+
+def test_strip_keeps_hashable_url_artifact(tmp_path):
+    """A plain-https artifact WITH a --hash is verifiable, so it must be kept; an
+    un-hashable VCS/URL root is dropped."""
+    from jacked.integrations._util import _strip_unhashable_requirements
+    src = tmp_path / "c.txt"
+    src.write_text(
+        "pkg @ https://example.com/pkg-1.0-py3-none-any.whl \\\n    --hash=sha256:" + "c" * 64 + "\n"
+        "agent-reach @ git+https://x/y@" + "a" * 40 + "\n",
+        encoding="utf-8",
+    )
+    text = _strip_unhashable_requirements(src, tmp_path / "out.txt").read_text()
+    assert "https://example.com/pkg-1.0" in text  # hashable URL artifact kept
+    assert "git+" not in text                      # un-hashable VCS root dropped
