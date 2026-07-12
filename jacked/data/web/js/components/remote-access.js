@@ -1,5 +1,5 @@
 /**
- * jacked web dashboard — remote-access (network bind) card
+ * jacked web dashboard - remote-access (network bind) card
  *
  * Lives at the TOP of Settings > Advanced. Flipping the master toggle or the
  * scope picker persists to the settings DB (PUT) and then restarts the jacked
@@ -74,7 +74,7 @@ function _remoteAccessIsCGNAT(hostname) {
     return !!octets && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
 }
 
-// Deterministic, SHARED lockout rule — the single source of truth used by BOTH
+// Deterministic, SHARED lockout rule - the single source of truth used by BOTH
 // the confirm/overlay flow in this file AND the websocket.js restart_started
 // handler, so the two can never disagree about whether applying `pending` will
 // strand THIS browser:

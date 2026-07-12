@@ -2714,12 +2714,12 @@ def _ensure_autostart_and_running(
     macOS: ``install_autostart`` bootstraps it via launchd (starts immediately)
     unless the service is already running. Windows/Linux: ``install_autostart``
     only registers the login entry, so we spawn the detached service ourselves
-    when nothing is already listening. Idempotent and non-fatal — never aborts
+    when nothing is already listening. Idempotent and non-fatal - never aborts
     the caller.
 
     The autostart artifact is always host-free (the bind host lives in the
     settings DB and is resolved at every boot). ``one_shot_host`` applies ONLY
-    to the immediate detached spawn on Windows/Linux — a caller-supplied
+    to the immediate detached spawn on Windows/Linux - a caller-supplied
     unmapped ``--host`` that is deliberately not persisted; the launchd path
     always boots host-free.
     """
@@ -3407,7 +3407,7 @@ def _resolve_service_start_host(typed_host: str | None) -> str | None:
 
     Pre-M5 autostart artifacts baked ``--host X`` into the launchd plist /
     Startup VBS. At ``service start`` time we may BE the launchd job that plist
-    describes, so: capture the baked host into the settings DB (guarded — never
+    describes, so: capture the baked host into the settings DB (guarded - never
     clobbers an existing GUI choice), rewrite the artifact host-free FILE-ONLY
     (a bootout here would kill us mid-boot), and decide what the typed
     ``--host`` argv means:
@@ -3418,7 +3418,7 @@ def _resolve_service_start_host(typed_host: str | None) -> str | None:
     - they differ, or the artifact carries no ``--host`` -> the typed host is a
       deliberate one-shot; honor it verbatim.
 
-    Never raises — a boot must never die over migration bookkeeping.
+    Never raises - a boot must never die over migration bookkeeping.
     """
     try:
         if sys.platform == "darwin":
@@ -3600,7 +3600,7 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
         ServiceRunner(host=host, port=the_port).run()
         return
 
-    # Detached — the tray must survive this command returning. Raw host stays
+    # Detached - the tray must survive this command returning. Raw host stays
     # out of argv when None so the child re-resolves the bind from the DB.
     log_path = _spawn_service_detached(host, the_port)
 
