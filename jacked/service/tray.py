@@ -278,9 +278,18 @@ def build_menu(
 class ServiceRunner:
     """Manages the uvicorn server thread and pystray icon."""
 
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
-        self.host = host
+    def __init__(self, host: str | None = None, port: int = DEFAULT_PORT):
+        # `cli_host` is the one-shot explicit --host override (None = "no flag",
+        # let resolve_bind consult the DB / loopback default). `host` stays as a
+        # display / back-compat attribute; it is overwritten from the resolved
+        # plan's primary_host on every _start_uvicorn, but is initialized here so
+        # nothing (menu labels, port guards) reads None before resolution.
+        self.cli_host = host
+        self.host = host or DEFAULT_HOST
         self.port = port
+        # The BindPlan from the most recent _start_uvicorn. None until the first
+        # start, so readiness/port-free probes fall back to loopback.
+        self.bind_plan = None
         self._stop_event = threading.Event()
         self._lifecycle_lock = threading.RLock()  # reentrant: update click holds through _on_stop
         self._uvicorn_thread: threading.Thread | None = None
@@ -308,20 +317,51 @@ class ServiceRunner:
         self._started_at: float | None = None
 
     def _start_uvicorn(self) -> threading.Thread:
-        """Start uvicorn in a daemon thread."""
-        os.environ["JACKED_HOST"] = self.host
+        """Resolve the bind plan, pre-bind its sockets, and serve in a daemon
+        thread.
+
+        Re-resolving here (not in ``__init__``) is deliberate: the tray's
+        in-process Restart re-reads the settings DB, so a GUI remote-access
+        toggle takes effect on the next restart without a process replacement.
+
+        ``create_sockets`` runs in the CALLING thread so a bind failure
+        (EADDRINUSE / a vanished pinned IP) surfaces synchronously as
+        ``SystemExit`` with the friendly "port in use" message, instead of
+        dying invisibly inside the daemon thread the way ``server.run()`` used
+        to. uvicorn then ``listen()``s the pre-bound sockets we hand it.
+        """
+        from jacked.service.bind import create_sockets, resolve_bind
+
+        plan = resolve_bind(self.cli_host, self.port)
+        self.bind_plan = plan
+        self.host = plan.primary_host
+
+        os.environ["JACKED_HOST"] = plan.primary_host
         os.environ["JACKED_PORT"] = str(self.port)
+
+        try:
+            socks = create_sockets(plan)
+        except OSError as exc:
+            raise SystemExit(
+                f"Port {self.port} is already in use.\n"
+                "Is another jacked instance running? Check with: jacked service status\n"
+                "Use --port to run on a different port."
+            ) from exc
 
         config = uvicorn.Config(
             "jacked.api.main:app",
-            host=self.host,
+            host=plan.primary_host,
             port=self.port,
             log_level="warning",
         )
         server = uvicorn.Server(config)
         self._uvicorn_server = server
 
-        thread = threading.Thread(target=server.run, name="jacked-uvicorn", daemon=True)
+        thread = threading.Thread(
+            target=lambda: server.run(sockets=socks),
+            name="jacked-uvicorn",
+            daemon=True,
+        )
         thread.start()
         return thread
 
@@ -330,10 +370,13 @@ class ServiceRunner:
         import socket
         import time
 
+        probe_host = (
+            self.bind_plan.probe_host if self.bind_plan is not None else "127.0.0.1"
+        )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                sock = socket.create_connection((self.host, self.port), timeout=0.5)
+                sock = socket.create_connection((probe_host, self.port), timeout=0.5)
                 sock.close()
                 return True
             except OSError:
@@ -341,27 +384,39 @@ class ServiceRunner:
         return False
 
     def _wait_for_port_free(self, timeout: float = 10.0) -> bool:
-        """Poll until the port is available for binding (old server fully released).
+        """Poll until EVERY plan address is free to bind (old server released).
 
-        After uvicorn's thread joins, the OS socket may still be in TIME_WAIT
+        After uvicorn's thread joins, the OS sockets may still be in TIME_WAIT
         for a few seconds. Binding too early raises OSError: Address already
-        in use. We bind+close a probe socket with SO_REUSEADDR to prove the
-        port is genuinely free.
+        in use. We bind+close a probe socket with SO_REUSEADDR on each address
+        the current plan listens on; the port is only "free" when they ALL bind.
+        Falls back to loopback when no plan has been resolved yet (never started).
         """
         import socket
         import time
 
+        addresses = (
+            self.bind_plan.addresses if self.bind_plan is not None else ("127.0.0.1",)
+        )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((self.host, self.port))
+            probes: list = []
+            all_free = True
+            for addr in addresses:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind((addr, self.port))
+                    probes.append(sock)
+                except OSError:
+                    sock.close()
+                    all_free = False
+                    break
+            for sock in probes:
                 sock.close()
+            if all_free:
                 return True
-            except OSError:
-                sock.close()
-                time.sleep(0.2)
+            time.sleep(0.2)
         return False
 
     def _shutdown_uvicorn(self) -> None:
@@ -418,7 +473,11 @@ class ServiceRunner:
                 )
 
     def _on_open_dashboard(self):
-        webbrowser.open(f"http://{self.host}:{self.port}")
+        # The tray runs on the same machine as uvicorn, and every non-cli plan
+        # binds (or, for 0.0.0.0, covers) loopback, so 127.0.0.1 always reaches
+        # it. Opening the resolved primary_host (a 100.x or 0.0.0.0) would be
+        # wrong or unreachable, so always open loopback.
+        webbrowser.open(f"http://127.0.0.1:{self.port}")
 
     def _started_text(self) -> str:
         """Format the "Started ..." menu label.
@@ -589,7 +648,13 @@ class ServiceRunner:
             uninstall_autostart()
             self._autostart_enabled = False
         else:
-            install_autostart(self.host, self.port)
+            # Pass DEFAULT_HOST, not self.host: self.host is now the resolved
+            # primary_host (could be a 100.x tailscale IP or 0.0.0.0), and
+            # baking that into a plist/VBS would pin the bind and defeat the
+            # DB-driven remote-access toggle. M5 removes the host param from
+            # install_autostart entirely so autostart artifacts stop carrying
+            # --host at all; until then, keep the artifact host-neutral.
+            install_autostart(DEFAULT_HOST, self.port)
             self._autostart_enabled = True
 
     def _check_version(self, force: bool = False) -> None:
@@ -956,7 +1021,11 @@ class ServiceRunner:
                 "Service mode requires uvicorn.\n"
                 'Install it with: uv tool install "claude-jacked" --force'
             )
-        if not is_port_available(self.host, self.port):
+        # Probe loopback, not the eventual bind host: this guard runs BEFORE
+        # resolve_bind, and every plan except a cli-pinned specific IP includes
+        # or covers loopback. A cli specific-IP run still conflict-checks cleanly
+        # at create_sockets time (which raises SystemExit with this same message).
+        if not is_port_available("127.0.0.1", self.port):
             raise SystemExit(
                 f"Port {self.port} is already in use.\n"
                 "Is another jacked instance running? Check with: jacked service status\n"
@@ -1008,7 +1077,11 @@ class ServiceRunner:
                 'Install it with: uv tool install "claude-jacked" --force'
             )
 
-        if not is_port_available(self.host, self.port):
+        # Probe loopback, not the eventual bind host: this guard runs BEFORE
+        # resolve_bind, and every plan except a cli-pinned specific IP includes
+        # or covers loopback. A cli specific-IP run still conflict-checks cleanly
+        # at create_sockets time (which raises SystemExit with this same message).
+        if not is_port_available("127.0.0.1", self.port):
             raise SystemExit(
                 f"Port {self.port} is already in use.\n"
                 "Is another jacked instance running? Check with: jacked service status\n"

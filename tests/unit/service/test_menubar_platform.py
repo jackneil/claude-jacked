@@ -87,9 +87,13 @@ def test_menubar_mac_importable_and_loopback():
     # rumps/pyobjc are darwin-only deps; on this darwin dev/CI box they resolve.
     if sys.platform == "darwin":
         assert menubar_mac.RUMPS_AVAILABLE is True
+    # _loopback always yields loopback now: the co-located agent reaches its
+    # own uvicorn over 127.0.0.1 regardless of the resolved bind host (0.0.0.0,
+    # a 100.x Tailscale IP, a LAN IP, ...). Every plan it serves covers loopback.
     assert menubar_mac._loopback("0.0.0.0") == "127.0.0.1"
     assert menubar_mac._loopback("127.0.0.1") == "127.0.0.1"
-    assert menubar_mac._loopback("192.168.1.5") == "192.168.1.5"
+    assert menubar_mac._loopback("192.168.1.5") == "127.0.0.1"
+    assert menubar_mac._loopback("100.64.12.7") == "127.0.0.1"
 
 
 def test_mac_menubar_available_matches_platform():

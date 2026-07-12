@@ -70,6 +70,21 @@ class BindPlan:
     tailscale_ip: str | None = None
     fallback_reason: str | None = None
 
+    @property
+    def probe_host(self) -> str:
+        """The address to health-probe / bind-check this server on locally.
+
+        For ``loopback``, ``tailscale``, and ``all`` the loopback address is
+        always reachable from the same machine (``127.0.0.1`` is bound
+        directly, or ``0.0.0.0`` covers it), so we probe loopback. Only a
+        ``cli`` plan binds a single caller-specified address and nothing else,
+        so it must be probed on exactly that address (this also preserves
+        today's ``--host 0.0.0.0`` probe behavior verbatim).
+        """
+        if self.mode in ("loopback", "tailscale", "all"):
+            return _LOOPBACK
+        return self.primary_host
+
     def as_effective(self) -> dict:
         """The live-state view the settings API exposes to the GUI.
 

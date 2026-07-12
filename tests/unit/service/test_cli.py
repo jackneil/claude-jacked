@@ -4,6 +4,96 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 
+class TestSpawnServiceDetachedArgv:
+    """argv honesty: `--host` appears ONLY when the caller passed an explicit
+    host. Omitting it lets the detached child re-resolve its bind from the DB,
+    which is what makes upgrade/autostart restarts honor the GUI toggle."""
+
+    @patch("jacked.findbin.find_bin", return_value="/fake/jacked")
+    @patch("subprocess.Popen")
+    def test_no_host_omits_host_flag(self, mock_popen, _mock_find):
+        from jacked.cli import _spawn_service_detached
+        _spawn_service_detached(None, 8321)
+        args = mock_popen.call_args[0][0]
+        assert "--host" not in args
+        assert "service" in args and "start" in args
+        assert "--port" in args
+        assert "8321" in args
+
+    @patch("jacked.findbin.find_bin", return_value="/fake/jacked")
+    @patch("subprocess.Popen")
+    def test_explicit_host_includes_host_flag(self, mock_popen, _mock_find):
+        from jacked.cli import _spawn_service_detached
+        _spawn_service_detached("0.0.0.0", 8321)
+        args = mock_popen.call_args[0][0]
+        assert "--host" in args
+        assert args[args.index("--host") + 1] == "0.0.0.0"
+        assert "--port" in args
+        assert "8321" in args
+
+
+class TestWebuxHostResolution:
+    """webux resolves its bind via resolve_bind and feeds JACKED_HOST from the
+    plan's primary_host; --reload stays single-host and ignores the DB."""
+
+    def test_webux_sets_jacked_host_from_plan_and_passes_sockets(self, monkeypatch):
+        import os
+        import uvicorn
+        from jacked.cli import main
+        from jacked.service.bind import BindPlan
+
+        plan = BindPlan(
+            mode="tailscale", addresses=("127.0.0.1", "100.64.1.2"), port=8321,
+            primary_host="100.64.1.2", tailscale_ip="100.64.1.2",
+        )
+        captured = {}
+
+        class _FakeServer:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def run(self, sockets=None):
+                captured["sockets"] = sockets
+
+        monkeypatch.setattr("jacked.service.bind.resolve_bind", lambda h, p: plan)
+        monkeypatch.setattr(
+            "jacked.service.bind.create_sockets", lambda _plan: ["S1", "S2"]
+        )
+        monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: {"a": a, "k": k})
+        monkeypatch.setattr(uvicorn, "Server", _FakeServer)
+        # setenv so monkeypatch restores JACKED_HOST at teardown (webux mutates
+        # os.environ directly, which would otherwise leak into other tests).
+        monkeypatch.setenv("JACKED_HOST", "sentinel")
+
+        result = CliRunner().invoke(main, ["webux", "--no-browser"])
+        assert result.exit_code == 0, result.output
+        assert os.environ["JACKED_HOST"] == "100.64.1.2"
+        assert captured["sockets"] == ["S1", "S2"]
+        # The Tailscale URL is surfaced to the user.
+        assert "100.64.1.2" in result.output
+
+    def test_webux_reload_is_single_host_and_skips_resolve_bind(self, monkeypatch):
+        import os
+        import uvicorn
+        from jacked.cli import main
+
+        captured = {}
+        monkeypatch.setattr(
+            uvicorn, "run", lambda *a, **k: captured.update(args=a, kwargs=k)
+        )
+
+        def _boom(*a, **k):
+            raise AssertionError("resolve_bind must not run on the --reload path")
+
+        monkeypatch.setattr("jacked.service.bind.resolve_bind", _boom)
+        monkeypatch.setenv("JACKED_HOST", "sentinel")
+
+        result = CliRunner().invoke(main, ["webux", "--no-browser", "--reload"])
+        assert result.exit_code == 0, result.output
+        assert os.environ["JACKED_HOST"] == "127.0.0.1"
+        assert captured["kwargs"]["reload"] is True
+
+
 
 class TestServiceStatus:
     def test_status_when_not_running(self, tmp_path):

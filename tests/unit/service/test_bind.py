@@ -287,6 +287,48 @@ def test_bindplan_is_frozen():
 
 
 # ---------------------------------------------------------------------------
+# BindPlan.probe_host
+# ---------------------------------------------------------------------------
+
+
+def test_probe_host_loopback_is_loopback():
+    plan = BindPlan(
+        mode="loopback", addresses=("127.0.0.1",), port=8321, primary_host="127.0.0.1"
+    )
+    assert plan.probe_host == "127.0.0.1"
+
+
+def test_probe_host_tailscale_is_loopback():
+    """tailscale primary_host is the 100.x IP, but loopback is always bound too
+    and is the reliable local probe target."""
+    plan = BindPlan(
+        mode="tailscale",
+        addresses=("127.0.0.1", "100.64.5.5"),
+        port=8321,
+        primary_host="100.64.5.5",
+        tailscale_ip="100.64.5.5",
+    )
+    assert plan.probe_host == "127.0.0.1"
+
+
+def test_probe_host_all_is_loopback():
+    """all binds 0.0.0.0 (not a connect target); loopback covers it."""
+    plan = BindPlan(
+        mode="all", addresses=("0.0.0.0",), port=8321, primary_host="0.0.0.0"
+    )
+    assert plan.probe_host == "127.0.0.1"
+
+
+def test_probe_host_cli_is_primary_host():
+    """A cli plan binds ONLY the caller's address, so it must be probed there
+    (this preserves today's --host verbatim behavior)."""
+    plan = BindPlan(
+        mode="cli", addresses=("192.168.1.5",), port=8321, primary_host="192.168.1.5"
+    )
+    assert plan.probe_host == "192.168.1.5"
+
+
+# ---------------------------------------------------------------------------
 # Tailscale detection
 # ---------------------------------------------------------------------------
 

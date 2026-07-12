@@ -154,15 +154,99 @@ class TestServiceRunner:
     # create=True: headless boxes never bind tray.pystray (backend resolution
     # fails without a display), and @patch resolves the target BEFORE the
     # in-body _skip_if_no_tray() can skip.
+    @patch("jacked.service.bind.create_sockets", return_value=[])
     @patch("jacked.service.tray.pystray", create=True)
     @patch("jacked.service.tray.uvicorn")
-    def test_start_uvicorn_thread_is_daemon(self, mock_uvicorn, mock_pystray):
+    def test_start_uvicorn_thread_is_daemon(self, mock_uvicorn, mock_pystray, mock_socks):
         _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
-        thread = runner._start_uvicorn()
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        with patch("jacked.service.bind.resolve_bind", return_value=plan):
+            thread = runner._start_uvicorn()
         assert thread.daemon is True
         thread.join(timeout=0.1)
+
+    @patch("jacked.service.bind.create_sockets", return_value=[])
+    @patch("jacked.service.tray.pystray", create=True)
+    @patch("jacked.service.tray.uvicorn")
+    def test_start_uvicorn_reresolves_and_sets_env_from_plan(
+        self, mock_uvicorn, mock_pystray, mock_socks, monkeypatch,
+    ):
+        """_start_uvicorn re-resolves the bind plan on EVERY call (the tray's
+        re-read-on-restart guarantee) and feeds JACKED_HOST from the plan's
+        primary_host, not self.cli_host."""
+        import os
+
+        _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host=None, port=8321)  # no cli override
+
+        # First start: DB says loopback.
+        loop_plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        # Second start (a Restart after a GUI toggle): DB now says tailscale.
+        ts_plan = BindPlan(
+            mode="tailscale", addresses=("127.0.0.1", "100.64.9.9"), port=8321,
+            primary_host="100.64.9.9", tailscale_ip="100.64.9.9",
+        )
+        plans = [loop_plan, ts_plan]
+        calls = []
+
+        def _fake_resolve(cli_host, port):
+            calls.append((cli_host, port))
+            return plans[len(calls) - 1]
+
+        monkeypatch.setattr("jacked.service.bind.resolve_bind", _fake_resolve)
+
+        t1 = runner._start_uvicorn()
+        t1.join(timeout=0.1)
+        assert runner.bind_plan is loop_plan
+        assert runner.host == "127.0.0.1"
+        assert os.environ["JACKED_HOST"] == "127.0.0.1"
+        assert os.environ["JACKED_PORT"] == "8321"
+
+        t2 = runner._start_uvicorn()
+        t2.join(timeout=0.1)
+        # resolve_bind was invoked AGAIN — the re-read-on-restart contract.
+        assert len(calls) == 2
+        assert calls == [(None, 8321), (None, 8321)]
+        assert runner.bind_plan is ts_plan
+        assert runner.host == "100.64.9.9"
+        assert os.environ["JACKED_HOST"] == "100.64.9.9"
+
+    @patch("jacked.service.tray.pystray", create=True)
+    @patch("jacked.service.tray.uvicorn")
+    def test_start_uvicorn_raises_systemexit_on_bind_conflict(
+        self, mock_uvicorn, mock_pystray,
+    ):
+        """A create_sockets OSError (port in use) surfaces synchronously as
+        SystemExit with the friendly message, not a silent daemon-thread death."""
+        _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        with (
+            patch("jacked.service.bind.resolve_bind", return_value=plan),
+            patch("jacked.service.bind.create_sockets",
+                  side_effect=OSError("Failed to bind 127.0.0.1:8321")),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner._start_uvicorn()
+        assert "already in use" in str(exc_info.value)
 
     def test_on_restart_handles_exception(self):
         _skip_if_no_tray()
