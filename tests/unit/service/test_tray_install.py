@@ -52,13 +52,16 @@ class TestSetupTrayAutostart:
         monkeypatch.setattr(cli, "_is_headless", lambda: False)
         captured = {}
 
-        def fake_ensure(host, port, *, label="Service"):
-            captured.update(host=host, port=port, label=label)
+        def fake_ensure(port, *, one_shot_host=None, label="Service"):
+            captured.update(port=port, one_shot_host=one_shot_host, label=label)
 
         monkeypatch.setattr(cli, "_ensure_autostart_and_running", fake_ensure)
         cli._setup_tray_autostart()
         assert captured["label"] == "Tray"
         assert captured["port"]  # DEFAULT_PORT threaded through
+        # No host is ever passed: the artifact is host-free and the bind is
+        # resolved from the settings DB at boot.
+        assert captured["one_shot_host"] is None
 
     def test_skips_on_headless_environment(self, monkeypatch):
         import jacked.cli as cli
@@ -91,7 +94,7 @@ class TestEnsureAutostartAndRunning:
         cli, spawned = _patch_autostart(
             monkeypatch, result="Could not find 'jacked' binary on PATH."
         )
-        cli._ensure_autostart_and_running("127.0.0.1", 8321)
+        cli._ensure_autostart_and_running(8321)
         assert spawned == []
 
     def test_skips_spawn_when_already_running(self, monkeypatch):
@@ -101,25 +104,36 @@ class TestEnsureAutostartAndRunning:
             pid={"pid": 999, "port": 8321},
             alive=True,
         )
-        cli._ensure_autostart_and_running("127.0.0.1", 8321)
+        cli._ensure_autostart_and_running(8321)
         assert spawned == []  # no double-start
 
-    def test_spawns_when_stopped_on_windows(self, monkeypatch):
+    def test_spawns_hostfree_when_stopped_on_windows(self, monkeypatch):
         cli, spawned = _patch_autostart(
             monkeypatch, result="Installed startup script: x", pid=None, platform="win32"
         )
-        cli._ensure_autostart_and_running("127.0.0.1", 8321, label="Tray")
-        assert spawned == [("127.0.0.1", 8321)]
+        cli._ensure_autostart_and_running(8321, label="Tray")
+        # No one-shot host -> the spawn passes None so the child resolves its
+        # bind from the settings DB.
+        assert spawned == [(None, 8321)]
+
+    def test_one_shot_host_passes_through_to_spawn(self, monkeypatch):
+        """An unmapped `service install --host X` stays a one-shot for the
+        immediate spawn only — never baked into the artifact."""
+        cli, spawned = _patch_autostart(
+            monkeypatch, result="Installed startup script: x", pid=None, platform="win32"
+        )
+        cli._ensure_autostart_and_running(8321, one_shot_host="192.168.1.5")
+        assert spawned == [("192.168.1.5", 8321)]
 
     def test_no_self_spawn_on_macos(self, monkeypatch):
-        # launchd already started it via install_autostart's launchctl load
+        # launchd already started it via install_autostart's bootstrap
         cli, spawned = _patch_autostart(
             monkeypatch,
             result="Installed and started launchd agent",
             pid=None,
             platform="darwin",
         )
-        cli._ensure_autostart_and_running("127.0.0.1", 8321)
+        cli._ensure_autostart_and_running(8321)
         assert spawned == []
 
     def test_spawn_failure_is_non_fatal(self, monkeypatch):
@@ -136,4 +150,4 @@ class TestEnsureAutostartAndRunning:
 
         monkeypatch.setattr(cli, "_spawn_service_detached", boom)
         # Must not propagate — install should never die over the tray.
-        cli._ensure_autostart_and_running("127.0.0.1", 8321)
+        cli._ensure_autostart_and_running(8321)

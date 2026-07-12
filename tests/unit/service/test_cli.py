@@ -4,6 +4,38 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 
+def _legacy_plist(host: str, port: int = 8321) -> str:
+    """A pre-M5 launchd plist with a baked --host, as installs used to write."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "    <key>Label</key>\n"
+        "    <string>ai.hank.jacked</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        "        <string>/usr/local/bin/jacked</string>\n"
+        "        <string>service</string>\n"
+        "        <string>start</string>\n"
+        f"        <string>--host</string>\n"
+        f"        <string>{host}</string>\n"
+        "        <string>--port</string>\n"
+        f"        <string>{port}</string>\n"
+        "    </array>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
+
+
+def _mem_db(monkeypatch):
+    """One shared in-memory settings DB behind every Database() construction."""
+    from jacked.web.database import Database
+
+    db = Database(":memory:")
+    monkeypatch.setattr("jacked.web.database.Database", lambda *a, **k: db)
+    return db
+
+
 class TestSpawnServiceDetachedArgv:
     """argv honesty: `--host` appears ONLY when the caller passed an explicit
     host. Omitting it lets the detached child re-resolve its bind from the DB,
@@ -474,3 +506,288 @@ class TestStartCommand:
             result = CliRunner().invoke(main, ["start"])
         assert result.exit_code != 0
         assert "didn't answer" in result.output.lower()
+
+
+class TestServiceStartBootMigration:
+    """`service start` boot-time migration + argv neutralization: a pre-M5
+    artifact's baked --host is captured into the DB, the artifact is rewritten
+    host-free FILE-ONLY (we may BE the launchd job it describes — no bootout),
+    and a typed --host that exactly equals the baked host is recognized as the
+    artifact's own respawn and neutralized so the DB decides the bind."""
+
+    def _invoke(self, monkeypatch, tmp_path, *, baked, argv_host):
+        import jacked.cli as cli
+
+        monkeypatch.setattr(cli.sys, "platform", "darwin")
+        plist = tmp_path / "ai.hank.jacked.plist"
+        if baked is not None:
+            plist.write_text(_legacy_plist(baked), encoding="utf-8")
+        db = _mem_db(monkeypatch)
+
+        args = ["service", "start"]
+        if argv_host is not None:
+            args += ["--host", argv_host]
+        with (
+            patch("jacked.service.platform._get_launchd_plist_path",
+                  return_value=plist),
+            patch("jacked.service.tray.ServiceRunner") as mock_runner_cls,
+        ):
+            mock_runner_cls.return_value.run.return_value = None
+            result = CliRunner().invoke(cli.main, args)
+        return result, mock_runner_cls, db, plist
+
+    def test_respawn_argv_is_neutralized_and_db_migrated(
+        self, monkeypatch, tmp_path,
+    ):
+        """Baked 0.0.0.0 + `--host 0.0.0.0` argv: this IS the artifact's own
+        respawn — runner gets host None AND the DB captured enabled+all."""
+        result, runner_cls, db, plist = self._invoke(
+            monkeypatch, tmp_path, baked="0.0.0.0", argv_host="0.0.0.0",
+        )
+        assert result.exit_code == 0, result.output
+        assert runner_cls.call_args.kwargs["host"] is None
+        assert db.get_setting("remote_access_enabled") == "true"
+        assert db.get_setting("remote_access_scope") == "all"
+        # Artifact rewritten host-free, file only.
+        assert "--host" not in plist.read_text()
+
+    def test_different_typed_host_is_honored_as_one_shot(
+        self, monkeypatch, tmp_path,
+    ):
+        """Baked 0.0.0.0 + `--host 192.168.1.5` argv: the typed host differs,
+        so it is a deliberate one-shot and passes through untouched."""
+        result, runner_cls, db, plist = self._invoke(
+            monkeypatch, tmp_path, baked="0.0.0.0", argv_host="192.168.1.5",
+        )
+        assert result.exit_code == 0, result.output
+        assert runner_cls.call_args.kwargs["host"] == "192.168.1.5"
+        # The baked host still got migrated + the artifact still rewritten.
+        assert db.get_setting("remote_access_enabled") == "true"
+        assert "--host" not in plist.read_text()
+
+    def test_no_artifact_honors_typed_host(self, monkeypatch, tmp_path):
+        result, runner_cls, db, _plist = self._invoke(
+            monkeypatch, tmp_path, baked=None, argv_host="192.168.1.5",
+        )
+        assert result.exit_code == 0, result.output
+        assert runner_cls.call_args.kwargs["host"] == "192.168.1.5"
+        assert db.get_setting("remote_access_enabled") is None
+
+    def test_hostfree_artifact_leaves_argv_alone(self, monkeypatch, tmp_path):
+        """An already-migrated (host-free) artifact: nothing to do."""
+        import jacked.cli as cli
+
+        monkeypatch.setattr(cli.sys, "platform", "darwin")
+        plist = tmp_path / "ai.hank.jacked.plist"
+        hostfree = _legacy_plist("PLACEHOLDER").replace(
+            "        <string>--host</string>\n"
+            "        <string>PLACEHOLDER</string>\n",
+            "",
+        )
+        plist.write_text(hostfree, encoding="utf-8")
+        before = plist.read_text()
+        db = _mem_db(monkeypatch)
+        with (
+            patch("jacked.service.platform._get_launchd_plist_path",
+                  return_value=plist),
+            patch("jacked.service.tray.ServiceRunner") as mock_runner_cls,
+        ):
+            mock_runner_cls.return_value.run.return_value = None
+            result = CliRunner().invoke(cli.main, ["service", "start"])
+        assert result.exit_code == 0, result.output
+        assert mock_runner_cls.call_args.kwargs["host"] is None
+        assert plist.read_text() == before  # untouched
+        assert db.get_setting("remote_access_enabled") is None
+
+    def test_migration_guard_never_clobbers_gui_choice(
+        self, monkeypatch, tmp_path,
+    ):
+        """Stale baked 0.0.0.0 vs a GUI that already turned remote access OFF:
+        the boot migration must leave the GUI's choice alone (argv is still
+        neutralized — the DB decides, and the DB says off)."""
+        import jacked.cli as cli
+
+        monkeypatch.setattr(cli.sys, "platform", "darwin")
+        plist = tmp_path / "ai.hank.jacked.plist"
+        plist.write_text(_legacy_plist("0.0.0.0"), encoding="utf-8")
+        db = _mem_db(monkeypatch)
+        db.set_setting("remote_access_enabled", "false")
+        with (
+            patch("jacked.service.platform._get_launchd_plist_path",
+                  return_value=plist),
+            patch("jacked.service.tray.ServiceRunner") as mock_runner_cls,
+        ):
+            mock_runner_cls.return_value.run.return_value = None
+            result = CliRunner().invoke(
+                cli.main, ["service", "start", "--host", "0.0.0.0"]
+            )
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "false"
+        assert mock_runner_cls.call_args.kwargs["host"] is None
+        assert "--host" not in plist.read_text()
+
+
+class TestServiceInstallRemoteAccessParity:
+    """`service install --host X` maps X onto the dashboard Remote access
+    setting (OVERWRITING existing keys — the command expresses intent), then
+    installs host-free. Unmapped IPs stay a one-shot for the immediate spawn."""
+
+    def _invoke(self, monkeypatch, host, platform="win32"):
+        import jacked.cli as cli
+
+        db = _mem_db(monkeypatch)
+        monkeypatch.setattr(cli.sys, "platform", platform)
+        with (
+            patch("jacked.service.platform.install_autostart",
+                  return_value="Installed startup script: x"),
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.cli._spawn_service_detached") as spawn,
+        ):
+            result = CliRunner().invoke(
+                cli.main, ["service", "install", "--host", host]
+            )
+        return result, db, spawn
+
+    def test_all_interfaces_writes_enabled_all(self, monkeypatch):
+        result, db, spawn = self._invoke(monkeypatch, "0.0.0.0")
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "true"
+        assert db.get_setting("remote_access_scope") == "all"
+        assert "Remote access setting updated" in result.output
+        # Host consumed -> the immediate spawn is host-free (DB decides).
+        spawn.assert_called_once_with(None, 8321)
+
+    def test_tailscale_ip_writes_enabled_tailscale(self, monkeypatch):
+        result, db, _spawn = self._invoke(monkeypatch, "100.77.1.2")
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "true"
+        assert db.get_setting("remote_access_scope") == "tailscale"
+        assert "Remote access setting updated" in result.output
+
+    def test_loopback_writes_disabled(self, monkeypatch):
+        result, db, _spawn = self._invoke(monkeypatch, "127.0.0.1")
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "false"
+        assert "Remote access setting updated" in result.output
+
+    def test_overwrites_existing_setting(self, monkeypatch):
+        """Unlike the artifact migration, an explicit --host OVERWRITES: the
+        command is the user expressing intent right now."""
+        import jacked.cli as cli
+
+        db = _mem_db(monkeypatch)
+        db.set_setting("remote_access_enabled", "false")
+        db.set_setting("remote_access_scope", "tailscale")
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        with (
+            patch("jacked.service.platform.install_autostart",
+                  return_value="Installed startup script: x"),
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.cli._spawn_service_detached"),
+        ):
+            result = CliRunner().invoke(
+                cli.main, ["service", "install", "--host", "0.0.0.0"]
+            )
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "true"
+        assert db.get_setting("remote_access_scope") == "all"
+
+    def test_unmapped_ip_is_one_shot_pass_through(self, monkeypatch):
+        result, db, spawn = self._invoke(monkeypatch, "192.168.1.5")
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") is None
+        assert db.get_setting("remote_access_scope") is None
+        assert "one-shot" in result.output
+        # The one-shot host reaches the immediate spawn but is never persisted.
+        spawn.assert_called_once_with("192.168.1.5", 8321)
+
+
+class TestServiceRestartRemoteAccessParity:
+    """`service restart --host X` maps X onto the Remote access setting before
+    restarting, so the restarted service (native kickstart or detached spawn)
+    resolves the new mode from the DB — this is what makes the command finally
+    work reliably on macOS, where kickstart reuses launchd's in-memory argv."""
+
+    def test_all_interfaces_writes_db_then_native_restart(self, monkeypatch):
+        import jacked.cli as cli
+
+        db = _mem_db(monkeypatch)
+        with (
+            patch("jacked.service.platform.ensure_native_lifecycle",
+                  return_value=(True, "already_installed", "plist installed")),
+            patch("jacked.service.platform.native_restart",
+                  return_value=(True, "launchctl kickstart")) as mock_native,
+        ):
+            result = CliRunner().invoke(
+                cli.main, ["service", "restart", "--host", "0.0.0.0"]
+            )
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "true"
+        assert db.get_setting("remote_access_scope") == "all"
+        assert "Remote access setting updated" in result.output
+        mock_native.assert_called_once()
+
+    def test_loopback_disables_then_restarts(self, monkeypatch):
+        import jacked.cli as cli
+
+        db = _mem_db(monkeypatch)
+        db.set_setting("remote_access_enabled", "true")
+        db.set_setting("remote_access_scope", "all")
+        with (
+            patch("jacked.service.platform.ensure_native_lifecycle",
+                  return_value=(True, "already_installed", "plist installed")),
+            patch("jacked.service.platform.native_restart",
+                  return_value=(True, "launchctl kickstart")),
+        ):
+            result = CliRunner().invoke(
+                cli.main, ["service", "restart", "--host", "127.0.0.1"]
+            )
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "false"
+        assert "Remote access setting updated" in result.output
+
+    def test_mapped_host_spawn_argv_is_hostfree(self, monkeypatch):
+        """On the manual fallback path a MAPPED host must not leak into the
+        detached child's argv — the DB carries the intent now."""
+        import jacked.cli as cli
+
+        db = _mem_db(monkeypatch)
+        with (
+            patch("jacked.service.platform.ensure_native_lifecycle",
+                  return_value=(False, "unavailable", "no native manager")),
+            patch("jacked.findbin.find_bin", return_value="/fake/jacked"),
+            patch("subprocess.Popen") as mock_popen,
+            patch("jacked.service.process.stop_process_graceful",
+                  return_value={"was_running": False, "died": False,
+                                "killed": False}),
+        ):
+            result = CliRunner().invoke(
+                cli.main, ["service", "restart", "--host", "0.0.0.0"]
+            )
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") == "true"
+        args = mock_popen.call_args[0][0]
+        assert "--host" not in args
+
+    def test_unmapped_ip_one_shot_passes_through_spawn(self, monkeypatch):
+        import jacked.cli as cli
+
+        db = _mem_db(monkeypatch)
+        with (
+            patch("jacked.service.platform.ensure_native_lifecycle",
+                  return_value=(False, "unavailable", "no native manager")),
+            patch("jacked.findbin.find_bin", return_value="/fake/jacked"),
+            patch("subprocess.Popen") as mock_popen,
+            patch("jacked.service.process.stop_process_graceful",
+                  return_value={"was_running": False, "died": False,
+                                "killed": False}),
+        ):
+            result = CliRunner().invoke(
+                cli.main, ["service", "restart", "--host", "192.168.1.5"]
+            )
+        assert result.exit_code == 0, result.output
+        assert db.get_setting("remote_access_enabled") is None
+        assert "one-shot" in result.output
+        args = mock_popen.call_args[0][0]
+        assert "--host" in args
+        assert args[args.index("--host") + 1] == "192.168.1.5"

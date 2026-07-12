@@ -2707,20 +2707,27 @@ def _tray_extra_installed() -> bool:
 
 
 def _ensure_autostart_and_running(
-    host: str, port: int, *, label: str = "Service"
+    port: int, *, one_shot_host: str | None = None, label: str = "Service"
 ) -> None:
     """Register login autostart and make sure the service is running now.
 
-    macOS: ``install_autostart`` loads it via launchd (starts immediately).
-    Windows/Linux: ``install_autostart`` only registers the login entry, so we
-    spawn the detached service ourselves when nothing is already listening.
-    Idempotent and non-fatal — never aborts the caller.
+    macOS: ``install_autostart`` bootstraps it via launchd (starts immediately)
+    unless the service is already running. Windows/Linux: ``install_autostart``
+    only registers the login entry, so we spawn the detached service ourselves
+    when nothing is already listening. Idempotent and non-fatal — never aborts
+    the caller.
+
+    The autostart artifact is always host-free (the bind host lives in the
+    settings DB and is resolved at every boot). ``one_shot_host`` applies ONLY
+    to the immediate detached spawn on Windows/Linux — a caller-supplied
+    unmapped ``--host`` that is deliberately not persisted; the launchd path
+    always boots host-free.
     """
     from jacked.service import PID_FILE
     from jacked.service.platform import install_autostart
     from jacked.service.process import is_process_alive, read_pid
 
-    result = install_autostart(host, port)
+    result = install_autostart(port)
     if result.startswith("Could not find"):
         console.print(f"[red]Error:[/red] {result}")
         return
@@ -2734,7 +2741,7 @@ def _ensure_autostart_and_running(
         )
         return
     if sys.platform == "darwin":
-        # launchd just started it via install_autostart's launchctl load; the
+        # launchd just started it via install_autostart's bootstrap; the
         # PID file can lag a beat, so don't race it with a second spawn.
         console.print(
             f"[green][OK][/green] {label} started via launchd -> "
@@ -2742,7 +2749,7 @@ def _ensure_autostart_and_running(
         )
         return
     try:
-        _spawn_service_detached(host, port)
+        _spawn_service_detached(one_shot_host, port)
         console.print(
             f"[green][OK][/green] {label} started -> http://127.0.0.1:{port}"
         )
@@ -2767,9 +2774,9 @@ def _setup_tray_autostart() -> None:
             "Run `jacked service start` to run the service without a tray."
         )
         return
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service import DEFAULT_PORT
 
-    _ensure_autostart_and_running(DEFAULT_HOST, DEFAULT_PORT, label="Tray")
+    _ensure_autostart_and_running(DEFAULT_PORT, label="Tray")
 
 
 # Plugins that jacked's behaviors and skills genuinely depend on. Missing
@@ -3350,6 +3357,117 @@ def menubar(host: str | None, port: int | None):
     ServiceRunner(host=host, port=port or DEFAULT_PORT).run()
 
 
+def _persist_remote_access_from_host(host: str) -> bool:
+    """Map an explicit ``service install/restart --host`` onto the dashboard
+    Remote access setting.
+
+    These commands EXPRESS intent about the persistent mode, so unlike the
+    artifact migration (which only fills absent keys) this OVERWRITES any
+    existing setting. Returns True when the host was consumed (persisted, and
+    the caller should proceed host-free so the DB decides the bind); False when
+    it stays a one-shot pass-through (an unmapped specific IP, or the DB write
+    failed).
+    """
+    from jacked.service.migrate import map_host_to_setting
+
+    mapping = map_host_to_setting(host)
+    if mapping is None:
+        console.print(
+            f"[yellow]Host {host} is a one-shot override for this start only "
+            "and is not persisted. Use the dashboard Remote access setting "
+            "(Settings > Advanced) for a persistent mode.[/yellow]"
+        )
+        return False
+    enabled, scope = mapping
+    try:
+        from jacked.web.database import Database
+
+        db = Database()
+        db.set_setting("remote_access_enabled", enabled)
+        if scope is not None:
+            db.set_setting("remote_access_scope", scope)
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not persist the Remote access setting ({exc}); "
+            f"using --host {host} for this start only.[/yellow]"
+        )
+        return False
+    if enabled == "false":
+        desc = "disabled (loopback only)"
+    elif scope == "all":
+        desc = "enabled, all interfaces (0.0.0.0)"
+    else:
+        desc = f"enabled, Tailscale only ({host})"
+    console.print(f"[green][OK][/green] Remote access setting updated: {desc}")
+    return True
+
+
+def _resolve_service_start_host(typed_host: str | None) -> str | None:
+    """Boot-time autostart-artifact migration plus argv neutralization.
+
+    Pre-M5 autostart artifacts baked ``--host X`` into the launchd plist /
+    Startup VBS. At ``service start`` time we may BE the launchd job that plist
+    describes, so: capture the baked host into the settings DB (guarded — never
+    clobbers an existing GUI choice), rewrite the artifact host-free FILE-ONLY
+    (a bootout here would kill us mid-boot), and decide what the typed
+    ``--host`` argv means:
+
+    - typed host EXACTLY equals the artifact's baked host -> this invocation IS
+      the artifact's own respawn, so treat it as None (the DB decides; the
+      migration just captured the old intent).
+    - they differ, or the artifact carries no ``--host`` -> the typed host is a
+      deliberate one-shot; honor it verbatim.
+
+    Never raises — a boot must never die over migration bookkeeping.
+    """
+    try:
+        if sys.platform == "darwin":
+            from jacked.service.platform import _get_launchd_plist_path
+
+            artifact_path, kind = _get_launchd_plist_path(), "plist"
+        elif sys.platform == "win32":
+            from jacked.service.platform import _get_windows_startup_path
+
+            artifact_path, kind = _get_windows_startup_path(), "vbs"
+        else:
+            # Linux: no artifact is generated; the DB read at boot covers it.
+            return typed_host
+        if not artifact_path.exists():
+            return typed_host
+        text = artifact_path.read_text(encoding="utf-8")
+
+        from jacked.service.migrate import (
+            extract_baked_host,
+            migrate_baked_host_to_db,
+            strip_baked_host,
+        )
+
+        baked = extract_baked_host(text, kind)
+        if baked is None:
+            return typed_host
+        status = migrate_baked_host_to_db(baked)
+        try:
+            artifact_path.write_text(strip_baked_host(text, kind), encoding="utf-8")
+            rewrite = "artifact rewritten host-free (file only, no reload)"
+        except OSError as exc:
+            rewrite = f"artifact rewrite failed: {exc}"
+        if typed_host == baked:
+            console.print(
+                f"[dim]Autostart artifact carried --host {baked}: {status}; "
+                f"{rewrite}. This start is the artifact's own respawn, so the "
+                "bind resolves from the settings DB.[/dim]"
+            )
+            return None
+        console.print(
+            f"[dim]Autostart artifact carried --host {baked}: {status}; "
+            f"{rewrite}.[/dim]"
+        )
+        return typed_host
+    except Exception:
+        logger.exception("Boot-time autostart --host migration failed; continuing")
+        return typed_host
+
+
 @main.group()
 def service():
     """Manage the jacked background service (tray icon + auto-start)."""
@@ -3363,6 +3481,11 @@ def service_start(host: str | None, port: int | None):
     """Start jacked as a background service with system tray icon."""
     from jacked.service import DEFAULT_PORT
     from jacked.service.tray import ServiceRunner
+
+    # Boot-time migration: capture a pre-M5 artifact's baked --host into the
+    # DB, rewrite the artifact host-free, and neutralize our own argv when this
+    # invocation is that artifact's respawn (details in the helper docstring).
+    host = _resolve_service_start_host(host)
 
     # Pass the raw host (possibly None): ServiceRunner resolves the bind plan
     # from the DB / loopback default when no explicit --host was given.
@@ -3397,7 +3520,7 @@ def service_stop():
 
 
 @service.command(name="restart")
-@click.option("--host", default=None, help="Host to bind (one-shot override; default: the dashboard Remote access setting, else 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
+@click.option("--host", default=None, help="Sets the dashboard Remote access setting, then restarts: 0.0.0.0 enables all interfaces, a Tailscale 100.x IP enables Tailscale only, 127.0.0.1 disables remote access. Any other IP applies to this start only and is not persisted. The GUI toggle (Settings > Advanced) is the primary interface.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 @click.option(
     "--foreground",
@@ -3422,6 +3545,15 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     )
 
     the_port = port or DEFAULT_PORT
+
+    # An explicit --host expresses intent about the persistent Remote access
+    # mode: map it into the settings DB (unlike migration, this DOES overwrite
+    # existing keys), then restart host-free so the DB decides the bind. This
+    # is what makes the command work reliably on macOS: native_restart's
+    # kickstart reuses launchd's in-memory argv, but the DB is re-read at every
+    # boot. Unmapped specific IPs stay a one-shot pass-through.
+    if host is not None and _persist_remote_access_from_host(host):
+        host = None
 
     # Preferred path: make sure native lifecycle (launchd plist / systemd
     # unit) is configured, then delegate.  Skip kickstart when the plist
@@ -3510,14 +3642,21 @@ def service_status():
 
 
 @service.command(name="install")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
+@click.option("--host", default=None, help="Sets the dashboard Remote access setting: 0.0.0.0 enables all interfaces, a Tailscale 100.x IP enables Tailscale only, 127.0.0.1 disables remote access. Any other IP applies to this start only and is not persisted. The GUI toggle (Settings > Advanced) is the primary interface.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_install(host: str | None, port: int | None):
     """Configure jacked to start automatically on login, and start it now."""
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service import DEFAULT_PORT
 
+    # An explicit --host expresses intent about the persistent Remote access
+    # mode: map it into the settings DB (overwriting existing keys), then
+    # install host-free so every boot resolves the bind from the DB. An
+    # unmapped specific IP stays a one-shot for the immediate start only.
+    one_shot = None
+    if host is not None and not _persist_remote_access_from_host(host):
+        one_shot = host
     _ensure_autostart_and_running(
-        host or DEFAULT_HOST, port or DEFAULT_PORT, label="Service"
+        port or DEFAULT_PORT, one_shot_host=one_shot, label="Service"
     )
 
 

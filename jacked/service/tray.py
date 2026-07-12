@@ -582,6 +582,26 @@ class ServiceRunner:
                 )
                 self._on_stop()
 
+    def _on_settings_restart(self):
+        """Apply a settings-triggered restart, honoring the DB over any launch pin.
+
+        A settings apply (POST /api/settings/remote-access/restart) is an
+        explicit request to honor the settings DB. But this process may have
+        been LAUNCHED with ``--host X``: a stale launchd in-memory definition
+        keeps its old baked-``--host`` argv until reboot even after the plist
+        on disk was rewritten host-free, and an old detached spawn's argv
+        lingers the same way. That launch-time pin lives in ``self.cli_host``
+        and would win over the DB inside ``resolve_bind`` on every in-process
+        restart, silently making the GUI toggle inert. Clearing the pin here
+        makes the GUI work regardless of how this process was launched.
+
+        The tray MENU's Restart keeps calling ``_on_restart`` directly: an
+        operator's one-shot launch pin is deliberate for the life of that
+        launch, and a plain restart must not discard it.
+        """
+        self.cli_host = None
+        self._on_restart()
+
     def _request_stop(self):
         """Signal-safe stop request — only sets flags, no locks or I/O."""
         if self._uvicorn_server is not None:
@@ -655,13 +675,10 @@ class ServiceRunner:
             uninstall_autostart()
             self._autostart_enabled = False
         else:
-            # Pass DEFAULT_HOST, not self.host: self.host is now the resolved
-            # primary_host (could be a 100.x tailscale IP or 0.0.0.0), and
-            # baking that into a plist/VBS would pin the bind and defeat the
-            # DB-driven remote-access toggle. M5 removes the host param from
-            # install_autostart entirely so autostart artifacts stop carrying
-            # --host at all; until then, keep the artifact host-neutral.
-            install_autostart(DEFAULT_HOST, self.port)
+            # Artifacts are host-free: the bind host is resolved from the
+            # settings DB at every boot, so autostart honors the GUI Remote
+            # access toggle instead of pinning a host in the plist/VBS.
+            install_autostart(self.port)
             self._autostart_enabled = True
 
     def _check_version(self, force: bool = False) -> None:
@@ -1073,11 +1090,14 @@ class ServiceRunner:
 
         # Register the in-process restart handler for the WHOLE run lifetime,
         # so the settings API's POST /remote-access/restart can apply a bind
-        # change via _on_restart (same PID, tray survives) instead of execv.
+        # change (same PID, tray survives) instead of execv. Registered as
+        # _on_settings_restart, NOT _on_restart: a settings apply must clear
+        # any launch-time --host pin (stale launchd in-memory argv) so the DB
+        # actually wins — see _on_settings_restart's docstring.
         # Shared across both backends below; the finally unregisters on exit.
         from jacked.service.restart import set_restart_handler
 
-        set_restart_handler(self._on_restart)
+        set_restart_handler(self._on_settings_restart)
         try:
             return self._run()
         finally:

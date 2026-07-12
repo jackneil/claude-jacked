@@ -946,8 +946,9 @@ class TestOnUpdateClickBreadcrumbs:
 class TestRestartHandlerRegistration:
     """ServiceRunner.run() registers its in-process restart handler for the
     whole run lifetime and unregisters it on exit — the seam the settings API's
-    POST /remote-access/restart uses to restart via _on_restart (same PID)
-    instead of os.execv."""
+    POST /remote-access/restart uses to restart in-process (same PID) instead
+    of os.execv. The registered handler is _on_settings_restart, which clears
+    any launch-time --host pin before restarting so the DB actually wins."""
 
     def test_run_registers_during_and_unregisters_after(self, monkeypatch):
         _skip_if_no_tray()
@@ -989,7 +990,53 @@ class TestRestartHandlerRegistration:
 
         runner.run()
 
-        # Registered before the run loop, and it was OUR runner's handler.
-        assert captured.get("during") == runner._on_restart
+        # Registered before the run loop, and it is the SETTINGS variant that
+        # clears the launch-time --host pin — NOT the bare _on_restart the
+        # tray menu uses (an operator's launch pin is deliberate there).
+        assert captured.get("during") == runner._on_settings_restart
+        assert captured.get("during") != runner._on_restart
         # Unregistered on exit (run()'s finally).
         assert restart_mod.get_restart_handler() is None
+
+
+class TestOnSettingsRestart:
+    """_on_settings_restart is the deal-breaker fix: a service still running
+    under a STALE launchd in-memory definition (or an old detached argv) was
+    launched with --host X, and that pin (cli_host) would beat the DB inside
+    resolve_bind on every in-process restart, making the GUI toggle inert."""
+
+    def test_clears_cli_host_before_restarting(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="0.0.0.0", port=8321)
+        assert runner.cli_host == "0.0.0.0"
+
+        seen = []
+        runner._on_restart = lambda: seen.append(runner.cli_host)
+
+        runner._on_settings_restart()
+
+        # Pin cleared BEFORE _on_restart ran, so the restarted bind resolves
+        # from the settings DB.
+        assert runner.cli_host is None
+        assert seen == [None]
+
+    def test_menu_restart_keeps_the_launch_pin(self, monkeypatch):
+        """The tray MENU's Restart calls _on_restart directly and must NOT
+        clear the operator's one-shot --host pin."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="192.168.1.5", port=8321)
+        # Stub the heavy lifecycle so _on_restart returns fast without a server.
+        monkeypatch.setattr(runner, "_shutdown_uvicorn", lambda: None)
+        monkeypatch.setattr(runner, "_wait_for_port_free", lambda timeout=10: True)
+        monkeypatch.setattr(
+            runner, "_start_uvicorn", lambda: MagicMock(name="thread")
+        )
+        monkeypatch.setattr(runner, "_wait_for_ready", lambda timeout=15: True)
+
+        runner._on_restart()
+
+        assert runner.cli_host == "192.168.1.5"
