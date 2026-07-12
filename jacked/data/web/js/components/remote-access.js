@@ -29,7 +29,6 @@ const _remoteAccessState = {
 
 const _REMOTE_ACCESS_URL = '/api/settings/remote-access';
 const _REMOTE_ACCESS_RESTART_URL = '/api/settings/remote-access/restart';
-const _REMOTE_ACCESS_DANGER = '#dc2626'; // red-600, matches the danger palette
 
 // --- Location helpers (guarded so the node test-harness can stub them) ---
 
@@ -100,10 +99,25 @@ function remoteAccessLockout(pending, hostname) {
     return false;
 }
 
-// Shared across component files via a window global (same pattern the rest of the
-// dashboard uses); websocket.js reads window.remoteAccessLockout.
+// The terminal "this page will not reconnect" message, keyed on the pending
+// state. Defined ONCE and shared so the inline apply path and the WS
+// restart_started handler (websocket.js) can never drift to different copy.
+function remoteAccessTerminalMessage(pending) {
+    return (pending && pending.enabled === false)
+        ? 'Remote access is off. This page will not reconnect; open the dashboard on the machine itself.'
+        : 'This page is not on your tailnet, so it will not reconnect. Open the dashboard on the machine itself or use its Tailscale address.';
+}
+
+// Shared across component files via window globals (same pattern the rest of the
+// dashboard uses). websocket.js reads window.remoteAccessLockout and
+// window.remoteAccessTerminalMessage. NOTE load order: index.html loads
+// websocket.js BEFORE remote-access.js, but these globals are set at parse time
+// (long before any WS event can fire) and both consumers guard with a typeof
+// check, so the ordering is safe. If either file is switched to defer/lazy-load,
+// re-verify this.
 if (typeof window !== 'undefined') {
     window.remoteAccessLockout = remoteAccessLockout;
+    window.remoteAccessTerminalMessage = remoteAccessTerminalMessage;
 }
 
 // --- HTML builders (pure functions, unit-tested directly on their output) ---
@@ -134,7 +148,7 @@ function _remoteAccessScopePickerHTML(scope) {
     const allActive = scope === 'all';
     return `
         <div class="mt-4 space-y-2" role="radiogroup" aria-label="Remote access scope">
-            <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors active:scale-[0.99] ${tsActive ? 'border-blue-500 bg-blue-900/20' : 'border-slate-700 hover:border-slate-600'}">
+            <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition active:scale-[0.99] ${tsActive ? 'border-blue-500 bg-blue-900/20' : 'border-slate-700 hover:border-slate-600'}">
                 <input type="radio" name="remote-access-scope" value="tailscale" class="mt-0.5 accent-blue-500" ${tsActive ? 'checked' : ''}>
                 <span class="min-w-0 flex-1">
                     <span class="flex items-center gap-2">
@@ -144,14 +158,14 @@ function _remoteAccessScopePickerHTML(scope) {
                     <span class="block text-xs text-slate-400 mt-0.5 text-pretty">Reachable only over your private tailnet (loopback plus your Tailscale IP). Not exposed to local Wi-Fi or the public internet.</span>
                 </span>
             </label>
-            <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors active:scale-[0.99] ${allActive ? 'border-red-500 bg-red-900/20' : 'border-red-900/40 hover:border-red-700'}">
+            <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition active:scale-[0.99] ${allActive ? 'border-red-500 bg-red-900/20' : 'border-red-900/40 hover:border-red-700'}">
                 <input type="radio" name="remote-access-scope" value="all" class="mt-0.5 accent-red-500" ${allActive ? 'checked' : ''}>
                 <span class="min-w-0 flex-1">
                     <span class="flex items-center gap-2">
                         <span class="text-sm font-medium text-red-300">All interfaces</span>
                         <span class="badge badge-danger">Unauthenticated</span>
                     </span>
-                    <span class="block text-xs text-red-400/80 mt-0.5 text-pretty">Listens on every network (0.0.0.0), including public Wi-Fi and LAN. Anyone who can reach the port controls the dashboard. Use only on networks you trust.</span>
+                    <span class="block text-xs text-red-400 mt-0.5 text-pretty">Listens on every network (0.0.0.0), including public Wi-Fi and LAN. Anyone who can reach the port controls the dashboard. Use only on networks you trust.</span>
                 </span>
             </label>
         </div>
@@ -162,13 +176,20 @@ function _remoteAccessStatusHTML(effective, port) {
     const eff = effective || {};
     const addrs = Array.isArray(eff.addresses) ? eff.addresses : [];
     const tsIp = eff.tailscale_ip || null;
+    // The address is mono (it's a literal); the "(Tailscale)" annotation is
+    // prose, so keep it out of the mono run instead of typesetting it like part
+    // of the address.
     const parts = (addrs.length ? addrs : ['127.0.0.1']).map(a =>
-        (tsIp && a === tsIp) ? `${escapeHtml(a)} (Tailscale)` : escapeHtml(a)
+        (tsIp && a === tsIp)
+            ? `<span class="font-mono text-slate-200">${escapeHtml(a)}</span> <span class="text-slate-400">(Tailscale)</span>`
+            : `<span class="font-mono text-slate-200">${escapeHtml(a)}</span>`
     );
-    const listening = parts.join(' + ');
+    const listening = parts.join('<span class="text-slate-500"> + </span>');
 
+    // Indent the URL hint to line up under the status text (icon w-3.5 + gap-2
+    // = 22px), so the status block has one clean left edge instead of two.
     const urlHint = tsIp
-        ? `<div class="text-xs text-slate-400 mt-1.5">
+        ? `<div class="text-xs text-slate-400 mt-1.5 pl-[22px]">
                Open remotely at
                <a class="font-mono text-blue-400 hover:text-blue-300 transition-colors" href="http://${escapeHtml(tsIp)}:${escapeHtml(port)}">http://${escapeHtml(tsIp)}:${escapeHtml(port)}</a>
            </div>`
@@ -185,7 +206,7 @@ function _remoteAccessStatusHTML(effective, port) {
         <div class="mt-4 pt-3 border-t border-slate-700/60">
             <div class="flex items-start gap-2 text-xs">
                 <svg class="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
-                <span class="text-slate-300">Listening on <span class="font-mono text-slate-200">${listening}</span></span>
+                <span class="text-slate-300">Listening on ${listening}</span>
             </div>
             ${urlHint}
             ${fallback}
@@ -234,7 +255,7 @@ function _remoteAccessConfirmOptions(saved, pending, lockout) {
                 showCancelButton: true,
                 confirmButtonText: 'Turn off and disconnect',
                 cancelButtonText: 'Cancel',
-                confirmButtonColor: _REMOTE_ACCESS_DANGER,
+                customClass: { confirmButton: 'swal-confirm-danger' },
                 focusCancel: true,
             };
         }
@@ -245,7 +266,7 @@ function _remoteAccessConfirmOptions(saved, pending, lockout) {
             showCancelButton: true,
             confirmButtonText: 'Switch and disconnect',
             cancelButtonText: 'Cancel',
-            confirmButtonColor: _REMOTE_ACCESS_DANGER,
+            customClass: { confirmButton: 'swal-confirm-danger' },
             focusCancel: true,
         };
     }
@@ -275,7 +296,7 @@ function _remoteAccessConfirmOptions(saved, pending, lockout) {
             showCancelButton: true,
             confirmButtonText: 'Expose on all interfaces',
             cancelButtonText: 'Cancel',
-            confirmButtonColor: _REMOTE_ACCESS_DANGER,
+            customClass: { confirmButton: 'swal-confirm-danger' },
             focusCancel: true,
         };
     }
@@ -334,7 +355,6 @@ async function _applyRemoteAccessChange(container, pending) {
         // the true last-known-good state.
         _remoteAccessState.enabled = norm.enabled;
         _remoteAccessState.scope = norm.scope;
-        await api.post(_REMOTE_ACCESS_RESTART_URL);
     } catch (e) {
         _remoteAccessRerender(container);
         const emsg = (e && e.message) ? e.message : 'unknown error';
@@ -344,10 +364,23 @@ async function _applyRemoteAccessChange(container, pending) {
         return { applied: false, reverted: true, error: true, lockout };
     }
 
+    try {
+        await api.post(_REMOTE_ACCESS_RESTART_URL);
+    } catch (e) {
+        // 409 = a restart is already applying (two tabs, or a fast re-apply).
+        // The setting IS saved and a restart IS in flight, so fall through to
+        // the overlay instead of a scary error, exactly like the upgrade flow.
+        if (!(e && e.status === 409)) {
+            const emsg = (e && e.message) ? e.message : 'unknown error';
+            if (typeof _showUpgradeError === 'function') {
+                _showUpgradeError('Saved, but could not start the restart: ' + emsg);
+            }
+            return { applied: true, reverted: false, error: true, lockout };
+        }
+    }
+
     if (lockout) {
-        const term = !norm.enabled
-            ? 'Remote access is off. This page will not reconnect; open the dashboard on the machine itself.'
-            : 'This page is not on your tailnet, so it will not reconnect. Open the dashboard on the machine itself or use its Tailscale address.';
+        const term = remoteAccessTerminalMessage(norm);
         if (typeof _showRestartTerminal === 'function') _showRestartTerminal(term);
         else if (typeof _showUpgradeModal === 'function') _showUpgradeModal(term);
         // Intentionally no health polling: this page will never reconnect.

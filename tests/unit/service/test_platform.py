@@ -222,6 +222,33 @@ class TestInstallAutostart:
         assert mock_run.call_args_list[1][0][0][:2] == ["launchctl", "bootstrap"]
         assert "running now" in result
 
+    @patch("jacked.service.platform._service_is_running", return_value=False)
+    @patch("sys.platform", "darwin")
+    @patch("subprocess.run")
+    def test_darwin_bootstrap_failure_returns_honest_status(
+        self, mock_run, _mock_running, tmp_path, monkeypatch,
+    ):
+        """When `launchctl bootstrap` FAILS the job never loaded and the bind
+        the user set never took effect — the return string must NOT claim
+        "running now", or the CLI prints a false success on a silent boot-time
+        failure (the observability trap this fixes)."""
+        import os
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # bootout ok
+            MagicMock(returncode=5, stdout="",
+                      stderr="Bootstrap failed: 5: Input/output error"),
+        ]
+        plist = tmp_path / "ai.hank.jacked.plist"
+        from jacked.service.platform import install_autostart
+        with patch("jacked.service.platform._get_launchd_plist_path", return_value=plist):
+            with patch("jacked.findbin.find_bin", return_value="/usr/local/bin/jacked"):
+                result = install_autostart(8321)
+        assert plist.exists()
+        assert "running now" not in result
+        assert "did not start" in result
+        assert "5" in result  # surfaces the exit code for triage
+
     @patch("jacked.service.platform._service_is_running", return_value=True)
     @patch("sys.platform", "darwin")
     @patch("subprocess.run")

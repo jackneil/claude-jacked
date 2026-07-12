@@ -3439,11 +3439,27 @@ def _resolve_service_start_host(typed_host: str | None) -> str | None:
         from jacked.service.migrate import (
             extract_baked_host,
             migrate_baked_host_to_db,
+            remote_access_configured,
             strip_baked_host,
         )
 
         baked = extract_baked_host(text, kind)
         if baked is None:
+            # The on-disk artifact is host-free (this version already stripped
+            # it), yet we still received a --host. It did NOT come from the
+            # current artifact: it is a STALE launchd in-memory / execv replay of
+            # a pre-migration argv (launchd serves its loaded definition, not the
+            # rewritten plist, until the next reboot). If remote access is
+            # configured in the DB, the DB is authoritative — ignore the stale
+            # host, or a crash-respawn could silently re-expose (or hide) the
+            # dashboard against the user's saved choice until the next reboot.
+            if typed_host is not None and remote_access_configured():
+                console.print(
+                    f"[dim]Ignoring stale --host {typed_host} from a "
+                    "pre-migration autostart replay; the bind resolves from the "
+                    "settings DB.[/dim]"
+                )
+                return None
             return typed_host
         status = migrate_baked_host_to_db(baked)
         try:

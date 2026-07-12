@@ -298,6 +298,32 @@ def test_restart_returns_409_when_already_in_progress(client):
         sr._restart_lock.release()
 
 
+def test_restart_lock_released_if_body_raises_before_thread_starts(db, monkeypatch):
+    """If anything between lock.acquire() and a successful Thread.start() throws
+    (a sqlite 'database is locked' on the payload read, thread exhaustion), the
+    lock MUST be released — otherwise every future restart returns 409 forever
+    and the GUI toggle silently wedges until the process restarts."""
+    # Force the post-acquire body to raise: make the payload DB read blow up.
+    monkeypatch.setattr(
+        sr, "_read_enabled_scope",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("database is locked")),
+    )
+    # raise_server_exceptions=False so the raised error becomes a 500 response
+    # instead of propagating into the test (the default re-raises).
+    strict_client = TestClient(app, raise_server_exceptions=False)
+    assert not sr._restart_lock.locked()
+    resp = strict_client.post("/api/settings/remote-access/restart")
+    assert resp.status_code == 500
+    assert not sr._restart_lock.locked(), "restart lock leaked on a failed body"
+    # And a subsequent restart is not permanently 409-wedged.
+    monkeypatch.undo()
+    set_restart_handler(lambda: None)
+    import jacked.service.restart as restart_mod
+    monkeypatch.setattr(restart_mod.os, "execv", lambda *a, **k: None)
+    resp2 = strict_client.post("/api/settings/remote-access/restart")
+    assert resp2.status_code == 200
+
+
 def test_restart_lock_is_reacquirable_after_handler_path_completes(client):
     """The in-process (handler) restart path must RELEASE the lock so a later
     apply can run. Regression pin for the daemon-thread finally-release."""

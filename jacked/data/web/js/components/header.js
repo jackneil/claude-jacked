@@ -151,19 +151,32 @@ function _showRestartTerminal(message) {
     if (dismiss) dismiss.remove();
 }
 
+// Module-level so a second _startHealthPolling() call is a no-op instead of a
+// second overlapping interval. The remote-access apply path and the WS
+// `restart_started` handler both call this on the initiating tab; without the
+// guard that tab would run two 1.5s pollers (and, the day reload becomes
+// non-idempotent, double-fire).
+let _healthPollInterval = null;
+
 function _startHealthPolling() {
     // Never poll on a terminal modal: this page is not coming back.
     const existing = document.getElementById('upgrade-modal');
     if (existing && existing.dataset.terminal === '1') return;
+    if (_healthPollInterval !== null) return;  // already polling
     _updateUpgradeModal('Restarting\u2026');
     const deadline = Date.now() + 30000;
-    const interval = setInterval(async () => {
+    _healthPollInterval = setInterval(async () => {
         try {
             const res = await fetch('/api/health', { cache: 'no-store' });
-            if (res.ok) { clearInterval(interval); location.reload(); }
+            if (res.ok) {
+                clearInterval(_healthPollInterval);
+                _healthPollInterval = null;
+                location.reload();
+            }
         } catch (_) { /* server not up yet */ }
         if (Date.now() > deadline) {
-            clearInterval(interval);
+            clearInterval(_healthPollInterval);
+            _healthPollInterval = null;
             _showUpgradeError('Restart is taking longer than expected \u2014 you may need to restart jacked manually.');
         }
     }, 1500);

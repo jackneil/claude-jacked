@@ -225,11 +225,12 @@ class TestServiceRunner:
 
     @patch("jacked.service.tray.pystray", create=True)
     @patch("jacked.service.tray.uvicorn")
-    def test_start_uvicorn_raises_systemexit_on_bind_conflict(
+    def test_start_uvicorn_cold_start_raises_systemexit_on_bind_conflict(
         self, mock_uvicorn, mock_pystray,
     ):
-        """A create_sockets OSError (port in use) surfaces synchronously as
-        SystemExit with the friendly message, not a silent daemon-thread death."""
+        """At COLD START a create_sockets OSError surfaces as SystemExit with the
+        friendly message, so the boot exits cleanly rather than dying silently in
+        the daemon thread."""
         _skip_if_no_tray()
         from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
@@ -245,8 +246,39 @@ class TestServiceRunner:
                   side_effect=OSError("Failed to bind 127.0.0.1:8321")),
             pytest.raises(SystemExit) as exc_info,
         ):
-            runner._start_uvicorn()
+            runner._start_uvicorn(cold_start=True)
         assert "already in use" in str(exc_info.value)
+
+    @patch("jacked.service.tray.pystray", create=True)
+    @patch("jacked.service.tray.uvicorn")
+    def test_start_uvicorn_restart_raises_oserror_not_systemexit(
+        self, mock_uvicorn, mock_pystray,
+    ):
+        """On the RESTART path (default), a create_sockets bind failure must
+        raise OSError (an Exception), NOT SystemExit (a BaseException), so
+        _on_restart's `except Exception` retry loop can catch it and fall back to
+        the "stopped" state instead of the exception escaping and stranding a
+        dead dashboard."""
+        _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        with (
+            patch("jacked.service.bind.resolve_bind", return_value=plan),
+            patch("jacked.service.bind.create_sockets",
+                  side_effect=OSError("Failed to bind 127.0.0.1:8321")),
+        ):
+            with pytest.raises(OSError):
+                runner._start_uvicorn()  # default: restart mode
+            # And prove it is NOT a SystemExit (BaseException) escaping the loop.
+            with pytest.raises(Exception) as exc_info:
+                runner._start_uvicorn()
+            assert not isinstance(exc_info.value, SystemExit)
 
     def test_on_restart_handles_exception(self):
         _skip_if_no_tray()

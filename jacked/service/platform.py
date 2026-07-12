@@ -340,10 +340,17 @@ def install_autostart(
             capture_output=True, text=True,
         )
         if bootstrap.returncode != 0:
-            logger.warning(
-                "launchctl bootstrap exit %d: %s",
-                bootstrap.returncode,
-                (bootstrap.stderr or bootstrap.stdout or "").strip(),
+            err = (bootstrap.stderr or bootstrap.stdout or "").strip()
+            logger.warning("launchctl bootstrap exit %d: %s", bootstrap.returncode, err)
+            # Do NOT claim "running now" — the job never loaded, RunAtLoad never
+            # fired, and the bind the user just set did not take effect. Report
+            # the truth so the CLI/caller does not print a false success.
+            return (
+                f"Installed launchd agent: {plist_path}\n"
+                f"  WARNING: it did not start (launchctl bootstrap exit "
+                f"{bootstrap.returncode}: {err or 'no output'}). "
+                "It will start at next login/reboot, or run "
+                "`jacked service start` to start it now."
             )
         return (
             f"Installed and started launchd agent: {plist_path}\n"

@@ -626,6 +626,71 @@ class TestServiceStartBootMigration:
         assert mock_runner_cls.call_args.kwargs["host"] is None
         assert "--host" not in plist.read_text()
 
+    def test_stale_launchd_replay_is_ignored_when_db_configured(
+        self, monkeypatch, tmp_path,
+    ):
+        """CRITICAL regression: the disk artifact is already host-free (this
+        version stripped it), but launchd replays a STALE in-memory `--host
+        0.0.0.0` on a crash-respawn/kickstart. With remote access configured in
+        the DB as OFF, the stale host must be IGNORED so the dashboard is not
+        silently re-exposed on 0.0.0.0 against the user's saved choice."""
+        import jacked.cli as cli
+
+        monkeypatch.setattr(cli.sys, "platform", "darwin")
+        plist = tmp_path / "ai.hank.jacked.plist"
+        # Host-free artifact (already migrated) — the stale --host is NOT here.
+        hostfree = _legacy_plist("PLACEHOLDER").replace(
+            "        <string>--host</string>\n"
+            "        <string>PLACEHOLDER</string>\n",
+            "",
+        )
+        plist.write_text(hostfree, encoding="utf-8")
+        db = _mem_db(monkeypatch)
+        db.set_setting("remote_access_enabled", "false")  # user turned it OFF
+        with (
+            patch("jacked.service.platform._get_launchd_plist_path",
+                  return_value=plist),
+            patch("jacked.service.tray.ServiceRunner") as mock_runner_cls,
+        ):
+            mock_runner_cls.return_value.run.return_value = None
+            result = CliRunner().invoke(
+                cli.main, ["service", "start", "--host", "0.0.0.0"]
+            )
+        assert result.exit_code == 0, result.output
+        # Stale --host ignored -> runner gets None -> resolve_bind reads the DB.
+        assert mock_runner_cls.call_args.kwargs["host"] is None
+        assert db.get_setting("remote_access_enabled") == "false"
+
+    def test_hostfree_artifact_honors_typed_host_when_db_unconfigured(
+        self, monkeypatch, tmp_path,
+    ):
+        """Backward compat: host-free artifact, a typed --host, and NO DB
+        remote-access setting (legacy pure-CLI user who never used the GUI) ->
+        the typed host is honored as a one-shot override."""
+        import jacked.cli as cli
+
+        monkeypatch.setattr(cli.sys, "platform", "darwin")
+        plist = tmp_path / "ai.hank.jacked.plist"
+        hostfree = _legacy_plist("PLACEHOLDER").replace(
+            "        <string>--host</string>\n"
+            "        <string>PLACEHOLDER</string>\n",
+            "",
+        )
+        plist.write_text(hostfree, encoding="utf-8")
+        db = _mem_db(monkeypatch)
+        assert db.get_setting("remote_access_enabled") is None  # precondition
+        with (
+            patch("jacked.service.platform._get_launchd_plist_path",
+                  return_value=plist),
+            patch("jacked.service.tray.ServiceRunner") as mock_runner_cls,
+        ):
+            mock_runner_cls.return_value.run.return_value = None
+            result = CliRunner().invoke(
+                cli.main, ["service", "start", "--host", "192.168.1.5"]
+            )
+        assert result.exit_code == 0, result.output
+        assert mock_runner_cls.call_args.kwargs["host"] == "192.168.1.5"
+
 
 class TestServiceInstallRemoteAccessParity:
     """`service install --host X` maps X onto the dashboard Remote access

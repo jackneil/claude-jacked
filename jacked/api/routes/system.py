@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -798,8 +797,15 @@ async def _do_upgrade(ws_registry) -> None:
             await _upgrade_broadcast(ws_registry, "upgrade_complete",
                                      {"message": "Restarting server\u2026"})
             await asyncio.sleep(1.5)  # let WS message flush
-            # Replace the running process with a fresh start — entry point shebang picks up new venv
-            os.execv(sys.argv[0], sys.argv)
+            # Replace the running process with a fresh start (picks up the new
+            # venv). Use the shared exec-target resolver, not a raw
+            # os.execv(sys.argv[0], ...): under `python -m jacked` / `pythonw
+            # -m jacked` argv[0] is __main__.py (no exec bit) and a raw execv
+            # raises OSError, stranding the dashboard on the old code.
+            from jacked.service.restart import _exec_target
+
+            prog, argv = _exec_target()
+            os.execv(prog, argv)
 
         except Exception as exc:
             await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": str(exc)})

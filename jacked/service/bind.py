@@ -224,11 +224,22 @@ def _detect_via_udp() -> str | None:
     try:
         sock.connect((_TAILSCALE_SERVICE_IP, 80))
         local_ip = sock.getsockname()[0]
-    except OSError:
+    except OSError as exc:
+        # Diagnostic breadcrumb: distinguish "no route to the tailnet" (daemon
+        # down / not on the tailnet) from the other miss modes below, so an
+        # on-call can tell WHY the bind fell back to loopback, not just THAT it
+        # did. debug-level: normal on a machine that never runs Tailscale.
+        logger.debug("Tailscale UDP route detection failed (%s)", exc)
         return None
     finally:
         sock.close()
-    return local_ip if _in_cgnat_range(local_ip) else None
+    if _in_cgnat_range(local_ip):
+        return local_ip
+    logger.debug(
+        "Tailscale UDP route detection returned %s, outside 100.64.0.0/10; "
+        "not a tailnet address", local_ip,
+    )
+    return None
 
 
 def _detect_via_cli() -> str | None:
@@ -246,14 +257,24 @@ def _detect_via_cli() -> str | None:
             timeout=3,
             creationflags=NO_WINDOW,  # hidden console on Windows, no-op on POSIX
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
         # FileNotFoundError (⊂ OSError), TimeoutExpired (⊂ SubprocessError), ...
+        # debug-level so an on-call can distinguish "binary missing" from "CLI
+        # hung/timed out" when triaging a loopback fallback.
+        logger.debug("`tailscale ip -4` could not run (%s: %s)",
+                     type(exc).__name__, exc)
         return None
     if result.returncode != 0:
+        logger.debug("`tailscale ip -4` exit %d: %s", result.returncode,
+                     (result.stderr or result.stdout or "").strip())
         return None
     lines = (result.stdout or "").splitlines()
     first_line = lines[0].strip() if lines else ""
-    return first_line if _in_cgnat_range(first_line) else None
+    if _in_cgnat_range(first_line):
+        return first_line
+    logger.debug("`tailscale ip -4` returned %r, not a 100.64.0.0/10 address",
+                 first_line)
+    return None
 
 
 def detect_tailscale_ip() -> str | None:

@@ -48,6 +48,44 @@
     outline-offset: 2px;
 }
 
+/* Danger confirm — for destructive / exposure-widening actions (e.g. binding
+   the unauthenticated dashboard to all interfaces). SweetAlert2's inline
+   `confirmButtonColor` is swallowed by the base `.swal2-confirm !important`
+   above, so a dedicated class is the only way the "loud" dialog reads loud. */
+.swal2-confirm.swal-confirm-danger {
+    background: #dc2626 !important;
+}
+
+.swal2-confirm.swal-confirm-danger:hover {
+    background: #b91c1c !important;
+}
+
+/* Restore a severity-true warning icon (the generic slate override above mutes
+   the `icon: 'warning'` that the danger dialogs rely on). */
+.swal2-icon.swal2-warning {
+    border-color: #f59e0b !important;
+    color: #f59e0b !important;
+}
+
+/* Checkbox input (Swal `input: 'checkbox'`, e.g. the mandatory "I understand"
+   acknowledgement). Swal's default renders it on a white strip with inherited
+   near-white text — illegible on the dark popup. */
+.swal2-checkbox {
+    background: transparent !important;
+    color: #cbd5e1 !important;
+    font-size: 0.85rem !important;
+}
+
+.swal2-checkbox input {
+    accent-color: #dc2626;
+    margin-inline-end: 0.5rem;
+}
+
+.swal2-validation-message {
+    background: #0f172a !important;
+    color: #fca5a5 !important;
+}
+
 .swal2-actions {
     gap: 0.5rem !important;
 }

@@ -370,6 +370,15 @@ body {
     height: 0;
 }
 
+/* Keyboard focus indicator: the native checkbox is visually hidden, so a
+   keyboard user gets no cue on the toggle without this. Matters most for the
+   Remote access toggle, which opens the unauthenticated dashboard to the
+   network. */
+.toggle-switch input:focus-visible + .toggle-slider {
+    outline: 2px solid #3b82f6;
+    outline-offset: 2px;
+}
+
 .toggle-slider {
     position: absolute;
     cursor: pointer;

@@ -316,7 +316,7 @@ class ServiceRunner:
         # every successful start/restart.
         self._started_at: float | None = None
 
-    def _start_uvicorn(self) -> threading.Thread:
+    def _start_uvicorn(self, cold_start: bool = False) -> threading.Thread:
         """Resolve the bind plan, pre-bind its sockets, and serve in a daemon
         thread.
 
@@ -325,10 +325,16 @@ class ServiceRunner:
         toggle takes effect on the next restart without a process replacement.
 
         ``create_sockets`` runs in the CALLING thread so a bind failure
-        (EADDRINUSE / a vanished pinned IP) surfaces synchronously as
-        ``SystemExit`` with the friendly "port in use" message, instead of
+        (EADDRINUSE / a vanished pinned IP) surfaces synchronously instead of
         dying invisibly inside the daemon thread the way ``server.run()`` used
         to. uvicorn then ``listen()``s the pre-bound sockets we hand it.
+
+        On a bind failure: at COLD START (``cold_start=True``, the boot paths)
+        we raise ``SystemExit`` with the friendly "port in use" message so the
+        service exits cleanly. On a RESTART (default) we raise ``OSError`` so
+        ``_on_restart``'s retry loop — which catches ``Exception``, not
+        ``BaseException`` — can catch it, retry, and fall back to the "stopped"
+        icon instead of the exception escaping and stranding a dead dashboard.
         """
         from jacked.service.bind import (
             create_sockets,
@@ -349,11 +355,16 @@ class ServiceRunner:
         try:
             socks = create_sockets(plan)
         except OSError as exc:
-            raise SystemExit(
-                f"Port {self.port} is already in use.\n"
-                "Is another jacked instance running? Check with: jacked service status\n"
-                "Use --port to run on a different port."
-            ) from exc
+            if cold_start:
+                raise SystemExit(
+                    f"Port {self.port} is already in use.\n"
+                    "Is another jacked instance running? Check with: jacked service status\n"
+                    "Use --port to run on a different port."
+                ) from exc
+            # Restart path: propagate as OSError so _on_restart's retry loop
+            # (except Exception) can catch it, retry, and show the "stopped"
+            # state instead of a BaseException escaping the loop.
+            raise
 
         config = uvicorn.Config(
             "jacked.api.main:app",
@@ -398,7 +409,15 @@ class ServiceRunner:
         in use. We bind+close a probe socket with SO_REUSEADDR on each address
         the current plan listens on; the port is only "free" when they ALL bind.
         Falls back to loopback when no plan has been resolved yet (never started).
+
+        An address that is no longer assignable on this host (``EADDRNOTAVAIL``)
+        is treated as free, NOT as still-in-use: if a pinned Tailscale IP
+        vanished (tailnet down, sleep/wake) it cannot be bound and it cannot be
+        holding the port, so waiting the full timeout on it would only strand a
+        restart that is about to re-resolve to a loopback-only plan. Only
+        ``EADDRINUSE`` counts as genuinely occupied.
         """
+        import errno
         import socket
         import time
 
@@ -415,8 +434,12 @@ class ServiceRunner:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.bind((addr, self.port))
                     probes.append(sock)
-                except OSError:
+                except OSError as exc:
                     sock.close()
+                    # An unassignable address can't be holding the port; skip it.
+                    # Anything else (notably EADDRINUSE) means keep waiting.
+                    if exc.errno == errno.EADDRNOTAVAIL:
+                        continue
                     all_free = False
                     break
             for sock in probes:
@@ -981,7 +1004,7 @@ class ServiceRunner:
         threading.Thread(
             target=self._check_version, name="jacked-version-check", daemon=True
         ).start()
-        self._uvicorn_thread = self._start_uvicorn()
+        self._uvicorn_thread = self._start_uvicorn(cold_start=True)
         if self._wait_for_ready():
             self._started_at = time.time()
             logger.info(
@@ -1069,7 +1092,7 @@ class ServiceRunner:
 
         # Start the one uvicorn (daemon thread) and health-check it before the
         # status item appears, so the first pill reflects real data.
-        self._uvicorn_thread = self._start_uvicorn()
+        self._uvicorn_thread = self._start_uvicorn(cold_start=True)
         if self._wait_for_ready():
             self._started_at = time.time()
             logger.info(

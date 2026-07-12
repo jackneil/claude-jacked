@@ -7,7 +7,7 @@ generated host-free, so a user who once ran ``jacked service install --host
 0.0.0.0`` must have that intent captured in the DB *before* the old artifact is
 overwritten or its argv neutralized. This module owns that capture:
 
-- :func:`extract_baked_host` / :func:`extract_baked_port` parse an artifact's
+- :func:`extract_baked_host` parses the baked ``--host`` out of an artifact's
   text without ever raising on malformed input.
 - :func:`strip_baked_host` rewrites artifact text host-free while preserving
   everything else (binary path, port, environment) byte-for-byte.
@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 #     <string>--host</string>
 #     <string>X</string>
 _PLIST_HOST_RE = re.compile(r"<string>\s*--host\s*</string>\s*<string>([^<]*)</string>")
-_PLIST_PORT_RE = re.compile(r"<string>\s*--port\s*</string>\s*<string>([^<]*)</string>")
 # Same pair including surrounding whitespace/newlines, for host-free rewriting.
 _PLIST_HOST_STRIP_RE = re.compile(
     r"[ \t]*<string>\s*--host\s*</string>\s*<string>[^<]*</string>[ \t]*\n?"
@@ -40,7 +39,6 @@ _PLIST_HOST_STRIP_RE = re.compile(
 # Windows VBS: a single WshShell.Run command line carrying `--host X`.
 # Hosts are IP literals or hostnames; stop before the VBS quote/comma tail.
 _VBS_HOST_RE = re.compile(r"--host\s+([\w.:\-]+)")
-_VBS_PORT_RE = re.compile(r"--port\s+(\d+)")
 _VBS_HOST_STRIP_RE = re.compile(r"\s--host\s+[\w.:\-]+")
 
 
@@ -65,23 +63,6 @@ def extract_baked_host(artifact_text: str, kind: str) -> str | None:
     return host or None
 
 
-def extract_baked_port(artifact_text: str, kind: str) -> int | None:
-    """The ``--port`` value baked into an autostart artifact, or ``None``."""
-    try:
-        if kind == "plist":
-            match = _PLIST_PORT_RE.search(artifact_text)
-        elif kind == "vbs":
-            match = _VBS_PORT_RE.search(artifact_text)
-        else:
-            return None
-    except TypeError:
-        return None
-    if match is None:
-        return None
-    try:
-        return int(match.group(1).strip())
-    except ValueError:
-        return None
 
 
 def strip_baked_host(artifact_text: str, kind: str) -> str:
@@ -163,9 +144,14 @@ def migrate_baked_host_to_db(host: str, db=None) -> str:
             )
             logger.info(msg)
             return msg
-        db.set_setting("remote_access_enabled", enabled)
+        # Write scope FIRST, then the guard key `remote_access_enabled` LAST.
+        # If the second write fails mid-migration, `remote_access_enabled` stays
+        # absent, so the guard above lets a later boot retry the whole migration
+        # cleanly instead of the intent sticking half-applied (enabled set, scope
+        # missing) and being permanently downgraded to the default scope.
         if scope is not None:
             db.set_setting("remote_access_scope", scope)
+        db.set_setting("remote_access_enabled", enabled)
     except Exception as exc:  # sqlite errors, unreadable DB path ...
         msg = f"could not migrate baked host {host}: {exc}"
         logger.warning(msg)
@@ -173,3 +159,26 @@ def migrate_baked_host_to_db(host: str, db=None) -> str:
     msg = f"migrated baked host {host} to remote access: enabled, scope {scope}"
     logger.info(msg)
     return msg
+
+
+def remote_access_configured(db=None) -> bool:
+    """True if remote access has been configured via the GUI or CLI parity.
+
+    ``remote_access_enabled`` is present in the settings DB exactly when a user
+    has set remote access through the dashboard toggle or ``service
+    install/restart --host`` (which persists it). When it is present the DB is
+    the authoritative source for the service/autostart bind, and a ``--host``
+    reaching ``service start`` from a stale launchd in-memory replay must be
+    ignored. Absent means a legacy pure-CLI setup that never used the DB channel,
+    where an explicit ``--host`` is still honored. Never raises.
+    """
+    try:
+        if db is None:
+            from jacked.web.database import Database
+
+            db = Database()
+        return db.get_setting("remote_access_enabled") is not None
+    except Exception as exc:  # a broken DB must not crash boot resolution
+        logger.warning("Could not read remote-access setting (%s); "
+                       "treating as unconfigured", exc)
+        return False

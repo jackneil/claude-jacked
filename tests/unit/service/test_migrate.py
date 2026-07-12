@@ -7,9 +7,9 @@ import pytest
 
 from jacked.service.migrate import (
     extract_baked_host,
-    extract_baked_port,
     map_host_to_setting,
     migrate_baked_host_to_db,
+    remote_access_configured,
     strip_baked_host,
 )
 
@@ -109,18 +109,6 @@ class TestExtractBakedHostVbs:
     @pytest.mark.parametrize("text", ["", "WshShell garbage", "--host"])
     def test_malformed_returns_none_without_raising(self, text):
         assert extract_baked_host(text, "vbs") is None
-
-
-class TestExtractBakedPort:
-    def test_plist_port(self):
-        assert extract_baked_port(_plist("0.0.0.0", port=9000), "plist") == 9000
-
-    def test_vbs_port(self):
-        assert extract_baked_port(_vbs_exe("0.0.0.0", port=9000), "vbs") == 9000
-
-    def test_missing_port_returns_none(self):
-        assert extract_baked_port("no port here", "plist") is None
-        assert extract_baked_port("no port here", "vbs") is None
 
 
 class TestStripBakedHost:
@@ -232,3 +220,45 @@ class TestMigrateBakedHostToDb:
 
         msg = migrate_baked_host_to_db("0.0.0.0", db=_BoomDb())  # must not raise
         assert "could not migrate" in msg
+
+    def test_scope_written_before_guard_key_so_partial_write_self_heals(self):
+        """The guard key `remote_access_enabled` must be written LAST. If the
+        scope write is the one that lands but enabled fails, the guard stays
+        absent so a later boot retries cleanly instead of sticking a half-applied
+        intent (enabled set, scope missing -> silently downgraded to default)."""
+        writes = []
+
+        class _PartialDb:
+            def get_setting(self, key):
+                return None  # key absent -> migration proceeds
+
+            def set_setting(self, key, value):
+                writes.append(key)
+                if key == "remote_access_enabled":
+                    raise RuntimeError("write failed after scope landed")
+
+        msg = migrate_baked_host_to_db("0.0.0.0", db=_PartialDb())  # must not raise
+        assert "could not migrate" in msg
+        # scope was attempted BEFORE the guard key (so the guard never landed).
+        assert writes == ["remote_access_scope", "remote_access_enabled"]
+
+
+class TestRemoteAccessConfigured:
+    def test_absent_key_is_unconfigured(self, db):
+        assert remote_access_configured(db=db) is False
+
+    def test_present_enabled_true_is_configured(self, db):
+        db.set_setting("remote_access_enabled", "true")
+        assert remote_access_configured(db=db) is True
+
+    def test_present_enabled_false_is_still_configured(self, db):
+        # 'false' is a deliberate GUI/CLI choice -> the DB is authoritative.
+        db.set_setting("remote_access_enabled", "false")
+        assert remote_access_configured(db=db) is True
+
+    def test_db_error_treated_as_unconfigured_without_raising(self):
+        class _BoomDb:
+            def get_setting(self, key):
+                raise RuntimeError("db is toast")
+
+        assert remote_access_configured(db=_BoomDb()) is False

@@ -117,38 +117,50 @@ async def restart_remote_access(request: Request):
             status_code=409, content={"detail": "Restart already in progress"}
         )
 
-    # Include the just-saved settings so every client can decide how to react:
-    # a remote browser that sees enabled=false knows this page will not
-    # reconnect (loopback-only re-bind) and shows a terminal message instead of
-    # health-polling forever. Read from the DB so the payload reflects what was
-    # actually persisted by the preceding PUT.
-    enabled, scope = _read_enabled_scope(_get_db(request))
-    ws_registry = getattr(request.app.state, "ws_registry", None)
-    await _restart_broadcast(
-        ws_registry,
-        "restart_started",
-        {
-            "message": "Applying network settings...",
-            "enabled": enabled,
-            "scope": scope,
-        },
-    )
+    # Everything between acquire() and a SUCCESSFUL Thread.start() must release
+    # the lock on any failure, or the lock leaks permanently and every future
+    # restart returns 409 forever until the process is restarted. The DB read
+    # (a sqlite "database is locked" is possible right after the preceding PUT
+    # writer) and Thread.start() (thread exhaustion) can both raise.
+    try:
+        # Include the just-saved settings so every client can decide how to
+        # react: a remote browser that sees enabled=false knows this page will
+        # not reconnect (loopback-only re-bind) and shows a terminal message
+        # instead of health-polling forever. Read from the DB so the payload
+        # reflects what was actually persisted by the preceding PUT.
+        enabled, scope = _read_enabled_scope(_get_db(request))
+        ws_registry = getattr(request.app.state, "ws_registry", None)
+        await _restart_broadcast(
+            ws_registry,
+            "restart_started",
+            {
+                "message": "Applying network settings...",
+                "enabled": enabled,
+                "scope": scope,
+            },
+        )
 
-    def _do_restart():
-        try:
-            # Let the WS frame + this HTTP response flush before we tear down.
-            time.sleep(1.5)
-            from jacked.service.restart import restart_service_now
+        def _do_restart():
+            try:
+                # Let the WS frame + this HTTP response flush before we tear down.
+                time.sleep(1.5)
+                from jacked.service.restart import restart_service_now
 
-            restart_service_now()
-        finally:
-            # Reached only if restart_service_now RETURNED — the tray handler
-            # path (in-process restart). Release so a later apply can run. The
-            # execv path never returns, so the lock stays held for that
-            # process's brief remaining life, which is fine.
-            lock.release()
+                restart_service_now()
+            finally:
+                # Reached only if restart_service_now RETURNED — the tray handler
+                # path (in-process restart). Release so a later apply can run. The
+                # execv path never returns, so the lock stays held for that
+                # process's brief remaining life, which is fine.
+                lock.release()
 
-    threading.Thread(
-        target=_do_restart, name="jacked-remote-access-restart", daemon=True
-    ).start()
+        threading.Thread(
+            target=_do_restart, name="jacked-remote-access-restart", daemon=True
+        ).start()
+    except BaseException:
+        # The daemon thread never started (or the body raised before it did),
+        # so its finally-release will never run — release here so the endpoint
+        # doesn't wedge on a stuck lock.
+        lock.release()
+        raise
     return {"status": "started"}

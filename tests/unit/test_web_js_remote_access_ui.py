@@ -230,9 +230,12 @@ out({ html });
         assert "Tailscale only" in html
         assert "Recommended" in html
         assert "All interfaces" in html
-        # URL hint + Tailscale annotation come from the effective state.
+        # URL hint + Tailscale annotation come from the effective state. The
+        # address is mono and the "(Tailscale)" annotation is a separate prose
+        # span, so they are present but not one contiguous string.
         assert "http://100.64.12.7:8321" in html
-        assert "100.64.12.7 (Tailscale)" in html
+        assert "100.64.12.7" in html
+        assert "(Tailscale)" in html
 
     def test_fallback_reason_renders_warning_chip(self, tmp_path):
         result = _run(tmp_path, r"""
@@ -356,7 +359,7 @@ class TestSaveFlow:
     out({
         input: opts && opts.input,
         hasValidator: !!(opts && opts.inputValidator),
-        confirmColor: opts && opts.confirmButtonColor,
+        confirmClass: opts && opts.customClass && opts.customClass.confirmButton,
         icon: opts && opts.icon,
         placeholder: (opts && opts.inputPlaceholder) || '',
         html: (opts && opts.html) || '',
@@ -367,7 +370,9 @@ class TestSaveFlow:
 """)
         assert result["input"] == "checkbox"
         assert result["hasValidator"] is True
-        assert result["confirmColor"] == "#dc2626"
+        # Danger confirm uses the customClass (inline confirmButtonColor is
+        # swallowed by swal-dark.css's !important base rule).
+        assert result["confirmClass"] == "swal-confirm-danger"
         assert result["icon"] == "warning"
         # The mandatory acknowledgment is the checkbox label.
         assert "without authentication" in result["placeholder"]
@@ -483,6 +488,61 @@ class TestLockout:
         assert result["modals"] == 1     # normal restart overlay
         assert result["polled"] == 1
 
+    def test_restart_409_is_not_an_error_and_still_shows_overlay(self, tmp_path):
+        """A 409 on POST restart (another tab already applying) is NOT a failure:
+        the setting saved and a restart is in flight, so show the overlay, do not
+        pop a scary error, and do not revert — mirroring the upgrade flow."""
+        result = _run(tmp_path, r"""
+(async () => {
+    global.window.location = { hostname: '127.0.0.1', port: '8321' };
+    global.api.get = async () => ({
+        enabled: false, scope: 'tailscale',
+        effective: { mode: 'loopback', addresses: ['127.0.0.1'],
+                     tailscale_ip: null, fallback_reason: null },
+    });
+    const container = __makeEl('div');
+    await renderRemoteAccessCard(container);
+
+    global.Swal = { fire: async () => ({ isConfirmed: true }) };
+    let putCount = 0; global.api.put = async () => { putCount++; return {}; };
+    // POST rejects with a 409 (ApiError-shaped: carries .status).
+    global.api.post = async () => { const e = new Error('Restart already in progress'); e.status = 409; throw e; };
+    const modals = []; global._showUpgradeModal = (m) => modals.push(m);
+    const errors = []; global._showUpgradeError = (m) => errors.push(m);
+    let polled = 0; global._startHealthPolling = () => { polled++; };
+
+    const res = await _applyRemoteAccessChange(container, { enabled: true, scope: 'tailscale' });
+    out({
+        applied: res.applied, reverted: res.reverted, error: res.error || false,
+        putCount, modals: modals.length, errors: errors.length, polled,
+    });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["applied"] is True
+        assert result["reverted"] is False
+        assert result["error"] is False          # 409 is not an error
+        assert result["putCount"] == 1
+        assert result["errors"] == 0             # no scary error dialog
+        assert result["modals"] == 1             # overlay still shown
+        assert result["polled"] == 1
+
+    def test_terminal_message_helper_is_shared_and_keyed_on_enabled(self, tmp_path):
+        """remoteAccessTerminalMessage is the single source both the inline apply
+        path and the websocket handler use, so their terminal copy can't drift."""
+        result = _run(tmp_path, r"""
+out({
+    exported: typeof global.window.remoteAccessTerminalMessage === 'function',
+    disabled: remoteAccessTerminalMessage({ enabled: false }),
+    scopeSwitch: remoteAccessTerminalMessage({ enabled: true, scope: 'tailscale' }),
+});
+""")
+        assert result["exported"] is True
+        assert "will not reconnect" in result["disabled"]
+        assert "off" in result["disabled"].lower()
+        assert "will not reconnect" in result["scopeSwitch"]
+        assert "Tailscale address" in result["scopeSwitch"]
+
     def test_scope_switch_from_lan_ip_shows_terminal_and_does_not_poll(self, tmp_path):
         """Narrowing scope to Tailscale-only while browsing from a bare LAN IP is a
         lockout even though remote access stays ON: the tailnet-only bind drops the
@@ -515,7 +575,7 @@ class TestLockout:
         putBody: puts[0] ? puts[0][1] : null,
         confirmTitle: confirmOpts && confirmOpts.title,
         confirmHtml: (confirmOpts && confirmOpts.html) || '',
-        confirmColor: confirmOpts && confirmOpts.confirmButtonColor,
+        confirmClass: confirmOpts && confirmOpts.customClass && confirmOpts.customClass.confirmButton,
         terminals, modals, polled,
     });
     process.exit(0);
@@ -535,7 +595,7 @@ class TestLockout:
         assert len(result["modals"]) == 0
         # Confirm copy is the scope-switch variant: cites loopback + the Tailscale
         # address, and does NOT falsely claim remote access is being turned off.
-        assert result["confirmColor"] == "#dc2626"
+        assert result["confirmClass"] == "swal-confirm-danger"
         assert "127.0.0.1" in result["confirmHtml"]
         assert "Tailscale address" in result["confirmHtml"]
         assert "will not reconnect" in result["confirmHtml"]
@@ -613,6 +673,23 @@ out({
         assert result["guardWouldPollAfterPollable"] is True
         assert result["afterSecondPoll"]["msg"] == "Restarting…"
         assert result["afterSecondPoll"]["intervals"] == 1
+
+    def test_start_health_polling_is_idempotent(self, tmp_path):
+        """The initiating tab calls _startHealthPolling both inline and from its
+        own WS restart_started broadcast. A second call while one is already
+        running must be a no-op (one interval), not a second overlapping poller."""
+        snippet = r"""
+let intervalsStarted = 0;
+global.setInterval = () => { intervalsStarted++; return intervalsStarted; };
+global.clearInterval = () => {};
+global.fetch = async () => ({ ok: false });
+
+_startHealthPolling();   // first: arms one interval
+_startHealthPolling();   // second: must be a no-op while the first runs
+out({ intervals: intervalsStarted });
+"""
+        result = _run_js(tmp_path, snippet, js_file=HEADER_JS)
+        assert result["intervals"] == 1
 
 
 # ---------------------------------------------------------------------------

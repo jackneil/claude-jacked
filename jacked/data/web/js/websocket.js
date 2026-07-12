@@ -509,9 +509,11 @@ jackedWS.on('restart_started', (msg) => {
         ? window.remoteAccessLockout(d, host)
         : false;
     if (lockout) {
-        const term = (d.enabled === false)
-            ? 'Remote access is off. This page will not reconnect; open the dashboard on the machine itself.'
-            : 'This page is not on your tailnet, so it will not reconnect. Open the dashboard on the machine itself or use its Tailscale address.';
+        // Shared message source with remote-access.js so the inline apply and
+        // this broadcast handler can never show different terminal copy.
+        const term = (typeof window !== 'undefined' && typeof window.remoteAccessTerminalMessage === 'function')
+            ? window.remoteAccessTerminalMessage(d)
+            : 'Remote access changed; this page will not reconnect. Open the dashboard on the machine itself.';
         if (typeof _showRestartTerminal === 'function') _showRestartTerminal(term);
         else if (typeof _showUpgradeModal === 'function') _showUpgradeModal(term);
         return;
