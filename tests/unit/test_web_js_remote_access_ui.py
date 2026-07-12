@@ -24,6 +24,7 @@ from tests.unit.test_web_js_swap_ui import WEB_JS, _run_js
 
 REMOTE_ACCESS_JS = WEB_JS / "components" / "remote-access.js"
 WEBSOCKET_JS = WEB_JS / "websocket.js"
+HEADER_JS = WEB_JS / "components" / "header.js"
 
 EM_DASH = "—"
 
@@ -539,6 +540,79 @@ class TestLockout:
         assert "Tailscale address" in result["confirmHtml"]
         assert "will not reconnect" in result["confirmHtml"]
         assert "Turning off remote access" not in result["confirmHtml"]
+
+
+class TestTerminalModalContract:
+    """The REAL header.js modal functions (not the global stubs the lockout
+    tests use). This is the layer the lockout bug hid in: the terminal modal
+    reuses the #upgrade-modal element, and the WS onclose handler starts health
+    polling whenever that element is present. A terminal modal must mark itself
+    so the disconnect poll and _startHealthPolling both leave it alone, or a
+    remote page that turned remote access off gets its terminal message
+    clobbered by 'Restarting...' and a doomed poll against a dead origin."""
+
+    def test_terminal_marks_modal_and_blocks_poll_until_pollable_modal_clears_it(
+        self, tmp_path
+    ):
+        snippet = r"""
+// _startHealthPolling touches setInterval/fetch only if the terminal guard
+// FAILS. Stub them so a regression fails by assertion, not a node crash.
+let intervalsStarted = 0;
+global.setInterval = () => { intervalsStarted++; return 1; };
+global.clearInterval = () => {};
+global.fetch = async () => ({ ok: false });
+
+const msgText = () => { const m = global.document.getElementById('upgrade-modal-msg'); return m ? m.textContent : null; };
+// `?? null`: a cleared marker is `undefined`, which JSON.stringify would drop
+// (turning {terminal: undefined} into {}); null round-trips so the assert can
+// distinguish "marker cleared" from "key never emitted".
+const modalTerminal = () => { const md = global.document.getElementById('upgrade-modal'); return md ? (md.dataset.terminal ?? null) : null; };
+
+// 1. Terminal modal marks itself and shows its message.
+_showRestartTerminal('Remote access is off. This page will not reconnect.');
+const afterTerminal = { terminal: modalTerminal(), msg: msgText() };
+
+// 2. The WS disconnect guard: it polls only when the modal is NOT terminal.
+//    Reproduce the exact websocket.js onclose condition against the real modal.
+const md1 = global.document.getElementById('upgrade-modal');
+const guardWouldPollWhileTerminal = !!(md1 && md1.dataset.terminal !== '1');
+
+// 3. _startHealthPolling itself is a no-op on a terminal modal: the message
+//    must NOT flip to 'Restarting...', and no interval starts.
+_startHealthPolling();
+const afterPollAttempt = { msg: msgText(), intervals: intervalsStarted };
+
+// 4. A pollable modal (_showUpgradeModal) clears the terminal marker, so a
+//    later real restart on the SAME element polls normally again.
+_showUpgradeModal('Applying network settings...');
+const afterPollable = { terminal: modalTerminal() };
+const guardWouldPollAfterPollable = (() => {
+    const md = global.document.getElementById('upgrade-modal');
+    return !!(md && md.dataset.terminal !== '1');
+})();
+_startHealthPolling();
+const afterSecondPoll = { msg: msgText(), intervals: intervalsStarted };
+
+out({
+    afterTerminal, guardWouldPollWhileTerminal,
+    afterPollAttempt, afterPollable, guardWouldPollAfterPollable,
+    afterSecondPoll,
+});
+"""
+        result = _run_js(tmp_path, snippet, js_file=HEADER_JS)
+        # 1. Terminal modal is marked and shows its own message.
+        assert result["afterTerminal"]["terminal"] == "1"
+        assert "will not reconnect" in result["afterTerminal"]["msg"]
+        # 2. The disconnect guard would NOT poll while the modal is terminal.
+        assert result["guardWouldPollWhileTerminal"] is False
+        # 3. _startHealthPolling no-ops: message stays terminal, no interval armed.
+        assert "will not reconnect" in result["afterPollAttempt"]["msg"]
+        assert result["afterPollAttempt"]["intervals"] == 0
+        # 4. A pollable modal clears the marker; polling resumes for a real restart.
+        assert result["afterPollable"]["terminal"] is None
+        assert result["guardWouldPollAfterPollable"] is True
+        assert result["afterSecondPoll"]["msg"] == "Restarting…"
+        assert result["afterSecondPoll"]["intervals"] == 1
 
 
 # ---------------------------------------------------------------------------

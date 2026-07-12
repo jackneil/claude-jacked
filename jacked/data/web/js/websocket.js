@@ -122,8 +122,12 @@ const jackedWS = {
             document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
             // Cancel any pending watchdogs — they'd clobber the fresh render on reconnect.
             _clearAllCheckingWatchdogs();
-            // If upgrade modal is open and WS drops, server is likely restarting — begin health poll
-            if (document.getElementById('upgrade-modal') && typeof _startHealthPolling === 'function') {
+            // If upgrade modal is open and WS drops, server is likely restarting — begin health poll.
+            // Skip a TERMINAL modal (a remote page that turned remote access off): that page will
+            // never reconnect, so polling would only clobber its terminal message and dead-end on a
+            // false "taking longer than expected" error.
+            const upModal = document.getElementById('upgrade-modal');
+            if (upModal && upModal.dataset.terminal !== '1' && typeof _startHealthPolling === 'function') {
                 _startHealthPolling();
             }
             this._scheduleReconnect();

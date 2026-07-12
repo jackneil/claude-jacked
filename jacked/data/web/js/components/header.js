@@ -95,6 +95,9 @@ function _getOrCreateUpgradeModal() {
 function _showUpgradeModal(message) {
     const modal = _getOrCreateUpgradeModal();
     modal.style.display = 'flex';
+    // A pollable/reconnecting modal: clear any terminal marker so the WS
+    // disconnect handler resumes health polling for this one.
+    delete modal.dataset.terminal;
     const spinner = document.getElementById('upgrade-modal-spinner');
     if (spinner) spinner.style.display = '';
     const msg = document.getElementById('upgrade-modal-msg');
@@ -129,9 +132,17 @@ function _showUpgradeError(message) {
 // and NO health polling. Used when the current page will never reconnect (a
 // remote browser turned remote access off, so the server re-binds loopback
 // only). A spinner here would imply "reconnecting" and never resolve.
+//
+// The `data-terminal` marker is load-bearing: this modal reuses the #upgrade-modal
+// element, and the WS onclose handler starts health polling whenever that element
+// is present. When the server re-binds and THIS remote page's socket drops, that
+// handler would otherwise clobber the terminal message with "Restarting..." and
+// poll a dead origin until a false "taking longer than expected" error. The marker
+// tells the disconnect handler (and _startHealthPolling) to leave a terminal modal alone.
 function _showRestartTerminal(message) {
     const modal = _getOrCreateUpgradeModal();
     modal.style.display = 'flex';
+    modal.dataset.terminal = '1';
     const spinner = document.getElementById('upgrade-modal-spinner');
     if (spinner) spinner.style.display = 'none';
     const msg = document.getElementById('upgrade-modal-msg');
@@ -141,6 +152,9 @@ function _showRestartTerminal(message) {
 }
 
 function _startHealthPolling() {
+    // Never poll on a terminal modal: this page is not coming back.
+    const existing = document.getElementById('upgrade-modal');
+    if (existing && existing.dataset.terminal === '1') return;
     _updateUpgradeModal('Restarting\u2026');
     const deadline = Date.now() + 30000;
     const interval = setInterval(async () => {
