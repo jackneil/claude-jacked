@@ -54,8 +54,10 @@ def restart_service_now() -> None:
     Restart stays available for manual recovery.
 
     With no handler (the ``webux`` foreground path), replace the process via
-    ``os.execv``. Argv no longer carries ``--host``, so the fresh process
-    re-resolves the bind from the DB.
+    ``os.execv``. The service/artifact launch path no longer bakes ``--host``
+    into argv, so a re-exec there re-resolves the bind from the DB. (A ``webux
+    --host X`` foreground launch replays its argv verbatim and stays pinned to
+    X, which is the documented CLI-override precedence; see :mod:`jacked.service.bind`.)
     """
     handler = _restart_handler
     if handler is not None:
@@ -67,9 +69,20 @@ def restart_service_now() -> None:
                 "the OLD bind. Use the tray menu's Restart to recover."
             )
         return
-    # No handler: full process replacement (webux foreground path).
+    # No handler: full process replacement (webux foreground path). execv only
+    # returns on failure; when it does, log LOUDLY (matching the handler path)
+    # rather than letting the OSError die on stderr where the tray-log reader
+    # never sees why the restart stranded.
     prog, argv = _exec_target()
-    os.execv(prog, argv)
+    try:
+        os.execv(prog, argv)
+    except OSError:
+        logger.exception(
+            "execv restart failed (%s); the dashboard is still on the OLD bind. "
+            "Restart jacked manually to apply the change.",
+            prog,
+        )
+        raise
 
 
 def _exec_target() -> tuple[str, list[str]]:

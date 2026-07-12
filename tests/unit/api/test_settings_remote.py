@@ -296,3 +296,84 @@ def test_restart_returns_409_when_already_in_progress(client):
         assert "in progress" in resp.json()["detail"].lower()
     finally:
         sr._restart_lock.release()
+
+
+def test_restart_lock_is_reacquirable_after_handler_path_completes(client):
+    """The in-process (handler) restart path must RELEASE the lock so a later
+    apply can run. Regression pin for the daemon-thread finally-release."""
+    fired = threading.Event()
+    set_restart_handler(lambda: fired.set())
+
+    resp = client.post("/api/settings/remote-access/restart")
+    assert resp.status_code == 200
+    assert fired.wait(timeout=4.0), "handler was not invoked"
+    # The daemon thread's finally must have released the lock; prove it is free.
+    acquired = sr._restart_lock.acquire(blocking=True, timeout=2.0)
+    assert acquired, "restart lock was not released after the handler path"
+    sr._restart_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Middleware coverage on the two new security-critical routes.
+#
+# The HostValidationMiddleware (jacked/api/security.py) is app-level, so it
+# guards these routes, but a future refactor (sub-app mount, exemption list)
+# could silently uncover them. Pin the guarantees on the routes themselves, and
+# specifically that the widest bind (JACKED_HOST=0.0.0.0) never loosens them.
+# ---------------------------------------------------------------------------
+
+
+def test_put_remote_access_foreign_origin_is_csrf_403(client):
+    """A cross-site PUT (foreign Origin) to flip the bind must be blocked."""
+    resp = client.put(
+        "/api/settings/remote-access",
+        json={"enabled": True, "scope": "all"},
+        headers={"Origin": "http://evil.example"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CSRF_ORIGIN"
+
+
+def test_post_restart_foreign_origin_is_csrf_403(client):
+    """A cross-site POST to trigger a restart must be blocked."""
+    resp = client.post(
+        "/api/settings/remote-access/restart",
+        headers={"Origin": "http://evil.example"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CSRF_ORIGIN"
+
+
+def test_post_restart_origin_null_is_csrf_403(client):
+    """`Origin: null` (redirect-laundered / no-referrer cross-site POST) blocked."""
+    resp = client.post(
+        "/api/settings/remote-access/restart",
+        headers={"Origin": "null"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CSRF_ORIGIN"
+
+
+def test_put_remote_access_rebinding_host_is_421(client):
+    """A registrable multi-label Host (DNS-rebinding shape) must be refused."""
+    resp = client.put(
+        "/api/settings/remote-access",
+        json={"enabled": True, "scope": "all"},
+        headers={"Host": "attacker.example:8321"},
+    )
+    assert resp.status_code == 421
+    assert resp.json()["error"]["code"] == "UNTRUSTED_HOST"
+
+
+def test_csrf_guard_holds_even_when_bound_all_interfaces(client, monkeypatch):
+    """The widest bind must never loosen the CSRF guard: with JACKED_HOST set to
+    0.0.0.0 (all-interfaces), a foreign-Origin PUT is still 403. Pins that the
+    guard is bind-independent (build_allowed_origins ignores its host arg)."""
+    monkeypatch.setenv("JACKED_HOST", "0.0.0.0")
+    resp = client.put(
+        "/api/settings/remote-access",
+        json={"enabled": True, "scope": "all"},
+        headers={"Origin": "http://evil.example"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CSRF_ORIGIN"

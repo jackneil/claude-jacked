@@ -521,3 +521,62 @@ def test_create_sockets_conflict_on_occupied_port(socket_cleanup):
     msg = str(exc_info.value)
     assert "127.0.0.1" in msg
     assert str(port) in msg
+
+
+def test_create_sockets_uses_reuseaddr_on_posix(socket_cleanup, monkeypatch):
+    """POSIX must use SO_REUSEADDR so a restart reclaims a TIME_WAIT port; it
+    does not let another process steal an active listener."""
+    from jacked.service import bind as bind_mod
+
+    monkeypatch.setattr(bind_mod.sys, "platform", "linux")
+    calls = []
+    real_setsockopt = socket.socket.setsockopt
+
+    def _record(self, level, opt, val):
+        calls.append(opt)
+        return real_setsockopt(self, level, opt, val)
+
+    monkeypatch.setattr(socket.socket, "setsockopt", _record)
+    plan = BindPlan(
+        mode="loopback", addresses=("127.0.0.1",), port=0, primary_host="127.0.0.1"
+    )
+    socks = create_sockets(plan)
+    socket_cleanup.extend(socks)
+    assert socket.SO_REUSEADDR in calls
+    # Windows-only option must never be set on POSIX.
+    win_opt = getattr(socket, "SO_EXCLUSIVEADDRUSE", object())
+    assert win_opt not in calls
+
+
+def test_create_sockets_uses_exclusiveaddruse_on_windows(monkeypatch):
+    """On Windows, SO_REUSEADDR lets a same-user process bind over an active
+    listener, so create_sockets must claim the port exclusively via
+    SO_EXCLUSIVEADDRUSE instead. Verified by capturing the option set (no real
+    Windows bind needed): the socket object is faked so this runs on any OS."""
+    from jacked.service import bind as bind_mod
+
+    monkeypatch.setattr(bind_mod.sys, "platform", "win32")
+    # SO_EXCLUSIVEADDRUSE only exists on Windows Pythons; inject it if absent so
+    # the test exercises the real code path cross-platform.
+    if not hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        monkeypatch.setattr(socket, "SO_EXCLUSIVEADDRUSE", -5, raising=False)
+
+    set_opts = []
+
+    class _FakeSock:
+        def setsockopt(self, level, opt, val):
+            set_opts.append(opt)
+
+        def bind(self, addr):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bind_mod.socket, "socket", lambda *a, **k: _FakeSock())
+    plan = BindPlan(
+        mode="loopback", addresses=("127.0.0.1",), port=8321, primary_host="127.0.0.1"
+    )
+    create_sockets(plan)
+    assert socket.SO_EXCLUSIVEADDRUSE in set_opts
+    assert socket.SO_REUSEADDR not in set_opts

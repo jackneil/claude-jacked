@@ -37,6 +37,7 @@ import ipaddress
 import logging
 import socket
 import subprocess
+import sys
 from dataclasses import dataclass
 
 from jacked.winproc import NO_WINDOW
@@ -260,6 +261,28 @@ def detect_tailscale_ip() -> str | None:
     return _detect_via_udp() or _detect_via_cli()
 
 
+def _apply_reuse_option(sock: socket.socket) -> None:
+    """Set the correct address-reuse option for the platform.
+
+    POSIX: ``SO_REUSEADDR`` lets a fresh bind reclaim a port still in TIME_WAIT
+    from the just-stopped server (needed across a restart); it does NOT let a
+    second process steal an actively-listening socket.
+
+    Windows: ``SO_REUSEADDR`` means something DIFFERENT and dangerous - it lets
+    a second same-user socket bind over an active listener with nondeterministic
+    delivery. The server-correct option there is ``SO_EXCLUSIVEADDRUSE``, which
+    claims the port exclusively. The tray's ``_wait_for_port_free`` already polls
+    until the old bind is released, so we do not need TIME_WAIT reuse on Windows.
+    """
+    if sys.platform == "win32":
+        # SO_EXCLUSIVEADDRUSE exists only on Windows.
+        opt = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if opt is not None:
+            sock.setsockopt(socket.SOL_SOCKET, opt, 1)
+            return
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 def create_sockets(plan: BindPlan) -> list[socket.socket]:
     """Create and bind (but do NOT listen on) one socket per plan address.
 
@@ -272,7 +295,7 @@ def create_sockets(plan: BindPlan) -> list[socket.socket]:
     for addr in plan.addresses:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _apply_reuse_option(sock)
             sock.bind((addr, plan.port))
         except OSError as exc:
             sock.close()

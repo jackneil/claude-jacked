@@ -71,6 +71,22 @@ def test_no_handler_calls_execv(monkeypatch):
     assert argv == expected_argv
 
 
+def test_execv_failure_is_logged_loudly_and_reraised(monkeypatch, caplog):
+    """execv only returns on failure. When it does, we must log LOUDLY (like the
+    handler path) so the tray-log reader sees why the restart stranded, and
+    re-raise rather than continue on a half-applied restart."""
+    restart_mod.set_restart_handler(None)
+
+    def _boom(*_a):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(restart_mod.os, "execv", _boom)
+    with caplog.at_level(logging.ERROR, logger="jacked.service.restart"):
+        with pytest.raises(OSError):
+            restart_mod.restart_service_now()
+    assert any("execv restart failed" in r.getMessage() for r in caplog.records)
+
+
 def test_exec_target_console_script(monkeypatch, tmp_path):
     """An executable argv[0] (console-script launch) is re-exec'd verbatim."""
     import sys
