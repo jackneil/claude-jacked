@@ -41,17 +41,10 @@ def _get_db(request: Request):
     return getattr(request.app.state, "db", None)
 
 
-def _read_state(db) -> dict:
-    """Assemble the GET/PUT response body from the DB + the live BindPlan.
-
-    ``enabled``/``scope`` come from the DB using the bare-string convention
-    (``'true'``/``'false'``); absent keys mean off + the default scope.
-    ``effective`` is the plan the server actually bound (published by the
-    serving path), or an honest ``'unknown'`` when nothing is registered
-    (TestClient, ``webux --reload``) — we never fabricate a live mode.
-    """
-    from jacked.service.bind import get_active_plan
-
+def _read_enabled_scope(db) -> tuple[bool, str]:
+    """Read ``(enabled, scope)`` from the DB using the bare-string convention
+    (``'true'``/``'false'``); absent keys mean off + the default scope. Shared
+    by the GET/PUT response body and the restart broadcast payload."""
     enabled = False
     scope = "tailscale"
     if db is not None:
@@ -59,6 +52,19 @@ def _read_state(db) -> dict:
         stored_scope = db.get_setting("remote_access_scope")
         if stored_scope in ("tailscale", "all"):
             scope = stored_scope
+    return enabled, scope
+
+
+def _read_state(db) -> dict:
+    """Assemble the GET/PUT response body from the DB + the live BindPlan.
+
+    ``effective`` is the plan the server actually bound (published by the
+    serving path), or an honest ``'unknown'`` when nothing is registered
+    (TestClient, ``webux --reload``) — we never fabricate a live mode.
+    """
+    from jacked.service.bind import get_active_plan
+
+    enabled, scope = _read_enabled_scope(db)
 
     plan = get_active_plan()
     if plan is not None:
@@ -111,9 +117,21 @@ async def restart_remote_access(request: Request):
             status_code=409, content={"detail": "Restart already in progress"}
         )
 
+    # Include the just-saved settings so every client can decide how to react:
+    # a remote browser that sees enabled=false knows this page will not
+    # reconnect (loopback-only re-bind) and shows a terminal message instead of
+    # health-polling forever. Read from the DB so the payload reflects what was
+    # actually persisted by the preceding PUT.
+    enabled, scope = _read_enabled_scope(_get_db(request))
     ws_registry = getattr(request.app.state, "ws_registry", None)
     await _restart_broadcast(
-        ws_registry, "restart_started", {"message": "Applying network settings..."}
+        ws_registry,
+        "restart_started",
+        {
+            "message": "Applying network settings...",
+            "enabled": enabled,
+            "scope": scope,
+        },
     )
 
     def _do_restart():

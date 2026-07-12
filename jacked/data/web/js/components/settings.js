@@ -1254,6 +1254,8 @@ function renderAdvancedTab(container) {
     }
 
     container.innerHTML = `
+        <div id="remote-access-card" class="bg-slate-800 border border-slate-700 rounded-lg p-4 mb-4"></div>
+
         <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-x-auto">
             ${tableHtml}
         </div>
@@ -1267,6 +1269,13 @@ function renderAdvancedTab(container) {
             </div>
         </div>
     `;
+
+    // Remote-access (network bind) card sits at the top of Advanced. It fetches
+    // its own live state and manages its own loading/error/populated rendering.
+    const raCard = document.getElementById('remote-access-card');
+    if (raCard && typeof renderRemoteAccessCard === 'function') {
+        renderRemoteAccessCard(raCard);
+    }
 
     bindAdvancedTabEvents();
 }

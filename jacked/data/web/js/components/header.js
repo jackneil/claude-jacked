@@ -125,6 +125,21 @@ function _showUpgradeError(message) {
     }
 }
 
+// Terminal restart state: show the modal with a final message and NO spinner
+// and NO health polling. Used when the current page will never reconnect (a
+// remote browser turned remote access off, so the server re-binds loopback
+// only). A spinner here would imply "reconnecting" and never resolve.
+function _showRestartTerminal(message) {
+    const modal = _getOrCreateUpgradeModal();
+    modal.style.display = 'flex';
+    const spinner = document.getElementById('upgrade-modal-spinner');
+    if (spinner) spinner.style.display = 'none';
+    const msg = document.getElementById('upgrade-modal-msg');
+    if (msg) { msg.textContent = message; msg.className = 'upgrade-modal__msg'; }
+    const dismiss = modal.querySelector('.upgrade-modal__dismiss');
+    if (dismiss) dismiss.remove();
+}
+
 function _startHealthPolling() {
     _updateUpgradeModal('Restarting\u2026');
     const deadline = Date.now() + 30000;

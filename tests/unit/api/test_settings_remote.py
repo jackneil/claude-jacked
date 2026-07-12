@@ -224,11 +224,59 @@ def test_restart_broadcasts_and_calls_handler_not_execv(client, monkeypatch):
         # Broadcast happened synchronously on the request.
         assert ws.calls, "expected a restart_started broadcast"
         assert ws.calls[0][0] == "restart_started"
-        assert "message" in ws.calls[0][1]
+        payload = ws.calls[0][1]
+        assert "message" in payload
+        # Enriched with the just-saved settings so clients can detect a lockout.
+        # No PUT preceded this restart, so the DB defaults apply.
+        assert payload["enabled"] is False
+        assert payload["scope"] == "tailscale"
 
         # Handler fires after the ~1.5s flush sleep; execv must NOT be called.
         assert fired.wait(timeout=4.0), "restart handler was not invoked"
         assert not execv_called.is_set(), "execv called despite a registered handler"
+    finally:
+        if prev_ws is not None:
+            app.state.ws_registry = prev_ws
+        else:
+            try:
+                del app.state.ws_registry
+            except AttributeError:
+                pass
+
+
+def test_restart_payload_mirrors_saved_settings(client, monkeypatch):
+    """After a PUT persists enabled+all, the restart_started payload carries
+    those exact values so a remote client can decide to poll or go terminal."""
+    ws = _FakeWSRegistry()
+    prev_ws = getattr(app.state, "ws_registry", None)
+    app.state.ws_registry = ws
+
+    # In-process handler so the daemon thread returns without touching execv.
+    # Signal an Event so we can wait for the handler to run BEFORE teardown
+    # resets it (otherwise the ~1.5s-delayed thread would race the reset and
+    # fall through to a real os.execv). Patch execv too as a belt-and-braces.
+    fired = threading.Event()
+    set_restart_handler(lambda: fired.set())
+
+    import jacked.service.restart as restart_mod
+    monkeypatch.setattr(restart_mod.os, "execv", lambda *a, **k: None)
+
+    try:
+        client.put(
+            "/api/settings/remote-access",
+            json={"enabled": True, "scope": "all"},
+        )
+        resp = client.post("/api/settings/remote-access/restart")
+        assert resp.status_code == 200
+
+        assert ws.calls, "expected a restart_started broadcast"
+        topic, payload = ws.calls[0]
+        assert topic == "restart_started"
+        assert payload["enabled"] is True
+        assert payload["scope"] == "all"
+
+        # Let the delayed restart handler run before teardown resets it.
+        assert fired.wait(timeout=4.0), "restart handler was not invoked"
     finally:
         if prev_ws is not None:
             app.state.ws_registry = prev_ws

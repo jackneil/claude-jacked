@@ -489,6 +489,33 @@ jackedWS.on('upgrade_failed', (msg) => {
     if (typeof _showUpgradeError === 'function') _showUpgradeError(d.error || 'Upgrade failed');
 });
 
+/** Remote-access restart: the server is re-binding the network. Whether this page
+ *  can survive the re-bind is decided by the SHARED window.remoteAccessLockout
+ *  rule (defined in components/remote-access.js) so this handler and the settings
+ *  confirm dialog can never disagree. The payload carries enabled + scope; the
+ *  page's own origin decides. On a lockout (remote access turned OFF, or scope
+ *  narrowed to Tailscale-only while this page is on a bare LAN/other IP the
+ *  tailnet bind drops) show a terminal message and do NOT poll, because this page
+ *  will never reconnect. Otherwise reuse the upgrade modal + health poll to reload
+ *  once the server is back on the same origin. */
+jackedWS.on('restart_started', (msg) => {
+    const d = msg.payload || msg;
+    const host = (typeof location !== 'undefined' && location.hostname) ? location.hostname : '';
+    const lockout = (typeof window !== 'undefined' && typeof window.remoteAccessLockout === 'function')
+        ? window.remoteAccessLockout(d, host)
+        : false;
+    if (lockout) {
+        const term = (d.enabled === false)
+            ? 'Remote access is off. This page will not reconnect; open the dashboard on the machine itself.'
+            : 'This page is not on your tailnet, so it will not reconnect. Open the dashboard on the machine itself or use its Tailscale address.';
+        if (typeof _showRestartTerminal === 'function') _showRestartTerminal(term);
+        else if (typeof _showUpgradeModal === 'function') _showUpgradeModal(term);
+        return;
+    }
+    if (typeof _showUpgradeModal === 'function') _showUpgradeModal(d.message || 'Applying network settings...');
+    if (typeof _startHealthPolling === 'function') _startHealthPolling();
+});
+
 jackedWS.on('auto_swap_triggered', (msg) => {
     const d = msg.payload || msg;
     const toLabel = d.to_label || d.to_email || 'another account';
