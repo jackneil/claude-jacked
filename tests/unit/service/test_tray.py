@@ -154,15 +154,131 @@ class TestServiceRunner:
     # create=True: headless boxes never bind tray.pystray (backend resolution
     # fails without a display), and @patch resolves the target BEFORE the
     # in-body _skip_if_no_tray() can skip.
+    @patch("jacked.service.bind.create_sockets", return_value=[])
     @patch("jacked.service.tray.pystray", create=True)
     @patch("jacked.service.tray.uvicorn")
-    def test_start_uvicorn_thread_is_daemon(self, mock_uvicorn, mock_pystray):
+    def test_start_uvicorn_thread_is_daemon(self, mock_uvicorn, mock_pystray, mock_socks):
         _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
-        thread = runner._start_uvicorn()
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        with patch("jacked.service.bind.resolve_bind", return_value=plan):
+            thread = runner._start_uvicorn()
         assert thread.daemon is True
         thread.join(timeout=0.1)
+
+    @patch("jacked.service.bind.create_sockets", return_value=[])
+    @patch("jacked.service.tray.pystray", create=True)
+    @patch("jacked.service.tray.uvicorn")
+    def test_start_uvicorn_reresolves_and_sets_env_from_plan(
+        self, mock_uvicorn, mock_pystray, mock_socks, monkeypatch,
+    ):
+        """_start_uvicorn re-resolves the bind plan on EVERY call (the tray's
+        re-read-on-restart guarantee) and feeds JACKED_HOST from the plan's
+        primary_host, not self.cli_host."""
+        import os
+
+        _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host=None, port=8321)  # no cli override
+
+        # First start: DB says loopback.
+        loop_plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        # Second start (a Restart after a GUI toggle): DB now says tailscale.
+        ts_plan = BindPlan(
+            mode="tailscale", addresses=("127.0.0.1", "100.64.9.9"), port=8321,
+            primary_host="100.64.9.9", tailscale_ip="100.64.9.9",
+        )
+        plans = [loop_plan, ts_plan]
+        calls = []
+
+        def _fake_resolve(cli_host, port):
+            calls.append((cli_host, port))
+            return plans[len(calls) - 1]
+
+        monkeypatch.setattr("jacked.service.bind.resolve_bind", _fake_resolve)
+
+        t1 = runner._start_uvicorn()
+        t1.join(timeout=0.1)
+        assert runner.bind_plan is loop_plan
+        assert runner.host == "127.0.0.1"
+        assert os.environ["JACKED_HOST"] == "127.0.0.1"
+        assert os.environ["JACKED_PORT"] == "8321"
+
+        t2 = runner._start_uvicorn()
+        t2.join(timeout=0.1)
+        # resolve_bind was invoked AGAIN — the re-read-on-restart contract.
+        assert len(calls) == 2
+        assert calls == [(None, 8321), (None, 8321)]
+        assert runner.bind_plan is ts_plan
+        assert runner.host == "100.64.9.9"
+        assert os.environ["JACKED_HOST"] == "100.64.9.9"
+
+    @patch("jacked.service.tray.pystray", create=True)
+    @patch("jacked.service.tray.uvicorn")
+    def test_start_uvicorn_cold_start_raises_systemexit_on_bind_conflict(
+        self, mock_uvicorn, mock_pystray,
+    ):
+        """At COLD START a create_sockets OSError surfaces as SystemExit with the
+        friendly message, so the boot exits cleanly rather than dying silently in
+        the daemon thread."""
+        _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        with (
+            patch("jacked.service.bind.resolve_bind", return_value=plan),
+            patch("jacked.service.bind.create_sockets",
+                  side_effect=OSError("Failed to bind 127.0.0.1:8321")),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner._start_uvicorn(cold_start=True)
+        assert "already in use" in str(exc_info.value)
+
+    @patch("jacked.service.tray.pystray", create=True)
+    @patch("jacked.service.tray.uvicorn")
+    def test_start_uvicorn_restart_raises_oserror_not_systemexit(
+        self, mock_uvicorn, mock_pystray,
+    ):
+        """On the RESTART path (default), a create_sockets bind failure must
+        raise OSError (an Exception), NOT SystemExit (a BaseException), so
+        _on_restart's `except Exception` retry loop can catch it and fall back to
+        the "stopped" state instead of the exception escaping and stranding a
+        dead dashboard."""
+        _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        with (
+            patch("jacked.service.bind.resolve_bind", return_value=plan),
+            patch("jacked.service.bind.create_sockets",
+                  side_effect=OSError("Failed to bind 127.0.0.1:8321")),
+        ):
+            with pytest.raises(OSError):
+                runner._start_uvicorn()  # default: restart mode
+            # And prove it is NOT a SystemExit (BaseException) escaping the loop.
+            with pytest.raises(Exception) as exc_info:
+                runner._start_uvicorn()
+            assert not isinstance(exc_info.value, SystemExit)
 
     def test_on_restart_handles_exception(self):
         _skip_if_no_tray()
@@ -857,3 +973,102 @@ class TestOnUpdateClickBreadcrumbs:
 
         assert not (tmp_path / "jacked-update-progress.html").exists()
         assert mock_wb.call_args[0][0] == "http://127.0.0.1:8321/update.html"
+
+
+class TestRestartHandlerRegistration:
+    """ServiceRunner.run() registers its in-process restart handler for the
+    whole run lifetime and unregisters it on exit — the seam the settings API's
+    POST /remote-access/restart uses to restart in-process (same PID) instead
+    of os.execv. The registered handler is _on_settings_restart, which clears
+    any launch-time --host pin before restarting so the DB actually wins."""
+
+    def test_run_registers_during_and_unregisters_after(self, monkeypatch):
+        _skip_if_no_tray()
+        from jacked.service import restart as restart_mod
+        from jacked.service.tray import ServiceRunner
+
+        restart_mod.set_restart_handler(None)
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+
+        captured = {}
+
+        def _fake_icon_run(setup=None):
+            # We're now inside run(): the handler must already be registered.
+            captured["during"] = restart_mod.get_restart_handler()
+
+        icon_instance = MagicMock()
+        icon_instance.run.side_effect = _fake_icon_run
+
+        # Force the pystray (non-mac) branch and stub out every side-effecting
+        # boundary so run() executes without a real server, tray, or signals.
+        monkeypatch.setattr(
+            "jacked.service.tray.select_menubar_backend", lambda *a, **k: "pystray"
+        )
+        monkeypatch.setattr(
+            "jacked.service.tray.is_port_available", lambda *a, **k: True
+        )
+        monkeypatch.setattr("jacked.service.tray.write_pid", lambda *a, **k: None)
+        monkeypatch.setattr("jacked.service.tray.remove_pid", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "jacked.service.platform.detect_autostart", lambda: False
+        )
+
+        import jacked.service.tray as tray_mod
+        monkeypatch.setattr(tray_mod.signal, "signal", lambda *a, **k: None)
+
+        fake_pystray = MagicMock()
+        fake_pystray.Icon.return_value = icon_instance
+        monkeypatch.setattr(tray_mod, "pystray", fake_pystray, raising=False)
+
+        runner.run()
+
+        # Registered before the run loop, and it is the SETTINGS variant that
+        # clears the launch-time --host pin — NOT the bare _on_restart the
+        # tray menu uses (an operator's launch pin is deliberate there).
+        assert captured.get("during") == runner._on_settings_restart
+        assert captured.get("during") != runner._on_restart
+        # Unregistered on exit (run()'s finally).
+        assert restart_mod.get_restart_handler() is None
+
+
+class TestOnSettingsRestart:
+    """_on_settings_restart is the deal-breaker fix: a service still running
+    under a STALE launchd in-memory definition (or an old detached argv) was
+    launched with --host X, and that pin (cli_host) would beat the DB inside
+    resolve_bind on every in-process restart, making the GUI toggle inert."""
+
+    def test_clears_cli_host_before_restarting(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="0.0.0.0", port=8321)
+        assert runner.cli_host == "0.0.0.0"
+
+        seen = []
+        runner._on_restart = lambda: seen.append(runner.cli_host)
+
+        runner._on_settings_restart()
+
+        # Pin cleared BEFORE _on_restart ran, so the restarted bind resolves
+        # from the settings DB.
+        assert runner.cli_host is None
+        assert seen == [None]
+
+    def test_menu_restart_keeps_the_launch_pin(self, monkeypatch):
+        """The tray MENU's Restart calls _on_restart directly and must NOT
+        clear the operator's one-shot --host pin."""
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="192.168.1.5", port=8321)
+        # Stub the heavy lifecycle so _on_restart returns fast without a server.
+        monkeypatch.setattr(runner, "_shutdown_uvicorn", lambda: None)
+        monkeypatch.setattr(runner, "_wait_for_port_free", lambda timeout=10: True)
+        monkeypatch.setattr(
+            runner, "_start_uvicorn", lambda: MagicMock(name="thread")
+        )
+        monkeypatch.setattr(runner, "_wait_for_ready", lambda timeout=15: True)
+
+        runner._on_restart()
+
+        assert runner.cli_host == "192.168.1.5"

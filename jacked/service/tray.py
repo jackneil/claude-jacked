@@ -278,9 +278,18 @@ def build_menu(
 class ServiceRunner:
     """Manages the uvicorn server thread and pystray icon."""
 
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
-        self.host = host
+    def __init__(self, host: str | None = None, port: int = DEFAULT_PORT):
+        # `cli_host` is the one-shot explicit --host override (None = "no flag",
+        # let resolve_bind consult the DB / loopback default). `host` stays as a
+        # display / back-compat attribute; it is overwritten from the resolved
+        # plan's primary_host on every _start_uvicorn, but is initialized here so
+        # nothing (menu labels, port guards) reads None before resolution.
+        self.cli_host = host
+        self.host = host or DEFAULT_HOST
         self.port = port
+        # The BindPlan from the most recent _start_uvicorn. None until the first
+        # start, so readiness/port-free probes fall back to loopback.
+        self.bind_plan = None
         self._stop_event = threading.Event()
         self._lifecycle_lock = threading.RLock()  # reentrant: update click holds through _on_stop
         self._uvicorn_thread: threading.Thread | None = None
@@ -307,21 +316,70 @@ class ServiceRunner:
         # every successful start/restart.
         self._started_at: float | None = None
 
-    def _start_uvicorn(self) -> threading.Thread:
-        """Start uvicorn in a daemon thread."""
-        os.environ["JACKED_HOST"] = self.host
+    def _start_uvicorn(self, cold_start: bool = False) -> threading.Thread:
+        """Resolve the bind plan, pre-bind its sockets, and serve in a daemon
+        thread.
+
+        Re-resolving here (not in ``__init__``) is deliberate: the tray's
+        in-process Restart re-reads the settings DB, so a GUI remote-access
+        toggle takes effect on the next restart without a process replacement.
+
+        ``create_sockets`` runs in the CALLING thread so a bind failure
+        (EADDRINUSE / a vanished pinned IP) surfaces synchronously instead of
+        dying invisibly inside the daemon thread the way ``server.run()`` used
+        to. uvicorn then ``listen()``s the pre-bound sockets we hand it.
+
+        On a bind failure: at COLD START (``cold_start=True``, the boot paths)
+        we raise ``SystemExit`` with the friendly "port in use" message so the
+        service exits cleanly. On a RESTART (default) we raise ``OSError`` so
+        ``_on_restart``'s retry loop — which catches ``Exception``, not
+        ``BaseException`` — can catch it, retry, and fall back to the "stopped"
+        icon instead of the exception escaping and stranding a dead dashboard.
+        """
+        from jacked.service.bind import (
+            create_sockets,
+            resolve_bind,
+            set_active_plan,
+        )
+
+        plan = resolve_bind(self.cli_host, self.port)
+        self.bind_plan = plan
+        self.host = plan.primary_host
+        # Publish the live plan so the settings API's effective-state view
+        # reflects what we actually bound (re-published on every restart).
+        set_active_plan(plan)
+
+        os.environ["JACKED_HOST"] = plan.primary_host
         os.environ["JACKED_PORT"] = str(self.port)
+
+        try:
+            socks = create_sockets(plan)
+        except OSError as exc:
+            if cold_start:
+                raise SystemExit(
+                    f"Port {self.port} is already in use.\n"
+                    "Is another jacked instance running? Check with: jacked service status\n"
+                    "Use --port to run on a different port."
+                ) from exc
+            # Restart path: propagate as OSError so _on_restart's retry loop
+            # (except Exception) can catch it, retry, and show the "stopped"
+            # state instead of a BaseException escaping the loop.
+            raise
 
         config = uvicorn.Config(
             "jacked.api.main:app",
-            host=self.host,
+            host=plan.primary_host,
             port=self.port,
             log_level="warning",
         )
         server = uvicorn.Server(config)
         self._uvicorn_server = server
 
-        thread = threading.Thread(target=server.run, name="jacked-uvicorn", daemon=True)
+        thread = threading.Thread(
+            target=lambda: server.run(sockets=socks),
+            name="jacked-uvicorn",
+            daemon=True,
+        )
         thread.start()
         return thread
 
@@ -330,10 +388,13 @@ class ServiceRunner:
         import socket
         import time
 
+        probe_host = (
+            self.bind_plan.probe_host if self.bind_plan is not None else "127.0.0.1"
+        )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                sock = socket.create_connection((self.host, self.port), timeout=0.5)
+                sock = socket.create_connection((probe_host, self.port), timeout=0.5)
                 sock.close()
                 return True
             except OSError:
@@ -341,27 +402,51 @@ class ServiceRunner:
         return False
 
     def _wait_for_port_free(self, timeout: float = 10.0) -> bool:
-        """Poll until the port is available for binding (old server fully released).
+        """Poll until EVERY plan address is free to bind (old server released).
 
-        After uvicorn's thread joins, the OS socket may still be in TIME_WAIT
+        After uvicorn's thread joins, the OS sockets may still be in TIME_WAIT
         for a few seconds. Binding too early raises OSError: Address already
-        in use. We bind+close a probe socket with SO_REUSEADDR to prove the
-        port is genuinely free.
+        in use. We bind+close a probe socket with SO_REUSEADDR on each address
+        the current plan listens on; the port is only "free" when they ALL bind.
+        Falls back to loopback when no plan has been resolved yet (never started).
+
+        An address that is no longer assignable on this host (``EADDRNOTAVAIL``)
+        is treated as free, NOT as still-in-use: if a pinned Tailscale IP
+        vanished (tailnet down, sleep/wake) it cannot be bound and it cannot be
+        holding the port, so waiting the full timeout on it would only strand a
+        restart that is about to re-resolve to a loopback-only plan. Only
+        ``EADDRINUSE`` counts as genuinely occupied.
         """
+        import errno
         import socket
         import time
 
+        addresses = (
+            self.bind_plan.addresses if self.bind_plan is not None else ("127.0.0.1",)
+        )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((self.host, self.port))
+            probes: list = []
+            all_free = True
+            for addr in addresses:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind((addr, self.port))
+                    probes.append(sock)
+                except OSError as exc:
+                    sock.close()
+                    # An unassignable address can't be holding the port; skip it.
+                    # Anything else (notably EADDRINUSE) means keep waiting.
+                    if exc.errno == errno.EADDRNOTAVAIL:
+                        continue
+                    all_free = False
+                    break
+            for sock in probes:
                 sock.close()
+            if all_free:
                 return True
-            except OSError:
-                sock.close()
-                time.sleep(0.2)
+            time.sleep(0.2)
         return False
 
     def _shutdown_uvicorn(self) -> None:
@@ -418,7 +503,11 @@ class ServiceRunner:
                 )
 
     def _on_open_dashboard(self):
-        webbrowser.open(f"http://{self.host}:{self.port}")
+        # The tray runs on the same machine as uvicorn, and every non-cli plan
+        # binds (or, for 0.0.0.0, covers) loopback, so 127.0.0.1 always reaches
+        # it. Opening the resolved primary_host (a 100.x or 0.0.0.0) would be
+        # wrong or unreachable, so always open loopback.
+        webbrowser.open(f"http://127.0.0.1:{self.port}")
 
     def _started_text(self) -> str:
         """Format the "Started ..." menu label.
@@ -516,6 +605,26 @@ class ServiceRunner:
                 )
                 self._on_stop()
 
+    def _on_settings_restart(self):
+        """Apply a settings-triggered restart, honoring the DB over any launch pin.
+
+        A settings apply (POST /api/settings/remote-access/restart) is an
+        explicit request to honor the settings DB. But this process may have
+        been LAUNCHED with ``--host X``: a stale launchd in-memory definition
+        keeps its old baked-``--host`` argv until reboot even after the plist
+        on disk was rewritten host-free, and an old detached spawn's argv
+        lingers the same way. That launch-time pin lives in ``self.cli_host``
+        and would win over the DB inside ``resolve_bind`` on every in-process
+        restart, silently making the GUI toggle inert. Clearing the pin here
+        makes the GUI work regardless of how this process was launched.
+
+        The tray MENU's Restart keeps calling ``_on_restart`` directly: an
+        operator's one-shot launch pin is deliberate for the life of that
+        launch, and a plain restart must not discard it.
+        """
+        self.cli_host = None
+        self._on_restart()
+
     def _request_stop(self):
         """Signal-safe stop request — only sets flags, no locks or I/O."""
         if self._uvicorn_server is not None:
@@ -589,7 +698,10 @@ class ServiceRunner:
             uninstall_autostart()
             self._autostart_enabled = False
         else:
-            install_autostart(self.host, self.port)
+            # Artifacts are host-free: the bind host is resolved from the
+            # settings DB at every boot, so autostart honors the GUI Remote
+            # access toggle instead of pinning a host in the plist/VBS.
+            install_autostart(self.port)
             self._autostart_enabled = True
 
     def _check_version(self, force: bool = False) -> None:
@@ -892,7 +1004,7 @@ class ServiceRunner:
         threading.Thread(
             target=self._check_version, name="jacked-version-check", daemon=True
         ).start()
-        self._uvicorn_thread = self._start_uvicorn()
+        self._uvicorn_thread = self._start_uvicorn(cold_start=True)
         if self._wait_for_ready():
             self._started_at = time.time()
             logger.info(
@@ -956,7 +1068,11 @@ class ServiceRunner:
                 "Service mode requires uvicorn.\n"
                 'Install it with: uv tool install "claude-jacked" --force'
             )
-        if not is_port_available(self.host, self.port):
+        # Probe loopback, not the eventual bind host: this guard runs BEFORE
+        # resolve_bind, and every plan except a cli-pinned specific IP includes
+        # or covers loopback. A cli specific-IP run still conflict-checks cleanly
+        # at create_sockets time (which raises SystemExit with this same message).
+        if not is_port_available("127.0.0.1", self.port):
             raise SystemExit(
                 f"Port {self.port} is already in use.\n"
                 "Is another jacked instance running? Check with: jacked service status\n"
@@ -976,7 +1092,7 @@ class ServiceRunner:
 
         # Start the one uvicorn (daemon thread) and health-check it before the
         # status item appears, so the first pill reflects real data.
-        self._uvicorn_thread = self._start_uvicorn()
+        self._uvicorn_thread = self._start_uvicorn(cold_start=True)
         if self._wait_for_ready():
             self._started_at = time.time()
             logger.info(
@@ -995,6 +1111,23 @@ class ServiceRunner:
         """Start the service: tray icon on main thread, uvicorn in background."""
         self._install_tray_file_logger()
 
+        # Register the in-process restart handler for the WHOLE run lifetime,
+        # so the settings API's POST /remote-access/restart can apply a bind
+        # change (same PID, tray survives) instead of execv. Registered as
+        # _on_settings_restart, NOT _on_restart: a settings apply must clear
+        # any launch-time --host pin (stale launchd in-memory argv) so the DB
+        # actually wins — see _on_settings_restart's docstring.
+        # Shared across both backends below; the finally unregisters on exit.
+        from jacked.service.restart import set_restart_handler
+
+        set_restart_handler(self._on_settings_restart)
+        try:
+            return self._run()
+        finally:
+            set_restart_handler(None)
+
+    def _run(self) -> None:
+        """Backend dispatch for :meth:`run` (wrapped there for handler setup)."""
         # macOS gets the native menu-bar agent; every other platform keeps the
         # existing pystray tray below, unchanged.
         if select_menubar_backend(sys.platform, _mac_menubar_available()) == "mac":
@@ -1008,7 +1141,11 @@ class ServiceRunner:
                 'Install it with: uv tool install "claude-jacked" --force'
             )
 
-        if not is_port_available(self.host, self.port):
+        # Probe loopback, not the eventual bind host: this guard runs BEFORE
+        # resolve_bind, and every plan except a cli-pinned specific IP includes
+        # or covers loopback. A cli specific-IP run still conflict-checks cleanly
+        # at create_sockets time (which raises SystemExit with this same message).
+        if not is_port_available("127.0.0.1", self.port):
             raise SystemExit(
                 f"Port {self.port} is already in use.\n"
                 "Is another jacked instance running? Check with: jacked service status\n"

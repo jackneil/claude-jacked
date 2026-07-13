@@ -63,6 +63,10 @@ class TestRunUpdate:
         restart_args = mock_popen.call_args_list[0][0][0]
         assert "/fake/jacked" in restart_args
         assert "service" in restart_args and "start" in restart_args
+        # Regression pin: the updater's detached spawn must stay host-free so
+        # the restarted service resolves its bind from the settings DB (the
+        # GUI Remote access toggle survives upgrades).
+        assert "--host" not in restart_args
 
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.install_method.detect_install_method", return_value="uv")

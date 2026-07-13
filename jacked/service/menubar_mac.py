@@ -804,5 +804,14 @@ else:  # pragma: no cover - exercised only where rumps/pyobjc are unavailable
 
 
 def _loopback(host: str) -> str:
-    """Always reach uvicorn over loopback even if it bound 0.0.0.0."""
-    return "127.0.0.1" if host in ("0.0.0.0", "", None) else host
+    """Always reach uvicorn over loopback, whatever it bound.
+
+    The menu-bar agent is co-located with uvicorn, and every bind plan it
+    serves includes (loopback, tailscale) or covers (all-interfaces via
+    0.0.0.0) the loopback address, so 127.0.0.1 always reaches the server.
+    We deliberately ignore the resolved bind host here: it can be a 100.x
+    Tailscale IP (which may momentarily be unreachable) or 0.0.0.0 (not a
+    connectable target), and trusting it would make the panel/status calls
+    fragile. The parameter is kept for call-site compatibility.
+    """
+    return "127.0.0.1"

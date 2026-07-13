@@ -238,43 +238,96 @@ def recover(cwd, exclude, session_id, as_digest, limit, depth, budget, as_json):
 
 
 @main.command(name="webux")
-@click.option("--host", default="127.0.0.1", help="Host to bind to (0.0.0.0 for remote/Tailscale access; see README Remote Access)")
+@click.option("--host", default=None, help="Host to bind (one-shot override; default: the dashboard Remote access setting, else 127.0.0.1)")
 @click.option("--port", default=8321, type=int, help="Port to bind to")
 @click.option("--no-browser", is_flag=True, help="Don't auto-open browser")
-@click.option("--reload", is_flag=True, help="Auto-reload on file changes (dev mode)")
-def webux(host: str, port: int, no_browser: bool, reload: bool):
+@click.option("--reload", is_flag=True, help="Auto-reload on file changes (dev mode); ignores the Remote access setting and binds a single host (the reloader subprocess can't inherit pre-bound sockets)")
+def webux(host: str | None, port: int, no_browser: bool, reload: bool):
     """Start the jacked web dashboard."""
     try:
-        import uvicorn  # noqa: F401
+        import uvicorn
     except ImportError:
         console.print("[red]Error:[/red] webux requires the web extra.")
         console.print("Install it with:")
         console.print(r'  [bold]uv tool install "claude-jacked\[web]" --force[/bold]')
         sys.exit(1)
 
-    # Propagate host/port to app via env vars (used for dynamic CORS + WebSocket origin checks)
     import os as _os
 
-    _os.environ["JACKED_HOST"] = host
+    # --reload stays on the single-host uvicorn.run path: uvicorn's reloader
+    # re-execs a child process that cannot inherit our pre-bound sockets, so the
+    # BindPlan / Remote access setting does not apply. An explicit --host still
+    # overrides; otherwise dev binds loopback.
+    if reload:
+        dev_host = host or "127.0.0.1"
+        _os.environ["JACKED_HOST"] = dev_host
+        _os.environ["JACKED_PORT"] = str(port)
+        url = f"http://{dev_host}:{port}"
+        console.print(f"[bold]Starting jacked dashboard at {url}[/bold]")
+        console.print(
+            "[dim]Auto-reload enabled, watching for file changes "
+            "(Remote access setting ignored)[/dim]"
+        )
+        if not no_browser:
+            import webbrowser
+
+            webbrowser.open(url)
+        uvicorn.run(
+            "jacked.api.main:app",
+            host=dev_host,
+            port=port,
+            reload=True,
+            reload_dirs=["jacked"],
+        )
+        return
+
+    # Normal path: resolve the bind plan (explicit --host > DB setting >
+    # loopback), pre-bind its sockets, and hand them to uvicorn. JACKED_HOST
+    # (dynamic CORS / WebSocket origin / CSRF) comes from the plan's primary host.
+    from jacked.service.bind import create_sockets, resolve_bind, set_active_plan
+
+    plan = resolve_bind(host, port)
+    # Publish the live plan so the settings API reports the real effective bind.
+    set_active_plan(plan)
+    _os.environ["JACKED_HOST"] = plan.primary_host
     _os.environ["JACKED_PORT"] = str(port)
 
-    url = f"http://{host}:{port}"
-    console.print(f"[bold]Starting jacked dashboard at {url}[/bold]")
-    if reload:
-        console.print("[dim]Auto-reload enabled — watching for file changes[/dim]")
+    try:
+        socks = create_sockets(plan)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        console.print(f"Is another process already using port {port}?")
+        sys.exit(1)
+
+    # Loopback reaches every plan except a cli-pinned specific IP; show that as
+    # the primary URL, then list the other bound addresses.
+    if plan.mode in ("loopback", "tailscale", "all"):
+        primary_url = f"http://127.0.0.1:{port}"
+    else:
+        primary_url = f"http://{plan.primary_host}:{port}"
+    console.print(f"[bold]Starting jacked dashboard at {primary_url}[/bold]")
+    if plan.mode == "all":
+        console.print(
+            f"[dim]Bound on all interfaces (0.0.0.0:{port}), reachable from the LAN[/dim]"
+        )
+    if plan.tailscale_ip:
+        console.print(f"[dim]Tailscale: http://{plan.tailscale_ip}:{port}[/dim]")
+    if plan.fallback_reason:
+        console.print(f"[yellow]{plan.fallback_reason}[/yellow]")
 
     if not no_browser:
         import webbrowser
 
-        webbrowser.open(url)
+        webbrowser.open(primary_url)
 
-    uvicorn.run(
+    config = uvicorn.Config(
         "jacked.api.main:app",
-        host=host,
+        host=plan.primary_host,
         port=port,
-        reload=reload,
-        reload_dirs=["jacked"] if reload else None,
+        log_level="warning",
     )
+    server = uvicorn.Server(config)
+    server.run(sockets=socks)
 
 
 def _service_http_ok(port: int, timeout: float = 1.0) -> bool:
@@ -309,7 +362,7 @@ def _wait_service_ready(port: int, timeout: float = 15.0) -> bool:
     return _service_http_ok(port)
 
 
-def _spawn_service_detached(host: str, port: int):
+def _spawn_service_detached(host: str | None, port: int):
     """Spawn `jacked service start` detached so it survives the caller exiting.
 
     Returns the log path the detached service writes to. The child runs the
@@ -317,6 +370,11 @@ def _spawn_service_detached(host: str, port: int):
     windowless pythonw.exe path and CREATE_NO_WINDOW for the jacked.exe fallback
     (a console trampoline that would otherwise pop a window); POSIX uses
     start_new_session. Shared by `jacked start` and `jacked service restart`.
+
+    ``host`` is passed through as ``--host`` ONLY when the caller supplied one
+    (not None). Omitting it keeps argv honest so the detached service resolves
+    its bind from the DB / loopback default, which is what makes upgrade and
+    autostart restarts honor the GUI Remote access toggle instead of a baked host.
     """
     import subprocess as _subprocess
 
@@ -331,7 +389,10 @@ def _spawn_service_detached(host: str, port: int):
     except Exception:
         log_fh = _subprocess.DEVNULL
 
-    svc_args = ["service", "start", "--host", host, "--port", str(port)]
+    svc_args = ["service", "start"]
+    if host is not None:
+        svc_args += ["--host", host]
+    svc_args += ["--port", str(port)]
     if sys.platform == "win32":
         # ROOT CAUSE of "close the window and the tray dies": the uv `jacked.exe`
         # console-trampoline spawns python WITH a new console window even when we
@@ -382,7 +443,7 @@ def _spawn_service_detached(host: str, port: int):
 
 
 @main.command(name="start")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
+@click.option("--host", default=None, help="Host to bind for this launch (ignored once Remote access is configured in the dashboard, which is then authoritative; default 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 @click.option(
     "--restart", is_flag=True, help="Force a restart even if already healthy."
@@ -396,7 +457,7 @@ def start(host: str | None, port: int | None, restart: bool):
     the tray disappears or the dashboard stops responding — you don't have
     to know whether it's down, just run `jacked start`.
     """
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service import DEFAULT_PORT, PID_FILE
     from jacked.service.process import (
         is_port_available,
         is_process_alive,
@@ -406,7 +467,6 @@ def start(host: str | None, port: int | None, restart: bool):
         wait_for_port_free,
     )
 
-    the_host = host or DEFAULT_HOST
     the_port = port or DEFAULT_PORT
 
     info = read_pid(PID_FILE)
@@ -434,13 +494,15 @@ def start(host: str | None, port: int | None, restart: bool):
         if result["was_running"] and not result["died"]:
             console.print("[red]Couldn't stop the stuck service. Aborting.[/red]")
             sys.exit(1)
-        wait_for_port_free(the_host, the_port, timeout=10.0)
+        # Probe loopback: the actual bind host is resolved in the detached
+        # child from the DB, and every plan covers loopback on this port.
+        wait_for_port_free("127.0.0.1", the_port, timeout=10.0)
     elif info and not pid_alive:
         remove_pid(PID_FILE)
         console.print("[dim]Cleared a stale PID file left by a previous crash[/dim]")
 
     # Port held by something that isn't us?
-    if not is_port_available(the_host, the_port):
+    if not is_port_available("127.0.0.1", the_port):
         console.print(
             f"[red]Port {the_port} is in use by another process.[/red] "
             "Free it or pass --port."
@@ -448,7 +510,9 @@ def start(host: str | None, port: int | None, restart: bool):
         sys.exit(1)
 
     console.print(f"[dim]Starting jacked service (detached) on :{the_port}...[/dim]")
-    log_path = _spawn_service_detached(the_host, the_port)
+    # Pass the raw host (possibly None): None means "no --host in argv", so the
+    # detached service resolves its bind from the DB / loopback default.
+    log_path = _spawn_service_detached(host, the_port)
 
     if _wait_service_ready(the_port, timeout=15.0):
         console.print(
@@ -2643,20 +2707,27 @@ def _tray_extra_installed() -> bool:
 
 
 def _ensure_autostart_and_running(
-    host: str, port: int, *, label: str = "Service"
+    port: int, *, one_shot_host: str | None = None, label: str = "Service"
 ) -> None:
     """Register login autostart and make sure the service is running now.
 
-    macOS: ``install_autostart`` loads it via launchd (starts immediately).
-    Windows/Linux: ``install_autostart`` only registers the login entry, so we
-    spawn the detached service ourselves when nothing is already listening.
-    Idempotent and non-fatal — never aborts the caller.
+    macOS: ``install_autostart`` bootstraps it via launchd (starts immediately)
+    unless the service is already running. Windows/Linux: ``install_autostart``
+    only registers the login entry, so we spawn the detached service ourselves
+    when nothing is already listening. Idempotent and non-fatal - never aborts
+    the caller.
+
+    The autostart artifact is always host-free (the bind host lives in the
+    settings DB and is resolved at every boot). ``one_shot_host`` applies ONLY
+    to the immediate detached spawn on Windows/Linux - a caller-supplied
+    unmapped ``--host`` that is deliberately not persisted; the launchd path
+    always boots host-free.
     """
     from jacked.service import PID_FILE
     from jacked.service.platform import install_autostart
     from jacked.service.process import is_process_alive, read_pid
 
-    result = install_autostart(host, port)
+    result = install_autostart(port)
     if result.startswith("Could not find"):
         console.print(f"[red]Error:[/red] {result}")
         return
@@ -2670,7 +2741,7 @@ def _ensure_autostart_and_running(
         )
         return
     if sys.platform == "darwin":
-        # launchd just started it via install_autostart's launchctl load; the
+        # launchd just started it via install_autostart's bootstrap; the
         # PID file can lag a beat, so don't race it with a second spawn.
         console.print(
             f"[green][OK][/green] {label} started via launchd -> "
@@ -2678,7 +2749,7 @@ def _ensure_autostart_and_running(
         )
         return
     try:
-        _spawn_service_detached(host, port)
+        _spawn_service_detached(one_shot_host, port)
         console.print(
             f"[green][OK][/green] {label} started -> http://127.0.0.1:{port}"
         )
@@ -2703,9 +2774,9 @@ def _setup_tray_autostart() -> None:
             "Run `jacked service start` to run the service without a tray."
         )
         return
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service import DEFAULT_PORT
 
-    _ensure_autostart_and_running(DEFAULT_HOST, DEFAULT_PORT, label="Tray")
+    _ensure_autostart_and_running(DEFAULT_PORT, label="Tray")
 
 
 # Plugins that jacked's behaviors and skills genuinely depend on. Missing
@@ -3263,7 +3334,7 @@ def permissions_group():
 
 
 @main.command(name="menubar")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
+@click.option("--host", default=None, help="Host to bind for this launch (ignored once Remote access is configured in the dashboard, which is then authoritative; default 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def menubar(host: str | None, port: int | None):
     """Start the macOS menu-bar agent in the foreground (manual start).
@@ -3278,10 +3349,144 @@ def menubar(host: str | None, port: int | None):
                       "Use `jacked service start` on this platform.")
         sys.exit(1)
 
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service import DEFAULT_PORT
     from jacked.service.tray import ServiceRunner
 
-    ServiceRunner(host=host or DEFAULT_HOST, port=port or DEFAULT_PORT).run()
+    # Pass the raw host (possibly None): ServiceRunner resolves the bind plan
+    # from the DB / loopback default when no explicit --host was given.
+    ServiceRunner(host=host, port=port or DEFAULT_PORT).run()
+
+
+def _persist_remote_access_from_host(host: str) -> bool:
+    """Map an explicit ``service install/restart --host`` onto the dashboard
+    Remote access setting.
+
+    These commands EXPRESS intent about the persistent mode, so unlike the
+    artifact migration (which only fills absent keys) this OVERWRITES any
+    existing setting. Returns True when the host was consumed (persisted, and
+    the caller should proceed host-free so the DB decides the bind); False when
+    it stays a one-shot pass-through (an unmapped specific IP, or the DB write
+    failed).
+    """
+    from jacked.service.migrate import map_host_to_setting
+
+    mapping = map_host_to_setting(host)
+    if mapping is None:
+        console.print(
+            f"[yellow]Host {host} is a one-shot override for this start only "
+            "and is not persisted. Use the dashboard Remote access setting "
+            "(Settings > Advanced) for a persistent mode.[/yellow]"
+        )
+        return False
+    enabled, scope = mapping
+    try:
+        from jacked.web.database import Database
+
+        db = Database()
+        db.set_setting("remote_access_enabled", enabled)
+        if scope is not None:
+            db.set_setting("remote_access_scope", scope)
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not persist the Remote access setting ({exc}); "
+            f"using --host {host} for this start only.[/yellow]"
+        )
+        return False
+    if enabled == "false":
+        desc = "disabled (loopback only)"
+    elif scope == "all":
+        desc = "enabled, all interfaces (0.0.0.0)"
+    else:
+        desc = f"enabled, Tailscale only ({host})"
+    console.print(f"[green][OK][/green] Remote access setting updated: {desc}")
+    return True
+
+
+def _resolve_service_start_host(typed_host: str | None) -> str | None:
+    """Boot-time autostart-artifact migration plus argv neutralization.
+
+    Pre-M5 autostart artifacts baked ``--host X`` into the launchd plist /
+    Startup VBS. At ``service start`` time we may BE the launchd job that plist
+    describes, so: capture the baked host into the settings DB (guarded - never
+    clobbers an existing GUI choice), rewrite the artifact host-free FILE-ONLY
+    (a bootout here would kill us mid-boot), and decide what the typed
+    ``--host`` argv means:
+
+    - typed host EXACTLY equals the artifact's baked host -> this invocation IS
+      the artifact's own respawn, so treat it as None (the DB decides; the
+      migration just captured the old intent).
+    - they differ, or the artifact carries no ``--host`` -> the typed host is a
+      deliberate one-shot; honor it verbatim.
+
+    Never raises - a boot must never die over migration bookkeeping.
+    """
+    try:
+        if sys.platform == "darwin":
+            from jacked.service.platform import _get_launchd_plist_path
+
+            artifact_path, kind = _get_launchd_plist_path(), "plist"
+        elif sys.platform == "win32":
+            from jacked.service.platform import _get_windows_startup_path
+
+            artifact_path, kind = _get_windows_startup_path(), "vbs"
+        else:
+            # Linux: no artifact is generated; the DB read at boot covers it.
+            return typed_host
+        if not artifact_path.exists():
+            return typed_host
+        text = artifact_path.read_text(encoding="utf-8")
+
+        from jacked.service.migrate import (
+            extract_baked_host,
+            migrate_baked_host_to_db,
+            remote_access_configured,
+            strip_baked_host,
+        )
+
+        baked = extract_baked_host(text, kind)
+        if baked is None:
+            # The on-disk artifact is host-free (this version already stripped
+            # it), yet we still received a --host. It did NOT come from the
+            # current artifact: it is a STALE launchd in-memory / execv replay of
+            # a pre-migration argv (launchd serves its loaded definition, not the
+            # rewritten plist, until the next reboot). If remote access is
+            # configured in the DB, the DB is authoritative — ignore the stale
+            # host, or a crash-respawn could silently re-expose (or hide) the
+            # dashboard against the user's saved choice until the next reboot.
+            if typed_host is not None and remote_access_configured():
+                msg = (
+                    f"Ignoring stale --host {typed_host} from a pre-migration "
+                    "autostart replay; the bind resolves from the settings DB."
+                )
+                console.print(f"[dim]{msg}[/dim]")
+                # Also log it: this is the one decision that flips network
+                # exposure, and on a launchd crash-respawn stdout goes to
+                # /dev/null. logger.warning lands in the service log once the
+                # process is up, giving a durable audit trail of the ignore.
+                logger.warning(msg)
+                return None
+            return typed_host
+        status = migrate_baked_host_to_db(baked)
+        try:
+            artifact_path.write_text(strip_baked_host(text, kind), encoding="utf-8")
+            rewrite = "artifact rewritten host-free (file only, no reload)"
+        except OSError as exc:
+            rewrite = f"artifact rewrite failed: {exc}"
+        if typed_host == baked:
+            console.print(
+                f"[dim]Autostart artifact carried --host {baked}: {status}; "
+                f"{rewrite}. This start is the artifact's own respawn, so the "
+                "bind resolves from the settings DB.[/dim]"
+            )
+            return None
+        console.print(
+            f"[dim]Autostart artifact carried --host {baked}: {status}; "
+            f"{rewrite}.[/dim]"
+        )
+        return typed_host
+    except Exception:
+        logger.exception("Boot-time autostart --host migration failed; continuing")
+        return typed_host
 
 
 @main.group()
@@ -3291,14 +3496,21 @@ def service():
 
 
 @service.command(name="start")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
+@click.option("--host", default=None, help="Host to bind for this launch (ignored once Remote access is configured in the dashboard, which is then authoritative; default 127.0.0.1). Pass 0.0.0.0 to expose on all interfaces.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_start(host: str | None, port: int | None):
     """Start jacked as a background service with system tray icon."""
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service import DEFAULT_PORT
     from jacked.service.tray import ServiceRunner
 
-    runner = ServiceRunner(host=host or DEFAULT_HOST, port=port or DEFAULT_PORT)
+    # Boot-time migration: capture a pre-M5 artifact's baked --host into the
+    # DB, rewrite the artifact host-free, and neutralize our own argv when this
+    # invocation is that artifact's respawn (details in the helper docstring).
+    host = _resolve_service_start_host(host)
+
+    # Pass the raw host (possibly None): ServiceRunner resolves the bind plan
+    # from the DB / loopback default when no explicit --host was given.
+    runner = ServiceRunner(host=host, port=port or DEFAULT_PORT)
     runner.run()
 
 
@@ -3329,7 +3541,7 @@ def service_stop():
 
 
 @service.command(name="restart")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
+@click.option("--host", default=None, help="Sets the dashboard Remote access setting, then restarts: 0.0.0.0 enables all interfaces, a Tailscale 100.x IP enables Tailscale only, 127.0.0.1 disables remote access. Any other IP applies to this start only and is not persisted. The GUI toggle (Settings > Advanced) is the primary interface.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 @click.option(
     "--foreground",
@@ -3346,7 +3558,7 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
 
     Use --foreground to run interactively (tray logs to your terminal).
     """
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service import DEFAULT_PORT, PID_FILE
     from jacked.service.platform import ensure_native_lifecycle, native_restart
     from jacked.service.process import (
         stop_process_graceful,
@@ -3354,7 +3566,15 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     )
 
     the_port = port or DEFAULT_PORT
-    the_host = host or DEFAULT_HOST
+
+    # An explicit --host expresses intent about the persistent Remote access
+    # mode: map it into the settings DB (unlike migration, this DOES overwrite
+    # existing keys), then restart host-free so the DB decides the bind. This
+    # is what makes the command work reliably on macOS: native_restart's
+    # kickstart reuses launchd's in-memory argv, but the DB is re-read at every
+    # boot. Unmapped specific IPs stay a one-shot pass-through.
+    if host is not None and _persist_remote_access_from_host(host):
+        host = None
 
     # Preferred path: make sure native lifecycle (launchd plist / systemd
     # unit) is configured, then delegate.  Skip kickstart when the plist
@@ -3388,19 +3608,22 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
         if not result["died"]:
             console.print("[red]Could not stop existing service — aborting restart[/red]")
             sys.exit(1)
-        # Port can linger a beat after the PID dies.
-        if not wait_for_port_free(the_host, the_port, timeout=10.0):
+        # Port can linger a beat after the PID dies. Probe loopback: the bind
+        # host is resolved by the child from the DB, and every plan covers it.
+        if not wait_for_port_free("127.0.0.1", the_port, timeout=10.0):
             console.print(f"[red]Port {the_port} still in use — aborting start[/red]")
             sys.exit(1)
 
     # 2. Start the new service.
     if foreground:
         from jacked.service.tray import ServiceRunner
-        ServiceRunner(host=the_host, port=the_port).run()
+        # Raw host (possibly None): ServiceRunner resolves from the DB otherwise.
+        ServiceRunner(host=host, port=the_port).run()
         return
 
-    # Detached — the tray must survive this command returning.
-    log_path = _spawn_service_detached(the_host, the_port)
+    # Detached - the tray must survive this command returning. Raw host stays
+    # out of argv when None so the child re-resolves the bind from the DB.
+    log_path = _spawn_service_detached(host, the_port)
 
     console.print(f"[green][OK][/green] Started jacked service (detached) on :{the_port}")
     console.print(f"[dim]Logs: {log_path}[/dim]")
@@ -3440,14 +3663,21 @@ def service_status():
 
 
 @service.command(name="install")
-@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1; 0.0.0.0 for remote/Tailscale access)")
+@click.option("--host", default=None, help="Sets the dashboard Remote access setting: 0.0.0.0 enables all interfaces, a Tailscale 100.x IP enables Tailscale only, 127.0.0.1 disables remote access. Any other IP applies to this start only and is not persisted. The GUI toggle (Settings > Advanced) is the primary interface.")
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_install(host: str | None, port: int | None):
     """Configure jacked to start automatically on login, and start it now."""
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service import DEFAULT_PORT
 
+    # An explicit --host expresses intent about the persistent Remote access
+    # mode: map it into the settings DB (overwriting existing keys), then
+    # install host-free so every boot resolves the bind from the DB. An
+    # unmapped specific IP stays a one-shot for the immediate start only.
+    one_shot = None
+    if host is not None and not _persist_remote_access_from_host(host):
+        one_shot = host
     _ensure_autostart_and_running(
-        host or DEFAULT_HOST, port or DEFAULT_PORT, label="Service"
+        port or DEFAULT_PORT, one_shot_host=one_shot, label="Service"
     )
 
 

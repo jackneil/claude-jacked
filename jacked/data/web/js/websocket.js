@@ -122,8 +122,12 @@ const jackedWS = {
             document.querySelectorAll('.usage-status-overlay').forEach(el => el.remove());
             // Cancel any pending watchdogs — they'd clobber the fresh render on reconnect.
             _clearAllCheckingWatchdogs();
-            // If upgrade modal is open and WS drops, server is likely restarting — begin health poll
-            if (document.getElementById('upgrade-modal') && typeof _startHealthPolling === 'function') {
+            // If upgrade modal is open and WS drops, server is likely restarting — begin health poll.
+            // Skip a TERMINAL modal (a remote page that turned remote access off): that page will
+            // never reconnect, so polling would only clobber its terminal message and dead-end on a
+            // false "taking longer than expected" error.
+            const upModal = document.getElementById('upgrade-modal');
+            if (upModal && upModal.dataset.terminal !== '1' && typeof _startHealthPolling === 'function') {
                 _startHealthPolling();
             }
             this._scheduleReconnect();
@@ -487,6 +491,35 @@ jackedWS.on('upgrade_complete', () => {
 jackedWS.on('upgrade_failed', (msg) => {
     const d = msg.payload || msg;
     if (typeof _showUpgradeError === 'function') _showUpgradeError(d.error || 'Upgrade failed');
+});
+
+/** Remote-access restart: the server is re-binding the network. Whether this page
+ *  can survive the re-bind is decided by the SHARED window.remoteAccessLockout
+ *  rule (defined in components/remote-access.js) so this handler and the settings
+ *  confirm dialog can never disagree. The payload carries enabled + scope; the
+ *  page's own origin decides. On a lockout (remote access turned OFF, or scope
+ *  narrowed to Tailscale-only while this page is on a bare LAN/other IP the
+ *  tailnet bind drops) show a terminal message and do NOT poll, because this page
+ *  will never reconnect. Otherwise reuse the upgrade modal + health poll to reload
+ *  once the server is back on the same origin. */
+jackedWS.on('restart_started', (msg) => {
+    const d = msg.payload || msg;
+    const host = (typeof location !== 'undefined' && location.hostname) ? location.hostname : '';
+    const lockout = (typeof window !== 'undefined' && typeof window.remoteAccessLockout === 'function')
+        ? window.remoteAccessLockout(d, host)
+        : false;
+    if (lockout) {
+        // Shared message source with remote-access.js so the inline apply and
+        // this broadcast handler can never show different terminal copy.
+        const term = (typeof window !== 'undefined' && typeof window.remoteAccessTerminalMessage === 'function')
+            ? window.remoteAccessTerminalMessage(d)
+            : 'Remote access changed; this page will not reconnect. Open the dashboard on the machine itself.';
+        if (typeof _showRestartTerminal === 'function') _showRestartTerminal(term);
+        else if (typeof _showUpgradeModal === 'function') _showUpgradeModal(term);
+        return;
+    }
+    if (typeof _showUpgradeModal === 'function') _showUpgradeModal(d.message || 'Applying network settings...');
+    if (typeof _startHealthPolling === 'function') _startHealthPolling();
 });
 
 jackedWS.on('auto_swap_triggered', (msg) => {

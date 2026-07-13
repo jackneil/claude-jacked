@@ -458,11 +458,13 @@ async def websocket_endpoint(ws: WebSocket):
 
 from jacked.api.routes import system, analytics, features, logs, permissions, menubar  # noqa: E402
 from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
+from jacked.api.routes.settings_remote import router as remote_access_router  # noqa: E402
 
-# Swap settings router MUST be registered before system router —
-# system.py has a catch-all PUT /settings/{key} that would steal
-# the swap-settings routes otherwise.
+# Dedicated /api/settings routers MUST be registered before the system router —
+# system.py has a catch-all PUT /settings/{key} that would steal these routes
+# otherwise (e.g. PUT /api/settings/remote-access).
 app.include_router(swap_settings_router, prefix="/api/settings", tags=["settings"])
+app.include_router(remote_access_router, prefix="/api/settings", tags=["settings"])
 app.include_router(system.router, prefix="/api", tags=["system"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(features.router, prefix="/api", tags=["features"])

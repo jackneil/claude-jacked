@@ -1254,6 +1254,8 @@ function renderAdvancedTab(container) {
     }
 
     container.innerHTML = `
+        <div id="remote-access-card" class="bg-slate-800 border border-slate-700 rounded-lg p-4 mb-4"></div>
+
         <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-x-auto">
             ${tableHtml}
         </div>
@@ -1267,6 +1269,13 @@ function renderAdvancedTab(container) {
             </div>
         </div>
     `;
+
+    // Remote-access (network bind) card sits at the top of Advanced. It fetches
+    // its own live state and manages its own loading/error/populated rendering.
+    const raCard = document.getElementById('remote-access-card');
+    if (raCard && typeof renderRemoteAccessCard === 'function') {
+        renderRemoteAccessCard(raCard);
+    }
 
     bindAdvancedTabEvents();
 }
@@ -1367,10 +1376,18 @@ function renderSettingRow(key, value) {
     `;
 }
 
+// Keys managed by a dedicated control on this same Advanced tab (the Remote
+// access card). They are protected server-side, so editing them in the raw
+// table only dead-ends in a 422; hide them here so the card is the single place
+// they are changed. The card renders their live state directly above.
+const RAW_TABLE_HIDDEN_KEYS = new Set(['remote_access_enabled', 'remote_access_scope']);
+
 function settingsToEntries(settings) {
     if (!settings) return [];
-    if (Array.isArray(settings)) {
-        return settings.map(s => [s.key, s.value]).sort((a, b) => a[0].localeCompare(b[0]));
-    }
-    return Object.entries(settings).sort((a, b) => a[0].localeCompare(b[0]));
+    const pairs = Array.isArray(settings)
+        ? settings.map(s => [s.key, s.value])
+        : Object.entries(settings);
+    return pairs
+        .filter(([key]) => !RAW_TABLE_HIDDEN_KEYS.has(key))
+        .sort((a, b) => a[0].localeCompare(b[0]));
 }
