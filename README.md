@@ -89,7 +89,7 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 <details>
 <summary><strong>More Dashboard Views</strong></summary>
 
-**Feature Toggles** - Toggle hooks (sound notifications) and knowledge documents (behavioral rules, skills, reference docs) on and off.
+**Feature Toggles** - Toggle hooks (sound notifications), knowledge documents (behavioral rules, skills, reference docs), and skill packs on and off.
 
 ![Settings - Features](docs/screenshots/dashboard-settings-features.png)
 
