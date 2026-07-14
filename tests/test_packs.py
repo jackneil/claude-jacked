@@ -429,6 +429,34 @@ def test_state_newer_version_preserves_unknown_fields_and_warns(tmp_path, caplog
     assert raw["profiles"] == {"work": ["marketing"]}          # top-level key kept
     assert raw["packs"]["marketing"]["pinned_sha"] == "abc123"  # per-entry field kept
     assert raw["packs"]["design-extras"]["state"] == "enabled"  # our write applied
+    assert raw["version"] == 3                                  # true version retained
+
+
+def test_state_unrecognized_state_preserved_and_treated_as_no_decision(tmp_path):
+    """A future third state (e.g. 'paused') this build can't interpret must be
+    PRESERVED on disk across a write-back (not silently dropped -- the exact
+    doctrine violation the forward-compat handling exists to prevent), and
+    treated as 'no decision' (registry default decides), never as disabled."""
+    home = tmp_path
+    p = home / ".claude" / "jacked-packs.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({
+        "version": 3,
+        "packs": {"catalog": {"state": "paused", "at": "x"}},
+    }), encoding="utf-8")
+
+    # Not enabled/disabled -> no explicit decision this build acts on.
+    assert packs.pack_state(home, "catalog") == "paused"
+    assert packs.enabled_pack_names(home) == []  # not counted as enabled
+    default_on = packs.Pack("catalog", "", "", "acme/skills", "", ("a",), True)
+    default_off = packs.Pack("catalog", "", "", "acme/skills", "", ("a",), False)
+    assert packs.is_effectively_enabled(default_on, home) is True   # falls to default
+    assert packs.is_effectively_enabled(default_off, home) is False
+
+    # Write-back on a different pack must NOT wipe the paused entry.
+    packs.set_enabled(home, "other", True)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert raw["packs"]["catalog"] == {"state": "paused", "at": "x"}
 
 
 def test_effective_enablement_default_on_and_opt_out(tmp_path):

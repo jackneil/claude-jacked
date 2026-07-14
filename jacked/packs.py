@@ -254,15 +254,24 @@ def _normalize_state(raw: object) -> dict:
         )
     packs_map = raw.get("packs")
     if isinstance(packs_map, dict):
-        # v2+: preserve unknown top-level keys and unknown per-entry fields;
-        # only keep entries whose state we can interpret.
+        # v2+: preserve unknown top-level keys, unknown per-entry fields, AND
+        # entries whose `state` this build doesn't recognize (a future third
+        # state like "paused"). Drop only genuine garbage (a non-dict entry, or
+        # a state that isn't even a string). An unrecognized state is kept on
+        # disk here and treated as "no explicit decision" by is_effectively_enabled
+        # so it is neither honored blindly nor silently destroyed.
         out = dict(raw)
         clean: dict = {}
         for name, entry in packs_map.items():
-            if isinstance(entry, dict) and entry.get("state") in ("enabled", "disabled"):
+            if isinstance(entry, dict) and isinstance(entry.get("state"), str):
                 clean[name] = entry
         out["packs"] = clean
-        out["version"] = STATE_VERSION
+        # Keep the file's true (newer) version so a future reader keys its
+        # migration off the real schema, not a downgraded label.
+        out["version"] = (
+            version if (isinstance(version, int) and version > STATE_VERSION)
+            else STATE_VERSION
+        )
         return out
     # v1: {"enabled": {name: {enabled_at}}} -> everything enabled, none disabled.
     v1_enabled = raw.get("enabled")
@@ -320,11 +329,19 @@ def pack_state(home: Path, name: str) -> str | None:
 
 
 def is_effectively_enabled(pack: Pack, home: Path) -> bool:
-    """Whether ``pack`` should be installed: an explicit decision wins, and with
-    none recorded the registry ``default`` flag decides."""
+    """Whether ``pack`` should be installed: a recognized explicit decision
+    wins, and otherwise the registry ``default`` flag decides.
+
+    A state value this build doesn't recognize (a future third state preserved
+    on disk) is NOT treated as disabled -- it falls through to the registry
+    default, matching the "no decision this build can interpret" contract in
+    _normalize_state. A future jacked that understands the state re-honors it.
+    """
     state = pack_state(home, pack.name)
-    if state is not None:
-        return state == "enabled"
+    if state == "enabled":
+        return True
+    if state == "disabled":
+        return False
     return pack.default
 
 
