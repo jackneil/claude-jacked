@@ -81,6 +81,7 @@ def _fake_packs(
     enabled_before=None,
     disabled_before=None,
     installed_before=None,
+    foreign_before=None,
     npx="/usr/bin/npx",
     install_result=None,
     update_result=None,
@@ -128,6 +129,12 @@ def _fake_packs(
             _p = registry.get(_n)
             if _p is not None:
                 installed_disk.update(_p.skills)
+
+    # Skills present on disk but NOT ours (a same-named dir from another source
+    # or a user's own skill). These read installed=True but source_ok=False, so
+    # a pack fully shadowed by them must route to install (where the real
+    # collision guard surfaces the shadow), never to a silent "up to date".
+    foreign_disk: set[str] = set(foreign_before or [])
 
     def load_registry(data_root):
         return dict(registry)
@@ -218,7 +225,15 @@ def _fake_packs(
         calls.pack_status.append(pack.name)
         if status is not None:
             return status(pack) if callable(status) else status
-        skills = [{"name": s, "installed": s in installed_disk} for s in pack.skills]
+        skills = []
+        for s in pack.skills:
+            if s in installed_disk:
+                skills.append({"name": s, "installed": True, "source_ok": True})
+            elif s in foreign_disk:
+                # on disk, but not ours (foreign source / user's own dir)
+                skills.append({"name": s, "installed": True, "source_ok": False})
+            else:
+                skills.append({"name": s, "installed": False, "source_ok": None})
         return {
             "name": pack.name,
             "installed_count": sum(1 for s in skills if s["installed"]),
@@ -757,3 +772,20 @@ def test_uninstall_removes_default_on_pack(env):
     assert r.exit_code == 0, r.output + env.buf.getvalue()
     assert [c.pack.name for c in calls.remove_pack] == ["core-extras"]
     assert "Pack 'core-extras': removed" in env.buf.getvalue()
+
+
+def test_install_foreign_shadowed_pack_routes_to_install_not_silent_update(env):
+    # A default-on pack whose skills are all present on disk but NOT ours (a
+    # same-named dir from another source / the user's own) must route to
+    # install, where the collision guard surfaces the shadow -- never to a
+    # silent batched update that reports "up to date" while installing nothing.
+    registry = {"core-extras": DEFAULT_ON}
+    calls = _fake_packs(
+        env.monkeypatch, registry=registry,
+        foreign_before=list(DEFAULT_ON.skills),
+    )
+    r = CliRunner().invoke(main, ["install", "--no-codex"])
+    assert r.exit_code == 0, r.output + env.buf.getvalue()
+    # Routed to install (collision guard runs there), not the silent update path.
+    assert [c.pack.name for c in calls.install_pack] == ["core-extras"]
+    assert calls.update_packs == []

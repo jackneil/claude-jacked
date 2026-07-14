@@ -403,6 +403,34 @@ def test_state_corrupt_tolerated(tmp_path):
     assert packs.enabled_pack_names(home) == ["marketing"]
 
 
+def test_state_newer_version_preserves_unknown_fields_and_warns(tmp_path, caplog):
+    """A file written by a future jacked (v3 with fields this build doesn't
+    know) must NOT be silently truncated on write-back: unknown top-level keys
+    and unknown per-entry fields survive the load->mutate->save round-trip, and
+    a warning is logged (doctrine: never silently drop data)."""
+    home = tmp_path
+    p = home / ".claude" / "jacked-packs.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({
+        "version": 3,
+        "profiles": {"work": ["marketing"]},          # unknown top-level key
+        "packs": {
+            "marketing": {"state": "enabled", "at": "x", "pinned_sha": "abc123"},
+        },
+    }), encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        packs.load_state(home)
+    assert any("newer than this build" in r.getMessage() for r in caplog.records)
+
+    # A write-back (set_enabled on a DIFFERENT pack) must keep the v3 extras.
+    packs.set_enabled(home, "design-extras", True)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert raw["profiles"] == {"work": ["marketing"]}          # top-level key kept
+    assert raw["packs"]["marketing"]["pinned_sha"] == "abc123"  # per-entry field kept
+    assert raw["packs"]["design-extras"]["state"] == "enabled"  # our write applied
+
+
 def test_effective_enablement_default_on_and_opt_out(tmp_path):
     """effective enablement: default-on unless explicitly disabled; default-off
     (opt-in) unless explicitly enabled."""
@@ -904,6 +932,40 @@ def test_run_skills_pins_cwd_to_home(skills_env, monkeypatch):
     assert calls, "no subprocess calls recorded"
     for kwargs in calls:
         assert kwargs.get("cwd") == str(env.home)
+
+
+def test_registry_default_non_bool_coerced_to_false_with_warning(tmp_path, caplog):
+    """A stray `"default": "false"` (a non-empty string) must NOT truthy-coerce
+    a pack ON: it falls back to opt-in (False) with a warning, rather than
+    silently defaulting the pack in for every user."""
+    reg = {"packs": {
+        "sneaky": {"source": "acme/skills", "skills": ["alpha"], "default": "false"},
+        "good": {"source": "acme/skills", "skills": ["beta"], "default": True},
+    }}
+    (tmp_path / "packs.json").write_text(json.dumps(reg), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        packs_reg = packs.load_registry(tmp_path)
+    assert packs_reg["sneaky"].default is False    # not coerced True
+    assert packs_reg["good"].default is True
+    assert any("'default' is not a bool" in r.getMessage() for r in caplog.records)
+
+
+def test_install_pack_skips_dangling_symlink_no_lock(skills_env):
+    """A dangling symlink at ~/.claude/skills/<n> with no own-source lock entry
+    must be treated as a pre-existing trace the guard refuses to overwrite (not
+    a clobber), and _skill_installed stays False for it. Pins the wild-card
+    behavior so a future _skill_present/_skill_installed merge can't break it."""
+    env = skills_env
+    link = env.home / ".claude" / "skills" / "alpha"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(env.home / "nonexistent-target")  # dangling
+    assert link.is_symlink() and not link.exists()
+    assert packs._skill_installed(env.home, "alpha") is False
+
+    res = packs.install_pack(_pack(skills=("alpha",)), env.home, include_codex=False)
+    assert "alpha" in res.skipped               # guard refused it
+    assert not _calls(env)                       # never handed to the CLI
+    assert link.is_symlink()                     # untouched (not clobbered)
 
 
 def test_registry_packs_not_a_dict(tmp_path, caplog):

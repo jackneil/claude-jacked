@@ -2913,16 +2913,23 @@ def _run_packs_phase(
             )
         return results
 
-    # Discriminate install vs refresh by disk presence, not by "was it enabled
-    # this run": a pack whose skills aren't all on disk yet (fresh machine, a
-    # first default-on install, or a newly-enabled pack) gets a fresh install and
-    # the trust line; a fully-present pack is refreshed via one batched update.
+    # Discriminate install vs refresh, not by "was it enabled this run" but by
+    # whether every skill is already on disk AND tracked as OURS (own-source in
+    # the lockfile). A pack that's fully present and ours is refreshed via one
+    # batched update; anything else -- missing skills, or skills shadowed by a
+    # same-named dir from another source or a user's own hand-made skill -- goes
+    # to install, where the collision guard surfaces the shadow loudly instead
+    # of the refresh path silently reporting "up to date" (it can only update
+    # own-source skills, so a foreign shadow would be a silent no-op).
     to_install: list[str] = []
     to_update: list[str] = []
     for name in targets:
         st = _packs.pack_status(registry[name], home)
-        total = st.get("total", 0)
-        if total > 0 and st.get("installed_count", 0) >= total:
+        skills = st.get("skills", [])
+        fully_ours = bool(skills) and all(
+            s.get("installed") and s.get("source_ok") is True for s in skills
+        )
+        if fully_ours:
             to_update.append(name)
         else:
             to_install.append(name)

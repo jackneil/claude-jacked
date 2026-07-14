@@ -166,6 +166,17 @@ def load_registry(data_root: Path) -> dict[str, Pack]:
                 name, homepage,
             )
             continue
+        # `default` must be a real bool, not a truthy coercion: a stray
+        # "default": "false" (a non-empty string) would otherwise silently flip
+        # a pack ON. Fall back to opt-in (False) with a warning rather than
+        # dropping the whole pack.
+        default_raw = spec.get("default", False)
+        if not isinstance(default_raw, bool):
+            logger.warning(
+                "Pack %r: 'default' is not a bool (%r); treating as false (opt-in)",
+                name, default_raw,
+            )
+            default_raw = False
         packs[name] = Pack(
             name=name,
             display_name=spec.get("display_name", name),
@@ -173,7 +184,7 @@ def load_registry(data_root: Path) -> dict[str, Pack]:
             source=source,
             homepage=homepage,
             skills=tuple(skills),
-            default=bool(spec.get("default", False)),
+            default=default_raw,
         )
     return packs
 
@@ -222,18 +233,37 @@ def load_state(home: Path) -> dict:
 
 
 def _normalize_state(raw: object) -> dict:
-    """Coerce any on-disk state shape (v1, v2, or garbage) to the v2 shape."""
+    """Coerce any on-disk state shape (v1, v2, or garbage) to the v2 shape.
+
+    A file written by a NEWER jacked (version > STATE_VERSION) is handled
+    forward-compatibly rather than silently truncated: unknown top-level keys
+    and unknown per-entry fields are PRESERVED across the load->mutate->save
+    round-trip, and a warning is logged (mirroring read_lockfile's version
+    guard). Only entries whose ``state`` this build can interpret
+    (enabled/disabled) are trusted by consumers; an entry with a state value we
+    don't recognize is kept on disk but treated as "no decision" here.
+    """
     if not isinstance(raw, dict):
         return {"version": STATE_VERSION, "packs": {}}
+    version = raw.get("version")
+    if isinstance(version, int) and version > STATE_VERSION:
+        logger.warning(
+            "packs state version %s is newer than this build understands (%s); "
+            "preserving unknown fields, treating unrecognized states as absent",
+            version, STATE_VERSION,
+        )
     packs_map = raw.get("packs")
     if isinstance(packs_map, dict):
-        # Already v2-ish: keep only well-formed {state, at} entries.
+        # v2+: preserve unknown top-level keys and unknown per-entry fields;
+        # only keep entries whose state we can interpret.
+        out = dict(raw)
         clean: dict = {}
         for name, entry in packs_map.items():
-            state = entry.get("state") if isinstance(entry, dict) else None
-            if state in ("enabled", "disabled"):
-                clean[name] = {"state": state, "at": entry.get("at")}
-        return {"version": STATE_VERSION, "packs": clean}
+            if isinstance(entry, dict) and entry.get("state") in ("enabled", "disabled"):
+                clean[name] = entry
+        out["packs"] = clean
+        out["version"] = STATE_VERSION
+        return out
     # v1: {"enabled": {name: {enabled_at}}} -> everything enabled, none disabled.
     v1_enabled = raw.get("enabled")
     packs: dict = {}
