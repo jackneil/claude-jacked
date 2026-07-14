@@ -141,7 +141,7 @@ async def toggle_pack(name: str, body: PackToggleRequest):
     pack = registry.get(name)
     if pack is None:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": f"Unknown pack: {name}", "code": "INVALID_PACK"}},
         )
 

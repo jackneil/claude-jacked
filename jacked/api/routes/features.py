@@ -411,7 +411,7 @@ async def toggle_feature(
     # Validate name
     if not _validate_name(name):
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Invalid feature name", "code": "INVALID_FEATURE"}},
         )
 
@@ -419,7 +419,7 @@ async def toggle_feature(
     if category == "agents":
         if name not in _get_valid_agent_names():
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": f"Unknown agent: {name}", "code": "INVALID_FEATURE"}},
             )
         return await _toggle_file_feature(
@@ -433,7 +433,7 @@ async def toggle_feature(
     if category == "commands":
         if name not in _get_valid_command_names():
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": f"Unknown command: {name}", "code": "INVALID_FEATURE"}},
             )
         return await _toggle_file_feature(
@@ -447,7 +447,7 @@ async def toggle_feature(
     if category == "hooks":
         if name not in VALID_HOOKS:
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": f"Unknown hook: {name}", "code": "INVALID_FEATURE"}},
             )
         db = getattr(request.app.state, "db", None)
@@ -456,13 +456,13 @@ async def toggle_feature(
     if category == "knowledge":
         if name not in _get_valid_knowledge_names():
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": f"Unknown knowledge item: {name}", "code": "INVALID_FEATURE"}},
             )
         return await _toggle_knowledge(name, body.enabled)
 
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         content={"error": {"message": f"Invalid category: {category}", "code": "INVALID_CATEGORY"}},
     )
 
@@ -483,7 +483,7 @@ async def _toggle_file_feature(src: Path, dst: Path, enabled: bool, name: str, c
             dst.resolve().relative_to(CLAUDE_DIR.resolve())
         except ValueError:
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": "Invalid path", "code": "INVALID_FEATURE"}},
             )
         shutil.copy(src, dst)
@@ -524,7 +524,7 @@ async def _toggle_knowledge(name: str, enabled: bool):
             if src.exists():
                 return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": f"Unknown skill: {skill_name}", "code": "INVALID_FEATURE"}},
         )
     if name == "reference":
@@ -533,7 +533,7 @@ async def _toggle_knowledge(name: str, enabled: bool):
         return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
 
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         content={"error": {"message": f"Unknown knowledge: {name}", "code": "INVALID_FEATURE"}},
     )
 
@@ -563,7 +563,7 @@ async def _toggle_rules(enabled: bool):
         has_end = RULES_END_MARKER in existing
         if has_start != has_end:
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {
                     "message": "CLAUDE.md has corrupted jacked rules markers. Fix manually or remove the orphaned marker.",
                     "code": "FILE_CORRUPT",
@@ -739,7 +739,7 @@ async def set_claude_env(name: str, body: EnvToggleRequest):
 
     if not is_toggle and not is_numeric:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": f"Unknown env var: {name}", "code": "INVALID_ENV_VAR"}},
         )
 
@@ -751,7 +751,7 @@ async def set_claude_env(name: str, body: EnvToggleRequest):
         if is_toggle:
             if body.enabled is None:
                 return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     content={"error": {"message": "enabled field is required for toggle vars", "code": "MISSING_FIELD"}},
                 )
             value_on = TOGGLEABLE_ENV_VARS[name].get("value_on", "1")
@@ -767,7 +767,7 @@ async def set_claude_env(name: str, body: EnvToggleRequest):
                 num = int(raw)
             except (ValueError, TypeError):
                 return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     content={"error": {"message": "Value must be a number", "code": "INVALID_VALUE"}},
                 )
             num = max(meta["min"], min(meta["max"], num))
@@ -787,7 +787,7 @@ async def set_claude_key(name: str, body: DirectSettingRequest):
     """Set a direct Claude Code settings.json key."""
     if name not in DIRECT_SETTINGS:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": f"Unknown setting: {name}", "code": "INVALID_SETTING"}},
         )
 
@@ -799,7 +799,7 @@ async def set_claude_key(name: str, body: DirectSettingRequest):
         if meta["type"] == "bool":
             if not isinstance(body.value, bool):
                 return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     content={"error": {"message": "Value must be a boolean (true/false)", "code": "INVALID_VALUE"}},
                 )
             settings[name] = body.value
@@ -808,7 +808,7 @@ async def set_claude_key(name: str, body: DirectSettingRequest):
                 num = int(body.value)
             except (ValueError, TypeError):
                 return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     content={"error": {"message": "Value must be a number", "code": "INVALID_VALUE"}},
                 )
             lo = meta.get("min", num)
@@ -829,7 +829,7 @@ async def toggle_claude_plugin(name: str, body: PluginToggleRequest):
     """Enable or disable a Claude Code plugin."""
     if not name or len(name) > 200 or "\0" in name:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Invalid plugin name", "code": "INVALID_PLUGIN"}},
         )
     async with _settings_lock:
@@ -861,7 +861,7 @@ async def set_claude_permissions(body: PermissionsRequest):
     """Update Claude Code permission rules."""
     if body.defaultMode and body.defaultMode not in VALID_PERMISSION_MODES:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": f"Invalid mode: {body.defaultMode}. Valid: {', '.join(sorted(VALID_PERMISSION_MODES))}", "code": "INVALID_MODE"}},
         )
 
@@ -900,7 +900,7 @@ async def set_raw_settings(body: RawSettingsRequest):
     """Overwrite settings.json with raw JSON content. Requires confirm_overwrite."""
     if not body.confirm_overwrite:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Set confirm_overwrite: true to overwrite settings.json", "code": "CONFIRMATION_REQUIRED"}},
         )
     async with _settings_lock:

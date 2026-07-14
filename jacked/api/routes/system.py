@@ -235,7 +235,7 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
     p = Path(repo_path)
     if not p.is_dir():
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
                     "message": f"Not a directory: {repo_path}",
@@ -245,7 +245,7 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
         )
     if not (p / ".git").is_dir():
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
                     "message": f"No .git directory in: {repo_path}",
@@ -262,7 +262,7 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
             normalized = str(p).replace("\\", "/")
             if normalized not in known_paths and str(p) not in known_paths:
                 return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     content={
                         "error": {
                             "message": f"Unknown project: {repo_path}. Must have jacked activity.",
@@ -404,7 +404,7 @@ async def update_project_env(body: EnvUpdateRequest, request: Request):
     validation_error = _validate_env_path(body.env_path)
     if validation_error:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {"message": validation_error, "code": "INVALID_ENV_PATH"}
             },
@@ -451,7 +451,7 @@ async def detect_project_env(body: ProjectInitRequest, request: Request):
     validation_error = _validate_env_path(env_path)
     if validation_error:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {"message": validation_error, "code": "INVALID_ENV_PATH"}
             },
@@ -528,7 +528,7 @@ async def update_project_lessons(body: LessonsUpdateRequest, request: Request):
 
     if len(body.lessons) > 200:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {"message": "Too many lessons (max 200)", "code": "TOO_MANY"}
             },
@@ -933,7 +933,7 @@ async def update_setting(key: str, body: SettingUpdateRequest, request: Request)
 
     if key in _PROTECTED_SETTING_KEYS:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
                     "message": f"Use the dedicated endpoint for '{key}'",
@@ -961,7 +961,7 @@ async def delete_setting(key: str, request: Request):
     """Delete a setting by key."""
     if key in _PROTECTED_SETTING_KEYS:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
                     "message": f"Use the dedicated endpoint for '{key}'",

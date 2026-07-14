@@ -90,7 +90,7 @@ async def get_project_permissions(repo_path: str, request: Request):
     resolved = _validate_repo_path(repo_path, db=db)
     if not resolved:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Invalid repo_path"}},
         )
     settings = _read_project_settings(str(resolved))
@@ -116,14 +116,14 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
     """Update project-level Claude Code permissions."""
     if body.defaultMode and body.defaultMode not in VALID_PERMISSION_MODES:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": f"Invalid mode: {body.defaultMode}"}},
         )
     db = getattr(request.app.state, "db", None)
     resolved = _validate_repo_path(body.repo_path, db=db)
     if not resolved:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Invalid repo_path"}},
         )
     # Validate all patterns against the same rules as add_permission_rule —
@@ -135,7 +135,7 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
             stripped = pat.strip()
             if stripped.lower() in _DANGEROUS_PATTERNS_LOWER:
                 return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     content={
                         "error": {
                             "message": f"Pattern '{pat}' in {list_name} list is dangerously broad — it would auto-approve everything"
@@ -147,7 +147,7 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
                 segments = [s for s in ft_match.group(2).split("/") if s]
                 if len(segments) < 3:
                     return JSONResponse(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         content={
                             "error": {
                                 "message": (
@@ -216,20 +216,20 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
     """Add a single permission rule to allow/deny/ask list."""
     if body.list_name not in ("allow", "deny", "ask"):
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Invalid list_name"}},
         )
     pattern = body.pattern.strip()
     if not pattern:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Pattern required"}},
         )
     # Case-insensitive check: tool names are case-sensitive in Claude Code
     # (Read, Bash, etc.) but we normalize to catch bypass attempts like "bash(*:*)".
     if pattern.lower() in _DANGEROUS_PATTERNS_LOWER:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
                     "message": f"Pattern '{pattern}' is dangerously broad — it would auto-approve everything"
@@ -244,7 +244,7 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
         segments = [s for s in path_prefix.split("/") if s]
         if len(segments) < 3:
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={
                     "error": {
                         "message": (
@@ -260,7 +260,7 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
         resolved = _validate_repo_path(body.repo_path, db=db)
         if not resolved:
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": "Invalid repo_path"}},
             )
         async with _project_settings_lock:
