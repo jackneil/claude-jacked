@@ -2760,6 +2760,16 @@ def _detect_codex_for_packs() -> bool:
         return False
 
 
+def _rich_escape(text: str) -> str:
+    """Escape Rich markup in untrusted text (npx stderr tails, lockfile-derived
+    skill names, user argv) before console.print interpolation. npm error
+    output routinely contains bracketed tokens that otherwise raise
+    rich.errors.MarkupError or render live [link] markup."""
+    from rich.markup import escape
+
+    return escape(text or "")
+
+
 def _packs_unknown_name(names, registry: dict) -> None:
     """Print an actionable unknown-pack error and exit 1.
 
@@ -2771,7 +2781,7 @@ def _packs_unknown_name(names, registry: dict) -> None:
         names = [names]
     valid = ", ".join(sorted(registry)) or "(none available)"
     console.print(
-        f"[red][FAIL][/red] Unknown skill pack(s): {', '.join(names)}. "
+        f"[red][FAIL][/red] Unknown skill pack(s): {_rich_escape(', '.join(names))}. "
         f"Valid packs: {valid}."
     )
     raise SystemExit(1)
@@ -2818,11 +2828,11 @@ def _emit_pack_result(name: str, res, total: int, as_json: bool, results: dict) 
             f"{len(installed)}/{total} skills installed"
         )
     else:
-        console.print(f"[red][FAIL][/red] {getattr(res, 'message', '')}")
+        console.print(f"[red][FAIL][/red] {_rich_escape(getattr(res, 'message', ''))}")
     if skipped:
         console.print(
             f"[yellow][!][/yellow] Pack '{name}': left "
-            f"{', '.join(skipped)} untouched (a skill dir you already own)"
+            f"{_rich_escape(', '.join(skipped))} untouched (a skill dir you already own)"
         )
 
 
@@ -3583,7 +3593,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                 if _pk_res.skipped:
                     console.print(
                         f"[yellow][!][/yellow] Pack '{_pk_name}': skipped "
-                        f"{', '.join(_pk_res.skipped)} (different source or not tracked)"
+                        f"{_rich_escape(', '.join(_pk_res.skipped))} (different source or not tracked)"
                     )
         _state_file = home / ".claude" / _packs.STATE_PATH_NAME
         _state_file.unlink(missing_ok=True)
@@ -3668,9 +3678,9 @@ def packs_enable(name: str):
     include_codex = _detect_codex_for_packs()
     res = _packs.install_pack(pack, home, include_codex=include_codex)
     if res.ok:
-        console.print(f"[green][OK][/green] {res.message}")
+        console.print(f"[green][OK][/green] {_rich_escape(res.message)}")
     else:
-        console.print(f"[red][FAIL][/red] {res.message}")
+        console.print(f"[red][FAIL][/red] {_rich_escape(res.message)}")
         raise SystemExit(1)
 
 
@@ -3703,10 +3713,10 @@ def packs_disable(name: str):
     _packs.set_enabled(home, name, False)
     res = _packs.remove_pack(pack, home)
     if res.ok:
-        console.print(f"[green][OK][/green] {res.message}")
+        console.print(f"[green][OK][/green] {_rich_escape(res.message)}")
     else:
         console.print(
-            f"[red][FAIL][/red] {res.message} The pack is disabled; some skills "
+            f"[red][FAIL][/red] {_rich_escape(res.message)} The pack is disabled; some skills "
             "may remain on disk. Enable and disable again to retry removal."
         )
         raise SystemExit(1)
@@ -3742,13 +3752,21 @@ def packs_update(name: str | None):
         if not enabled:
             console.print("No skill packs are enabled. Nothing to update.")
             return
+        for unknown_name in [n for n in enabled if n not in registry]:
+            console.print(
+                f"[yellow][!][/yellow] Pack '{unknown_name}' is enabled but "
+                "unknown to this jacked version; its skills were left untouched."
+            )
         targets = [registry[n] for n in enabled if n in registry]
+        if not targets:
+            console.print("No known skill packs to update.")
+            return
 
     res = _packs.update_packs(targets, home, include_codex=include_codex)
     if res.ok:
-        console.print(f"[green][OK][/green] {res.message}")
+        console.print(f"[green][OK][/green] {_rich_escape(res.message)}")
     else:
-        console.print(f"[red][FAIL][/red] {res.message}")
+        console.print(f"[red][FAIL][/red] {_rich_escape(res.message)}")
         raise SystemExit(1)
 
 

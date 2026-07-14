@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -315,9 +316,46 @@ def test_state_roundtrip_and_atomic(tmp_path):
     assert "marketing" in state["enabled"]
     assert "enabled_at" in state["enabled"]["marketing"]
     assert packs.enabled_pack_names(home) == ["marketing"]
-    # atomic write leaves no stray tmp file behind
-    assert not (home / ".claude" / "jacked-packs.json.tmp").exists()
+    # atomic write leaves no stray tmp file behind (any name)
+    leftovers = [p for p in (home / ".claude").iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
     assert (home / ".claude" / "jacked-packs.json").exists()
+
+
+def test_save_state_tmp_is_writer_unique(tmp_path, monkeypatch):
+    """Two concurrent writers must never share a tmp path: a shared name lets
+    one writer os.replace the other's half-written file away. Capture the tmp
+    names two saves generate and assert they differ."""
+    home = tmp_path
+    seen = []
+    real_mkstemp = tempfile.mkstemp
+
+    def spy_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        seen.append(name)
+        return fd, name
+
+    monkeypatch.setattr(packs.tempfile, "mkstemp", spy_mkstemp)
+    packs.save_state(home, {"version": 1, "enabled": {}})
+    packs.save_state(home, {"version": 1, "enabled": {"marketing": {}}})
+    assert len(seen) == 2 and seen[0] != seen[1]
+    # both tmps were consumed by os.replace
+    assert not Path(seen[0]).exists() and not Path(seen[1]).exists()
+
+
+def test_save_state_cleans_tmp_on_write_failure(tmp_path, monkeypatch):
+    """A failed write must not leave the unique tmp behind."""
+    home = tmp_path
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(packs.os, "replace", boom)
+    with pytest.raises(OSError):
+        packs.save_state(home, {"version": 1, "enabled": {}})
+    leftovers = [p for p in (home / ".claude").iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
 
 
 def test_state_disable_drops_entry(tmp_path):
@@ -425,6 +463,44 @@ def test_remove_pack_own_source(skills_env):
     for name in p.skills:
         assert not (env.home / ".claude" / "skills" / name).exists()
         assert not (env.home / ".agents" / "skills" / name).exists()
+
+
+def test_remove_pack_nonzero_exit(skills_env):
+    """npx remove exits non-zero: nothing verified removed, loud failure."""
+    env = skills_env
+    p = _pack(skills=("alpha",))
+    packs.install_pack(p, env.home, include_codex=False)
+    env.set_scenario(mode="exit_nonzero", exit_code=2, stderr="remove boom")
+    res = packs.remove_pack(p, env.home)
+    assert res.ok is False
+    assert "remove boom" in res.message
+    # skill untouched on disk
+    assert (env.home / ".claude" / "skills" / "alpha" / "SKILL.md").exists()
+
+
+def test_remove_pack_rc0_but_skill_persists(skills_env):
+    """The rc=0 gotcha on the REMOVE side: the CLI exits 0 but a skill is
+    still on disk afterward. Verification must fail loud, naming it."""
+    env = skills_env
+    p = _pack(skills=("alpha", "beta"))
+    packs.install_pack(p, env.home, include_codex=False)
+    env.set_scenario(mode="normal", skip=["beta"])  # remove silently skips beta
+    res = packs.remove_pack(p, env.home)
+    assert res.ok is False
+    assert res.removed == ["alpha"]
+    assert "beta" in res.message
+    assert (env.home / ".agents" / "skills" / "beta" / "SKILL.md").exists()
+
+
+def test_run_skills_launch_oserror(skills_env, monkeypatch, tmp_path):
+    """npx path exists but won't exec (broken node): loud, no crash."""
+    env = skills_env
+    broken = tmp_path / "broken-npx"
+    broken.write_text("not executable content")  # no +x bit
+    monkeypatch.setattr(packs, "find_npx", lambda: str(broken))
+    res = packs.install_pack(_pack(), env.home, include_codex=False)
+    assert res.ok is False
+    assert "Failed to run npx" in res.message
 
 
 def test_remove_pack_refuses_foreign_source(skills_env):
@@ -730,6 +806,51 @@ def test_registry_validation_rejects_hostile_packs(tmp_path, caplog):
     assert set(reg) == {"good"}
     for name in ("dashg", "traversal", "strskills", "badsource", "badhome"):
         assert name in caplog.text
+
+
+def test_registry_source_segments_must_start_alnum(tmp_path, caplog):
+    """Leading '-' (argv flag smuggling) and leading '.' ('..', '.git') in
+    EITHER source segment must be rejected — the source lands positionally on
+    the skills-CLI argv with no terminator."""
+    bad = {
+        "packs": {
+            "updir":    {"source": "../evil", "skills": ["alpha"]},
+            "flagown":  {"source": "-g/x", "skills": ["alpha"]},
+            "flagrepo": {"source": "owner/-flag", "skills": ["alpha"]},
+            "dotrepo":  {"source": "owner/..", "skills": ["alpha"]},
+            "hidden":   {"source": ".git/x", "skills": ["alpha"]},
+            "good":     {"source": "acme/skills", "skills": ["alpha"]},
+        }
+    }
+    (tmp_path / "packs.json").write_text(json.dumps(bad), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        reg = packs.load_registry(tmp_path)
+    assert set(reg) == {"good"}
+    for name in ("updir", "flagown", "flagrepo", "dotrepo", "hidden"):
+        assert name in caplog.text
+
+
+def test_run_skills_pins_cwd_to_home(skills_env, monkeypatch):
+    """cwd must be the verification home: npm exec prefers a cwd-local (or
+    ancestor) node_modules/skills over the pinned registry package, so an
+    inherited launch cwd inside an untrusted checkout defeats the version pin
+    (proven empirically). Every subprocess call must pin cwd."""
+    env = skills_env
+    calls = []
+    real_run = packs.subprocess.run
+
+    def spy_run(cmd, **kwargs):
+        calls.append(kwargs)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(packs.subprocess, "run", spy_run)
+    p = _pack(skills=("alpha",))
+    packs.install_pack(p, env.home, include_codex=False)
+    packs.update_packs([p], env.home, include_codex=False)
+    packs.remove_pack(p, env.home)
+    assert calls, "no subprocess calls recorded"
+    for kwargs in calls:
+        assert kwargs.get("cwd") == str(env.home)
 
 
 def test_registry_packs_not_a_dict(tmp_path, caplog):

@@ -20,7 +20,6 @@ extra here.
 
 import asyncio
 import logging
-import os
 from pathlib import Path
 
 from fastapi import APIRouter, status
@@ -41,12 +40,12 @@ DATA_ROOT = Path(__file__).parent.parent.parent / "data"
 def _home() -> Path:
     """Home directory for pack state + status, resolved per request.
 
-    Honors ``$JACKED_HOME`` exactly like the CLI (see ``cli._jacked_home``), so
-    the dashboard and CLI read/write the same enabled-pack state and skill tree.
-    Evaluated inside each handler (never cached at import) so an env override —
-    set for tests or unusual installs — always takes effect.
+    Delegates to the one canonical resolver (``packs.jacked_home``) so the
+    dashboard, the CLI, and the core module can never drift on where state and
+    skills live. Evaluated inside each handler (never cached at import) so an
+    env override — set for tests or unusual installs — always takes effect.
     """
-    return Path(os.getenv("JACKED_HOME") or Path.home())
+    return packs.jacked_home()
 
 
 # --- Pydantic models ---

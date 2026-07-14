@@ -248,3 +248,46 @@ def test_hostile_description_and_homepage_are_escaped(tmp_path):
     # Documented gap: escapeHtml leaves the javascript: scheme intact. It is
     # harmless HERE only because it sits in a text node, not an href.
     assert "javascript:alert(2)" in html
+
+
+def test_inflight_checkbox_reflects_intent_not_stale_cache(tmp_path):
+    """Mid-disable, the cached enabled flag is still True; the checkbox must
+    render UNCHECKED (the user's intent) so a re-render never snaps the track
+    back to ON under a 'Removing skills...' label — and vice versa mid-enable."""
+    disabling = {
+        "npx_available": True,
+        "packs": [_pack(enabled=True, installed_count=9, total=9)],
+    }
+    html = _render_packs_section(tmp_path, disabling, inflight={"marketing": "disable"})
+    assert "checked" not in html.split("aria-label")[0].split("input")[-1]
+    assert 'aria-busy="true"' in html
+
+    enabling = {
+        "npx_available": True,
+        "packs": [_pack(enabled=False, installed_count=0, total=9)],
+    }
+    html = _render_packs_section(tmp_path, enabling, inflight={"marketing": "enable"})
+    assert "checked disabled" in html
+
+
+def test_retry_link_suppressed_when_npx_missing(tmp_path):
+    """A partial pack with no Node must not dangle an actionable Retry link
+    next to a dead toggle: the link needs npx exactly like the toggle."""
+    data = {
+        "npx_available": False,
+        "packs": [_pack(enabled=True, installed_count=3, total=9)],
+    }
+    html = _render_packs_section(tmp_path, data)
+    assert "3 of 9 skills installed" in html
+    assert "Retry install" not in html
+
+
+def test_status_line_is_a_live_region(tmp_path):
+    """The status div is the one signal for a minute-long operation; it must be
+    announced to assistive tech."""
+    data = {
+        "npx_available": True,
+        "packs": [_pack(enabled=True, installed_count=9, total=9)],
+    }
+    html = _render_packs_section(tmp_path, data)
+    assert 'role="status"' in html and 'aria-live="polite"' in html

@@ -588,3 +588,20 @@ def test_install_packs_skipped_recorded_in_json(env):
     line = [ln for ln in r.output.splitlines() if ln.strip()][-1]
     rec = json.loads(line)
     assert rec["packs"]["marketing"]["skipped"] == ["pricing"]
+
+def test_pack_failure_message_with_rich_markup_does_not_crash(env):
+    """npm error tails routinely contain bracketed tokens; a hostile or merely
+    unlucky message must neither raise rich.errors.MarkupError nor render live
+    [link] markup. Regression for the Rich-injection finding."""
+    hostile = "npx skills exited 1. npm ERR! [/bad] [link=http://evil.example]click[/link]"
+    _fake_packs(
+        env.monkeypatch,
+        install_result=packs_mod.PackOpResult(ok=False, message=hostile),
+    )
+    _stub_codex(env.monkeypatch, present=False)
+    r = CliRunner().invoke(main, ["packs", "enable", "marketing"])
+    assert r.exit_code == 1
+    out = env.buf.getvalue()
+    assert "npm ERR!" in out
+    # the [link=...] token must appear as inert text, not be swallowed as markup
+    assert "evil.example" in out

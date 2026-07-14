@@ -20,11 +20,13 @@ Our own enable-state (independent of what's on disk) lives at
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,8 +52,12 @@ _NPX_MISSING_MSG = (
 
 # Structural validation for the bundled registry (defense in depth: the values
 # below flow straight onto the skills-CLI argv, so a stray "-g" or "../evil"
-# must never reach a subprocess).
-_SOURCE_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+# must never reach a subprocess). Each source segment must START alphanumeric:
+# that anchors out leading "-" (argv flag smuggling) and leading "." ("..",
+# ".git" and friends) in one stroke.
+_SOURCE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$"
+)
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
@@ -189,12 +195,27 @@ def load_state(home: Path) -> dict:
 
 
 def save_state(home: Path, state: dict) -> None:
-    """Atomically write enable-state (tmp file in the same dir + os.replace)."""
+    """Atomically write enable-state via a writer-unique tmp + os.replace.
+
+    The tmp name must be unique per writer: the CLI and the dashboard service
+    are separate processes that can both call set_enabled against the same
+    home. A shared tmp path lets one writer os.replace the other's half-written
+    file away (FileNotFoundError for the loser, or a torn file that load_state
+    silently degrades to {}, wiping enable-state).
+    """
     path = _state_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state, indent=2))
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def set_enabled(home: Path, name: str, enabled: bool) -> None:
@@ -581,13 +602,20 @@ def _run_skills(cmd: list[str], *, home: Path, timeout: int) -> tuple[bool, str]
     skills CLI writes relative to $HOME, and jacked verifies against ``home``
     (which honors $JACKED_HOME), so pinning the child's HOME keeps the
     subprocess and our post-op verification pointed at the same tree.
+
+    cwd is pinned to ``home`` too: npm exec prefers a cwd-local (or ancestor)
+    ``node_modules/skills`` that satisfies the version specifier over the
+    registry package, so running jacked from inside an untrusted checkout that
+    committed a spoofed ``node_modules/skills`` would execute the spoof despite
+    the SKILLS_CLI_SPEC pin (proven empirically). Pinning cwd to the user-owned
+    home makes resolution deterministic regardless of launch directory.
     """
     logger.info("Running skills command: %s", " ".join(cmd))
     env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
-            stdin=subprocess.DEVNULL, env=env,
+            stdin=subprocess.DEVNULL, env=env, cwd=str(home),
         )
     except subprocess.TimeoutExpired as e:
         out = _tail((e.stderr or "") + (e.stdout or ""))

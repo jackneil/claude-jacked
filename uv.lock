@@ -249,6 +249,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "rich" },
     { name = "rumps", marker = "sys_platform == 'darwin'" },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -277,6 +278,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.2.2,<2" },
     { name = "rich", specifier = ">=13.0,<16" },
     { name = "rumps", marker = "sys_platform == 'darwin'", specifier = ">=0.4,<1" },
+    { name = "starlette", specifier = ">=0.48" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.20,<1" },
 ]
 provides-extras = ["all", "search", "security", "tray", "web"]

@@ -309,3 +309,44 @@ def test_jacked_home_env_honored_on_put_enable(monkeypatch, tmp_path):
     assert seen["set_enabled_home"] == expected
     assert seen["install_home"] == expected
     assert seen["status_home"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Route-pinned CSRF/Host coverage: PUT /api/packs/{name} is the one endpoint
+# that triggers a subprocess + remote fetch, so its middleware protection is
+# asserted BY NAME here. A future middleware path-exclusion or router-order
+# change must fail this test, not silently drop the guard.
+# ---------------------------------------------------------------------------
+
+def _make_guarded_app():
+    from jacked.api.security import HostValidationMiddleware, build_allowed_origins
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    app.add_middleware(HostValidationMiddleware)
+    app.state.allowed_origins = build_allowed_origins("127.0.0.1", 8321)
+    return app
+
+
+def test_put_packs_foreign_origin_is_403(monkeypatch):
+    monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
+    client = TestClient(_make_guarded_app())
+    resp = client.put(
+        "/api/packs/marketing",
+        json={"enabled": True},
+        headers={"origin": "http://evil.example.com"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CSRF_ORIGIN"
+
+
+def test_put_packs_untrusted_host_is_421(monkeypatch):
+    monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
+    client = TestClient(_make_guarded_app())
+    resp = client.put(
+        "/api/packs/marketing",
+        json={"enabled": True},
+        headers={"host": "evil.example.com"},
+    )
+    assert resp.status_code == 421
+    assert resp.json()["error"]["code"] == "UNTRUSTED_HOST"

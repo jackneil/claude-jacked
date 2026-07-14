@@ -456,15 +456,20 @@ function _renderPacksSection(packsData) {
         let statusLine;
         if (inflight) {
             // Mid-op: show progress, never the (stale) count. Survives any
-            // re-render that lands while npx is still running.
+            // re-render that lands while npx is still running. role=status so
+            // assistive tech hears the minute-long operation begin.
             const busyText = inflight === 'enable' ? 'Installing skills...' : 'Removing skills...';
-            statusLine = `<div class="text-xs text-slate-400 mt-1 pack-status">${busyText}</div>`;
+            statusLine = `<div class="text-xs text-slate-400 mt-1 pack-status" role="status" aria-live="polite">${busyText}</div>`;
         } else if (partial) {
             // Enabled but short: some skills failed to land. Flag it amber and
-            // offer a one-click repair that re-fires the enable PUT.
-            statusLine = `<div class="text-xs text-amber-400 mt-1 pack-status">${escapeHtml(countText)}<a href="#" class="pack-retry text-xs text-blue-400 hover:text-blue-300 ml-2 transition-colors" data-pack-retry="${escapeHtml(p.name)}">Retry install</a></div>`;
+            // offer a one-click repair that re-fires the enable PUT. The link
+            // needs npx just like the toggle, so it disappears with it.
+            const retryLink = npxAvailable
+                ? `<a href="#" class="pack-retry text-xs text-blue-400 hover:text-blue-300 ml-2 transition-colors" data-pack-retry="${escapeHtml(p.name)}">Retry install</a>`
+                : '';
+            statusLine = `<div class="text-xs text-amber-400 mt-1 pack-status" role="status" aria-live="polite">${escapeHtml(countText)}${retryLink}</div>`;
         } else {
-            statusLine = `<div class="text-xs text-slate-400 mt-1 pack-status">${escapeHtml(countText)}</div>`;
+            statusLine = `<div class="text-xs text-slate-400 mt-1 pack-status" role="status" aria-live="polite">${escapeHtml(countText)}</div>`;
         }
 
         const homeLink = p.homepage
@@ -478,6 +483,11 @@ function _renderPacksSection(packsData) {
         if (inflight) labelClasses.push('pending');
         const inputDisabled = (!npxAvailable || inflight) ? 'disabled' : '';
         const describedBy = npxAvailable ? '' : ' aria-describedby="packs-npx-note"';
+        const ariaBusy = inflight ? ' aria-busy="true"' : '';
+        // Mid-op the checkbox reflects the user's INTENT (the op in flight),
+        // never the stale cached enabled flag: a re-render during a disable
+        // must not snap the track back to ON under a "Removing skills..." label.
+        const checked = (inflight ? inflight === 'enable' : p.enabled) ? 'checked' : '';
 
         return `
             <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50 gap-3" data-pack-row="${escapeHtml(p.name)}">
@@ -489,8 +499,8 @@ function _renderPacksSection(packsData) {
                     <div class="text-xs text-slate-400 mt-1">${escapeHtml(p.description || '')}</div>
                     ${statusLine}
                 </div>
-                <label class="${labelClasses.join(' ')}" data-pack="${escapeHtml(p.name)}" data-display-name="${escapeHtml(displayName)}">
-                    <input type="checkbox" ${p.enabled ? 'checked' : ''} ${inputDisabled} aria-label="${escapeHtml(displayName)} skill pack"${describedBy}>
+                <label class="${labelClasses.join(' ')}" data-pack="${escapeHtml(p.name)}" data-display-name="${escapeHtml(displayName)}"${ariaBusy}>
+                    <input type="checkbox" ${checked} ${inputDisabled} aria-label="${escapeHtml(displayName)} skill pack"${describedBy}>
                     <span class="toggle-slider"></span>
                 </label>
             </div>
@@ -508,6 +518,9 @@ function _renderPacksSection(packsData) {
 }
 
 async function _runPackToggle(toggle, input, name, displayName, enabled) {
+    // Re-entry guard: a stale Retry link (or any handler bound before this op
+    // started) must never fire a second concurrent npx run for the same pack.
+    if (_packsInFlight.has(name)) return;
     // Optimistic pending + disable: these ops take 10-60s, and the instant
     // feature toggles don't, so guard against double-clicks firing a second
     // npx run mid-install. The in-flight record is what makes that guard
