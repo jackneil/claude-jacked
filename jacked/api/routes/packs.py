@@ -114,7 +114,11 @@ async def list_packs():
         # toggle matches what a plain `jacked install` would install.
         st["enabled"] = packs.is_effectively_enabled(pack, home)
         st["default"] = pack.default
-        st["explicit"] = packs.pack_state(home, name) is not None
+        # "explicit" = the user made a decision THIS build recognizes. A future
+        # unrecognized state is treated as no-decision by is_effectively_enabled,
+        # so it must not read as explicit here either (keep the flag consistent
+        # with the effective-state contract).
+        st["explicit"] = packs.pack_state(home, name) in ("enabled", "disabled")
         items.append(st)
 
     return {

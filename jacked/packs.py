@@ -322,8 +322,12 @@ def set_enabled(home: Path, name: str, enabled: bool) -> None:
 
 
 def pack_state(home: Path, name: str) -> str | None:
-    """The explicit state of a pack: ``"enabled"``, ``"disabled"``, or ``None``
-    (no explicit decision recorded -- the registry default applies)."""
+    """The recorded state string for a pack, or ``None`` if no entry exists.
+
+    Normally ``"enabled"`` / ``"disabled"`` / ``None`` (no decision -> registry
+    default applies). May also return a state string a NEWER jacked wrote that
+    this build doesn't recognize; is_effectively_enabled treats any such value
+    as "no decision" (falls through to the default)."""
     entry = load_state(home).get("packs", {}).get(name)
     return entry.get("state") if isinstance(entry, dict) else None
 
