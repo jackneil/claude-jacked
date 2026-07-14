@@ -55,10 +55,13 @@ _NPX_MISSING_MSG = (
 # must never reach a subprocess). Each source segment must START alphanumeric:
 # that anchors out leading "-" (argv flag smuggling) and leading "." ("..",
 # ".git" and friends) in one stroke.
+# \Z (not $) so a trailing newline can't sneak into a value: $ matches before a
+# final \n, and while a list-argv/shell=False call makes that non-exploitable,
+# an airtight contract costs nothing here.
 _SOURCE_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z"
 )
-_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
 
 
 @dataclass(frozen=True)
@@ -587,8 +590,16 @@ def _skill_present(home: Path, name: str) -> bool:
     )
 
 
+# Control chars except tab/newline/carriage-return. npx stderr is upstream
+# controlled; a compromised package could embed terminal escape/OSC sequences
+# (screen-clear, OSC-52 clipboard write, OSC-8 hyperlink) that fire when the
+# tail is later cat'd from the log. Strip them at the source so both the log
+# sink and the console print carry inert text.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
 def _tail(text: str, n: int = 500) -> str:
-    return (text or "").strip()[-n:]
+    return _CONTROL_CHARS_RE.sub("", (text or "").strip())[-n:]
 
 
 def _run_skills(cmd: list[str], *, home: Path, timeout: int) -> tuple[bool, str]:

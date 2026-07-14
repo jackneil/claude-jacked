@@ -900,3 +900,31 @@ def test_jacked_home_honors_env(tmp_path, monkeypatch):
 def test_jacked_home_defaults_to_home(monkeypatch):
     monkeypatch.delenv("JACKED_HOME", raising=False)
     assert packs.jacked_home() == Path.home()
+
+
+def test_run_skills_strips_terminal_escapes_from_tail(skills_env, caplog):
+    """A compromised upstream package could emit ANSI/OSC escape sequences on
+    stderr that fire when the tail is later cat'd from the log. _tail must
+    strip control chars so both the returned message and the log record are
+    inert. Newlines/tabs are preserved."""
+    env = skills_env
+    hostile = "npm ERR!\x1b[2J\x1b]52;c;ZXZpbA==\x07 boom\ttab\nline"
+    env.set_scenario(mode="exit_nonzero", exit_code=1, stderr=hostile)
+    with caplog.at_level("WARNING"):
+        res = packs.install_pack(_pack(), env.home, include_codex=False)
+    assert res.ok is False
+    assert "\x1b" not in res.message and "\x07" not in res.message
+    assert "npm ERR!" in res.message and "boom" in res.message
+    assert "\n" in res.message  # newlines survive the strip
+    for rec in caplog.records:
+        assert "\x1b" not in rec.getMessage()
+
+
+def test_registry_source_rejects_trailing_newline(tmp_path, caplog):
+    """\\Z (not $) anchoring: a trailing newline in a source must be rejected."""
+    bad = {"packs": {"nl": {"source": "acme/skills\n", "skills": ["alpha"]},
+                     "good": {"source": "acme/skills", "skills": ["alpha"]}}}
+    (tmp_path / "packs.json").write_text(json.dumps(bad), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        reg = packs.load_registry(tmp_path)
+    assert set(reg) == {"good"}

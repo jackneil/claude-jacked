@@ -291,3 +291,59 @@ def test_status_line_is_a_live_region(tmp_path):
     }
     html = _render_packs_section(tmp_path, data)
     assert 'role="status"' in html and 'aria-live="polite"' in html
+
+
+def _run_toggle_reentry(tmp_path):
+    """Drive _runPackToggle twice for the same pack while the first PUT is still
+    pending, and count how many api.put calls fire. The re-entry guard
+    (_packsInFlight.has(name)) must permit exactly one. Returns the call count.
+
+    Same single-eval trick as the render harness so the driver shares scope with
+    the module-level `const _packsInFlight` and the module functions.
+    """
+    driver = r"""
+let putCalls = 0;
+let resolveFirst;
+// Stub the api the handler closes over: first PUT hangs (pending) so the second
+// _runPackToggle re-enters while the first is still in flight.
+global.api = { put: (path, body) => { putCalls++; return new Promise(r => { resolveFirst = r; }); } };
+global.showToast = () => {};
+global.renderSettingsTab = async () => {};
+global.refreshPacks = async () => {};
+// Minimal fake label + input (the handler toggles .classList and .disabled).
+function fakeToggle() {
+  return {
+    classList: { add() {}, remove() {} },
+  };
+}
+const input = { disabled: false, checked: false };
+const toggle = fakeToggle();
+// Fire twice back-to-back: the 2nd must hit the guard and return before put().
+_runPackToggle(toggle, input, 'marketing', 'Marketing Skills', true);
+_runPackToggle(toggle, input, 'marketing', 'Marketing Skills', true);
+process.stdout.write('\n<<<PUTCALLS>>>' + putCalls + '<<<END>>>\n');
+"""
+    program = f"""
+const fs = require('fs');
+global.window = {{ jackedState: {{}} }};
+global.document = {{ createElement: () => ({{ set textContent(v){{}}, get innerHTML(){{return '';}} }}), getElementById: () => null, querySelectorAll: () => [], querySelector: () => null }};
+global.localStorage = {{ getItem: () => null, setItem: () => {{}} }};
+const UTILS = fs.readFileSync({json.dumps(str(UTILS_JS))}, 'utf8');
+const SETTINGS = fs.readFileSync({json.dumps(str(SETTINGS_JS))}, 'utf8');
+const DRIVER = {json.dumps(driver)};
+eval(UTILS + '\\n' + SETTINGS + '\\n' + DRIVER);
+"""
+    script = tmp_path / "reentry_harness.js"
+    script.write_text(program, encoding="utf-8")
+    proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, f"node failed:\nstderr={proc.stderr}\nstdout={proc.stdout}"
+    out = proc.stdout
+    return int(out[out.index("<<<PUTCALLS>>>") + len("<<<PUTCALLS>>>"):out.index("<<<END>>>")])
+
+
+def test_run_pack_toggle_reentry_guard_blocks_second_put(tmp_path):
+    """A second _runPackToggle for the same pack while the first PUT is pending
+    must NOT fire a second concurrent PUT. Pins settings.js:_runPackToggle's
+    `if (_packsInFlight.has(name)) return;` guard, which is otherwise silently
+    revertible (no other test drives the handler)."""
+    assert _run_toggle_reentry(tmp_path) == 1
