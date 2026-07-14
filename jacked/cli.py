@@ -2274,6 +2274,12 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     is_flag=True,
     help="Skip installing skills/commands/rules/gatekeeper into Codex (auto-detected by default)",
 )
+@click.option(
+    "--packs",
+    "packs_csv",
+    default=None,
+    help="Comma-separated skill packs to enable and install (e.g. --packs marketing). See `jacked packs list`.",
+)
 def install(
     sounds: bool,
     no_rules: bool,
@@ -2281,6 +2287,7 @@ def install(
     force: bool,
     as_json: bool,
     no_codex: bool,
+    packs_csv: str | None,
 ):
     """Auto-install skills, agents, commands, rules, and hooks.
 
@@ -2346,11 +2353,13 @@ def install(
     # manifest. Best-effort: a Codex failure never fails the Claude install.
     _codex_summary = None
     _codex_failed = False
+    _codex_detected = False
     if not no_codex:
         try:
             from jacked.codex import installer as _cdx
 
             if _cdx.codex_present():
+                _codex_detected = True
                 _codex_summary = _cdx.install_codex(
                     pkg_root,
                     version=_ver,
@@ -2359,6 +2368,16 @@ def install(
         except Exception:
             logger.exception("Codex install pass failed (Claude install unaffected)")
             _codex_failed = True
+
+    # --- Skill packs pass ---
+    # Enable + install/refresh any requested (and any already-enabled) skill
+    # packs. include_codex mirrors the Codex pass condition above (reuse the
+    # detection result, never re-detect). A pack failure prints loud but never
+    # fails the overall install; an unknown --packs name exits before touching
+    # pack state.
+    _packs_record = _run_packs_phase(
+        home, pkg_root, packs_csv, _codex_detected, as_json
+    )
 
     if as_json:
         if _codex_summary is not None:
@@ -2375,6 +2394,8 @@ def install(
             }
         elif _codex_failed:
             _record["codex"] = {"failed": True}
+        if _packs_record:
+            _record["packs"] = _packs_record
         click.echo(json.dumps(_record))
     else:
         console.print("")
@@ -2693,6 +2714,136 @@ def _run_install(
     # autostart and start the tray now. `--no-tray` opts out.
     if not no_tray:
         _setup_tray_autostart()
+
+
+def _detect_codex_for_packs() -> bool:
+    """Auto-detect Codex for a standalone skill-pack op (enable/update).
+
+    Mirrors the guard the install path uses: best-effort, and a Codex probe
+    failure just means "don't target Codex" rather than an error.
+    """
+    try:
+        from jacked.codex import installer as _cdx
+
+        return _cdx.codex_present()
+    except Exception:
+        return False
+
+
+def _packs_unknown_name(name: str, registry: dict) -> None:
+    """Print an actionable unknown-pack error and exit 1.
+
+    Lists the valid pack names (or a clear "none available" when the registry
+    is empty). Never returns - always raises SystemExit(1).
+    """
+    valid = ", ".join(sorted(registry)) or "(none available)"
+    console.print(
+        f"[red][FAIL][/red] Unknown skill pack '{name}'. Valid packs: {valid}."
+    )
+    raise SystemExit(1)
+
+
+def _run_packs_phase(
+    home: Path,
+    pkg_root: Path,
+    packs_csv: str | None,
+    include_codex: bool,
+    as_json: bool,
+) -> dict:
+    """Enable + install/refresh skill packs as part of `jacked install`.
+
+    Returns ``{name: {"ok", "installed", "missing", "message"}}`` for the JSON
+    record (empty dict when no packs are enabled or npx is missing). Never fails
+    the overall install: a pack error prints loud but the caller's exit code
+    stays 0. An unknown ``--packs`` name is the ONE exit - and it exits BEFORE
+    any pack state is written.
+    """
+    from jacked import packs as _packs
+
+    registry = _packs.load_registry(pkg_root)
+    prior_enabled = set(_packs.enabled_pack_names(home))
+
+    # Validate every requested name against the registry BEFORE touching state.
+    newly_enabled: list[str] = []
+    if packs_csv:
+        requested = [p.strip() for p in packs_csv.split(",") if p.strip()]
+        unknown = [p for p in requested if p not in registry]
+        if unknown:
+            valid = ", ".join(sorted(registry)) or "(none available)"
+            console.print(
+                "[red][FAIL][/red] Unknown skill pack(s): "
+                f"{', '.join(unknown)}. Valid packs: {valid}."
+            )
+            raise SystemExit(1)
+        for name in requested:
+            if name not in prior_enabled:
+                newly_enabled.append(name)
+            _packs.set_enabled(home, name, True)
+
+    enabled = _packs.enabled_pack_names(home)
+    results: dict = {}
+    if not enabled:
+        return results
+
+    if _packs.find_npx() is None:
+        if not as_json:
+            console.print(
+                "[yellow][-][/yellow] Skill packs skipped: Node.js/npx not found "
+                "(install Node 18+)"
+            )
+        return results
+
+    newly_set = set(newly_enabled)
+
+    # Newly-enabled packs get a fresh install; already-enabled ones are batched
+    # through ONE update call (the skills CLI updates every source at once).
+    for name in [n for n in enabled if n in registry and n in newly_set]:
+        pack = registry[name]
+        res = _packs.install_pack(pack, home, include_codex=include_codex)
+        n_installed = len(res.installed)
+        total = len(pack.skills)
+        results[name] = {
+            "ok": res.ok,
+            "installed": n_installed,
+            "missing": list(res.missing),
+            "message": res.message,
+        }
+        if not as_json:
+            if res.ok:
+                console.print(
+                    f"[green][OK][/green] Pack '{name}': "
+                    f"{n_installed}/{total} skills installed"
+                )
+            else:
+                console.print(f"[red][FAIL][/red] {res.message}")
+
+    to_update = [n for n in enabled if n in registry and n not in newly_set]
+    if to_update:
+        update_packs = [registry[n] for n in to_update]
+        upd = _packs.update_packs(update_packs, home, include_codex=include_codex)
+        for name in to_update:
+            pack = registry[name]
+            st = _packs.pack_status(pack, home)
+            installed_count = st.get("installed_count", 0)
+            total = st.get("total", len(pack.skills))
+            missing = [s["name"] for s in st.get("skills", []) if not s.get("installed")]
+            pack_ok = upd.ok and not missing
+            results[name] = {
+                "ok": pack_ok,
+                "installed": installed_count,
+                "missing": missing,
+                "message": upd.message,
+            }
+            if not as_json:
+                if pack_ok:
+                    console.print(
+                        f"[green][OK][/green] Pack '{name}': "
+                        f"{installed_count}/{total} skills installed"
+                    )
+                else:
+                    console.print(f"[red][FAIL][/red] {upd.message}")
+
+    return results
 
 
 def _tray_extra_installed() -> bool:
@@ -3321,10 +3472,170 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     except Exception:
         logger.exception("Codex uninstall pass failed")
 
+    # Remove enabled skill packs' skills (best-effort), then always drop the
+    # pack state file so a fresh install starts clean. npx missing: we can't
+    # drive the skills CLI to remove anything, so warn and still clear state.
+    try:
+        from jacked import packs as _packs
+
+        _enabled_packs = _packs.enabled_pack_names(home)
+        _registry = _packs.load_registry(pkg_root)
+        if _enabled_packs and _packs.find_npx() is None:
+            console.print(
+                "[yellow][-][/yellow] Skill packs: Node.js/npx not found; "
+                "skipping skill removal and clearing pack state only"
+            )
+        else:
+            for _pk_name in _enabled_packs:
+                _pk = _registry.get(_pk_name)
+                if _pk is None:
+                    continue
+                _pk_res = _packs.remove_pack(_pk, home)
+                if _pk_res.removed:
+                    console.print(
+                        f"[green][OK][/green] Pack '{_pk_name}': removed "
+                        f"{len(_pk_res.removed)} skill(s)"
+                    )
+                if _pk_res.skipped:
+                    console.print(
+                        f"[yellow][!][/yellow] Pack '{_pk_name}': skipped "
+                        f"{', '.join(_pk_res.skipped)} (different source or not tracked)"
+                    )
+        _state_file = home / ".claude" / _packs.STATE_PATH_NAME
+        _state_file.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("Skill packs uninstall pass failed")
+
     console.print("\n[bold]Uninstall complete![/bold]")
     console.print(
         "\n[dim]Run 'uv tool uninstall claude-jacked' to fully remove the package.[/dim]"
     )
+
+
+@main.group(name="packs")
+def packs_group():
+    """Manage optional third-party skill packs."""
+    pass
+
+
+@packs_group.command(name="list")
+def packs_list():
+    """List available skill packs and their install status."""
+    from rich.table import Table
+
+    from jacked import packs as _packs
+
+    home = _jacked_home()
+    registry = _packs.load_registry(_get_data_root())
+    if not registry:
+        console.print("[yellow]No skill packs are available in this build.[/yellow]")
+        return
+
+    enabled = set(_packs.enabled_pack_names(home))
+    table = Table(title="Skill packs")
+    table.add_column("Pack", style="cyan", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Installed", justify="right", no_wrap=True)
+    table.add_column("Source", no_wrap=True)
+    table.add_column("Description")
+
+    for name in sorted(registry):
+        pack = registry[name]
+        st = _packs.pack_status(pack, home)
+        if name in enabled:
+            status = "[green]enabled[/green]"
+        else:
+            status = "[dim]disabled[/dim]"
+        installed = f"{st.get('installed_count', 0)}/{st.get('total', len(pack.skills))}"
+        desc = pack.description or ""
+        if len(desc) > 60:
+            desc = desc[:57] + "..."
+        table.add_row(name, status, installed, pack.source, desc)
+
+    console.print(table)
+
+
+@packs_group.command(name="enable")
+@click.argument("name")
+def packs_enable(name: str):
+    """Enable a skill pack and install its skills."""
+    from jacked import packs as _packs
+
+    home = _jacked_home()
+    registry = _packs.load_registry(_get_data_root())
+    pack = registry.get(name)
+    if pack is None:
+        _packs_unknown_name(name, registry)
+
+    # Persist intent first so a failed install still leaves the pack enabled
+    # (a later `jacked packs update` can then repair it).
+    _packs.set_enabled(home, name, True)
+    include_codex = _detect_codex_for_packs()
+    res = _packs.install_pack(pack, home, include_codex=include_codex)
+    if res.ok:
+        console.print(f"[green][OK][/green] {res.message}")
+    else:
+        console.print(f"[red][FAIL][/red] {res.message}")
+        raise SystemExit(1)
+
+
+@packs_group.command(name="disable")
+@click.argument("name")
+def packs_disable(name: str):
+    """Disable a skill pack and remove its skills."""
+    from jacked import packs as _packs
+
+    home = _jacked_home()
+    registry = _packs.load_registry(_get_data_root())
+    pack = registry.get(name)
+    if pack is None:
+        _packs_unknown_name(name, registry)
+
+    # Remove skills first, then clear intent regardless of the result: a
+    # disable request always wins so the pack never lingers enabled.
+    res = _packs.remove_pack(pack, home)
+    _packs.set_enabled(home, name, False)
+    if res.ok:
+        console.print(f"[green][OK][/green] {res.message}")
+    else:
+        console.print(f"[red][FAIL][/red] {res.message}")
+        raise SystemExit(1)
+
+
+@packs_group.command(name="update")
+@click.argument("name", required=False)
+def packs_update(name: str | None):
+    """Update enabled skill packs (all, or a single NAME)."""
+    from jacked import packs as _packs
+
+    home = _jacked_home()
+    registry = _packs.load_registry(_get_data_root())
+    enabled = _packs.enabled_pack_names(home)
+    include_codex = _detect_codex_for_packs()
+
+    if name:
+        pack = registry.get(name)
+        if pack is None:
+            _packs_unknown_name(name, registry)
+        if name not in enabled:
+            console.print(
+                f"[yellow]Pack '{name}' is not enabled. "
+                f"Run `jacked packs enable {name}` first.[/yellow]"
+            )
+            raise SystemExit(1)
+        targets = [pack]
+    else:
+        if not enabled:
+            console.print("No skill packs are enabled. Nothing to update.")
+            return
+        targets = [registry[n] for n in enabled if n in registry]
+
+    res = _packs.update_packs(targets, home, include_codex=include_codex)
+    if res.ok:
+        console.print(f"[green][OK][/green] {res.message}")
+    else:
+        console.print(f"[red][FAIL][/red] {res.message}")
+        raise SystemExit(1)
 
 
 @main.group(name="permissions")

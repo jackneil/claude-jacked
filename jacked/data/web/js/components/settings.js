@@ -134,6 +134,26 @@ async function refreshFeatures() {
     return await loadFeatures();
 }
 
+// --- Skill packs data loading ---
+
+// Enabling/disabling a pack runs `npx skills add/remove`, which typically takes
+// 10-60s (longer for big packs). The default 60s api timeout would abort a
+// legitimate slow install; wait comfortably past the server's own 600s
+// subprocess cap so the browser never gives up before the server reports back.
+const PACK_TOGGLE_TIMEOUT_MS = 660000;
+
+async function loadPacks() {
+    if (!window.jackedState.packs) {
+        window.jackedState.packs = await api.get('/api/packs');
+    }
+    return window.jackedState.packs;
+}
+
+async function refreshPacks() {
+    window.jackedState.packs = null;
+    return await loadPacks();
+}
+
 // --- Claude Code settings data loading ---
 
 async function loadClaudeSettings() {
@@ -163,7 +183,11 @@ function renderToggle(name, category, checked, sourceAvailable) {
 }
 
 function bindToggleEvents(container) {
-    container.querySelectorAll('.toggle-switch').forEach(toggle => {
+    // Scope to feature toggles (agents/commands/hooks/knowledge), which carry
+    // data-category. Skill-pack toggles share the .toggle-switch styling but
+    // have no data-category and are bound separately in _bindPackToggleEvents —
+    // this selector keeps the two handlers from colliding.
+    container.querySelectorAll('.toggle-switch[data-category]').forEach(toggle => {
         const input = toggle.querySelector('input');
         if (!input) return;
         input.addEventListener('change', async () => {
@@ -315,6 +339,20 @@ async function renderFeaturesTab(container) {
         const hooks = features.hooks || [];
         const knowledge = features.knowledge || [];
 
+        // Skill packs come from a separate endpoint. A hiccup fetching them
+        // must not blank out hooks/knowledge, so its failure is captured here
+        // and rendered as a small inline error with its own retry.
+        let packsData = null;
+        let packsError = null;
+        try {
+            packsData = await loadPacks();
+        } catch (e) {
+            packsError = e.message || 'Failed to load skill packs';
+        }
+        const packsSection = packsError
+            ? _renderPacksError(packsError)
+            : _renderPacksSection(packsData);
+
         const hookRows = hooks.map(h => `
             <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(h.display_name)}">
                 <div class="min-w-0 flex-1">
@@ -358,10 +396,13 @@ async function renderFeaturesTab(container) {
                         ${knowledgeRows}
                     </div>
                 </div>
+
+                ${packsSection}
             </div>
         `;
 
         bindToggleEvents(container);
+        _bindPackToggleEvents(container);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -370,6 +411,117 @@ async function renderFeaturesTab(container) {
             </div>
         `;
     }
+}
+
+// --- Skill packs section (rendered inside the Features tab) ---
+
+function _renderPacksError(message) {
+    return `
+        <div>
+            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Skill Packs</h3>
+            <div class="text-xs text-red-400">
+                Failed to load skill packs: ${escapeHtml(message)}
+                <button onclick="renderSettingsTab('features')" class="text-blue-400 hover:text-blue-300 ml-2 transition-colors">Retry</button>
+            </div>
+        </div>
+    `;
+}
+
+function _renderPacksSection(packsData) {
+    const packs = (packsData && packsData.packs) || [];
+    if (packs.length === 0) return '';
+
+    const npxAvailable = !!(packsData && packsData.npx_available);
+    const npxNote = npxAvailable
+        ? ''
+        : `<p class="text-xs text-yellow-400 mb-3">Requires Node.js 18+ (npx). Install Node to enable skill packs.</p>`;
+
+    const rows = packs.map(p => {
+        const displayName = p.display_name || p.name;
+        const installedLine = `${p.installed_count} of ${p.total} skills installed`;
+        const homeLink = p.homepage
+            ? `<a href="${escapeHtml(p.homepage)}" target="_blank" rel="noopener" class="text-xs text-blue-400 hover:text-blue-300 transition-colors flex-shrink-0">Source</a>`
+            : '';
+        return `
+            <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50 gap-3">
+                <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2">
+                        <span class="text-sm text-white">${escapeHtml(displayName)}</span>
+                        ${homeLink}
+                    </div>
+                    <div class="text-xs text-slate-400 mt-1">${escapeHtml(p.description || '')}</div>
+                    <div class="text-[11px] text-slate-500 mt-1">${escapeHtml(installedLine)}</div>
+                </div>
+                <label class="toggle-switch pack-toggle flex-shrink-0" data-pack="${escapeHtml(p.name)}" data-display-name="${escapeHtml(displayName)}">
+                    <input type="checkbox" ${p.enabled ? 'checked' : ''} ${npxAvailable ? '' : 'disabled'}>
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        `;
+    }).join('');
+
+    return `
+        <div>
+            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Skill Packs</h3>
+            <p class="text-xs text-slate-500 mb-3">Curated skill bundles installed live from upstream GitHub repos via the skills CLI. Toggling a pack runs npx and can take up to a minute.</p>
+            ${npxNote}
+            <div class="space-y-2">${rows}</div>
+        </div>
+    `;
+}
+
+function _bindPackToggleEvents(container) {
+    container.querySelectorAll('.pack-toggle').forEach(toggle => {
+        const input = toggle.querySelector('input');
+        // A disabled input (npx unavailable) gets no handler — the section
+        // stays read-only until Node is installed.
+        if (!input || input.disabled) return;
+        input.addEventListener('change', async () => {
+            const name = toggle.dataset.pack;
+            const displayName = toggle.dataset.displayName || name;
+            const enabled = input.checked;
+
+            // Optimistic pending + disable: these ops take 10-60s, and the
+            // instant feature toggles don't, so guard against double-clicks
+            // firing a second npx run mid-install.
+            toggle.classList.add('pending');
+            input.disabled = true;
+
+            try {
+                const res = await api.put(
+                    `/api/packs/${encodeURIComponent(name)}`,
+                    { enabled },
+                    { timeout: PACK_TOGGLE_TIMEOUT_MS },
+                );
+                if (res && res.ok) {
+                    showToast(res.message || `${displayName} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+                } else {
+                    // HTTP 200 with ok=false: the op ran but did not fully
+                    // succeed. The server persists the requested intent even
+                    // on partial failure, so surface the reason and fall
+                    // through to the re-render below; the authoritative state
+                    // decides what the toggle shows, never a manual revert.
+                    showToast((res && res.message) || `${displayName} ${enabled ? 'enable' : 'disable'} failed`, 'error');
+                }
+            } catch (e) {
+                showToast(e.message || 'Toggle failed', 'error');
+            } finally {
+                // Always re-render from the authoritative on-disk status:
+                // enabled intent, the "N of M installed" line, and the toggle
+                // binding all come back from GET /api/packs, whether the op
+                // succeeded, half-succeeded, or the request itself died.
+                try {
+                    await refreshPacks();
+                    await renderSettingsTab('features');
+                } catch (_) {
+                    // Re-render failed (e.g. server restarting): restore the
+                    // live toggle so the user can retry manually.
+                    toggle.classList.remove('pending');
+                    input.disabled = false;
+                }
+            }
+        });
+    });
 }
 
 // --- Tab: Plugins ---
