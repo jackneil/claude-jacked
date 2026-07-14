@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,10 +35,24 @@ logger = logging.getLogger(__name__)
 
 STATE_PATH_NAME = "jacked-packs.json"   # lives at home/.claude/jacked-packs.json
 
+# Pin the skills CLI to an empirically verified version. The behavioral
+# contracts jacked relies on -- the on-disk layout, the lockfile v3 schema, the
+# argv flags, and the agent names -- were verified against this exact version.
+# Bump ONLY deliberately, and only with a fresh re-verification pass against
+# those contracts; a silent floating version is how the rc=0 gotcha and the
+# lockfile source checks would drift out from under us.
+SKILLS_CLI_SPEC = "skills@1.5.17"
+
 _NPX_MISSING_MSG = (
     "Node.js with npx is required for skill packs. "
     "Install Node 18+ (https://nodejs.org) and re-run."
 )
+
+# Structural validation for the bundled registry (defense in depth: the values
+# below flow straight onto the skills-CLI argv, so a stray "-g" or "../evil"
+# must never reach a subprocess).
+_SOURCE_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 @dataclass(frozen=True)
@@ -56,8 +71,23 @@ class PackOpResult:
     installed: list[str] = field(default_factory=list)   # verified present on disk after the op
     missing: list[str] = field(default_factory=list)     # expected but absent afterward -> loud failure
     removed: list[str] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)     # e.g. foreign-source skills we refused to remove
+    skipped: list[str] = field(default_factory=list)     # e.g. foreign-source skills we refused to touch
     message: str = ""                                    # human-readable summary or error
+    per_pack: dict = field(default_factory=dict)         # name -> PackOpResult (update_packs attribution)
+
+
+# --------------------------------------------------------------------------- #
+# Home resolution
+# --------------------------------------------------------------------------- #
+
+def jacked_home() -> Path:
+    """Resolve jacked's home dir (the ~/.claude / ~/.agents parent).
+
+    Mirrors ``cli._jacked_home`` so every pack surface (CLI, API) resolves the
+    same home: honors ``$JACKED_HOME`` and otherwise falls back to the real
+    home directory.
+    """
+    return Path(os.getenv("JACKED_HOME") or Path.home())
 
 
 # --------------------------------------------------------------------------- #
@@ -70,6 +100,13 @@ def load_registry(data_root: Path) -> dict[str, Pack]:
     Returns ``{name: Pack}``. Tolerant of a missing or malformed file (logs a
     warning and returns ``{}``): a broken bundled registry degrades to "no
     packs" rather than crashing the dashboard.
+
+    Every pack is structurally validated before it is admitted: ``source`` must
+    look like ``owner/repo``, ``skills`` must be a list of safe skill names, and
+    ``homepage`` must be empty or an ``https://`` URL. A pack that fails any
+    check is skipped with a warning naming it and the reason -- the registry is
+    the argv source for the skills CLI, so hostile or malformed values never get
+    the chance to reach a subprocess.
     """
     path = Path(data_root) / "packs.json"
     try:
@@ -81,15 +118,51 @@ def load_registry(data_root: Path) -> dict[str, Pack]:
         logger.warning("Ignoring unreadable pack registry %s: %s", path, e)
         return {}
 
+    raw_packs = raw.get("packs") if isinstance(raw, dict) else None
+    if raw_packs is None:
+        raw_packs = {}
+    if not isinstance(raw_packs, dict):
+        logger.warning(
+            "Pack registry %s: 'packs' is not an object (%s); ignoring registry",
+            path, type(raw_packs).__name__,
+        )
+        return {}
+
     packs: dict[str, Pack] = {}
-    for name, spec in (raw.get("packs") or {}).items():
+    for name, spec in raw_packs.items():
+        if not isinstance(spec, dict):
+            logger.warning("Skipping pack %r: entry is not an object", name)
+            continue
+        source = spec.get("source", "")
+        skills = spec.get("skills", [])
+        homepage = spec.get("homepage", "")
+        if not (isinstance(source, str) and _SOURCE_RE.match(source)):
+            logger.warning(
+                "Skipping pack %r: invalid source %r (want 'owner/repo')", name, source
+            )
+            continue
+        if not isinstance(skills, list):
+            logger.warning(
+                "Skipping pack %r: 'skills' is not a list (%s)", name, type(skills).__name__
+            )
+            continue
+        bad = [s for s in skills if not (isinstance(s, str) and _SKILL_NAME_RE.match(s))]
+        if bad:
+            logger.warning("Skipping pack %r: invalid skill name(s): %s", name, bad)
+            continue
+        if not (isinstance(homepage, str) and (homepage == "" or homepage.startswith("https://"))):
+            logger.warning(
+                "Skipping pack %r: invalid homepage %r (want '' or an https:// URL)",
+                name, homepage,
+            )
+            continue
         packs[name] = Pack(
             name=name,
             display_name=spec.get("display_name", name),
             description=spec.get("description", ""),
-            source=spec.get("source", ""),
-            homepage=spec.get("homepage", ""),
-            skills=tuple(spec.get("skills", [])),
+            source=source,
+            homepage=homepage,
+            skills=tuple(skills),
         )
     return packs
 
@@ -155,95 +228,191 @@ def find_npx() -> str | None:
 
 
 def read_lockfile(home: Path) -> dict:
-    """Parse ``home/.agents/.skill-lock.json``. Returns ``{}`` if absent/corrupt."""
+    """Parse ``home/.agents/.skill-lock.json``. Returns ``{}`` if absent/corrupt.
+
+    Emits a warning if the lockfile schema version is anything other than 3:
+    the source-attribution checks (collision guard, own-source update/remove)
+    are written against the v3 shape, so a different version means those checks
+    may misfire and the pinned skills CLI contract needs re-verification.
+    """
     path = Path(home) / ".agents" / ".skill-lock.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Ignoring unreadable skills lockfile %s: %s", path, e)
         return {}
+    if isinstance(data, dict) and data.get("version") != 3:
+        logger.warning(
+            "skills lockfile version %s != 3; source checks may misfire. "
+            "Re-verify the skills CLI contract.",
+            data.get("version"),
+        )
+    return data
 
 
 def install_pack(
     pack: Pack, home: Path, *, include_codex: bool, timeout: int = 600
 ) -> PackOpResult:
-    """Install every skill of ``pack`` via ``npx skills add`` and verify on disk."""
+    """Install every skill of ``pack`` via ``npx skills add`` and verify on disk.
+
+    Collision guard (confirmed user-data-loss: ``skills add`` clobbers a
+    pre-existing user-owned ~/.claude/skills/<name> with no warning): before
+    running anything, each skill is partitioned against the lockfile + disk.
+    A skill is ELIGIBLE only when it has no trace on disk, or its lockfile entry
+    records this pack's own source (a safe reinstall/refresh). Any other trace
+    on disk (a user's own dir, or a same-named skill from a different source) is
+    SKIPPED and never handed to the CLI. Skips do not fail the op, but are
+    always surfaced loudly.
+    """
+    lock = read_lockfile(home)
+    lock_skills = lock.get("skills", {}) if isinstance(lock, dict) else {}
+
+    eligible: list[str] = []
+    skipped: list[str] = []
+    for name in pack.skills:
+        entry = lock_skills.get(name)
+        own_source = isinstance(entry, dict) and entry.get("source") == pack.source
+        if not _skill_present(home, name) or own_source:
+            eligible.append(name)
+        else:
+            skipped.append(name)
+
+    skip_msg = ""
+    if skipped:
+        skip_msg = (
+            f"Refusing to overwrite existing skill(s) not installed from "
+            f"{pack.source}: {', '.join(skipped)}. Move or remove them first, "
+            "then run `jacked packs update`."
+        )
+
+    # Nothing to install (all skills already exist from another owner). Skips
+    # never fail the op, so report success while still surfacing them loudly.
+    if not eligible:
+        return PackOpResult(
+            ok=True, skipped=skipped,
+            message=skip_msg or f"Nothing to install for pack '{pack.display_name}'.",
+        )
+
     npx = find_npx()
     if not npx:
-        return PackOpResult(ok=False, missing=list(pack.skills), message=_NPX_MISSING_MSG)
+        return PackOpResult(
+            ok=False, missing=list(eligible), skipped=skipped,
+            message=_join(_NPX_MISSING_MSG, skip_msg),
+        )
 
-    cmd = _add_command(npx, pack, include_codex=include_codex)
-    ok, tail = _run_skills(cmd, timeout=timeout)
+    cmd = _add_command(npx, pack, eligible, include_codex=include_codex)
+    ok, tail = _run_skills(cmd, home=home, timeout=timeout)
     if not ok:
         return PackOpResult(
-            ok=False, missing=list(pack.skills),
-            message=tail or "npx skills add failed.",
+            ok=False, missing=list(eligible), skipped=skipped,
+            message=_join(tail or "npx skills add failed.", skip_msg),
         )
 
-    installed = [s for s in pack.skills if _skill_installed(home, s)]
-    missing = [s for s in pack.skills if s not in installed]
+    installed = [s for s in eligible if _skill_installed(home, s)]
+    missing = [s for s in eligible if s not in installed]
     if missing:
-        msg = (
-            f"Installed {len(installed)}/{len(pack.skills)} skills for pack "
-            f"'{pack.name}'. Missing after install: {', '.join(missing)}. "
-            f"Upstream ({pack.source}) may have renamed or removed these skills; "
-            "fix jacked/data/packs.json and run `jacked packs update`."
+        return PackOpResult(
+            ok=False, installed=installed, missing=missing, skipped=skipped,
+            message=_join(_missing_after_install_msg(pack, installed, missing, eligible), skip_msg),
         )
-        return PackOpResult(ok=False, installed=installed, missing=missing, message=msg)
 
     return PackOpResult(
-        ok=True, installed=installed,
-        message=f"Installed {len(installed)} skill(s) for pack '{pack.display_name}'.",
+        ok=True, installed=installed, skipped=skipped,
+        message=_join(
+            f"Installed {len(installed)} skill(s) for pack '{pack.display_name}'.",
+            skip_msg,
+        ),
     )
 
 
 def update_packs(
     packs: list[Pack], home: Path, *, include_codex: bool, timeout: int = 600
 ) -> PackOpResult:
-    """Update all globally installed skills, then verify + repair each pack.
+    """Update this pack-set's own skills, then verify + repair each pack.
 
-    Runs ``npx skills update`` once (it updates every source), then re-verifies
-    every skill of every given pack. A pack with any missing skill gets ONE
-    ``install_pack`` repair attempt and is re-verified. Results aggregate into a
-    single PackOpResult.
+    Only skills whose lockfile entry records the owning pack's source are passed
+    to ``skills update`` -- we never update another source's same-named skill,
+    and never touch an unmanaged directory. The scoped update runs once; then
+    each pack is verified independently and, if it has any missing skill, gets
+    ONE ``install_pack`` repair (which itself honors the collision guard) and is
+    re-verified. Each pack's own outcome is recorded in ``per_pack``; the
+    aggregate ``ok`` is the AND of every pack's ok.
     """
     npx = find_npx()
     if not npx:
         return PackOpResult(ok=False, message=_NPX_MISSING_MSG)
 
-    ok, tail = _run_skills([npx, "-y", "skills", "update", "-g", "-y"], timeout=timeout)
-    if not ok:
-        return PackOpResult(ok=False, message=tail or "npx skills update failed.")
+    lock = read_lockfile(home)
+    lock_skills = lock.get("skills", {}) if isinstance(lock, dict) else {}
 
+    # Scope the update: only CLI-managed skills whose recorded source matches
+    # the pack that claims them. De-dup while preserving order.
+    update_names: list[str] = []
+    seen: set[str] = set()
+    for pack in packs:
+        for name in pack.skills:
+            entry = lock_skills.get(name)
+            if (
+                isinstance(entry, dict)
+                and entry.get("source") == pack.source
+                and name not in seen
+            ):
+                update_names.append(name)
+                seen.add(name)
+
+    if update_names:
+        ok, tail = _run_skills(
+            [npx, "-y", SKILLS_CLI_SPEC, "update", *update_names, "-g", "-y"],
+            home=home, timeout=timeout,
+        )
+        if not ok:
+            # The update command failed wholesale: we cannot vouch for the
+            # freshness of ANY pack, so every pack is reported failed.
+            msg = tail or "npx skills update failed."
+            per_pack = {p.name: PackOpResult(ok=False, message=msg) for p in packs}
+            return PackOpResult(ok=False, message=msg, per_pack=per_pack)
+
+    per_pack: dict[str, PackOpResult] = {}
+    notes: list[str] = []
     all_installed: list[str] = []
     all_missing: list[str] = []
-    notes: list[str] = []
     overall_ok = True
 
     for pack in packs:
         missing = [s for s in pack.skills if not _skill_installed(home, s)]
         if not missing:
-            all_installed.extend(pack.skills)
-            notes.append(f"{pack.name}: up to date ({len(pack.skills)} skill(s))")
-            continue
-
-        # One repair pass through the normal install path.
-        install_pack(pack, home, include_codex=include_codex, timeout=timeout)
-        installed = [s for s in pack.skills if _skill_installed(home, s)]
-        still_missing = [s for s in pack.skills if s not in installed]
-        all_installed.extend(installed)
-        if still_missing:
-            overall_ok = False
-            all_missing.extend(still_missing)
-            notes.append(f"{pack.name}: still missing after repair: {', '.join(still_missing)}")
+            res = PackOpResult(
+                ok=True, installed=list(pack.skills),
+                message=f"{pack.name}: up to date ({len(pack.skills)} skill(s))",
+            )
         else:
-            notes.append(f"{pack.name}: repaired {', '.join(missing)}")
+            # One repair pass through the normal install path (collision-guarded).
+            repair = install_pack(pack, home, include_codex=include_codex, timeout=timeout)
+            installed = [s for s in pack.skills if _skill_installed(home, s)]
+            still_missing = [s for s in pack.skills if s not in installed]
+            if still_missing:
+                res = PackOpResult(
+                    ok=False, installed=installed, missing=still_missing,
+                    skipped=repair.skipped,
+                    message=f"{pack.name}: still missing after repair: {', '.join(still_missing)}",
+                )
+            else:
+                res = PackOpResult(
+                    ok=True, installed=installed, skipped=repair.skipped,
+                    message=f"{pack.name}: repaired {', '.join(missing)}",
+                )
+        per_pack[pack.name] = res
+        notes.append(res.message)
+        all_installed.extend(res.installed)
+        all_missing.extend(res.missing)
+        overall_ok = overall_ok and res.ok
 
     msg = "Updated skill packs. " + "; ".join(notes) if notes else "Updated skill packs."
     return PackOpResult(
-        ok=overall_ok, installed=all_installed, missing=all_missing, message=msg,
+        ok=overall_ok, installed=all_installed, missing=all_missing,
+        message=msg, per_pack=per_pack,
     )
 
 
@@ -281,8 +450,8 @@ def remove_pack(pack: Pack, home: Path, *, timeout: int = 300) -> PackOpResult:
     if not npx:
         return PackOpResult(ok=False, skipped=skipped, message=_NPX_MISSING_MSG)
 
-    cmd = [npx, "-y", "skills", "remove", *to_remove, "-g", "-y"]
-    ok, tail = _run_skills(cmd, timeout=timeout)
+    cmd = [npx, "-y", SKILLS_CLI_SPEC, "remove", *to_remove, "-g", "-y"]
+    ok, tail = _run_skills(cmd, home=home, timeout=timeout)
     if not ok:
         return PackOpResult(
             ok=False, skipped=skipped, message=tail or "npx skills remove failed.",
@@ -311,7 +480,7 @@ def pack_status(pack: Pack, home: Path) -> dict:
     skills: list[dict] = []
     installed_count = 0
     for name in pack.skills:
-        installed = (Path(home) / ".claude" / "skills" / name / "SKILL.md").exists()
+        installed = _skill_installed(home, name)
         entry = lock_skills.get(name)
         if isinstance(entry, dict):
             source_ok: bool | None = entry.get("source") == pack.source
@@ -348,13 +517,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _add_command(npx: str, pack: Pack, *, include_codex: bool) -> list[str]:
+def _join(*parts: str) -> str:
+    """Join non-empty message fragments with a single space."""
+    return " ".join(p for p in parts if p)
+
+
+def _missing_after_install_msg(
+    pack: Pack, installed: list[str], missing: list[str], attempted: list[str]
+) -> str:
+    """End-user-facing message when the CLI exits 0 but skills are still absent."""
+    return (
+        f"Installed {len(installed)}/{len(attempted)} skills for pack "
+        f"'{pack.name}'. Missing: {', '.join(missing)}. These may have been "
+        f"renamed or removed upstream ({pack.source}). Run `jacked packs update` "
+        "to retry; if it persists, upgrade jacked or report it at "
+        "https://github.com/jackneil/claude-jacked/issues."
+    )
+
+
+def _add_command(npx: str, pack: Pack, names: list[str], *, include_codex: bool) -> list[str]:
     agents = ["claude-code"]
     if include_codex:
         agents.append("codex")
     return [
-        npx, "-y", "skills", "add", pack.source,
-        "--skill", *pack.skills,
+        npx, "-y", SKILLS_CLI_SPEC, "add", pack.source,
+        "--skill", *names,
         "-g", "-y", "-a", *agents,
     ]
 
@@ -383,16 +570,25 @@ def _tail(text: str, n: int = 500) -> str:
     return (text or "").strip()[-n:]
 
 
-def _run_skills(cmd: list[str], *, timeout: int) -> tuple[bool, str]:
+def _run_skills(cmd: list[str], *, home: Path, timeout: int) -> tuple[bool, str]:
     """Run one npx-skills subprocess. Returns (ok, message_tail).
 
     ok is True only on a clean exit 0. On non-zero exit or timeout it returns
-    (False, <last ~500 chars of stderr/stdout>). Never raises for flow control;
-    os.environ is inherited untouched (npx needs the real HOME/PATH).
+    (False, <last ~500 chars of stderr/stdout>). Never raises for flow control.
+
+    stdin is /dev/null so a future interactive prompt fails fast instead of
+    hanging to the timeout. HOME/USERPROFILE are overridden to ``home``: the
+    skills CLI writes relative to $HOME, and jacked verifies against ``home``
+    (which honors $JACKED_HOME), so pinning the child's HOME keeps the
+    subprocess and our post-op verification pointed at the same tree.
     """
     logger.info("Running skills command: %s", " ".join(cmd))
+    env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, env=env,
+        )
     except subprocess.TimeoutExpired as e:
         out = _tail((e.stderr or "") + (e.stdout or ""))
         logger.warning("skills command timed out after %ss: %s", timeout, " ".join(cmd))

@@ -68,8 +68,11 @@ You may keep Markdown for an internal artifact **only** when a downstream tool *
 ## CLI Commands
 
 ```
-jacked install [--sounds] [--force]                 # Install skills, agents, commands, hooks
-jacked uninstall [--sounds]                         # Remove from Claude Code
+jacked install [--sounds] [--force] [--packs NAME]  # Install skills, agents, commands, hooks (+ optional skill packs)
+jacked uninstall [--sounds]                         # Remove from Claude Code (also removes enabled skill packs)
+jacked packs list                                   # List optional third-party skill packs + install status
+jacked packs enable NAME / disable NAME             # Install / remove a pack via the npx skills CLI
+jacked packs update [NAME]                          # Refresh enabled packs from their upstream repos
 jacked permissions audit [--fix] [--yes]            # Audit permission rules for dangerous wildcards
 jacked check-version                                # Check for newer PyPI version
 jacked webux                                        # Launch the web dashboard
@@ -88,6 +91,19 @@ into every new Claude Code session, making the model-dispatch lanes binding from
 the first turn with no /chain-of-command invocation. Disable: toggle the
 chain-of-command skill off in the dashboard (hook goes silent when the skill
 file is absent). `jacked uninstall` removes the hook entry.
+
+Skill packs (0.82.0+): curated collections of third-party skills installed LIVE
+from their upstream GitHub repos via the vercel-labs skills CLI (`npx skills`,
+Node 18+ required); nothing is vendored. Registry ships in jacked/data/packs.json
+(currently `marketing` = 28 curated skills from coreyhaines31/marketingskills,
+`design-extras` = improve-animations from emilkowalski/skills). Enable state
+lives in ~/.claude/jacked-packs.json; skills land canonical in ~/.agents/skills/
+with symlinks in ~/.claude/skills/ and are tracked by the skills CLI lockfile
+(~/.agents/.skill-lock.json). Every `jacked install` refreshes enabled packs.
+Dashboard toggles: Settings > Features > Skill Packs (GET/PUT /api/packs).
+Exit codes from the skills CLI are untrusted (rc=0 even when nothing installs);
+jacked verifies every operation on disk. Removal is lockfile-source-checked so
+same-named skills from other sources are never touched.
 
 Remote dashboard access (0.76.0+): the dashboard binds 127.0.0.1 by default. Any
 `--host` beyond loopback is hardened server-side (no CORS wildcard, same-origin

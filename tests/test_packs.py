@@ -10,6 +10,7 @@ named skill while still exiting 0 (the rc=0 gotcha), exit non-zero, or hang.
 """
 import json
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -38,11 +39,24 @@ def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-home = Path(os.environ["SKILLS_TEST_HOME"])
+# Back-compat: prefer the explicit test-home env, but fall back to $HOME —
+# jacked now overrides the child HOME to the same tree (see _run_skills), so a
+# future test could drop SKILLS_TEST_HOME entirely and this shim still works.
+home = Path(os.environ.get("SKILLS_TEST_HOME") or os.environ["HOME"])
 scenario = {}
 sp = os.environ.get("SKILLS_SCENARIO")
 if sp and os.path.exists(sp):
     scenario = json.loads(Path(sp).read_text())
+
+# Record the env jacked handed us so tests can assert HOME/USERPROFILE.
+try:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".child-env.json").write_text(json.dumps({
+        "HOME": os.environ.get("HOME"),
+        "USERPROFILE": os.environ.get("USERPROFILE"),
+    }))
+except OSError:
+    pass
 
 argv = sys.argv[1:]
 
@@ -64,11 +78,21 @@ if mode == "hang":
 if mode == "exit_nonzero":
     sys.stderr.write(scenario.get("stderr", "fake npx error"))
     sys.exit(int(scenario.get("exit_code", 1)))
+if mode == "read_stdin":
+    # DEVNULL -> read() returns "" immediately; an inherited TTY/pipe could
+    # block. Record what we saw, then fall through to normal handling.
+    data = sys.stdin.read()
+    try:
+        (home / ".stdin-eof").write_text("eof" if data == "" else "data")
+    except OSError:
+        pass
 
+# The CLI spec is pinned (skills@<version>), so match either the bare token or
+# a version-pinned one -- never assume an unpinned "skills".
 try:
-    i = argv.index("skills")
+    i = next(k for k, t in enumerate(argv) if t == "skills" or t.startswith("skills@"))
     sub = argv[i + 1]
-except (ValueError, IndexError):
+except (StopIteration, IndexError):
     sys.exit(0)
 
 
@@ -371,11 +395,12 @@ def test_install_pack_npx_missing(tmp_path, monkeypatch):
 def test_codex_flag_changes_agent_list(skills_env):
     npx = "/fake/npx"
     p = _pack(skills=("alpha",))
-    without = packs._add_command(npx, p, include_codex=False)
-    with_codex = packs._add_command(npx, p, include_codex=True)
+    without = packs._add_command(npx, p, list(p.skills), include_codex=False)
+    with_codex = packs._add_command(npx, p, list(p.skills), include_codex=True)
     assert without[-2:] == ["-a", "claude-code"]
     assert with_codex[-3:] == ["-a", "claude-code", "codex"]
     assert "codex" not in without
+    assert packs.SKILLS_CLI_SPEC in without and "skills" not in without
 
     # ...and it reaches the real subprocess command line.
     env = skills_env
@@ -504,3 +529,253 @@ def test_pack_status_foreign_source(skills_env):
     assert row["installed"] is True       # on disk
     assert row["source_ok"] is False      # but from a different repo
     assert st["installed_count"] == 1
+
+
+def test_pack_status_canonical_deleted_claude_copy_survives(skills_env):
+    # Windows copytree fallback: claude-side is a REAL dir copy (not a symlink),
+    # and the canonical .agents copy was deleted. The old SKILL.md-only check
+    # said "installed" here; _skill_installed requires BOTH and says False.
+    env = skills_env
+    p = _pack(skills=("alpha",))
+    packs.install_pack(p, env.home, include_codex=False)
+    claude = env.home / ".claude" / "skills" / "alpha"
+    canon = env.home / ".agents" / "skills" / "alpha"
+    if claude.is_symlink():
+        claude.unlink()
+    shutil.copytree(canon, claude)   # emulate the copytree fallback
+    shutil.rmtree(canon)             # canonical deleted out from under it
+
+    st = packs.pack_status(p, env.home)
+    assert (claude / "SKILL.md").exists()          # claude-side copy survives
+    assert st["skills"][0]["installed"] is False   # ...but still reported absent
+    assert st["installed_count"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Pinned CLI spec + argv shape
+# --------------------------------------------------------------------------- #
+
+def test_every_operation_uses_pinned_spec(skills_env):
+    env = skills_env
+    p = _pack(skills=("alpha",), source="acme/skills")
+    packs.install_pack(p, env.home, include_codex=False)
+    packs.update_packs([p], env.home, include_codex=False)
+    packs.remove_pack(p, env.home)
+
+    calls = _calls(env)
+    assert calls, "no npx calls recorded"
+    for c in calls:
+        assert packs.SKILLS_CLI_SPEC in c, f"call missing pinned spec: {c}"
+        assert "skills" not in c, f"call has a bare unpinned 'skills' token: {c}"
+
+
+def test_update_argv_is_scoped_to_named_skills(skills_env):
+    env = skills_env
+    p = _pack(skills=("alpha", "beta"), source="acme/skills")
+    packs.install_pack(p, env.home, include_codex=False)
+    packs.update_packs([p], env.home, include_codex=False)
+
+    update_call = next(c for c in _calls(env) if "update" in c)
+    assert "alpha" in update_call and "beta" in update_call
+    assert packs.SKILLS_CLI_SPEC in update_call
+    assert "skills" not in update_call
+
+
+# --------------------------------------------------------------------------- #
+# stdin hardening + HOME env override
+# --------------------------------------------------------------------------- #
+
+def test_stdin_is_devnull_reads_eof(skills_env):
+    env = skills_env
+    env.set_scenario(mode="read_stdin")
+    p = _pack(skills=("alpha",))
+    res = packs.install_pack(p, env.home, include_codex=False)
+    assert res.ok is True                       # falls through to a normal add
+    assert (env.home / ".stdin-eof").read_text() == "eof"
+
+
+def test_child_home_points_at_target_home(skills_env):
+    env = skills_env
+    packs.install_pack(_pack(skills=("alpha",)), env.home, include_codex=False)
+    child_env = json.loads((env.home / ".child-env.json").read_text())
+    assert child_env["HOME"] == str(env.home)
+    assert child_env["USERPROFILE"] == str(env.home)
+
+
+# --------------------------------------------------------------------------- #
+# install_pack collision guard (confirmed user-data-loss)
+# --------------------------------------------------------------------------- #
+
+def test_install_collision_guard_user_dir_skipped(skills_env):
+    env = skills_env
+    # The user hand-placed their own skill dir; no lockfile entry at all.
+    userdir = env.home / ".claude" / "skills" / "alpha"
+    userdir.mkdir(parents=True)
+    (userdir / "SKILL.md").write_text("MY OWN WORK\n")
+
+    p = _pack(skills=("alpha", "beta"), source="acme/skills")
+    res = packs.install_pack(p, env.home, include_codex=False)
+
+    assert res.ok is True                       # skips do not fail the op
+    assert res.skipped == ["alpha"]
+    assert res.installed == ["beta"]
+    assert "Refusing to overwrite" in res.message and "acme/skills" in res.message
+    # alpha was NEVER handed to the CLI; beta was.
+    add_call = next(c for c in _calls(env) if "add" in c)
+    assert "alpha" not in add_call and "beta" in add_call
+    # the user's content is untouched
+    assert (userdir / "SKILL.md").read_text() == "MY OWN WORK\n"
+
+
+def test_install_collision_guard_foreign_source_skipped(skills_env):
+    env = skills_env
+    _seed_installed(env.home, "alpha", source="someone/else")
+    p = _pack(skills=("alpha", "beta"), source="acme/skills")
+    res = packs.install_pack(p, env.home, include_codex=False)
+
+    assert res.ok is True
+    assert res.skipped == ["alpha"]
+    assert res.installed == ["beta"]
+    add_call = next(c for c in _calls(env) if "add" in c)
+    assert "alpha" not in add_call
+
+
+def test_install_collision_guard_own_source_refreshes(skills_env):
+    env = skills_env
+    p = _pack(skills=("alpha",), source="acme/skills")
+    packs.install_pack(p, env.home, include_codex=False)   # first install, own source in lock
+    res = packs.install_pack(p, env.home, include_codex=False)  # reinstall/refresh
+
+    assert res.ok is True
+    assert res.installed == ["alpha"]
+    assert res.skipped == []
+    add_calls = [c for c in _calls(env) if "add" in c]
+    assert len(add_calls) == 2                  # own-source skill is NOT skipped
+    assert "alpha" in add_calls[1]
+
+
+def test_install_collision_guard_all_skipped_no_subprocess(skills_env):
+    env = skills_env
+    _seed_installed(env.home, "alpha", source="someone/else")
+    p = _pack(skills=("alpha",), source="acme/skills")
+    res = packs.install_pack(p, env.home, include_codex=False)
+
+    assert res.ok is True
+    assert res.skipped == ["alpha"]
+    assert res.installed == []
+    assert _calls(env) == []                    # subprocess skipped entirely
+
+
+# --------------------------------------------------------------------------- #
+# update_packs per-pack attribution
+# --------------------------------------------------------------------------- #
+
+def test_update_packs_per_pack_attribution(skills_env):
+    env = skills_env
+    good = _pack(skills=("alpha",), source="acme/skills", name="good")
+    bad = _pack(skills=("beta", "gamma"), source="acme/skills", name="bad")
+    packs.install_pack(good, env.home, include_codex=False)
+    packs.install_pack(bad, env.home, include_codex=False)
+
+    # gamma becomes un-reinstallable and is dropped from disk (lock lingers).
+    env.set_scenario(mode="normal", skip=["gamma"])
+    _delete_skill(env.home, "gamma")
+
+    res = packs.update_packs([good, bad], env.home, include_codex=False)
+    assert res.ok is False
+    assert res.per_pack["good"].ok is True
+    assert res.per_pack["bad"].ok is False
+    assert "gamma" in res.per_pack["bad"].missing
+    assert res.per_pack["good"].missing == []
+
+
+def test_update_packs_command_failure_marks_all_packs(skills_env):
+    env = skills_env
+    good = _pack(skills=("alpha",), source="acme/skills", name="good")
+    bad = _pack(skills=("beta",), source="acme/skills", name="bad")
+    packs.install_pack(good, env.home, include_codex=False)
+    packs.install_pack(bad, env.home, include_codex=False)
+
+    env.set_scenario(mode="exit_nonzero", exit_code=3, stderr="update boom")
+    res = packs.update_packs([good, bad], env.home, include_codex=False)
+
+    assert res.ok is False
+    assert res.per_pack["good"].ok is False
+    assert res.per_pack["bad"].ok is False
+    assert "update boom" in res.per_pack["good"].message
+    assert "update boom" in res.per_pack["bad"].message
+
+
+# --------------------------------------------------------------------------- #
+# Registry structural validation
+# --------------------------------------------------------------------------- #
+
+def test_registry_validation_rejects_hostile_packs(tmp_path, caplog):
+    bad = {
+        "packs": {
+            "dashg":     {"source": "acme/skills", "skills": ["-g"]},
+            "traversal": {"source": "acme/skills", "skills": ["../evil"]},
+            "strskills": {"source": "acme/skills", "skills": "alpha"},
+            "badsource": {"source": "--help", "skills": ["alpha"]},
+            "badhome":   {"source": "acme/skills", "skills": ["alpha"],
+                          "homepage": "javascript:alert(1)"},
+            "good":      {"source": "acme/skills", "skills": ["alpha"],
+                          "homepage": "https://example.com"},
+        }
+    }
+    (tmp_path / "packs.json").write_text(json.dumps(bad), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        reg = packs.load_registry(tmp_path)
+
+    assert set(reg) == {"good"}
+    for name in ("dashg", "traversal", "strskills", "badsource", "badhome"):
+        assert name in caplog.text
+
+
+def test_registry_packs_not_a_dict(tmp_path, caplog):
+    (tmp_path / "packs.json").write_text(json.dumps({"packs": ["a", "b"]}), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        reg = packs.load_registry(tmp_path)
+    assert reg == {}
+    assert "packs" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Lockfile version guard
+# --------------------------------------------------------------------------- #
+
+def test_read_lockfile_version_mismatch_warns_but_returns(tmp_path, caplog):
+    lock_path = tmp_path / ".agents" / ".skill-lock.json"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(json.dumps({"version": 4, "skills": {"x": {"source": "a/b"}}}))
+
+    with caplog.at_level("WARNING"):
+        data = packs.read_lockfile(tmp_path)
+
+    assert data["version"] == 4
+    assert data["skills"]["x"]["source"] == "a/b"   # parse still returned intact
+    assert "version" in caplog.text and "4" in caplog.text
+
+
+def test_read_lockfile_version_3_no_warning(tmp_path, caplog):
+    lock_path = tmp_path / ".agents" / ".skill-lock.json"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(json.dumps({"version": 3, "skills": {}}))
+    with caplog.at_level("WARNING"):
+        data = packs.read_lockfile(tmp_path)
+    assert data["version"] == 3
+    assert "!= 3" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# jacked_home
+# --------------------------------------------------------------------------- #
+
+def test_jacked_home_honors_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    assert packs.jacked_home() == tmp_path
+
+
+def test_jacked_home_defaults_to_home(monkeypatch):
+    monkeypatch.delenv("JACKED_HOME", raising=False)
+    assert packs.jacked_home() == Path.home()

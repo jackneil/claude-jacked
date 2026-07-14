@@ -507,6 +507,25 @@ Alongside the commands, `jacked install` ships 25 skills: knowledge packs and en
 
 The four design-engineering skills are adapted from [Emil Kowalski](https://emilkowal.ski)'s excellent [emilkowalski/skills](https://github.com/emilkowalski/skills) (MIT), built on his years of design-engineering work and his course at [animations.dev](https://animations.dev/). They teach Claude the craft details agents usually get wrong: easing choice, spring parameters, interruptibility, `prefers-reduced-motion`, and when the right animation is no animation. jacked's `/dcr` frontend reviewer automatically pulls in `review-animations` when a diff touches motion code.
 
+### Skill Packs (optional, installed live from upstream)
+
+Beyond the bundled suite, jacked can install curated collections of third-party skills directly from their upstream repos. Nothing is vendored: install and updates run through the [vercel-labs skills CLI](https://github.com/vercel-labs/skills) (`npx skills`, requires Node 18+), so the upstream repo stays the source of truth and every `jacked install` refreshes the packs you have enabled.
+
+```bash
+jacked install --packs marketing   # enable + install a pack during install
+jacked packs list                  # see packs, status, and install counts
+jacked packs enable design-extras  # or enable one any time
+jacked packs update                # refresh all enabled packs from upstream
+jacked packs disable marketing     # remove a pack's skills cleanly
+```
+
+| Pack | Source | What you get |
+|------|--------|--------------|
+| `marketing` | [coreyhaines31/marketingskills](https://github.com/coreyhaines31/marketingskills) | 28 curated marketing skills (of the repo's 47): paid ads with quantified kill/scale rules, AI SEO, pricing research, prospecting, positioning, cold email, PR and newsjacking, RevOps scoring, and more. |
+| `design-extras` | [emilkowalski/skills](https://github.com/emilkowalski/skills) | `improve-animations`: audits a whole codebase's motion and writes self-contained, prioritized fix plans any agent can execute. |
+
+Packs can also be toggled from the dashboard (Settings > Features > Skill Packs). Skills install for Codex too when it is present. Removal is source-checked against the skills CLI lockfile, so a same-named skill you installed yourself from another repo is never touched. Enabling a pack means trusting the upstream repo's main branch at install and update time; review upstream before enabling if that matters for your environment.
+
 ### QA Browser Testing
 
 The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.

@@ -2301,6 +2301,24 @@ def install(
     home = _jacked_home()
     pkg_root = _get_data_root()
 
+    # Validate --packs at the VERY top, before any install work. A typo must
+    # fail fast with the list of valid packs instead of running a full install
+    # and only then exiting 1 with no summary. Duplicates collapse to a single
+    # install. The validated list is handed to _run_packs_phase (which keeps its
+    # own re-validation as a backstop but should never hit it from here).
+    validated_packs: list[str] = []
+    if packs_csv:
+        from jacked import packs as _packs_val
+
+        _registry = _packs_val.load_registry(pkg_root)
+        _requested = [p.strip() for p in packs_csv.split(",") if p.strip()]
+        _seen: set[str] = set()
+        _requested = [p for p in _requested if not (p in _seen or _seen.add(p))]
+        _unknown = [p for p in _requested if p not in _registry]
+        if _unknown:
+            _packs_unknown_name(_unknown, _registry)  # prints + raises SystemExit(1)
+        validated_packs = _requested
+
     # Capture the prior manifest BEFORE we touch anything, so the diff
     # reflects source-now vs source-at-last-install (correct for both copy
     # and editable/symlink installs).
@@ -2372,12 +2390,20 @@ def install(
     # --- Skill packs pass ---
     # Enable + install/refresh any requested (and any already-enabled) skill
     # packs. include_codex mirrors the Codex pass condition above (reuse the
-    # detection result, never re-detect). A pack failure prints loud but never
-    # fails the overall install; an unknown --packs name exits before touching
-    # pack state.
-    _packs_record = _run_packs_phase(
-        home, pkg_root, packs_csv, _codex_detected, as_json
-    )
+    # detection result, never re-detect). Unknown --packs names were already
+    # rejected up top, so the phase never exits here. Wrap it like the sibling
+    # Codex pass: any failure prints loud but the main install stays unaffected.
+    _packs_record: dict = {}
+    try:
+        _packs_record = _run_packs_phase(
+            home, pkg_root, validated_packs, _codex_detected, as_json
+        )
+    except Exception:
+        logger.exception("Skill packs phase failed (install unaffected)")
+        console.print(
+            "[yellow][-][/yellow] Skill packs phase failed; see logs. "
+            "The main install is unaffected."
+        )
 
     if as_json:
         if _codex_summary is not None:
@@ -2727,60 +2753,124 @@ def _detect_codex_for_packs() -> bool:
 
         return _cdx.codex_present()
     except Exception:
+        logger.debug(
+            "Codex detection for skill packs failed; targeting claude-code only",
+            exc_info=True,
+        )
         return False
 
 
-def _packs_unknown_name(name: str, registry: dict) -> None:
+def _packs_unknown_name(names, registry: dict) -> None:
     """Print an actionable unknown-pack error and exit 1.
 
+    Accepts a single name or a list of names — one message shape everywhere.
     Lists the valid pack names (or a clear "none available" when the registry
     is empty). Never returns - always raises SystemExit(1).
     """
+    if isinstance(names, str):
+        names = [names]
     valid = ", ".join(sorted(registry)) or "(none available)"
     console.print(
-        f"[red][FAIL][/red] Unknown skill pack '{name}'. Valid packs: {valid}."
+        f"[red][FAIL][/red] Unknown skill pack(s): {', '.join(names)}. "
+        f"Valid packs: {valid}."
     )
     raise SystemExit(1)
+
+
+def _pack_trust_line(pack) -> str:
+    """One-line provenance/consent notice shown before installing a pack.
+
+    Plain text (no em-dashes): skills are instructions the user's agents will
+    follow, so we name the count, the upstream source, and the homepage to
+    review before trusting them.
+    """
+    n = len(pack.skills)
+    return (
+        f"Installing {n} skill{'s' if n != 1 else ''} from {pack.source} "
+        f"(upstream main branch). Skills are instructions your agents will "
+        f"follow; review the source at {pack.homepage}."
+    )
+
+
+def _emit_pack_result(name: str, res, total: int, as_json: bool, results: dict) -> None:
+    """Record and print the outcome for ONE pack.
+
+    ``res`` is a PackOpResult-like carrying ``.ok``, ``.installed`` (list),
+    ``.missing`` (list), ``.message``, and optional ``.skipped`` (list). Builds
+    ``results[name]`` (installed as a count) and prints the [OK]/[FAIL] line plus
+    a loud [!] line for any skipped (pre-existing user-owned) skill dirs.
+    """
+    installed = list(getattr(res, "installed", []) or [])
+    missing = list(getattr(res, "missing", []) or [])
+    skipped = list(getattr(res, "skipped", []) or [])
+    results[name] = {
+        "ok": bool(res.ok),
+        "installed": len(installed),
+        "missing": missing,
+        "skipped": skipped,
+        "message": getattr(res, "message", ""),
+    }
+    if as_json:
+        return
+    if res.ok:
+        console.print(
+            f"[green][OK][/green] Pack '{name}': "
+            f"{len(installed)}/{total} skills installed"
+        )
+    else:
+        console.print(f"[red][FAIL][/red] {getattr(res, 'message', '')}")
+    if skipped:
+        console.print(
+            f"[yellow][!][/yellow] Pack '{name}': left "
+            f"{', '.join(skipped)} untouched (a skill dir you already own)"
+        )
 
 
 def _run_packs_phase(
     home: Path,
     pkg_root: Path,
-    packs_csv: str | None,
+    requested_packs: list[str],
     include_codex: bool,
     as_json: bool,
 ) -> dict:
     """Enable + install/refresh skill packs as part of `jacked install`.
 
-    Returns ``{name: {"ok", "installed", "missing", "message"}}`` for the JSON
-    record (empty dict when no packs are enabled or npx is missing). Never fails
-    the overall install: a pack error prints loud but the caller's exit code
-    stays 0. An unknown ``--packs`` name is the ONE exit - and it exits BEFORE
-    any pack state is written.
+    Returns ``{name: {"ok", "installed", "missing", "skipped", "message"}}`` for
+    the JSON record (empty dict when no packs are enabled or npx is missing).
+    Never fails the overall install: a pack error prints loud but the caller's
+    exit code stays 0. ``requested_packs`` is the pre-validated list from
+    ``install`` (already de-duped, all known); the registry re-check here is a
+    backstop that should never trigger from the install path.
     """
+    from types import SimpleNamespace
+
     from jacked import packs as _packs
 
     registry = _packs.load_registry(pkg_root)
     prior_enabled = set(_packs.enabled_pack_names(home))
 
-    # Validate every requested name against the registry BEFORE touching state.
+    # Backstop validation (install() already rejected unknown names up top).
     newly_enabled: list[str] = []
-    if packs_csv:
-        requested = [p.strip() for p in packs_csv.split(",") if p.strip()]
-        unknown = [p for p in requested if p not in registry]
+    if requested_packs:
+        unknown = [p for p in requested_packs if p not in registry]
         if unknown:
-            valid = ", ".join(sorted(registry)) or "(none available)"
-            console.print(
-                "[red][FAIL][/red] Unknown skill pack(s): "
-                f"{', '.join(unknown)}. Valid packs: {valid}."
-            )
-            raise SystemExit(1)
-        for name in requested:
+            _packs_unknown_name(unknown, registry)
+        for name in requested_packs:
             if name not in prior_enabled:
                 newly_enabled.append(name)
             _packs.set_enabled(home, name, True)
 
     enabled = _packs.enabled_pack_names(home)
+
+    # Deregistered packs: enabled in state but unknown to this build. Never a
+    # silent skip — say the skills were left as-is so the user isn't surprised.
+    if not as_json:
+        for name in [n for n in enabled if n not in registry]:
+            console.print(
+                f"[yellow][!][/yellow] Pack '{name}' is enabled but unknown to "
+                "this jacked version; its skills were left untouched."
+            )
+
     results: dict = {}
     if not enabled:
         return results
@@ -2799,49 +2889,36 @@ def _run_packs_phase(
     # through ONE update call (the skills CLI updates every source at once).
     for name in [n for n in enabled if n in registry and n in newly_set]:
         pack = registry[name]
-        res = _packs.install_pack(pack, home, include_codex=include_codex)
-        n_installed = len(res.installed)
-        total = len(pack.skills)
-        results[name] = {
-            "ok": res.ok,
-            "installed": n_installed,
-            "missing": list(res.missing),
-            "message": res.message,
-        }
         if not as_json:
-            if res.ok:
-                console.print(
-                    f"[green][OK][/green] Pack '{name}': "
-                    f"{n_installed}/{total} skills installed"
-                )
-            else:
-                console.print(f"[red][FAIL][/red] {res.message}")
+            console.print(_pack_trust_line(pack))
+        res = _packs.install_pack(pack, home, include_codex=include_codex)
+        _emit_pack_result(name, res, len(pack.skills), as_json, results)
 
     to_update = [n for n in enabled if n in registry and n not in newly_set]
     if to_update:
-        update_packs = [registry[n] for n in to_update]
-        upd = _packs.update_packs(update_packs, home, include_codex=include_codex)
+        update_targets = [registry[n] for n in to_update]
+        upd = _packs.update_packs(update_targets, home, include_codex=include_codex)
+        # Per-pack attribution comes from upd.per_pack[name] — the aggregate
+        # upd.ok is False whenever ANY pack in the batch failed, so keying the
+        # per-pack line off it would print [FAIL] on a healthy sibling.
+        per_pack = getattr(upd, "per_pack", None) or {}
         for name in to_update:
             pack = registry[name]
-            st = _packs.pack_status(pack, home)
-            installed_count = st.get("installed_count", 0)
-            total = st.get("total", len(pack.skills))
-            missing = [s["name"] for s in st.get("skills", []) if not s.get("installed")]
-            pack_ok = upd.ok and not missing
-            results[name] = {
-                "ok": pack_ok,
-                "installed": installed_count,
-                "missing": missing,
-                "message": upd.message,
-            }
-            if not as_json:
-                if pack_ok:
-                    console.print(
-                        f"[green][OK][/green] Pack '{name}': "
-                        f"{installed_count}/{total} skills installed"
-                    )
-                else:
-                    console.print(f"[red][FAIL][/red] {upd.message}")
+            res = per_pack.get(name)
+            if res is None:
+                # Fallback for a packs.py without per_pack: derive this pack's
+                # truth from on-disk status, never from the batch aggregate, so
+                # a sibling's failure still can't mark this one FAIL.
+                st = _packs.pack_status(pack, home)
+                skills = st.get("skills", [])
+                res = SimpleNamespace(
+                    installed=[s["name"] for s in skills if s.get("installed")],
+                    missing=[s["name"] for s in skills if not s.get("installed")],
+                    skipped=[],
+                    message=getattr(upd, "message", ""),
+                )
+                res.ok = not res.missing
+            _emit_pack_result(name, res, len(pack.skills), as_json, results)
 
     return results
 
@@ -3489,6 +3566,13 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
             for _pk_name in _enabled_packs:
                 _pk = _registry.get(_pk_name)
                 if _pk is None:
+                    # Deregistered pack: we don't know its skills, so we can't
+                    # remove them. Say so before we drop the state file.
+                    console.print(
+                        f"[yellow][!][/yellow] Pack '{_pk_name}' is enabled but "
+                        "unknown to this jacked version; its skills (if any) were "
+                        "left on disk."
+                    )
                     continue
                 _pk_res = _packs.remove_pack(_pk, home)
                 if _pk_res.removed:
@@ -3554,6 +3638,14 @@ def packs_list():
 
     console.print(table)
 
+    # Enabled-but-deregistered packs never show up in the registry-keyed table
+    # above; surface them loudly instead of dropping them silently.
+    for name in sorted(enabled - set(registry)):
+        console.print(
+            f"[yellow][!][/yellow] Pack '{name}' is enabled but unknown to this "
+            "jacked version; its skills were left untouched."
+        )
+
 
 @packs_group.command(name="enable")
 @click.argument("name")
@@ -3566,6 +3658,9 @@ def packs_enable(name: str):
     pack = registry.get(name)
     if pack is None:
         _packs_unknown_name(name, registry)
+
+    # Consent/provenance line before we pull instructions the agents will run.
+    console.print(_pack_trust_line(pack))
 
     # Persist intent first so a failed install still leaves the pack enabled
     # (a later `jacked packs update` can then repair it).
@@ -3589,23 +3684,42 @@ def packs_disable(name: str):
     registry = _packs.load_registry(_get_data_root())
     pack = registry.get(name)
     if pack is None:
+        # A pack this build no longer knows about can still be stuck enabled in
+        # state — let the user turn it off. We can't remove skills we can't
+        # enumerate, so just clear the state entry and say so.
+        if name in set(_packs.enabled_pack_names(home)):
+            console.print(
+                f"[yellow][!][/yellow] Pack '{name}' is unknown to this jacked "
+                "version but was enabled; disabling it. Any skills it installed "
+                "were left on disk."
+            )
+            _packs.set_enabled(home, name, False)
+            return
         _packs_unknown_name(name, registry)
 
-    # Remove skills first, then clear intent regardless of the result: a
-    # disable request always wins so the pack never lingers enabled.
-    res = _packs.remove_pack(pack, home)
+    # Clear intent FIRST (durable), then remove skills. If a crash lands between
+    # the two, the pack stays disabled rather than resurrecting as enabled with
+    # its skills half-removed.
     _packs.set_enabled(home, name, False)
+    res = _packs.remove_pack(pack, home)
     if res.ok:
         console.print(f"[green][OK][/green] {res.message}")
     else:
-        console.print(f"[red][FAIL][/red] {res.message}")
+        console.print(
+            f"[red][FAIL][/red] {res.message} The pack is disabled; some skills "
+            "may remain on disk. Enable and disable again to retry removal."
+        )
         raise SystemExit(1)
 
 
 @packs_group.command(name="update")
 @click.argument("name", required=False)
 def packs_update(name: str | None):
-    """Update enabled skill packs (all, or a single NAME)."""
+    """Refresh the skills of enabled packs from their upstream repos.
+
+    Scoped to packs that are currently enabled (all of them, or a single NAME).
+    Disabled packs are left alone; enable a pack first to install its skills.
+    """
     from jacked import packs as _packs
 
     home = _jacked_home()

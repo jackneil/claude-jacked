@@ -20,6 +20,7 @@ extra here.
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, status
@@ -34,9 +35,18 @@ router = APIRouter()
 
 # --- Constants ---
 
-HOME = Path.home()
-CLAUDE_DIR = HOME / ".claude"
 DATA_ROOT = Path(__file__).parent.parent.parent / "data"
+
+
+def _home() -> Path:
+    """Home directory for pack state + status, resolved per request.
+
+    Honors ``$JACKED_HOME`` exactly like the CLI (see ``cli._jacked_home``), so
+    the dashboard and CLI read/write the same enabled-pack state and skill tree.
+    Evaluated inside each handler (never cached at import) so an env override —
+    set for tests or unusual installs — always takes effect.
+    """
+    return Path(os.getenv("JACKED_HOME") or Path.home())
 
 
 # --- Pydantic models ---
@@ -47,7 +57,7 @@ class PackToggleRequest(BaseModel):
 
 # --- Helpers ---
 
-def _install_in_thread(pack: packs.Pack) -> packs.PackOpResult:
+def _install_in_thread(pack: packs.Pack, home: Path) -> packs.PackOpResult:
     """Install a pack. Runs inside ``asyncio.to_thread`` — npx is blocking.
 
     Whether to also install the codex-side copy is decided here (not by the
@@ -59,13 +69,19 @@ def _install_in_thread(pack: packs.Pack) -> packs.PackOpResult:
 
         include_codex = bool(codex_present())
     except Exception:
+        logger.debug(
+            "Codex detection for skill packs failed; targeting claude-code only",
+            exc_info=True,
+        )
         include_codex = False
-    return packs.install_pack(pack, HOME, include_codex=include_codex)
+    return packs.install_pack(pack, home, include_codex=include_codex)
 
 
-def _toggle_response(result: packs.PackOpResult, pack: packs.Pack, enabled: bool) -> dict:
+def _toggle_response(
+    result: packs.PackOpResult, pack: packs.Pack, enabled: bool, home: Path
+) -> dict:
     """Shape the PUT response body from an op result + fresh on-disk status."""
-    fresh = packs.pack_status(pack, HOME)
+    fresh = packs.pack_status(pack, home)
     fresh["enabled"] = enabled
     return {
         "ok": result.ok,
@@ -87,13 +103,14 @@ async def list_packs():
     Side-effect free: ``pack_status`` only reads disk (lockfile + skill dirs).
     Sorted by pack name so the dashboard order is stable.
     """
+    home = _home()
     registry = packs.load_registry(DATA_ROOT)
-    enabled = set(packs.enabled_pack_names(HOME))
+    enabled = set(packs.enabled_pack_names(home))
 
     items = []
     for name in sorted(registry):
         pack = registry[name]
-        st = packs.pack_status(pack, HOME)
+        st = packs.pack_status(pack, home)
         st["enabled"] = name in enabled
         items.append(st)
 
@@ -114,10 +131,12 @@ async def toggle_pack(name: str, body: PackToggleRequest):
     (unknown pack) returns 4xx. npx-missing is handled inside install_pack,
     which returns the Node install message; we surface it unchanged.
 
-    Disable: remove off-thread, then record disabled intent regardless of the
-    remove result (the user asked for it off; intent wins even if removal hit
-    a snag the message explains).
+    Disable: record disabled intent first (durable — survives a crash mid-remove
+    so a restart never resurrects the pack as enabled), then remove off-thread.
+    The remove result rides back in the body regardless (the user asked for it
+    off; intent wins even if removal hit a snag the message explains).
     """
+    home = _home()
     registry = packs.load_registry(DATA_ROOT)
     pack = registry.get(name)
     if pack is None:
@@ -127,10 +146,10 @@ async def toggle_pack(name: str, body: PackToggleRequest):
         )
 
     if body.enabled:
-        packs.set_enabled(HOME, name, True)
-        result = await asyncio.to_thread(_install_in_thread, pack)
+        packs.set_enabled(home, name, True)
+        result = await asyncio.to_thread(_install_in_thread, pack, home)
     else:
-        result = await asyncio.to_thread(packs.remove_pack, pack, HOME)
-        packs.set_enabled(HOME, name, False)
+        packs.set_enabled(home, name, False)
+        result = await asyncio.to_thread(packs.remove_pack, pack, home)
 
-    return _toggle_response(result, pack, body.enabled)
+    return _toggle_response(result, pack, body.enabled, home)

@@ -181,9 +181,10 @@ def test_put_enable_install_failure_returns_200_ok_false(monkeypatch):
     assert body["pack"]["enabled"] is True  # intent wins despite failure
 
 
-def test_put_disable_removes_then_sets_disabled_even_when_remove_fails(monkeypatch):
-    """Disable runs remove_pack THEN set_enabled(False), and records disabled
-    intent even when the remove op reports failure."""
+def test_put_disable_sets_disabled_then_removes_even_when_remove_fails(monkeypatch):
+    """Disable records set_enabled(False) FIRST (durable intent, survives a
+    crash mid-remove), THEN runs remove_pack, and still reports the remove
+    failure in the body."""
     order: list = []
 
     def fake_remove(pack, home, timeout=300):
@@ -211,8 +212,8 @@ def test_put_disable_removes_then_sets_disabled_even_when_remove_fails(monkeypat
     assert "still exist on disk" in body["message"]
     assert body["pack"]["enabled"] is False
 
-    # remove first, then disabled intent recorded — regardless of remove result.
-    assert order == [("remove", "marketing"), ("set_enabled", "marketing", False)]
+    # disabled intent recorded FIRST, then remove runs — regardless of result.
+    assert order == [("set_enabled", "marketing", False), ("remove", "marketing")]
 
 
 def test_put_enable_npx_missing_surfaces_node_message(monkeypatch):
@@ -233,3 +234,78 @@ def test_put_enable_npx_missing_surfaces_node_message(monkeypatch):
     assert "Node.js" in body["message"]
     assert body["missing"] == ["ads", "seo"]  # every skill reported missing
     assert body["pack"]["enabled"] is True
+
+
+def test_jacked_home_env_honored_on_get(monkeypatch, tmp_path):
+    """GET resolves home from $JACKED_HOME per request (not the module-level
+    Path.home() from the pre-fix code), so state + status reads target that
+    tree — matching the CLI's _jacked_home. The home handed to the faked packs
+    functions must be exactly the env-set path."""
+    fake_home = tmp_path / "alt-home"
+    monkeypatch.setenv("JACKED_HOME", str(fake_home))
+
+    seen: dict = {}
+
+    def fake_enabled_pack_names(home):
+        seen["enabled_home"] = home
+        return []
+
+    def fake_pack_status(pack, home):
+        seen["status_home"] = home
+        return _fake_pack_status(pack, home)
+
+    monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
+    monkeypatch.setattr(packs, "enabled_pack_names", fake_enabled_pack_names)
+    monkeypatch.setattr(packs, "pack_status", fake_pack_status)
+    monkeypatch.setattr(packs, "find_npx", lambda: "/usr/bin/npx")
+
+    client = TestClient(_make_app())
+    resp = client.get("/api/packs")
+    assert resp.status_code == 200
+
+    from pathlib import Path
+
+    assert seen["enabled_home"] == Path(str(fake_home))
+    assert seen["status_home"] == Path(str(fake_home))
+
+
+def test_jacked_home_env_honored_on_put_enable(monkeypatch, tmp_path):
+    """PUT enable threads the $JACKED_HOME-resolved home through set_enabled,
+    install_pack (via _install_in_thread), and pack_status — all under the env
+    path, so the dashboard writes state where the CLI reads it."""
+    fake_home = tmp_path / "alt-home"
+    monkeypatch.setenv("JACKED_HOME", str(fake_home))
+
+    seen: dict = {}
+
+    def fake_set_enabled(home, name, enabled):
+        seen["set_enabled_home"] = home
+
+    def fake_install(pack, home, *, include_codex, timeout=600):
+        seen["install_home"] = home
+        return packs.PackOpResult(
+            ok=True,
+            installed=list(pack.skills),
+            message="Installed.",
+        )
+
+    def fake_pack_status(pack, home):
+        seen["status_home"] = home
+        return _fake_pack_status(pack, home)
+
+    monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
+    monkeypatch.setattr(packs, "set_enabled", fake_set_enabled)
+    monkeypatch.setattr(packs, "install_pack", fake_install)
+    monkeypatch.setattr(packs, "pack_status", fake_pack_status)
+    monkeypatch.setattr(packs, "find_npx", lambda: "/usr/bin/npx")
+
+    client = TestClient(_make_app())
+    resp = client.put("/api/packs/marketing", json={"enabled": True})
+    assert resp.status_code == 200
+
+    from pathlib import Path
+
+    expected = Path(str(fake_home))
+    assert seen["set_enabled_home"] == expected
+    assert seen["install_home"] == expected
+    assert seen["status_home"] == expected
