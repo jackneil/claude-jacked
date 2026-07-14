@@ -68,10 +68,10 @@ You may keep Markdown for an internal artifact **only** when a downstream tool *
 ## CLI Commands
 
 ```
-jacked install [--sounds] [--force] [--packs NAME]  # Install skills, agents, commands, hooks (+ optional skill packs)
+jacked install [--sounds] [--force] [--no-packs] [--packs NAME]  # Install suite (+ default skill packs; --no-packs to skip)
 jacked uninstall [--sounds]                         # Remove from Claude Code (also removes enabled skill packs)
-jacked packs list                                   # List optional third-party skill packs + install status
-jacked packs enable NAME / disable NAME             # Install / remove a pack via the npx skills CLI
+jacked packs list                                   # List skill packs + on/off/default status + install counts
+jacked packs enable NAME / disable NAME             # Install / durably remove a pack via the npx skills CLI
 jacked packs update [NAME]                          # Refresh enabled packs from their upstream repos
 jacked permissions audit [--fix] [--yes]            # Audit permission rules for dangerous wildcards
 jacked check-version                                # Check for newer PyPI version
@@ -96,14 +96,23 @@ Skill packs (0.82.0+): curated collections of third-party skills installed LIVE
 from their upstream GitHub repos via the vercel-labs skills CLI (`npx skills`,
 Node 18+ required); nothing is vendored. Registry ships in jacked/data/packs.json
 (currently `marketing` = 28 curated skills from coreyhaines31/marketingskills,
-`design-extras` = improve-animations from emilkowalski/skills). Enable state
-lives in ~/.claude/jacked-packs.json; skills land canonical in ~/.agents/skills/
-with symlinks in ~/.claude/skills/ and are tracked by the skills CLI lockfile
-(~/.agents/.skill-lock.json). Every `jacked install` refreshes enabled packs.
-Dashboard toggles: Settings > Features > Skill Packs (GET/PUT /api/packs).
-Exit codes from the skills CLI are untrusted (rc=0 even when nothing installs);
-jacked verifies every operation on disk. Removal is lockfile-source-checked so
-same-named skills from other sources are never touched.
+`design-extras` = improve-animations from emilkowalski/skills). Packs marked
+`default: true` install by DEFAULT on a plain `jacked install`; opt out with
+`jacked install --no-packs` (per-run) or `jacked packs disable NAME` (durable).
+State in ~/.claude/jacked-packs.json is a v2 three-state model
+(`{"version":2,"packs":{name:{"state":"enabled"|"disabled","at":iso}}}`): an
+explicit decision wins, and a pack with no entry follows the registry `default`.
+Disable writes a durable "disabled" (never drops the entry) so a default-on pack
+the user removed is not silently reinstalled next install. v1 files migrate on
+load. Skills land canonical in ~/.agents/skills/ with symlinks in ~/.claude/skills/
+tracked by the skills CLI lockfile (~/.agents/.skill-lock.json). Every
+`jacked install` refreshes the effectively-enabled packs (defaults minus
+disabled, plus explicit-enabled). Dashboard toggles: Settings > Features > Skill
+Packs (GET/PUT /api/packs; GET exposes enabled/default/explicit per pack). Exit
+codes from the skills CLI are untrusted (rc=0 even when nothing installs); jacked
+verifies every operation on disk. Removal is lockfile-source-checked and install
+refuses to overwrite a skill dir you already own (both from another source or
+unmanaged) so a same-named user skill is never clobbered.
 
 Remote dashboard access (0.76.0+): the dashboard binds 127.0.0.1 by default. Any
 `--host` beyond loopback is hardened server-side (no CORS wildcard, same-origin

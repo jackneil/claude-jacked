@@ -309,13 +309,14 @@ def test_pack_skill_names_unique_and_no_jacked_collision():
 
 def test_state_roundtrip_and_atomic(tmp_path):
     home = tmp_path
-    assert packs.load_state(home) == {}
+    assert packs.load_state(home) == {"version": 2, "packs": {}}
     packs.set_enabled(home, "marketing", True)
     state = packs.load_state(home)
-    assert state["version"] == 1
-    assert "marketing" in state["enabled"]
-    assert "enabled_at" in state["enabled"]["marketing"]
+    assert state["version"] == 2
+    assert state["packs"]["marketing"]["state"] == "enabled"
+    assert state["packs"]["marketing"]["at"]
     assert packs.enabled_pack_names(home) == ["marketing"]
+    assert packs.pack_state(home, "marketing") == "enabled"
     # atomic write leaves no stray tmp file behind (any name)
     leftovers = [p for p in (home / ".claude").iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
@@ -336,8 +337,8 @@ def test_save_state_tmp_is_writer_unique(tmp_path, monkeypatch):
         return fd, name
 
     monkeypatch.setattr(packs.tempfile, "mkstemp", spy_mkstemp)
-    packs.save_state(home, {"version": 1, "enabled": {}})
-    packs.save_state(home, {"version": 1, "enabled": {"marketing": {}}})
+    packs.save_state(home, {"version": 2, "packs": {}})
+    packs.save_state(home, {"version": 2, "packs": {"marketing": {"state": "enabled"}}})
     assert len(seen) == 2 and seen[0] != seen[1]
     # both tmps were consumed by os.replace
     assert not Path(seen[0]).exists() and not Path(seen[1]).exists()
@@ -353,17 +354,41 @@ def test_save_state_cleans_tmp_on_write_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(packs.os, "replace", boom)
     with pytest.raises(OSError):
-        packs.save_state(home, {"version": 1, "enabled": {}})
+        packs.save_state(home, {"version": 2, "packs": {}})
     leftovers = [p for p in (home / ".claude").iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
 
 
-def test_state_disable_drops_entry(tmp_path):
+def test_state_disable_is_durable_not_dropped(tmp_path):
+    """Disable must RECORD a durable 'disabled' state (not drop the entry), so a
+    default-on pack the user removed is not silently reinstalled on next
+    install. This is the whole point of the v2 three-state model."""
     home = tmp_path
     packs.set_enabled(home, "marketing", True)
     packs.set_enabled(home, "design-extras", True)
     packs.set_enabled(home, "marketing", False)
+    # marketing is no longer explicitly ENABLED...
     assert packs.enabled_pack_names(home) == ["design-extras"]
+    # ...but it IS explicitly disabled (durable), not simply forgotten.
+    assert packs.pack_state(home, "marketing") == "disabled"
+    assert packs.pack_state(home, "design-extras") == "enabled"
+
+
+def test_v1_state_migrated_to_v2_on_load(tmp_path):
+    """A v1 state file ({"version":1,"enabled":{name:{enabled_at}}}) is migrated
+    in memory: enabled entries become state=enabled, none become disabled."""
+    home = tmp_path
+    p = home / ".claude" / "jacked-packs.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({
+        "version": 1,
+        "enabled": {"marketing": {"enabled_at": "2026-01-01T00:00:00Z"}},
+    }), encoding="utf-8")
+    state = packs.load_state(home)
+    assert state["version"] == 2
+    assert state["packs"]["marketing"] == {"state": "enabled", "at": "2026-01-01T00:00:00Z"}
+    assert packs.pack_state(home, "marketing") == "enabled"
+    assert packs.enabled_pack_names(home) == ["marketing"]
 
 
 def test_state_corrupt_tolerated(tmp_path):
@@ -371,11 +396,34 @@ def test_state_corrupt_tolerated(tmp_path):
     p = home / ".claude" / "jacked-packs.json"
     p.parent.mkdir(parents=True)
     p.write_text("{broken", encoding="utf-8")
-    assert packs.load_state(home) == {}
+    assert packs.load_state(home) == {"version": 2, "packs": {}}
     assert packs.enabled_pack_names(home) == []
     # a subsequent set_enabled recovers cleanly over the corrupt file
     packs.set_enabled(home, "marketing", True)
     assert packs.enabled_pack_names(home) == ["marketing"]
+
+
+def test_effective_enablement_default_on_and_opt_out(tmp_path):
+    """effective enablement: default-on unless explicitly disabled; default-off
+    (opt-in) unless explicitly enabled."""
+    home = tmp_path
+    on = _pack(name="on", skills=("a",))
+    on = packs.Pack(**{**on.__dict__, "default": True})
+    off = _pack(name="off", skills=("b",))
+    off = packs.Pack(**{**off.__dict__, "default": False})
+    registry = {"on": on, "off": off}
+
+    # Fresh: default-on installs, opt-in doesn't.
+    assert packs.is_effectively_enabled(on, home) is True
+    assert packs.is_effectively_enabled(off, home) is False
+    assert packs.effective_enabled_pack_names(home, registry) == ["on"]
+
+    # Disable the default one, enable the opt-in one: effective set flips.
+    packs.set_enabled(home, "on", False)
+    packs.set_enabled(home, "off", True)
+    assert packs.is_effectively_enabled(on, home) is False
+    assert packs.is_effectively_enabled(off, home) is True
+    assert packs.effective_enabled_pack_names(home, registry) == ["off"]
 
 
 # --------------------------------------------------------------------------- #
@@ -607,10 +655,14 @@ def test_pack_status_foreign_source(skills_env):
     assert st["installed_count"] == 1
 
 
-def test_pack_status_canonical_deleted_claude_copy_survives(skills_env):
-    # Windows copytree fallback: claude-side is a REAL dir copy (not a symlink),
-    # and the canonical .agents copy was deleted. The old SKILL.md-only check
-    # said "installed" here; _skill_installed requires BOTH and says False.
+def test_pack_status_claude_real_dir_no_canonical_is_installed(skills_env):
+    # The claude-code-only layout the skills CLI produces on a REAL jacked
+    # install: a real ~/.claude/skills/<n>/ dir with NO ~/.agents canonical
+    # (jacked seeds ~/.claude/skills with the vendored suite first, so the CLI
+    # installs the pack skill directly there rather than via an .agents symlink).
+    # Claude Code reads ~/.claude/skills/<n>/SKILL.md, so this IS installed --
+    # requiring the .agents canonical here was a false-negative that made every
+    # real install report the pack missing and re-run its install forever.
     env = skills_env
     p = _pack(skills=("alpha",))
     packs.install_pack(p, env.home, include_codex=False)
@@ -618,13 +670,14 @@ def test_pack_status_canonical_deleted_claude_copy_survives(skills_env):
     canon = env.home / ".agents" / "skills" / "alpha"
     if claude.is_symlink():
         claude.unlink()
-    shutil.copytree(canon, claude)   # emulate the copytree fallback
-    shutil.rmtree(canon)             # canonical deleted out from under it
+    shutil.copytree(canon, claude)   # real dir in .claude (not a symlink)
+    shutil.rmtree(canon)             # no .agents canonical
 
+    assert (claude / "SKILL.md").exists()
+    assert packs._skill_installed(env.home, "alpha") is True
     st = packs.pack_status(p, env.home)
-    assert (claude / "SKILL.md").exists()          # claude-side copy survives
-    assert st["skills"][0]["installed"] is False   # ...but still reported absent
-    assert st["installed_count"] == 0
+    assert st["skills"][0]["installed"] is True
+    assert st["installed_count"] == 1
 
 
 # --------------------------------------------------------------------------- #

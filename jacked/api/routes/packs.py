@@ -104,13 +104,17 @@ async def list_packs():
     """
     home = _home()
     registry = packs.load_registry(DATA_ROOT)
-    enabled = set(packs.enabled_pack_names(home))
 
     items = []
     for name in sorted(registry):
         pack = registry[name]
         st = packs.pack_status(pack, home)
-        st["enabled"] = name in enabled
+        # "enabled" reflects EFFECTIVE state (an explicit decision, or the
+        # registry default when the user never toggled it) so the dashboard
+        # toggle matches what a plain `jacked install` would install.
+        st["enabled"] = packs.is_effectively_enabled(pack, home)
+        st["default"] = pack.default
+        st["explicit"] = packs.pack_state(home, name) is not None
         items.append(st)
 
     return {

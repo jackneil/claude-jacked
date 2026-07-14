@@ -26,6 +26,9 @@ def _make_app() -> FastAPI:
 
 
 def _sample_registry() -> dict[str, packs.Pack]:
+    # Both are opt-in (default=False) so the enable/disable operational tests
+    # exercise a normal toggle; default-on behavior gets its own registry in
+    # test_get_default_pack_reads_enabled_without_explicit_state.
     return {
         "marketing": packs.Pack(
             name="marketing",
@@ -34,6 +37,7 @@ def _sample_registry() -> dict[str, packs.Pack]:
             source="coreyhaines31/marketingskills",
             homepage="https://github.com/coreyhaines31/marketingskills",
             skills=("ads", "seo"),
+            default=False,
         ),
         "design-extras": packs.Pack(
             name="design-extras",
@@ -42,6 +46,7 @@ def _sample_registry() -> dict[str, packs.Pack]:
             source="emilkowalski/skills",
             homepage="https://github.com/emilkowalski/skills",
             skills=("improve-animations",),
+            default=False,
         ),
     }
 
@@ -64,10 +69,17 @@ def _fake_pack_status(pack: packs.Pack, home) -> dict:
 
 
 def test_get_packs_shape(monkeypatch):
-    """GET returns npx_available plus every registry pack (sorted by name)
-    with an enabled flag reflecting enabled_pack_names."""
+    """GET returns npx_available plus every registry pack (sorted by name), each
+    carrying the effective ``enabled`` flag (is_effectively_enabled), the
+    registry ``default`` flag, and ``explicit`` (whether a state decision was
+    recorded, i.e. pack_state is not None)."""
     monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
-    monkeypatch.setattr(packs, "enabled_pack_names", lambda home: ["marketing"])
+    monkeypatch.setattr(
+        packs, "is_effectively_enabled", lambda pack, home: pack.name == "marketing"
+    )
+    monkeypatch.setattr(
+        packs, "pack_state", lambda home, name: "enabled" if name == "marketing" else None
+    )
     monkeypatch.setattr(packs, "pack_status", _fake_pack_status)
     monkeypatch.setattr(packs, "find_npx", lambda: "/usr/bin/npx")
 
@@ -81,17 +93,26 @@ def test_get_packs_shape(monkeypatch):
     assert names == ["design-extras", "marketing"]  # sorted by name
 
     by_name = {p["name"]: p for p in body["packs"]}
+    # enabled reflects EFFECTIVE state (is_effectively_enabled), not the raw default.
     assert by_name["marketing"]["enabled"] is True
     assert by_name["design-extras"]["enabled"] is False
+    # default is carried straight from the Pack.
+    assert by_name["marketing"]["default"] is False
+    assert by_name["design-extras"]["default"] is False
+    # explicit = an explicit enabled/disabled decision was recorded (pack_state).
+    assert by_name["marketing"]["explicit"] is True
+    assert by_name["design-extras"]["explicit"] is False
     # pack_status fields are carried through.
     assert by_name["marketing"]["total"] == 2
     assert by_name["marketing"]["installed_count"] == 0
 
 
 def test_get_packs_npx_unavailable(monkeypatch):
-    """npx_available is False when find_npx returns None."""
+    """npx_available is False when find_npx returns None; with nothing enabled,
+    every pack reads enabled=False."""
     monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
-    monkeypatch.setattr(packs, "enabled_pack_names", lambda home: [])
+    monkeypatch.setattr(packs, "is_effectively_enabled", lambda pack, home: False)
+    monkeypatch.setattr(packs, "pack_state", lambda home, name: None)
     monkeypatch.setattr(packs, "pack_status", _fake_pack_status)
     monkeypatch.setattr(packs, "find_npx", lambda: None)
 
@@ -99,6 +120,55 @@ def test_get_packs_npx_unavailable(monkeypatch):
     body = client.get("/api/packs").json()
     assert body["npx_available"] is False
     assert all(p["enabled"] is False for p in body["packs"])
+
+
+def test_get_default_pack_reads_enabled_without_explicit_state(monkeypatch, tmp_path):
+    """A default=True pack with NO recorded state reads enabled=True (the
+    registry default carries), while a default=False pack with no state reads
+    enabled=False. Both are explicit=False because neither was toggled.
+
+    This runs the REAL is_effectively_enabled / pack_state against an empty
+    $JACKED_HOME (no state file on disk), so the default-resolution wiring is
+    exercised end to end rather than through a fake."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))  # empty tree -> no state file
+
+    def _registry() -> dict[str, packs.Pack]:
+        return {
+            "on-by-default": packs.Pack(
+                name="on-by-default",
+                display_name="On By Default",
+                description="Ships enabled",
+                source="owner/on",
+                homepage="https://github.com/owner/on",
+                skills=("a",),
+                default=True,
+            ),
+            "opt-in": packs.Pack(
+                name="opt-in",
+                display_name="Opt In",
+                description="Ships disabled",
+                source="owner/off",
+                homepage="https://github.com/owner/off",
+                skills=("b",),
+                default=False,
+            ),
+        }
+
+    monkeypatch.setattr(packs, "load_registry", lambda data_root: _registry())
+    monkeypatch.setattr(packs, "pack_status", _fake_pack_status)
+    monkeypatch.setattr(packs, "find_npx", lambda: "/usr/bin/npx")
+
+    client = TestClient(_make_app())
+    body = client.get("/api/packs").json()
+    by_name = {p["name"]: p for p in body["packs"]}
+
+    assert by_name["on-by-default"]["enabled"] is True
+    assert by_name["on-by-default"]["default"] is True
+    assert by_name["on-by-default"]["explicit"] is False
+
+    assert by_name["opt-in"]["enabled"] is False
+    assert by_name["opt-in"]["default"] is False
+    assert by_name["opt-in"]["explicit"] is False
 
 
 def test_put_unknown_pack_is_422(monkeypatch):
@@ -216,6 +286,66 @@ def test_put_disable_sets_disabled_then_removes_even_when_remove_fails(monkeypat
     assert order == [("set_enabled", "marketing", False), ("remove", "marketing")]
 
 
+def test_put_disable_default_pack_is_durable(monkeypatch, tmp_path):
+    """Disabling a default=True pack writes a DURABLE 'disabled' state (not a
+    dropped entry), so a later GET reads enabled=False, explicit=True — the pack
+    stays off across restarts instead of silently reverting to its default-on.
+
+    Uses the REAL set_enabled/load_state/save_state/pack_state so the durability
+    round-trips through disk; only the npx-touching remove_pack and lockfile
+    pack_status are faked. set_enabled(False) is recorded and asserted to fire
+    BEFORE remove_pack (durable intent must survive a crash mid-remove)."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+
+    def _registry() -> dict[str, packs.Pack]:
+        return {
+            "on-by-default": packs.Pack(
+                name="on-by-default",
+                display_name="On By Default",
+                description="Ships enabled",
+                source="owner/on",
+                homepage="https://github.com/owner/on",
+                skills=("a",),
+                default=True,
+            ),
+        }
+
+    order: list = []
+    real_set_enabled = packs.set_enabled  # captured before we shadow it below
+
+    def spy_set_enabled(home, name, enabled):
+        order.append(("set_enabled", name, enabled))
+        real_set_enabled(home, name, enabled)  # persist real durable state
+
+    def fake_remove(pack, home, timeout=300):
+        order.append(("remove", pack.name))
+        return packs.PackOpResult(ok=True, removed=list(pack.skills), message="Removed.")
+
+    monkeypatch.setattr(packs, "load_registry", lambda data_root: _registry())
+    monkeypatch.setattr(packs, "set_enabled", spy_set_enabled)
+    monkeypatch.setattr(packs, "remove_pack", fake_remove)
+    monkeypatch.setattr(packs, "pack_status", _fake_pack_status)
+    monkeypatch.setattr(packs, "find_npx", lambda: "/usr/bin/npx")
+
+    client = TestClient(_make_app())
+    resp = client.put("/api/packs/on-by-default", json={"enabled": False})
+    assert resp.status_code == 200
+    assert resp.json()["pack"]["enabled"] is False
+
+    # durable intent recorded FIRST, then remove.
+    assert order == [
+        ("set_enabled", "on-by-default", False),
+        ("remove", "on-by-default"),
+    ]
+
+    # A subsequent GET reads the durable disabled state, NOT the default-on:
+    # is_effectively_enabled/pack_state run for real against the written file.
+    body = client.get("/api/packs").json()
+    pack = next(p for p in body["packs"] if p["name"] == "on-by-default")
+    assert pack["enabled"] is False
+    assert pack["explicit"] is True
+
+
 def test_put_enable_npx_missing_surfaces_node_message(monkeypatch):
     """With npx absent, the real install_pack early-returns the Node install
     message (no subprocess). The endpoint surfaces it as 200 ok=false and
@@ -246,16 +376,21 @@ def test_jacked_home_env_honored_on_get(monkeypatch, tmp_path):
 
     seen: dict = {}
 
-    def fake_enabled_pack_names(home):
-        seen["enabled_home"] = home
-        return []
+    def fake_is_effectively_enabled(pack, home):
+        seen["effective_home"] = home
+        return False
+
+    def fake_pack_state(home, name):
+        seen["state_home"] = home
+        return None
 
     def fake_pack_status(pack, home):
         seen["status_home"] = home
         return _fake_pack_status(pack, home)
 
     monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
-    monkeypatch.setattr(packs, "enabled_pack_names", fake_enabled_pack_names)
+    monkeypatch.setattr(packs, "is_effectively_enabled", fake_is_effectively_enabled)
+    monkeypatch.setattr(packs, "pack_state", fake_pack_state)
     monkeypatch.setattr(packs, "pack_status", fake_pack_status)
     monkeypatch.setattr(packs, "find_npx", lambda: "/usr/bin/npx")
 
@@ -265,7 +400,10 @@ def test_jacked_home_env_honored_on_get(monkeypatch, tmp_path):
 
     from pathlib import Path
 
-    assert seen["enabled_home"] == Path(str(fake_home))
+    # The GET no longer calls enabled_pack_names; home now flows through the
+    # effective-state resolvers and pack_status. All must see the $JACKED_HOME path.
+    assert seen["effective_home"] == Path(str(fake_home))
+    assert seen["state_home"] == Path(str(fake_home))
     assert seen["status_home"] == Path(str(fake_home))
 
 

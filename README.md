@@ -507,16 +507,18 @@ Alongside the commands, `jacked install` ships 25 skills: knowledge packs and en
 
 The four design-engineering skills are adapted from [Emil Kowalski](https://emilkowal.ski)'s excellent [emilkowalski/skills](https://github.com/emilkowalski/skills) (MIT), built on his years of design-engineering work and his course at [animations.dev](https://animations.dev/). They teach Claude the craft details agents usually get wrong: easing choice, spring parameters, interruptibility, `prefers-reduced-motion`, and when the right animation is no animation. jacked's `/dcr` frontend reviewer automatically pulls in `review-animations` when a diff touches motion code.
 
-### Skill Packs (optional, installed live from upstream)
+### Skill Packs (installed by default, opt out anytime)
 
-Beyond the bundled suite, jacked can install curated collections of third-party skills directly from their upstream repos. Nothing is vendored: install and updates run through the [vercel-labs skills CLI](https://github.com/vercel-labs/skills) (`npx skills`, requires Node 18+), so the upstream repo stays the source of truth and every `jacked install` refreshes the packs you have enabled.
+Beyond the bundled suite, jacked installs curated collections of third-party skills directly from their upstream repos. Nothing is vendored: install and updates run through the [vercel-labs skills CLI](https://github.com/vercel-labs/skills) (`npx skills`, requires Node 18+), so the upstream repo stays the source of truth and every `jacked install` refreshes them. If Node is not present, packs are skipped with a note and the rest of the install is unaffected.
+
+The default packs install with a plain `jacked install`. To opt out:
 
 ```bash
-jacked install --packs marketing   # enable + install a pack during install
-jacked packs list                  # see packs, status, and install counts
-jacked packs enable design-extras  # or enable one any time
-jacked packs update                # refresh all enabled packs from upstream
-jacked packs disable marketing     # remove a pack's skills cleanly
+jacked install --no-packs          # skip packs entirely for this install
+jacked packs disable marketing     # durably remove a pack (it won't return on the next install)
+jacked packs list                  # see packs, on/off/default status, and install counts
+jacked packs enable design-extras  # re-enable a disabled pack, or add a non-default one
+jacked packs update                # refresh enabled packs from upstream
 ```
 
 | Pack | Source | What you get |
@@ -524,7 +526,7 @@ jacked packs disable marketing     # remove a pack's skills cleanly
 | `marketing` | [coreyhaines31/marketingskills](https://github.com/coreyhaines31/marketingskills) | 28 curated marketing skills (of the repo's 47): paid ads with quantified kill/scale rules, AI SEO, pricing research, prospecting, positioning, cold email, PR and newsjacking, RevOps scoring, and more. |
 | `design-extras` | [emilkowalski/skills](https://github.com/emilkowalski/skills) | `improve-animations`: audits a whole codebase's motion and writes self-contained, prioritized fix plans any agent can execute. |
 
-Packs can also be toggled from the dashboard (Settings > Features > Skill Packs). Skills install for Codex too when it is present. Removal is source-checked against the skills CLI lockfile, so a same-named skill you installed yourself from another repo is never touched. Enabling a pack means trusting the upstream repo's main branch at install and update time; review upstream before enabling if that matters for your environment.
+Packs can also be toggled from the dashboard (Settings > Features > Skill Packs). Skills install for Codex too when it is present. Removal is source-checked against the skills CLI lockfile, so a same-named skill you installed yourself from another repo is never touched, and a skill directory you already own is never overwritten. Because packs are on by default, a plain `jacked install` pulls third-party content from those repos' main branch at install time; if that trust boundary matters for your environment, run `jacked install --no-packs` or disable the packs you do not want. A disable is durable: a pack you turn off stays off across future installs.
 
 ### QA Browser Testing
 

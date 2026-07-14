@@ -2278,7 +2278,12 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     "--packs",
     "packs_csv",
     default=None,
-    help="Comma-separated skill packs to enable and install (e.g. --packs marketing). See `jacked packs list`.",
+    help="Comma-separated skill packs to explicitly enable and install (e.g. --packs marketing). Default packs install anyway; use this to add a non-default pack or re-enable one you disabled. See `jacked packs list`.",
+)
+@click.option(
+    "--no-packs",
+    is_flag=True,
+    help="Skip skill packs entirely for this install (does not change which packs are enabled).",
 )
 def install(
     sounds: bool,
@@ -2288,6 +2293,7 @@ def install(
     as_json: bool,
     no_codex: bool,
     packs_csv: str | None,
+    no_packs: bool,
 ):
     """Auto-install skills, agents, commands, rules, and hooks.
 
@@ -2295,11 +2301,20 @@ def install(
     session-account tracker + QA hooks, and the tray service. Also prunes
     artifacts from retired features (the security gatekeeper hook and the
     session-indexing Stop hook) left behind by older versions.
+
+    Default skill packs install too (opt out with --no-packs, or durably
+    remove one with `jacked packs disable NAME`).
     """
     import json
 
     home = _jacked_home()
     pkg_root = _get_data_root()
+
+    if no_packs and packs_csv:
+        console.print(
+            "[red][FAIL][/red] --no-packs and --packs are contradictory; pass one."
+        )
+        raise SystemExit(1)
 
     # Validate --packs at the VERY top, before any install work. A typo must
     # fail fast with the list of valid packs instead of running a full install
@@ -2396,7 +2411,8 @@ def install(
     _packs_record: dict = {}
     try:
         _packs_record = _run_packs_phase(
-            home, pkg_root, validated_packs, _codex_detected, as_json
+            home, pkg_root, validated_packs, _codex_detected, as_json,
+            no_packs=no_packs,
         )
     except Exception:
         logger.exception("Skill packs phase failed (install unaffected)")
@@ -2842,47 +2858,51 @@ def _run_packs_phase(
     requested_packs: list[str],
     include_codex: bool,
     as_json: bool,
+    no_packs: bool = False,
 ) -> dict:
-    """Enable + install/refresh skill packs as part of `jacked install`.
+    """Install/refresh the effectively-enabled skill packs as part of `jacked install`.
 
-    Returns ``{name: {"ok", "installed", "missing", "skipped", "message"}}`` for
-    the JSON record (empty dict when no packs are enabled or npx is missing).
-    Never fails the overall install: a pack error prints loud but the caller's
-    exit code stays 0. ``requested_packs`` is the pre-validated list from
-    ``install`` (already de-duped, all known); the registry re-check here is a
-    backstop that should never trigger from the install path.
+    Effectively-enabled = every registry pack marked ``default: true`` that the
+    user has not explicitly disabled, plus any pack explicitly enabled (via a
+    prior toggle or ``--packs`` this run). Returns
+    ``{name: {"ok", "installed", "missing", "skipped", "message"}}`` for the JSON
+    record (empty when nothing is enabled, ``--no-packs`` was passed, or npx is
+    missing). Never fails the overall install: a pack error prints loud but the
+    caller's exit code stays 0.
     """
     from types import SimpleNamespace
 
     from jacked import packs as _packs
 
     registry = _packs.load_registry(pkg_root)
-    prior_enabled = set(_packs.enabled_pack_names(home))
 
-    # Backstop validation (install() already rejected unknown names up top).
-    newly_enabled: list[str] = []
+    if no_packs:
+        if not as_json:
+            console.print("[dim][-] Skill packs skipped (--no-packs).[/dim]")
+        return {}
+
+    # --packs explicitly enables (durably) + installs the named packs. This is
+    # additive to the default-on set; install() already rejected unknown names,
+    # so the registry re-check here is a backstop.
     if requested_packs:
         unknown = [p for p in requested_packs if p not in registry]
         if unknown:
             _packs_unknown_name(unknown, registry)
         for name in requested_packs:
-            if name not in prior_enabled:
-                newly_enabled.append(name)
             _packs.set_enabled(home, name, True)
 
-    enabled = _packs.enabled_pack_names(home)
-
-    # Deregistered packs: enabled in state but unknown to this build. Never a
-    # silent skip — say the skills were left as-is so the user isn't surprised.
+    # Deregistered packs: an explicit enabled decision for a pack unknown to this
+    # build. Never a silent skip — say the skills were left as-is.
     if not as_json:
-        for name in [n for n in enabled if n not in registry]:
+        for name in [n for n in _packs.enabled_pack_names(home) if n not in registry]:
             console.print(
                 f"[yellow][!][/yellow] Pack '{name}' is enabled but unknown to "
                 "this jacked version; its skills were left untouched."
             )
 
+    targets = _packs.effective_enabled_pack_names(home, registry)
     results: dict = {}
-    if not enabled:
+    if not targets:
         return results
 
     if _packs.find_npx() is None:
@@ -2893,18 +2913,27 @@ def _run_packs_phase(
             )
         return results
 
-    newly_set = set(newly_enabled)
+    # Discriminate install vs refresh by disk presence, not by "was it enabled
+    # this run": a pack whose skills aren't all on disk yet (fresh machine, a
+    # first default-on install, or a newly-enabled pack) gets a fresh install and
+    # the trust line; a fully-present pack is refreshed via one batched update.
+    to_install: list[str] = []
+    to_update: list[str] = []
+    for name in targets:
+        st = _packs.pack_status(registry[name], home)
+        total = st.get("total", 0)
+        if total > 0 and st.get("installed_count", 0) >= total:
+            to_update.append(name)
+        else:
+            to_install.append(name)
 
-    # Newly-enabled packs get a fresh install; already-enabled ones are batched
-    # through ONE update call (the skills CLI updates every source at once).
-    for name in [n for n in enabled if n in registry and n in newly_set]:
+    for name in to_install:
         pack = registry[name]
         if not as_json:
             console.print(_pack_trust_line(pack))
         res = _packs.install_pack(pack, home, include_codex=include_codex)
         _emit_pack_result(name, res, len(pack.skills), as_json, results)
 
-    to_update = [n for n in enabled if n in registry and n not in newly_set]
     if to_update:
         update_targets = [registry[n] for n in to_update]
         upd = _packs.update_packs(update_targets, home, include_codex=include_codex)
@@ -3565,25 +3594,21 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     try:
         from jacked import packs as _packs
 
-        _enabled_packs = _packs.enabled_pack_names(home)
         _registry = _packs.load_registry(pkg_root)
-        if _enabled_packs and _packs.find_npx() is None:
+        # Remove every pack that was effectively installed (registry defaults the
+        # user didn't disable, plus explicit-enabled), not just explicit ones.
+        _effective = _packs.effective_enabled_pack_names(home, _registry)
+        _deregistered = [
+            n for n in _packs.enabled_pack_names(home) if n not in _registry
+        ]
+        if _effective and _packs.find_npx() is None:
             console.print(
                 "[yellow][-][/yellow] Skill packs: Node.js/npx not found; "
                 "skipping skill removal and clearing pack state only"
             )
         else:
-            for _pk_name in _enabled_packs:
-                _pk = _registry.get(_pk_name)
-                if _pk is None:
-                    # Deregistered pack: we don't know its skills, so we can't
-                    # remove them. Say so before we drop the state file.
-                    console.print(
-                        f"[yellow][!][/yellow] Pack '{_pk_name}' is enabled but "
-                        "unknown to this jacked version; its skills (if any) were "
-                        "left on disk."
-                    )
-                    continue
+            for _pk_name in _effective:
+                _pk = _registry[_pk_name]
                 _pk_res = _packs.remove_pack(_pk, home)
                 if _pk_res.removed:
                     console.print(
@@ -3595,6 +3620,13 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                         f"[yellow][!][/yellow] Pack '{_pk_name}': skipped "
                         f"{_rich_escape(', '.join(_pk_res.skipped))} (different source or not tracked)"
                     )
+        for _pk_name in _deregistered:
+            # Deregistered pack: we don't know its skills, so we can't remove
+            # them. Say so before we drop the state file.
+            console.print(
+                f"[yellow][!][/yellow] Pack '{_pk_name}' is enabled but unknown "
+                "to this jacked version; its skills (if any) were left on disk."
+            )
         _state_file = home / ".claude" / _packs.STATE_PATH_NAME
         _state_file.unlink(missing_ok=True)
     except Exception:
@@ -3625,7 +3657,7 @@ def packs_list():
         console.print("[yellow]No skill packs are available in this build.[/yellow]")
         return
 
-    enabled = set(_packs.enabled_pack_names(home))
+    explicit = set(_packs.enabled_pack_names(home))
     table = Table(title="Skill packs")
     table.add_column("Pack", style="cyan", no_wrap=True)
     table.add_column("Status", no_wrap=True)
@@ -3636,10 +3668,13 @@ def packs_list():
     for name in sorted(registry):
         pack = registry[name]
         st = _packs.pack_status(pack, home)
-        if name in enabled:
-            status = "[green]enabled[/green]"
+        state = _packs.pack_state(home, name)  # explicit decision or None
+        if _packs.is_effectively_enabled(pack, home):
+            status = "[green]on[/green]" + (" [dim](default)[/dim]" if state is None else "")
         else:
-            status = "[dim]disabled[/dim]"
+            # Off: distinguish a user's explicit disable from an opt-in pack the
+            # user simply never turned on.
+            status = "[dim]off[/dim]" if state == "disabled" else "[dim]off (opt-in)[/dim]"
         installed = f"{st.get('installed_count', 0)}/{st.get('total', len(pack.skills))}"
         desc = pack.description or ""
         if len(desc) > 60:
@@ -3648,9 +3683,9 @@ def packs_list():
 
     console.print(table)
 
-    # Enabled-but-deregistered packs never show up in the registry-keyed table
-    # above; surface them loudly instead of dropping them silently.
-    for name in sorted(enabled - set(registry)):
+    # Explicitly-enabled-but-deregistered packs never show up in the
+    # registry-keyed table above; surface them loudly instead of dropping them.
+    for name in sorted(explicit - set(registry)):
         console.print(
             f"[yellow][!][/yellow] Pack '{name}' is enabled but unknown to this "
             "jacked version; its skills were left untouched."
@@ -3727,21 +3762,22 @@ def packs_disable(name: str):
 def packs_update(name: str | None):
     """Refresh the skills of enabled packs from their upstream repos.
 
-    Scoped to packs that are currently enabled (all of them, or a single NAME).
+    Scoped to packs that are effectively enabled (default-on packs you didn't
+    disable, plus any you explicitly enabled) -- all of them, or a single NAME.
     Disabled packs are left alone; enable a pack first to install its skills.
     """
     from jacked import packs as _packs
 
     home = _jacked_home()
     registry = _packs.load_registry(_get_data_root())
-    enabled = _packs.enabled_pack_names(home)
+    effective = _packs.effective_enabled_pack_names(home, registry)
     include_codex = _detect_codex_for_packs()
 
     if name:
         pack = registry.get(name)
         if pack is None:
             _packs_unknown_name(name, registry)
-        if name not in enabled:
+        if name not in effective:
             console.print(
                 f"[yellow]Pack '{name}' is not enabled. "
                 f"Run `jacked packs enable {name}` first.[/yellow]"
@@ -3749,17 +3785,18 @@ def packs_update(name: str | None):
             raise SystemExit(1)
         targets = [pack]
     else:
-        if not enabled:
-            console.print("No skill packs are enabled. Nothing to update.")
-            return
-        for unknown_name in [n for n in enabled if n not in registry]:
+        # Explicit-enabled-but-deregistered packs can't be updated (unknown to
+        # this build); warn rather than silently skip.
+        for unknown_name in [
+            n for n in _packs.enabled_pack_names(home) if n not in registry
+        ]:
             console.print(
                 f"[yellow][!][/yellow] Pack '{unknown_name}' is enabled but "
                 "unknown to this jacked version; its skills were left untouched."
             )
-        targets = [registry[n] for n in enabled if n in registry]
+        targets = [registry[n] for n in effective]
         if not targets:
-            console.print("No known skill packs to update.")
+            console.print("No skill packs are enabled. Nothing to update.")
             return
 
     res = _packs.update_packs(targets, home, include_codex=include_codex)

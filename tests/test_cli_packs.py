@@ -41,6 +41,21 @@ DESIGN = packs_mod.Pack(
 )
 REGISTRY = {"marketing": MARKETING, "design-extras": DESIGN}
 
+# A default-on pack: installed by a plain `jacked install` unless the user has
+# durably opted out (default=True is the crux of the state-model change these
+# tests cover). The base MARKETING/DESIGN packs stay default=False so the
+# existing explicit `--packs`/enable tests keep their meaning and a plain
+# install in the base registry installs nothing by default.
+DEFAULT_ON = packs_mod.Pack(
+    name="core-extras",
+    display_name="Core Extras",
+    description="Default-on curated skills that install unless opted out.",
+    source="jackneil/coreextras",
+    homepage="https://github.com/jackneil/coreextras",
+    skills=("triage", "summarize"),
+    default=True,
+)
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
@@ -64,6 +79,8 @@ def _fake_packs(
     *,
     registry=REGISTRY,
     enabled_before=None,
+    disabled_before=None,
+    installed_before=None,
     npx="/usr/bin/npx",
     install_result=None,
     update_result=None,
@@ -72,6 +89,20 @@ def _fake_packs(
 ):
     """Replace every jacked.packs entrypoint with a recording fake.
 
+    Models both halves of the v2 state model the CLI now depends on:
+
+    * explicit enable/disable decisions (``state_map``: a name maps to
+      ``"enabled"``/``"disabled"``, or is absent when no explicit decision was
+      recorded, in which case the registry ``default`` flag decides). Seed with
+      ``enabled_before`` / ``disabled_before``.
+    * disk-installed skills (``installed_disk``). This is what the install-vs-
+      update discriminator in ``_run_packs_phase`` reads via ``pack_status``: a
+      pack whose skills are all present routes to a batched update, one that
+      isn't routes to a fresh install. ``installed_before`` seeds it; it
+      DEFAULTS to the skills of every ``enabled_before`` pack (a pack enabled
+      before was presumably installed), so already-enabled packs route to
+      update without extra wiring.
+
     Returns a namespace of call records. ``*_result`` may be a PackOpResult or a
     callable(pack)->PackOpResult; ``status`` similarly for pack_status.
     """
@@ -79,7 +110,24 @@ def _fake_packs(
         set_enabled=[], install_pack=[], update_packs=[], remove_pack=[],
         pack_status=[], order=[],
     )
-    state = {"enabled": list(enabled_before or [])}
+
+    # Explicit decisions only. Absence == "no explicit decision" (default rules).
+    state_map: dict[str, str] = {}
+    for _n in (enabled_before or []):
+        state_map[_n] = "enabled"
+    for _n in (disabled_before or []):
+        state_map[_n] = "disabled"
+
+    # Disk-installed skill set. Defaults to the skills of every enabled_before
+    # pack so a previously-enabled pack reads as fully installed on disk.
+    if installed_before is not None:
+        installed_disk: set[str] = set(installed_before)
+    else:
+        installed_disk = set()
+        for _n in (enabled_before or []):
+            _p = registry.get(_n)
+            if _p is not None:
+                installed_disk.update(_p.skills)
 
     def load_registry(data_root):
         return dict(registry)
@@ -87,13 +135,25 @@ def _fake_packs(
     def set_enabled(home, name, enabled):
         calls.set_enabled.append((str(home), name, enabled))
         calls.order.append(("set_enabled", name, enabled))
-        if enabled and name not in state["enabled"]:
-            state["enabled"].append(name)
-        elif not enabled and name in state["enabled"]:
-            state["enabled"].remove(name)
+        # v2: both directions write a durable state entry (disable does NOT drop
+        # the entry — that is what lets a default-on pack be durably opted out).
+        state_map[name] = "enabled" if enabled else "disabled"
+
+    def pack_state(home, name):
+        return state_map.get(name)
 
     def enabled_pack_names(home):
-        return sorted(state["enabled"])
+        # EXPLICITLY-enabled only (default-on-but-untoggled packs excluded).
+        return sorted(n for n, s in state_map.items() if s == "enabled")
+
+    def is_effectively_enabled(pack, home):
+        s = state_map.get(pack.name)
+        if s is not None:
+            return s == "enabled"
+        return pack.default
+
+    def effective_enabled_pack_names(home, reg):
+        return sorted(n for n, p in reg.items() if is_effectively_enabled(p, home))
 
     def find_npx():
         return npx
@@ -102,12 +162,17 @@ def _fake_packs(
         calls.install_pack.append(SimpleNamespace(pack=pack, include_codex=include_codex))
         calls.order.append(("install_pack", pack.name))
         if install_result is not None:
-            return install_result(pack) if callable(install_result) else install_result
-        return packs_mod.PackOpResult(
-            ok=True,
-            installed=list(pack.skills),
-            message=f"Installed {len(pack.skills)} skill(s) for pack '{pack.display_name}'.",
-        )
+            res = install_result(pack) if callable(install_result) else install_result
+        else:
+            res = packs_mod.PackOpResult(
+                ok=True,
+                installed=list(pack.skills),
+                message=f"Installed {len(pack.skills)} skill(s) for pack '{pack.display_name}'.",
+            )
+        # Model disk: a successful install lands its reported skills on disk (a
+        # failure result carries installed=[], so nothing lands).
+        installed_disk.update(getattr(res, "installed", None) or [])
+        return res
 
     def update_packs(pks, home, *, include_codex, timeout=600):
         calls.update_packs.append(
@@ -117,9 +182,7 @@ def _fake_packs(
         if update_result is not None:
             return update_result
         # Mirror the real contract: aggregate fields PLUS a per_pack dict of
-        # per-pack PackOpResults keyed by pack name. The container is a plain
-        # namespace so tests don't depend on the PackOpResult dataclass having
-        # gained `per_pack` yet (a sibling agent is adding that field).
+        # per-pack PackOpResults keyed by pack name.
         per = {
             p.name: packs_mod.PackOpResult(
                 ok=True,
@@ -140,28 +203,36 @@ def _fake_packs(
         calls.remove_pack.append(SimpleNamespace(pack=pack))
         calls.order.append(("remove_pack", pack.name))
         if remove_result is not None:
-            return remove_result(pack) if callable(remove_result) else remove_result
-        return packs_mod.PackOpResult(
-            ok=True,
-            removed=list(pack.skills),
-            message=f"Removed {len(pack.skills)} skill(s) for pack '{pack.display_name}'.",
-        )
+            res = remove_result(pack) if callable(remove_result) else remove_result
+        else:
+            res = packs_mod.PackOpResult(
+                ok=True,
+                removed=list(pack.skills),
+                message=f"Removed {len(pack.skills)} skill(s) for pack '{pack.display_name}'.",
+            )
+        # Model disk: removal takes this pack's skills off disk.
+        installed_disk.difference_update(pack.skills)
+        return res
 
     def pack_status(pack, home):
         calls.pack_status.append(pack.name)
         if status is not None:
             return status(pack) if callable(status) else status
+        skills = [{"name": s, "installed": s in installed_disk} for s in pack.skills]
         return {
             "name": pack.name,
-            "installed_count": len(pack.skills),
+            "installed_count": sum(1 for s in skills if s["installed"]),
             "total": len(pack.skills),
-            "skills": [{"name": s, "installed": True} for s in pack.skills],
+            "skills": skills,
         }
 
     for fn in (
         load_registry,
         set_enabled,
+        pack_state,
         enabled_pack_names,
+        is_effectively_enabled,
+        effective_enabled_pack_names,
         find_npx,
         install_pack,
         update_packs,
@@ -255,14 +326,23 @@ def test_install_json_includes_packs_record(env):
 # --------------------------------------------------------------------------- #
 
 def test_packs_list_renders_both(env):
+    # marketing is explicitly enabled; design-extras is default=False and never
+    # toggled. Both packs render, each with its correct v2 status label.
     _fake_packs(env.monkeypatch, enabled_before=["marketing"])
     r = CliRunner().invoke(main, ["packs", "list"])
     assert r.exit_code == 0
     out = env.buf.getvalue()
     assert "marketing" in out
     assert "design-extras" in out
-    assert "enabled" in out
-    assert "disabled" in out
+    lines = out.splitlines()
+    mk_line = next(ln for ln in lines if "marketing" in ln)
+    dx_line = next(ln for ln in lines if "design-extras" in ln)
+    # Explicitly-enabled -> effectively on, WITHOUT the "(default)" suffix
+    # (that suffix marks a pack that's on purely because default=True).
+    assert "on" in mk_line
+    assert "(default)" not in mk_line
+    # default=False and never enabled -> off, flagged as opt-in (not a disable).
+    assert "off (opt-in)" in dx_line
 
 
 def test_packs_enable_persists_intent_even_on_install_failure(env):
@@ -605,3 +685,75 @@ def test_pack_failure_message_with_rich_markup_does_not_crash(env):
     assert "npm ERR!" in out
     # the [link=...] token must appear as inert text, not be swallowed as markup
     assert "evil.example" in out
+
+
+# --------------------------------------------------------------------------- #
+# default-on packs: a plain `install` installs default:true packs, opt-out is
+# durable, and --no-packs skips the phase entirely
+# --------------------------------------------------------------------------- #
+
+def test_install_default_on_installs_without_flag(env):
+    # A registry with one default-on and one default-off pack; a bare install
+    # (no --packs) installs the default-on one and leaves the default-off alone.
+    registry = {"core-extras": DEFAULT_ON, "marketing": MARKETING}
+    calls = _fake_packs(env.monkeypatch, registry=registry)
+    r = CliRunner().invoke(main, ["install", "--no-codex"])
+    assert r.exit_code == 0, r.output + env.buf.getvalue()
+    installed_names = [c.pack.name for c in calls.install_pack]
+    assert installed_names == ["core-extras"]  # default-on installs by itself
+    assert "marketing" not in installed_names  # default-off is untouched
+    assert calls.update_packs == []
+    out = env.buf.getvalue()
+    # The trust line prints before pulling a fresh pack's instructions.
+    assert "review the source at" in out
+    assert DEFAULT_ON.source in out
+
+
+def test_install_no_packs_flag_skips(env):
+    # --no-packs short-circuits the whole phase: a default-on pack that would
+    # otherwise install this run is skipped, and nothing is installed/updated.
+    registry = {"core-extras": DEFAULT_ON}
+    calls = _fake_packs(env.monkeypatch, registry=registry)
+    r = CliRunner().invoke(main, ["install", "--no-codex", "--no-packs"])
+    assert r.exit_code == 0, r.output + env.buf.getvalue()
+    assert calls.install_pack == []
+    assert calls.update_packs == []
+    assert "skipped (--no-packs)" in env.buf.getvalue()
+
+
+def test_install_no_packs_with_packs_is_error(env):
+    # Contradictory flags fail fast, before ANY state mutation or install work.
+    calls = _fake_packs(env.monkeypatch)
+    r = CliRunner().invoke(
+        main, ["install", "--no-codex", "--no-packs", "--packs", "marketing"]
+    )
+    assert r.exit_code == 1
+    assert calls.set_enabled == []
+    assert calls.install_pack == []
+    assert calls.update_packs == []
+    assert "--no-packs and --packs are contradictory" in env.buf.getvalue()
+
+
+def test_disabled_default_pack_not_reinstalled_on_install(env):
+    # The whole point of the durable-disable state: a default-on pack the user
+    # opted out of must NOT silently reinstall on the next `jacked install`.
+    registry = {"core-extras": DEFAULT_ON}
+    calls = _fake_packs(
+        env.monkeypatch, registry=registry, disabled_before=["core-extras"]
+    )
+    r = CliRunner().invoke(main, ["install", "--no-codex"])
+    assert r.exit_code == 0, r.output + env.buf.getvalue()
+    assert calls.install_pack == []  # explicit disable beats default=True
+    assert calls.update_packs == []
+
+
+def test_uninstall_removes_default_on_pack(env):
+    # Uninstall operates on the EFFECTIVE set: a default-on pack that's on with
+    # no explicit state entry is still removed (not just explicit-enabled packs).
+    registry = {"core-extras": DEFAULT_ON}
+    calls = _fake_packs(env.monkeypatch, registry=registry)
+    _stub_uninstall_side_effects(env)
+    r = CliRunner().invoke(main, ["uninstall", "--yes"])
+    assert r.exit_code == 0, r.output + env.buf.getvalue()
+    assert [c.pack.name for c in calls.remove_pack] == ["core-extras"]
+    assert "Pack 'core-extras': removed" in env.buf.getvalue()

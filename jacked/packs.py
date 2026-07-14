@@ -72,6 +72,7 @@ class Pack:
     source: str
     homepage: str
     skills: tuple[str, ...]
+    default: bool = False  # installed by a plain `jacked install` unless opted out
 
 
 @dataclass
@@ -172,6 +173,7 @@ def load_registry(data_root: Path) -> dict[str, Pack]:
             source=source,
             homepage=homepage,
             skills=tuple(skills),
+            default=bool(spec.get("default", False)),
         )
     return packs
 
@@ -184,17 +186,62 @@ def _state_path(home: Path) -> Path:
     return Path(home) / ".claude" / STATE_PATH_NAME
 
 
+STATE_VERSION = 2
+
+
 def load_state(home: Path) -> dict:
-    """Load enable-state. Returns ``{}`` if the file is missing; logs a warning
-    and returns ``{}`` if it is present but corrupt."""
+    """Load pack state, normalized to the current v2 shape.
+
+    v2 shape: ``{"version": 2, "packs": {name: {"state": "enabled"|"disabled",
+    "at": iso}}}``. A pack with NO entry has made no explicit decision -- the
+    registry's ``default`` flag decides whether it installs (see
+    ``is_effectively_enabled``). This three-state model (enabled / disabled /
+    unset) is what lets default-on packs be durably opted out: a plain "drop the
+    entry on disable" (the v1 behavior) would make "disabled" and "never
+    decided" indistinguishable, so a default-on pack the user removed would
+    silently reinstall on the next ``jacked install``.
+
+    v1 files (``{"version": 1, "enabled": {name: {enabled_at}}}``) are migrated
+    in memory: each enabled entry becomes ``state: "enabled"``. v1 had no
+    disabled state (disable dropped the entry), so nothing maps to disabled. The
+    migrated shape is only persisted on the next ``set_enabled`` write.
+
+    Returns an empty-but-valid v2 dict if the file is missing, and logs a
+    warning + returns empty-but-valid if it is present but corrupt.
+    """
+    empty = {"version": STATE_VERSION, "packs": {}}
     path = _state_path(home)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        return empty
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Ignoring unreadable packs state %s: %s", path, e)
-        return {}
+        return empty
+    return _normalize_state(raw)
+
+
+def _normalize_state(raw: object) -> dict:
+    """Coerce any on-disk state shape (v1, v2, or garbage) to the v2 shape."""
+    if not isinstance(raw, dict):
+        return {"version": STATE_VERSION, "packs": {}}
+    packs_map = raw.get("packs")
+    if isinstance(packs_map, dict):
+        # Already v2-ish: keep only well-formed {state, at} entries.
+        clean: dict = {}
+        for name, entry in packs_map.items():
+            state = entry.get("state") if isinstance(entry, dict) else None
+            if state in ("enabled", "disabled"):
+                clean[name] = {"state": state, "at": entry.get("at")}
+        return {"version": STATE_VERSION, "packs": clean}
+    # v1: {"enabled": {name: {enabled_at}}} -> everything enabled, none disabled.
+    v1_enabled = raw.get("enabled")
+    packs: dict = {}
+    if isinstance(v1_enabled, dict):
+        for name, entry in v1_enabled.items():
+            at = entry.get("enabled_at") if isinstance(entry, dict) else None
+            packs[name] = {"state": "enabled", "at": at}
+    return {"version": STATE_VERSION, "packs": packs}
 
 
 def save_state(home: Path, state: dict) -> None:
@@ -222,24 +269,52 @@ def save_state(home: Path, state: dict) -> None:
 
 
 def set_enabled(home: Path, name: str, enabled: bool) -> None:
-    """Mark a pack enabled (records enabled_at) or disabled (drops the entry)."""
-    state = load_state(home)
-    if not isinstance(state, dict):
-        state = {}
-    state.setdefault("version", 1)
-    enabled_map = state.setdefault("enabled", {})
-    if enabled:
-        enabled_map[name] = {"enabled_at": _now_iso()}
-    else:
-        enabled_map.pop(name, None)
+    """Record an EXPLICIT enable/disable decision for a pack, durably.
+
+    Both directions write a state entry -- disable records ``state: "disabled"``
+    rather than dropping the entry, so the decision survives future
+    ``jacked install`` runs and a default-on pack the user removed is not
+    silently reinstalled.
+    """
+    state = load_state(home)  # already normalized to v2
+    packs_map = state.setdefault("packs", {})
+    packs_map[name] = {"state": "enabled" if enabled else "disabled", "at": _now_iso()}
     save_state(home, state)
 
 
+def pack_state(home: Path, name: str) -> str | None:
+    """The explicit state of a pack: ``"enabled"``, ``"disabled"``, or ``None``
+    (no explicit decision recorded -- the registry default applies)."""
+    entry = load_state(home).get("packs", {}).get(name)
+    return entry.get("state") if isinstance(entry, dict) else None
+
+
+def is_effectively_enabled(pack: Pack, home: Path) -> bool:
+    """Whether ``pack`` should be installed: an explicit decision wins, and with
+    none recorded the registry ``default`` flag decides."""
+    state = pack_state(home, pack.name)
+    if state is not None:
+        return state == "enabled"
+    return pack.default
+
+
 def enabled_pack_names(home: Path) -> list[str]:
-    """Names of packs currently marked enabled, sorted."""
-    state = load_state(home)
-    enabled = state.get("enabled", {}) if isinstance(state, dict) else {}
-    return sorted(enabled.keys())
+    """Names of packs with an EXPLICIT ``enabled`` decision, sorted. Does NOT
+    include default-on packs that were never explicitly toggled -- use
+    ``effective_enabled_pack_names`` for "what should be installed"."""
+    packs_map = load_state(home).get("packs", {})
+    return sorted(
+        n for n, e in packs_map.items()
+        if isinstance(e, dict) and e.get("state") == "enabled"
+    )
+
+
+def effective_enabled_pack_names(home: Path, registry: dict[str, "Pack"]) -> list[str]:
+    """Registry packs that should be installed right now, sorted: every pack
+    whose effective state is enabled (explicit ``enabled``, or unset with
+    ``default: true``). Packs in the state file but absent from the registry are
+    ignored here (handled loudly by the callers that surface deregistration)."""
+    return sorted(n for n, p in registry.items() if is_effectively_enabled(p, home))
 
 
 # --------------------------------------------------------------------------- #
@@ -571,12 +646,24 @@ def _add_command(npx: str, pack: Pack, names: list[str], *, include_codex: bool)
 
 
 def _skill_installed(home: Path, name: str) -> bool:
-    """A skill is installed when BOTH the canonical dir and the claude-side
-    symlink resolve to a SKILL.md (Path.exists follows symlinks)."""
-    home = Path(home)
-    claude_link = home / ".claude" / "skills" / name / "SKILL.md"
-    canonical = home / ".agents" / "skills" / name / "SKILL.md"
-    return claude_link.exists() and canonical.exists()
+    """A skill is installed (for the always-targeted claude-code agent) when its
+    claude-side entry resolves to a SKILL.md.
+
+    The skills CLI produces two on-disk layouts depending on the target and the
+    prior state of ~/.claude/skills:
+      - a real ~/.agents/skills/<name>/ canonical + a ~/.claude/skills/<name>
+        symlink into it (universal / codex layout, or a fresh empty skills dir);
+      - a real ~/.claude/skills/<name>/ directory with NO ~/.agents canonical
+        (claude-code-only install into an already-populated skills dir -- what a
+        normal `jacked install` produces, since it seeds ~/.claude/skills with
+        the vendored suite first).
+    Both are usable by Claude Code, which reads ~/.claude/skills/<name>/SKILL.md.
+    ``Path.exists()`` follows the symlink, so this one check covers both layouts;
+    requiring the ~/.agents canonical too (an artifact of only the first layout)
+    was a false-negative that made every real install report the pack missing
+    and re-run its install forever.
+    """
+    return (Path(home) / ".claude" / "skills" / name / "SKILL.md").exists()
 
 
 def _skill_present(home: Path, name: str) -> bool:

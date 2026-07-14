@@ -489,11 +489,18 @@ function _renderPacksSection(packsData) {
         // must not snap the track back to ON under a "Removing skills..." label.
         const checked = (inflight ? inflight === 'enable' : p.enabled) ? 'checked' : '';
 
+        // A default pack the user hasn't explicitly toggled is on because it
+        // ships default-on; label it so "why is this enabled?" answers itself.
+        const defaultChip = (p.default && !p.explicit)
+            ? '<span class="text-[10px] uppercase tracking-wider text-slate-500 border border-slate-700 rounded px-1 py-0.5 flex-shrink-0">Default</span>'
+            : '';
+
         return `
             <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50 gap-3" data-pack-row="${escapeHtml(p.name)}">
                 <div class="min-w-0 flex-1">
                     <div class="flex items-center gap-2">
                         <span class="text-sm text-white">${escapeHtml(displayName)}</span>
+                        ${defaultChip}
                         ${homeLink}
                     </div>
                     <div class="text-xs text-slate-400 mt-1">${escapeHtml(p.description || '')}</div>

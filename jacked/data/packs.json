@@ -6,6 +6,7 @@
       "description": "Curated marketing skills from Corey Haines' marketingskills repo: paid ads, AI SEO, pricing, prospecting, positioning, cold email, PR, RevOps and more. Installed live from upstream via the skills CLI.",
       "source": "coreyhaines31/marketingskills",
       "homepage": "https://github.com/coreyhaines31/marketingskills",
+      "default": true,
       "skills": ["ad-creative","ads","ai-seo","aso","churn-prevention","cold-email","competitor-profiling","competitors","copy-editing","copywriting","customer-research","directory-submissions","marketing-council","marketing-loops","marketing-plan","offers","pricing","product-marketing","programmatic-seo","prospecting","public-relations","referrals","revops","sales-enablement","seo-audit","sms","social","video"]
     },
     "design-extras": {
@@ -13,6 +14,7 @@
       "description": "Emil Kowalski's improve-animations skill: audits a whole codebase's motion and writes self-contained, prioritized fix plans other agents can execute.",
       "source": "emilkowalski/skills",
       "homepage": "https://github.com/emilkowalski/skills",
+      "default": true,
       "skills": ["improve-animations"]
     }
   }
