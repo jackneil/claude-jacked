@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Skill Packs: upstream-managed optional skill collections</title>
+
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="in-progress">
+<meta name="jacked:branch" content="feature/skill-packs">
+<meta name="jacked:date" content="2026-07-14">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--sans); font-size: 16px; line-height: 1.6; color: var(--fg); background: var(--bg); margin: 0; padding: 2rem 1rem; }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin: 0 0 .25rem; line-height: 1.2; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; padding-bottom: .35rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; color: var(--fg-muted); }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+  .meta { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin: .5rem 0 2rem; padding: .75rem 1rem; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); font-size: .9rem; }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+  .badge { display: inline-block; padding: .15rem .6rem; border-radius: 99px; font-size: .8rem; font-weight: 500; line-height: 1.4; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.info { background: var(--accent-bg); color: var(--accent); }
+  nav.toc { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.25rem; margin-bottom: 2rem; box-shadow: var(--shadow); }
+  nav.toc h2 { margin: 0 0 .5rem; font-size: .9rem; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-muted); border: none; padding: 0; }
+  nav.toc ol { margin: 0; padding-left: 1.5rem; }
+  nav.toc li { margin: .15rem 0; }
+  aside.callout { margin: 1rem 0; padding: .9rem 1.1rem; border-left: 4px solid var(--accent); background: var(--accent-bg); border-radius: 0 var(--radius) var(--radius) 0; }
+  aside.callout.warn { border-color: var(--warn); background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok { border-color: var(--ok); background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child { margin-bottom: 0; }
+  code { font-family: var(--mono); font-size: .92em; background: var(--code-bg); padding: .12em .35em; border-radius: 3px; }
+  pre { font-family: var(--mono); font-size: .88rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: .9rem 1rem; overflow-x: auto; line-height: 1.45; }
+  pre code { background: transparent; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; background: var(--bg-card); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
+  th, td { text-align: left; padding: .55rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; font-size: .9rem; }
+  tr:last-child td { border-bottom: none; }
+  .diagram { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; margin: 1rem 0; text-align: center; overflow-x: auto; }
+  .diagram pre.mermaid-source { text-align: left; display: none; }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Skill Packs: upstream-managed optional skill collections</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">in progress</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-07-14</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">feature/skill-packs</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#decisions">Key decisions</a></li>
+    <li><a href="#verified">Empirically verified skills-CLI behavior</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#packs">The packs</a></li>
+    <li><a href="#files">File structure</a></li>
+    <li><a href="#safety">Safety rails</a></li>
+    <li><a href="#testing">Testing</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>Let a jacked user opt in to curated collections of third-party skills ("skill packs")
+as part of <code>jacked install</code> and from the dashboard, without jacked vendoring any
+third-party content. Upstream repos stay the single source of truth; jacked orchestrates
+install, update, verification, and removal through the
+<a href="https://github.com/vercel-labs/skills">vercel-labs <code>npx skills</code> CLI</a>
+(skills.sh), which is also the upstream-recommended installer for the repos in question.</p>
+
+<aside class="callout info">
+  <strong>Context:</strong> Jack evaluated three third-party skill repos on 2026-07-14
+  (marketingskills scored 47 skills via 9-agent review; emilkowalski/skills diffed against
+  jacked's vendored copies; first-customer-finder found to be absorbed into marketingskills'
+  <code>prospecting</code> skill with credit). Explicit direction: no vendored clones that
+  drift out of sync; jacked manages the install but the upstream repo and its own manager
+  coordinate the skills. Opt-in is a CLI flag plus a dashboard toggle.
+</aside>
+
+<h2 id="decisions">Key decisions</h2>
+<table>
+  <thead><tr><th>Decision</th><th>Choice</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Delivery</td><td>Live install via <code>npx skills</code>, never vendored</td><td>Jack's call: upstream ships multiple releases per week; snapshots drift. The skills CLI has per-skill selection, a lockfile, an update command, and multi-agent targeting.</td></tr>
+    <tr><td>Curation</td><td>jacked owns only a pack registry (name, repo, skill list)</td><td>The 28-skill marketing list keeps the practitioner-depth skills and drops the generic filler plus the broken <code>image</code> skill (fabricated model names).</td></tr>
+    <tr><td>Opt-in UX</td><td><code>jacked install --packs NAME</code> + dashboard toggle, persisted state</td><td>Jack picked flag + dashboard. Enabled packs auto-refresh on every subsequent <code>jacked install</code>.</td></tr>
+    <tr><td>Emil skills</td><td>The 4 vendored core skills stay vendored; only <code>improve-animations</code> ships as a pack</td><td>jacked's own behavior rules reference the 4 by name, so they cannot be optional or network-dependent.</td></tr>
+    <tr><td>first-customer-finder</td><td>Excluded</td><td>Superseded: marketingskills' <code>prospecting</code> re-expresses its framework with credit and extends it.</td></tr>
+    <tr><td>Codex</td><td>Pack skills install for Codex too when Codex is present</td><td>Matches jacked's existing Codex-parity pass; the skills CLI natively supports <code>-a claude-code codex</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="verified">Empirically verified skills-CLI behavior (sandbox, 2026-07-14, CLI v1.5.17)</h2>
+<ul>
+  <li><code>npx -y skills add owner/repo --skill a b -g -y -a claude-code codex</code> puts the canonical full skill directory at <code>~/.agents/skills/&lt;name&gt;/</code> and a relative symlink at <code>~/.claude/skills/&lt;name&gt;</code>.</li>
+  <li>Lockfile <code>~/.agents/.skill-lock.json</code> (v3): per-skill <code>source</code>, <code>sourceUrl</code>, <code>skillFolderHash</code>, timestamps. Multiple source repos coexist.</li>
+  <li><code>npx -y skills update -g -y</code> refreshes all globally installed skills from their sources; <code>npx -y skills remove name -g -y</code> removes canonical dir, symlink, and lock entry.</li>
+  <li><strong>Gotcha:</strong> requesting a nonexistent skill name exits 0 and installs nothing. Exit codes cannot be trusted; every operation is verified on disk afterward.</li>
+  <li>The CLI detects agent sessions and runs non-interactively; <code>-y</code> plus explicit <code>-a</code> makes runs deterministic. skills.sh runs its own per-skill security scan during install.</li>
+</ul>
+
+<h2 id="architecture">Architecture</h2>
+<p>One new core module (<code>jacked/packs.py</code>) owns registry parsing, enablement state,
+subprocess orchestration of the skills CLI, and post-operation disk verification. The CLI
+layer and the dashboard API are thin consumers of that module.</p>
+
+<div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+    subgraph jacked
+      R[packs.json registry] --> P[packs.py]
+      S[state: ~/.claude/jacked-packs.json] --> P
+      C[cli.py: install --packs / jacked packs] --> P
+      A[api/routes/packs.py] --> P
+      W[dashboard Skill Packs section] --> A
+    end
+    P -->|npx -y skills add/update/remove| CLI[skills CLI]
+    CLI -->|clone| U[(upstream GitHub repos)]
+    CLI --> D1[~/.agents/skills/ canonical]
+    CLI --> D2[~/.claude/skills/ symlinks]
+    CLI --> L[.skill-lock.json]
+    P -->|verify on disk after every op| D1
+    P -->|verify| D2
+    P -->|source check before remove| L
+  </pre>
+  <pre class="mermaid-source">
+flowchart LR
+    packs.json --> packs.py --> skills CLI --> upstream repos
+    cli.py + dashboard API consume packs.py
+    packs.py verifies ~/.claude/skills + ~/.agents/skills after every op
+  </pre>
+</div>
+
+<h3>Flows</h3>
+<ul>
+  <li><strong>Enable:</strong> persist intent in state file, run <code>skills add</code> with the pack's curated <code>--skill</code> list, verify every expected skill exists at both destinations, report loudly on misses.</li>
+  <li><strong>Every <code>jacked install</code>:</strong> after the main install and Codex pass, refresh enabled packs (<code>skills update</code> + verify + one repair attempt for missing skills). Missing npx: loud warning, never fails the main install.</li>
+  <li><strong>Disable / uninstall:</strong> remove only skills whose lockfile entry matches the pack's source; anything same-named from another source is skipped and reported. <code>jacked uninstall</code> removes all enabled packs' skills and the state file.</li>
+  <li><strong>Dashboard:</strong> <code>GET /api/packs</code> for status (per-skill installed/source-ok/updated-at), <code>PUT /api/packs/{name}</code> to toggle; the slow npx work runs off the event loop with a pending state in the UI.</li>
+</ul>
+
+<h2 id="packs">The packs</h2>
+<table>
+  <thead><tr><th>Pack</th><th>Source</th><th>Contents</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>marketing</code></td>
+      <td><a href="https://github.com/coreyhaines31/marketingskills">coreyhaines31/marketingskills</a></td>
+      <td>28 curated of 47: ad-creative, ads, ai-seo, aso, churn-prevention, cold-email, competitor-profiling, competitors, copy-editing, copywriting, customer-research, directory-submissions, marketing-council, marketing-loops, marketing-plan, offers, pricing, product-marketing, programmatic-seo, prospecting, public-relations, referrals, revops, sales-enablement, seo-audit, sms, social, video. Excluded: <code>image</code> (fabricated model names) and 18 generic-tier skills.</td>
+    </tr>
+    <tr>
+      <td><code>design-extras</code></td>
+      <td><a href="https://github.com/emilkowalski/skills">emilkowalski/skills</a></td>
+      <td>improve-animations (whole-codebase motion audit producing self-contained fix plans).</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="files">File structure</h2>
+<table>
+  <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/data/packs.json</code></td><td>Pack registry: display name, description, source repo, curated skill list.</td></tr>
+    <tr><td><code>jacked/packs.py</code></td><td>Core: registry load, state persistence (atomic), npx discovery via findbin, skills-CLI orchestration, post-op disk verification, lockfile source checks, pack status.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td><code>--packs</code> option on install, enabled-pack refresh on every install, <code>jacked packs list/enable/disable/update</code> group, uninstall removal.</td></tr>
+    <tr><td><code>jacked/api/routes/packs.py</code></td><td><code>GET /api/packs</code>, <code>PUT /api/packs/{name}</code>; registered like the features router.</td></tr>
+    <tr><td><code>jacked/data/web/js/components/settings.js</code></td><td>Skill Packs section in the Features tab: toggle, per-pack install count, upstream link, pending state.</td></tr>
+    <tr><td><code>tests/test_packs.py</code> + route/CLI tests</td><td>Fake-npx shim tests; no network anywhere in the suite.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="safety">Safety rails</h2>
+<ul>
+  <li><strong>Verify, never trust exit codes:</strong> the CLI exits 0 for unknown skill names, so every add/update/remove is verified against the filesystem and failures name the exact skills (upstream renames surface immediately instead of installing nothing silently).</li>
+  <li><strong>Source-checked removal:</strong> a skill is only removed when the lockfile says it came from the pack's repo. Same-named skills from other sources are never touched. jacked never deletes skill directories itself; all removal goes through the skills CLI.</li>
+  <li><strong>No collision with jacked-shipped skills:</strong> a test asserts no pack skill name matches any directory in <code>jacked/data/skills/</code>, so a pack can never shadow a vendored skill.</li>
+  <li><strong>Manifest isolation:</strong> pack skills never enter jacked's install manifest, so manifest pruning cannot remove them; pack state lives in its own <code>~/.claude/jacked-packs.json</code>.</li>
+  <li><strong>Trust boundary:</strong> enabling a pack means trusting the upstream repo's main branch at install/update time (explicitly accepted trade-off). Only <code>skills/</code> content is installed; upstream AGENTS.md and tools/ never reach the machine. skills.sh adds its own scan during install.</li>
+  <li><strong>Degradation:</strong> no Node/npx means packs are unavailable with a loud, actionable message; the core jacked install is never blocked or failed by pack machinery.</li>
+</ul>
+
+<h2 id="testing">Testing</h2>
+<ul>
+  <li>Fake-npx shim (scenario-driven executable) emulates verified CLI behavior including the silent-skip rc=0 gotcha, non-zero exits, and hangs; tests prove the disk verification catches what exit codes miss.</li>
+  <li>Registry validation: unique skill names across packs, no collision with vendored skills, malformed JSON tolerated loudly.</li>
+  <li>State: atomic writes, corrupt-file tolerance, round-trip.</li>
+  <li>Removal safety: foreign-source and unlocked skills are skipped, own-source removed, verified gone.</li>
+  <li>CLI + API layers tested with the packs module mocked; dashboard section browser-verified on a scratch-HOME instance before merge.</li>
+</ul>
+
+<hr>
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a>
+  HTML artifact template. Edit freely.
+</p>
+
+</div>
+
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+  } catch (err) {
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>

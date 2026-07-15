@@ -134,6 +134,36 @@ async function refreshFeatures() {
     return await loadFeatures();
 }
 
+// --- Skill packs data loading ---
+
+// Enabling/disabling a pack runs `npx skills add/remove`, which typically takes
+// 10-60s (longer for big packs). The default 60s api timeout would abort a
+// legitimate slow install; wait comfortably past the server's own 600s
+// subprocess cap so the browser never gives up before the server reports back.
+const PACK_TOGGLE_TIMEOUT_MS = 660000;
+
+// Packs whose install/remove PUT is currently running, keyed by pack name to
+// 'enable' | 'disable'. This is MODULE-level (not per-render) on purpose: a
+// pack op takes 10-60s, and any Features-tab re-render that lands mid-op (a
+// sibling feature toggle, a background refresh) rebuilds the section from
+// scratch. Without a durable record, that re-render resurrects a live-looking
+// toggle and erases the spinner. _renderPacksSection and _bindPackToggleEvents
+// both consult this so an in-flight row stays disabled + "Installing skills..."
+// across re-renders until the op's own finally clears it.
+const _packsInFlight = new Map();
+
+async function loadPacks() {
+    if (!window.jackedState.packs) {
+        window.jackedState.packs = await api.get('/api/packs');
+    }
+    return window.jackedState.packs;
+}
+
+async function refreshPacks() {
+    window.jackedState.packs = null;
+    return await loadPacks();
+}
+
 // --- Claude Code settings data loading ---
 
 async function loadClaudeSettings() {
@@ -163,7 +193,11 @@ function renderToggle(name, category, checked, sourceAvailable) {
 }
 
 function bindToggleEvents(container) {
-    container.querySelectorAll('.toggle-switch').forEach(toggle => {
+    // Scope to feature toggles (agents/commands/hooks/knowledge), which carry
+    // data-category. Skill-pack toggles share the .toggle-switch styling but
+    // have no data-category and are bound separately in _bindPackToggleEvents —
+    // this selector keeps the two handlers from colliding.
+    container.querySelectorAll('.toggle-switch[data-category]').forEach(toggle => {
         const input = toggle.querySelector('input');
         if (!input) return;
         input.addEventListener('change', async () => {
@@ -315,6 +349,20 @@ async function renderFeaturesTab(container) {
         const hooks = features.hooks || [];
         const knowledge = features.knowledge || [];
 
+        // Skill packs come from a separate endpoint. A hiccup fetching them
+        // must not blank out hooks/knowledge, so its failure is captured here
+        // and rendered as a small inline error with its own retry.
+        let packsData = null;
+        let packsError = null;
+        try {
+            packsData = await loadPacks();
+        } catch (e) {
+            packsError = e.message || 'Failed to load skill packs';
+        }
+        const packsSection = packsError
+            ? _renderPacksError(packsError)
+            : _renderPacksSection(packsData);
+
         const hookRows = hooks.map(h => `
             <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(h.display_name)}">
                 <div class="min-w-0 flex-1">
@@ -358,10 +406,13 @@ async function renderFeaturesTab(container) {
                         ${knowledgeRows}
                     </div>
                 </div>
+
+                ${packsSection}
             </div>
         `;
 
         bindToggleEvents(container);
+        _bindPackToggleEvents(container);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -370,6 +421,196 @@ async function renderFeaturesTab(container) {
             </div>
         `;
     }
+}
+
+// --- Skill packs section (rendered inside the Features tab) ---
+
+function _renderPacksError(message) {
+    return `
+        <div>
+            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Skill Packs</h3>
+            <div class="text-xs text-red-400">
+                Failed to load skill packs: ${escapeHtml(message)}
+                <button onclick="renderSettingsTab('features')" class="text-blue-400 hover:text-blue-300 ml-2 transition active:scale-[0.96]">Retry</button>
+            </div>
+        </div>
+    `;
+}
+
+function _renderPacksSection(packsData) {
+    const packs = (packsData && packsData.packs) || [];
+    if (packs.length === 0) return '';
+
+    const npxAvailable = !!(packsData && packsData.npx_available);
+    const npxNote = npxAvailable
+        ? ''
+        : `<p id="packs-npx-note" class="text-xs text-yellow-400 mb-3">Requires Node.js 18+ (npx). Install Node to enable skill packs.</p>`;
+
+    const rows = packs.map(p => {
+        const displayName = p.display_name || p.name;
+        // 'enable' | 'disable' | undefined — a PUT for this pack is running.
+        const inflight = _packsInFlight.get(p.name);
+        const partial = !inflight && p.enabled && p.installed_count < p.total;
+        const countText = `${p.installed_count} of ${p.total} skills installed`;
+
+        let statusLine;
+        if (inflight) {
+            // Mid-op: show progress, never the (stale) count. Survives any
+            // re-render that lands while npx is still running. role=status so
+            // assistive tech hears the minute-long operation begin.
+            const busyText = inflight === 'enable' ? 'Installing skills...' : 'Removing skills...';
+            statusLine = `<div class="text-xs text-slate-400 mt-1 pack-status" role="status" aria-live="polite">${busyText}</div>`;
+        } else if (partial) {
+            // Enabled but short: some skills failed to land. Flag it amber and
+            // offer a one-click repair that re-fires the enable PUT. The link
+            // needs npx just like the toggle, so it disappears with it.
+            const retryLink = npxAvailable
+                ? `<a href="#" class="pack-retry text-xs text-blue-400 hover:text-blue-300 ml-2 transition-colors" data-pack-retry="${escapeHtml(p.name)}">Retry install</a>`
+                : '';
+            statusLine = `<div class="text-xs text-amber-400 mt-1 pack-status" role="status" aria-live="polite">${escapeHtml(countText)}${retryLink}</div>`;
+        } else {
+            statusLine = `<div class="text-xs text-slate-400 mt-1 pack-status" role="status" aria-live="polite">${escapeHtml(countText)}</div>`;
+        }
+
+        const homeLink = p.homepage
+            ? `<a href="${escapeHtml(p.homepage)}" target="_blank" rel="noopener" class="text-xs text-blue-400 hover:text-blue-300 transition-colors flex-shrink-0">Source</a>`
+            : '';
+
+        // Label carries `disabled` (npx missing → CSS dims + kills pointer) and
+        // `pending` (mid-op spinner). Input is disabled in either case.
+        const labelClasses = ['toggle-switch', 'pack-toggle', 'flex-shrink-0'];
+        if (!npxAvailable) labelClasses.push('disabled');
+        if (inflight) labelClasses.push('pending');
+        const inputDisabled = (!npxAvailable || inflight) ? 'disabled' : '';
+        const describedBy = npxAvailable ? '' : ' aria-describedby="packs-npx-note"';
+        const ariaBusy = inflight ? ' aria-busy="true"' : '';
+        // Mid-op the checkbox reflects the user's INTENT (the op in flight),
+        // never the stale cached enabled flag: a re-render during a disable
+        // must not snap the track back to ON under a "Removing skills..." label.
+        const checked = (inflight ? inflight === 'enable' : p.enabled) ? 'checked' : '';
+
+        // A default pack the user hasn't explicitly toggled is on because it
+        // ships default-on; label it so "why is this enabled?" answers itself.
+        const defaultChip = (p.default && !p.explicit)
+            ? '<span class="text-[10px] uppercase tracking-wider text-slate-500 border border-slate-700 rounded px-1 py-0.5 flex-shrink-0">Default</span>'
+            : '';
+
+        return `
+            <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50 gap-3" data-pack-row="${escapeHtml(p.name)}">
+                <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2">
+                        <span class="text-sm text-white">${escapeHtml(displayName)}</span>
+                        ${defaultChip}
+                        ${homeLink}
+                    </div>
+                    <div class="text-xs text-slate-400 mt-1">${escapeHtml(p.description || '')}</div>
+                    ${statusLine}
+                </div>
+                <label class="${labelClasses.join(' ')}" data-pack="${escapeHtml(p.name)}" data-display-name="${escapeHtml(displayName)}"${ariaBusy}>
+                    <input type="checkbox" ${checked} ${inputDisabled} aria-label="${escapeHtml(displayName)} skill pack"${describedBy}>
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        `;
+    }).join('');
+
+    return `
+        <div>
+            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Skill Packs</h3>
+            <p class="text-xs text-slate-500 mb-3">Curated skill bundles installed live from upstream GitHub repos via the skills CLI. Toggling a pack runs npx and can take up to a minute. Skills are instructions your agents will follow. Enabling a pack installs content from its upstream repo; review it via the Source link.</p>
+            ${npxNote}
+            <div class="space-y-2">${rows}</div>
+        </div>
+    `;
+}
+
+async function _runPackToggle(toggle, input, name, displayName, enabled) {
+    // Re-entry guard: a stale Retry link (or any handler bound before this op
+    // started) must never fire a second concurrent npx run for the same pack.
+    if (_packsInFlight.has(name)) return;
+    // Optimistic pending + disable: these ops take 10-60s, and the instant
+    // feature toggles don't, so guard against double-clicks firing a second
+    // npx run mid-install. The in-flight record is what makes that guard
+    // survive an unrelated re-render (see _packsInFlight).
+    _packsInFlight.set(name, enabled ? 'enable' : 'disable');
+    toggle.classList.add('pending');
+    if (input) input.disabled = true;
+
+    try {
+        const res = await api.put(
+            `/api/packs/${encodeURIComponent(name)}`,
+            { enabled },
+            { timeout: PACK_TOGGLE_TIMEOUT_MS },
+        );
+        if (res && res.ok) {
+            showToast(res.message || `${displayName} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+        } else {
+            // HTTP 200 with ok=false: the op ran but did not fully succeed. The
+            // server persists the requested intent even on partial failure, so
+            // surface the reason and fall through to the re-render below; the
+            // authoritative state decides what the toggle shows, never a manual
+            // revert.
+            showToast((res && res.message) || `${displayName} ${enabled ? 'enable' : 'disable'} failed`, 'error');
+        }
+    } catch (e) {
+        showToast(e.message || 'Toggle failed', 'error');
+    } finally {
+        // Op is done: drop the in-flight marker BEFORE re-rendering so the row
+        // rebuilds from the real on-disk status (enabled intent, the "N of M
+        // installed" line, partial-repair link), not the spinner.
+        _packsInFlight.delete(name);
+        try {
+            await refreshPacks();
+            // Don't hijack the user back to Features if they navigated away
+            // mid-op; only re-render when Features is still the saved tab. The
+            // packs cache is refreshed above regardless, so the next Features
+            // visit shows fresh state.
+            const activeTab = localStorage.getItem(SETTINGS_TAB_KEY) || DEFAULT_TAB;
+            if (activeTab === 'features') {
+                await renderSettingsTab('features');
+            }
+        } catch (_) {
+            // Re-render failed (e.g. server restarting): restore the live toggle
+            // so the user can retry manually.
+            console.warn('packs re-render failed', _);
+            toggle.classList.remove('pending');
+            if (input) input.disabled = false;
+        }
+    }
+}
+
+function _bindPackToggleEvents(container) {
+    container.querySelectorAll('.pack-toggle').forEach(toggle => {
+        const input = toggle.querySelector('input');
+        const name = toggle.dataset.pack;
+        // A disabled input (npx unavailable) gets no handler — the section
+        // stays read-only until Node is installed. An in-flight pack likewise
+        // gets no fresh binding: its op owns the row until its finally clears
+        // the marker and re-renders.
+        if (!input || input.disabled) return;
+        if (_packsInFlight.has(name)) return;
+        input.addEventListener('change', () => {
+            const displayName = toggle.dataset.displayName || name;
+            _runPackToggle(toggle, input, name, displayName, input.checked);
+        });
+    });
+
+    // Partial-install repair: the amber "Retry install" link re-fires the
+    // enable PUT for a pack that landed short. Skip in-flight packs (their op
+    // is already running).
+    container.querySelectorAll('.pack-retry').forEach(link => {
+        const name = link.dataset.packRetry;
+        if (_packsInFlight.has(name)) return;
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            const row = link.closest('[data-pack-row]');
+            const toggle = row ? row.querySelector('.pack-toggle') : null;
+            const input = toggle ? toggle.querySelector('input') : null;
+            const displayName = (toggle && toggle.dataset.displayName) || name;
+            if (!toggle) return;
+            _runPackToggle(toggle, input, name, displayName, true);
+        });
+    });
 }
 
 // --- Tab: Plugins ---
