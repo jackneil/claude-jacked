@@ -4184,6 +4184,43 @@ def memory_capture_merge(repo: str):
     raise SystemExit(0)
 
 
+@memory_group.command(name="rollup")
+def memory_rollup():
+    """Roll episodic history forward: past-day files to recent, aged recent to archive."""
+    from jacked import memory as _memory
+    from jacked.memory import rollup as _rollup
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        # Exit 0 even when uninitialized: rollup is a maintenance no-op, not a
+        # failure the caller (or the SessionEnd tail-call) should trip on.
+        console.print(
+            "[yellow]Vault is not initialized.[/yellow] Run `jacked memory init` first."
+        )
+        return
+
+    summary = _rollup.rollup(vault, home)
+    console.print(
+        f"[green][OK][/green] Rollup complete: "
+        f"{summary['days_rolled']} day(s) rolled to recent, "
+        f"{summary['sections_archived']} section(s) archived, "
+        f"{summary['skipped_unparseable']} skipped (unparseable)."
+    )
+    if not summary["changed"]:
+        console.print("[dim]Nothing new to roll up; vault unchanged.[/dim]")
+
+
+@memory_group.command(name="mark-groomed", hidden=True)
+def memory_mark_groomed():
+    """Record a completed librarian groom (reset drift, stamp last_groomed)."""
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    _memory.mark_groomed(home)
+    console.print("[green][OK][/green] Marked vault as groomed (drift counter reset).")
+
+
 @main.group(name="permissions")
 def permissions_group():
     """Audit and prune Claude Code Bash permission rules."""

@@ -139,6 +139,18 @@ def _capture(payload: dict, kind: str) -> None:
         prefix = session_id[:8] or "-"
         vault_mod.commit_all(vault, f"memory: capture session {prefix}")
 
+    # 5. SessionEnd tail-call: fold past-day episodic files into recent/archive.
+    #    PreCompact is mid-session, so it never rolls up. Own try/except + own
+    #    commit: a rollup failure must never cost the capture we just committed
+    #    (the fail-open umbrella already guarantees this run exits 0 regardless).
+    if kind == "session_end":
+        try:
+            from jacked.memory import rollup as rollup_mod
+
+            rollup_mod.rollup(vault, home)
+        except Exception:  # noqa: BLE001 -- rollup failure must not break capture
+            logger.debug("memory capture: rollup tail-call failed", exc_info=True)
+
 
 def _capture_current(
     vault: Path,

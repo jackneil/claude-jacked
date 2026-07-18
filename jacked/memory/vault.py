@@ -108,6 +108,7 @@ def _default_state() -> dict:
         "drift_added": 0,
         "drift_threshold": DEFAULT_DRIFT_THRESHOLD,
         "last_rollup": None,
+        "last_groomed": None,
         "last_sync": None,
         "last_sync_error": None,
         "retry_queue": [],
@@ -207,6 +208,19 @@ def bump_drift(home: Path | None = None, n: int = 1) -> int:
     state["drift_added"] = int(state.get("drift_added", 0)) + n
     save_state(home, state)
     return state["drift_added"]
+
+
+def mark_groomed(home: Path | None = None) -> dict:
+    """Record a completed librarian groom: reset the drift counter and stamp
+    ``last_groomed`` (ISO). Returns the saved state. The ``memory-librarian``
+    skill calls this (via ``jacked memory mark-groomed``) when it finishes a
+    grooming pass, so the SessionStart drift nudge quiets down again.
+    """
+    state = load_state(home)
+    state["drift_added"] = 0
+    state["last_groomed"] = _now_iso()
+    save_state(home, state)
+    return state
 
 
 def set_enabled(home: Path | None, enabled: bool, *, vault: Path | None = None) -> dict:
