@@ -4,7 +4,8 @@ This is pure code -- NO LLM anywhere. It runs from the ``jacked memory rollup``
 CLI command and as a tail-call at the end of a SessionEnd capture. It walks every
 ``groups/<group>/episodic/<repo>/`` dir and does two things, in order:
 
-1. Every ``today-YYYY-MM-DD.md`` whose date is BEFORE today (UTC) is folded into
+1. Every ``today-YYYY-MM-DD.md`` whose date is BEFORE today (LOCAL calendar day,
+   matching ``capture._write_episodic``'s local today-file naming) is folded into
    ``recent.md`` as one ``## YYYY-MM-DD`` day section (its ``## HH:MM | branch``
    entries demoted to ``### HH:MM | branch`` so the day nests cleanly). The
    processed file is then RENAMED to ``today-YYYY-MM-DD.done.md`` -- the remember
@@ -25,12 +26,9 @@ sections) so migration and human readers keep continuity.
 """
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
 import re
-import tempfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from jacked.memory import vault as vault_mod
@@ -62,13 +60,19 @@ _DEMOTABLE_HEADING_RE = re.compile(r"^#{1,5}\s")
 # Public entry point
 # --------------------------------------------------------------------------- #
 
-def rollup(vault: Path, home: Path | None = None, only_repo_short: str | None = None) -> dict:
+def rollup(
+    vault: Path,
+    home: Path | None = None,
+    only_repo: tuple[str, str] | None = None,
+) -> dict:
     """Roll episodic history forward across the vault's episodic dirs.
 
-    ``only_repo_short`` scopes the run to a single repo's episodic dir (by its
-    sanitized short name): a session ending in repo X passes X so it never
-    rewrites repo Z's recent.md. ``None`` (the ``jacked memory rollup`` CLI) rolls
-    every dir.
+    ``only_repo`` scopes the run to a single ``(group, repo_short)`` episodic dir:
+    a session ending in group G / repo X passes ``("G", "X")`` so it never rewrites
+    a same-named repo dir in a DIFFERENT group (two groups can each hold an
+    episodic dir with the same short name -- scoping on the short name alone would
+    roll the wrong group's history). ``None`` (the ``jacked memory rollup`` CLI)
+    rolls every dir.
 
     Returns a summary dict:
     ``{days_rolled, sections_archived, skipped_unparseable, dirs, changed}``.
@@ -92,7 +96,9 @@ def rollup(vault: Path, home: Path | None = None, only_repo_short: str | None = 
     with vault_mod.vault_write_lock(vault):
         today = _today()
         for edir in _episodic_dirs(vault):
-            if only_repo_short is not None and edir.name != only_repo_short:
+            # edir is groups/<group>/episodic/<repo_short>; scope on BOTH so a
+            # same-named repo dir in another group is never touched.
+            if only_repo is not None and (edir.parent.parent.name, edir.name) != tuple(only_repo):
                 continue
             summary["dirs"] += 1
             _rollup_dir(edir, today, summary)
@@ -233,18 +239,6 @@ def _merge_day_section(sections: list[tuple[str, str]], day: tuple[str, str]) ->
             sections[i] = (h, f"{existing}\n\n{addition}" if existing else addition)
             return
     sections.append((header, body))
-
-
-def _day_sections(text: str) -> list[tuple[date, str, str]]:
-    """``[(date, header, body), ...]`` for the valid ``## YYYY-MM-DD`` sections of
-    a recent.md-shaped text (small + unit-testable)."""
-    out: list[tuple[date, str, str]] = []
-    _, sections = _split_h2(text)
-    for header, body in sections:
-        d = _day_header_date(header)
-        if d is not None:
-            out.append((d, header, body))
-    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -399,23 +393,14 @@ def _read_text(path: Path) -> str:
 
 
 def _write_if_differs(path: Path, new_text: str) -> bool:
-    """Write ``new_text`` only when it differs from disk, ATOMICALLY (writer-unique
-    tmp + os.replace). Returns True if a write happened (so a no-op run neither
-    rewrites nor commits). Atomic so a crash mid-write never leaves a half-written
-    recent.md/archive.md."""
+    """Write ``new_text`` only when it differs from disk, ATOMICALLY (via the
+    shared ``vault.atomic_write_text``). Returns True if a write happened (so a
+    no-op run neither rewrites nor commits). Atomic so a crash mid-write never
+    leaves a half-written recent.md/archive.md."""
     old = _read_text(path) if path.exists() else None
     if old == new_text:
         return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(new_text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    vault_mod.atomic_write_text(path, new_text)
     return True
 
 
@@ -423,7 +408,7 @@ def _record_last_rollup(home: Path | None) -> None:
     """Stamp ``state.last_rollup`` under the state lock so a concurrent writer's
     drift/queue/health is not clobbered."""
     def _m(state: dict) -> None:
-        state["last_rollup"] = _now_iso()
+        state["last_rollup"] = vault_mod.now_iso()
 
     vault_mod.update_state(home, _m)
 
@@ -432,7 +417,3 @@ def _today() -> date:
     """LOCAL date -- matches ``capture._write_episodic``'s local today-file naming
     so the current-day file is never rolled mid-day for negative-UTC users."""
     return datetime.now().date()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -147,6 +147,17 @@ def _snapshot(remember_dir):
     return snap
 
 
+def _remember_plugin_retired(env) -> bool:
+    """True iff settings.json has disabled the remember plugin (enabledPlugins
+    entry set to False). `memory init` now creates settings.json for the hooks,
+    so the retirement check reads the plugin entry, not the file's existence."""
+    path = env.home / ".claude" / "settings.json"
+    if not path.exists():
+        return False
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data.get("enabledPlugins", {}).get(migrate_mod.REMEMBER_PLUGIN_ID) is False
+
+
 # --------------------------------------------------------------------------- #
 # discover
 # --------------------------------------------------------------------------- #
@@ -269,6 +280,42 @@ def test_core_memories_become_candidate_notes(env):
         assert meta["repos"] == ["github.com/acme/myrepo"]
         titles.add(vault_mod.slugify(note.stem))
     assert titles == {"chose-sqlite-over-postgres", "renamed-billing-to-ledger"}
+
+
+def test_migrate_writes_candidate_notes_before_core_memories_move(env):
+    """core-memories.md must land in the vault AFTER its candidate notes. If it
+    moved first and an interrupt hit before the notes were written, a rerun's
+    byte-identical idempotency check would skip re-staging it and never re-extract
+    the candidates -- silent loss. This pins the notes-before-move ordering."""
+    root, repo = _fixture_repo(env)
+    _init(env, root)
+    _neutral_cwd(env)
+
+    events: list[tuple[str, str]] = []
+    real_move = migrate_mod.shutil.move
+    real_add = vault_mod.add_note
+
+    def _spy_move(src, dst):
+        events.append(("move", str(dst)))
+        return real_move(src, dst)
+
+    def _spy_add(*a, **k):
+        events.append(("note", str(k.get("title"))))
+        return real_add(*a, **k)
+
+    env.monkeypatch.setattr(migrate_mod.shutil, "move", _spy_move)
+    env.monkeypatch.setattr(vault_mod, "add_note", _spy_add)
+
+    migrate_mod.migrate(env.vault, env.home, roots=[root])
+
+    move_idx = next(i for i, (kind, name) in enumerate(events)
+                    if kind == "move" and name.endswith("core-memories.md"))
+    note_idxs = [i for i, (kind, _n) in enumerate(events) if kind == "note"]
+    assert note_idxs, "expected candidate note writes from core-memories.md"
+    # Every candidate note is written BEFORE core-memories.md lands in the vault.
+    assert max(note_idxs) < move_idx
+    # ...and core-memories.md still landed.
+    assert (env.vault / "groups" / "myrepo" / "episodic" / "myrepo" / "core-memories.md").exists()
 
 
 def test_now_folded_into_current_today_as_addition(env):
@@ -458,8 +505,9 @@ def test_cli_non_tty_never_retires_prints_notice(env):
     assert r.exit_code == 0
     out = env.buf.getvalue()
     assert "Not retiring the remember plugin" in out
-    # settings.json was never written -> the plugin is not disabled.
-    assert not (env.home / ".claude" / "settings.json").exists()
+    # The remember plugin was NOT retired: no disable entry in settings.json.
+    # (settings.json itself exists because `memory init` installs the hooks.)
+    assert not _remember_plugin_retired(env)
 
 
 def test_cli_keep_plugin_never_offers(env):
@@ -471,7 +519,7 @@ def test_cli_keep_plugin_never_offers(env):
     assert r.exit_code == 0
     out = env.buf.getvalue().lower()
     assert "retir" not in out  # neither the offer nor the non-TTY notice
-    assert not (env.home / ".claude" / "settings.json").exists()
+    assert not _remember_plugin_retired(env)
 
 
 def test_cli_migrate_no_remember_dirs_is_clean_noop(env):

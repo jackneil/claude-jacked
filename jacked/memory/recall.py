@@ -139,7 +139,23 @@ def build_brief(cwd: str) -> str:
     brief = fit_to_budget(sections, TOKEN_BUDGET)
     # Vault content is injected into the session context; strip any control /
     # escape sequences a note body might carry (keeps tab/newline/CR).
-    return vault_mod._CONTROL_CHARS_RE.sub("", brief)
+    brief = vault_mod._CONTROL_CHARS_RE.sub("", brief)
+    if brief:
+        _record_last_recall(home)
+    return brief
+
+
+def _record_last_recall(home: Path) -> None:
+    """Stamp ``state.last_recall`` (ISO) when a non-empty brief was built, under
+    the state lock. Its own try/except: a health-write failure must NEVER break
+    the brief the session is about to receive (recall is otherwise read-only)."""
+    def _m(state: dict) -> None:
+        state["last_recall"] = vault_mod.now_iso()
+
+    try:
+        vault_mod.update_state(home, _m)
+    except Exception:  # noqa: BLE001 -- health writing must never break recall
+        logger.debug("memory recall: could not record last_recall", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,13 +183,18 @@ def _resolve_group_dir(vault: Path, identity: str) -> tuple[str | None, Path | N
 def _assemble_sections(
     vault: Path, gdir: Path, group: str, repo_short: str, state: dict
 ) -> list[tuple[str, str]]:
-    decision_lines = _decision_lines(gdir)
+    # ONE tail-lazy pass over index.md feeds both the decisions tier and the
+    # index-excerpt tier, reading each linked note at most once. The old code ran
+    # _reviewed_index_lines TWICE (once per tier), opening EVERY note in the group
+    # each time -- SessionStart cost grew with the group's lifetime size. Now it
+    # is bounded by what the brief actually needs.
+    excerpt_lines, decision_lines = _reviewed_tail(gdir)
     return [
         (_L_HEADER, _header_section(gdir, group)),
         (_L_HOT, _hot_section(gdir)),
         (_L_EPISODIC, _episodic_section(gdir, repo_short)),
         (_L_DECISIONS, _decisions_section(decision_lines)),
-        (_L_INDEX, _index_excerpt_section(gdir, exclude=set(decision_lines))),
+        (_L_INDEX, _index_excerpt_section(excerpt_lines, exclude=set(decision_lines))),
         (_L_DRIFT, _drift_section(state)),
     ]
 
@@ -223,15 +244,6 @@ def _episodic_section(gdir: Path, repo_short: str) -> str:
     return f"# Last session\n{block}" if block else ""
 
 
-def _decision_lines(gdir: Path) -> list[str]:
-    """The last few index lines that link into ``decision/`` (newest-at-bottom
-    index, so the tail is the newest decisions). Unreviewed ``candidate`` notes
-    are excluded (see ``_is_candidate_note``)."""
-    return [
-        line for line in _reviewed_index_lines(gdir) if "](decision/" in line
-    ][-_TOP_DECISIONS:]
-
-
 def _decisions_section(lines: list[str]) -> str:
     """Priority 4: the newest decision index lines."""
     if not lines:
@@ -239,42 +251,77 @@ def _decisions_section(lines: list[str]) -> str:
     return "# Key decisions\n" + "\n".join(lines)
 
 
-def _index_excerpt_section(gdir: Path, exclude: set[str] | None = None) -> str:
-    """Priority 5: the last ``_INDEX_EXCERPT`` index lines, any type.
+def _index_excerpt_section(lines: list[str], exclude: set[str] | None = None) -> str:
+    """Priority 5: the reviewed index-excerpt tail (any type).
 
     Lines already surfaced by the decisions tier are excluded so the brief never
     repeats itself (repetition wastes the token budget and reads as noise).
     """
     exclude = exclude or set()
-    lines = [
-        line for line in _reviewed_index_lines(gdir)[-_INDEX_EXCERPT:]
-        if line not in exclude
-    ]
-    if not lines:
+    kept = [line for line in lines if line not in exclude]
+    if not kept:
         return ""
-    return "# Recent notes (index)\n" + "\n".join(lines)
+    return "# Recent notes (index)\n" + "\n".join(kept)
 
 
 _INDEX_LINK_RE = re.compile(r"\]\(([^)]+\.md)\)")
 
 
-def _reviewed_index_lines(gdir: Path) -> list[str]:
-    """Index entry lines whose notes are NOT tagged ``candidate``.
+def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
+    """One tail-lazy pass over index.md for both recall index tiers.
 
-    Unreviewed auto-captures (session triage, merge distillation — the paths
+    Scans the index entry lines from the END (newest first) and reads each
+    linked note AT MOST ONCE (memoized) to decide whether it is reviewed (not a
+    ``candidate``). It stops as soon as it has BOTH the last ``_INDEX_EXCERPT``
+    reviewed lines of any type AND the last ``_TOP_DECISIONS`` reviewed decision
+    lines. Decision lines can sit deeper than the 20-line excerpt tail, so the
+    scan keeps going past 20 until 5 reviewed decisions are found or the index is
+    exhausted. This bounds SessionStart note reads by what the brief needs, never
+    by the group's lifetime note count.
+
+    Unreviewed auto-captures (session triage, merge distillation -- the paths
     where content of external origin such as a contributor's PR body can enter
     the vault) stay out of the injected brief until a librarian or human pass
-    promotes them. A line whose note can't be read or parsed is kept: only a
+    promotes them. A line whose note can't be read or parsed is KEPT: only a
     positively-identified candidate tag excludes it, so a broken note never
     silently vanishes from recall.
+
+    Returns ``(excerpt_lines, decision_lines)`` both in original (oldest-first)
+    order to match the newest-at-bottom index: ``excerpt_lines`` is the last
+    ``_INDEX_EXCERPT`` reviewed lines; ``decision_lines`` is the last
+    ``_TOP_DECISIONS`` reviewed ``decision/`` lines.
     """
-    out: list[str] = []
-    for line in _index_entry_lines(gdir):
+    candidate_memo: dict[Path, bool] = {}
+
+    def _reviewed(line: str) -> bool:
         m = _INDEX_LINK_RE.search(line)
-        if m and _is_candidate_note(gdir / m.group(1)):
+        if not m:
+            return True  # no parseable link -> keep (never silently drop)
+        path = gdir / m.group(1)
+        cand = candidate_memo.get(path)
+        if cand is None:
+            cand = _is_candidate_note(path)
+            candidate_memo[path] = cand
+        return not cand
+
+    excerpt_rev: list[str] = []    # newest-first reviewed lines (any type), <= 20
+    decisions_rev: list[str] = []  # newest-first reviewed decision lines, <= 5
+    for line in reversed(_index_entry_lines(gdir)):
+        # Once the excerpt is full, only decision lines can still contribute --
+        # skip non-decision lines WITHOUT reading their notes, so a decision-poor
+        # group never degrades back into a full-index scan.
+        if len(excerpt_rev) >= _INDEX_EXCERPT and "](decision/" not in line:
             continue
-        out.append(line)
-    return out
+        if not _reviewed(line):
+            continue
+        if len(excerpt_rev) < _INDEX_EXCERPT:
+            excerpt_rev.append(line)
+        if "](decision/" in line and len(decisions_rev) < _TOP_DECISIONS:
+            decisions_rev.append(line)
+        if len(excerpt_rev) >= _INDEX_EXCERPT and len(decisions_rev) >= _TOP_DECISIONS:
+            break
+
+    return list(reversed(excerpt_rev)), list(reversed(decisions_rev))
 
 
 def _is_candidate_note(path: Path) -> bool:
@@ -369,7 +416,7 @@ def _maybe_sync(vault: Path, home: Path, state: dict) -> None:
         # Stamp under the state lock so a concurrent writer's drift/queue/health
         # isn't clobbered.
         def _stamp(st: dict) -> None:
-            st["last_sync"] = _now_iso()
+            st["last_sync"] = vault_mod.now_iso()
             st["last_sync_error"] = None if ok else err
 
         vault_mod.update_state(home, _stamp)
@@ -435,7 +482,3 @@ def _within_minutes(iso: str, minutes: int) -> bool:
 def _one_line(s: str) -> str:
     collapsed = " ".join(vault_mod._CONTROL_CHARS_RE.sub("", s or "").split())
     return collapsed[:_ERR_MAXLEN]
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -14,6 +14,8 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked.memory.settings_io import SettingsUnreadableError
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -228,13 +230,32 @@ def _name_to_display(name: str) -> str:
 
 
 def _read_settings_json() -> dict:
-    """Read ~/.claude/settings.json, returning {} if missing or corrupt."""
-    if not SETTINGS_JSON.exists():
-        return {}
-    try:
-        return json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+    """Read ~/.claude/settings.json via the corruption-safe reader.
+
+    A missing file returns ``{}`` (a fresh install). A PRESENT-but-unreadable file
+    (a JSON typo, a partial write, a permissions hiccup) raises
+    ``SettingsUnreadableError`` -- the old behavior of returning ``{}`` here was a
+    latent wipe bug: the next read-modify-write would then CLOBBER every real
+    hook, permission, and env var the user had. Mutation endpoints turn this into
+    a 503 (``_settings_unreadable_response``); read-only consumers catch it and
+    degrade to ``{}`` (surfacing ``settings_unreadable`` where the shape allows).
+    """
+    from jacked.memory.settings_io import read_settings
+
+    return read_settings(SETTINGS_JSON)
+
+
+def _settings_unreadable_response() -> JSONResponse:
+    """The 503 a mutation endpoint returns when settings.json exists but can't be
+    parsed: refuse to modify it rather than clobber the user's real config with a
+    fresh file (mirrors the memory-vault toggle's refusal shape)."""
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": {
+            "message": "settings.json is unreadable; refusing to modify it",
+            "code": "SETTINGS_UNREADABLE",
+        }},
+    )
 
 
 def _write_settings_json(data: dict):
@@ -328,6 +349,7 @@ def _memory_vault_health() -> dict | None:
         return {
             "last_capture": st.get("last_capture"),
             "last_capture_error": st.get("last_capture_error"),
+            "last_recall": st.get("last_recall"),
             "last_sync_error": st.get("last_sync_error"),
             "retry_pending": st.get("retry_pending"),
             "drift_added": st.get("drift_added"),
@@ -367,7 +389,14 @@ def _detect_rules_status() -> dict:
 @router.get("/features")
 async def list_features():
     """Full feature manifest with installed status."""
-    settings = _read_settings_json()
+    # Read-only consumer: a corrupt settings.json must not 500 the whole feature
+    # list. Degrade to {} for detection and flag it so the client can warn.
+    try:
+        settings = _read_settings_json()
+        settings_unreadable = False
+    except SettingsUnreadableError:
+        settings = {}
+        settings_unreadable = True
 
     # Agents
     agents = []
@@ -459,6 +488,7 @@ async def list_features():
     return {
         "agents": agents, "commands": commands, "hooks": hooks,
         "knowledge": knowledge,
+        "settings_unreadable": settings_unreadable,
     }
 
 
@@ -564,7 +594,10 @@ async def _toggle_hook(name: str, enabled: bool, db=None):
         return await _toggle_memory_vault(enabled)
 
     async with _settings_lock:
-        settings = _read_settings_json()
+        try:
+            settings = _read_settings_json()
+        except SettingsUnreadableError:
+            return _settings_unreadable_response()
         if "hooks" not in settings:
             settings["hooks"] = {}
 
@@ -593,7 +626,6 @@ async def _toggle_memory_vault(enabled: bool):
     """
     from jacked.memory import setup as memory_setup
     from jacked.memory import vault as memory_vault
-    from jacked.memory.settings_io import SettingsUnreadableError
 
     home = memory_vault.jacked_home()
     async with _settings_lock:
@@ -605,13 +637,7 @@ async def _toggle_memory_vault(enabled: bool):
         except SettingsUnreadableError:
             # settings.json exists but can't be parsed: refuse to touch it rather
             # than clobber the user's hooks/permissions with a fresh file.
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={"error": {
-                    "message": "settings.json is unreadable; refusing to modify it",
-                    "code": "SETTINGS_UNREADABLE",
-                }},
-            )
+            return _settings_unreadable_response()
 
     return {"name": "memory_vault", "category": "hooks", "enabled": enabled, **result}
 
@@ -764,7 +790,14 @@ def _disable_sound_hooks(settings: dict):
 @router.get("/claude-settings")
 async def get_claude_settings():
     """Return current state of all Claude Code settings."""
-    settings = _read_settings_json()
+    # Read-only: a corrupt settings.json degrades to empty defaults plus a flag
+    # rather than 500ing the settings panel.
+    try:
+        settings = _read_settings_json()
+        settings_unreadable = False
+    except SettingsUnreadableError:
+        settings = {}
+        settings_unreadable = True
     env_section = settings.get("env", {})
 
     # Env var toggles
@@ -827,6 +860,7 @@ async def get_claude_settings():
         "direct_settings": direct_settings,
         "plugins": plugins,
         "permissions": permissions,
+        "settings_unreadable": settings_unreadable,
     }
 
 
@@ -848,7 +882,10 @@ async def set_claude_env(name: str, body: EnvToggleRequest):
         )
 
     async with _settings_lock:
-        settings = _read_settings_json()
+        try:
+            settings = _read_settings_json()
+        except SettingsUnreadableError:
+            return _settings_unreadable_response()
         if "env" not in settings:
             settings["env"] = {}
 
@@ -898,7 +935,10 @@ async def set_claude_key(name: str, body: DirectSettingRequest):
     meta = DIRECT_SETTINGS[name]
 
     async with _settings_lock:
-        settings = _read_settings_json()
+        try:
+            settings = _read_settings_json()
+        except SettingsUnreadableError:
+            return _settings_unreadable_response()
 
         if meta["type"] == "bool":
             if not isinstance(body.value, bool):
@@ -937,7 +977,10 @@ async def toggle_claude_plugin(name: str, body: PluginToggleRequest):
             content={"error": {"message": "Invalid plugin name", "code": "INVALID_PLUGIN"}},
         )
     async with _settings_lock:
-        settings = _read_settings_json()
+        try:
+            settings = _read_settings_json()
+        except SettingsUnreadableError:
+            return _settings_unreadable_response()
         if "enabledPlugins" not in settings:
             settings["enabledPlugins"] = {}
 
@@ -970,7 +1013,10 @@ async def set_claude_permissions(body: PermissionsRequest):
         )
 
     async with _settings_lock:
-        settings = _read_settings_json()
+        try:
+            settings = _read_settings_json()
+        except SettingsUnreadableError:
+            return _settings_unreadable_response()
         if "permissions" not in settings:
             settings["permissions"] = {}
 
@@ -990,8 +1036,17 @@ async def set_claude_permissions(body: PermissionsRequest):
 
 @router.get("/claude-settings/raw")
 async def get_raw_settings():
-    """Return the raw settings.json content for the editor."""
-    return {"content": _read_settings_json()}
+    """Return the raw settings.json content for the editor.
+
+    Read-only: a corrupt file degrades to empty content plus a flag so the editor
+    can warn instead of 500ing. The PUT path requires an explicit
+    ``confirm_overwrite`` before it replaces the file, so an accidental save of {}
+    can't silently wipe a real config.
+    """
+    try:
+        return {"content": _read_settings_json(), "settings_unreadable": False}
+    except SettingsUnreadableError:
+        return {"content": {}, "settings_unreadable": True}
 
 
 class RawSettingsRequest(BaseModel):

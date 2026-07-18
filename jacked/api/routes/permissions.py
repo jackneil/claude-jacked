@@ -20,6 +20,7 @@ from jacked.api.routes.features import (
     _read_settings_json,
     _write_settings_json,
 )
+from jacked.memory.settings_io import SettingsUnreadableError
 
 router = APIRouter()
 
@@ -275,7 +276,12 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
         return {"ok": True, "scope": "project"}
     else:
         async with _features_mod._settings_lock:
-            settings = _read_settings_json()
+            try:
+                settings = _read_settings_json()
+            except SettingsUnreadableError:
+                # A corrupt global settings.json: refuse to add the rule rather
+                # than clobber the user's real permissions with a fresh file.
+                return _features_mod._settings_unreadable_response()
             if "permissions" not in settings:
                 settings["permissions"] = {}
             rules = settings["permissions"].get(body.list_name, [])

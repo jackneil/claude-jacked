@@ -540,6 +540,88 @@ def test_candidate_note_surfaces_after_promotion(env):
 
 
 # --------------------------------------------------------------------------- #
+# W1: the reviewed-tail scan is single-pass and tail-lazy (bounded reads)
+# --------------------------------------------------------------------------- #
+
+def _seed_big_group(env, group="bigrepo", n_notes=200, *, tag_every_candidate=False):
+    """An initialized, enabled vault with one group carrying ``n_notes`` decision
+    notes written DIRECTLY to disk (no git per note) plus a matching index.md, so
+    the read-count math is exercised cheaply."""
+    vault_mod.init_vault(env.vault, [], {})
+    vault_mod.set_enabled(env.home, True, vault=env.vault)
+    gdir = env.vault / "groups" / group
+    vault_mod.ensure_group(env.vault, group)
+    (gdir / "hot.md").write_text(f"# Hot: {group}\n\nprogress\n", encoding="utf-8")
+    ddir = gdir / "decision"
+    ddir.mkdir(parents=True, exist_ok=True)
+    index_lines: list[str] = []
+    for i in range(n_notes):
+        slug = f"note-{i:03d}"
+        tags = ["candidate"] if (tag_every_candidate and i % 2 == 0) else []
+        meta = {
+            "type": "decision", "repos": [group], "group": group,
+            "created": "2026-07-18", "updated": "2026-07-18", "tags": tags,
+        }
+        (ddir / f"{slug}.md").write_text(
+            vault_mod.render_note(meta, f"Decision body {i}."), encoding="utf-8"
+        )
+        index_lines.append(
+            f"- [Decision {i}](decision/{slug}.md) - hook {i} (updated 2026-07-18)"
+        )
+    (gdir / "index.md").write_text(
+        "# Index\n\n" + "\n".join(index_lines) + "\n", encoding="utf-8"
+    )
+    return gdir
+
+
+def test_build_brief_bounds_note_reads_to_the_tail(env):
+    """A 200-note group must not read all 200 notes to build the brief: the single
+    tail-lazy pass stops once it has the last 20 reviewed lines + 5 decisions."""
+    _seed_big_group(env, n_notes=200)
+
+    reads: list[str] = []
+    real_read = vault_mod.read_note
+
+    def _counting_read(path):
+        reads.append(str(path))
+        return real_read(path)
+
+    env.monkeypatch.setattr(vault_mod, "read_note", _counting_read)
+    brief = recall.build_brief(str(_cwd_dir(env, "bigrepo")))
+
+    assert brief
+    assert "](decision/" in brief
+    # Bounded by the brief's needs (20 excerpt + up to 5 decisions), not the 200
+    # notes in the group. A generous ceiling of 25 leaves room for the small
+    # constant while still failing hard on the old full-group double pass (~400).
+    assert len(reads) <= 25, f"expected a bounded tail scan, got {len(reads)} note reads"
+    # Each note read at most once within the single pass (memoized).
+    assert len(reads) == len(set(reads))
+
+
+def test_build_brief_reads_each_note_once_with_candidates(env):
+    """Even when half the tail is candidate (excluded), no note is read twice and
+    the scan stays bounded -- candidate exclusion + dedup behavior is unchanged."""
+    _seed_big_group(env, n_notes=200, tag_every_candidate=True)
+
+    reads: list[str] = []
+    real_read = vault_mod.read_note
+
+    def _counting_read(path):
+        reads.append(str(path))
+        return real_read(path)
+
+    env.monkeypatch.setattr(vault_mod, "read_note", _counting_read)
+    brief = recall.build_brief(str(_cwd_dir(env, "bigrepo")))
+
+    assert brief
+    assert len(reads) == len(set(reads))  # memoized: never the same note twice
+    # Candidate (even-index) notes are excluded from the brief; odd-index survive.
+    assert "](decision/note-199.md)" in brief          # odd -> reviewed
+    assert "](decision/note-198.md)" not in brief       # even -> candidate, excluded
+
+
+# --------------------------------------------------------------------------- #
 # F11: a dirty vault working tree skips the sync (state untouched)
 # --------------------------------------------------------------------------- #
 
@@ -595,3 +677,35 @@ def test_episodic_fallback_uses_recent_md_last_block(env):
     )
     brief = recall.build_brief(str(_cwd_dir(env, group)))
     assert "MOST RECENT RECENT-MD ENTRY" in brief
+
+
+# --------------------------------------------------------------------------- #
+# W11: a non-empty brief stamps state.last_recall; an empty brief does not
+# --------------------------------------------------------------------------- #
+
+def test_non_empty_brief_stamps_last_recall(env):
+    _seed_group(env)
+    assert vault_mod.load_state(env.home).get("last_recall") is None
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert brief  # non-empty
+    assert vault_mod.load_state(env.home)["last_recall"] is not None
+
+
+def test_empty_brief_leaves_last_recall_unchanged(env):
+    _seed_group(env)  # vault present + enabled
+    vault_mod.update_state(env.home, lambda s: s.update({"last_recall": None}))
+    # An unmapped cwd with no group dir yields an empty brief -> no stamp.
+    assert recall.build_brief(str(_cwd_dir(env, "ghostrepo"))) == ""
+    assert vault_mod.load_state(env.home).get("last_recall") is None
+
+
+def test_last_recall_stamp_failure_never_breaks_brief(env):
+    """A health-write failure must not defeat the brief the session receives."""
+    _seed_group(env)
+
+    def _boom(home, mutator):
+        raise RuntimeError("state lock jammed")
+
+    env.monkeypatch.setattr(vault_mod, "update_state", _boom)
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert "=== MEMORY VAULT (myrepo) ===" in brief  # brief still returned

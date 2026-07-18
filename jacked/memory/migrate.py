@@ -512,7 +512,18 @@ def _materialize(vault: Path, home: Path | None, plan: dict) -> None:
         vault_mod.save_vault_config(vault, cfg)
     vault_mod.ensure_group(vault, group)
 
-    for staged_path, final_path in plan["moves"]:
+    # core-memories.md must land in the vault AFTER its candidate notes. If it
+    # moved first and the process was interrupted before the notes were written,
+    # a rerun's byte-identical idempotency check (_already_have) would skip
+    # re-staging it and never re-extract the candidates -- a SILENT LOSS. So
+    # everything else moves first, then the candidate notes, then core-memories.md
+    # last. The residual reverse window (a crash between the notes and this move)
+    # only DUPLICATES candidates on a rerun's re-extraction, never loses them --
+    # the deliberate duplicates-over-loss tradeoff.
+    core_moves = [(s, f) for s, f in plan["moves"] if f.name == "core-memories.md"]
+    other_moves = [(s, f) for s, f in plan["moves"] if f.name != "core-memories.md"]
+
+    for staged_path, final_path in other_moves:
         final_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(staged_path), str(final_path))
 
@@ -525,6 +536,10 @@ def _materialize(vault: Path, home: Path | None, plan: dict) -> None:
             vault_mod.add_note(vault, home, commit=False, **spec)
         except (ValueError, RuntimeError):
             logger.debug("memory migrate: candidate note write failed", exc_info=True)
+
+    for staged_path, final_path in core_moves:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staged_path), str(final_path))
 
 
 # --------------------------------------------------------------------------- #

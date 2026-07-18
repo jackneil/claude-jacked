@@ -98,26 +98,29 @@ def _capture_merge(repo: Path) -> None:
         return
 
     model = state.get("triage_model") or vault_mod.DEFAULT_TRIAGE_MODEL
-    original = dict(state.get("processed_merges") or {})
-    processed = dict(original)
+    # The shas already recorded when this run STARTED -- used only to skip work,
+    # never as the base we write back. The write merges just this run's delta into
+    # a fresh load (see _save_processed) so a concurrent hook's shas survive.
+    already = dict(state.get("processed_merges") or {})
 
     # Resolve the vault destination once (registers a solo group if unmapped).
     identity, group, _repo_short = capture.resolve_group_and_repo(vault, str(repo))
 
     wrote_shas: list[str] = []
+    new_processed: dict[str, str] = {}
     for sha, subject in merges:
-        if sha in processed:
+        if sha in already or sha in new_processed:
             continue
         if _capture_one_merge(vault, home, repo, group, identity, sha, subject, model):
             wrote_shas.append(sha)
-        processed[sha] = _now_iso()
+        new_processed[sha] = vault_mod.now_iso()
 
-    processed = _prune_processed(processed)
-
-    # Persist processed_merges under the state lock so add_note's drift bumps and
-    # any concurrent writer's updates survive.
-    if processed != original:
-        _save_processed(home, processed)
+    # Persist ONLY this run's newly-processed shas, merged into the freshly-loaded
+    # state under the lock. Never assign a whole dict snapshotted before the slow
+    # claude -p calls above: a concurrent post-merge hook that recorded its own
+    # sha meanwhile must survive, and add_note's drift bumps must too.
+    if new_processed:
+        _save_processed(home, new_processed)
 
     # Serialize the stage+commit across processes (the lock wraps only the git
     # write, never a claude -p call above).
@@ -144,7 +147,13 @@ def _capture_one_merge(
     prompt = _build_prompt(
         subject, merged_branch, pr_number, pr_title, pr_body, pr_trimmed, changed
     )
-    parsed = _note_from_result(capture.parse_triage(capture.call_claude(prompt, model)))
+    text, cause = capture.call_claude(prompt, model)
+    if cause is not None:
+        logger.warning(
+            "memory merge-capture: distillation failed (%s); using the deterministic fallback note",
+            cause,
+        )
+    parsed = _note_from_result(capture.parse_triage(text))
 
     if parsed is None:
         # Distillation failed -> deterministic fallback so the merge is not lost.
@@ -179,11 +188,18 @@ def _write_merge_note(vault: Path, home: Path, group: str, identity: str, note: 
         logger.debug("memory merge-capture: note write failed", exc_info=True)
 
 
-def _save_processed(home: Path, processed: dict) -> None:
-    """Persist processed_merges under the state lock (preserves concurrent drift /
-    health / queue updates)."""
+def _save_processed(home: Path, new_processed: dict) -> None:
+    """Merge THIS run's newly-processed shas into the FRESHLY-loaded state's
+    processed_merges (a dict update, never a wholesale assignment of a dict
+    captured before the run's slow claude -p calls) and age-prune the result --
+    all under the state lock. A concurrent post-merge hook's shas, recorded while
+    this run was still distilling, therefore survive instead of being clobbered;
+    add_note's drift bumps and any other concurrent writer's updates survive too.
+    """
     def _m(state: dict) -> None:
-        state["processed_merges"] = processed
+        merged = dict(state.get("processed_merges") or {})
+        merged.update(new_processed)
+        state["processed_merges"] = _prune_processed(merged)
 
     vault_mod.update_state(home, _m)
 
@@ -424,7 +440,3 @@ def _merge_commits(repo: Path) -> list[tuple[str, str]]:
             out.append((sha, subject.strip()))
     out.reverse()  # git log is newest-first; process chronologically
     return out
-
-
-def _now_iso() -> str:
-    return capture._now_iso()

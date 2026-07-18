@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from jacked.findbin import find_bin
@@ -186,8 +186,12 @@ def _capture(payload: dict, kind: str) -> None:
         try:
             from jacked.memory import rollup as rollup_mod
 
-            repo_short = vault_mod.group_for_identity(vault_mod.repo_identity(Path(cwd)))
-            rollup_mod.rollup(vault, home, only_repo_short=repo_short)
+            identity = vault_mod.repo_identity(Path(cwd))
+            repo_short = vault_mod.group_for_identity(identity)
+            # Scope the tail-call to THIS session's (group, repo_short) so a repo
+            # dir of the same short name in another group is never rewritten.
+            group = vault_mod.resolve_group(vault, identity) or repo_short
+            rollup_mod.rollup(vault, home, only_repo=(group, repo_short))
         except Exception:  # noqa: BLE001 -- rollup failure must not break capture
             logger.debug("memory capture: rollup tail-call failed", exc_info=True)
 
@@ -215,24 +219,30 @@ def _capture_current(
 
     excerpt = _build_excerpt(parsed)
     prompt = _build_triage_prompt(excerpt, kind)
-    result = parse_triage(call_claude(prompt, model))
+    text, cause = call_claude(prompt, model)
+    result = parse_triage(text)
     episodic = _episodic_text(result)
 
     if episodic is None:
-        # Triage failed: deterministic stub now + enqueue for retry. A genuine
-        # failure (claude -p error/timeout or an unparseable response), logged
-        # loudly and recorded in the capture-health signal.
-        logger.warning("memory capture: triage failed for %s; wrote stub + enqueued retry", repo_short)
+        # Triage failed: deterministic stub now + enqueue for retry. Name WHY it
+        # failed so the health signal + durable log distinguish a launch failure /
+        # timeout / non-zero exit (cause set by call_claude) from a non-empty but
+        # unparseable response (cause None here -> its own distinct cause).
+        cause = cause or "triage returned unparseable output"
+        logger.warning(
+            "memory capture: triage failed for %s (%s); wrote stub + enqueued retry",
+            repo_short, cause,
+        )
         _write_stub(vault, kind, group, repo_short, branch)
         queue.append({
             "kind": kind,
             "transcript_path": str(transcript_path),
             "cwd": str(cwd),
             "session_id": session_id,
-            "ts": _now_iso(),
+            "ts": vault_mod.now_iso(),
             "attempts": 1,
         })
-        _record_capture_failure(home, "triage failed (claude -p error or timeout)")
+        _record_capture_failure(home, cause)
         return True
 
     _write_episodic(vault, group, repo_short, branch, _episodic_sentence(kind, episodic))
@@ -286,7 +296,8 @@ def _retry_item(
         return False
     identity, group, repo_short = resolve_group_and_repo(vault, cwd)
     branch = current_branch(cwd)
-    result = parse_triage(call_claude(_build_triage_prompt(_build_excerpt(parsed), kind), model))
+    text, _cause = call_claude(_build_triage_prompt(_build_excerpt(parsed), kind), model)
+    result = parse_triage(text)
     episodic = _episodic_text(result)
     if episodic is None:
         return False
@@ -402,12 +413,18 @@ def _build_triage_prompt(excerpt: str, kind: str) -> str:
     )
 
 
-def call_claude(prompt: str, model: str) -> str | None:
-    """Run ONE `claude -p` triage pass. Returns stdout, or None on any failure.
+def call_claude(prompt: str, model: str) -> tuple[str | None, str | None]:
+    """Run ONE `claude -p` triage pass.
+
+    Returns ``(stdout, None)`` on success and ``(None, cause)`` on failure, where
+    ``cause`` is a short human string naming WHY triage failed -- one of a launch
+    failure, a timeout, or a non-zero exit. That lets the caller record a
+    distinguishable capture-health error (a hung binary reads very differently
+    from a crashed one). A non-empty but unparseable response is NOT a call_claude
+    failure -- it returns ``(stdout, None)`` and the caller names that case itself.
 
     The prompt is piped on stdin (a 300KB transcript excerpt would blow past
-    ARG_MAX as an argv). Any launch error, non-zero exit, or timeout is a
-    failure the caller handles with a stub + retry.
+    ARG_MAX as an argv).
     """
     claude_bin = find_bin("claude") or "claude"
     try:
@@ -418,11 +435,13 @@ def call_claude(prompt: str, model: str) -> str | None:
             text=True,
             timeout=_TRIAGE_TIMEOUT,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except subprocess.TimeoutExpired:
+        return None, f"claude timed out after {_TRIAGE_TIMEOUT}s"
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"claude binary not found or failed to launch: {e}"
     if proc.returncode != 0:
-        return None
-    return proc.stdout
+        return None, f"claude exited {proc.returncode}"
+    return proc.stdout, None
 
 
 def parse_triage(raw: str | None) -> dict | None:
@@ -582,7 +601,3 @@ def _coerce_int(value, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return default
     return value
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

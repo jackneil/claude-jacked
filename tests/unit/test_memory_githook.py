@@ -113,8 +113,10 @@ def no_gh(monkeypatch):
 
 
 def _mock_distill(monkeypatch, raw):
-    """Monkeypatch the single claude -p call to return a canned string (or None)."""
-    monkeypatch.setattr(capture, "call_claude", lambda prompt, model: raw)
+    """Monkeypatch the single claude -p call. call_claude returns ``(text, cause)``;
+    a canned string is a success (cause None), ``None`` models distillation
+    unavailable (the deterministic fallback then fires regardless of cause)."""
+    monkeypatch.setattr(capture, "call_claude", lambda prompt, model: (raw, None))
 
 
 # --------------------------------------------------------------------------- #
@@ -458,6 +460,33 @@ def test_capture_merge_prunes_old_processed(env, no_gh, monkeypatch):
     processed = memory.load_state(env.home)["processed_merges"]
     assert "oldsha" not in processed        # pruned
     assert len(processed) == 1              # only the new merge remains
+
+
+def test_capture_merge_preserves_concurrent_processed_sha(env, no_gh, monkeypatch):
+    """A concurrent post-merge hook that records its OWN sha while this run is
+    distilling must survive. This run writes only its delta merged into a fresh
+    load, never a snapshot taken before the slow claude -p call. Simulate the
+    concurrent write from inside the distillation call (which runs after this
+    run's initial state load)."""
+    _init_vault(env)
+    repo = _merge_repo(env.tmp / "widget")
+    _do_merge(repo)
+
+    def _distill_and_inject(prompt, model):
+        # A concurrent hook records shaA between our initial load and our save.
+        st = memory.load_state(env.home)
+        pm = dict(st.get("processed_merges") or {})
+        pm["shaA_concurrent"] = vault_mod.now_iso()
+        st["processed_merges"] = pm
+        memory.save_state(env.home, st)
+        return ('{"title": "New", "body": "Body.", "tags": []}', None)
+
+    monkeypatch.setattr(capture, "call_claude", _distill_and_inject)
+    merge_capture.capture_merge(str(repo))
+
+    processed = memory.load_state(env.home)["processed_merges"]
+    assert "shaA_concurrent" in processed   # the concurrent hook's sha survived
+    assert len(processed) == 2              # ...alongside this run's own merge sha
 
 
 def test_capture_merge_disabled_writes_nothing(env, no_gh, monkeypatch):

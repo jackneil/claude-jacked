@@ -139,6 +139,7 @@ def _default_state() -> dict:
         "last_sync_error": None,
         "last_capture": None,
         "last_capture_error": None,
+        "last_recall": None,
         "capture_failures": 0,
         "retry_queue": [],
         "processed_merges": {},
@@ -207,30 +208,41 @@ def _normalize_state(raw: object) -> dict:
         out["last_capture"] = None
     if out.get("last_capture_error") is not None and not isinstance(out.get("last_capture_error"), str):
         out["last_capture_error"] = None
+    if out.get("last_recall") is not None and not isinstance(out.get("last_recall"), str):
+        out["last_recall"] = None
 
     out["version"] = version if newer else STATE_VERSION
     return out
 
 
-def save_state(home: Path | None, state: dict) -> None:
-    """Atomically write memory state via a writer-unique tmp + os.replace.
+def atomic_write_text(path: Path | str, text: str) -> None:
+    """Atomically write ``text`` to ``path`` (writer-unique tmp + ``os.replace``).
 
     The tmp name is writer-unique (prefix keyed off the target name) because the
-    CLI and the dashboard service are separate processes that can both write the
-    same home; a shared tmp path lets one os.replace the other's half-written
-    file away.
+    CLI, the dashboard service, and hook processes are separate processes that can
+    all write the same home; a shared tmp path would let one ``os.replace`` the
+    other's half-written file away. The tmp is unlinked on any ``BaseException``
+    (a ``KeyboardInterrupt`` mid-write included) so a crash never leaves a stray
+    tmp or a half-written target. This is the single shared atomic-text writer
+    behind vault state, vault config, the rollup recent/archive writes, and the
+    settings_io writer.
     """
-    path = state_path(home)
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(state, indent=2))
+            fh.write(text)
         os.replace(tmp_name, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+
+
+def save_state(home: Path | None, state: dict) -> None:
+    """Atomically write memory state (via the shared atomic-text writer)."""
+    atomic_write_text(state_path(home), json.dumps(state, indent=2))
 
 
 # --------------------------------------------------------------------------- #
@@ -384,7 +396,16 @@ def now_iso() -> str:
 
 
 def today() -> str:
-    """UTC date, ``YYYY-MM-DD`` -- the value written to created/updated."""
+    """UTC date, ``YYYY-MM-DD`` -- the value written to a note's created/updated.
+
+    Deliberately UTC (not local): note dates are cross-machine metadata, so a
+    vault synced between machines in different timezones stays stable and
+    comparable. This is the intentional counterpart to the LOCAL calendar day
+    used for episodic today-file naming (``capture._write_episodic``) and the
+    rollup buckets (``rollup._today``) -- those track the user's actual workday,
+    so a session at 11pm never lands in "tomorrow" and its current-day file is
+    never rolled out from under it mid-day.
+    """
     return datetime.now(timezone.utc).date().isoformat()
 
 
@@ -773,18 +794,8 @@ def load_vault_config(vault: Path | None = None) -> dict:
 
 
 def save_vault_config(vault: Path, cfg: dict) -> None:
-    """Atomically write vault.json (writer-unique tmp + os.replace)."""
-    path = vault_config_path(vault)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(cfg, indent=2))
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    """Atomically write vault.json (via the shared atomic-text writer)."""
+    atomic_write_text(vault_config_path(vault), json.dumps(cfg, indent=2))
 
 
 def register_repo(cfg: dict, identity: str, group: str) -> dict:
@@ -1057,7 +1068,14 @@ def add_note(
 
     bump_drift(home, 1)
     if commit:
-        _commit(vault, f"memory: add {note_type} '{slug}' to {group}")
+        # A committing add joins the vault-write lock contract: it serializes the
+        # stage+commit against the capture / merge / rollup commit paths that hold
+        # the same lock, so two processes can't collide on the vault git index.
+        # commit=False callers (capture, merge_capture, migrate) already hold this
+        # lock around their own batched commit, so the lock is scoped to the commit
+        # branch ONLY -- they must never double-acquire it.
+        with vault_write_lock(vault):
+            _commit(vault, f"memory: add {note_type} '{slug}' to {group}")
 
     return {
         "path": str(note_path.relative_to(vault)),
@@ -1209,6 +1227,7 @@ def status(vault: Path | None = None, home: Path | None = None) -> dict:
         "last_sync_error": state.get("last_sync_error"),
         "last_capture": state.get("last_capture"),
         "last_capture_error": state.get("last_capture_error"),
+        "last_recall": state.get("last_recall"),
         "capture_failures": int(state.get("capture_failures", 0) or 0),
         "retry_pending": len(state.get("retry_queue", []) or []),
     }

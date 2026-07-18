@@ -48,6 +48,7 @@ from jacked.memory.vault import (
     validate_note,
     vault_config_path,
     vault_dir,
+    vault_write_lock,
 )
 
 __all__ = [
@@ -92,4 +93,5 @@ __all__ = [
     "validate_note",
     "vault_config_path",
     "vault_dir",
+    "vault_write_lock",
 ]

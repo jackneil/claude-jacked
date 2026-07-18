@@ -509,6 +509,73 @@ def test_put_memory_vault_503_on_corrupt_settings(menv, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# W6: the generic settings surface adopts the same wipe-guard (refuse, degrade)
+# --------------------------------------------------------------------------- #
+
+def test_env_put_503_on_corrupt_settings_and_file_untouched(menv, monkeypatch):
+    """A corrupt settings.json makes an env PUT (a read-modify-write) refuse with
+    503 and never clobber the file with a fresh one."""
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    path = menv.home / ".claude" / "settings.json"
+    path.write_text("{ not valid json at all", encoding="utf-8")
+    before = path.read_bytes()
+
+    client = TestClient(_make_app())
+    resp = client.put(
+        "/api/claude-settings/env/CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+        json={"enabled": True},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "SETTINGS_UNREADABLE"
+    assert path.read_bytes() == before  # never clobbered
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: c.put("/api/claude-settings/key/alwaysThinkingEnabled", json={"value": True}),
+    lambda c: c.put("/api/claude-settings/plugins/x@official", json={"enabled": False}),
+    lambda c: c.put("/api/claude-settings/permissions", json={"allow": ["Bash(ls)"]}),
+])
+def test_all_settings_mutations_503_on_corrupt(menv, monkeypatch, call):
+    """Every RMW settings mutation refuses (503) on a corrupt file rather than
+    clobbering it."""
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    path = menv.home / ".claude" / "settings.json"
+    path.write_text("{ broken", encoding="utf-8")
+    before = path.read_bytes()
+
+    resp = call(TestClient(_make_app()))
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "SETTINGS_UNREADABLE"
+    assert path.read_bytes() == before
+
+
+def test_get_features_still_200_on_corrupt_settings(menv, monkeypatch):
+    """A corrupt settings.json degrades the read-only feature list (200 + a
+    settings_unreadable flag), never a 500."""
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    (menv.home / ".claude" / "settings.json").write_text("{ broken", encoding="utf-8")
+
+    client = TestClient(_make_app())
+    resp = client.get("/api/features")
+    assert resp.status_code == 200
+    assert resp.json()["settings_unreadable"] is True
+
+
+def test_get_claude_settings_still_200_on_corrupt_settings(menv, monkeypatch):
+    """GET /claude-settings degrades to empty defaults + a flag on a corrupt
+    file rather than 500ing the settings panel."""
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    (menv.home / ".claude" / "settings.json").write_text("{ broken", encoding="utf-8")
+
+    client = TestClient(_make_app())
+    resp = client.get("/api/claude-settings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["settings_unreadable"] is True
+    assert body["permissions"]["defaultMode"] == "default"  # empty defaults
+
+
+# --------------------------------------------------------------------------- #
 # F8: GET /features carries the memory vault health object when installed
 # --------------------------------------------------------------------------- #
 

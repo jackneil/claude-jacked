@@ -215,6 +215,46 @@ def test_init_empty_root_creates_empty_vault(env):
 
 
 # --------------------------------------------------------------------------- #
+# W5: `jacked memory init` enables the feature end-to-end (hooks + git hooks)
+# --------------------------------------------------------------------------- #
+
+def test_init_installs_hooks_and_reports(env):
+    root = _fixture_root(env)
+    r = _init_with(env, root)
+    assert r.exit_code == 0, r.output + env.buf.getvalue()
+
+    # settings.json now carries BOTH the capture and recall hook entries.
+    settings_text = (env.home / ".claude" / "settings.json").read_text()
+    assert "memory_capture" in settings_text
+    assert "memory_recall" in settings_text
+
+    # The post-merge git hook landed in a mapped repo.
+    assert (root / "hank-captable" / ".git" / "hooks" / "post-merge").exists()
+
+    # The output tells the user hooks were installed.
+    assert "hooks installed" in env.buf.getvalue().lower()
+
+
+def test_init_corrupt_settings_creates_vault_but_aborts_on_hooks(env):
+    # A pre-existing but unreadable settings.json must NOT be clobbered.
+    settings_path = env.home / ".claude" / "settings.json"
+    corrupt = "{ this is not valid json"
+    settings_path.write_text(corrupt, encoding="utf-8")
+
+    empty = env.tmp / "emptyroot2"
+    empty.mkdir()
+    r = _init_with(env, empty)
+
+    assert r.exit_code == 2
+    out = r.output + env.buf.getvalue()
+    assert "settings.json is unreadable" in out
+    # The vault WAS created (init ran)...
+    assert (env.vault / "vault.json").exists()
+    # ...but the corrupt settings.json is left exactly as it was (never clobbered).
+    assert settings_path.read_text() == corrupt
+
+
+# --------------------------------------------------------------------------- #
 # add
 # --------------------------------------------------------------------------- #
 
@@ -328,6 +368,57 @@ def test_add_before_init_fails_cleanly(env):
     ])
     assert r.exit_code == 2
     assert "not initialized" in env.buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# W4: add_note joins the vault-write lock contract; CLI git-timeout stays clean
+# --------------------------------------------------------------------------- #
+
+def test_add_note_commit_acquires_vault_lock_but_commit_false_does_not(env):
+    import contextlib
+
+    vault_mod.init_vault(env.vault, [], {})
+    vault_mod.ensure_group(env.vault, "g")
+
+    calls: list[str] = []
+    real_lock = vault_mod.vault_write_lock
+
+    @contextlib.contextmanager
+    def _recording_lock(vault):
+        calls.append(str(vault))
+        with real_lock(vault):
+            yield
+
+    env.monkeypatch.setattr(vault_mod, "vault_write_lock", _recording_lock)
+
+    # commit=True -> the commit path takes the vault-write lock exactly once.
+    vault_mod.add_note(env.vault, env.home, note_type="decision", title="Locked add",
+                       group="g", repos=["g"], tags=[], body="body", commit=True)
+    assert len(calls) == 1
+
+    # commit=False -> the caller owns the lock; add_note must NOT double-acquire.
+    calls.clear()
+    vault_mod.add_note(env.vault, env.home, note_type="decision", title="Batched add",
+                       group="g", repos=["g"], tags=[], body="body", commit=False)
+    assert calls == []
+
+
+def test_cli_add_git_timeout_prints_clean_failure(env):
+    _init_empty(env)
+
+    def _timeout(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+    env.monkeypatch.setattr(vault_mod, "_run_git", _timeout)
+    r = CliRunner().invoke(main, [
+        "memory", "add", "--type", "decision", "--title", "Timeout note",
+        "--group", "hank", "--body", "body",
+    ])
+    assert r.exit_code == 2
+    out = r.output + env.buf.getvalue()
+    assert "vault git operation timed out or failed" in out
+    # A clean SystemExit, never a raw TimeoutExpired traceback.
+    assert not isinstance(r.exception, subprocess.TimeoutExpired)
 
 
 # --------------------------------------------------------------------------- #

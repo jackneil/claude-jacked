@@ -7,7 +7,7 @@ on a bare CI runner, and cli.console swapped for a StringIO-backed Console.
 """
 import json
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,18 +109,24 @@ def test_monday_of_is_a_monday_on_or_before():
         assert (d - monday).days < 7
 
 
-def test_day_sections_parses_valid_headers_only():
+def test_split_h2_and_day_header_date_parse_valid_days_only():
     text = (
         "# Recent\n\n"
         "## 2026-07-10\n### 09:00 | master\nreal day\n\n"
         "## Identity Candidates\n- IDENTITY CANDIDATE: noise\n"
     )
-    sections = rollup_mod._day_sections(text)
-    assert len(sections) == 1
-    d, header, body = sections[0]
+    _preamble, sections = rollup_mod._split_h2(text)
+
+    # Exactly one ## section parses to a real day; the stray non-day ## is None.
+    days = [(rollup_mod._day_header_date(h), h, b) for h, b in sections]
+    valid = [(d, h, b) for d, h, b in days if d is not None]
+    assert len(valid) == 1
+    d, header, body = valid[0]
     assert d.isoformat() == "2026-07-10"
     assert header == "## 2026-07-10"
     assert "real day" in body
+    # The stray ## Identity Candidates section is kept by the split but is not a day.
+    assert rollup_mod._day_header_date("## Identity Candidates") is None
 
 
 def test_demote_h2_only_touches_level_two():
@@ -427,7 +433,8 @@ def _payload(transcript, cwd, event="SessionEnd"):
 
 
 def _mock_triage(env, response):
-    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model: response)
+    # call_claude now returns (text, cause); these rollup tests only use success.
+    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model: (response, None))
 
 
 def test_session_end_invokes_rollup(env):
@@ -436,15 +443,16 @@ def test_session_end_invokes_rollup(env):
     calls = []
     env.monkeypatch.setattr(
         rollup_mod, "rollup",
-        lambda v, h, only_repo_short=None: calls.append((v, h, only_repo_short)),
+        lambda v, h, only_repo=None: calls.append((v, h, only_repo)),
     )
 
     capture.session_end(_payload(_transcript(env), _cwd(env)))
 
     assert len(calls) == 1
     assert str(calls[0][0]) == str(env.vault)
-    # The tail-call is scoped to the session's repo_short (never the whole vault).
-    assert calls[0][2] == "caprepo"
+    # The tail-call is scoped to the session's (group, repo_short), never the whole
+    # vault. An unmapped 'caprepo' resolves to a solo group of the same name.
+    assert calls[0][2] == ("caprepo", "caprepo")
 
 
 def test_session_end_tail_call_rolls_a_past_file(env):
@@ -467,7 +475,7 @@ def test_rollup_exception_does_not_break_capture(env):
     _init_enabled_vault(env)
     _mock_triage(env, json.dumps({"episodic": "Captured fine.", "semantic": None}))
 
-    def _boom(vault, home, only_repo_short=None):
+    def _boom(vault, home, only_repo=None):
         raise RuntimeError("rollup blew up")
 
     env.monkeypatch.setattr(rollup_mod, "rollup", _boom)
@@ -486,7 +494,7 @@ def test_pre_compact_does_not_invoke_rollup(env):
     calls = []
     env.monkeypatch.setattr(
         rollup_mod, "rollup",
-        lambda v, h, only_repo_short=None: calls.append((v, h, only_repo_short)),
+        lambda v, h, only_repo=None: calls.append((v, h, only_repo)),
     )
 
     capture.pre_compact(_payload(_transcript(env), _cwd(env), event="PreCompact"))
@@ -560,7 +568,7 @@ def test_write_if_differs_is_atomic_and_leaves_no_tmp(env):
 
 
 # --------------------------------------------------------------------------- #
-# F5: local clock (current-day file never rolled) + only_repo_short scoping
+# F5: local clock (current-day file never rolled) + only_repo (group, short) scoping
 # --------------------------------------------------------------------------- #
 
 def test_local_today_file_is_never_rolled(env):
@@ -573,14 +581,54 @@ def test_local_today_file_is_never_rolled(env):
     assert not (edir / f"today-{_local_today()}.done.md").exists()
 
 
-def test_rollup_only_repo_short_scopes_to_one_dir(env):
+def test_rollup_today_is_local_date_not_utc(monkeypatch):
+    """rollup._today() must be the LOCAL calendar day, never the UTC day. Pin the
+    clock seam so local and UTC fall on DIFFERENT dates (wall clock 2026-07-18
+    23:30 while UTC is already 2026-07-19 04:30). _today() must be the 18th; this
+    fails the instant it reverts to datetime.now(timezone.utc).date()."""
+    real_dt = datetime
+
+    class _FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            if tz is None:
+                return real_dt(2026, 7, 18, 23, 30)            # local wall clock
+            return real_dt(2026, 7, 19, 4, 30, tzinfo=tz)      # UTC, already next day
+
+    monkeypatch.setattr(rollup_mod, "datetime", _FakeDatetime)
+
+    assert rollup_mod._today() == date(2026, 7, 18)             # LOCAL day
+    # The UTC-based date a silent revert would use is a different calendar day.
+    assert _FakeDatetime.now(timezone.utc).date() == date(2026, 7, 19)
+    assert rollup_mod._today() != _FakeDatetime.now(timezone.utc).date()
+
+
+def test_rollup_only_repo_scopes_to_one_dir(env):
     _init_enabled_vault(env)
     pa = _write_today(env, _days_ago(2), [("08:00", "m", "repo A past")], group="ra", repo="ra")
     pb = _write_today(env, _days_ago(2), [("08:00", "m", "repo B past")], group="rb", repo="rb")
 
-    summary = rollup_mod.rollup(env.vault, env.home, only_repo_short="ra")
+    summary = rollup_mod.rollup(env.vault, env.home, only_repo=("ra", "ra"))
 
     assert summary["dirs"] == 1
     assert not pa.exists()  # ra rolled
     assert pb.exists()      # rb untouched
     assert _read(_edir(env, "rb", "rb") / "recent.md") is None
+
+
+def test_rollup_only_repo_scopes_by_group_not_just_short_name(env):
+    """Two DIFFERENT groups can each hold an episodic dir with the SAME short
+    name. Scoping to (group, short) must roll only the addressed group's dir; a
+    session in group A must never rewrite the same-named 'shared' dir in group B."""
+    _init_enabled_vault(env)
+    pa = _write_today(env, _days_ago(2), [("08:00", "m", "group A past")],
+                      group="groupa", repo="shared")
+    pb = _write_today(env, _days_ago(2), [("08:00", "m", "group B past")],
+                      group="groupb", repo="shared")
+
+    summary = rollup_mod.rollup(env.vault, env.home, only_repo=("groupa", "shared"))
+
+    assert summary["dirs"] == 1
+    assert not pa.exists()  # groupa/shared rolled
+    assert pb.exists()      # groupb/shared untouched despite the same short name
+    assert _read(_edir(env, "groupb", "shared") / "recent.md") is None

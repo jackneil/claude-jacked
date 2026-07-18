@@ -19,10 +19,7 @@ before returning.
 """
 from __future__ import annotations
 
-import contextlib
 import json
-import os
-import tempfile
 from pathlib import Path
 
 
@@ -65,22 +62,17 @@ def read_settings(path: Path | str) -> dict:
 def write_settings(path: Path | str, data: dict) -> None:
     """Atomically write settings.json, then verify it re-reads as a JSON object.
 
-    Writer-unique tmp + ``os.replace`` (two processes can share this home). After
-    the replace, the file is re-read and parsed; a verification failure raises
-    ``SettingsUnreadableError`` so a corrupt write is surfaced loudly instead of
-    being trusted.
+    The atomic write itself (writer-unique tmp + ``os.replace``) is delegated to
+    the shared ``vault.atomic_write_text`` so every memory-side atomic write goes
+    through one implementation. On top of that shared write this keeps its own
+    post-write verification: the file is re-read and parsed, and a verification
+    failure raises ``SettingsUnreadableError`` so a corrupt write is surfaced
+    loudly instead of being trusted.
     """
+    from jacked.memory import vault as vault_mod
+
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2))
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    vault_mod.atomic_write_text(path, json.dumps(data, indent=2))
 
     try:
         verify = json.loads(path.read_text(encoding="utf-8"))

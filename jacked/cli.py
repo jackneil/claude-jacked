@@ -3990,7 +3990,9 @@ def memory_init(roots: tuple, yes: bool):
     home = _jacked_home()
     vault = _memory.vault_dir()
 
-    # Re-running init on an existing vault is safe: report, never clobber.
+    # Re-running init on an existing vault is safe: report, never clobber. Still
+    # (re)enable so the capture/recall hooks + per-repo git hooks are present and
+    # surfaced -- enable() is idempotent and never touches vault content.
     if _memory.is_initialized(vault):
         st = _memory.status(vault, home)
         console.print(
@@ -3998,6 +4000,7 @@ def memory_init(roots: tuple, yes: bool):
             "Nothing changed."
         )
         _memory_print_groups(st)
+        _memory_finish_enable(home)
         return
 
     root_paths = [_Path(r) for r in roots] if roots else _memory_default_roots()
@@ -4040,6 +4043,60 @@ def memory_init(roots: tuple, yes: bool):
     for group, repos in summary["groups"].items():
         console.print(f"  [cyan]{_rich_escape(group)}[/cyan]: {len(repos)} repo(s)")
 
+    # Turn the feature ON end-to-end: install the capture + recall settings.json
+    # hooks and the per-repo post-merge git hooks (this is what makes the README's
+    # "init installs hooks" claim true).
+    _memory_finish_enable(home)
+
+
+def _memory_finish_enable(home) -> None:
+    """Enable the memory vault end-to-end via the shared setup engine and report.
+
+    Installs the capture + recall settings.json entries and the post-merge git
+    hooks into every mapped repo (idempotent; never touches vault content), then
+    prints what happened -- hooks installed, per-repo git-hook results with any
+    skips surfaced, and a migration nudge when legacy ``.remember`` dirs remain.
+    A corrupt settings.json aborts LOUDLY (exit 2) rather than clobbering the
+    user's hooks with a fresh file.
+    """
+    from jacked.memory import setup as _setup
+    from jacked.memory.settings_io import SettingsUnreadableError
+
+    try:
+        result = _setup.enable(home)
+    except SettingsUnreadableError:
+        console.print(
+            "[red][FAIL][/red] settings.json is unreadable; vault created but hooks "
+            "NOT installed. Fix the JSON and re-run `jacked memory init`."
+        )
+        raise SystemExit(2)
+
+    hooks = result.get("hooks_installed") or []
+    if hooks:
+        console.print(
+            f"[green][OK][/green] Capture + recall hooks installed "
+            f"({', '.join(_rich_escape(h) for h in hooks)})."
+        )
+
+    git_hooks = result.get("git_hooks") or {}
+    if git_hooks:
+        installed = [ident for ident, res in git_hooks.items() if res.get("installed")]
+        if installed:
+            console.print(f"  post-merge git hook installed in {len(installed)} repo(s).")
+        for ident, res in git_hooks.items():
+            if not res.get("installed"):
+                console.print(
+                    f"  [yellow]post-merge git hook skipped for {_rich_escape(ident)}: "
+                    f"{_rich_escape(str(res.get('reason', '')))}[/yellow]"
+                )
+
+    migration = int(result.get("migration_available") or 0)
+    if migration:
+        console.print(
+            f"  migration: {migration} legacy .remember dir(s) found "
+            "(run `jacked memory migrate` to import)."
+        )
+
 
 def _memory_print_groups(st: dict) -> None:
     if not st.get("groups"):
@@ -4080,6 +4137,7 @@ def memory_status(quiet: bool):
     )
     console.print(f"  pending retries: {st['retry_pending']}")
     console.print(f"  last rollup: {_rich_escape(str(st['last_rollup']))}")
+    console.print(f"  last recall: {_rich_escape(str(st.get('last_recall')))}")
     console.print(f"  last capture: {_rich_escape(str(st.get('last_capture')))}")
     if st.get("capture_failures"):
         console.print(f"  capture failures: {st['capture_failures']}")
@@ -4196,10 +4254,14 @@ def memory_add(note_type: str, title: str, group: str | None, repos: str | None,
         group = _memory.resolve_group(vault, identity)
         if not group:
             # Unmapped repo -> a solo group named after it, created on the fly.
+            # The vault.json read-modify-write joins the vault-write lock contract
+            # so a concurrent capture/merge that also registers a solo group can't
+            # lose this mapping (or vice versa).
             group = _memory.group_for_identity(identity)
-            cfg = _memory.load_vault_config(vault)
-            _memory.register_repo(cfg, identity, group)
-            _memory.save_vault_config(vault, cfg)
+            with _memory.vault_write_lock(vault):
+                cfg = _memory.load_vault_config(vault)
+                _memory.register_repo(cfg, identity, group)
+                _memory.save_vault_config(vault, cfg)
             _memory.ensure_group(vault, group)
 
     repo_list = _memory_csv(repos) or [identity]
@@ -4215,6 +4277,13 @@ def memory_add(note_type: str, title: str, group: str | None, repos: str | None,
         # ValueError = schema violation; RuntimeError = vault git op failure.
         # Both are user-fixable conditions, not tracebacks.
         console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        raise SystemExit(2)
+    except subprocess.SubprocessError as exc:
+        # A vault git op that timed out or was killed (TimeoutExpired is a
+        # SubprocessError) surfaces as a clean failure, never a raw traceback.
+        console.print(
+            f"[red][FAIL][/red] vault git operation timed out or failed: {_rich_escape(str(exc))}"
+        )
         raise SystemExit(2)
 
     console.print(
@@ -4239,9 +4308,18 @@ def memory_search(query: str, group: str | None, note_type: str | None, limit: i
         console.print("[yellow]Vault is not initialized.[/yellow] Run `jacked memory init`.")
         return
 
-    results = _memory.search(
-        vault, query, group=group, note_type=note_type, limit=limit
-    )
+    try:
+        results = _memory.search(
+            vault, query, group=group, note_type=note_type, limit=limit
+        )
+    except subprocess.SubprocessError as exc:
+        # Search is file-only today, but the CLI presents the SAME clean failure
+        # as `add` for any vault git op that times out or is killed, so the vault
+        # failure contract reads uniformly across the memory commands.
+        console.print(
+            f"[red][FAIL][/red] vault git operation timed out or failed: {_rich_escape(str(exc))}"
+        )
+        raise SystemExit(2)
     if not results:
         console.print(f"[dim]No matches for {_rich_escape(query)}.[/dim]")
         return
