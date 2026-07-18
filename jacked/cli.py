@@ -2046,6 +2046,42 @@ def _install_memory_capture_hook(existing: dict, settings_path: Path):
     )
 
 
+def _install_memory_recall_hook(existing: dict, settings_path: Path):
+    """Install the memory-vault recall hook (synchronous SessionStart).
+
+    Registers a SINGLE synchronous SessionStart hook whose stdout is injected
+    into the session context: the group-scoped memory brief. The entry is
+    SYNCHRONOUS on purpose (``hooks_config.ensure_recall_entry`` omits the
+    ``async`` key) because async SessionStart hooks do not inject stdout, and
+    injecting the brief is the whole point. Entry math is delegated to
+    ``jacked.memory.hooks_config`` so the CLI and the dashboard Features route
+    (M7) share one implementation. Not wired into ``_run_install`` yet (M7
+    handles install parity); directly testable in the meantime.
+    """
+    script_path = _get_data_root() / "hooks" / "memory_recall.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] Memory recall script not found: {script_path}"
+        )
+        console.print("[yellow]Skipping memory recall hook installation[/yellow]")
+        return
+
+    from jacked.memory import hooks_config
+
+    existing.setdefault("hooks", {})
+    command_str = _build_hook_command("memory_recall")
+
+    if not hooks_config.ensure_recall_entry(existing, command_str):
+        console.print("[yellow][-][/yellow] Memory recall hook already configured")
+        return
+
+    _write_settings_atomic(settings_path, existing)
+    console.print(
+        "[green][OK][/green] Installed memory recall hook (SessionStart event)"
+    )
+
+
 def _remove_memory_hooks(settings_path: Path) -> bool:
     """Remove the jacked memory capture + recall hooks. Returns True if removed.
 
@@ -4002,6 +4038,10 @@ def memory_status(quiet: bool):
     console.print(f"  pending retries: {st['retry_pending']}")
     console.print(f"  last rollup: {_rich_escape(str(st['last_rollup']))}")
     console.print(f"  last sync: {_rich_escape(str(st['last_sync']))}")
+    if st.get("last_sync_error"):
+        console.print(
+            f"  [yellow]last sync error: {_rich_escape(str(st['last_sync_error']))}[/yellow]"
+        )
 
     if not st["initialized"]:
         console.print(

@@ -109,6 +109,7 @@ def _default_state() -> dict:
         "drift_threshold": DEFAULT_DRIFT_THRESHOLD,
         "last_rollup": None,
         "last_sync": None,
+        "last_sync_error": None,
         "retry_queue": [],
         "processed_merges": {},
     }
@@ -985,5 +986,6 @@ def status(vault: Path | None = None, home: Path | None = None) -> dict:
         "drift_threshold": int(state.get("drift_threshold", DEFAULT_DRIFT_THRESHOLD)),
         "last_rollup": state.get("last_rollup"),
         "last_sync": state.get("last_sync"),
+        "last_sync_error": state.get("last_sync_error"),
         "retry_pending": len(state.get("retry_queue", []) or []),
     }

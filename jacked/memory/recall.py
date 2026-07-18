@@ -1,0 +1,376 @@
+"""Memory-vault recall: assemble the SessionStart brief, token-budgeted.
+
+The ``memory_recall`` SessionStart hook calls ``build_brief(cwd)`` and prints
+the result. A SYNCHRONOUS SessionStart hook's stdout is injected into the
+session context, so this brief is what the agent sees before its first turn: a
+group-scoped, hard-budgeted (<= ``TOKEN_BUDGET`` tokens) slice of the vault for
+the repo the session opened in.
+
+Assembly is priority-ordered (highest first). Everything is assembled, then the
+lowest-priority sections are trimmed until the whole thing fits the budget; when
+anything is cut the brief's final line names what was dropped (never a silent
+cut). The header + imperative line is priority 1 and never trimmed.
+
+Recall is READ-ONLY over the vault except for one thing: an optional
+``git pull --ff-only`` sync (guarded, timeout-bounded, every failure swallowed)
+that keeps a multi-machine vault fresh, plus the ``last_sync`` /
+``last_sync_error`` state bookkeeping that records it. It NEVER creates a group,
+writes a note, or performs any other git mutation.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from jacked.memory import vault as vault_mod
+
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Constants (real constraints, not arbitrary caps)
+# --------------------------------------------------------------------------- #
+
+# The design's hard budget for the injected brief. len(text) // 4 is the token
+# estimate; the brief is trimmed until its estimate is at or under this.
+TOKEN_BUDGET = 1500
+
+# How many trailing index lines the two index tiers surface.
+_TOP_DECISIONS = 5
+_INDEX_EXCERPT = 20
+
+# Sync guardrails: only pull when a remote exists and the last sync is stale;
+# never block longer than the timeout.
+_SYNC_MIN_INTERVAL_MIN = 10
+_SYNC_TIMEOUT = 5
+
+# Cap on the recorded sync-error string so a noisy git failure stays one line.
+_ERR_MAXLEN = 200
+
+# Section labels (used verbatim in the "[trimmed: ...]" marker).
+_L_HEADER = "header"
+_L_HOT = "hot progress"
+_L_EPISODIC = "last episodic entry"
+_L_DECISIONS = "top decisions"
+_L_INDEX = "index excerpt"
+_L_DRIFT = "drift nudge"
+
+
+# --------------------------------------------------------------------------- #
+# Budget math (its own testable functions)
+# --------------------------------------------------------------------------- #
+
+def estimate_tokens(text: str) -> int:
+    """Cheap token estimate: one token per ~4 characters."""
+    return len(text or "") // 4
+
+
+def _trim_marker(labels: list[str]) -> str:
+    return "[trimmed: " + ", ".join(labels) + "]"
+
+
+def fit_to_budget(sections: list[tuple[str, str]], budget: int = TOKEN_BUDGET) -> str:
+    """Join ``sections`` (``[(label, text), ...]``, highest priority first) into
+    a brief that fits ``budget`` tokens.
+
+    Empty-text sections are dropped silently (they were absent, not cut). If the
+    whole thing is over budget, the lowest-priority (last) non-empty sections are
+    dropped one at a time -- never the first section -- and a final
+    ``[trimmed: ...]`` line naming the cut sections (in priority order) is
+    appended. A section that fits exactly at the budget is kept; one token over
+    triggers a trim.
+    """
+    order = {label: i for i, (label, _) in enumerate(sections)}
+    kept = [(label, text) for label, text in sections if text]
+    if not kept:
+        return ""
+
+    dropped: list[str] = []
+
+    def render() -> str:
+        body = "\n\n".join(text for _, text in kept)
+        if dropped:
+            ordered = sorted(dropped, key=lambda label: order.get(label, len(sections)))
+            body = body + "\n\n" + _trim_marker(ordered)
+        return body
+
+    while len(kept) > 1 and estimate_tokens(render()) > budget:
+        label, _ = kept.pop()
+        dropped.append(label)
+
+    return render()
+
+
+# --------------------------------------------------------------------------- #
+# Public entry point
+# --------------------------------------------------------------------------- #
+
+def build_brief(cwd: str) -> str:
+    """Assemble the SessionStart brief for the repo at ``cwd``.
+
+    Returns "" when the feature is disabled, the vault is missing, or the cwd's
+    repo maps to nothing on disk (unmapped with no solo group dir). Otherwise
+    returns a control-stripped brief whose token estimate is at or under
+    ``TOKEN_BUDGET``.
+    """
+    home = vault_mod.jacked_home()
+    state = vault_mod.load_state(home)
+    if not state.get("enabled"):
+        return ""
+
+    vault = vault_mod.vault_dir()
+    if not vault_mod.is_initialized(vault):
+        return ""
+
+    # Keep a multi-machine vault fresh before we read from it. Fully guarded:
+    # any failure only records last_sync_error and never aborts the brief.
+    _maybe_sync(vault, home, state)
+
+    identity = vault_mod.repo_identity(Path(cwd))
+    group, gdir = _resolve_group_dir(vault, identity)
+    if group is None:
+        return ""
+
+    repo_short = vault_mod.group_for_identity(identity)
+    sections = _assemble_sections(vault, gdir, group, repo_short, state)
+    brief = fit_to_budget(sections, TOKEN_BUDGET)
+    # Vault content is injected into the session context; strip any control /
+    # escape sequences a note body might carry (keeps tab/newline/CR).
+    return vault_mod._CONTROL_CHARS_RE.sub("", brief)
+
+
+# --------------------------------------------------------------------------- #
+# Group resolution (read-only: never creates a group)
+# --------------------------------------------------------------------------- #
+
+def _resolve_group_dir(vault: Path, identity: str) -> tuple[str | None, Path | None]:
+    """(group, group_dir) for ``identity``, or (None, None) when there is nothing
+    to say. A mapped group whose dir is missing, or an unmapped repo with no solo
+    group dir on disk, both yield (None, None) -- recall never creates a group."""
+    group = vault_mod.resolve_group(vault, identity)
+    if not group:
+        group = vault_mod.group_for_identity(identity)
+    gdir = vault_mod.group_dir(vault, group)
+    if not gdir.is_dir():
+        return None, None
+    return group, gdir
+
+
+# --------------------------------------------------------------------------- #
+# Section assembly (priority order: header > hot > episodic > decisions >
+# index excerpt > drift nudge)
+# --------------------------------------------------------------------------- #
+
+def _assemble_sections(
+    vault: Path, gdir: Path, group: str, repo_short: str, state: dict
+) -> list[tuple[str, str]]:
+    decision_lines = _decision_lines(gdir)
+    return [
+        (_L_HEADER, _header_section(gdir, group)),
+        (_L_HOT, _hot_section(gdir)),
+        (_L_EPISODIC, _episodic_section(gdir, repo_short)),
+        (_L_DECISIONS, _decisions_section(decision_lines)),
+        (_L_INDEX, _index_excerpt_section(gdir, exclude=set(decision_lines))),
+        (_L_DRIFT, _drift_section(state)),
+    ]
+
+
+def _header_section(gdir: Path, group: str) -> str:
+    """Priority 1: the vault banner + the imperative. Never trimmed.
+
+    The imperative carries a real absolute path so the agent can open the group
+    with ordinary file tools for deeper recall.
+    """
+    abs_group = os.path.abspath(str(gdir))
+    return (
+        f"=== MEMORY VAULT ({group}) ===\n"
+        f"IMPORTANT: before working on {group} topics, read {abs_group}."
+    )
+
+
+def _hot_section(gdir: Path) -> str:
+    """Priority 2: the current progress slice (hot.md), minus its own H1."""
+    body = _strip_h1(_read_text(gdir / "hot.md"))
+    if not body:
+        return ""
+    return f"# Hot progress\n{body}"
+
+
+def _episodic_section(gdir: Path, repo_short: str) -> str:
+    """Priority 3: the last episodic entry for the cwd's repo.
+
+    The final ``## HH:MM | branch`` block of the newest ``today-*.md``; if none,
+    the last entry in ``recent.md``.
+    """
+    edir = gdir / "episodic" / repo_short
+    if not edir.is_dir():
+        return ""
+    for path in reversed(sorted(edir.glob("today-*.md"))):
+        block = _last_block(_read_text(path))
+        if block:
+            return f"# Last session\n{block}"
+    block = _last_block(_read_text(edir / "recent.md"))
+    return f"# Last session\n{block}" if block else ""
+
+
+def _decision_lines(gdir: Path) -> list[str]:
+    """The last few index lines that link into ``decision/`` (newest-at-bottom
+    index, so the tail is the newest decisions)."""
+    return [
+        line for line in _index_entry_lines(gdir) if "](decision/" in line
+    ][-_TOP_DECISIONS:]
+
+
+def _decisions_section(lines: list[str]) -> str:
+    """Priority 4: the newest decision index lines."""
+    if not lines:
+        return ""
+    return "# Key decisions\n" + "\n".join(lines)
+
+
+def _index_excerpt_section(gdir: Path, exclude: set[str] | None = None) -> str:
+    """Priority 5: the last ``_INDEX_EXCERPT`` index lines, any type.
+
+    Lines already surfaced by the decisions tier are excluded so the brief never
+    repeats itself (repetition wastes the token budget and reads as noise).
+    """
+    exclude = exclude or set()
+    lines = [
+        line for line in _index_entry_lines(gdir)[-_INDEX_EXCERPT:]
+        if line not in exclude
+    ]
+    if not lines:
+        return ""
+    return "# Recent notes (index)\n" + "\n".join(lines)
+
+
+def _drift_section(state: dict) -> str:
+    """Priority 6: a one-line librarian nudge when drift has crossed threshold."""
+    added = int(state.get("drift_added", 0) or 0)
+    threshold = int(state.get("drift_threshold", vault_mod.DEFAULT_DRIFT_THRESHOLD) or 0)
+    if threshold <= 0 or added < threshold:
+        return ""
+    return (
+        f"Memory drift is high ({added}/{threshold} notes added since the last "
+        "groom). Consider running the memory-librarian skill to reconcile and "
+        "re-index."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Text helpers
+# --------------------------------------------------------------------------- #
+
+def _read_text(path: Path) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _strip_h1(text: str) -> str:
+    """Drop a leading H1 (``# ...``) header line, then strip surrounding blanks."""
+    lines = text.splitlines()
+    if lines and lines[0].lstrip().startswith("#"):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def _last_block(text: str) -> str:
+    """The last ``## ...`` header block (header through EOF), stripped."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            start = i
+    if start is None:
+        return ""
+    return "\n".join(lines[start:]).strip()
+
+
+def _index_entry_lines(gdir: Path) -> list[str]:
+    """The note-entry lines of ``index.md`` (``- [title](type/slug.md) ...``),
+    skipping the file's header/prose."""
+    out: list[str] = []
+    for line in _read_text(gdir / "index.md").splitlines():
+        if line.lstrip().startswith("- ["):
+            out.append(line.rstrip())
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Optional ff-only vault sync (guarded; every failure swallowed)
+# --------------------------------------------------------------------------- #
+
+def _maybe_sync(vault: Path, home: Path, state: dict) -> None:
+    """Best-effort ``git pull --ff-only`` to keep a multi-machine vault fresh.
+
+    Runs only when the vault has an ``origin`` remote AND the last sync is null
+    or older than ``_SYNC_MIN_INTERVAL_MIN`` minutes. Records ``last_sync`` (and
+    clears/sets ``last_sync_error``) on both success and failure. Never blocks
+    longer than the timeout; never performs any other git mutation; swallows
+    every failure so a broken sync can't break a session start.
+    """
+    try:
+        if not _has_remote(vault):
+            return
+        last = state.get("last_sync")
+        if isinstance(last, str) and _within_minutes(last, _SYNC_MIN_INTERVAL_MIN):
+            return
+        ok, err = _pull_ff_only(vault)
+        # Re-load so a concurrent writer's state (drift, queue) isn't clobbered.
+        st = vault_mod.load_state(home)
+        st["last_sync"] = _now_iso()
+        st["last_sync_error"] = None if ok else err
+        vault_mod.save_state(home, st)
+    except Exception:  # noqa: BLE001 -- a sync failure must never break recall
+        logger.debug("memory recall: vault sync failed", exc_info=True)
+
+
+def _has_remote(vault: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(vault), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=_SYNC_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+def _pull_ff_only(vault: Path) -> tuple[bool, str | None]:
+    """``git pull --ff-only``. Returns (ok, one_line_error_or_None)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(vault), "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=_SYNC_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "sync timed out"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, _one_line(str(e))
+    if proc.returncode == 0:
+        return True, None
+    err = _one_line((proc.stderr or "") + " " + (proc.stdout or "")) or "git pull --ff-only failed"
+    return False, err
+
+
+def _within_minutes(iso: str, minutes: int) -> bool:
+    try:
+        dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    return (datetime.now(timezone.utc) - dt) < timedelta(minutes=minutes)
+
+
+def _one_line(s: str) -> str:
+    collapsed = " ".join(vault_mod._CONTROL_CHARS_RE.sub("", s or "").split())
+    return collapsed[:_ERR_MAXLEN]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
