@@ -2013,6 +2013,66 @@ def _remove_chain_of_command_hook(settings_path: Path) -> bool:
     return False
 
 
+def _install_memory_capture_hook(existing: dict, settings_path: Path):
+    """Install the memory-vault capture hooks (SessionEnd + PreCompact(auto)).
+
+    Both entries are async: the SessionEnd/PreCompact triage runs without
+    blocking Claude Code. Entry math is delegated to
+    ``jacked.memory.hooks_config`` so the CLI and the dashboard Features route
+    (M7) share one implementation. Not wired into ``_run_install`` yet (M7
+    handles install parity); directly testable in the meantime.
+    """
+    script_path = _get_data_root() / "hooks" / "memory_capture.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] Memory capture script not found: {script_path}"
+        )
+        console.print("[yellow]Skipping memory capture hook installation[/yellow]")
+        return
+
+    from jacked.memory import hooks_config
+
+    existing.setdefault("hooks", {})
+    command_str = _build_hook_command("memory_capture")
+
+    if not hooks_config.ensure_capture_entries(existing, command_str):
+        console.print("[yellow][-][/yellow] Memory capture hooks already configured")
+        return
+
+    _write_settings_atomic(settings_path, existing)
+    console.print(
+        "[green][OK][/green] Installed memory capture hooks (SessionEnd, PreCompact)"
+    )
+
+
+def _remove_memory_hooks(settings_path: Path) -> bool:
+    """Remove the jacked memory capture + recall hooks. Returns True if removed.
+
+    Marker-scoped via ``jacked.memory.hooks_config`` (anchored on the
+    ``memory_capture`` / ``memory_recall`` command substrings), so foreign
+    hooks and the sibling jacked SessionStart/SessionEnd hooks are untouched.
+    """
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    from jacked.memory import hooks_config
+
+    changed = hooks_config.remove_capture_entries(settings)
+    changed = hooks_config.remove_recall_entries(settings) or changed
+
+    if changed:
+        settings_path.write_text(json.dumps(settings, indent=2))
+        console.print("[green][OK][/green] Removed memory hooks")
+        return True
+
+    return False
+
+
 # Single source of truth for the chrome-devtools MCP npx package spec. The Codex
 # installer (jacked/codex/installer._mcp_block_body) imports this + the autoConnect
 # args below so the two CLIs never drift on the version/flags they register.

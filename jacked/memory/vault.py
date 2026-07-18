@@ -791,12 +791,18 @@ def add_note(
     repos: list[str],
     tags: list[str] | None,
     body: str,
+    commit: bool = True,
 ) -> dict:
     """Write one note, update the group index, bump drift, and commit the vault.
 
     Assumes ``group`` already exists (the CLI ensures/creates it, including the
     on-the-fly solo group for an unmapped repo, before calling). Returns a
     summary dict with the written path (relative to the vault) and the slug.
+
+    ``commit=False`` writes the note + index line + drift bump but defers the
+    vault git commit to the caller. The capture hook uses this to fold several
+    writes (episodic entries + at most one semantic note per session) into a
+    single vault commit per run instead of one commit per note.
     """
     vault = Path(vault)
     group = _sanitize_name(group)
@@ -829,7 +835,8 @@ def add_note(
     _append_index_line(vault, group, title, note_type, slug, _first_sentence(body))
 
     bump_drift(home, 1)
-    _commit(vault, f"memory: add {note_type} '{slug}' to {group}")
+    if commit:
+        _commit(vault, f"memory: add {note_type} '{slug}' to {group}")
 
     return {
         "path": str(note_path.relative_to(vault)),
