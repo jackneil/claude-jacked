@@ -626,3 +626,32 @@ def test_settings_js_has_git_hooks_skipped_toast():
     line = next(ln for ln in js.splitlines() if "skipped post-merge hook install" in ln)
     assert "—" not in line
     assert "'warning'" in line
+
+
+def test_init_already_initialized_reinstalls_hooks(menv):
+    """`jacked memory init` on an ALREADY-initialized vault still finishes the
+    enable (reinstalls stripped hooks) — the wave-3 pin for the already-init
+    wiring path."""
+    from click.testing import CliRunner
+
+    from jacked.cli import main
+    from jacked.memory import settings_io
+
+    root = _github_root(menv)
+    _make_repo(root / "widget", "git@github.com:acme/widget.git")
+    r1 = CliRunner().invoke(main, ["memory", "init", "--root", str(root), "--yes"])
+    assert r1.exit_code == 0, r1.output
+
+    # Strip the hooks out-of-band, then re-run init on the existing vault.
+    sp = settings_io.settings_path(menv.home)
+    settings = settings_io.read_settings(sp)
+    hooks_config.remove_capture_entries(settings)
+    hooks_config.remove_recall_entries(settings)
+    settings_io.write_settings(sp, settings)
+    assert not hooks_config.has_capture_entry(settings_io.read_settings(sp))
+
+    r2 = CliRunner().invoke(main, ["memory", "init", "--root", str(root), "--yes"])
+    assert r2.exit_code == 0, r2.output
+    after = settings_io.read_settings(sp)
+    assert hooks_config.has_capture_entry(after)
+    assert hooks_config.has_recall_entry(after)

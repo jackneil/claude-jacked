@@ -159,9 +159,17 @@ def _mapped_repos(vault: Path, roots) -> list[tuple[Path, str]]:
 
 
 def _install_summary(res: dict) -> dict:
-    """Normalize install_post_merge output for the per-repo bulk result."""
+    """Normalize install_post_merge output for the per-repo bulk result.
+
+    "already installed" is a HEALTHY state (idempotent re-run), reported as
+    ``current`` -- not as a skip, so re-enabling never shows warnings for hooks
+    that are exactly where they should be. Only genuine refusals (foreign hook,
+    framework conflict, no .git) carry ``skipped``.
+    """
     if res.get("installed"):
         return {"installed": True, "path": res.get("path")}
+    if res.get("reason") == "already installed":
+        return {"installed": False, "current": True, "path": res.get("path")}
     return {
         "installed": False,
         "path": res.get("path"),

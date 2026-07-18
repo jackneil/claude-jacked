@@ -364,6 +364,15 @@ async function renderFeaturesTab(container) {
         const hooks = features.hooks || [];
         const knowledge = features.knowledge || [];
 
+        // A present-but-corrupt settings.json makes every toggle read as OFF
+        // and every mutation refuse with 503; without a banner that reads as
+        // "everything mysteriously disabled". Say what is actually wrong.
+        const settingsWarning = features.settings_unreadable
+            ? `<div class="mb-4 p-3 rounded border border-yellow-600/50 bg-yellow-900/20 text-yellow-300 text-sm">
+                   ~/.claude/settings.json is unreadable (corrupt JSON). Toggle states shown here may be wrong and changes are refused until the file is fixed.
+               </div>`
+            : '';
+
         // Skill packs come from a separate endpoint. A hiccup fetching them
         // must not blank out hooks/knowledge, so its failure is captured here
         // and rendered as a small inline error with its own retry.
@@ -420,6 +429,7 @@ async function renderFeaturesTab(container) {
 
         container.innerHTML = `
             <div class="space-y-6">
+                ${settingsWarning}
                 <div>
                     <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Hooks</h3>
                     <p class="text-xs text-slate-500 mb-3">Background hooks that run automatically during Claude Code sessions.</p>

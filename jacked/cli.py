@@ -4080,11 +4080,16 @@ def _memory_finish_enable(home) -> None:
 
     git_hooks = result.get("git_hooks") or {}
     if git_hooks:
-        installed = [ident for ident, res in git_hooks.items() if res.get("installed")]
-        if installed:
-            console.print(f"  post-merge git hook installed in {len(installed)} repo(s).")
+        # "current" = already installed and up to date (healthy idempotent
+        # re-run); only genuine refusals print as warnings.
+        ok = [
+            ident for ident, res in git_hooks.items()
+            if res.get("installed") or res.get("current")
+        ]
+        if ok:
+            console.print(f"  post-merge git hook active in {len(ok)} repo(s).")
         for ident, res in git_hooks.items():
-            if not res.get("installed"):
+            if res.get("skipped"):
                 console.print(
                     f"  [yellow]post-merge git hook skipped for {_rich_escape(ident)}: "
                     f"{_rich_escape(str(res.get('reason', '')))}[/yellow]"
@@ -4163,6 +4168,12 @@ def memory_status(quiet: bool):
                 console.print(
                     "  [yellow]enabled in state but the capture hook is not installed in "
                     "settings.json (run jacked install or re-enable from the dashboard)[/yellow]"
+                )
+            elif not hooks_config.has_recall_entry(settings):
+                console.print(
+                    "  [yellow]capture hook installed but the recall hook is missing; "
+                    "the SessionStart brief will not inject (re-enable from the "
+                    "dashboard or run jacked memory init)[/yellow]"
                 )
         except settings_io.SettingsUnreadableError:
             console.print(

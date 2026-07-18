@@ -138,12 +138,25 @@ def has_capture_entry(settings: dict) -> bool:
     ensure/remove and never re-implements the string math. Capture is the marker
     of "the feature is on": recall alone never installs without it.
     """
+    return _has_entry(settings, _CAPTURE_ANCHOR)
+
+
+def has_recall_entry(settings: dict) -> bool:
+    """True if the jacked memory-recall entry is present in ``settings``.
+
+    Used by the status honesty cross-check: capture without recall means the
+    SessionStart brief silently never injects, which is worth a warning.
+    """
+    return _has_entry(settings, _RECALL_ANCHOR)
+
+
+def _has_entry(settings: dict, anchor: str) -> bool:
     hooks = settings.get("hooks", {})
     if not isinstance(hooks, dict):
         return False
     for arr in hooks.values():
         if not isinstance(arr, list):
             continue
-        if any(_entry_has_anchor(entry, _CAPTURE_ANCHOR) for entry in arr):
+        if any(_entry_has_anchor(entry, anchor) for entry in arr):
             return True
     return False

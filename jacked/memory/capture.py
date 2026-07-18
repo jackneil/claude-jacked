@@ -570,9 +570,14 @@ def resolve_group_and_repo(vault: Path, cwd: str) -> tuple[str, str, str]:
     group = vault_mod.resolve_group(vault, identity)
     if not group:
         group = vault_mod.group_for_identity(identity)
-        cfg = vault_mod.load_vault_config(vault)
-        vault_mod.register_repo(cfg, identity, group)
-        vault_mod.save_vault_config(vault, cfg)
+        # Same lock the CLI's registration path holds: two concurrent captures
+        # from different unmapped repos must not last-writer-wins each other's
+        # vault.json mapping. Re-resolve under the lock before writing.
+        with vault_mod.vault_write_lock(vault):
+            if not vault_mod.resolve_group(vault, identity):
+                cfg = vault_mod.load_vault_config(vault)
+                vault_mod.register_repo(cfg, identity, group)
+                vault_mod.save_vault_config(vault, cfg)
     vault_mod.ensure_group(vault, group)
     return identity, group, repo_short
 

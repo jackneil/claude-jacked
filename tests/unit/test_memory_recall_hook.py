@@ -709,3 +709,32 @@ def test_last_recall_stamp_failure_never_breaks_brief(env):
     env.monkeypatch.setattr(vault_mod, "update_state", _boom)
     brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
     assert "=== MEMORY VAULT (myrepo) ===" in brief  # brief still returned
+
+
+def test_decision_poor_group_never_full_scans(env):
+    """Once the 20-line excerpt is full, non-decision lines are skipped WITHOUT
+    reading their notes, so a group with few or no decisions never degrades
+    into a full-index scan (wave-3 pin for the early-skip branch)."""
+    _seed_group(env)
+    gdir = env.vault / "groups" / "myrepo"
+    # 60 reference notes, zero additional decisions (the seed adds 2 decisions).
+    for i in range(60):
+        vault_mod.add_note(
+            env.vault, env.home, note_type="reference", title=f"Ref {i}",
+            group="myrepo", repos=["myrepo"], tags=[],
+            body=f"Reference fact number {i}.",
+        )
+    reads = []
+    real_read = vault_mod.read_note
+
+    def counting_read(path):
+        reads.append(path)
+        return real_read(path)
+
+    env.monkeypatch.setattr("jacked.memory.recall.vault_mod.read_note", counting_read)
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert brief
+    # Excerpt tail (20) + the 2 seeded decisions; the early-skip must prevent
+    # reads for the ~40 older reference notes past the excerpt window.
+    assert len(reads) <= 25, f"read {len(reads)} notes; early skip not working"
+    assert gdir.exists()
