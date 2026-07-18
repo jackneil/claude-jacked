@@ -4126,6 +4126,24 @@ def memory_search(query: str, group: str | None, note_type: str | None, limit: i
     console.print(f"[dim]{len(results)} match(es).[/dim]")
 
 
+@memory_group.command(name="capture-merge", hidden=True)
+@click.option("--repo", default=".", type=click.Path(),
+              help="Repo whose just-landed merge to distill (default: cwd).")
+def memory_capture_merge(repo: str):
+    """Distill a just-landed merge into a candidate note (git post-merge hook).
+
+    Invoked (backgrounded) by the installed post-merge hook. Fail-open: it always
+    exits 0 so a git merge is never blocked by a memory-capture failure.
+    """
+    try:
+        from jacked.memory import merge_capture as _merge_capture
+
+        _merge_capture.capture_merge(repo)
+    except Exception:  # noqa: BLE001 -- a git hook must never propagate failure
+        logger.debug("memory capture-merge failed", exc_info=True)
+    raise SystemExit(0)
+
+
 @main.group(name="permissions")
 def permissions_group():
     """Audit and prune Claude Code Bash permission rules."""
