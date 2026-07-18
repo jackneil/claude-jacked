@@ -10,6 +10,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,9 @@ import jacked.cli as cli
 from jacked import memory
 from jacked.cli import main
 from jacked.memory import vault as vault_mod
+
+# Repo root, so a spawned `python -c` subprocess resolves the editable jacked.
+REPO_ROOT_VAULT = Path(__file__).resolve().parents[2]
 
 
 # --------------------------------------------------------------------------- #
@@ -578,3 +582,191 @@ def test_no_em_dash_in_command_output(env):
     ])
     CliRunner().invoke(main, ["memory", "status"])
     assert "—" not in env.buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# F7: slugify collision fix (empty-after-sanitize -> deterministic note-<hash>)
+# --------------------------------------------------------------------------- #
+
+def test_slugify_empty_returns_deterministic_hash():
+    import hashlib
+
+    slug = vault_mod.slugify("..")
+    expected = "note-" + hashlib.sha1(b"..").hexdigest()[:8]
+    assert slug == expected
+    # Stable across calls.
+    assert vault_mod.slugify("..") == expected
+
+
+def test_slugify_distinct_non_ascii_names_stay_distinct():
+    # Two different CJK repo names both sanitize to empty; they must NOT collide
+    # onto one slug/group (the pre-fix "note" constant merged them).
+    a = vault_mod.slugify("東京")      # Tokyo
+    b = vault_mod.slugify("大阪")      # Osaka
+    assert a != b
+    assert a.startswith("note-") and b.startswith("note-")
+    # Deterministic per input.
+    assert vault_mod.slugify("東京") == a
+
+
+def test_slugify_normal_ascii_unchanged():
+    assert vault_mod.slugify("Hank Captable") == "hank-captable"
+    assert vault_mod.slugify("../../etc/passwd") == "etc-passwd"
+
+
+# --------------------------------------------------------------------------- #
+# F8: capture health fields in default state + status
+# --------------------------------------------------------------------------- #
+
+def test_default_state_has_health_fields(env):
+    st = vault_mod.load_state(env.home)
+    assert st["last_capture"] is None
+    assert st["last_capture_error"] is None
+    assert st["capture_failures"] == 0
+
+
+def test_normalize_coerces_bad_health_fields(env):
+    path = vault_mod.state_path(env.home)
+    path.write_text(json.dumps({
+        "version": 1, "capture_failures": "lots",
+        "last_capture": 123, "last_capture_error": ["nope"],
+    }), encoding="utf-8")
+    st = vault_mod.load_state(env.home)
+    assert st["capture_failures"] == 0
+    assert st["last_capture"] is None
+    assert st["last_capture_error"] is None
+
+
+def test_status_surfaces_health(env):
+    vault_mod.init_vault(env.vault, [], {})
+    vault_mod.set_enabled(env.home, True, vault=env.vault)
+    vault_mod.update_state(env.home, lambda s: s.update({
+        "last_capture": "2026-07-18T10:00:00Z",
+        "last_capture_error": "triage failed",
+        "capture_failures": 3,
+    }))
+    st = vault_mod.status(env.vault, env.home)
+    assert st["last_capture"] == "2026-07-18T10:00:00Z"
+    assert st["last_capture_error"] == "triage failed"
+    assert st["capture_failures"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# F3: cross-process update_state (concurrent writers keep both updates)
+# --------------------------------------------------------------------------- #
+
+def test_update_state_concurrent_writers_keep_both(env):
+    # Two subprocesses each bump a DIFFERENT key under the state lock; both must
+    # survive (a naive load/save would lose one).
+    import sys
+    import textwrap
+
+    vault_mod.save_state(env.home, vault_mod.load_state(env.home))
+    prog = textwrap.dedent(
+        """
+        import os, sys
+        os.environ["JACKED_HOME"] = sys.argv[1]
+        from jacked.memory import vault as v
+        key = sys.argv[2]
+        for _ in range(20):
+            v.update_state(None, lambda s: s.__setitem__(key, int(s.get(key, 0)) + 1))
+        """
+    )
+    procs = [
+        subprocess.Popen([sys.executable, "-c", prog, str(env.home), key],
+                         cwd=str(REPO_ROOT_VAULT))
+        for key in ("drift_added", "capture_failures")
+    ]
+    for p in procs:
+        assert p.wait(timeout=60) == 0
+
+    st = vault_mod.load_state(env.home)
+    assert st["drift_added"] == 20
+    assert st["capture_failures"] == 20
+
+
+def test_file_lock_timeout_yields_with_warning(env, caplog):
+    import threading
+
+    lock_path = env.home / ".claude" / "held.lock"
+    holding = threading.Event()
+    release = threading.Event()
+
+    def _holder():
+        with vault_mod._file_lock(lock_path, timeout=5.0):
+            holding.set()
+            release.wait(timeout=10)
+
+    t = threading.Thread(target=_holder)
+    t.start()
+    assert holding.wait(timeout=5)
+
+    # A second acquire with a tiny timeout can't get the lock; it must warn and
+    # yield anyway (fail-open) rather than block or raise.
+    ran = []
+    with caplog.at_level("WARNING"):
+        with vault_mod._file_lock(lock_path, timeout=0.2):
+            ran.append(True)
+    release.set()
+    t.join(timeout=10)
+
+    assert ran == [True]
+    assert any("unavailable" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# F9: durable memory failure log (rotating handler attached once)
+# --------------------------------------------------------------------------- #
+
+def test_ensure_memory_file_logging_attaches_once(env):
+    import contextlib
+    import logging
+
+    log = logging.getLogger(vault_mod.MEMORY_LOGGER_NAME)
+    # The logger is a global singleton; a handler left by another test points at a
+    # stale home and would make ensure() short-circuit. Clear ours first.
+    stale = [h for h in log.handlers if getattr(h, "_jacked_memory_handler", False)]
+    for h in stale:
+        log.removeHandler(h)
+        with contextlib.suppress(Exception):
+            h.close()
+    try:
+        vault_mod.ensure_memory_file_logging(env.home)
+        vault_mod.ensure_memory_file_logging(env.home)  # idempotent
+        ours = [h for h in log.handlers if getattr(h, "_jacked_memory_handler", False)]
+        assert len(ours) == 1
+        log.warning("a durable memory warning")
+        assert vault_mod.memory_log_path(env.home).exists()
+        assert "a durable memory warning" in vault_mod.memory_log_path(env.home).read_text(encoding="utf-8")
+    finally:
+        for h in [h for h in log.handlers if getattr(h, "_jacked_memory_handler", False)]:
+            log.removeHandler(h)
+            with contextlib.suppress(Exception):
+                h.close()
+
+
+# --------------------------------------------------------------------------- #
+# F12: `jacked memory status` honesty cross-check
+# --------------------------------------------------------------------------- #
+
+def test_status_warns_when_enabled_but_capture_hook_missing(env):
+    vault_mod.init_vault(env.vault, [], {})
+    vault_mod.set_enabled(env.home, True, vault=env.vault)
+    # settings.json exists but carries NO capture hook entry.
+    (env.home / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+    r = CliRunner().invoke(main, ["memory", "status"])
+    assert r.exit_code == 0
+    out = env.buf.getvalue()
+    assert "capture hook is not installed" in out
+    assert "—" not in out  # user-facing, em-dash free
+
+
+def test_status_warns_when_settings_unreadable(env):
+    vault_mod.init_vault(env.vault, [], {})
+    vault_mod.set_enabled(env.home, True, vault=env.vault)
+    (env.home / ".claude" / "settings.json").write_text("{ corrupt json", encoding="utf-8")
+
+    r = CliRunner().invoke(main, ["memory", "status"])
+    assert r.exit_code == 0
+    assert "unreadable" in env.buf.getvalue()

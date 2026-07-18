@@ -25,8 +25,11 @@ sections) so migration and human readers keep continuity.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
+import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -59,8 +62,13 @@ _DEMOTABLE_HEADING_RE = re.compile(r"^#{1,5}\s")
 # Public entry point
 # --------------------------------------------------------------------------- #
 
-def rollup(vault: Path, home: Path | None = None) -> dict:
-    """Roll episodic history forward across every episodic dir in the vault.
+def rollup(vault: Path, home: Path | None = None, only_repo_short: str | None = None) -> dict:
+    """Roll episodic history forward across the vault's episodic dirs.
+
+    ``only_repo_short`` scopes the run to a single repo's episodic dir (by its
+    sanitized short name): a session ending in repo X passes X so it never
+    rewrites repo Z's recent.md. ``None`` (the ``jacked memory rollup`` CLI) rolls
+    every dir.
 
     Returns a summary dict:
     ``{days_rolled, sections_archived, skipped_unparseable, dirs, changed}``.
@@ -79,13 +87,18 @@ def rollup(vault: Path, home: Path | None = None) -> dict:
     if not vault_mod.is_initialized(vault):
         return summary
 
-    today = _today()
-    for edir in _episodic_dirs(vault):
-        summary["dirs"] += 1
-        _rollup_dir(edir, today, summary)
+    # Serialize the whole file-write + commit section across processes so a
+    # concurrent capture/merge commit can't collide on the vault git index.
+    with vault_mod.vault_write_lock(vault):
+        today = _today()
+        for edir in _episodic_dirs(vault):
+            if only_repo_short is not None and edir.name != only_repo_short:
+                continue
+            summary["dirs"] += 1
+            _rollup_dir(edir, today, summary)
 
-    if summary["changed"]:
-        vault_mod.commit_all(vault, "memory: rollup episodic history")
+        if summary["changed"]:
+            vault_mod.commit_all(vault, "memory: rollup episodic history")
 
     _record_last_rollup(home)
     return summary
@@ -144,10 +157,13 @@ def _rollup_dir(edir: Path, today: date, summary: dict) -> None:
     new_recent = _render(preamble, sections)
     new_archive = _render(apre, asections)
 
+    # Add-before-remove: write archive.md BEFORE recent.md. A crash between the
+    # two then duplicates an archived day section instead of losing it (the same
+    # philosophy as the write-then-mark rename below).
     wrote = False
-    if (recent_existed or sections) and _write_if_differs(recent_path, new_recent):
-        wrote = True
     if (archive_existed or asections) and _write_if_differs(archive_path, new_archive):
+        wrote = True
+    if (recent_existed or sections) and _write_if_differs(recent_path, new_recent):
         wrote = True
 
     # Rename the processed today files only after recent.md reflects them
@@ -383,26 +399,39 @@ def _read_text(path: Path) -> str:
 
 
 def _write_if_differs(path: Path, new_text: str) -> bool:
-    """Write ``new_text`` only when it differs from what's on disk. Returns True
-    if a write happened (so a no-op run neither rewrites nor commits)."""
+    """Write ``new_text`` only when it differs from disk, ATOMICALLY (writer-unique
+    tmp + os.replace). Returns True if a write happened (so a no-op run neither
+    rewrites nor commits). Atomic so a crash mid-write never leaves a half-written
+    recent.md/archive.md."""
     old = _read_text(path) if path.exists() else None
     if old == new_text:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_text, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new_text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     return True
 
 
 def _record_last_rollup(home: Path | None) -> None:
-    """Stamp ``state.last_rollup`` via a fresh load/save so a concurrent writer's
-    drift/queue is not clobbered."""
-    state = vault_mod.load_state(home)
-    state["last_rollup"] = _now_iso()
-    vault_mod.save_state(home, state)
+    """Stamp ``state.last_rollup`` under the state lock so a concurrent writer's
+    drift/queue/health is not clobbered."""
+    def _m(state: dict) -> None:
+        state["last_rollup"] = _now_iso()
+
+    vault_mod.update_state(home, _m)
 
 
 def _today() -> date:
-    return datetime.now(timezone.utc).date()
+    """LOCAL date -- matches ``capture._write_episodic``'s local today-file naming
+    so the current-day file is never rolled mid-day for negative-UTC users."""
+    return datetime.now().date()
 
 
 def _now_iso() -> str:

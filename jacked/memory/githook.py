@@ -14,14 +14,18 @@ shells out to ``jacked``), so there is no language detection here.
 from __future__ import annotations
 
 import logging
-import shutil
 import stat
 from pathlib import Path
 
 from jacked import guardrails
+from jacked.findbin import find_bin
 from jacked.memory import vault as vault_mod
 
 logger = logging.getLogger(__name__)
+
+# Placeholder in the template that install substitutes with the absolute jacked
+# binary path (so the hook fires even under a stripped PATH).
+_JACKED_BIN_PLACEHOLDER = "@JACKED_BIN@"
 
 # Bundled template dir (jacked/data/git-hooks), with the same global-copy
 # fallback guardrails uses (deploy_templates globs git-hooks/*.sh into it).
@@ -69,7 +73,10 @@ def install_post_merge(repo_path: str | Path, force: bool = False) -> dict:
     src = _resolve_template()
     if src is None:
         return {"installed": False, "reason": "post-merge memory hook template not found"}
-    new_content = src.read_text(encoding="utf-8")
+    # Substitute the absolute jacked path at install time so the already-installed
+    # content comparison below compares the SUBSTITUTED text (not the raw template).
+    jacked_bin = find_bin("jacked") or ""
+    new_content = src.read_text(encoding="utf-8").replace(_JACKED_BIN_PLACEHOLDER, jacked_bin)
 
     hooks_dir = git_dir / "hooks"
     hooks_dir.mkdir(exist_ok=True)
@@ -109,7 +116,7 @@ def install_post_merge(repo_path: str | Path, force: bool = False) -> dict:
                 ),
             }
 
-    shutil.copy2(src, target)
+    target.write_text(new_content, encoding="utf-8")
     try:
         target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     except OSError:

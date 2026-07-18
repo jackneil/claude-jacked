@@ -18,6 +18,9 @@ import sys
 def main(argv=None):
     """Read the hook payload from stdin and dispatch. Never raises."""
     try:
+        from jacked.memory import vault as _vault
+        _vault.ensure_memory_file_logging()
+
         raw = sys.stdin.read()
         if not raw.strip():
             return

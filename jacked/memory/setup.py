@@ -21,14 +21,10 @@ from the CLI's canonical ``_build_hook_command`` so the dashboard and
 """
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
-import os
-import tempfile
 from pathlib import Path
 
-from jacked.memory import githook, hooks_config
+from jacked.memory import githook, hooks_config, settings_io
 from jacked.memory import migrate as migrate_mod
 from jacked.memory import vault as vault_mod
 
@@ -42,35 +38,8 @@ _RECALL_HOOK = "memory_recall"
 
 
 # --------------------------------------------------------------------------- #
-# settings.json I/O (home-parameterized; atomic write)
+# settings.json I/O (delegated to the shared, corruption-safe module)
 # --------------------------------------------------------------------------- #
-
-def _settings_path(home: Path) -> Path:
-    return Path(home) / ".claude" / "settings.json"
-
-
-def _read_settings(path: Path) -> dict:
-    """Tolerant settings.json read: missing or corrupt yields an empty dict."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_settings(path: Path, data: dict) -> None:
-    """Atomically write settings.json (writer-unique tmp + os.replace)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2))
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
-
 
 def _hook_command(hook_name: str) -> str:
     """The settings.json command for a jacked hook, via the CLI's canonical
@@ -134,13 +103,15 @@ def enable(home: Path | None = None) -> dict:
 
     vault_mod.set_enabled(home, True, vault=vault)
 
-    # Capture (async pair) + recall (sync) settings.json entries.
-    settings_path = _settings_path(home)
-    settings = _read_settings(settings_path)
+    # Capture (async pair) + recall (sync) settings.json entries. A corrupt
+    # settings.json raises SettingsUnreadableError here and aborts the enable
+    # LOUDLY rather than clobbering the user's hooks with a fresh file.
+    settings_path = settings_io.settings_path(home)
+    settings = settings_io.read_settings(settings_path)
     changed = hooks_config.ensure_capture_entries(settings, _hook_command(_CAPTURE_HOOK))
     changed = hooks_config.ensure_recall_entry(settings, _hook_command(_RECALL_HOOK)) or changed
     if changed:
-        _write_settings(settings_path, settings)
+        settings_io.write_settings(settings_path, settings)
 
     # Post-merge git hooks into every mapped repo (foreign hooks refused, not forced).
     roots = _config_roots(vault)
@@ -175,12 +146,12 @@ def disable(home: Path | None = None) -> dict:
     home = vault_mod.jacked_home() if home is None else Path(home)
     vault = vault_mod.vault_dir()
 
-    settings_path = _settings_path(home)
-    settings = _read_settings(settings_path)
+    settings_path = settings_io.settings_path(home)
+    settings = settings_io.read_settings(settings_path)
     changed = hooks_config.remove_capture_entries(settings)
     changed = hooks_config.remove_recall_entries(settings) or changed
     if changed:
-        _write_settings(settings_path, settings)
+        settings_io.write_settings(settings_path, settings)
 
     # Only mappable when a vault exists to read repo_map from. Never touches
     # vault content -- only the repos' .git/hooks/post-merge that WE installed.

@@ -35,10 +35,7 @@ key reads as "enabled by default"). Sources are never removed by retirement.
 """
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
-import os
 import re
 import shutil
 import tempfile
@@ -46,6 +43,7 @@ from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 
+from jacked.memory import settings_io
 from jacked.memory import vault as vault_mod
 
 logger = logging.getLogger(__name__)
@@ -237,7 +235,7 @@ def preview(vault: Path, *, roots) -> list[dict]:
 def _resolve_target(vault: Path, repo_path: Path) -> tuple[str, str, str]:
     """``(identity, group, repo_short)`` for a repo, WITHOUT touching the vault.
 
-    Mirrors ``capture._resolve_group_and_repo`` but omits its ``ensure_group`` /
+    Mirrors ``capture.resolve_group_and_repo`` but omits its ``ensure_group`` /
     ``register_repo`` side effects, so a repo that later fails verification never
     leaves a group skeleton or vault.json entry behind. Registration is deferred
     to the commit pass (``_materialize``), which only runs for repos that pass.
@@ -324,6 +322,8 @@ def _migrate_one(vault: Path, repo_path: Path, remember_dir: Path, staging_root:
     moves: list[tuple[Path, Path]] = []
     verifications: list[_Verify] = []
     candidate_specs: list[dict] = []
+    skipped_symlinks: list[str] = []
+    already_imported: list[str] = []
 
     def _base_report(status: str, reason: str | None, candidates: int) -> dict:
         return {
@@ -336,11 +336,23 @@ def _migrate_one(vault: Path, repo_path: Path, remember_dir: Path, staging_root:
             "status": status,
             "reason": reason,
             "skipped_symlinks": skipped_symlinks,
+            "already_imported": already_imported,
         }
 
-    current_today_name = f"today-{_today_local()}.md"
+    def _already_have(base_name: str, content_bytes: bytes) -> bool:
+        """True if the vault already holds ``base_name`` with IDENTICAL bytes.
 
-    skipped_symlinks: list[str] = []
+        This is what makes a second migrate a no-op: an unchanged source file
+        whose exact content is already at its final vault path is skipped
+        entirely (no re-staging under a ``.migrated-N`` name, no duplicate).
+        """
+        target = vault_episodic / base_name
+        try:
+            return target.is_file() and target.read_bytes() == content_bytes
+        except OSError:
+            return False
+
+    current_today_name = f"today-{_today_local()}.md"
 
     # now.md: read once; it folds into the current day's today file (not copied
     # as its own file). Only a non-empty buffer folds in. Symlinked sources are
@@ -359,7 +371,7 @@ def _migrate_one(vault: Path, repo_path: Path, remember_dir: Path, staging_root:
             now_entries = _count_entries(now_text)
     now_folds = now_entries > 0
 
-    staged_current_today: Path | None = None
+    current_today_src_bytes: bytes | None = None
     current_today_source_entries = 0
 
     # today-*.md (and .done.md) then the singletons -- all copied VERBATIM.
@@ -379,20 +391,28 @@ def _migrate_one(vault: Path, repo_path: Path, remember_dir: Path, staging_root:
         src_bytes = src.read_bytes()
         src_text = src_bytes.decode("utf-8", "replace")
         src_entries = _count_entries(src_text)
+
+        if src.name == current_today_name:
+            # Deferred: its FINAL content (and dedup check) depends on the now.md
+            # fold-in resolved below.
+            current_today_src_bytes = src_bytes
+            current_today_source_entries = src_entries
+            continue
+
+        # Idempotency: if this exact file is already in the vault, skip it whole
+        # (no move, no verify, no candidate notes) and record it as already
+        # imported. Only genuinely new/changed content is staged.
+        if _already_have(src.name, src_bytes):
+            already_imported.append(src.name)
+            continue
+
         name = _noncolliding_name(vault_episodic, src.name)
         staged_path = stage_dir / name
         staged_path.write_bytes(src_bytes)
 
         files_report[src.name] = {"source_entries": src_entries, "staged_entries": None}
         moves.append((staged_path, vault_episodic / name))
-
-        if src.name == current_today_name:
-            # Verification deferred: whether we check the whole file or only the
-            # pre-``migrated-now`` region depends on the now.md fold-in below.
-            staged_current_today = staged_path
-            current_today_source_entries = src_entries
-        else:
-            verifications.append(_Verify(src.name, staged_path, None, src_entries))
+        verifications.append(_Verify(src.name, staged_path, None, src_entries))
 
         if src.name == "core-memories.md":
             for c_title, c_body in _core_memory_entries(src_text):
@@ -405,38 +425,53 @@ def _migrate_one(vault: Path, repo_path: Path, remember_dir: Path, staging_root:
                     "body": c_body,
                 })
 
-    # Fold now.md into the current day's today file (create it if the source has
-    # no today file for today).
-    if now_folds:
-        if staged_current_today is None:
+    # Build the current day's today file (folding now.md in when present) and
+    # dedup it exactly like the verbatim files. This keeps the now.md fold-in
+    # idempotent: a repeated migrate that would recreate the identical fold-in
+    # skips it instead of appending a duplicate.
+    if current_today_src_bytes is not None or now_folds:
+        base = current_today_src_bytes.decode("utf-8", "replace") if current_today_src_bytes is not None else ""
+        if now_folds:
+            final_today = (
+                base.rstrip("\n") + "\n\n" + _MIGRATED_NOW_MARKER + "\n" + now_text
+                if base else _MIGRATED_NOW_MARKER + "\n" + now_text
+            )
+        else:
+            final_today = base
+        final_today_bytes = final_today.encode("utf-8")
+
+        if _already_have(current_today_name, final_today_bytes):
+            if current_today_src_bytes is not None:
+                already_imported.append(current_today_name)
+            if now_folds:
+                already_imported.append("now.md")
+        else:
             name = _noncolliding_name(vault_episodic, current_today_name)
             staged_current_today = stage_dir / name
-            staged_current_today.write_text(
-                f"{_MIGRATED_NOW_MARKER}\n{now_text}", encoding="utf-8"
-            )
+            staged_current_today.write_bytes(final_today_bytes)
             moves.append((staged_current_today, vault_episodic / name))
-        else:
-            base = staged_current_today.read_text(encoding="utf-8")
-            combined = base.rstrip("\n") + "\n\n" + _MIGRATED_NOW_MARKER + "\n" + now_text
-            staged_current_today.write_text(combined, encoding="utf-8")
-            # The today file's own entries are verified excluding the folded-in
-            # region, so its per-file staged count still equals its source count.
-            verifications.append(
-                _Verify(current_today_name, staged_current_today, "today", current_today_source_entries)
-            )
-        verifications.append(_Verify("now.md", staged_current_today, "now", now_entries))
-        files_report["now.md"] = {
-            "source_entries": now_entries,
-            "staged_entries": None,
-            "folded_into": staged_current_today.name,
-        }
-    elif staged_current_today is not None:
-        verifications.append(
-            _Verify(current_today_name, staged_current_today, None, current_today_source_entries)
-        )
 
-    # Nothing with content to migrate (e.g. a lone empty now.md).
+            if current_today_src_bytes is not None:
+                files_report[current_today_name] = {
+                    "source_entries": current_today_source_entries, "staged_entries": None,
+                }
+                region = "today" if now_folds else None
+                verifications.append(
+                    _Verify(current_today_name, staged_current_today, region, current_today_source_entries)
+                )
+            if now_folds:
+                verifications.append(_Verify("now.md", staged_current_today, "now", now_entries))
+                files_report["now.md"] = {
+                    "source_entries": now_entries,
+                    "staged_entries": None,
+                    "folded_into": staged_current_today.name,
+                }
+
+    # Nothing new to migrate: distinguish "already migrated" (idempotent re-run)
+    # from an empty source (a lone empty now.md).
     if not moves and not candidate_specs:
+        if already_imported:
+            return {"report": _base_report("skipped", "already migrated", 0), "plan": None}
         return {"report": _base_report("skipped", "no content to migrate", 0), "plan": None}
 
     # VERIFY: independently re-count the staged files; any mismatch fails the repo.
@@ -533,23 +568,26 @@ def migrate(vault: Path, home: Path | None, *, roots) -> dict:
                 plans.append(result["plan"])
 
         # COMMIT PASS: materialize only the verified repos, then one commit.
-        for plan in plans:
-            _materialize(vault, home, plan)
-            report["repos_migrated"] += 1
+        # Serialized across processes so a concurrent capture/rollup commit can't
+        # collide on the vault git index. No claude -p call happens in here.
+        with vault_mod.vault_write_lock(vault):
+            for plan in plans:
+                _materialize(vault, home, plan)
+                report["repos_migrated"] += 1
 
-        for rep in report["repos"].values():
-            if rep["status"] == "migrated":
-                report["total_files"] += len(rep["files"])
-                report["total_entries"] += sum(
-                    f["source_entries"] for f in rep["files"].values()
+            for rep in report["repos"].values():
+                if rep["status"] == "migrated":
+                    report["total_files"] += len(rep["files"])
+                    report["total_entries"] += sum(
+                        f["source_entries"] for f in rep["files"].values()
+                    )
+                    report["candidates_created"] += rep["candidates_created"]
+
+            if report["repos_migrated"] > 0:
+                vault_mod.commit_all(
+                    vault,
+                    f"memory: migrate .remember history ({report['repos_migrated']} repos)",
                 )
-                report["candidates_created"] += rep["candidates_created"]
-
-        if report["repos_migrated"] > 0:
-            vault_mod.commit_all(
-                vault,
-                f"memory: migrate .remember history ({report['repos_migrated']} repos)",
-            )
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 
@@ -560,32 +598,10 @@ def migrate(vault: Path, home: Path | None, *, roots) -> dict:
 # Public: plugin retirement
 # --------------------------------------------------------------------------- #
 
-def _settings_path(home: Path | None) -> Path:
+def settings_path(home: Path | None) -> Path:
+    """``<home>/.claude/settings.json`` (thin wrapper over ``settings_io``)."""
     home = vault_mod.jacked_home() if home is None else Path(home)
-    return home / ".claude" / "settings.json"
-
-
-def _read_settings(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_settings(path: Path, data: dict) -> None:
-    """Atomically write settings.json (writer-unique tmp + os.replace), matching
-    the vault/features atomic-write pattern."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2))
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    return settings_io.settings_path(home)
 
 
 def retire_remember_plugin(home: Path | None = None) -> dict:
@@ -594,17 +610,19 @@ def retire_remember_plugin(home: Path | None = None) -> dict:
     Uses the same contract as ``features.toggle_claude_plugin``: an explicit
     ``enabledPlugins[id] = False`` (never ``.pop`` -- Claude Code treats an absent
     key as enabled-by-default). Every other setting is preserved untouched, and
-    no ``.remember`` source is removed. Returns what changed.
+    no ``.remember`` source is removed. A corrupt settings.json raises
+    ``SettingsUnreadableError`` and aborts LOUDLY instead of clobbering it.
+    Returns what changed.
     """
-    path = _settings_path(home)
-    settings = _read_settings(path)
+    path = settings_path(home)
+    settings = settings_io.read_settings(path)
     plugins = settings.get("enabledPlugins")
     if not isinstance(plugins, dict):
         plugins = {}
         settings["enabledPlugins"] = plugins
     previous = plugins.get(REMEMBER_PLUGIN_ID)
     plugins[REMEMBER_PLUGIN_ID] = False
-    _write_settings(path, settings)
+    settings_io.write_settings(path, settings)
     return {
         "plugin": REMEMBER_PLUGIN_ID,
         "settings_path": str(path),

@@ -1,9 +1,12 @@
 """Feature detection and toggle routes — agents, commands, hooks, knowledge."""
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -235,11 +238,22 @@ def _read_settings_json() -> dict:
 
 
 def _write_settings_json(data: dict):
-    """Write ~/.claude/settings.json atomically (write-to-temp then rename)."""
+    """Write ~/.claude/settings.json atomically via a writer-unique temp + replace.
+
+    Writer-unique (mkstemp) rather than a fixed ``.json.tmp``: the CLI, the
+    dashboard, and hook processes can all write this same file, and a shared tmp
+    path lets one process os.replace another's half-written temp away.
+    """
     SETTINGS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SETTINGS_JSON.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(SETTINGS_JSON)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{SETTINGS_JSON.name}.", suffix=".tmp", dir=str(SETTINGS_JSON.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2))
+        os.replace(tmp_name, SETTINGS_JSON)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _get_valid_agent_names() -> list[str]:
@@ -301,6 +315,28 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
         return hooks_config.has_capture_entry(mem_settings)
 
     return False
+
+
+def _memory_vault_health() -> dict | None:
+    """The memory vault's health snapshot for the dashboard card, via
+    ``vault.status()`` ($JACKED_HOME-aware). Cheap (one state read); a failure
+    just omits the health object rather than breaking the feature list."""
+    try:
+        from jacked.memory import vault as memory_vault_mod
+
+        st = memory_vault_mod.status()
+        return {
+            "last_capture": st.get("last_capture"),
+            "last_capture_error": st.get("last_capture_error"),
+            "last_sync_error": st.get("last_sync_error"),
+            "retry_pending": st.get("retry_pending"),
+            "drift_added": st.get("drift_added"),
+            "drift_threshold": st.get("drift_threshold"),
+            "capture_failures": st.get("capture_failures"),
+        }
+    except Exception:  # noqa: BLE001 -- health is best-effort; never break /features
+        logger.debug("memory vault health read failed", exc_info=True)
+        return None
 
 
 def _detect_rules_status() -> dict:
@@ -378,13 +414,17 @@ async def list_features():
     }
     for name in ("sounds", "memory_vault"):
         meta = hook_meta[name]
-        hooks.append({
+        installed = _detect_hook_installed(settings, name)
+        entry = {
             "name": name,
             "display_name": meta["display_name"],
             "description": meta["description"],
-            "installed": _detect_hook_installed(settings, name),
+            "installed": installed,
             "source_available": True,
-        })
+        }
+        if name == "memory_vault" and installed:
+            entry["health"] = _memory_vault_health()
+        hooks.append(entry)
 
     # Knowledge
     rules_status = _detect_rules_status()
@@ -553,13 +593,25 @@ async def _toggle_memory_vault(enabled: bool):
     """
     from jacked.memory import setup as memory_setup
     from jacked.memory import vault as memory_vault
+    from jacked.memory.settings_io import SettingsUnreadableError
 
     home = memory_vault.jacked_home()
     async with _settings_lock:
-        if enabled:
-            result = await asyncio.to_thread(memory_setup.enable, home)
-        else:
-            result = await asyncio.to_thread(memory_setup.disable, home)
+        try:
+            if enabled:
+                result = await asyncio.to_thread(memory_setup.enable, home)
+            else:
+                result = await asyncio.to_thread(memory_setup.disable, home)
+        except SettingsUnreadableError:
+            # settings.json exists but can't be parsed: refuse to touch it rather
+            # than clobber the user's hooks/permissions with a fresh file.
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"error": {
+                    "message": "settings.json is unreadable; refusing to modify it",
+                    "code": "SETTINGS_UNREADABLE",
+                }},
+            )
 
     return {"name": "memory_vault", "category": "hooks", "enabled": enabled, **result}
 

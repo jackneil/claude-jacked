@@ -3949,7 +3949,14 @@ def packs_update(name: str | None):
 @main.group(name="memory")
 def memory_group():
     """Cross-repo memory vault: capture and recall durable facts across repos."""
-    pass
+    # Attach the durable rotating failure log so any memory-command warning lands
+    # in <home>/.claude/jacked-memory.log (covers capture-merge run from the hook).
+    try:
+        from jacked.memory import vault as _vault
+
+        _vault.ensure_memory_file_logging()
+    except Exception:  # noqa: BLE001 -- logging setup must never break a command
+        logger.debug("memory: file logging setup failed", exc_info=True)
 
 
 def _memory_csv(value: str | None) -> list[str]:
@@ -4073,11 +4080,37 @@ def memory_status(quiet: bool):
     )
     console.print(f"  pending retries: {st['retry_pending']}")
     console.print(f"  last rollup: {_rich_escape(str(st['last_rollup']))}")
+    console.print(f"  last capture: {_rich_escape(str(st.get('last_capture')))}")
+    if st.get("capture_failures"):
+        console.print(f"  capture failures: {st['capture_failures']}")
+    if st.get("last_capture_error"):
+        console.print(
+            f"  [yellow]last capture error: {_rich_escape(str(st['last_capture_error']))}[/yellow]"
+        )
     console.print(f"  last sync: {_rich_escape(str(st['last_sync']))}")
     if st.get("last_sync_error"):
         console.print(
             f"  [yellow]last sync error: {_rich_escape(str(st['last_sync_error']))}[/yellow]"
         )
+
+    # Honesty cross-check: state says enabled but the capture hook is not actually
+    # installed in settings.json (a half-applied enable, or a settings edit that
+    # dropped it). Surface it so a user isn't fooled into thinking capture runs.
+    if st["enabled"]:
+        try:
+            from jacked.memory import hooks_config, settings_io
+
+            settings = settings_io.read_settings(settings_io.settings_path(home))
+            if not hooks_config.has_capture_entry(settings):
+                console.print(
+                    "  [yellow]enabled in state but the capture hook is not installed in "
+                    "settings.json (run jacked install or re-enable from the dashboard)[/yellow]"
+                )
+        except settings_io.SettingsUnreadableError:
+            console.print(
+                "  [yellow]settings.json is unreadable; cannot confirm the capture hook is "
+                "installed[/yellow]"
+            )
 
     # Cheap scan for legacy .remember dirs that can still be imported.
     if st["initialized"]:
@@ -4374,12 +4407,19 @@ def memory_migrate(roots: tuple, yes: bool, keep_plugin: bool):
                 f"symlinked source file(s) refused: "
                 f"{_rich_escape(', '.join(skipped_links))}"
             )
+        already = rep.get("already_imported") or []
+        if already:
+            console.print(
+                f"  [dim]{len(already)} file(s) already imported, skipped[/dim]"
+            )
 
     any_failed = report["repos_failed"] > 0
     migrated_any = report["repos_migrated"] > 0
 
     if migrated_any and not any_failed and not keep_plugin:
-        res_path = _migrate._settings_path(home)
+        from jacked.memory.settings_io import SettingsUnreadableError
+
+        res_path = _migrate.settings_path(home)
         if sys.stdin.isatty():
             console.print(
                 f"\nThe remember plugin '{_migrate.REMEMBER_PLUGIN_ID}' can now be retired. "
@@ -4387,7 +4427,14 @@ def memory_migrate(roots: tuple, yes: bool, keep_plugin: bool):
                 "your .remember sources stay on disk, untouched."
             )
             if click.confirm("Retire the remember plugin now?", default=False):
-                res = _migrate.retire_remember_plugin(home)
+                try:
+                    res = _migrate.retire_remember_plugin(home)
+                except SettingsUnreadableError as exc:
+                    console.print(
+                        f"[red][FAIL][/red] settings.json is unreadable; refusing to modify it "
+                        f"({_rich_escape(str(exc))})."
+                    )
+                    raise SystemExit(2)
                 console.print(
                     f"[green][OK][/green] Disabled '{_rich_escape(res['plugin'])}' in "
                     f"{_rich_escape(res['settings_path'])}."

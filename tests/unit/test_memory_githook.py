@@ -114,7 +114,7 @@ def no_gh(monkeypatch):
 
 def _mock_distill(monkeypatch, raw):
     """Monkeypatch the single claude -p call to return a canned string (or None)."""
-    monkeypatch.setattr(capture, "_call_claude", lambda prompt, model: raw)
+    monkeypatch.setattr(capture, "call_claude", lambda prompt, model: raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -541,3 +541,50 @@ def test_branch_merge_note_has_no_pr_tag(env, no_gh, monkeypatch):
     assert len(notes) == 1
     meta, _ = vault_mod.read_note(notes[0])
     assert not any(t.startswith("pr-") for t in meta["tags"])
+
+
+# --------------------------------------------------------------------------- #
+# F10: post-merge PATH hardening (@JACKED_BIN@ substituted at install time)
+# --------------------------------------------------------------------------- #
+
+def test_template_has_jacked_bin_placeholder():
+    src = githook._GIT_HOOKS_DIR / githook._TEMPLATE_NAME
+    content = src.read_text(encoding="utf-8")
+    assert "@JACKED_BIN@" in content
+    assert githook.HOOK_MARKER in content
+    assert "command -v jacked" in content  # PATH fallback branch
+
+
+def test_install_substitutes_absolute_jacked_path(env, monkeypatch):
+    monkeypatch.setattr(githook, "find_bin", lambda name: "/opt/tools/jacked")
+    repo = _bare_git_dir(env.tmp / "repo")
+    res = githook.install_post_merge(repo)
+    assert res["installed"] is True
+    content = (repo / ".git" / "hooks" / "post-merge").read_text(encoding="utf-8")
+    assert 'JACKED_BIN="/opt/tools/jacked"' in content
+    assert "@JACKED_BIN@" not in content  # placeholder fully substituted
+
+
+def test_install_refresh_in_place_compares_substituted(env, monkeypatch):
+    monkeypatch.setattr(githook, "find_bin", lambda name: "/opt/tools/jacked")
+    repo = _bare_git_dir(env.tmp / "repo")
+    assert githook.install_post_merge(repo)["installed"] is True
+    # Same resolved path -> already installed (compares SUBSTITUTED content).
+    second = githook.install_post_merge(repo)
+    assert second["installed"] is False
+    assert "already installed" in second["reason"]
+    # A changed resolved path -> refresh in place.
+    monkeypatch.setattr(githook, "find_bin", lambda name: "/opt/tools/jacked-new")
+    third = githook.install_post_merge(repo)
+    assert third["installed"] is True
+    content = (repo / ".git" / "hooks" / "post-merge").read_text(encoding="utf-8")
+    assert 'JACKED_BIN="/opt/tools/jacked-new"' in content
+
+
+def test_install_empty_jacked_bin_when_unresolved(env, monkeypatch):
+    monkeypatch.setattr(githook, "find_bin", lambda name: None)
+    repo = _bare_git_dir(env.tmp / "repo")
+    githook.install_post_merge(repo)
+    content = (repo / ".git" / "hooks" / "post-merge").read_text(encoding="utf-8")
+    assert 'JACKED_BIN=""' in content
+    assert "command -v jacked" in content  # PATH fallback still present

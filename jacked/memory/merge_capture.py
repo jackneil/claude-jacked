@@ -70,8 +70,8 @@ def capture_merge(repo_path: str | Path) -> None:
     """Distill the just-landed merge(s) in ``repo_path``. Swallows every error."""
     try:
         _capture_merge(Path(repo_path))
-    except Exception:  # noqa: BLE001 -- a hook must never propagate failure
-        logger.debug("memory merge-capture failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 -- a hook must never propagate failure
+        logger.warning("memory merge-capture failed: %s", exc, exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -88,7 +88,7 @@ def _capture_merge(repo: Path) -> None:
         return
     if not _is_git_repo(repo):
         return
-    if capture._current_branch(str(repo)) not in _MAIN_BRANCHES:
+    if capture.current_branch(str(repo)) not in _MAIN_BRANCHES:
         return
     if not _orig_head(repo):
         return
@@ -102,7 +102,7 @@ def _capture_merge(repo: Path) -> None:
     processed = dict(original)
 
     # Resolve the vault destination once (registers a solo group if unmapped).
-    identity, group, _repo_short = capture._resolve_group_and_repo(vault, str(repo))
+    identity, group, _repo_short = capture.resolve_group_and_repo(vault, str(repo))
 
     wrote_shas: list[str] = []
     for sha, subject in merges:
@@ -114,12 +114,16 @@ def _capture_merge(repo: Path) -> None:
 
     processed = _prune_processed(processed)
 
-    # Persist processed_merges via a fresh load so add_note's drift bumps survive.
+    # Persist processed_merges under the state lock so add_note's drift bumps and
+    # any concurrent writer's updates survive.
     if processed != original:
         _save_processed(home, processed)
 
+    # Serialize the stage+commit across processes (the lock wraps only the git
+    # write, never a claude -p call above).
     if wrote_shas:
-        vault_mod.commit_all(vault, f"memory: capture merge {wrote_shas[-1][:8]}")
+        with vault_mod.vault_write_lock(vault):
+            vault_mod.commit_all(vault, f"memory: capture merge {wrote_shas[-1][:8]}")
 
 
 def _capture_one_merge(
@@ -140,7 +144,7 @@ def _capture_one_merge(
     prompt = _build_prompt(
         subject, merged_branch, pr_number, pr_title, pr_body, pr_trimmed, changed
     )
-    parsed = _note_from_result(capture._parse_triage(capture._call_claude(prompt, model)))
+    parsed = _note_from_result(capture.parse_triage(capture.call_claude(prompt, model)))
 
     if parsed is None:
         # Distillation failed -> deterministic fallback so the merge is not lost.
@@ -176,10 +180,12 @@ def _write_merge_note(vault: Path, home: Path, group: str, identity: str, note: 
 
 
 def _save_processed(home: Path, processed: dict) -> None:
-    """Persist processed_merges with a fresh load (preserves add_note drift bumps)."""
-    st = vault_mod.load_state(home)
-    st["processed_merges"] = processed
-    vault_mod.save_state(home, st)
+    """Persist processed_merges under the state lock (preserves concurrent drift /
+    health / queue updates)."""
+    def _m(state: dict) -> None:
+        state["processed_merges"] = processed
+
+    vault_mod.update_state(home, _m)
 
 
 # --------------------------------------------------------------------------- #
@@ -251,16 +257,16 @@ def _build_prompt(
     changed: list[str],
 ) -> str:
     """Build the distillation prompt. Merge metadata is fenced + framed as data."""
-    lines: list[str] = [f"Merge subject: {capture._one_line(subject)}"]
+    lines: list[str] = [f"Merge subject: {vault_mod.one_line(subject)}"]
     if merged_branch:
         lines.append(f"Merged branch: {merged_branch}")
     if pr_number:
         lines.append(f"Pull request: #{pr_number}")
     if pr_title:
-        lines.append(f"PR title: {capture._one_line(pr_title)}")
+        lines.append(f"PR title: {vault_mod.one_line(pr_title)}")
     if pr_body:
         lines.append("PR body:")
-        lines.append(capture._strip_control(pr_body).strip())
+        lines.append(vault_mod.strip_control(pr_body).strip())
         if pr_trimmed:
             lines.append("[PR body trimmed]")
     if changed:
@@ -279,7 +285,7 @@ def _build_prompt(
         "You are a memory-triage assistant for a developer's cross-repo memory "
         "vault. A merge just landed on the main branch. Decide whether it is "
         "worth remembering as ONE durable decision note.\n\n"
-        f"{capture._DATA_FRAMING}\n\n"
+        f"{capture.DATA_FRAMING}\n\n"
         "Return STRICT JSON ONLY -- no prose, no markdown fences -- either:\n"
         '{"skip": true}   when nothing durable is worth keeping, OR\n'
         '{"title": "<short title>", "body": "<what landed and why it matters, in '
@@ -314,12 +320,12 @@ def _note_from_result(result: dict | None) -> dict | None:
         return None
     raw_tags = result.get("tags")
     tags = (
-        [capture._one_line(t) for t in raw_tags if isinstance(t, str) and t.strip()]
+        [vault_mod.one_line(t) for t in raw_tags if isinstance(t, str) and t.strip()]
         if isinstance(raw_tags, list) else []
     )
     return {
-        "title": capture._one_line(title),
-        "body": capture._strip_control(body).strip(),
+        "title": vault_mod.one_line(title),
+        "body": vault_mod.strip_control(body).strip(),
         "tags": tags,
     }
 
@@ -335,7 +341,7 @@ def _fallback_note(
     Title from the merge subject; body summarizes branch + PR + changed files.
     Tagged ``auto-fallback`` (candidate + merge are added at write time).
     """
-    title = capture._one_line(subject) or "Merged change"
+    title = vault_mod.one_line(subject) or "Merged change"
     parts: list[str] = []
     if merged_branch:
         parts.append(f"Merged branch: {merged_branch}.")

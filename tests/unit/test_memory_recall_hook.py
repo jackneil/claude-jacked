@@ -84,6 +84,10 @@ def _seed_group(env, *, group="myrepo", repo_short="myrepo", hot=_DEFAULT_HOT, b
         f"## 14:30 | {branch}\n{_LAST_EPISODIC}\n\n",
         encoding="utf-8",
     )
+    # Commit the seed so the vault working tree is CLEAN, mirroring production
+    # (capture commits every episodic write). A dirty tree makes recall's sync
+    # skip the pull by design, which is exercised separately.
+    vault_mod.commit_all(env.vault, "seed group")
     return gdir
 
 
@@ -533,3 +537,61 @@ def test_candidate_note_surfaces_after_promotion(env):
 
     brief2 = recall.build_brief(str(_cwd_dir(env, "myrepo")))
     assert "Promoted merge note" in brief2
+
+
+# --------------------------------------------------------------------------- #
+# F11: a dirty vault working tree skips the sync (state untouched)
+# --------------------------------------------------------------------------- #
+
+def test_dirty_vault_skips_sync(env):
+    _seed_group(env)
+    vault = env.vault
+    branch = _vault_branch(vault)
+    bare = _init_bare(env)
+    _git(vault, "remote", "add", "origin", str(bare))
+    _git(vault, "push", "-u", "origin", branch)
+
+    # An in-flight capture's uncommitted write dirties the tree.
+    (vault / "groups" / "myrepo" / "episodic" / "myrepo" / "today-dirty.md").write_text(
+        "## 10:00 | wip\nmid-capture\n", encoding="utf-8")
+
+    st = vault_mod.load_state(env.home)
+    st["last_sync"] = None
+    st["last_sync_error"] = None
+    vault_mod.save_state(env.home, st)
+
+    called = []
+
+    def _fail_if_called(v):
+        called.append(True)
+        return False, "must not be called"
+
+    env.monkeypatch.setattr(recall, "_pull_ff_only", _fail_if_called)
+    recall.build_brief(str(_cwd_dir(env, "myrepo")))
+
+    assert called == []  # no pull attempted against a dirty tree
+    st2 = vault_mod.load_state(env.home)
+    assert st2["last_sync"] is None       # state untouched
+    assert st2["last_sync_error"] is None
+
+
+# --------------------------------------------------------------------------- #
+# F16: episodic fallback to recent.md when there is no today-*.md file
+# --------------------------------------------------------------------------- #
+
+def test_episodic_fallback_uses_recent_md_last_block(env):
+    vault_mod.init_vault(env.vault, [], {})
+    vault_mod.set_enabled(env.home, True, vault=env.vault)
+    group = "myrepo"
+    vault_mod.ensure_group(env.vault, group)
+    edir = env.vault / "groups" / group / "episodic" / group
+    edir.mkdir(parents=True, exist_ok=True)
+    # No today-*.md file -> recall falls back to the last block of recent.md.
+    (edir / "recent.md").write_text(
+        "# Recent\n\n"
+        "## 2026-07-15\n### 09:00 | m\nan older day entry\n\n"
+        "## 2026-07-17\n### 14:00 | m\nMOST RECENT RECENT-MD ENTRY\n",
+        encoding="utf-8",
+    )
+    brief = recall.build_brief(str(_cwd_dir(env, group)))
+    assert "MOST RECENT RECENT-MD ENTRY" in brief

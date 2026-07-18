@@ -359,14 +359,22 @@ def _maybe_sync(vault: Path, home: Path, state: dict) -> None:
         last = state.get("last_sync")
         if isinstance(last, str) and _within_minutes(last, _SYNC_MIN_INTERVAL_MIN):
             return
+        # A dirty working tree means an in-flight capture's uncommitted writes are
+        # present -- a normal transient. Skip the pull WITHOUT touching last_sync /
+        # last_sync_error so the next session simply retries; a ff-only pull would
+        # only refuse against local edits anyway.
+        if _is_dirty(vault):
+            return
         ok, err = _pull_ff_only(vault)
-        # Re-load so a concurrent writer's state (drift, queue) isn't clobbered.
-        st = vault_mod.load_state(home)
-        st["last_sync"] = _now_iso()
-        st["last_sync_error"] = None if ok else err
-        vault_mod.save_state(home, st)
+        # Stamp under the state lock so a concurrent writer's drift/queue/health
+        # isn't clobbered.
+        def _stamp(st: dict) -> None:
+            st["last_sync"] = _now_iso()
+            st["last_sync_error"] = None if ok else err
+
+        vault_mod.update_state(home, _stamp)
     except Exception:  # noqa: BLE001 -- a sync failure must never break recall
-        logger.debug("memory recall: vault sync failed", exc_info=True)
+        logger.warning("memory recall: vault sync failed", exc_info=True)
 
 
 def _has_remote(vault: Path) -> bool:
@@ -379,6 +387,23 @@ def _has_remote(vault: Path) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+def _is_dirty(vault: Path) -> bool:
+    """True when the vault working tree has uncommitted changes (or git can't be
+    read). Treating an unreadable status as dirty is the safe default: skip the
+    pull rather than risk fighting a concurrent write."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(vault), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=_SYNC_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if proc.returncode != 0:
+        return True
+    return bool((proc.stdout or "").strip())
 
 
 def _pull_ff_only(vault: Path) -> tuple[bool, str | None]:

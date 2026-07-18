@@ -15,15 +15,29 @@ hand-rolled here).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import re
 import subprocess
 import tempfile
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Cross-process advisory file locking: POSIX flock or Windows msvcrt. Either may
+# be unavailable (imported None); the lock helper then degrades to fail-open.
+try:  # pragma: no cover - platform dependent
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:  # pragma: no cover - platform dependent
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +47,21 @@ logger = logging.getLogger(__name__)
 
 VAULT_DIR_ENV = "JACKED_VAULT_DIR"
 STATE_PATH_NAME = "jacked-memory.json"          # <home>/.claude/jacked-memory.json
+STATE_LOCK_NAME = "jacked-memory.json.lock"     # cross-process state RMW lock
 VAULT_CONFIG_NAME = "vault.json"
 STATE_VERSION = 1
 VAULT_CONFIG_VERSION = 1
+
+# Durable memory failure log (rotating). Hooks run detached with no console, so
+# a genuine capture/recall failure has to land somewhere the user can find it.
+MEMORY_LOGGER_NAME = "jacked.memory"
+MEMORY_LOG_NAME = "jacked-memory.log"
+_MEMORY_LOG_MAX_BYTES = 524288
+_MEMORY_LOG_BACKUPS = 1
+
+# How long update_state / vault_write_lock wait for the advisory lock before
+# giving up and proceeding anyway (fail-open: a lock must never wedge a hook).
+_LOCK_TIMEOUT = 5.0
 
 # The single note-type enum, validated on write.
 VALID_TYPES = ("decision", "convention", "vision", "reference", "progress")
@@ -111,6 +137,9 @@ def _default_state() -> dict:
         "last_groomed": None,
         "last_sync": None,
         "last_sync_error": None,
+        "last_capture": None,
+        "last_capture_error": None,
+        "capture_failures": 0,
         "retry_queue": [],
         "processed_merges": {},
     }
@@ -172,6 +201,12 @@ def _normalize_state(raw: object) -> dict:
         out["processed_merges"] = {}
     if not isinstance(out.get("enabled"), bool):
         out["enabled"] = bool(out.get("enabled"))
+    if not isinstance(out.get("capture_failures"), int) or isinstance(out.get("capture_failures"), bool):
+        out["capture_failures"] = 0
+    if out.get("last_capture") is not None and not isinstance(out.get("last_capture"), str):
+        out["last_capture"] = None
+    if out.get("last_capture_error") is not None and not isinstance(out.get("last_capture_error"), str):
+        out["last_capture_error"] = None
 
     out["version"] = version if newer else STATE_VERSION
     return out
@@ -198,16 +233,122 @@ def save_state(home: Path | None, state: dict) -> None:
         raise
 
 
+# --------------------------------------------------------------------------- #
+# Cross-process locking (advisory, fail-open) + read-modify-write
+# --------------------------------------------------------------------------- #
+
+def _lock_acquire(fh, timeout: float) -> bool:
+    """Try to take an exclusive advisory lock on ``fh`` within ``timeout`` s.
+
+    Non-blocking poll so a stuck holder can never wedge the caller. Returns True
+    on success, False on timeout or when no locking primitive is available.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            if msvcrt is not None:  # pragma: no cover - Windows
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            return False  # no locking primitive -> fail-open
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+def _lock_release(fh) -> None:
+    with contextlib.suppress(OSError):
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path, timeout: float = _LOCK_TIMEOUT):
+    """Hold an exclusive advisory lock on ``lock_path`` for the block.
+
+    FAIL-OPEN by design: if the lock file can't be opened, the primitive is
+    unavailable, or the lock can't be taken within ``timeout``, this logs a
+    warning and yields anyway. A memory hook must never deadlock or crash on
+    lock contention; a rare lost update is preferable to a wedged session.
+    """
+    lock_path = Path(lock_path)
+    fh = None
+    acquired = False
+    try:
+        with contextlib.suppress(OSError):
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fh = open(lock_path, "a+")  # noqa: SIM115 -- closed in finally
+        except OSError as e:
+            logger.warning("memory: could not open lock %s (%s); proceeding unlocked", lock_path, e)
+            yield
+            return
+        acquired = _lock_acquire(fh, timeout)
+        if not acquired:
+            logger.warning(
+                "memory: lock %s unavailable after %.1fs; proceeding without it",
+                lock_path, timeout,
+            )
+        yield
+    finally:
+        if fh is not None:
+            if acquired:
+                _lock_release(fh)
+            with contextlib.suppress(OSError):
+                fh.close()
+
+
+def state_lock_path(home: Path | None = None) -> Path:
+    return state_path(home).parent / STATE_LOCK_NAME
+
+
+def update_state(home: Path | None, mutator) -> dict:
+    """Load -> ``mutator(state)`` -> save, serialized by the state lock.
+
+    ``mutator`` mutates ``state`` in place (and may return a replacement dict).
+    The whole read-modify-write runs under ``<home>/.claude/jacked-memory.json.lock``
+    so two processes (the CLI and the dashboard, or two ending sessions) can't
+    lose each other's counter/queue updates. Returns the saved state.
+    """
+    with _file_lock(state_lock_path(home)):
+        state = load_state(home)
+        result = mutator(state)
+        if isinstance(result, dict):
+            state = result
+        save_state(home, state)
+        return state
+
+
+def vault_write_lock(vault: Path):
+    """Advisory lock serializing a vault's write+commit sections across processes.
+
+    Kept inside ``.git`` (``<vault>/.git/jacked-vault.lock``) so it never shows
+    up as an untracked working-tree file; falls back to ``<vault>/.jacked-vault.lock``
+    when there is no ``.git`` yet. Fail-open like every memory lock.
+    """
+    vault = Path(vault)
+    git_dir = vault / ".git"
+    lock_path = (git_dir / "jacked-vault.lock") if git_dir.is_dir() else (vault / ".jacked-vault.lock")
+    return _file_lock(lock_path)
+
+
 def bump_drift(home: Path | None = None, n: int = 1) -> int:
     """Increment the drift counter (notes added since the last librarian run).
 
     Returns the new value. The recall milestone nudges a librarian pass once
     this crosses ``drift_threshold``.
     """
-    state = load_state(home)
-    state["drift_added"] = int(state.get("drift_added", 0)) + n
-    save_state(home, state)
-    return state["drift_added"]
+    def _m(state: dict) -> None:
+        state["drift_added"] = int(state.get("drift_added", 0)) + n
+
+    return int(update_state(home, _m)["drift_added"])
 
 
 def mark_groomed(home: Path | None = None) -> dict:
@@ -216,34 +357,93 @@ def mark_groomed(home: Path | None = None) -> dict:
     skill calls this (via ``jacked memory mark-groomed``) when it finishes a
     grooming pass, so the SessionStart drift nudge quiets down again.
     """
-    state = load_state(home)
-    state["drift_added"] = 0
-    state["last_groomed"] = _now_iso()
-    save_state(home, state)
-    return state
+    def _m(state: dict) -> None:
+        state["drift_added"] = 0
+        state["last_groomed"] = now_iso()
+
+    return update_state(home, _m)
 
 
 def set_enabled(home: Path | None, enabled: bool, *, vault: Path | None = None) -> dict:
     """Record the feature-level enabled flag (and the vault path when enabling)."""
-    state = load_state(home)
-    state["enabled"] = bool(enabled)
-    if enabled and vault is not None:
-        state["vault_dir"] = str(vault)
-    save_state(home, state)
-    return state
+    def _m(state: dict) -> None:
+        state["enabled"] = bool(enabled)
+        if enabled and vault is not None:
+            state["vault_dir"] = str(vault)
+
+    return update_state(home, _m)
 
 
 # --------------------------------------------------------------------------- #
 # Time helpers
 # --------------------------------------------------------------------------- #
 
-def _now_iso() -> str:
+def now_iso() -> str:
+    """UTC timestamp, ``YYYY-MM-DDTHH:MM:SSZ`` -- the shared state-stamp format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def today() -> str:
     """UTC date, ``YYYY-MM-DD`` -- the value written to created/updated."""
     return datetime.now(timezone.utc).date().isoformat()
+
+
+# --------------------------------------------------------------------------- #
+# Text sanitizing (shared by every capture/recall surface)
+# --------------------------------------------------------------------------- #
+
+def strip_control(s: str) -> str:
+    """Strip control chars (keeps tab/newline/CR) via the single vault regex.
+
+    Vault content is echoed to terminals and injected into session context, so
+    a note body or a remote-derived string could carry a terminal escape/OSC
+    sequence; this is the one place that regex is applied.
+    """
+    return _CONTROL_CHARS_RE.sub("", s or "")
+
+
+def one_line(s: str) -> str:
+    """Control-stripped, whitespace-collapsed single line."""
+    return " ".join(strip_control(s).split())
+
+
+# --------------------------------------------------------------------------- #
+# Durable failure logging (rotating file handler on the jacked.memory logger)
+# --------------------------------------------------------------------------- #
+
+def memory_log_path(home: Path | None = None) -> Path:
+    home = jacked_home() if home is None else Path(home)
+    return home / ".claude" / MEMORY_LOG_NAME
+
+
+def ensure_memory_file_logging(home: Path | None = None) -> None:
+    """Attach the rotating memory failure log to ``jacked.memory`` exactly once.
+
+    Idempotent (a sentinel attribute marks our handler) and OSError-swallowing:
+    logging setup must never be the thing that breaks a hook. WARNING and above
+    from every ``jacked.memory.*`` module lands in ``<home>/.claude/jacked-memory.log``.
+    """
+    log = logging.getLogger(MEMORY_LOGGER_NAME)
+    for h in log.handlers:
+        if getattr(h, "_jacked_memory_handler", False):
+            return
+    try:
+        path = memory_log_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            str(path), maxBytes=_MEMORY_LOG_MAX_BYTES, backupCount=_MEMORY_LOG_BACKUPS,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.WARNING)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        ))
+        handler._jacked_memory_handler = True  # type: ignore[attr-defined]
+        log.addHandler(handler)
+        if log.level == logging.NOTSET or log.level > logging.WARNING:
+            log.setLevel(logging.WARNING)
+    except OSError:
+        logger.debug("memory: could not attach the failure log handler", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -254,13 +454,19 @@ def slugify(text: str) -> str:
     """Path-safe slug: lowercase, non-alphanumerics collapsed to single hyphens.
 
     Traversal-proof by construction: no path separators and no dots survive, so
-    ``../../etc/passwd`` becomes ``etc-passwd`` and ``..`` becomes ``note``.
-    Never returns empty.
+    ``../../etc/passwd`` becomes ``etc-passwd``. When sanitizing leaves nothing
+    (non-ASCII or symbol-only input, e.g. ``..`` or a CJK repo name) the slug is
+    ``note-<8 hex of sha1(text)>`` -- deterministic and DISTINCT per input, so two
+    different non-ASCII names can never collide onto a single group/slug. Never
+    returns empty.
     """
     s = (text or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = s.strip("-")
-    return s or "note"
+    if s:
+        return s
+    digest = hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:8]
+    return f"note-{digest}"
 
 
 # Group / repo names double as directory components, so they get the same
@@ -1001,5 +1207,8 @@ def status(vault: Path | None = None, home: Path | None = None) -> dict:
         "last_rollup": state.get("last_rollup"),
         "last_sync": state.get("last_sync"),
         "last_sync_error": state.get("last_sync_error"),
+        "last_capture": state.get("last_capture"),
+        "last_capture_error": state.get("last_capture_error"),
+        "capture_failures": int(state.get("capture_failures", 0) or 0),
         "retry_pending": len(state.get("retry_queue", []) or []),
     }

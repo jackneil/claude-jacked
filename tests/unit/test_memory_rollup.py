@@ -427,19 +427,24 @@ def _payload(transcript, cwd, event="SessionEnd"):
 
 
 def _mock_triage(env, response):
-    env.monkeypatch.setattr(capture, "_call_claude", lambda prompt, model: response)
+    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model: response)
 
 
 def test_session_end_invokes_rollup(env):
     _init_enabled_vault(env)
     _mock_triage(env, json.dumps({"episodic": "Did work.", "semantic": None}))
     calls = []
-    env.monkeypatch.setattr(rollup_mod, "rollup", lambda v, h: calls.append((v, h)))
+    env.monkeypatch.setattr(
+        rollup_mod, "rollup",
+        lambda v, h, only_repo_short=None: calls.append((v, h, only_repo_short)),
+    )
 
     capture.session_end(_payload(_transcript(env), _cwd(env)))
 
     assert len(calls) == 1
     assert str(calls[0][0]) == str(env.vault)
+    # The tail-call is scoped to the session's repo_short (never the whole vault).
+    assert calls[0][2] == "caprepo"
 
 
 def test_session_end_tail_call_rolls_a_past_file(env):
@@ -462,7 +467,7 @@ def test_rollup_exception_does_not_break_capture(env):
     _init_enabled_vault(env)
     _mock_triage(env, json.dumps({"episodic": "Captured fine.", "semantic": None}))
 
-    def _boom(vault, home):
+    def _boom(vault, home, only_repo_short=None):
         raise RuntimeError("rollup blew up")
 
     env.monkeypatch.setattr(rollup_mod, "rollup", _boom)
@@ -479,7 +484,10 @@ def test_pre_compact_does_not_invoke_rollup(env):
     _init_enabled_vault(env)
     _mock_triage(env, json.dumps({"episodic": "Mid-session.", "semantic": None}))
     calls = []
-    env.monkeypatch.setattr(rollup_mod, "rollup", lambda v, h: calls.append((v, h)))
+    env.monkeypatch.setattr(
+        rollup_mod, "rollup",
+        lambda v, h, only_repo_short=None: calls.append((v, h, only_repo_short)),
+    )
 
     capture.pre_compact(_payload(_transcript(env), _cwd(env), event="PreCompact"))
 
@@ -502,3 +510,77 @@ def test_librarian_skill_exists_and_valid():
     # Mentions the wrap-up command and never uses an em-dash.
     assert "mark-groomed" in text
     assert EM_DASH not in text
+
+
+# --------------------------------------------------------------------------- #
+# F4: atomic + ordered writes (archive.md BEFORE recent.md)
+# --------------------------------------------------------------------------- #
+
+def _local_today():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def test_rollup_writes_archive_before_recent(env):
+    _init_enabled_vault(env)
+    edir = _edir(env)
+    edir.mkdir(parents=True, exist_ok=True)
+    # A recent.md day older than the archive boundary forces BOTH an archive.md
+    # write and a recent.md rewrite in the same dir.
+    (edir / "recent.md").write_text(
+        f"# Recent\n\n## {_days_ago(9)}\n### 09:00 | master\nold day\n",
+        encoding="utf-8",
+    )
+
+    order = []
+    real = rollup_mod._write_if_differs
+
+    def _spy(path, text):
+        order.append(path.name)
+        return real(path, text)
+
+    env.monkeypatch.setattr(rollup_mod, "_write_if_differs", _spy)
+    summary = rollup_mod.rollup(env.vault, env.home)
+
+    assert summary["sections_archived"] == 1
+    assert "archive.md" in order and "recent.md" in order
+    # Add-before-remove: archive.md is written before recent.md.
+    assert order.index("archive.md") < order.index("recent.md")
+
+
+def test_write_if_differs_is_atomic_and_leaves_no_tmp(env):
+    edir = _edir(env)
+    edir.mkdir(parents=True, exist_ok=True)
+    target = edir / "recent.md"
+    assert rollup_mod._write_if_differs(target, "# Recent\n\nhi\n") is True
+    assert target.read_text(encoding="utf-8") == "# Recent\n\nhi\n"
+    # No writer-unique temp left behind.
+    assert not list(edir.glob(".recent.md.*.tmp"))
+    # Idempotent second call is a no-op.
+    assert rollup_mod._write_if_differs(target, "# Recent\n\nhi\n") is False
+
+
+# --------------------------------------------------------------------------- #
+# F5: local clock (current-day file never rolled) + only_repo_short scoping
+# --------------------------------------------------------------------------- #
+
+def test_local_today_file_is_never_rolled(env):
+    _init_enabled_vault(env)
+    edir = _edir(env)
+    p = _write_today(env, _local_today(), [("11:00", "master", "live work today")])
+    summary = rollup_mod.rollup(env.vault, env.home)
+    assert p.exists()  # still the live today file
+    assert summary["days_rolled"] == 0
+    assert not (edir / f"today-{_local_today()}.done.md").exists()
+
+
+def test_rollup_only_repo_short_scopes_to_one_dir(env):
+    _init_enabled_vault(env)
+    pa = _write_today(env, _days_ago(2), [("08:00", "m", "repo A past")], group="ra", repo="ra")
+    pb = _write_today(env, _days_ago(2), [("08:00", "m", "repo B past")], group="rb", repo="rb")
+
+    summary = rollup_mod.rollup(env.vault, env.home, only_repo_short="ra")
+
+    assert summary["dirs"] == 1
+    assert not pa.exists()  # ra rolled
+    assert pb.exists()      # rb untouched
+    assert _read(_edir(env, "rb", "rb") / "recent.md") is None

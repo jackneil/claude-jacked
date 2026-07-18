@@ -22,6 +22,9 @@ import sys
 def main(argv=None):
     """Read the SessionStart payload from stdin and inject the brief. Never raises."""
     try:
+        from jacked.memory import vault as _vault
+        _vault.ensure_memory_file_logging()
+
         # Drain stdin so the hook never blocks; keep the raw for cwd parsing.
         try:
             raw = sys.stdin.read()

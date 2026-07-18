@@ -469,3 +469,93 @@ def test_remove_memory_hooks_tolerates_corrupt_settings(menv):
 
     assert cli_mod._remove_memory_hooks(settings_path) is False
     assert settings_path.read_bytes() == before
+
+
+# --------------------------------------------------------------------------- #
+# F1: settings.json corruption is refused, never clobbered
+# --------------------------------------------------------------------------- #
+
+def test_setup_enable_raises_on_corrupt_settings_and_leaves_it(menv):
+    from jacked.memory.settings_io import SettingsUnreadableError
+
+    path = menv.home / ".claude" / "settings.json"
+    path.write_text("{ this is not valid json", encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(SettingsUnreadableError):
+        memory_setup.enable(menv.home)
+    assert path.read_bytes() == before  # byte-identical: never clobbered
+
+
+def test_enable_creates_settings_when_missing(menv):
+    path = menv.home / ".claude" / "settings.json"
+    if path.exists():
+        path.unlink()
+    memory_setup.enable(menv.home)
+    assert path.exists()
+    assert hooks_config.has_capture_entry(_read_settings(menv.home))
+
+
+def test_put_memory_vault_503_on_corrupt_settings(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    path = menv.home / ".claude" / "settings.json"
+    path.write_text("{ corrupt settings", encoding="utf-8")
+    before = path.read_bytes()
+
+    client = TestClient(_make_app())
+    resp = client.put("/api/features/hooks/memory_vault", json={"enabled": True})
+    assert resp.status_code == 503
+    assert "unreadable" in resp.json()["error"]["message"]
+    assert path.read_bytes() == before  # file untouched
+
+
+# --------------------------------------------------------------------------- #
+# F8: GET /features carries the memory vault health object when installed
+# --------------------------------------------------------------------------- #
+
+def test_get_features_carries_memory_vault_health(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    client = TestClient(_make_app())
+    client.put("/api/features/hooks/memory_vault", json={"enabled": True})
+
+    vault_mod.update_state(menv.home, lambda s: s.update({
+        "last_capture_error": "triage failed", "capture_failures": 2,
+    }))
+
+    feats = client.get("/api/features").json()
+    mv = next(h for h in feats["hooks"] if h["name"] == "memory_vault")
+    assert mv["installed"] is True
+    assert "health" in mv and mv["health"] is not None
+    assert mv["health"]["last_capture_error"] == "triage failed"
+    assert mv["health"]["capture_failures"] == 2
+
+
+def test_get_features_no_health_when_not_installed(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    client = TestClient(_make_app())
+    feats = client.get("/api/features").json()
+    mv = next(h for h in feats["hooks"] if h["name"] == "memory_vault")
+    assert mv["installed"] is False
+    assert "health" not in mv
+
+
+# --------------------------------------------------------------------------- #
+# F8 / F13: settings.js health line + git-hook skipped toast (source assertions)
+# --------------------------------------------------------------------------- #
+
+def test_settings_js_has_memory_health_line():
+    js = (DATA / "web" / "js" / "components" / "settings.js").read_text(encoding="utf-8")
+    assert "h.name === 'memory_vault' && h.installed && h.health" in js
+    assert "capture failing:" in js
+    assert "sync failing:" in js
+    for marker in ("capture failing:", "sync failing:"):
+        line = next(ln for ln in js.splitlines() if marker in ln)
+        assert "—" not in line  # user-facing copy stays em-dash free
+
+
+def test_settings_js_has_git_hooks_skipped_toast():
+    js = (DATA / "web" / "js" / "components" / "settings.js").read_text(encoding="utf-8")
+    assert "res.git_hooks" in js
+    assert "skipped post-merge hook install" in js
+    line = next(ln for ln in js.splitlines() if "skipped post-merge hook install" in ln)
+    assert "—" not in line
+    assert "'warning'" in line

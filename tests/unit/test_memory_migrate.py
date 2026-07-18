@@ -586,3 +586,86 @@ def test_symlinked_now_md_is_skipped(env):
         for p in env.vault.rglob("*.md") if p.is_file()
     )
     assert "NOW-SECRET" not in vault_blob
+
+
+# --------------------------------------------------------------------------- #
+# F6: migrate idempotency (a second run imports nothing, makes no commit)
+# --------------------------------------------------------------------------- #
+
+def test_migrate_twice_is_idempotent(env):
+    _neutral_cwd(env)
+    root, repo = _fixture_repo(env)
+    _init(env, root)
+    vault = env.vault
+
+    r1 = migrate_mod.migrate(vault, env.home, roots=[root])
+    assert r1["repos_migrated"] == 1
+    commits_after_first = _log_count(vault)
+
+    r2 = migrate_mod.migrate(vault, env.home, roots=[root])
+    assert r2["repos_migrated"] == 0
+    assert r2["total_files"] == 0
+    assert r2["candidates_created"] == 0
+    # No new vault commit on the idempotent re-run.
+    assert _log_count(vault) == commits_after_first
+
+    rep = r2["repos"][str(repo)]
+    assert rep["status"] == "skipped"
+    assert rep["reason"] == "already migrated"
+    assert rep["already_imported"]  # names of the files skipped
+
+
+def test_migrate_new_file_after_first_only_that_lands(env):
+    _neutral_cwd(env)
+    root, repo = _fixture_repo(env)
+    _init(env, root)
+    vault = env.vault
+    migrate_mod.migrate(vault, env.home, roots=[root])
+
+    # Add a NEW past-day file to the source, then migrate again.
+    (repo / ".remember" / "today-2026-06-20.md").write_text(
+        "## 07:00 | master\nBrand new past day.\n", encoding="utf-8")
+    r2 = migrate_mod.migrate(vault, env.home, roots=[root])
+
+    assert r2["repos_migrated"] == 1
+    rep = r2["repos"][str(repo)]
+    assert rep["status"] == "migrated"
+    # Only the new file is imported this run; the rest are already-imported.
+    assert "today-2026-06-20.md" in rep["files"]
+    assert "recent.md" not in rep["files"]
+    assert "recent.md" in rep["already_imported"]
+
+    _identity, group, repo_short = migrate_mod._resolve_target(vault, repo)
+    landed = vault / "groups" / group / "episodic" / repo_short / "today-2026-06-20.md"
+    assert landed.exists()
+
+
+def test_migrate_twice_creates_no_duplicate_candidate_notes(env):
+    _neutral_cwd(env)
+    root, repo = _fixture_repo(env)
+    _init(env, root)
+    vault = env.vault
+    migrate_mod.migrate(vault, env.home, roots=[root])
+
+    _identity, group, _repo_short = migrate_mod._resolve_target(vault, repo)
+    decision_dir = vault / "groups" / group / "decision"
+    notes_after_first = sorted(p.name for p in decision_dir.glob("*.md"))
+
+    migrate_mod.migrate(vault, env.home, roots=[root])
+    notes_after_second = sorted(p.name for p in decision_dir.glob("*.md"))
+    assert notes_after_first == notes_after_second  # no duplicate candidates
+
+
+# --------------------------------------------------------------------------- #
+# F1: retirement aborts loudly on a corrupt settings.json
+# --------------------------------------------------------------------------- #
+
+def test_retire_remember_plugin_raises_on_corrupt_settings(env):
+    from jacked.memory.settings_io import SettingsUnreadableError
+
+    path = env.home / ".claude" / "settings.json"
+    path.write_text("{ this is not valid json", encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(SettingsUnreadableError):
+        migrate_mod.retire_remember_plugin(env.home)
+    assert path.read_bytes() == before  # untouched

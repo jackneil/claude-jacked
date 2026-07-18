@@ -101,7 +101,7 @@ def _payload(transcript, cwd, session_id="sess-abcdef123456", event="SessionEnd"
 
 def _mock_triage(env, response):
     """Monkeypatch the single claude-call boundary to return `response`."""
-    env.monkeypatch.setattr(capture, "_call_claude", lambda prompt, model: response)
+    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model: response)
 
 
 def _episodic_files(env, group="myrepo", repo_short="myrepo"):
@@ -435,12 +435,12 @@ def test_exception_inside_capture_is_swallowed(env):
 
 def test_call_claude_returns_none_on_launch_error(env):
     with patch("subprocess.run", side_effect=OSError("no binary")):
-        assert capture._call_claude("prompt", "haiku") is None
+        assert capture.call_claude("prompt", "haiku") is None
 
 
 def test_call_claude_returns_none_on_timeout(env):
     with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1)):
-        assert capture._call_claude("prompt", "haiku") is None
+        assert capture.call_claude("prompt", "haiku") is None
 
 
 def test_call_claude_returns_none_on_nonzero_exit(env):
@@ -448,7 +448,7 @@ def test_call_claude_returns_none_on_nonzero_exit(env):
         returncode = 1
         stdout = ""
     with patch("subprocess.run", return_value=_P()):
-        assert capture._call_claude("prompt", "haiku") is None
+        assert capture.call_claude("prompt", "haiku") is None
 
 
 def test_call_claude_returns_stdout_on_success(env):
@@ -456,7 +456,7 @@ def test_call_claude_returns_stdout_on_success(env):
         returncode = 0
         stdout = '{"episodic": "ok", "semantic": null}'
     with patch("subprocess.run", return_value=_P()):
-        assert capture._call_claude("prompt", "haiku") == '{"episodic": "ok", "semantic": null}'
+        assert capture.call_claude("prompt", "haiku") == '{"episodic": "ok", "semantic": null}'
 
 
 # --------------------------------------------------------------------------- #
@@ -465,27 +465,27 @@ def test_call_claude_returns_stdout_on_success(env):
 
 def test_triage_prompt_contains_data_framing():
     prompt = capture._build_triage_prompt("SOME TRANSCRIPT", "session_end")
-    assert capture._DATA_FRAMING in prompt
+    assert capture.DATA_FRAMING in prompt
     assert "SOME TRANSCRIPT" in prompt
     assert "```" in prompt  # transcript is fenced
 
 
 def test_pre_compact_prompt_asks_for_handover():
     prompt = capture._build_triage_prompt("X", "pre_compact")
-    assert capture._DATA_FRAMING in prompt
+    assert capture.DATA_FRAMING in prompt
     assert "PRE-COMPACTION" in prompt
 
 
 def test_parse_triage_tolerates_fenced_json():
     raw = "Here you go:\n```json\n{\"episodic\": \"hi\", \"semantic\": null}\n```\n"
-    parsed = capture._parse_triage(raw)
+    parsed = capture.parse_triage(raw)
     assert parsed == {"episodic": "hi", "semantic": None}
 
 
 def test_parse_triage_rejects_non_object():
-    assert capture._parse_triage("[1, 2, 3]") is None
-    assert capture._parse_triage("") is None
-    assert capture._parse_triage(None) is None
+    assert capture.parse_triage("[1, 2, 3]") is None
+    assert capture.parse_triage("") is None
+    assert capture.parse_triage(None) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -648,3 +648,99 @@ def test_shim_swallows_downstream_exception(env, capsys):
         stdin.read.return_value = payload
         memory_capture.main()  # must not raise
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------- #
+# F15: _build_excerpt caps a single over-budget newest block (keep the tail)
+# --------------------------------------------------------------------------- #
+
+def test_build_excerpt_single_huge_block_capped_to_tail():
+    big = SimpleNamespace(role="user", content="Z" * 500_000, is_meta=False)
+    parsed = SimpleNamespace(messages=[big])
+    excerpt = capture._build_excerpt(parsed)
+    assert excerpt  # still non-empty
+    assert len(excerpt.encode("utf-8")) <= capture._EXTRACT_MAX_BYTES
+    # Kept the TAIL: the "USER:\n" header at the start was trimmed away.
+    assert "USER:" not in excerpt
+    assert excerpt.strip().endswith("Z")
+
+
+# --------------------------------------------------------------------------- #
+# F8: capture health signals (success clears, failure increments)
+# --------------------------------------------------------------------------- #
+
+def test_capture_success_records_health(env):
+    _init_enabled_vault(env)
+    _mock_triage(env, json.dumps({"episodic": "did work", "semantic": None}))
+    tr = _write_transcript(env.tmp / "t.jsonl")
+    memory_capture.main  # keep import referenced
+    capture.session_end(_payload(tr, _cwd_dir(env)))
+    st = vault_mod.load_state(env.home)
+    assert st["last_capture"] is not None
+    assert st["last_capture_error"] is None
+    assert st["capture_failures"] == 0
+
+
+def test_capture_triage_failure_records_health(env):
+    _init_enabled_vault(env)
+    _mock_triage(env, "this is not json")  # triage fails -> stub + health failure
+    tr = _write_transcript(env.tmp / "t.jsonl")
+    capture.session_end(_payload(tr, _cwd_dir(env)))
+    st = vault_mod.load_state(env.home)
+    assert st["capture_failures"] == 1
+    assert "triage failed" in (st["last_capture_error"] or "")
+
+
+def test_capture_success_after_failure_resets_count(env):
+    _init_enabled_vault(env)
+    vault_mod.update_state(env.home, lambda s: s.update({"capture_failures": 4, "last_capture_error": "old"}))
+    _mock_triage(env, json.dumps({"episodic": "recovered", "semantic": None}))
+    capture.session_end(_payload(_write_transcript(env.tmp / "t2.jsonl"), _cwd_dir(env)))
+    st = vault_mod.load_state(env.home)
+    assert st["capture_failures"] == 0
+    assert st["last_capture_error"] is None
+
+
+def test_capture_umbrella_records_health(env):
+    _init_enabled_vault(env)
+
+    def _boom(payload, kind):
+        raise RuntimeError("kaboom in capture")
+
+    env.monkeypatch.setattr(capture, "_capture", _boom)
+    # Fail-open: must not raise.
+    capture.session_end(_payload(_write_transcript(env.tmp / "t.jsonl"), _cwd_dir(env)))
+    st = vault_mod.load_state(env.home)
+    assert st["capture_failures"] == 1
+    assert "kaboom" in (st["last_capture_error"] or "")
+
+
+# --------------------------------------------------------------------------- #
+# F9: a genuine capture failure lands a WARNING in the durable memory log
+# --------------------------------------------------------------------------- #
+
+def test_capture_failure_writes_to_memory_log(env):
+    import contextlib
+    import logging
+
+    log = logging.getLogger(vault_mod.MEMORY_LOGGER_NAME)
+
+    def _clear():
+        for h in [h for h in log.handlers if getattr(h, "_jacked_memory_handler", False)]:
+            log.removeHandler(h)
+            with contextlib.suppress(Exception):
+                h.close()
+
+    _clear()
+    vault_mod.ensure_memory_file_logging()  # home from JACKED_HOME (env fixture)
+    try:
+        _init_enabled_vault(env)
+        _mock_triage(env, "garbage-not-json")  # triage failure -> logger.warning
+        capture.session_end(_payload(_write_transcript(env.tmp / "t.jsonl"), _cwd_dir(env)))
+        logpath = vault_mod.memory_log_path(env.home)
+        assert logpath.exists()
+        text = logpath.read_text(encoding="utf-8")
+        assert "WARNING" in text
+        assert "triage failed" in text
+    finally:
+        _clear()
