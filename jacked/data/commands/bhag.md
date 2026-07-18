@@ -60,5 +60,9 @@ DONE when: EVERY ledger cell is `done` — delivered, verified with passing outp
 
 After the block, add: **"Copy the block above (not this line), type `/goal `, paste, and send — Claude then runs the build-out loop autonomously. Prefer to drive it yourself or go targeted? Run `/whats-next` instead."** (`/goal` is built in on recent Claude Code; the brief also works pasted as an ordinary message.)
 
+## Memory vault (optional, guarded)
+
+If the memory vault is enabled (`jacked memory status --quiet` exits 0; skip silently otherwise), fold a guarded note step into the loop so the build-out leaves a durable trace: when a cell's PR MERGES (MERGE mode) or a major initiative reaches DONE, record ONE progress or decision note with `jacked memory add --type progress --title "<cell/initiative>" --body "<what landed + why>"`. Keep it high-signal (a landed cell or a real architectural decision), never per-commit. If the vault is off, do nothing.
+
 ## Why a separate command (not a flag on /whats-next)
 Auto-merging to `main` in a loop is the most powerful and most dangerous thing jacked can forge. It lives behind its own deliberately-typed name so it can never be reached by a stray argument, and it is a command (never an auto-triggering skill) so vague language can't invoke it. `/whats-next` stays the safe, targeted everyday default.

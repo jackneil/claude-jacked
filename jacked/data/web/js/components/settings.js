@@ -209,9 +209,15 @@ function bindToggleEvents(container) {
             input.disabled = true;
 
             try {
-                await api.put(`/api/features/${encodeURIComponent(category)}/${encodeURIComponent(name)}`, { enabled });
+                const res = await api.put(`/api/features/${encodeURIComponent(category)}/${encodeURIComponent(name)}`, { enabled });
                 const displayName = toggle.closest('[data-feature-row]')?.dataset.displayName || name;
                 showToast(`${displayName} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+                // Memory Vault enable can surface legacy .remember dirs still
+                // importable into the vault; nudge the user toward the migrate CLI.
+                if (enabled && name === 'memory_vault' && res && res.migration_available > 0) {
+                    const n = res.migration_available;
+                    showToast(`${n} legacy .remember dir(s) found; run jacked memory migrate to import`, 'info');
+                }
                 await refreshFeatures();
                 // Re-render the current tab to reflect changes
                 const activeTab = localStorage.getItem(SETTINGS_TAB_KEY) || DEFAULT_TAB;

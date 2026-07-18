@@ -29,7 +29,7 @@ RULES_START_PREFIX = "# jacked-behaviors-v"
 RULES_END_MARKER = "# end-jacked-behaviors"
 
 # Valid hook/knowledge names (allowlist)
-VALID_HOOKS = {"sounds"}
+VALID_HOOKS = {"sounds", "memory_vault"}
 
 
 def _get_valid_skill_names() -> list[str]:
@@ -280,6 +280,13 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
                     return True
         return False
 
+    if hook_name == "memory_vault":
+        # Installed when a memory-capture entry exists — reuse the installer's
+        # own anchor logic so detection never re-implements the string math.
+        from jacked.memory import hooks_config
+
+        return hooks_config.has_capture_entry(settings)
+
     return False
 
 
@@ -351,8 +358,12 @@ async def list_features():
             "display_name": "Sound Notifications",
             "description": "Play sounds on notifications and session completion",
         },
+        "memory_vault": {
+            "display_name": "Memory Vault",
+            "description": "Cross-repo memory: capture on session end and merges, recall brief at session start",
+        },
     }
-    for name in ("sounds",):
+    for name in ("sounds", "memory_vault"):
         meta = hook_meta[name]
         hooks.append({
             "name": name,
@@ -496,6 +507,9 @@ async def _toggle_file_feature(src: Path, dst: Path, enabled: bool, name: str, c
 
 async def _toggle_hook(name: str, enabled: bool, db=None):
     """Enable/disable a hook by adding/removing entries in settings.json."""
+    if name == "memory_vault":
+        return await _toggle_memory_vault(enabled)
+
     async with _settings_lock:
         settings = _read_settings_json()
         if "hooks" not in settings:
@@ -510,6 +524,31 @@ async def _toggle_hook(name: str, enabled: bool, db=None):
         _write_settings_json(settings)
 
     return {"name": name, "category": "hooks", "enabled": enabled}
+
+
+async def _toggle_memory_vault(enabled: bool):
+    """Enable/disable the memory vault via the shared setup engine.
+
+    The engine does slow side-effects (non-interactive vault init, per-repo git
+    hook install), so it runs off the event loop like the packs toggle. Home is
+    resolved from ``$JACKED_HOME`` so the dashboard writes state + settings where
+    the CLI reads them. Its result payload (vault path, groups,
+    ``migration_available``, git-hook summary) is merged into the response so the
+    dashboard can surface what happened. The settings lock is held across the
+    call so a concurrent sound/env toggle can't clobber the settings.json write
+    the engine performs.
+    """
+    from jacked.memory import setup as memory_setup
+    from jacked.memory import vault as memory_vault
+
+    home = memory_vault.jacked_home()
+    async with _settings_lock:
+        if enabled:
+            result = await asyncio.to_thread(memory_setup.enable, home)
+        else:
+            result = await asyncio.to_thread(memory_setup.disable, home)
+
+    return {"name": "memory_vault", "category": "hooks", "enabled": enabled, **result}
 
 
 async def _toggle_knowledge(name: str, enabled: bool):

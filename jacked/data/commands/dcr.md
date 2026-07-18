@@ -460,6 +460,8 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
     A clean DCR pass subsumes /dc — no separate /dc needed before committing.
     ```
 
+    **Memory vault (guarded, judgment-based):** on a clean final pass ONLY, if the memory vault is enabled (`jacked memory status --quiet` exits 0; skip silently otherwise), record any notable ARCHITECTURAL decision the review surfaced as a decision note: `jacked memory add --type decision --title "<decision>" --body "<the decision + the reasoning that settled it>"`. This is a rare, high-signal capture: most clean passes surface no such decision and record nothing. Never store a routine fix or a finding. If the vault is off, do nothing.
+
 17. **Report cap reached** (user-configured wave cap hit):
     ```
     ## DCR Cap Reached ([N] waves)

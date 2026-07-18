@@ -102,6 +102,16 @@ The `paths:` globs decide which open files trigger the rule. Use one file per to
 
 After writing, give a brief summary (1-2 lines) of what was added and where. Don't ask if it's OK — it's done.
 
+### Step 6: Mirror a graduated rule into the memory vault (guarded)
+
+If the memory vault is enabled (`jacked memory status --quiet` exits 0; if it exits nonzero, skip this step silently), ALSO record a rule you just graduated to CLAUDE.md as a durable convention note, so it is searchable across every repo:
+
+```bash
+jacked memory add --type convention --title "<the rule, short>" --body "<the rule + why it exists>"
+```
+
+Only mirror rules that actually graduated (recurred and earned a permanent CLAUDE.md entry), not first-time hypotheses. The vault note complements CLAUDE.md; it does not replace it. If the vault is off, do nothing here.
+
 ## SAFETY RAILS
 
 - NEVER invent lessons from nothing - if the conversation has no clear lesson, say so

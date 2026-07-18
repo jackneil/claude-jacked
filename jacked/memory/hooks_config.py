@@ -128,3 +128,22 @@ def ensure_recall_entry(settings: dict, command: str) -> bool:
 def remove_recall_entries(settings: dict) -> bool:
     """Remove the jacked memory-recall entries. Returns True if changed."""
     return _remove(settings, _RECALL_ANCHOR)
+
+
+def has_capture_entry(settings: dict) -> bool:
+    """True if any jacked memory-capture entry is present in ``settings``.
+
+    Anchors on the same ``memory_capture`` command substring the installer uses,
+    so the dashboard's installed-state detection shares one source of truth with
+    ensure/remove and never re-implements the string math. Capture is the marker
+    of "the feature is on": recall alone never installs without it.
+    """
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return False
+    for arr in hooks.values():
+        if not isinstance(arr, list):
+            continue
+        if any(_entry_has_anchor(entry, _CAPTURE_ANCHOR) for entry in arr):
+            return True
+    return False

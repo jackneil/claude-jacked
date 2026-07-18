@@ -144,6 +144,16 @@ A green workflow means "the job succeeded," not "it's live." Confirm reality:
 
 Then report the concrete artifact: the Release URL, the index/registry URL + install line, or the live app URL — whichever the model produced.
 
+### 9. RECORD (memory vault, guarded)
+
+After the release is verified live, if the memory vault is enabled (`jacked memory status --quiet` exits 0; skip silently if it exits nonzero), record a progress note so the shipped version and its highlights are searchable later:
+
+```bash
+jacked memory add --type progress --title "Released vX.Y.Z" --body "<the headline changes + the artifact URL>"
+```
+
+One note per release, high-signal. If the vault is off, do nothing.
+
 ## HARD RULES
 
 - Read the shipping model from config or detect it FIRST; when the model or publish target is ambiguous, STOP and ask. Never guess a publish target or push to the wrong branch.

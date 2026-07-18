@@ -196,6 +196,16 @@ Research: {N files written, or "inline"}
 ════════════════════════════════
 ```
 
+### Step 7: Record to the memory vault (guarded)
+
+If the memory vault is enabled (`jacked memory status --quiet` exits 0; if it exits nonzero, skip this step silently), record a short progress note so the checkpoint is searchable across sessions and repos:
+
+```bash
+jacked memory add --type progress --title "Checkpoint: {title}" --body "{one-paragraph summary: current state + top remaining work}"
+```
+
+Apply the Step 3 secrets-hygiene scan to the summary before it goes into the vault too: never write a credential into a note. This note is a pointer to the full checkpoint file, not a copy of it. If the vault is off, do nothing here.
+
 ## Resume Flow
 
 When the user runs `/checkpoint resume` or `/checkpoint resume {slug}`:

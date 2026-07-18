@@ -2082,6 +2082,24 @@ def _install_memory_recall_hook(existing: dict, settings_path: Path):
     )
 
 
+def _rewire_memory_hooks_on_install(home: Path, existing: dict, settings_path: Path) -> None:
+    """Re-wire the memory-vault hooks during ``jacked install`` ONLY when the
+    feature is already enabled.
+
+    An upgrade re-installs an enabled feature so its hook commands stay current,
+    but install NEVER turns the feature on -- enabling is the job of the
+    dashboard Features toggle / ``jacked memory init``. ``load_state`` is
+    tolerant, so a missing or corrupt state file reads as disabled and this is a
+    silent no-op.
+    """
+    from jacked.memory import vault as _mem_vault
+
+    if not _mem_vault.load_state(home).get("enabled"):
+        return
+    _install_memory_capture_hook(existing, settings_path)
+    _install_memory_recall_hook(existing, settings_path)
+
+
 def _remove_memory_hooks(settings_path: Path) -> bool:
     """Remove the jacked memory capture + recall hooks. Returns True if removed.
 
@@ -2788,6 +2806,10 @@ def _run_install(
 
     # Install QA suggestion hook (always — lightweight, no deps)
     _install_qa_hook(existing, settings_path)
+
+    # Re-wire the memory-vault hooks when the feature is already enabled
+    # (upgrade parity; install never enables the feature itself).
+    _rewire_memory_hooks_on_install(home, existing, settings_path)
 
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
@@ -3526,6 +3548,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _remove_session_tracker_hooks(settings_path)
     _remove_qa_hook(settings_path)
     _remove_chain_of_command_hook(settings_path)
+    # Remove the memory-vault hook entries unconditionally — stripping entries
+    # for a tool being uninstalled is always correct (the vault files stay put).
+    _remove_memory_hooks(settings_path)
     _remove_chrome_devtools_mcp()
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):

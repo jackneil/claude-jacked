@@ -110,6 +110,14 @@ After the block, add exactly: **"Copy the block above (not this line), type `/go
 
 If the user rejects the brief or names a different scope, re-forge from the adjusted context — no need to re-gather everything.
 
+## Memory vault (optional, guarded)
+
+If the memory vault is enabled (`jacked memory status --quiet` exits 0; skip silently if it exits nonzero), fold ONE guarded line into the forged brief's DONE step so the initiative leaves a durable trace when it lands:
+
+> When DONE, if `jacked memory status --quiet` exits 0, record a progress note: `jacked memory add --type progress --title "<initiative> shipped" --body "<what shipped + the key decisions>"`.
+
+This is a single high-signal note at the DONE moment, not per-milestone chatter. If the vault is off, the brief omits the line entirely.
+
 **Adapt, don't pad.** Use the real test command you detected. For non-code work (docs, research, infra), recast the Verify items into checkable artifacts for that kind of work ("the doc builds and every sample runs", "the research answers all N questions with cited sources") instead of forcing a test-suite line. Name real files; cite real evidence. If a detail would be guesswork, make the smallest honest statement instead of inventing it.
 
 ## Why a command, not an auto-triggering skill
