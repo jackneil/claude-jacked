@@ -3814,6 +3814,258 @@ def packs_update(name: str | None):
         raise SystemExit(1)
 
 
+@main.group(name="memory")
+def memory_group():
+    """Cross-repo memory vault: capture and recall durable facts across repos."""
+    pass
+
+
+def _memory_csv(value: str | None) -> list[str]:
+    """Split a comma-separated option into a clean list (drops empties)."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _memory_default_roots() -> list:
+    """Default init roots: <jacked_home>/Github if it exists, else the cwd parent."""
+    from pathlib import Path as _Path
+
+    gh = _jacked_home() / "Github"
+    if gh.is_dir():
+        return [gh]
+    return [_Path.cwd().parent]
+
+
+@memory_group.command(name="init")
+@click.option("--root", "roots", multiple=True, type=click.Path(),
+              help="Root dir to scan for repos (repeatable). Defaults to ~/Github or the cwd parent.")
+@click.option("--yes", is_flag=True, help="Accept all suggested groups without prompting.")
+def memory_init(roots: tuple, yes: bool):
+    """Initialize the memory vault: scan repos, suggest groups, write the vault."""
+    from collections import OrderedDict
+    from pathlib import Path as _Path
+
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+
+    # Re-running init on an existing vault is safe: report, never clobber.
+    if _memory.is_initialized(vault):
+        st = _memory.status(vault, home)
+        console.print(
+            f"[yellow]Vault already initialized[/yellow] at {_rich_escape(st['vault_dir'])}. "
+            "Nothing changed."
+        )
+        _memory_print_groups(st)
+        return
+
+    root_paths = [_Path(r) for r in roots] if roots else _memory_default_roots()
+    console.print(
+        "Scanning for repos under: "
+        + ", ".join(_rich_escape(str(p)) for p in root_paths)
+    )
+    discovered = _memory.scan_roots(root_paths)
+    if not discovered:
+        console.print(
+            "[yellow]No git repos found under those roots.[/yellow] "
+            "Creating an empty vault; groups are created on the fly as you add notes."
+        )
+    suggestions = _memory.suggest_groups(discovered)
+
+    interactive = sys.stdin.isatty() and not yes
+    final: "OrderedDict[str, list]" = OrderedDict()
+    for name, idents in suggestions.items():
+        if interactive:
+            console.print(
+                f"\nSuggested group [cyan]{_rich_escape(name)}[/cyan]: "
+                + ", ".join(_rich_escape(i) for i in idents)
+            )
+            chosen = (click.prompt("  Group name", default=name) or name).strip()
+            chosen = _memory.slugify(chosen) if chosen else name
+        else:
+            chosen = name
+        bucket = final.setdefault(chosen, [])
+        for ident in idents:
+            if ident not in bucket:
+                bucket.append(ident)
+
+    summary = _memory.init_vault(vault, [str(p) for p in root_paths], final)
+    _memory.set_enabled(home, True, vault=vault)
+
+    console.print(
+        f"\n[green][OK][/green] Vault initialized at {_rich_escape(summary['vault_dir'])} "
+        f"({len(summary['groups'])} group(s))."
+    )
+    for group, repos in summary["groups"].items():
+        console.print(f"  [cyan]{_rich_escape(group)}[/cyan]: {len(repos)} repo(s)")
+
+
+def _memory_print_groups(st: dict) -> None:
+    if not st.get("groups"):
+        return
+    for group, info in st["groups"].items():
+        total = sum(info.get("counts", {}).values())
+        console.print(
+            f"  [cyan]{_rich_escape(group)}[/cyan]: "
+            f"{len(info.get('repos', []))} repo(s), {total} note(s)"
+        )
+
+
+@memory_group.command(name="status")
+@click.option("--quiet", is_flag=True,
+              help="No output. Exit 0 if the vault is initialized and enabled, else 1.")
+def memory_status(quiet: bool):
+    """Show vault path, groups, note counts, drift, and sync state."""
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    st = _memory.status(vault, home)
+
+    if quiet:
+        raise SystemExit(0 if (st["initialized"] and st["enabled"]) else 1)
+
+    from rich.table import Table
+
+    state_word = "enabled" if st["enabled"] else "disabled"
+    init_word = "initialized" if st["initialized"] else "not initialized"
+    console.print(
+        f"[bold]Memory vault[/bold] ({_rich_escape(init_word)}, {state_word})"
+    )
+    console.print(f"  path: {_rich_escape(st['vault_dir'])}")
+    console.print(f"  triage model: {_rich_escape(str(st['triage_model']))}")
+    console.print(
+        f"  drift: {st['drift_added']}/{st['drift_threshold']} added since last groom"
+    )
+    console.print(f"  pending retries: {st['retry_pending']}")
+    console.print(f"  last rollup: {_rich_escape(str(st['last_rollup']))}")
+    console.print(f"  last sync: {_rich_escape(str(st['last_sync']))}")
+
+    if not st["initialized"]:
+        console.print(
+            "\n[yellow]Run `jacked memory init` to create the vault.[/yellow]"
+        )
+        return
+
+    if not st["groups"]:
+        console.print("\n[dim]No groups yet.[/dim]")
+        return
+
+    table = Table(title="Groups")
+    table.add_column("Group", style="cyan", no_wrap=True)
+    table.add_column("Repos", justify="right", no_wrap=True)
+    for t in _memory.VALID_TYPES:
+        table.add_column(t, justify="right", no_wrap=True)
+    for group in sorted(st["groups"]):
+        info = st["groups"][group]
+        counts = info.get("counts", {})
+        table.add_row(
+            group,
+            str(len(info.get("repos", []))),
+            *[str(counts.get(t, 0)) for t in _memory.VALID_TYPES],
+        )
+    console.print(table)
+
+
+@memory_group.command(name="add")
+@click.option("--type", "note_type", required=True,
+              type=click.Choice(["decision", "convention", "vision", "reference", "progress"]),
+              help="Note type.")
+@click.option("--title", required=True, help="Short note title (slugified for the filename).")
+@click.option("--group", default=None, help="Target group (default: auto from the current repo).")
+@click.option("--repos", default=None, help="Comma-separated repo identities (default: current repo).")
+@click.option("--tags", default=None, help="Comma-separated tags (optional).")
+@click.option("--body", required=True, help="Note body. Use '-' to read from stdin.")
+def memory_add(note_type: str, title: str, group: str | None, repos: str | None,
+               tags: str | None, body: str):
+    """Add a typed atomic note, update the index, and commit the vault."""
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        console.print(
+            "[red][FAIL][/red] Vault is not initialized. Run `jacked memory init` first."
+        )
+        raise SystemExit(2)
+
+    if body == "-":
+        body = sys.stdin.read()
+    if not (body or "").strip():
+        console.print("[red][FAIL][/red] Note body is empty.")
+        raise SystemExit(2)
+
+    # Resolve the current repo identity once (used for auto group + auto repos).
+    from pathlib import Path as _Path
+
+    identity = _memory.repo_identity(_Path.cwd())
+
+    if group:
+        group = _memory.slugify(group)
+        _memory.ensure_group(vault, group)
+    else:
+        group = _memory.resolve_group(vault, identity)
+        if not group:
+            # Unmapped repo -> a solo group named after it, created on the fly.
+            group = _memory.group_for_identity(identity)
+            cfg = _memory.load_vault_config(vault)
+            _memory.register_repo(cfg, identity, group)
+            _memory.save_vault_config(vault, cfg)
+            _memory.ensure_group(vault, group)
+
+    repo_list = _memory_csv(repos) or [identity]
+    tag_list = _memory_csv(tags)
+
+    try:
+        res = _memory.add_note(
+            vault, home,
+            note_type=note_type, title=title, group=group,
+            repos=repo_list, tags=tag_list, body=body,
+        )
+    except (ValueError, RuntimeError) as exc:
+        # ValueError = schema violation; RuntimeError = vault git op failure.
+        # Both are user-fixable conditions, not tracebacks.
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        raise SystemExit(2)
+
+    console.print(
+        f"[green][OK][/green] Added {note_type} note to group "
+        f"'{_rich_escape(res['group'])}': {_rich_escape(res['path'])}"
+    )
+
+
+@memory_group.command(name="search")
+@click.argument("query")
+@click.option("--group", default=None, help="Limit search to one group.")
+@click.option("--type", "note_type", default=None,
+              type=click.Choice(["decision", "convention", "vision", "reference", "progress"]),
+              help="Limit the note-body tier to one type.")
+@click.option("--limit", default=20, type=int, help="Max results (default 20).")
+def memory_search(query: str, group: str | None, note_type: str | None, limit: int):
+    """Search the vault (hot -> index -> note bodies -> episodic)."""
+    from jacked import memory as _memory
+
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        console.print("[yellow]Vault is not initialized.[/yellow] Run `jacked memory init`.")
+        return
+
+    results = _memory.search(
+        vault, query, group=group, note_type=note_type, limit=limit
+    )
+    if not results:
+        console.print(f"[dim]No matches for {_rich_escape(query)}.[/dim]")
+        return
+
+    for rel, lineno, line in results:
+        console.print(
+            f"[cyan]{_rich_escape(rel)}[/cyan]:{lineno}: {_rich_escape(line)}"
+        )
+    console.print(f"[dim]{len(results)} match(es).[/dim]")
+
+
 @main.group(name="permissions")
 def permissions_group():
     """Audit and prune Claude Code Bash permission rules."""

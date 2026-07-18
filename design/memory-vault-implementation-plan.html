@@ -74,7 +74,8 @@ jacked/data/web/js/components/settings.js  card copy only if needed (hooks secti
   README.md          agent-facing schema doc, written by init
   vault.json         {version:1, roots:["~/Github"], groups:{&lt;g&gt;:{repos:[&lt;identity&gt;...]}},
                       repo_map:{&lt;identity&gt;: &lt;group&gt;}}   identity = normalized remote URL else dir name
-  groups/&lt;g&gt;/index.md      "- [title](decision/slug.md) — hook phrase (updated YYYY-MM-DD)" lines, soft cap 150
+  groups/&lt;g&gt;/index.md      "- [title](decision/slug.md) - hook phrase (updated YYYY-MM-DD)" lines, soft cap 150
+                          (plain hyphen separator: search echoes index lines to the CLI, so no em-dash)
   groups/&lt;g&gt;/hot.md        current slice, overwritten by librarian/skills
   groups/&lt;g&gt;/{decision,convention,vision,reference}/&lt;slug&gt;.md
   groups/&lt;g&gt;/episodic/&lt;repo&gt;/{today-YYYY-MM-DD.md, recent.md, archive.md, core-memories.md}
