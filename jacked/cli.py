@@ -4043,6 +4043,24 @@ def memory_status(quiet: bool):
             f"  [yellow]last sync error: {_rich_escape(str(st['last_sync_error']))}[/yellow]"
         )
 
+    # Cheap scan for legacy .remember dirs that can still be imported.
+    if st["initialized"]:
+        try:
+            from pathlib import Path as _Path
+
+            from jacked.memory import migrate as _migrate
+
+            cfg = _memory.load_vault_config(vault)
+            root_paths = [_Path(r) for r in cfg.get("roots", [])]
+            remember_dirs = _migrate.discover_remember_dirs(root_paths)
+            if remember_dirs:
+                console.print(
+                    f"  migration: {len(remember_dirs)} legacy .remember dir(s) "
+                    "found (run `jacked memory migrate` to import)"
+                )
+        except Exception:  # noqa: BLE001 -- a status readout must never crash
+            logger.debug("memory status: .remember discovery failed", exc_info=True)
+
     if not st["initialized"]:
         console.print(
             "\n[yellow]Run `jacked memory init` to create the vault.[/yellow]"
@@ -4209,6 +4227,148 @@ def memory_rollup():
     )
     if not summary["changed"]:
         console.print("[dim]Nothing new to roll up; vault unchanged.[/dim]")
+
+
+@memory_group.command(name="migrate")
+@click.option("--root", "roots", multiple=True, type=click.Path(),
+              help="Root dir to scan for .remember dirs (repeatable). Defaults to the vault roots.")
+@click.option("--yes", is_flag=True, help="Skip the import confirmation prompt.")
+@click.option("--keep-plugin", is_flag=True,
+              help="Never offer to retire the remember plugin after migrating.")
+def memory_migrate(roots: tuple, yes: bool, keep_plugin: bool):
+    """Import legacy .remember history into the vault, verifying counts.
+
+    Sources are never modified or deleted. Every imported file's entry count is
+    verified against the source; any mismatch fails that repo and exits nonzero.
+    """
+    from pathlib import Path as _Path
+
+    from rich.table import Table
+
+    from jacked import memory as _memory
+    from jacked.memory import migrate as _migrate
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        console.print(
+            "[red][FAIL][/red] Vault is not initialized. Run `jacked memory init` first."
+        )
+        raise SystemExit(2)
+
+    if roots:
+        root_paths = [_Path(r) for r in roots]
+    else:
+        cfg = _memory.load_vault_config(vault)
+        root_paths = [_Path(r) for r in cfg.get("roots", [])]
+
+    rows = _migrate.preview(vault, roots=root_paths)
+    if not rows:
+        console.print(
+            "[yellow]No .remember directories found to migrate.[/yellow] "
+            "Nothing changed."
+        )
+        return
+
+    plan_table = Table(title="Will import")
+    plan_table.add_column("Repo", style="cyan")
+    plan_table.add_column("Group", style="cyan", no_wrap=True)
+    plan_table.add_column("Files", justify="right", no_wrap=True)
+    plan_table.add_column("Entries", justify="right", no_wrap=True)
+    for row in rows:
+        plan_table.add_row(
+            _rich_escape(row["repo"]), _rich_escape(row["group"]),
+            str(row["files"]), str(row["entries"]),
+        )
+    console.print(plan_table)
+    console.print(
+        "[dim]Sources are read-only: nothing in .remember is modified or deleted.[/dim]"
+    )
+
+    interactive = sys.stdin.isatty() and not yes
+    if interactive and not click.confirm("Import these into the vault?", default=True):
+        console.print("Aborted. Nothing changed.")
+        return
+
+    report = _migrate.migrate(vault, home, roots=root_paths)
+
+    verify_table = Table(title="Verification (source vs staged entries)")
+    verify_table.add_column("Repo", style="cyan")
+    verify_table.add_column("File")
+    verify_table.add_column("Source", justify="right", no_wrap=True)
+    verify_table.add_column("Staged", justify="right", no_wrap=True)
+    verify_table.add_column("Result", no_wrap=True)
+    for repo_path, rep in report["repos"].items():
+        short = rep.get("repo_short", repo_path)
+        if not rep["files"]:
+            verify_table.add_row(
+                _rich_escape(short), "[dim](no files)[/dim]", "-", "-",
+                _memory_migrate_status_cell(rep["status"]),
+            )
+            continue
+        for name, counts in rep["files"].items():
+            src = counts.get("source_entries")
+            staged = counts.get("staged_entries")
+            ok = staged is not None and src == staged
+            result = "[green]ok[/green]" if ok else "[red]MISMATCH[/red]"
+            verify_table.add_row(
+                _rich_escape(short), _rich_escape(name),
+                str(src if src is not None else "-"),
+                str(staged if staged is not None else "-"),
+                result,
+            )
+    console.print(verify_table)
+    console.print(
+        f"[bold]{report['repos_migrated']}[/bold] repo(s) migrated, "
+        f"[bold]{report['repos_failed']}[/bold] failed, "
+        f"[bold]{report['candidates_created']}[/bold] candidate note(s) created "
+        f"from core-memories."
+    )
+    for repo_path, rep in report["repos"].items():
+        if rep["status"] == "failed":
+            console.print(
+                f"[red][FAIL][/red] {_rich_escape(rep.get('repo_short', repo_path))}: "
+                f"{_rich_escape(str(rep.get('reason') or 'verification mismatch'))} "
+                "(nothing imported for this repo)"
+            )
+
+    any_failed = report["repos_failed"] > 0
+    migrated_any = report["repos_migrated"] > 0
+
+    if migrated_any and not any_failed and not keep_plugin:
+        res_path = _migrate._settings_path(home)
+        if sys.stdin.isatty():
+            console.print(
+                f"\nThe remember plugin '{_migrate.REMEMBER_PLUGIN_ID}' can now be retired. "
+                f"This will disable it in {_rich_escape(str(res_path))}; "
+                "your .remember sources stay on disk, untouched."
+            )
+            if click.confirm("Retire the remember plugin now?", default=False):
+                res = _migrate.retire_remember_plugin(home)
+                console.print(
+                    f"[green][OK][/green] Disabled '{_rich_escape(res['plugin'])}' in "
+                    f"{_rich_escape(res['settings_path'])}."
+                )
+            else:
+                console.print("[dim]Left the remember plugin enabled.[/dim]")
+        else:
+            console.print(
+                f"\n[dim]Not retiring the remember plugin (no interactive terminal). "
+                f"Rerun `jacked memory migrate` in a terminal to disable "
+                f"'{_rich_escape(_migrate.REMEMBER_PLUGIN_ID)}', or leave it; "
+                "your sources are safe either way.[/dim]"
+            )
+
+    if any_failed:
+        raise SystemExit(2)
+
+
+def _memory_migrate_status_cell(status: str) -> str:
+    if status == "migrated":
+        return "[green]migrated[/green]"
+    if status == "failed":
+        return "[red]failed[/red]"
+    return f"[dim]{_rich_escape(status)}[/dim]"
 
 
 @memory_group.command(name="mark-groomed", hidden=True)
