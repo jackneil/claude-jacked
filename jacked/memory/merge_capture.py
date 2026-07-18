@@ -151,6 +151,13 @@ def _capture_one_merge(
     else:
         note = parsed
 
+    # Provenance: a PR-derived note carries content that may originate from a
+    # contributor, not the operator; the tag lets recall/librarian treat it
+    # accordingly (candidate notes are already excluded from the recall brief).
+    if pr_number:
+        note = dict(note)
+        note["tags"] = [*note.get("tags", []), f"pr-{pr_number}"]
+
     _write_merge_note(vault, home, group, identity, note)
     return True
 

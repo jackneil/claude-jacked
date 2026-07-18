@@ -510,3 +510,34 @@ def test_cli_capture_merge_exits_zero_when_everything_raises(env, monkeypatch):
     monkeypatch.setattr("jacked.memory.merge_capture.capture_merge", boom)
     r = CliRunner().invoke(main, ["memory", "capture-merge", "--repo", str(env.tmp)])
     assert r.exit_code == 0
+
+
+def test_pr_merge_note_carries_pr_provenance_tag(env, monkeypatch):
+    """A note distilled from a PR merge is tagged pr-<n>: its content may
+    originate from a contributor, and recall/librarian treat provenance-tagged
+    candidates accordingly (CSO hardening)."""
+    _init_vault(env)
+    repo = _merge_repo(env.tmp / "widget")
+    _do_merge(repo, message="Merge pull request #77 from o/b")
+    monkeypatch.setattr(merge_capture.shutil, "which", lambda name: None)
+    _mock_distill(monkeypatch, '{"title": "Landed PR 77", "body": "PR body.", "tags": ["x"]}')
+
+    merge_capture.capture_merge(str(repo))
+    notes = _decision_notes(env.vault)
+    assert len(notes) == 1
+    meta, _ = vault_mod.read_note(notes[0])
+    assert "pr-77" in meta["tags"]
+    assert "candidate" in meta["tags"] and "merge" in meta["tags"]
+
+
+def test_branch_merge_note_has_no_pr_tag(env, no_gh, monkeypatch):
+    _init_vault(env)
+    repo = _merge_repo(env.tmp / "widget")
+    _do_merge(repo, message="Merge branch 'feature/x'")
+    _mock_distill(monkeypatch, '{"title": "Landed branch", "body": "Body.", "tags": []}')
+
+    merge_capture.capture_merge(str(repo))
+    notes = _decision_notes(env.vault)
+    assert len(notes) == 1
+    meta, _ = vault_mod.read_note(notes[0])
+    assert not any(t.startswith("pr-") for t in meta["tags"])

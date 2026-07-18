@@ -533,3 +533,56 @@ def test_status_no_migration_line_when_none(env):
     r = CliRunner().invoke(main, ["memory", "status"])
     assert r.exit_code == 0
     assert "migration:" not in env.buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Symlinked sources are refused (CSO hardening)
+# --------------------------------------------------------------------------- #
+
+def test_symlinked_source_file_is_skipped_never_copied(env):
+    """A symlink planted in .remember (e.g. today-x.md -> a sensitive file)
+    migrates NOTHING for that link: the target's content must never be copied
+    into the vault. Regular sibling files still migrate, and the skip is loud
+    in the report."""
+    root, repo = _fixture_repo(env)
+    secret = env.tmp / "sensitive.txt"
+    secret.write_text("## 01:00 | x\nTOP-SECRET-CONTENT\n", encoding="utf-8")
+    link = repo / ".remember" / "today-2026-06-01.md"
+    link.symlink_to(secret)
+    _init(env, root)
+    _neutral_cwd(env)
+
+    report = migrate_mod.migrate(env.vault, env.home, roots=[root])
+    rep = report["repos"][str(repo)]
+
+    assert rep["status"] == "migrated"
+    assert "today-2026-06-01.md" in rep.get("skipped_symlinks", [])
+    assert "today-2026-06-01.md" not in rep["files"]
+    # The secret content is nowhere in the vault.
+    vault_blob = "".join(
+        p.read_text(encoding="utf-8", errors="replace")
+        for p in env.vault.rglob("*.md") if p.is_file()
+    )
+    assert "TOP-SECRET-CONTENT" not in vault_blob
+    # The symlink itself is untouched on the source side.
+    assert link.is_symlink()
+
+
+def test_symlinked_now_md_is_skipped(env):
+    root, repo = _fixture_repo(env)
+    secret = env.tmp / "sensitive2.txt"
+    secret.write_text("## 02:00 | x\nNOW-SECRET\n", encoding="utf-8")
+    now = repo / ".remember" / "now.md"
+    now.unlink()
+    now.symlink_to(secret)
+    _init(env, root)
+    _neutral_cwd(env)
+
+    report = migrate_mod.migrate(env.vault, env.home, roots=[root])
+    rep = report["repos"][str(repo)]
+    assert "now.md" in rep.get("skipped_symlinks", [])
+    vault_blob = "".join(
+        p.read_text(encoding="utf-8", errors="replace")
+        for p in env.vault.rglob("*.md") if p.is_file()
+    )
+    assert "NOW-SECRET" not in vault_blob

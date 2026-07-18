@@ -456,3 +456,16 @@ def test_settings_js_has_migration_toast_and_guard():
     # The toast copy must be em-dash free (user-facing).
     toast_line = next(ln for ln in js.splitlines() if "run jacked memory migrate to import" in ln)
     assert "—" not in toast_line
+
+
+def test_remove_memory_hooks_tolerates_corrupt_settings(menv):
+    """A corrupt settings.json must not abort uninstall: removal returns False,
+    prints a notice, and leaves the file byte-identical (CSO hardening)."""
+    import jacked.cli as cli_mod
+
+    settings_path = menv.home / ".claude" / "settings.json"
+    settings_path.write_text("{ this is not json", encoding="utf-8")
+    before = settings_path.read_bytes()
+
+    assert cli_mod._remove_memory_hooks(settings_path) is False
+    assert settings_path.read_bytes() == before

@@ -335,16 +335,25 @@ def _migrate_one(vault: Path, repo_path: Path, remember_dir: Path, staging_root:
             "candidates_created": candidates,
             "status": status,
             "reason": reason,
+            "skipped_symlinks": skipped_symlinks,
         }
 
     current_today_name = f"today-{_today_local()}.md"
 
+    skipped_symlinks: list[str] = []
+
     # now.md: read once; it folds into the current day's today file (not copied
-    # as its own file). Only a non-empty buffer folds in.
+    # as its own file). Only a non-empty buffer folds in. Symlinked sources are
+    # refused: reads follow links, so a hostile repo could plant
+    # `.remember/now.md -> <sensitive file>` and have its content copied into
+    # the vault (and pushed to any vault remote). Skipped loudly, never silently.
     now_text = ""
     now_entries = 0
     now_file = remember_dir / "now.md"
-    if now_file.is_file():
+    if now_file.is_symlink():
+        skipped_symlinks.append(now_file.name)
+        logger.warning("memory migrate: skipping symlinked source %s", now_file)
+    elif now_file.is_file():
         now_text = now_file.read_bytes().decode("utf-8", "replace")
         if now_text.strip():
             now_entries = _count_entries(now_text)
@@ -354,9 +363,17 @@ def _migrate_one(vault: Path, repo_path: Path, remember_dir: Path, staging_root:
     current_today_source_entries = 0
 
     # today-*.md (and .done.md) then the singletons -- all copied VERBATIM.
-    today_files = sorted(p for p in remember_dir.glob("today-*.md") if p.is_file())
+    # Same symlink refusal as now.md above: only regular files migrate.
+    def _regular(p: Path) -> bool:
+        if p.is_symlink():
+            skipped_symlinks.append(p.name)
+            logger.warning("memory migrate: skipping symlinked source %s", p)
+            return False
+        return p.is_file()
+
+    today_files = sorted(p for p in remember_dir.glob("today-*.md") if _regular(p))
     singletons = [remember_dir / n for n in _SINGLETON_FILES if n != "now.md"]
-    verbatim = [*today_files, *(s for s in singletons if s.is_file())]
+    verbatim = [*today_files, *(s for s in singletons if s.exists() and _regular(s))]
 
     for src in verbatim:
         src_bytes = src.read_bytes()

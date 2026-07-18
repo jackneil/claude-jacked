@@ -2112,7 +2112,18 @@ def _remove_memory_hooks(settings_path: Path) -> bool:
     if not settings_path.exists():
         return False
 
-    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    # Tolerant read + atomic write (the repo-wide settings-writer pattern): a
+    # corrupt settings.json must not abort the wider uninstall flow, and a
+    # partial write must never be able to clobber the user's settings.
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        console.print(
+            "[yellow]settings.json is unreadable; skipping memory hook removal[/yellow]"
+        )
+        return False
+    if not isinstance(settings, dict):
+        return False
 
     from jacked.memory import hooks_config
 
@@ -2120,7 +2131,7 @@ def _remove_memory_hooks(settings_path: Path) -> bool:
     changed = hooks_config.remove_recall_entries(settings) or changed
 
     if changed:
-        settings_path.write_text(json.dumps(settings, indent=2))
+        _write_settings_atomic(settings_path, settings)
         console.print("[green][OK][/green] Removed memory hooks")
         return True
 
@@ -4355,6 +4366,13 @@ def memory_migrate(roots: tuple, yes: bool, keep_plugin: bool):
                 f"[red][FAIL][/red] {_rich_escape(rep.get('repo_short', repo_path))}: "
                 f"{_rich_escape(str(rep.get('reason') or 'verification mismatch'))} "
                 "(nothing imported for this repo)"
+            )
+        skipped_links = rep.get("skipped_symlinks") or []
+        if skipped_links:
+            console.print(
+                f"[yellow][SKIP][/yellow] {_rich_escape(rep.get('repo_short', repo_path))}: "
+                f"symlinked source file(s) refused: "
+                f"{_rich_escape(', '.join(skipped_links))}"
             )
 
     any_failed = report["repos_failed"] > 0
