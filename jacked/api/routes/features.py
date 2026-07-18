@@ -283,9 +283,22 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
     if hook_name == "memory_vault":
         # Installed when a memory-capture entry exists — reuse the installer's
         # own anchor logic so detection never re-implements the string math.
+        # Read the SAME settings file the toggle writes: the memory engine
+        # resolves its home via jacked_home() ($JACKED_HOME-aware), while this
+        # module's SETTINGS_JSON is pinned to Path.home() — under a redirected
+        # home those diverge and the checkbox would misreport its own toggle.
         from jacked.memory import hooks_config
+        from jacked.memory import vault as memory_vault_mod
 
-        return hooks_config.has_capture_entry(settings)
+        mem_settings = settings
+        mem_path = memory_vault_mod.jacked_home() / ".claude" / "settings.json"
+        if mem_path != SETTINGS_JSON:
+            try:
+                loaded = json.loads(mem_path.read_text(encoding="utf-8"))
+                mem_settings = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                mem_settings = {}
+        return hooks_config.has_capture_entry(mem_settings)
 
     return False
 
