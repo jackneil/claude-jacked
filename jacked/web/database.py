@@ -1163,6 +1163,8 @@ class Database:
         clear_seven_day to null that window's columns instead — otherwise a
         dead window's last reading survives forever (a Codex weekly-only
         account kept showing 100% "7d" from a window that expired days ago).
+        A clear_* flag takes precedence over any value passed for the same
+        window: the percent and resets_at columns are nulled together.
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
