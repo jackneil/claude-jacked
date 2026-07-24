@@ -39,6 +39,27 @@ RECORDED_RESULT = {
     "rateLimitResetCredits": {"availableCount": 0},
 }
 
+# Verbatim result captured live 2026-07-23: the weekly-only shape. secondary
+# is null and the lone primary IS the weekly window (windowDurationMins
+# 10080). Mapping positionally here filed the weekly percent under "5h" and
+# left a dead 100% frozen in the "7d" cache (#weekly-only regression).
+WEEKLY_ONLY_RESULT = {
+    "rateLimits": {
+        "limitId": "codex",
+        "limitName": None,
+        "primary": {"usedPercent": 23, "windowDurationMins": 10080, "resetsAt": 1785266094},
+        "secondary": None,
+        "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+        "individualLimit": None,
+        "planType": "pro",
+        "rateLimitReachedType": None,
+    },
+    "rateLimitsByLimitId": {
+        "codex": {"limitId": "codex", "primary": {"usedPercent": 23}, "planType": "pro"},
+    },
+    "rateLimitResetCredits": {"availableCount": 0, "credits": []},
+}
+
 
 # --------------------------------------------------------------------------
 # Normalizer
@@ -58,6 +79,108 @@ def test_normalize_converts_epoch_resets_to_iso():
     assert datetime.fromisoformat(five) == datetime.fromtimestamp(
         1782683811, tz=timezone.utc
     )
+
+
+def test_normalize_weekly_only_primary_lands_in_7d():
+    # windowDurationMins wins over position: a lone weekly primary must land
+    # in seven_day, leaving five_hour empty — not the other way around.
+    norm = cu.normalize_rate_limits(WEEKLY_ONLY_RESULT)
+    assert norm["seven_day"]["utilization"] == 23
+    assert norm["seven_day"]["reported"] is True
+    assert datetime.fromisoformat(norm["seven_day"]["resets_at"]) == datetime.fromtimestamp(
+        1785266094, tz=timezone.utc
+    )
+    assert norm["five_hour"]["utilization"] is None
+    assert norm["five_hour"]["resets_at"] is None
+    assert norm["five_hour"]["reported"] is False
+    # Explicit null secondary + recognized duration = authoritative shape.
+    assert norm["windows_complete"] is True
+
+
+def test_normalize_positional_fallback_without_durations():
+    # Old payloads without windowDurationMins keep the legacy mapping — but
+    # an un-understood shape is NOT authoritative (must never drive a clear).
+    norm = cu.normalize_rate_limits({"rateLimits": {
+        "primary": {"usedPercent": 4, "resetsAt": 1782683811},
+        "secondary": {"usedPercent": 40, "resetsAt": 1783199300},
+    }})
+    assert norm["five_hour"]["utilization"] == 4
+    assert norm["seven_day"]["utilization"] == 40
+    assert norm["windows_complete"] is False
+
+
+def test_normalize_drops_second_window_for_same_slot(caplog):
+    # Two weekly-duration windows must not misfile one under "5h": the first
+    # keeps the seven_day slot, the second is dropped — LOUDLY (a drop means
+    # codex changed shape; DEBUG would be invisible in the running server).
+    with caplog.at_level("WARNING", logger="jacked.codex.usage"):
+        norm = cu.normalize_rate_limits({"rateLimits": {
+            "primary": {"usedPercent": 11, "windowDurationMins": 10080, "resetsAt": 1785266094},
+            "secondary": {"usedPercent": 99, "windowDurationMins": 20160, "resetsAt": 1785266094},
+        }})
+    assert norm["seven_day"]["utilization"] == 11
+    assert norm["five_hour"]["utilization"] is None
+    assert norm["windows_complete"] is False  # a drop vetoes clearing
+    assert any("dropping codex rate-limit window" in r.message for r in caplog.records)
+
+
+def test_normalize_fallback_logs_warning(caplog):
+    # A present window without a usable duration is the "shape changed"
+    # signal — it must warn at default log level, not debug.
+    cu._warned_shapes.clear()  # per-process throttle: isolate from other tests
+    with caplog.at_level("WARNING", logger="jacked.codex.usage"):
+        cu.normalize_rate_limits({"rateLimits": {
+            "primary": {"usedPercent": 4, "resetsAt": 1782683811},
+            "secondary": None,
+        }})
+    assert any("no usable windowDurationMins" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("bad_dur", [True, False, "10080", float("nan"), -5, 0, None, {}])
+def test_normalize_unusable_durations_fall_back_positional(bad_dur):
+    # JSON true is an int to Python (True < 1440 would classify as 5h); NaN
+    # compares False everywhere; strings/objects/negatives are garbage. All
+    # must take the positional fallback, never duration classification.
+    norm = cu.normalize_rate_limits({"rateLimits": {
+        "primary": {"usedPercent": 7, "windowDurationMins": bad_dur, "resetsAt": 1782683811},
+        "secondary": None,
+    }})
+    assert norm["five_hour"]["utilization"] == 7  # positional: primary → 5h
+    assert norm["seven_day"]["utilization"] is None
+    assert norm["windows_complete"] is False
+
+
+def test_normalize_duration_boundary_and_float():
+    # Exactly 1440 (one day) is NOT the short window; float durations count.
+    norm = cu.normalize_rate_limits({"rateLimits": {
+        "primary": {"usedPercent": 9, "windowDurationMins": 1440, "resetsAt": 1785266094},
+        "secondary": {"usedPercent": 3, "windowDurationMins": 300.0, "resetsAt": 1782683811},
+    }})
+    assert norm["seven_day"]["utilization"] == 9
+    assert norm["five_hour"]["utilization"] == 3
+    assert norm["windows_complete"] is True
+
+
+def test_normalize_secondary_only_classified_by_duration():
+    # primary null, secondary present: duration classification, not position.
+    norm = cu.normalize_rate_limits({"rateLimits": {
+        "primary": None,
+        "secondary": {"usedPercent": 55, "windowDurationMins": 300, "resetsAt": 1782683811},
+    }})
+    assert norm["five_hour"]["utilization"] == 55
+    assert norm["seven_day"]["utilization"] is None
+    assert norm["seven_day"]["reported"] is False
+    assert norm["windows_complete"] is True
+
+
+def test_normalize_partial_payload_is_not_authoritative():
+    # secondary KEY entirely absent (not an explicit null): possibly a
+    # truncated/degraded read — never authoritative, never clears.
+    norm = cu.normalize_rate_limits({"rateLimits": {
+        "primary": {"usedPercent": 2, "windowDurationMins": 300, "resetsAt": 1782683811},
+    }})
+    assert norm["five_hour"]["utilization"] == 2
+    assert norm["windows_complete"] is False
 
 
 def test_normalize_handles_missing_windows():
@@ -107,6 +230,269 @@ def test_fetch_codex_usage_writes_cache(db, tmp_path, monkeypatch):
     assert row["cached_5h_resets_at"] is not None
     assert row["cached_7d_resets_at"] is not None
     assert row["usage_cached_at"] is not None
+
+
+def test_fetch_weekly_only_clears_stale_5h_and_updates_7d(db, tmp_path, monkeypatch):
+    """The weekly-only regression: a dead window's cache must be CLEARED.
+
+    Seed the cache as the old positional bug left it (weekly percent under
+    "5h", a frozen 100% under "7d"), then fetch the weekly-only payload: the
+    real weekly usage must land in 7d and the 5h columns must go NULL — not
+    keep serving the stale reading to the dashboard and auto-swap.
+    """
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(
+        acct["id"],
+        five_hour=23.0,
+        seven_day=100.0,
+        five_hour_resets_at="2026-07-28T19:14:54+00:00",
+        seven_day_resets_at="2026-07-18T06:04:44+00:00",
+    )
+
+    async def fake_read(**kwargs):
+        return WEEKLY_ONLY_RESULT
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is not None
+
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_7d"] == 23
+    assert row["cached_7d_resets_at"] is not None
+    assert row["cached_usage_5h"] is None
+    assert row["cached_5h_resets_at"] is None
+
+
+def test_fetch_5h_only_clears_stale_7d_and_updates_5h(db, tmp_path, monkeypatch):
+    """Mirror of the weekly-only case: a 5h-only authoritative payload must
+    clear the dead 7d column and file the 5h percent correctly."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(acct["id"], five_hour=50.0, seven_day=90.0)
+
+    async def fake_read(**kwargs):
+        return {"rateLimits": {
+            "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1782683811},
+            "secondary": None,
+            "planType": "pro",
+        }}
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is not None
+
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] == 12
+    assert row["cached_usage_7d"] is None
+    assert row["cached_7d_resets_at"] is None
+
+
+def test_fetch_partial_read_preserves_other_window(db, tmp_path, monkeypatch):
+    """A degraded read (secondary KEY absent, not an explicit null) must NOT
+    clear the other window — 'absent from this read' is not 'gone forever'."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(
+        acct["id"], seven_day=85.0, seven_day_resets_at="2026-07-28T19:14:54+00:00"
+    )
+
+    async def fake_read(**kwargs):
+        return {"rateLimits": {
+            "primary": {"usedPercent": 5, "windowDurationMins": 300, "resetsAt": 1782683811},
+            "planType": "pro",
+        }}
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is not None
+
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] == 5
+    assert row["cached_usage_7d"] == 85.0  # preserved, not destroyed
+    assert row["cached_7d_resets_at"] == "2026-07-28T19:14:54+00:00"
+
+
+def test_fetch_unrecognized_shape_never_clears(db, tmp_path, monkeypatch):
+    """A weekly-only account whose duration field got renamed falls back to
+    positional (weekly% lands under 5h — wrong but visible via WARNING); the
+    un-understood shape must NOT also clear the 7d column."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(acct["id"], seven_day=23.0)
+
+    async def fake_read(**kwargs):
+        return {"rateLimits": {
+            "primary": {"usedPercent": 31, "windowDurationMinutes": 10080, "resetsAt": 1785266094},
+            "secondary": None,
+            "planType": "pro",
+        }}
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is not None
+
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_7d"] == 23.0  # fallback shape may never clear
+
+
+def test_fetch_all_none_read_preserves_seeded_cache(db, tmp_path, monkeypatch):
+    """The degraded-read invariant, pinned directly: an empty payload must
+    leave previously cached usage untouched."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(acct["id"], five_hour=23.0, seven_day=42.0)
+
+    async def empty(**kwargs):
+        return {"rateLimits": {}}
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", empty)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is None
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] == 23.0
+    assert row["cached_usage_7d"] == 42.0
+
+
+def test_fetch_proceeds_when_root_identity_matches(db, tmp_path, monkeypatch):
+    """The PRODUCTION path of the TOCTOU guard: the real ~/.codex always has
+    an auth.json matching the polled account, so the re-check must match and
+    PROCEED to read + write. A regression in the identity comparison would
+    make every real poll skip silently while auth-less test rigs stay green —
+    this test pins the proceed branch."""
+    home = tmp_path / ".codex"
+    home.mkdir()
+    acct = db.create_account(
+        "dev@example.com", "tok", cu.time.time() + 99999, provider="codex"
+    )
+    (home / "auth.json").write_text(json.dumps(_root_auth("", "dev@example.com")))
+
+    called = []
+
+    async def fake_read(**kwargs):
+        called.append(1)
+        return WEEKLY_ONLY_RESULT
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=home))
+    assert result is not None
+    assert called == [1]
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_7d"] == 23
+
+
+def test_fetch_resets_at_only_travels_with_its_percent(db, tmp_path, monkeypatch):
+    """A window carrying resetsAt but no usedPercent must not pair a fresh
+    reset time with the preserved stale percent."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(
+        acct["id"], five_hour=40.0, five_hour_resets_at="2026-07-20T00:00:00+00:00"
+    )
+
+    async def fake_read(**kwargs):
+        return {"rateLimits": {
+            # 5h window reported, but degraded: resetsAt without usedPercent
+            "primary": {"windowDurationMins": 300, "resetsAt": 1785266094},
+            "secondary": {"usedPercent": 9, "windowDurationMins": 10080, "resetsAt": 1785266094},
+            "planType": "pro",
+        }}
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is not None
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] == 40.0  # stale percent preserved...
+    assert row["cached_5h_resets_at"] == "2026-07-20T00:00:00+00:00"  # ...with ITS reset time
+    assert row["cached_usage_7d"] == 9
+
+
+def test_fallback_warning_throttles_to_debug_on_repeat(caplog):
+    """The steady-state fallback (old codex client) warns once per shape per
+    process, then drops to DEBUG — WARNING must stay signal, not noise."""
+    cu._warned_shapes.clear()
+    payload = {"rateLimits": {
+        "primary": {"usedPercent": 4, "resetsAt": 1782683811},
+        "secondary": None,
+    }}
+    with caplog.at_level("DEBUG", logger="jacked.codex.usage"):
+        cu.normalize_rate_limits(payload)
+        cu.normalize_rate_limits(payload)
+    warnings = [r for r in caplog.records
+                if r.levelname == "WARNING" and "windowDurationMins" in r.message]
+    assert len(warnings) == 1
+
+
+def test_update_usage_cache_none_still_preserves_without_clear(db):
+    """Partial updates (the Anthropic path) keep their None-skips: only an
+    explicit clear flag nulls a column."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999)
+    db.update_account_usage_cache(acct["id"], five_hour=10.0, seven_day=20.0)
+    db.update_account_usage_cache(acct["id"], five_hour=11.0)  # 7d untouched
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] == 11.0
+    assert row["cached_usage_7d"] == 20.0
+    db.update_account_usage_cache(acct["id"], seven_day=21.0, clear_five_hour=True)
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] is None
+    assert row["cached_usage_7d"] == 21.0
+
+
+def test_update_usage_cache_clear_beats_passed_values(db):
+    """clear_* wins over a value AND a resets_at passed for the same window —
+    percent and resets_at are nulled together, never left half-set."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999)
+    db.update_account_usage_cache(
+        acct["id"], five_hour=10.0, five_hour_resets_at="2026-07-28T00:00:00+00:00"
+    )
+    db.update_account_usage_cache(
+        acct["id"],
+        five_hour=99.0,
+        five_hour_resets_at="2026-07-29T00:00:00+00:00",
+        clear_five_hour=True,
+    )
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] is None
+    assert row["cached_5h_resets_at"] is None
+    # And the seven-day twin — the symmetric guard must hold on both windows.
+    db.update_account_usage_cache(
+        acct["id"], seven_day=20.0, seven_day_resets_at="2026-07-28T00:00:00+00:00"
+    )
+    db.update_account_usage_cache(
+        acct["id"],
+        seven_day=88.0,
+        seven_day_resets_at="2026-07-30T00:00:00+00:00",
+        clear_seven_day=True,
+    )
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_7d"] is None
+    assert row["cached_7d_resets_at"] is None
+
+
+def test_fetch_skips_write_when_root_swapped_under_gate(db, tmp_path, monkeypatch):
+    """TOCTOU guard: the live-account gate runs outside the swap lock, so a
+    swap can land account B in the root before the poll takes the lock. The
+    in-lock identity re-check must skip the read — B's usage (or B's window
+    shape clearing columns) must never be written under A's id."""
+    home = tmp_path / ".codex"
+    home.mkdir()
+    acct_a = db.create_account(
+        "dev-a@example.com", "tok", cu.time.time() + 99999, provider="codex"
+    )
+    db.create_account(
+        "dev-b@example.com", "tok", cu.time.time() + 99999, provider="codex"
+    )
+    db.update_account_usage_cache(acct_a["id"], five_hour=40.0, seven_day=60.0)
+    # The root now holds B (the swap completed after the caller's gate).
+    (home / "auth.json").write_text(json.dumps(_root_auth("", "dev-b@example.com")))
+
+    called = []
+
+    async def fake_read(**kwargs):
+        called.append(1)
+        return WEEKLY_ONLY_RESULT
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct_a["id"], db, home=home))
+    assert result == {"_cached": True}
+    assert called == []  # never even spawned the app-server
+    row = db.get_account(acct_a["id"])
+    assert row["cached_usage_5h"] == 40.0  # A's cache untouched
+    assert row["cached_usage_7d"] == 60.0
 
 
 def test_fetch_codex_usage_records_error_on_failure(db, tmp_path, monkeypatch):

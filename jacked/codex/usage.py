@@ -1,13 +1,22 @@
 """Codex usage via the ``codex app-server`` JSON-RPC interface.
 
-Codex (ChatGPT-plan-backed) exposes the same 5h + weekly window shape Claude
-does. The officially documented, machine-readable source is ``codex
-app-server`` (newline-delimited JSON-RPC over stdin/stdout): after
-``initialize`` + ``initialized`` we call ``account/rateLimits/read`` and get
-``result.rateLimits.primary`` (5h) and ``.secondary`` (weekly), each with
-``usedPercent`` + ``resetsAt`` (unix epoch). We normalize that to jacked's
-``five_hour``/``seven_day`` shape and write the same cache columns the Anthropic
-path uses, so every downstream consumer (menubar, panel, auto-swap) is unchanged.
+Codex (ChatGPT-plan-backed) exposes up to two rate-limit windows. The
+officially documented, machine-readable source is ``codex app-server``
+(newline-delimited JSON-RPC over stdin/stdout): after ``initialize`` +
+``initialized`` we call ``account/rateLimits/read`` and get
+``result.rateLimits.primary`` / ``.secondary``, each with ``usedPercent``,
+``windowDurationMins`` and ``resetsAt`` (unix epoch). Historically primary was
+the 5h window and secondary the weekly one, but the shape is NOT positional
+anymore: weekly-only accounts report a lone primary with
+``windowDurationMins=10080`` and ``secondary: null``. So we classify each
+window by its duration (positional only as a fallback) and normalize to
+jacked's ``five_hour``/``seven_day`` shape, writing the same cache columns the
+Anthropic path uses, so every downstream consumer (menubar, panel, auto-swap)
+is unchanged. A window an AUTHORITATIVE payload no longer reports gets its
+cache column CLEARED — otherwise a dead window's last reading survives forever
+(a weekly-only account kept showing a stale 100% "7d" from a window that
+expired days earlier). A partial or unrecognized payload never clears: it
+preserves the last known value and logs a WARNING instead.
 
 This is NOT the ToS-risky chatgpt.com backend scrape and NOT the rollout-jsonl
 file (null since gpt-5.4) — it's the supported RPC.
@@ -18,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import time
@@ -40,26 +50,125 @@ class CodexUsageError(Exception):
     """The codex app-server call failed (no binary, timeout, RPC error)."""
 
 
+# A window under a day (24 * 60 minutes) is the "short" (5h-style) window;
+# anything longer is the weekly one. Today's real durations are 300 and 10080.
+_SHORT_WINDOW_MAX_MINS = 1440
+
+# Payload anomalies already warned about this process — steady-state repeats
+# (an old codex client on every poll) drop to DEBUG so WARNING stays signal.
+_warned_shapes: set = set()
+
+
+def _usable_duration(dur) -> bool:
+    """A duration we may classify by: a finite positive number.
+
+    ``bool`` is excluded explicitly — JSON ``true`` is an ``int`` to Python
+    and would otherwise classify as a 5h window (``True < 1440``). NaN and
+    non-positive values fall back to positional mapping too.
+    """
+    if not isinstance(dur, (int, float)) or isinstance(dur, bool):
+        return False
+    return math.isfinite(dur) and dur > 0
+
+
+def _classify_windows(primary, secondary) -> dict:
+    """Assign the app-server windows to the ``five_hour``/``seven_day`` slots.
+
+    Classify by ``windowDurationMins`` when usable (weekly-only accounts
+    report a lone primary with 10080); fall back to the legacy positional
+    mapping (primary=5h, secondary=weekly) only when the duration is missing
+    or unusable. A window that would land in an occupied slot is dropped
+    rather than misfiled — the cache columns are literally "5h" and "7d", and
+    a wrong column is worse than an empty one.
+
+    Returns ``{"five_hour": window|None, "seven_day": window|None,
+    "dropped": bool, "fallback": bool}``. ``dropped``/``fallback`` flag the
+    two states where the payload shape was NOT fully understood — both log a
+    WARNING (a shape change must be visible in default-level logs, not
+    silently misfiled: that is how the positional bug shipped) and both veto
+    cache clearing downstream.
+    """
+    slots: dict = {
+        "five_hour": None,
+        "seven_day": None,
+        "dropped": False,
+        "fallback": False,
+    }
+    for positional_slot, window in (
+        ("five_hour", primary),
+        ("seven_day", secondary),
+    ):
+        if not window:
+            continue
+        dur = window.get("windowDurationMins")
+        if _usable_duration(dur):
+            slot = "five_hour" if dur < _SHORT_WINDOW_MAX_MINS else "seven_day"
+        else:
+            slot = positional_slot
+            slots["fallback"] = True
+            # WARNING once per distinct shape, DEBUG after: an old codex
+            # client that simply lacks the field is a stable steady state,
+            # and a per-poll WARNING would train people to ignore warnings.
+            key = f"fallback:{positional_slot}:{dur!r}"
+            log = logger.debug if key in _warned_shapes else logger.warning
+            _warned_shapes.add(key)
+            log(
+                "codex rate-limit window has no usable windowDurationMins "
+                "(got %r) — using positional %s mapping; the app-server "
+                "payload shape may have changed or the codex client is old",
+                dur, positional_slot,
+            )
+        if slots[slot] is None:
+            slots[slot] = window
+        else:
+            slots["dropped"] = True
+            logger.warning(
+                "dropping codex rate-limit window that also classifies as "
+                "%s: %r — the app-server payload shape may have changed",
+                slot, window,
+            )
+    return slots
+
+
 def normalize_rate_limits(result: Mapping) -> dict:
     """Map an ``account/rateLimits/read`` result to jacked's two-window shape.
 
-    Returns ``{"five_hour": {"utilization", "resets_at"}, "seven_day": {...},
-    "plan_type", "credits", "reset_credits", "by_limit"}``. Utilization is the
-    app-server ``usedPercent``; resets_at is an ISO string.
+    Returns ``{"five_hour": {"utilization", "resets_at", "reported"},
+    "seven_day": {...}, "windows_complete", "plan_type", "credits",
+    "reset_credits", "by_limit"}``. Utilization is the app-server
+    ``usedPercent``; resets_at is an ISO string. A window Codex did not
+    report comes back as ``{"utilization": None, "resets_at": None,
+    "reported": False}``.
+
+    ``windows_complete`` is True only when the payload was AUTHORITATIVE
+    about which windows exist: both window keys present (an explicit null
+    counts as present), every present window classified by a recognized
+    duration, and nothing dropped. Only then may an empty slot be read as
+    "this window no longer exists" — a partial or unrecognized payload must
+    preserve the last known cache, never clear it.
     """
     result = result or {}
     rl = result.get("rateLimits") or {}
-    primary = rl.get("primary") or {}
-    secondary = rl.get("secondary") or {}
+    slots = _classify_windows(rl.get("primary"), rl.get("secondary"))
+    five = slots["five_hour"] or {}
+    seven = slots["seven_day"] or {}
     return {
         "five_hour": {
-            "utilization": primary.get("usedPercent"),
-            "resets_at": _epoch_to_iso(primary.get("resetsAt")),
+            "utilization": five.get("usedPercent"),
+            "resets_at": _epoch_to_iso(five.get("resetsAt")),
+            "reported": slots["five_hour"] is not None,
         },
         "seven_day": {
-            "utilization": secondary.get("usedPercent"),
-            "resets_at": _epoch_to_iso(secondary.get("resetsAt")),
+            "utilization": seven.get("usedPercent"),
+            "resets_at": _epoch_to_iso(seven.get("resetsAt")),
+            "reported": slots["seven_day"] is not None,
         },
+        "windows_complete": (
+            "primary" in rl
+            and "secondary" in rl
+            and not slots["dropped"]
+            and not slots["fallback"]
+        ),
         "plan_type": rl.get("planType"),
         "credits": rl.get("credits"),
         "reset_credits": result.get("rateLimitResetCredits"),
@@ -223,13 +332,29 @@ async def fetch_codex_usage(
     # spawn can rotate the root's single-use refresh token, so it must not
     # overlap a swap (that would lose the rotation, #15502). Non-blocking — if a
     # swap holds the lock, skip this poll and keep the cached usage.
-    from .switching import _codex_swap_lock
+    from .credentials import extract_identity, read_auth_json
+    from .switching import _codex_swap_lock, find_codex_account_id
 
     lock_base = home if home is not None else codex_home(env)
     with _codex_swap_lock(lock_base, retries=1) as locked:
         if not locked:
             logger.debug("Codex usage poll skipped for %s — swap in progress", account_id)
             return {"_cached": True}
+        # TOCTOU guard: the caller's live-account gate runs OUTSIDE this lock,
+        # so a swap can complete in the gap and land another account in the
+        # root. Re-resolve the root's identity under the lock — a read of the
+        # wrong account must never be written (or clear columns) under this
+        # account_id. No auth.json means an unswappable rig (tests, custom
+        # home): nothing to re-verify, proceed.
+        auth = read_auth_json(lock_base, env)
+        if auth is not None:
+            live_id = find_codex_account_id(db, extract_identity(auth))
+            if live_id != account_id:
+                logger.info(
+                    "Codex usage poll skipped for %s — root now holds account %s",
+                    account_id, live_id,
+                )
+                return {"_cached": True}
         try:
             result = await read_codex_rate_limits(
                 home=home, env=env, codex_bin=codex_bin
@@ -264,12 +389,29 @@ async def fetch_codex_usage(
         except Exception:  # pragma: no cover
             logger.debug("record_account_error failed", exc_info=True)
         return None
+    # A window Codex AUTHORITATIVELY no longer reports must CLEAR its cache
+    # column — a weekly-only account's dead 5h/7d reading would otherwise
+    # persist forever (stale 100% displayed and fed to auto-swap). But only
+    # a complete, fully-understood payload may clear: a partial read, an
+    # unrecognized shape (fallback/drop), or a window present without a
+    # usedPercent preserves the last known value instead of destroying it.
+    clear_five = norm["windows_complete"] and not five["reported"]
+    clear_seven = norm["windows_complete"] and not seven["reported"]
     db.update_account_usage_cache(
         account_id,
         five_hour=five["utilization"],
         seven_day=seven["utilization"],
-        five_hour_resets_at=five["resets_at"],
-        seven_day_resets_at=seven["resets_at"],
+        # A resets_at only travels WITH its percent — a window that carries a
+        # resetsAt but no usedPercent must not pair a fresh reset time with
+        # the preserved stale percent.
+        five_hour_resets_at=(
+            five["resets_at"] if five["utilization"] is not None else None
+        ),
+        seven_day_resets_at=(
+            seven["resets_at"] if seven["utilization"] is not None else None
+        ),
+        clear_five_hour=clear_five,
+        clear_seven_day=clear_seven,
         raw=result,
     )
     # The rate-limits read carries the CURRENT ChatGPT plan — keep the stored
@@ -294,5 +436,21 @@ async def fetch_codex_usage(
         logger.debug("clear_account_errors failed", exc_info=True)
     if state is not None:
         state["last_fetched_at"] = time.time()
-    logger.info("Codex usage fetched for account %s", account_id)
+    # The one line the on-call reads: carry the window values AND any clear on
+    # it, so a card that blanks on the dashboard is explainable from default
+    # logs (a clear is data disappearing — it must never be silent).
+    logger.info(
+        "Codex usage fetched for account %s: 5h=%s 7d=%s",
+        account_id,
+        _window_log_state(five, clear_five),
+        _window_log_state(seven, clear_seven),
+    )
     return result
+
+
+def _window_log_state(window: Mapping, cleared: bool) -> str:
+    if cleared:
+        return "cleared (window no longer reported)"
+    if window["utilization"] is None:
+        return "kept (not in this read)"
+    return f"{window['utilization']}%"

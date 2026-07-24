@@ -1153,8 +1153,18 @@ class Database:
         five_hour_resets_at: Optional[str] = None,
         seven_day_resets_at: Optional[str] = None,
         raw: Optional[dict] = None,
+        clear_five_hour: bool = False,
+        clear_seven_day: bool = False,
     ) -> bool:
         """Update cached usage data for an account.
+
+        None values are skipped (partial updates keep the old cache). A
+        caller that KNOWS a window no longer exists passes clear_five_hour /
+        clear_seven_day to null that window's columns instead — otherwise a
+        dead window's last reading survives forever (a Codex weekly-only
+        account kept showing 100% "7d" from a window that expired days ago).
+        A clear_* flag takes precedence over any value passed for the same
+        window: the percent and resets_at columns are nulled together.
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
@@ -1162,15 +1172,25 @@ class Database:
         True
         >>> db.update_account_usage_cache(acct["id"], raw={"test": "data"})
         True
+        >>> db.update_account_usage_cache(acct["id"], clear_five_hour=True)
+        True
+        >>> db.get_account(acct["id"])["cached_usage_5h"] is None
+        True
         """
         updates: dict[str, Any] = {"usage_cached_at": int(time.time())}
-        if five_hour is not None:
+        if clear_five_hour:
+            updates["cached_usage_5h"] = None
+            updates["cached_5h_resets_at"] = None
+        elif five_hour is not None:
             updates["cached_usage_5h"] = five_hour
-        if seven_day is not None:
+        if clear_seven_day:
+            updates["cached_usage_7d"] = None
+            updates["cached_7d_resets_at"] = None
+        elif seven_day is not None:
             updates["cached_usage_7d"] = seven_day
-        if five_hour_resets_at is not None:
+        if not clear_five_hour and five_hour_resets_at is not None:
             updates["cached_5h_resets_at"] = five_hour_resets_at
-        if seven_day_resets_at is not None:
+        if not clear_seven_day and seven_day_resets_at is not None:
             updates["cached_7d_resets_at"] = seven_day_resets_at
         if raw is not None:
             raw_str = json.dumps(raw)
