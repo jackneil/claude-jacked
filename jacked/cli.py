@@ -2013,6 +2013,131 @@ def _remove_chain_of_command_hook(settings_path: Path) -> bool:
     return False
 
 
+def _install_memory_capture_hook(existing: dict, settings_path: Path):
+    """Install the memory-vault capture hooks (SessionEnd + PreCompact(auto)).
+
+    Both entries are async: the SessionEnd/PreCompact triage runs without
+    blocking Claude Code. Entry math is delegated to
+    ``jacked.memory.hooks_config`` so the CLI and the dashboard Features route
+    (M7) share one implementation. Not wired into ``_run_install`` yet (M7
+    handles install parity); directly testable in the meantime.
+    """
+    script_path = _get_data_root() / "hooks" / "memory_capture.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] Memory capture script not found: {script_path}"
+        )
+        console.print("[yellow]Skipping memory capture hook installation[/yellow]")
+        return
+
+    from jacked.memory import hooks_config
+
+    existing.setdefault("hooks", {})
+    command_str = _build_hook_command("memory_capture")
+
+    if not hooks_config.ensure_capture_entries(existing, command_str):
+        console.print("[yellow][-][/yellow] Memory capture hooks already configured")
+        return
+
+    _write_settings_atomic(settings_path, existing)
+    console.print(
+        "[green][OK][/green] Installed memory capture hooks (SessionEnd, PreCompact)"
+    )
+
+
+def _install_memory_recall_hook(existing: dict, settings_path: Path):
+    """Install the memory-vault recall hook (synchronous SessionStart).
+
+    Registers a SINGLE synchronous SessionStart hook whose stdout is injected
+    into the session context: the group-scoped memory brief. The entry is
+    SYNCHRONOUS on purpose (``hooks_config.ensure_recall_entry`` omits the
+    ``async`` key) because async SessionStart hooks do not inject stdout, and
+    injecting the brief is the whole point. Entry math is delegated to
+    ``jacked.memory.hooks_config`` so the CLI and the dashboard Features route
+    (M7) share one implementation. Not wired into ``_run_install`` yet (M7
+    handles install parity); directly testable in the meantime.
+    """
+    script_path = _get_data_root() / "hooks" / "memory_recall.py"
+
+    if not script_path.exists():
+        console.print(
+            f"[red][FAIL][/red] Memory recall script not found: {script_path}"
+        )
+        console.print("[yellow]Skipping memory recall hook installation[/yellow]")
+        return
+
+    from jacked.memory import hooks_config
+
+    existing.setdefault("hooks", {})
+    command_str = _build_hook_command("memory_recall")
+
+    if not hooks_config.ensure_recall_entry(existing, command_str):
+        console.print("[yellow][-][/yellow] Memory recall hook already configured")
+        return
+
+    _write_settings_atomic(settings_path, existing)
+    console.print(
+        "[green][OK][/green] Installed memory recall hook (SessionStart event)"
+    )
+
+
+def _rewire_memory_hooks_on_install(home: Path, existing: dict, settings_path: Path) -> None:
+    """Re-wire the memory-vault hooks during ``jacked install`` ONLY when the
+    feature is already enabled.
+
+    An upgrade re-installs an enabled feature so its hook commands stay current,
+    but install NEVER turns the feature on -- enabling is the job of the
+    dashboard Features toggle / ``jacked memory init``. ``load_state`` is
+    tolerant, so a missing or corrupt state file reads as disabled and this is a
+    silent no-op.
+    """
+    from jacked.memory import vault as _mem_vault
+
+    if not _mem_vault.load_state(home).get("enabled"):
+        return
+    _install_memory_capture_hook(existing, settings_path)
+    _install_memory_recall_hook(existing, settings_path)
+
+
+def _remove_memory_hooks(settings_path: Path) -> bool:
+    """Remove the jacked memory capture + recall hooks. Returns True if removed.
+
+    Marker-scoped via ``jacked.memory.hooks_config`` (anchored on the
+    ``memory_capture`` / ``memory_recall`` command substrings), so foreign
+    hooks and the sibling jacked SessionStart/SessionEnd hooks are untouched.
+    """
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    # Tolerant read + atomic write (the repo-wide settings-writer pattern): a
+    # corrupt settings.json must not abort the wider uninstall flow, and a
+    # partial write must never be able to clobber the user's settings.
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        console.print(
+            "[yellow]settings.json is unreadable; skipping memory hook removal[/yellow]"
+        )
+        return False
+    if not isinstance(settings, dict):
+        return False
+
+    from jacked.memory import hooks_config
+
+    changed = hooks_config.remove_capture_entries(settings)
+    changed = hooks_config.remove_recall_entries(settings) or changed
+
+    if changed:
+        _write_settings_atomic(settings_path, settings)
+        console.print("[green][OK][/green] Removed memory hooks")
+        return True
+
+    return False
+
+
 # Single source of truth for the chrome-devtools MCP npx package spec. The Codex
 # installer (jacked/codex/installer._mcp_block_body) imports this + the autoConnect
 # args below so the two CLIs never drift on the version/flags they register.
@@ -2692,6 +2817,10 @@ def _run_install(
 
     # Install QA suggestion hook (always — lightweight, no deps)
     _install_qa_hook(existing, settings_path)
+
+    # Re-wire the memory-vault hooks when the feature is already enabled
+    # (upgrade parity; install never enables the feature itself).
+    _rewire_memory_hooks_on_install(home, existing, settings_path)
 
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
@@ -3430,6 +3559,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _remove_session_tracker_hooks(settings_path)
     _remove_qa_hook(settings_path)
     _remove_chain_of_command_hook(settings_path)
+    # Remove the memory-vault hook entries unconditionally — stripping entries
+    # for a tool being uninstalled is always correct (the vault files stay put).
+    _remove_memory_hooks(settings_path)
     _remove_chrome_devtools_mcp()
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):
@@ -3812,6 +3944,620 @@ def packs_update(name: str | None):
     else:
         console.print(f"[red][FAIL][/red] {_rich_escape(res.message)}")
         raise SystemExit(1)
+
+
+@main.group(name="memory")
+def memory_group():
+    """Cross-repo memory vault: capture and recall durable facts across repos."""
+    # Attach the durable rotating failure log so any memory-command warning lands
+    # in <home>/.claude/jacked-memory.log (covers capture-merge run from the hook).
+    try:
+        from jacked.memory import vault as _vault
+
+        _vault.ensure_memory_file_logging()
+    except Exception:  # noqa: BLE001 -- logging setup must never break a command
+        logger.debug("memory: file logging setup failed", exc_info=True)
+
+
+def _memory_csv(value: str | None) -> list[str]:
+    """Split a comma-separated option into a clean list (drops empties)."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _memory_default_roots() -> list:
+    """Default init roots: <jacked_home>/Github if it exists, else the cwd parent."""
+    from pathlib import Path as _Path
+
+    gh = _jacked_home() / "Github"
+    if gh.is_dir():
+        return [gh]
+    return [_Path.cwd().parent]
+
+
+@memory_group.command(name="init")
+@click.option("--root", "roots", multiple=True, type=click.Path(),
+              help="Root dir to scan for repos (repeatable). Defaults to ~/Github or the cwd parent.")
+@click.option("--yes", is_flag=True, help="Accept all suggested groups without prompting.")
+def memory_init(roots: tuple, yes: bool):
+    """Initialize the memory vault: scan repos, suggest groups, write the vault."""
+    from collections import OrderedDict
+    from pathlib import Path as _Path
+
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+
+    # Re-running init on an existing vault is safe: report, never clobber. Still
+    # (re)enable so the capture/recall hooks + per-repo git hooks are present and
+    # surfaced -- enable() is idempotent and never touches vault content.
+    if _memory.is_initialized(vault):
+        st = _memory.status(vault, home)
+        console.print(
+            f"[yellow]Vault already initialized[/yellow] at {_rich_escape(st['vault_dir'])}. "
+            "Nothing changed."
+        )
+        _memory_print_groups(st)
+        _memory_finish_enable(home)
+        return
+
+    root_paths = [_Path(r) for r in roots] if roots else _memory_default_roots()
+    console.print(
+        "Scanning for repos under: "
+        + ", ".join(_rich_escape(str(p)) for p in root_paths)
+    )
+    discovered = _memory.scan_roots(root_paths)
+    if not discovered:
+        console.print(
+            "[yellow]No git repos found under those roots.[/yellow] "
+            "Creating an empty vault; groups are created on the fly as you add notes."
+        )
+    suggestions = _memory.suggest_groups(discovered)
+
+    interactive = sys.stdin.isatty() and not yes
+    final: "OrderedDict[str, list]" = OrderedDict()
+    for name, idents in suggestions.items():
+        if interactive:
+            console.print(
+                f"\nSuggested group [cyan]{_rich_escape(name)}[/cyan]: "
+                + ", ".join(_rich_escape(i) for i in idents)
+            )
+            chosen = (click.prompt("  Group name", default=name) or name).strip()
+            chosen = _memory.slugify(chosen) if chosen else name
+        else:
+            chosen = name
+        bucket = final.setdefault(chosen, [])
+        for ident in idents:
+            if ident not in bucket:
+                bucket.append(ident)
+
+    summary = _memory.init_vault(vault, [str(p) for p in root_paths], final)
+    _memory.set_enabled(home, True, vault=vault)
+
+    console.print(
+        f"\n[green][OK][/green] Vault initialized at {_rich_escape(summary['vault_dir'])} "
+        f"({len(summary['groups'])} group(s))."
+    )
+    for group, repos in summary["groups"].items():
+        console.print(f"  [cyan]{_rich_escape(group)}[/cyan]: {len(repos)} repo(s)")
+
+    # Turn the feature ON end-to-end: install the capture + recall settings.json
+    # hooks and the per-repo post-merge git hooks (this is what makes the README's
+    # "init installs hooks" claim true).
+    _memory_finish_enable(home)
+
+
+def _memory_finish_enable(home) -> None:
+    """Enable the memory vault end-to-end via the shared setup engine and report.
+
+    Installs the capture + recall settings.json entries and the post-merge git
+    hooks into every mapped repo (idempotent; never touches vault content), then
+    prints what happened -- hooks installed, per-repo git-hook results with any
+    skips surfaced, and a migration nudge when legacy ``.remember`` dirs remain.
+    A corrupt settings.json aborts LOUDLY (exit 2) rather than clobbering the
+    user's hooks with a fresh file.
+    """
+    from jacked.memory import setup as _setup
+    from jacked.memory.settings_io import SettingsUnreadableError
+
+    try:
+        result = _setup.enable(home)
+    except SettingsUnreadableError:
+        console.print(
+            "[red][FAIL][/red] settings.json is unreadable; vault created but hooks "
+            "NOT installed. Fix the JSON and re-run `jacked memory init`."
+        )
+        raise SystemExit(2)
+
+    hooks = result.get("hooks_installed") or []
+    if hooks:
+        console.print(
+            f"[green][OK][/green] Capture + recall hooks installed "
+            f"({', '.join(_rich_escape(h) for h in hooks)})."
+        )
+
+    git_hooks = result.get("git_hooks") or {}
+    if git_hooks:
+        # "current" = already installed and up to date (healthy idempotent
+        # re-run); only genuine refusals print as warnings.
+        ok = [
+            ident for ident, res in git_hooks.items()
+            if res.get("installed") or res.get("current")
+        ]
+        if ok:
+            console.print(f"  post-merge git hook active in {len(ok)} repo(s).")
+        for ident, res in git_hooks.items():
+            if res.get("skipped"):
+                console.print(
+                    f"  [yellow]post-merge git hook skipped for {_rich_escape(ident)}: "
+                    f"{_rich_escape(str(res.get('reason', '')))}[/yellow]"
+                )
+
+    migration = int(result.get("migration_available") or 0)
+    if migration:
+        console.print(
+            f"  migration: {migration} legacy .remember dir(s) found "
+            "(run `jacked memory migrate` to import)."
+        )
+
+
+def _memory_print_groups(st: dict) -> None:
+    if not st.get("groups"):
+        return
+    for group, info in st["groups"].items():
+        total = sum(info.get("counts", {}).values())
+        console.print(
+            f"  [cyan]{_rich_escape(group)}[/cyan]: "
+            f"{len(info.get('repos', []))} repo(s), {total} note(s)"
+        )
+
+
+@memory_group.command(name="status")
+@click.option("--quiet", is_flag=True,
+              help="No output. Exit 0 if the vault is initialized and enabled, else 1.")
+def memory_status(quiet: bool):
+    """Show vault path, groups, note counts, drift, and sync state."""
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    st = _memory.status(vault, home)
+
+    if quiet:
+        raise SystemExit(0 if (st["initialized"] and st["enabled"]) else 1)
+
+    from rich.table import Table
+
+    state_word = "enabled" if st["enabled"] else "disabled"
+    init_word = "initialized" if st["initialized"] else "not initialized"
+    console.print(
+        f"[bold]Memory vault[/bold] ({_rich_escape(init_word)}, {state_word})"
+    )
+    console.print(f"  path: {_rich_escape(st['vault_dir'])}")
+    console.print(f"  triage model: {_rich_escape(str(st['triage_model']))}")
+    console.print(
+        f"  drift: {st['drift_added']}/{st['drift_threshold']} added since last groom"
+    )
+    console.print(f"  pending retries: {st['retry_pending']}")
+    console.print(f"  last rollup: {_rich_escape(str(st['last_rollup']))}")
+    console.print(f"  last recall: {_rich_escape(str(st.get('last_recall')))}")
+    console.print(f"  last capture: {_rich_escape(str(st.get('last_capture')))}")
+    if st.get("capture_failures"):
+        console.print(f"  capture failures: {st['capture_failures']}")
+    if st.get("last_capture_error"):
+        console.print(
+            f"  [yellow]last capture error: {_rich_escape(str(st['last_capture_error']))}[/yellow]"
+        )
+    console.print(f"  last sync: {_rich_escape(str(st['last_sync']))}")
+    if st.get("last_sync_error"):
+        console.print(
+            f"  [yellow]last sync error: {_rich_escape(str(st['last_sync_error']))}[/yellow]"
+        )
+
+    # Honesty cross-check: state says enabled but the capture hook is not actually
+    # installed in settings.json (a half-applied enable, or a settings edit that
+    # dropped it). Surface it so a user isn't fooled into thinking capture runs.
+    if st["enabled"]:
+        try:
+            from jacked.memory import hooks_config, settings_io
+
+            settings = settings_io.read_settings(settings_io.settings_path(home))
+            if not hooks_config.has_capture_entry(settings):
+                console.print(
+                    "  [yellow]enabled in state but the capture hook is not installed in "
+                    "settings.json (run jacked install or re-enable from the dashboard)[/yellow]"
+                )
+            elif not hooks_config.has_recall_entry(settings):
+                console.print(
+                    "  [yellow]capture hook installed but the recall hook is missing; "
+                    "the SessionStart brief will not inject (re-enable from the "
+                    "dashboard or run jacked memory init)[/yellow]"
+                )
+        except settings_io.SettingsUnreadableError:
+            console.print(
+                "  [yellow]settings.json is unreadable; cannot confirm the capture hook is "
+                "installed[/yellow]"
+            )
+
+    # Cheap scan for legacy .remember dirs that can still be imported.
+    if st["initialized"]:
+        try:
+            from pathlib import Path as _Path
+
+            from jacked.memory import migrate as _migrate
+
+            cfg = _memory.load_vault_config(vault)
+            root_paths = [_Path(r) for r in cfg.get("roots", [])]
+            remember_dirs = _migrate.discover_remember_dirs(root_paths)
+            if remember_dirs:
+                console.print(
+                    f"  migration: {len(remember_dirs)} legacy .remember dir(s) "
+                    "found (run `jacked memory migrate` to import)"
+                )
+        except Exception:  # noqa: BLE001 -- a status readout must never crash
+            logger.debug("memory status: .remember discovery failed", exc_info=True)
+
+    if not st["initialized"]:
+        console.print(
+            "\n[yellow]Run `jacked memory init` to create the vault.[/yellow]"
+        )
+        return
+
+    if not st["groups"]:
+        console.print("\n[dim]No groups yet.[/dim]")
+        return
+
+    table = Table(title="Groups")
+    table.add_column("Group", style="cyan", no_wrap=True)
+    table.add_column("Repos", justify="right", no_wrap=True)
+    for t in _memory.VALID_TYPES:
+        table.add_column(t, justify="right", no_wrap=True)
+    for group in sorted(st["groups"]):
+        info = st["groups"][group]
+        counts = info.get("counts", {})
+        table.add_row(
+            group,
+            str(len(info.get("repos", []))),
+            *[str(counts.get(t, 0)) for t in _memory.VALID_TYPES],
+        )
+    console.print(table)
+
+
+@memory_group.command(name="add")
+@click.option("--type", "note_type", required=True,
+              type=click.Choice(["decision", "convention", "vision", "reference", "progress"]),
+              help="Note type.")
+@click.option("--title", required=True, help="Short note title (slugified for the filename).")
+@click.option("--group", default=None, help="Target group (default: auto from the current repo).")
+@click.option("--repos", default=None, help="Comma-separated repo identities (default: current repo).")
+@click.option("--tags", default=None, help="Comma-separated tags (optional).")
+@click.option("--body", required=True, help="Note body. Use '-' to read from stdin.")
+def memory_add(note_type: str, title: str, group: str | None, repos: str | None,
+               tags: str | None, body: str):
+    """Add a typed atomic note, update the index, and commit the vault."""
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        console.print(
+            "[red][FAIL][/red] Vault is not initialized. Run `jacked memory init` first."
+        )
+        raise SystemExit(2)
+
+    if body == "-":
+        body = sys.stdin.read()
+    if not (body or "").strip():
+        console.print("[red][FAIL][/red] Note body is empty.")
+        raise SystemExit(2)
+
+    # Resolve the current repo identity once (used for auto group + auto repos).
+    from pathlib import Path as _Path
+
+    identity = _memory.repo_identity(_Path.cwd())
+
+    if group:
+        group = _memory.slugify(group)
+        _memory.ensure_group(vault, group)
+    else:
+        group = _memory.resolve_group(vault, identity)
+        if not group:
+            # Unmapped repo -> a solo group named after it, created on the fly.
+            # The vault.json read-modify-write joins the vault-write lock contract
+            # so a concurrent capture/merge that also registers a solo group can't
+            # lose this mapping (or vice versa).
+            group = _memory.group_for_identity(identity)
+            with _memory.vault_write_lock(vault):
+                cfg = _memory.load_vault_config(vault)
+                _memory.register_repo(cfg, identity, group)
+                _memory.save_vault_config(vault, cfg)
+            _memory.ensure_group(vault, group)
+
+    repo_list = _memory_csv(repos) or [identity]
+    tag_list = _memory_csv(tags)
+
+    try:
+        res = _memory.add_note(
+            vault, home,
+            note_type=note_type, title=title, group=group,
+            repos=repo_list, tags=tag_list, body=body,
+        )
+    except (ValueError, RuntimeError) as exc:
+        # ValueError = schema violation; RuntimeError = vault git op failure.
+        # Both are user-fixable conditions, not tracebacks.
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        raise SystemExit(2)
+    except subprocess.SubprocessError as exc:
+        # A vault git op that timed out or was killed (TimeoutExpired is a
+        # SubprocessError) surfaces as a clean failure, never a raw traceback.
+        console.print(
+            f"[red][FAIL][/red] vault git operation timed out or failed: {_rich_escape(str(exc))}"
+        )
+        raise SystemExit(2)
+
+    console.print(
+        f"[green][OK][/green] Added {note_type} note to group "
+        f"'{_rich_escape(res['group'])}': {_rich_escape(res['path'])}"
+    )
+
+
+@memory_group.command(name="search")
+@click.argument("query")
+@click.option("--group", default=None, help="Limit search to one group.")
+@click.option("--type", "note_type", default=None,
+              type=click.Choice(["decision", "convention", "vision", "reference", "progress"]),
+              help="Limit the note-body tier to one type.")
+@click.option("--limit", default=20, type=int, help="Max results (default 20).")
+def memory_search(query: str, group: str | None, note_type: str | None, limit: int):
+    """Search the vault (hot -> index -> note bodies -> episodic)."""
+    from jacked import memory as _memory
+
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        console.print("[yellow]Vault is not initialized.[/yellow] Run `jacked memory init`.")
+        return
+
+    try:
+        results = _memory.search(
+            vault, query, group=group, note_type=note_type, limit=limit
+        )
+    except subprocess.SubprocessError as exc:
+        # Search is file-only today, but the CLI presents the SAME clean failure
+        # as `add` for any vault git op that times out or is killed, so the vault
+        # failure contract reads uniformly across the memory commands.
+        console.print(
+            f"[red][FAIL][/red] vault git operation timed out or failed: {_rich_escape(str(exc))}"
+        )
+        raise SystemExit(2)
+    if not results:
+        console.print(f"[dim]No matches for {_rich_escape(query)}.[/dim]")
+        return
+
+    for rel, lineno, line in results:
+        console.print(
+            f"[cyan]{_rich_escape(rel)}[/cyan]:{lineno}: {_rich_escape(line)}"
+        )
+    console.print(f"[dim]{len(results)} match(es).[/dim]")
+
+
+@memory_group.command(name="capture-merge", hidden=True)
+@click.option("--repo", default=".", type=click.Path(),
+              help="Repo whose just-landed merge to distill (default: cwd).")
+def memory_capture_merge(repo: str):
+    """Distill a just-landed merge into a candidate note (git post-merge hook).
+
+    Invoked (backgrounded) by the installed post-merge hook. Fail-open: it always
+    exits 0 so a git merge is never blocked by a memory-capture failure.
+    """
+    try:
+        from jacked.memory import merge_capture as _merge_capture
+
+        _merge_capture.capture_merge(repo)
+    except Exception:  # noqa: BLE001 -- a git hook must never propagate failure
+        logger.debug("memory capture-merge failed", exc_info=True)
+    raise SystemExit(0)
+
+
+@memory_group.command(name="rollup")
+def memory_rollup():
+    """Roll episodic history forward: past-day files to recent, aged recent to archive."""
+    from jacked import memory as _memory
+    from jacked.memory import rollup as _rollup
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        # Exit 0 even when uninitialized: rollup is a maintenance no-op, not a
+        # failure the caller (or the SessionEnd tail-call) should trip on.
+        console.print(
+            "[yellow]Vault is not initialized.[/yellow] Run `jacked memory init` first."
+        )
+        return
+
+    summary = _rollup.rollup(vault, home)
+    console.print(
+        f"[green][OK][/green] Rollup complete: "
+        f"{summary['days_rolled']} day(s) rolled to recent, "
+        f"{summary['sections_archived']} section(s) archived, "
+        f"{summary['skipped_unparseable']} skipped (unparseable)."
+    )
+    if not summary["changed"]:
+        console.print("[dim]Nothing new to roll up; vault unchanged.[/dim]")
+
+
+@memory_group.command(name="migrate")
+@click.option("--root", "roots", multiple=True, type=click.Path(),
+              help="Root dir to scan for .remember dirs (repeatable). Defaults to the vault roots.")
+@click.option("--yes", is_flag=True, help="Skip the import confirmation prompt.")
+@click.option("--keep-plugin", is_flag=True,
+              help="Never offer to retire the remember plugin after migrating.")
+def memory_migrate(roots: tuple, yes: bool, keep_plugin: bool):
+    """Import legacy .remember history into the vault, verifying counts.
+
+    Sources are never modified or deleted. Every imported file's entry count is
+    verified against the source; any mismatch fails that repo and exits nonzero.
+    """
+    from pathlib import Path as _Path
+
+    from rich.table import Table
+
+    from jacked import memory as _memory
+    from jacked.memory import migrate as _migrate
+
+    home = _jacked_home()
+    vault = _memory.vault_dir()
+    if not _memory.is_initialized(vault):
+        console.print(
+            "[red][FAIL][/red] Vault is not initialized. Run `jacked memory init` first."
+        )
+        raise SystemExit(2)
+
+    if roots:
+        root_paths = [_Path(r) for r in roots]
+    else:
+        cfg = _memory.load_vault_config(vault)
+        root_paths = [_Path(r) for r in cfg.get("roots", [])]
+
+    rows = _migrate.preview(vault, roots=root_paths)
+    if not rows:
+        console.print(
+            "[yellow]No .remember directories found to migrate.[/yellow] "
+            "Nothing changed."
+        )
+        return
+
+    plan_table = Table(title="Will import")
+    plan_table.add_column("Repo", style="cyan")
+    plan_table.add_column("Group", style="cyan", no_wrap=True)
+    plan_table.add_column("Files", justify="right", no_wrap=True)
+    plan_table.add_column("Entries", justify="right", no_wrap=True)
+    for row in rows:
+        plan_table.add_row(
+            _rich_escape(row["repo"]), _rich_escape(row["group"]),
+            str(row["files"]), str(row["entries"]),
+        )
+    console.print(plan_table)
+    console.print(
+        "[dim]Sources are read-only: nothing in .remember is modified or deleted.[/dim]"
+    )
+
+    interactive = sys.stdin.isatty() and not yes
+    if interactive and not click.confirm("Import these into the vault?", default=True):
+        console.print("Aborted. Nothing changed.")
+        return
+
+    report = _migrate.migrate(vault, home, roots=root_paths)
+
+    verify_table = Table(title="Verification (source vs staged entries)")
+    verify_table.add_column("Repo", style="cyan")
+    verify_table.add_column("File")
+    verify_table.add_column("Source", justify="right", no_wrap=True)
+    verify_table.add_column("Staged", justify="right", no_wrap=True)
+    verify_table.add_column("Result", no_wrap=True)
+    for repo_path, rep in report["repos"].items():
+        short = rep.get("repo_short", repo_path)
+        if not rep["files"]:
+            verify_table.add_row(
+                _rich_escape(short), "[dim](no files)[/dim]", "-", "-",
+                _memory_migrate_status_cell(rep["status"]),
+            )
+            continue
+        for name, counts in rep["files"].items():
+            src = counts.get("source_entries")
+            staged = counts.get("staged_entries")
+            ok = staged is not None and src == staged
+            result = "[green]ok[/green]" if ok else "[red]MISMATCH[/red]"
+            verify_table.add_row(
+                _rich_escape(short), _rich_escape(name),
+                str(src if src is not None else "-"),
+                str(staged if staged is not None else "-"),
+                result,
+            )
+    console.print(verify_table)
+    console.print(
+        f"[bold]{report['repos_migrated']}[/bold] repo(s) migrated, "
+        f"[bold]{report['repos_failed']}[/bold] failed, "
+        f"[bold]{report['candidates_created']}[/bold] candidate note(s) created "
+        f"from core-memories."
+    )
+    for repo_path, rep in report["repos"].items():
+        if rep["status"] == "failed":
+            console.print(
+                f"[red][FAIL][/red] {_rich_escape(rep.get('repo_short', repo_path))}: "
+                f"{_rich_escape(str(rep.get('reason') or 'verification mismatch'))} "
+                "(nothing imported for this repo)"
+            )
+        skipped_links = rep.get("skipped_symlinks") or []
+        if skipped_links:
+            console.print(
+                f"[yellow][SKIP][/yellow] {_rich_escape(rep.get('repo_short', repo_path))}: "
+                f"symlinked source file(s) refused: "
+                f"{_rich_escape(', '.join(skipped_links))}"
+            )
+        already = rep.get("already_imported") or []
+        if already:
+            console.print(
+                f"  [dim]{len(already)} file(s) already imported, skipped[/dim]"
+            )
+
+    any_failed = report["repos_failed"] > 0
+    migrated_any = report["repos_migrated"] > 0
+
+    if migrated_any and not any_failed and not keep_plugin:
+        from jacked.memory.settings_io import SettingsUnreadableError
+
+        res_path = _migrate.settings_path(home)
+        if sys.stdin.isatty():
+            console.print(
+                f"\nThe remember plugin '{_migrate.REMEMBER_PLUGIN_ID}' can now be retired. "
+                f"This will disable it in {_rich_escape(str(res_path))}; "
+                "your .remember sources stay on disk, untouched."
+            )
+            if click.confirm("Retire the remember plugin now?", default=False):
+                try:
+                    res = _migrate.retire_remember_plugin(home)
+                except SettingsUnreadableError as exc:
+                    console.print(
+                        f"[red][FAIL][/red] settings.json is unreadable; refusing to modify it "
+                        f"({_rich_escape(str(exc))})."
+                    )
+                    raise SystemExit(2)
+                console.print(
+                    f"[green][OK][/green] Disabled '{_rich_escape(res['plugin'])}' in "
+                    f"{_rich_escape(res['settings_path'])}."
+                )
+            else:
+                console.print("[dim]Left the remember plugin enabled.[/dim]")
+        else:
+            console.print(
+                f"\n[dim]Not retiring the remember plugin (no interactive terminal). "
+                f"Rerun `jacked memory migrate` in a terminal to disable "
+                f"'{_rich_escape(_migrate.REMEMBER_PLUGIN_ID)}', or leave it; "
+                "your sources are safe either way.[/dim]"
+            )
+
+    if any_failed:
+        raise SystemExit(2)
+
+
+def _memory_migrate_status_cell(status: str) -> str:
+    if status == "migrated":
+        return "[green]migrated[/green]"
+    if status == "failed":
+        return "[red]failed[/red]"
+    return f"[dim]{_rich_escape(status)}[/dim]"
+
+
+@memory_group.command(name="mark-groomed", hidden=True)
+def memory_mark_groomed():
+    """Record a completed librarian groom (reset drift, stamp last_groomed)."""
+    from jacked import memory as _memory
+
+    home = _jacked_home()
+    _memory.mark_groomed(home)
+    console.print("[green][OK][/green] Marked vault as groomed (drift counter reset).")
 
 
 @main.group(name="permissions")

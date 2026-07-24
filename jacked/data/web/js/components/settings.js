@@ -209,9 +209,24 @@ function bindToggleEvents(container) {
             input.disabled = true;
 
             try {
-                await api.put(`/api/features/${encodeURIComponent(category)}/${encodeURIComponent(name)}`, { enabled });
+                const res = await api.put(`/api/features/${encodeURIComponent(category)}/${encodeURIComponent(name)}`, { enabled });
                 const displayName = toggle.closest('[data-feature-row]')?.dataset.displayName || name;
                 showToast(`${displayName} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+                // Memory Vault enable can surface legacy .remember dirs still
+                // importable into the vault; nudge the user toward the migrate CLI.
+                if (enabled && name === 'memory_vault' && res && res.migration_available > 0) {
+                    const n = res.migration_available;
+                    showToast(`${n} legacy .remember dir(s) found; run jacked memory migrate to import`, 'info');
+                }
+                // Some mapped repos may have refused the post-merge git hook (a
+                // foreign hook, a husky/pre-commit framework, no .git). Surface the
+                // count so the skip isn't silent; details live in memory status.
+                if (enabled && name === 'memory_vault' && res && res.git_hooks) {
+                    const skipped = Object.values(res.git_hooks).filter(g => g && g.skipped).length;
+                    if (skipped > 0) {
+                        showToast(`${skipped} repo(s) skipped post-merge hook install; run jacked memory status for details`, 'warning');
+                    }
+                }
                 await refreshFeatures();
                 // Re-render the current tab to reflect changes
                 const activeTab = localStorage.getItem(SETTINGS_TAB_KEY) || DEFAULT_TAB;
@@ -349,6 +364,15 @@ async function renderFeaturesTab(container) {
         const hooks = features.hooks || [];
         const knowledge = features.knowledge || [];
 
+        // A present-but-corrupt settings.json makes every toggle read as OFF
+        // and every mutation refuse with 503; without a banner that reads as
+        // "everything mysteriously disabled". Say what is actually wrong.
+        const settingsWarning = features.settings_unreadable
+            ? `<div class="mb-4 p-3 rounded border border-yellow-600/50 bg-yellow-900/20 text-yellow-300 text-sm">
+                   ~/.claude/settings.json is unreadable (corrupt JSON). Toggle states shown here may be wrong and changes are refused until the file is fixed.
+               </div>`
+            : '';
+
         // Skill packs come from a separate endpoint. A hiccup fetching them
         // must not blank out hooks/knowledge, so its failure is captured here
         // and rendered as a small inline error with its own retry.
@@ -363,15 +387,29 @@ async function renderFeaturesTab(container) {
             ? _renderPacksError(packsError)
             : _renderPacksSection(packsData);
 
-        const hookRows = hooks.map(h => `
+        const hookRows = hooks.map(h => {
+            // Memory Vault: when installed and reporting a capture/sync failure,
+            // surface a small muted status line under the description (mirrors the
+            // rules corrupt-marker note pattern).
+            let healthNote = '';
+            if (h.name === 'memory_vault' && h.installed && h.health) {
+                if (h.health.last_capture_error) {
+                    healthNote = `<div class="text-xs text-yellow-400 mt-1">capture failing: ${escapeHtml(h.health.last_capture_error)}</div>`;
+                } else if (h.health.last_sync_error) {
+                    healthNote = `<div class="text-xs text-yellow-400 mt-1">sync failing: ${escapeHtml(h.health.last_sync_error)}</div>`;
+                }
+            }
+            return `
             <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(h.display_name)}">
                 <div class="min-w-0 flex-1">
                     <div class="text-sm text-white">${escapeHtml(h.display_name)}</div>
                     <div class="text-xs text-slate-400">${escapeHtml(h.description || '')}</div>
+                    ${healthNote}
                 </div>
                 ${renderToggle(h.name, 'hooks', h.installed, h.source_available)}
             </div>
-        `).join('');
+        `;
+        }).join('');
 
         const knowledgeRows = knowledge.map(k => {
             let note = '';
@@ -391,6 +429,7 @@ async function renderFeaturesTab(container) {
 
         container.innerHTML = `
             <div class="space-y-6">
+                ${settingsWarning}
                 <div>
                     <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Hooks</h3>
                     <p class="text-xs text-slate-500 mb-3">Background hooks that run automatically during Claude Code sessions.</p>

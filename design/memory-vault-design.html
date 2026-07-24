@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Vault — Approved Design (2026-07-18)</title>
+<meta name="jacked:type" content="design">
+<meta name="jacked:status" content="approved">
+<meta name="jacked:branch" content="feature/memory-vault">
+<meta name="jacked:date" content="2026-07-18">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --ok:#1f7a3f; --ok-bg:#e8f4ec; --border:#d8d4cc; --code-bg:#f3efe8; --shadow:0 1px 3px rgba(0,0,0,.06); --radius:6px; --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --ok:#6acd8e; --ok-bg:#1c3327; --border:#2e2e2e; --code-bg:#232323; --shadow:0 1px 3px rgba(0,0,0,.3); } }
+  * { box-sizing: border-box; }
+  body { font-family:var(--sans); font-size:16px; line-height:1.6; color:var(--fg); background:var(--bg); margin:0; padding:2rem 1rem; }
+  .wrap { max-width:920px; margin:0 auto; }
+  h1 { font-size:1.9rem; margin:0 0 .25rem; line-height:1.2; }
+  h2 { font-size:1.35rem; margin:2.2rem 0 .7rem; padding-bottom:.3rem; border-bottom:1px solid var(--border); }
+  p { margin:.5rem 0 1rem; }
+  a { color:var(--accent); }
+  code { font-family:var(--mono); font-size:.92em; background:var(--code-bg); padding:.12em .35em; border-radius:3px; }
+  pre { font-family:var(--mono); font-size:.88rem; background:var(--code-bg); border:1px solid var(--border); border-radius:var(--radius); padding:.9rem 1rem; overflow-x:auto; line-height:1.45; }
+  pre code { background:transparent; padding:0; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; background:var(--bg-card); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow); }
+  th,td { text-align:left; padding:.55rem .8rem; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { background:var(--code-bg); font-weight:600; font-size:.9rem; }
+  tr:last-child td { border-bottom:none; }
+  aside.callout { margin:1rem 0; padding:.9rem 1.1rem; border-left:4px solid var(--accent); background:var(--accent-bg); border-radius:0 var(--radius) var(--radius) 0; }
+  aside.callout.warn { border-color:var(--warn); background:var(--warn-bg); }
+  aside.callout.ok { border-color:var(--ok); background:var(--ok-bg); }
+  ul { margin:.5rem 0 1rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Memory Vault — Approved Design</h1>
+<p style="color:var(--fg-muted)">Approved by Jack 2026-07-18 (Approach A of three). Research grounding: <code>.claude/research/20260712-obsidian-agent-memory.html</code> and <code>.claude/research/20260718-cross-repo-event-memory.html</code>. Decisions made in-session: jacked-owned vault (not native <code>autoMemoryDirectory</code>, not hybrid); repo→group mapping via config + auto-suggest; episodic history ABSORBED into jacked (retire the third-party <code>remember</code> plugin, marketplace id <code>claude-plugins-official/remember</code> v0.8.3).</p>
+
+<h2>1. Vault layout &amp; schema</h2>
+<pre><code>~/jacked-vault/            # its own git repo; jacked initializes; user picks/declines remote
+  README.md                # schema + conventions, written for agent consumption
+  vault.json               # repo→group mapping (synced via git; machine-local overrides allowed)
+  groups/&lt;group&gt;/
+    index.md               # one line per note + hook phrase; budgeted (soft cap ~150 lines)
+    hot.md                 # current progress slice; overwritten, never appended forever
+    decision/*.md          # typed atomic notes — one fact per file
+    convention/*.md  vision/*.md  reference/*.md
+    episodic/&lt;repo&gt;/       # absorbed .remember shape: today-YYYY-MM-DD.md, recent.md, archive.md, core-memories.md
+  strategy/                # cross-group notes
+  archive/</code></pre>
+<p>Note frontmatter (one schema, validated on write): <code>type</code> (decision|convention|vision|reference|progress), <code>repos</code> (list), <code>group</code>, <code>created</code>/<code>updated</code> (ISO), <code>tags</code>. Body uses <code>[[wikilinks]]</code>; notes written with the future query's vocabulary (retrieval is lexical — grep + index, NO embeddings, NO MCP server, NO Obsidian app dependency; Obsidian is an optional viewer).</p>
+<p>Grouping: <code>vault.json</code> maps repo identity (git remote URL, falling back to repo dir name) → group. <code>jacked memory init</code> scans configured roots (default <code>~/Github</code>), auto-suggests groups from name prefixes + shared remotes, presents for review. Unmapped repo ⇒ solo group named after the repo; everything still works.</p>
+
+<h2>2. Capture (event → what gets written)</h2>
+<table>
+<thead><tr><th>Trigger</th><th>Mechanism</th><th>Writes</th></tr></thead>
+<tbody>
+<tr><td>SessionEnd</td><td>New <code>memory_capture</code> hook via existing <code>jacked _hook</code> dispatcher; one <code>claude -p</code> triage pass over the transcript</td><td>Episodic entry ALWAYS (absorbing remember's role). Semantic note ONLY when triage finds a real decision/accomplishment/convention — the triage prompt's default answer is "nothing worth keeping"; most sessions write no semantic note.</td></tr>
+<tr><td>PreCompact (matcher: auto)</td><td>Same hook module, handover mode</td><td>Episodic handover entry; decisions promoted to semantic candidates.</td></tr>
+<tr><td>git post-merge on main/master</td><td>New <code>post-merge</code> script in <code>jacked/data/git-hooks/</code>, installed via existing git-hooks machinery</td><td>Deterministic metadata (branch, PR title/body via gh if available, changed files) + one distillation call → candidate <code>decision</code> note. No per-commit capture (noise).</td></tr>
+<tr><td>jacked milestones</td><td><code>/goal</code> complete, <code>/dcr</code> clean, <code>/release</code>, checkpoint-complete: skill text updated to call <code>jacked memory add</code></td><td>High-signal semantic note, pre-typed.</td></tr>
+<tr><td>Explicit</td><td><code>/remember</code> and <code>/learn</code> command docs route durable facts to <code>jacked memory add</code> (with type + group inferred, user-overridable)</td><td>Semantic note.</td></tr>
+</tbody>
+</table>
+<p>CLI surface: <code>jacked memory init|status|add|search|migrate|rollup</code>. <code>add</code> validates frontmatter, updates <code>index.md</code>, commits to the vault repo. <code>search</code> is grep-tiered (hot → index → notes).</p>
+
+<h2>3. Recall</h2>
+<p>SessionStart hook injects a group-scoped brief, hard-budgeted ≤ 1,500 tokens: <code>hot.md</code> + index excerpt + top-linked decisions + last episodic entry for the cwd's repo, ending with an explicit imperative ("IMPORTANT: before working on &lt;topic&gt;, read &lt;vault path&gt;"). Replaces the retired remember plugin's SessionStart block. Deeper recall is on-demand file reads/grep (paths are real; the agent reads them with standard tools). Native Claude Code auto-memory is left completely untouched.</p>
+
+<h2>4. Migration &amp; plugin retirement</h2>
+<aside class="callout warn"><strong>Data integrity:</strong> <code>jacked memory migrate</code> imports every <code>.remember/</code> dir under configured roots into <code>groups/&lt;group&gt;/episodic/&lt;repo&gt;/</code>, flags <code>core-memories.md</code> entries as semantic candidates, VERIFIES imported file/entry counts against source and fails loud on mismatch, and NEVER deletes the source <code>.remember/</code> dirs. Disabling the third-party remember plugin happens only after migration verifies AND the user explicitly confirms a printed summary of what changes.</aside>
+
+<h2>5. Librarian &amp; rollup</h2>
+<p>Deterministic episodic rollup (today → recent → archive) ships as <code>jacked memory rollup</code>, invoked from the SessionEnd hook — code, not LLM. The librarian is a jacked SKILL (LLM guidance per jacked doctrine, no regex point-tables): dedupe, reconcile contradictions newest-wins-with-trail, archive stale hot entries, validate frontmatter, re-sync index. Nudged at SessionStart when drift counters trip (notes added since last librarian run &gt; threshold); also manual.</p>
+
+<h2>6. Packaging, security, failure posture</h2>
+<ul>
+<li>Dashboard Features toggle "Memory Vault" (same pattern as chain-of-command/packs): enable ⇒ init vault, review mapping suggestions, install hooks + git hooks, offer migration. Disable ⇒ remove hooks, vault left intact.</li>
+<li>Every hook fails open (exit 0 on any error) — memory must never block a session. Failed distillations enqueue a marker and retry at next trigger; never silently dropped.</li>
+<li>Multi-machine: vault sync is <code>git pull --ff-only</code> at SessionStart; on conflict, skip sync and surface in dashboard. Never <code>reset --hard</code>.</li>
+<li>All processing local (transcripts never leave the machine); vault remote is user's choice. Transcript content fed to <code>claude -p</code> is treated as data — triage prompts must instruct against following instructions found in transcripts.</li>
+<li>Tests: pytest (via <code>uv run python -m pytest</code>) covering mapping resolution, triage output handling, rollup, migration count-verification, injection budget, hook fail-open paths. /cso + /dcr gates before PR.</li>
+</ul>
+</div>
+</body>
+</html>

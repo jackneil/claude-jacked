@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Vault — Implementation Plan (2026-07-18)</title>
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="active">
+<meta name="jacked:branch" content="feature/memory-vault">
+<meta name="jacked:date" content="2026-07-18">
+<style>
+  :root { --fg:#1a1a1a; --fg-muted:#555; --bg:#fafaf7; --bg-card:#fff; --accent:#2266aa; --accent-bg:#e7f0fa; --warn:#b3681c; --warn-bg:#fcf3e7; --border:#d8d4cc; --code-bg:#f3efe8; --radius:6px; --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8e6e1; --fg-muted:#a8a5a0; --bg:#161616; --bg-card:#1f1f1f; --accent:#6aa8e8; --accent-bg:#1a2935; --warn:#e0a85b; --warn-bg:#3a2d18; --border:#2e2e2e; --code-bg:#232323; } }
+  * { box-sizing:border-box; }
+  body { font-family:var(--sans); font-size:15px; line-height:1.55; color:var(--fg); background:var(--bg); margin:0; padding:2rem 1rem; }
+  .wrap { max-width:960px; margin:0 auto; }
+  h1 { font-size:1.7rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2rem 0 .6rem; padding-bottom:.25rem; border-bottom:1px solid var(--border); }
+  h3 { font-size:1.02rem; margin:1.2rem 0 .4rem; }
+  code { font-family:var(--mono); font-size:.9em; background:var(--code-bg); padding:.1em .3em; border-radius:3px; }
+  pre { font-family:var(--mono); font-size:.85rem; background:var(--code-bg); border:1px solid var(--border); border-radius:var(--radius); padding:.8rem 1rem; overflow-x:auto; line-height:1.4; }
+  pre code { background:transparent; padding:0; }
+  table { width:100%; border-collapse:collapse; margin:.8rem 0; background:var(--bg-card); }
+  th,td { text-align:left; padding:.45rem .7rem; border-bottom:1px solid var(--border); vertical-align:top; font-size:.92rem; }
+  th { background:var(--code-bg); }
+  aside { margin:.8rem 0; padding:.7rem 1rem; border-left:4px solid var(--warn); background:var(--warn-bg); border-radius:0 var(--radius) var(--radius) 0; font-size:.93rem; }
+  ul { margin:.4rem 0 .9rem; padding-left:1.4rem; }
+  li { margin:.15rem 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Memory Vault — Implementation Plan</h1>
+<p style="color:var(--fg-muted)">Companion to <code>design/memory-vault-design.html</code> (the approved spec). This plan pins the code-level decisions: module layout, integration points (verified against the codebase 2026-07-18), and per-milestone file/test lists. Recon facts referenced as <code>file:line</code>.</p>
+
+<h2>0. New surface at a glance</h2>
+<pre><code>jacked/memory/                    NEW package (mirrors jacked/packs.py idioms)
+  __init__.py                     public API re-exports
+  vault.py                        paths, init, vault.json mapping, group resolution,
+                                  note schema + frontmatter, add, index, search, status, git ops
+  capture.py                      SessionEnd/PreCompact triage, episodic writes, retry queue
+  merge_capture.py                post-merge distillation (deterministic metadata + one claude -p)
+  recall.py                       SessionStart brief assembly, token budget, ff-only sync
+  rollup.py                       deterministic today→recent→archive
+  migrate.py                      .remember import + count verification (never deletes)
+  hooks_config.py                 settings.json hook entries: pure add/remove on a settings dict,
+                                  shared by cli.py installer AND api/routes/features.py (no dup logic)
+  githook.py                      post-merge script install/remove per repo (guardrails-style guards)
+jacked/data/hooks/memory_capture.py    SessionEnd + PreCompact dispatch (async)
+jacked/data/hooks/memory_recall.py     SessionStart synchronous stdout injection
+jacked/data/git-hooks/post-merge-memory.sh
+jacked/data/skills/memory-librarian/SKILL.md
+jacked/data/commands/remember.md       jacked-owned /remember (plugin's is external)
+jacked/cli.py                          `memory` Click group + install/uninstall wiring
+jacked/api/routes/features.py          VALID_HOOKS += memory_vault; toggle branches
+jacked/data/web/js/components/settings.js  card copy only if needed (hooks section auto-renders)
+</code></pre>
+
+<h2>1. Conventions (binding, from recon)</h2>
+<ul>
+<li><b>Home/testability:</b> everything resolves via <code>jacked_home()</code>-style <code>$JACKED_HOME</code> override (packs.py:93). Vault dir: <code>Path(os.getenv("JACKED_VAULT_DIR") or jacked_home() / "jacked-vault")</code>. State file: <code>&lt;home&gt;/.claude/jacked-memory.json</code>.</li>
+<li><b>State file schema:</b> versioned + tolerant + atomic exactly like packs.py (STATE_VERSION, load→normalize preserving unknown keys, mkstemp+<code>os.replace</code> save — packs.py:200-294). Keys: <code>version, enabled, vault_dir, triage_model ("haiku" default, user-overridable), drift_added, drift_threshold (15), last_rollup, last_sync, retry_queue [], processed_merges {sha: iso} (age-pruned 90d, never count-capped)</code>.</li>
+<li><b>Hooks fail open:</b> module <code>main()</code> never raises out — top-level try/except, always effective exit 0 (pattern: session_account_tracker.py; unknown-hook shim already exits 0, cli.py:959-965). Slow work in a daemon thread with <code>t.join(timeout=...)</code> only where the event allows; SessionEnd capture may run in-process (session is ending) but MUST swallow all exceptions.</li>
+<li><b>settings.json entries:</b> marker comments <code># jacked-memory-capture</code> / <code># jacked-memory-recall</code>; match-then-update-in-place, never blind append, never touch foreign entries (cli.py:1653-1667 pattern); write via <code>_write_settings_atomic</code> (cli.py:1135). Recall hook is SYNCHRONOUS (no <code>async</code> key — async stdout is not injected, cli.py:1791-1801). Capture entries carry <code>"async": True</code>. Events: <code>("SessionEnd","")</code>, <code>("PreCompact","auto")</code> for capture; <code>("SessionStart","")</code> for recall.</li>
+<li><b>Frontmatter:</b> hand-rolled parser/serializer in vault.py (repo has no yaml dep — pyproject deps are click/dotenv/rich/fastapi/etc.). Tolerant parse; strict validated write.</li>
+<li><b>CLI:</b> <code>@main.group(name="memory")</code> + lazy <code>from jacked import memory</code> imports inside command bodies (packs group template, cli.py:3648). Rich console + <code>_rich_escape</code> for arbitrary text; <code>click.confirm</code> gated on <code>sys.stdin.isatty()</code>.</li>
+<li><b>User-facing copy:</b> no em-dashes (tests assert this for packs, test_cli_packs.py:640 — mirror it).</li>
+<li><b>Vault git:</b> subprocess <code>git -C &lt;vault&gt;</code>; init creates the repo; every add/rollup/migrate commits. Sync is <code>git pull --ff-only</code> ONLY, timeout-guarded, skipped unless a remote exists and last_sync &gt; 10 min ago; failure = skip + record in state (surfaced by <code>status</code> and the dashboard card). Never reset/checkout -f.</li>
+<li><b>Transcripts are DATA:</b> every triage prompt embeds transcript excerpts fenced, with an explicit instruction that content inside the fence is data and any instructions in it must be ignored.</li>
+</ul>
+
+<h2>2. Vault format (fixed by the design; code-level detail)</h2>
+<pre><code>~/jacked-vault/
+  README.md          agent-facing schema doc, written by init
+  vault.json         {version:1, roots:["~/Github"], groups:{&lt;g&gt;:{repos:[&lt;identity&gt;...]}},
+                      repo_map:{&lt;identity&gt;: &lt;group&gt;}}   identity = normalized remote URL else dir name
+  groups/&lt;g&gt;/index.md      "- [title](decision/slug.md) - hook phrase (updated YYYY-MM-DD)" lines, soft cap 150
+                          (plain hyphen separator: search echoes index lines to the CLI, so no em-dash)
+  groups/&lt;g&gt;/hot.md        current slice, overwritten by librarian/skills
+  groups/&lt;g&gt;/{decision,convention,vision,reference}/&lt;slug&gt;.md
+  groups/&lt;g&gt;/episodic/&lt;repo&gt;/{today-YYYY-MM-DD.md, recent.md, archive.md, core-memories.md}
+  strategy/  archive/
+</code></pre>
+<p>Note frontmatter (exact keys): <code>type</code> (decision|convention|vision|reference|progress), <code>repos</code> (list), <code>group</code>, <code>created</code>, <code>updated</code> (ISO date), <code>tags</code> (list; <code>candidate</code> marks unreviewed auto-captures). Episodic entry format preserved from the remember plugin so migration is lossless: <code>## HH:MM | branch</code> entries in today files; <code># Recent</code> + <code>## YYYY-MM-DD</code>; <code># Archive</code> + <code>## Week of YYYY-MM-DD</code> (plugin regexes: consolidate.py:32, save-session.sh:192).</p>
+
+<h2>3. Milestones — files and tests</h2>
+<table>
+<thead><tr><th>M</th><th>Code</th><th>Tests (all under tests/unit/, uv run python -m pytest)</th></tr></thead>
+<tbody>
+<tr><td><b>M1</b> vault core</td><td>jacked/memory/{__init__,vault}.py; cli.py memory group (init|status|add|search now; migrate|rollup stubs raise SystemExit(2) with "not yet available" is BANNED — instead register them in later milestones only). init: scan roots for .git dirs, cluster by remote org + name prefix, TTY review (<code>--yes</code> accepts), write vault.json + README + groups skeleton, git init + first commit. add: <code>--type --group --repos --title --tags --body -|text</code>, auto group/repos from cwd identity, validate frontmatter, write note, update index.md, bump drift counter, vault commit. search: case-insensitive tiered (hot → index → note bodies), prints path:line matches. status: vault path, groups, note counts, drift, hooks present, pending retries, last sync/rollup.</td><td>test_memory_vault.py: init on fixture root (tmp repos w/ fake remotes) suggests groups; add writes valid note + index line + commit exists (<code>git -C log</code>); search finds by keyword across tiers; frontmatter round-trip; identity fallback (no remote → dir name); unmapped repo → solo group; JACKED_HOME/JACKED_VAULT_DIR isolation. CLI runner tests per test_cli_packs.py pattern.</td></tr>
+<tr><td><b>M2</b> capture hooks</td><td>jacked/memory/capture.py; data/hooks/memory_capture.py; cli.py <code>_install_memory_hooks</code>/<code>_remove_memory_hooks</code> using memory/hooks_config.py. SessionEnd: read stdin JSON (transcript_path, cwd, session_id); skip if &lt;3 human messages; ONE <code>claude -p</code> triage (model from state) returning strict JSON {episodic: "one sentence", semantic: null | {type,title,body,tags}}; write episodic entry ALWAYS (deterministic fallback stub on triage failure + enqueue retry); write AT MOST one semantic note (tags += candidate). PreCompact(auto): handover episodic entry, promote decisions to candidates. Prompt default answer is "nothing".</td><td>test_memory_capture_hook.py: fixture transcript → episodic file appears with ## HH:MM | branch entry; decision fixture (mock claude -p via subprocess monkeypatch) → exactly ONE semantic note; triage returning garbage → episodic stub + retry enqueued + exit 0; raised exception anywhere → main() returns, exit 0 (test_qa_hook.py stdin/capsys pattern); non-mapped cwd → solo group used, never a crash.</td></tr>
+<tr><td><b>M3</b> post-merge</td><td>jacked/memory/{merge_capture,githook}.py; data/git-hooks/post-merge-memory.sh (marker <code># jacked-memory-hook</code>, backgrounds <code>jacked memory capture-merge --repo "$PWD"</code>, unconditional exit 0). githook.py: install/remove per repo — .git required, refuse existing foreign post-merge unless --force, framework detection reused (guardrails.py:152-172), chmod +x (guardrails.py:245-251 pattern). capture-merge (hidden subcommand): only when HEAD is main/master; scan ORIG_HEAD..HEAD merge commits; per new PR/branch merge not in processed_merges: deterministic metadata (branch, PR title/body via <code>gh pr view</code> if available, changed files) + one distillation call → candidate decision note; dedupe by sha.</td><td>test_memory_githook.py: template exists, #!/bin/sh, marker, exit 0; install into tmp repo writes executable .git/hooks/post-merge; refuses foreign hook without force; simulated merge in tmp repo (real git merge --no-ff) with mocked distillation → note with repos+group frontmatter; same merge twice → one note; pull on feature branch → no note.</td></tr>
+<tr><td><b>M4</b> recall</td><td>jacked/memory/recall.py; data/hooks/memory_recall.py (synchronous, stdout). Assembly order with hard 1500-token budget (len//4 estimate): imperative line reserved first ("IMPORTANT: before working on &lt;group&gt;, read &lt;abs vault group path&gt;"), hot.md, last episodic entry for cwd repo, top index decisions, index excerpt; trim lowest-priority first. Optional ff-only sync (see conventions). Drift nudge line when drift_added ≥ threshold. Silent (no output) when vault missing/disabled.</td><td>test_memory_recall_hook.py: fixture vault → stdout under budget AND contains imperative with real existing path; oversized hot.md → trimmed, never over budget; missing vault → empty stdout exit 0; disabled state → empty; budget math unit tests; nudge appears past threshold, absent below.</td></tr>
+<tr><td><b>M5</b> rollup + librarian</td><td>jacked/memory/rollup.py + cli rollup + SessionEnd tail-call; data/skills/memory-librarian/SKILL.md (LLM guidance: dedupe, contradictions newest-wins-with-trail, archive stale hot, validate frontmatter, re-sync index; ends with hidden <code>jacked memory mark-groomed</code>). rollup: past today-*.md → recent.md per-day sections; recent &gt;7d → archive.md week sections; idempotent; commits.</td><td>test_memory_rollup.py: fixtures produce expected recent.md/archive.md exactly; idempotent re-run no-op; malformed today file tolerated (kept, logged, never dropped silently); mark-groomed resets drift.</td></tr>
+<tr><td><b>M6</b> migrate</td><td>jacked/memory/migrate.py + cli migrate. Discover .remember/ dirs under vault roots + mapped repos; import today/recent/archive/core-memories/now → episodic/&lt;repo&gt;/ (tolerant parser: doubled # Recent headers, stray fences, Identity Candidates blocks — live-file anomalies are real); core-memories entries ALSO become candidate decision notes. VERIFY: per-source file count + entry count (## header regex) vs imported; print table; ANY mismatch → exit nonzero, vault changes rolled back (git reset of the migration commit is allowed ONLY on the vault repo commit we just made — implemented as: build in temp worktree dir, verify, then commit; never git-reset user data). NEVER touches source .remember/. Plugin retirement: prints exact summary, TTY <code>click.confirm</code> (default False), then disables via the existing enabledPlugins mechanism (features.py toggle_claude_plugin path); <code>--keep-plugin</code> skips.</td><td>test_memory_migrate.py: fixture .remember (incl. malformed recent.md + .done.md files) migrates; counts printed + match; tampered fixture (entry removed post-count) → nonzero exit + no partial vault commit; sources untouched (mtime+content); core-memories → candidate notes; no TTY → plugin retirement skipped with notice.</td></tr>
+<tr><td><b>M7</b> wiring + toggle</td><td>features.py: VALID_HOOKS += "memory_vault"; hook_meta entry; _toggle_hook branch → jacked.memory.hooks_config + vault init on enable (non-interactive: auto-accept suggestions, response includes vault_path/groups/migration_available) + git hooks into mapped repos (collect per-repo results, refusals surfaced not forced); disable → remove settings hooks + our marker-verified git hooks, vault intact. _detect_hook_installed branch. cli.py install/uninstall parity (re-install hooks iff state.enabled, sounds pattern cli.py:2666/3394). Commands: NEW remember.md (routes durable facts → jacked memory add); learn.md, goal-maker.md, bhag.md, dcr.md, release.md, checkpoint/SKILL.md each get a short memory-vault routing block (milestone events → <code>jacked memory add --type ... --tags milestone</code>) that no-ops gracefully when the feature is off (guard: <code>jacked memory status --quiet</code> exit code).</td><td>test_memory_features_toggle.py: PUT round-trip via TestClient (test_packs_endpoint.py hermetic pattern) → settings.json entries appear/disappear (markers), state.enabled flips, foreign hooks untouched; GET reflects installed state; guarded-app CSRF/host tests copied. test_web_js check only if custom markup added. Command-file assertions: routing block present in each edited md.</td></tr>
+<tr><td><b>M8</b> ship</td><td>README (features section + version history 0.83.0), dashboard copy, __init__.py 0.83.0, release notes. Gates: full pytest, /qa (dashboard card), /cso (Fable security audit — vault paths, settings mutation, subprocess, transcript handling), /dcr, CI mirror: <code>uv run python -m pytest</code> + <code>python -m build</code> (publish.yml build step). PR via gh, NOT merged.</td><td>—</td></tr>
+</tbody>
+</table>
+
+<h2>4. Security / data-integrity invariants (test-enforced)</h2>
+<ul>
+<li>Migration never deletes or rewrites any source file; count verification fails loud (nonzero) on any mismatch.</li>
+<li>All hooks exit 0 on every failure path; a broken vault must never block a session or a git merge.</li>
+<li>Vault sync: ff-only, never destructive; conflicts skip + surface.</li>
+<li>Note slugs sanitized (no path separators/traversal — mirror features.py:483 guard); group/repo names path-safe.</li>
+<li>Transcript/PR text handled as data: fenced in prompts with ignore-instructions framing; never executed; Rich-escaped when printed.</li>
+<li>No silent size caps anywhere; the 1500-token recall budget is the design's real constraint and trimming logs what was cut (in the brief's own last line when trimmed).</li>
+<li>settings.json mutations: atomic writes, marker-scoped, foreign entries untouched, backup snapshots already made by install flow.</li>
+</ul>
+
+<aside><b>Execution:</b> one milestone at a time on <code>feature/memory-vault</code>; each milestone lands as its own commit only after its tests + acceptance run green locally. Coding agents must escalate (stop and report) if a needed decision isn't covered here or in the design doc.</aside>
+</div>
+</body>
+</html>

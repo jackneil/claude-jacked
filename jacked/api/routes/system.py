@@ -630,8 +630,14 @@ async def installations_overview(request: Request):
         _name_to_display,
         _read_settings_json,
     )
+    from jacked.memory.settings_io import SettingsUnreadableError
 
-    settings = _read_settings_json()
+    # Read-only status readout: a corrupt settings.json degrades to empty
+    # detection rather than 500ing the whole installed-components view.
+    try:
+        settings = _read_settings_json()
+    except SettingsUnreadableError:
+        settings = {}
 
     # Agents
     agent_names = _get_valid_agent_names()
