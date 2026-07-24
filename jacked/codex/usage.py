@@ -1,13 +1,20 @@
 """Codex usage via the ``codex app-server`` JSON-RPC interface.
 
-Codex (ChatGPT-plan-backed) exposes the same 5h + weekly window shape Claude
-does. The officially documented, machine-readable source is ``codex
-app-server`` (newline-delimited JSON-RPC over stdin/stdout): after
-``initialize`` + ``initialized`` we call ``account/rateLimits/read`` and get
-``result.rateLimits.primary`` (5h) and ``.secondary`` (weekly), each with
-``usedPercent`` + ``resetsAt`` (unix epoch). We normalize that to jacked's
-``five_hour``/``seven_day`` shape and write the same cache columns the Anthropic
-path uses, so every downstream consumer (menubar, panel, auto-swap) is unchanged.
+Codex (ChatGPT-plan-backed) exposes up to two rate-limit windows. The
+officially documented, machine-readable source is ``codex app-server``
+(newline-delimited JSON-RPC over stdin/stdout): after ``initialize`` +
+``initialized`` we call ``account/rateLimits/read`` and get
+``result.rateLimits.primary`` / ``.secondary``, each with ``usedPercent``,
+``windowDurationMins`` and ``resetsAt`` (unix epoch). Historically primary was
+the 5h window and secondary the weekly one, but the shape is NOT positional
+anymore: weekly-only accounts report a lone primary with
+``windowDurationMins=10080`` and ``secondary: null``. So we classify each
+window by its duration (positional only as a fallback) and normalize to
+jacked's ``five_hour``/``seven_day`` shape, writing the same cache columns the
+Anthropic path uses, so every downstream consumer (menubar, panel, auto-swap)
+is unchanged. A window Codex no longer reports gets its cache column CLEARED —
+otherwise a dead window's last reading survives forever (a weekly-only account
+kept showing a stale 100% "7d" from a window that expired days earlier).
 
 This is NOT the ToS-risky chatgpt.com backend scrape and NOT the rollout-jsonl
 file (null since gpt-5.4) — it's the supported RPC.
@@ -40,25 +47,61 @@ class CodexUsageError(Exception):
     """The codex app-server call failed (no binary, timeout, RPC error)."""
 
 
+# A window under a day is the "short" (5h-style) window; anything longer is
+# the weekly one. Today's real durations are 300 and 10080 minutes.
+_SHORT_WINDOW_MAX_MINS = 1440
+
+
+def _classify_windows(primary, secondary) -> dict:
+    """Assign the app-server windows to the ``five_hour``/``seven_day`` slots.
+
+    Classify by ``windowDurationMins`` when present (weekly-only accounts
+    report a lone primary with 10080); fall back to the legacy positional
+    mapping (primary=5h, secondary=weekly) only when the duration is missing.
+    A window that would land in an occupied slot is dropped rather than
+    misfiled — the cache columns are literally "5h" and "7d", and a wrong
+    column is worse than an empty one.
+    """
+    slots: dict = {"five_hour": None, "seven_day": None}
+    for positional_slot, window in (
+        ("five_hour", primary),
+        ("seven_day", secondary),
+    ):
+        if not window:
+            continue
+        dur = window.get("windowDurationMins")
+        if isinstance(dur, (int, float)) and not isinstance(dur, bool):
+            slot = "five_hour" if dur < _SHORT_WINDOW_MAX_MINS else "seven_day"
+        else:
+            slot = positional_slot
+        if slots[slot] is None:
+            slots[slot] = window
+        else:
+            logger.debug("dropping extra %s rate-limit window: %r", slot, window)
+    return slots
+
+
 def normalize_rate_limits(result: Mapping) -> dict:
     """Map an ``account/rateLimits/read`` result to jacked's two-window shape.
 
     Returns ``{"five_hour": {"utilization", "resets_at"}, "seven_day": {...},
     "plan_type", "credits", "reset_credits", "by_limit"}``. Utilization is the
-    app-server ``usedPercent``; resets_at is an ISO string.
+    app-server ``usedPercent``; resets_at is an ISO string. A window Codex did
+    not report comes back as ``{"utilization": None, "resets_at": None}``.
     """
     result = result or {}
     rl = result.get("rateLimits") or {}
-    primary = rl.get("primary") or {}
-    secondary = rl.get("secondary") or {}
+    slots = _classify_windows(rl.get("primary"), rl.get("secondary"))
+    five = slots["five_hour"] or {}
+    seven = slots["seven_day"] or {}
     return {
         "five_hour": {
-            "utilization": primary.get("usedPercent"),
-            "resets_at": _epoch_to_iso(primary.get("resetsAt")),
+            "utilization": five.get("usedPercent"),
+            "resets_at": _epoch_to_iso(five.get("resetsAt")),
         },
         "seven_day": {
-            "utilization": secondary.get("usedPercent"),
-            "resets_at": _epoch_to_iso(secondary.get("resetsAt")),
+            "utilization": seven.get("usedPercent"),
+            "resets_at": _epoch_to_iso(seven.get("resetsAt")),
         },
         "plan_type": rl.get("planType"),
         "credits": rl.get("credits"),
@@ -264,12 +307,17 @@ async def fetch_codex_usage(
         except Exception:  # pragma: no cover
             logger.debug("record_account_error failed", exc_info=True)
         return None
+    # A window Codex no longer reports must CLEAR its cache column, not skip
+    # it — a weekly-only account's dead 5h/7d reading would otherwise persist
+    # forever (stale 100% displayed and fed to auto-swap).
     db.update_account_usage_cache(
         account_id,
         five_hour=five["utilization"],
         seven_day=seven["utilization"],
         five_hour_resets_at=five["resets_at"],
         seven_day_resets_at=seven["resets_at"],
+        clear_five_hour=five["utilization"] is None,
+        clear_seven_day=seven["utilization"] is None,
         raw=result,
     )
     # The rate-limits read carries the CURRENT ChatGPT plan — keep the stored

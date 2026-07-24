@@ -39,6 +39,27 @@ RECORDED_RESULT = {
     "rateLimitResetCredits": {"availableCount": 0},
 }
 
+# Verbatim result captured live 2026-07-23: the weekly-only shape. secondary
+# is null and the lone primary IS the weekly window (windowDurationMins
+# 10080). Mapping positionally here filed the weekly percent under "5h" and
+# left a dead 100% frozen in the "7d" cache (#weekly-only regression).
+WEEKLY_ONLY_RESULT = {
+    "rateLimits": {
+        "limitId": "codex",
+        "limitName": None,
+        "primary": {"usedPercent": 23, "windowDurationMins": 10080, "resetsAt": 1785266094},
+        "secondary": None,
+        "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+        "individualLimit": None,
+        "planType": "pro",
+        "rateLimitReachedType": None,
+    },
+    "rateLimitsByLimitId": {
+        "codex": {"limitId": "codex", "primary": {"usedPercent": 23}, "planType": "pro"},
+    },
+    "rateLimitResetCredits": {"availableCount": 0, "credits": []},
+}
+
 
 # --------------------------------------------------------------------------
 # Normalizer
@@ -58,6 +79,39 @@ def test_normalize_converts_epoch_resets_to_iso():
     assert datetime.fromisoformat(five) == datetime.fromtimestamp(
         1782683811, tz=timezone.utc
     )
+
+
+def test_normalize_weekly_only_primary_lands_in_7d():
+    # windowDurationMins wins over position: a lone weekly primary must land
+    # in seven_day, leaving five_hour empty — not the other way around.
+    norm = cu.normalize_rate_limits(WEEKLY_ONLY_RESULT)
+    assert norm["seven_day"]["utilization"] == 23
+    assert datetime.fromisoformat(norm["seven_day"]["resets_at"]) == datetime.fromtimestamp(
+        1785266094, tz=timezone.utc
+    )
+    assert norm["five_hour"]["utilization"] is None
+    assert norm["five_hour"]["resets_at"] is None
+
+
+def test_normalize_positional_fallback_without_durations():
+    # Old payloads without windowDurationMins keep the legacy mapping.
+    norm = cu.normalize_rate_limits({"rateLimits": {
+        "primary": {"usedPercent": 4, "resetsAt": 1782683811},
+        "secondary": {"usedPercent": 40, "resetsAt": 1783199300},
+    }})
+    assert norm["five_hour"]["utilization"] == 4
+    assert norm["seven_day"]["utilization"] == 40
+
+
+def test_normalize_drops_second_window_for_same_slot():
+    # Two weekly-duration windows must not misfile one under "5h": the first
+    # keeps the seven_day slot, the second is dropped.
+    norm = cu.normalize_rate_limits({"rateLimits": {
+        "primary": {"usedPercent": 11, "windowDurationMins": 10080, "resetsAt": 1785266094},
+        "secondary": {"usedPercent": 99, "windowDurationMins": 20160, "resetsAt": 1785266094},
+    }})
+    assert norm["seven_day"]["utilization"] == 11
+    assert norm["five_hour"]["utilization"] is None
 
 
 def test_normalize_handles_missing_windows():
@@ -107,6 +161,52 @@ def test_fetch_codex_usage_writes_cache(db, tmp_path, monkeypatch):
     assert row["cached_5h_resets_at"] is not None
     assert row["cached_7d_resets_at"] is not None
     assert row["usage_cached_at"] is not None
+
+
+def test_fetch_weekly_only_clears_stale_5h_and_updates_7d(db, tmp_path, monkeypatch):
+    """The weekly-only regression: a dead window's cache must be CLEARED.
+
+    Seed the cache as the old positional bug left it (weekly percent under
+    "5h", a frozen 100% under "7d"), then fetch the weekly-only payload: the
+    real weekly usage must land in 7d and the 5h columns must go NULL — not
+    keep serving the stale reading to the dashboard and auto-swap.
+    """
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(
+        acct["id"],
+        five_hour=23.0,
+        seven_day=100.0,
+        five_hour_resets_at="2026-07-28T19:14:54+00:00",
+        seven_day_resets_at="2026-07-18T06:04:44+00:00",
+    )
+
+    async def fake_read(**kwargs):
+        return WEEKLY_ONLY_RESULT
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    result = asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    assert result is not None
+
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_7d"] == 23
+    assert row["cached_7d_resets_at"] is not None
+    assert row["cached_usage_5h"] is None
+    assert row["cached_5h_resets_at"] is None
+
+
+def test_update_usage_cache_none_still_preserves_without_clear(db):
+    """Partial updates (the Anthropic path) keep their None-skips: only an
+    explicit clear flag nulls a column."""
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999)
+    db.update_account_usage_cache(acct["id"], five_hour=10.0, seven_day=20.0)
+    db.update_account_usage_cache(acct["id"], five_hour=11.0)  # 7d untouched
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] == 11.0
+    assert row["cached_usage_7d"] == 20.0
+    db.update_account_usage_cache(acct["id"], seven_day=21.0, clear_five_hour=True)
+    row = db.get_account(acct["id"])
+    assert row["cached_usage_5h"] is None
+    assert row["cached_usage_7d"] == 21.0
 
 
 def test_fetch_codex_usage_records_error_on_failure(db, tmp_path, monkeypatch):
