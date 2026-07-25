@@ -876,16 +876,26 @@ def _commit(vault: Path, message: str) -> None:
     in CI. A "nothing to commit" is treated as a no-op, not an error.
     """
     _run_git(vault, ["add", "-A"])
-    extra: list[str] = []
+    # Auto-maintenance OFF for vault commits: a background `git gc --auto`
+    # spawned by an earlier commit can race the next commit's ref read during
+    # pack-refs, and rapid note-writes (rollup, migrate, test seeds) then die
+    # with "fatal: could not parse HEAD" (seen on CI). One retry covers a gc
+    # that an OLDER jacked already left running against this vault.
+    extra: list[str] = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"]
     if not _git_config_value(vault, "user.name"):
         extra += ["-c", f"user.name={_GIT_FALLBACK_NAME}"]
     if not _git_config_value(vault, "user.email"):
         extra += ["-c", f"user.email={_GIT_FALLBACK_EMAIL}"]
-    proc = _run_git(vault, [*extra, "commit", "-q", "-m", message], check=False)
-    if proc.returncode != 0:
+    for attempt in (1, 2):
+        proc = _run_git(vault, [*extra, "commit", "-q", "-m", message], check=False)
+        if proc.returncode == 0:
+            return
         blob = ((proc.stdout or "") + (proc.stderr or "")).lower()
         if "nothing to commit" in blob or "no changes added" in blob:
             return
+        if attempt == 1 and "could not parse head" in blob:
+            time.sleep(0.2)
+            continue
         tail = _CONTROL_CHARS_RE.sub("", ((proc.stderr or "") + (proc.stdout or "")).strip())
         raise RuntimeError(f"git commit failed: {tail}")
 
