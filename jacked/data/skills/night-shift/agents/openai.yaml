@@ -1,0 +1,6 @@
+# Codex UI prompt for this skill. Claude Code ignores this file (it reads SKILL.md);
+# Codex uses it to surface the skill and seed its default invocation prompt.
+interface:
+  display_name: "Night Shift"
+  short_description: "Autonomous multi-brain loop: discover, build, verify, land"
+  default_prompt: "Use $night-shift to run the autonomous improvement loop on this repo: rotate the brain roster (users, designer, security, compliance, SRE, DX, product) to discover best-in-class gaps, build each queued item behind a done-contract, verify with a fresh skeptical evaluator (tests + browser evidence), and land verified work as one consolidated PR with a morning report. Never auto-merge without the explicit auto-merge argument; production repos always degrade to PR mode."

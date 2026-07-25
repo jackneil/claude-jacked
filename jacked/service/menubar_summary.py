@@ -397,3 +397,4 @@ def binding_model_compact(raw: Optional[dict]) -> Optional[dict]:
         "resets_at": bm.get("resets_at"),
         "severity": bm.get("severity"),
     }
+

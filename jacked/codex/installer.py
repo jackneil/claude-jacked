@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
+from jacked.install_manifest import skill_content_hash as _skill_content_hash
+
 from .credentials import codex_home
 from ._fsutil import (
     _atomic_write_bytes as _atomic_write_bytes,
@@ -212,10 +214,16 @@ def install_codex(
         if name in _CLAUDE_ONLY_SKILLS:
             continue
         expected = _sha_dir(skill_md.parent)
-        _preserve_user_skill_dir(
-            skills_base / name, expected, name, prior, preserved
-        )
-        _copy_tree(skill_md.parent, skills_base / name)
+        # One unwritable path must not abort the whole Codex pass.
+        try:
+            _preserve_user_skill_dir(
+                skills_base / name, expected, name, prior, preserved,
+                src_dir=skill_md.parent,
+            )
+            _copy_tree(skill_md.parent, skills_base / name)
+        except OSError as e:
+            logger.warning("skipping Codex skill %s: %s", name, e)
+            continue
         skills[name] = expected
 
     # 2. Commands -> prompts AND command-derived skills. Claude-only commands are
@@ -233,17 +241,23 @@ def install_codex(
         for cmd in sorted((data_root / "commands").glob("*.md")):
             if cmd.name in _CLAUDE_ONLY_COMMANDS:
                 continue
-            shutil.copy(cmd, prompts_dst / cmd.name)
-            prompts[cmd.name] = _sha_file(cmd)
             skill_dir = skills_base / cmd.stem
             content = _command_skill_md(cmd)
-            # this_run=skills: a wrapper dir step 1 wrote this run is jacked's own,
-            # not user content, so overwriting it must not spawn a .pre-jacked.
-            _preserve_user_skill_dir(
-                skill_dir, _sha_solo_skill(content), cmd.stem, prior, preserved,
-                this_run=skills,
-            )
-            _write_solo_skill(skill_dir, content)
+            try:
+                shutil.copy(cmd, prompts_dst / cmd.name)
+                prompts[cmd.name] = _sha_file(cmd)
+                # this_run=skills: a wrapper dir step 1 wrote this run is jacked's
+                # own, not user content, so overwriting it must not spawn a backup.
+                # No src_dir: this skill's content is GENERATED from the command,
+                # so the expected-hash identity check is the only source test.
+                _preserve_user_skill_dir(
+                    skill_dir, _sha_solo_skill(content), cmd.stem, prior, preserved,
+                    this_run=skills,
+                )
+                _write_solo_skill(skill_dir, content)
+            except OSError as e:
+                logger.warning("skipping Codex command %s: %s", cmd.name, e)
+                continue
             skills[cmd.stem] = _sha_dir(skill_dir)
 
     # 3. Rules -> AGENTS.md block. The body is authored for Claude Code, so it is
@@ -328,7 +342,9 @@ def install_codex(
         # matches what jacked installed. A user who edited/recreated a now-
         # dropped skill keeps it (upgrade runs this automatically, so it's a
         # higher-exposure path than an explicit uninstall).
-        if isinstance(recorded, str) and _sha_dir(d) == recorded:
+        if isinstance(recorded, str) and (
+            _sha_dir(d) == recorded or _skill_content_hash(d) == recorded
+        ):
             shutil.rmtree(d, ignore_errors=True)
             removed.append(f"skills/{name}")
         else:
@@ -393,7 +409,9 @@ def uninstall_codex(
         d = skills_base / name
         if not d.is_dir():
             continue
-        if isinstance(recorded, str) and _sha_dir(d) == recorded:
+        if isinstance(recorded, str) and (
+            _sha_dir(d) == recorded or _skill_content_hash(d) == recorded
+        ):
             shutil.rmtree(d, ignore_errors=True)
             removed.append(f"skills/{name}")
         else:
