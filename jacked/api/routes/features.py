@@ -327,7 +327,12 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
 
         mem_settings = settings
         mem_path = memory_vault_mod.jacked_home() / ".claude" / "settings.json"
-        if mem_path != SETTINGS_JSON:
+        # Divert to the engine's file ONLY when SETTINGS_JSON still points at
+        # the stock location ($JACKED_HOME redirected the engine elsewhere).
+        # A caller/test that re-pins SETTINGS_JSON is authoritative — reading
+        # past it leaks the real machine's settings into isolated contexts.
+        stock_settings_json = Path.home() / ".claude" / "settings.json"
+        if mem_path != SETTINGS_JSON and SETTINGS_JSON == stock_settings_json:
             try:
                 loaded = json.loads(mem_path.read_text(encoding="utf-8"))
                 mem_settings = loaded if isinstance(loaded, dict) else {}

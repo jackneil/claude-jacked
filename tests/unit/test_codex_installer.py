@@ -353,6 +353,30 @@ def test_uninstall_removes_command_derived_skills(data_root, homes):
     assert "skills/dcr" in out["removed"]
 
 
+def test_ds_store_does_not_flip_ownership_or_spawn_backups(data_root, homes):
+    """A Finder .DS_Store inside jacked's OWN dir must not read as a user
+    modification: reinstall would otherwise back the dir up on every run
+    (unbounded junk) while claiming it "preserved your existing skill"."""
+    _install(data_root, homes)
+    # Both flavors: a command-derived skill (written with src_dir=None, so the
+    # source-subset fallback can't rescue it) and an ordinary source skill.
+    for name in ("dcr", "demo-skill"):
+        (_skill_dir(homes, name) / ".DS_Store").write_bytes(b"\x00junk")
+    summ = _install(data_root, homes)
+    assert summ.preserved == []
+    assert not (homes["agents_home"] / "jacked-backups").exists()
+
+
+def test_uninstall_removes_owned_dir_despite_ds_store(data_root, homes):
+    """Same tolerance on the delete gate: a dropping is not a user edit, so
+    uninstall still removes jacked's dir instead of leaving junk behind."""
+    _install(data_root, homes)
+    (_skill_dir(homes, "dcr") / ".DS_Store").write_bytes(b"\x00junk")
+    out = ins.uninstall_codex(home=homes["home"], agents_home=homes["agents_home"])
+    assert not _skill_dir(homes, "dcr").exists()
+    assert "skills/dcr" in out["removed"]
+
+
 def test_real_commands_generate_parseable_skill_frontmatter():
     """Integration guard against the REAL data/commands: every non-excluded
     command's _command_skill_md yields frontmatter yaml.safe_load parses with a
@@ -1218,12 +1242,19 @@ def test_clone_website_skill_bundled_with_license_parses_and_ships_to_codex():
 
 # FIX 1: never destroy a user's own ~/.agents/skills/<name> on a name collision.
 
-def test_user_owned_skill_dir_preserved_as_pre_jacked(data_root, homes):
+def _backups_of(skills_base: Path, name: str) -> list:
+    """Preserved copies of `name`, which live OUTSIDE the live skills tree."""
+    root = skills_base.parent / "jacked-backups" / "skills"
+    return sorted(root.glob(f"{name}-*")) if root.is_dir() else []
+
+
+def test_user_owned_skill_dir_preserved_in_backups_dir(data_root, homes):
     """A user owns dirs whose names collide with a jacked skill (demo-skill) and a
     command-derived skill (dcr). Neither is jacked-owned yet (no prior manifest),
-    so install must back each up to <name>.pre-jacked (user copy intact), record
-    it in summary.preserved, and install its own copy. A SECOND install must NOT
-    re-backup the now-jacked-owned dirs."""
+    so install must back each up under ~/.agents/jacked-backups/skills (user copy
+    intact, NOT left beside the live skills where it would load as a duplicate),
+    record it in summary.preserved, and install its own copy. A SECOND install
+    must NOT re-backup the now-jacked-owned dirs."""
     skills_base = ins.agents_skills_dir(homes["agents_home"])
     for name in ("demo-skill", "dcr"):
         d = skills_base / name
@@ -1236,11 +1267,14 @@ def test_user_owned_skill_dir_preserved_as_pre_jacked(data_root, homes):
     summ = _install(data_root, homes)
 
     for name in ("demo-skill", "dcr"):
-        backup = skills_base / f"{name}.pre-jacked"
-        assert backup.is_dir(), f"{name} user copy must be preserved"
+        backups = _backups_of(skills_base, name)
+        assert len(backups) == 1, f"{name} user copy must be preserved"
+        backup = backups[0]
         assert (backup / "my-notes.txt").read_text() == "do not delete\n"
         assert "MY OWN" in (backup / "SKILL.md").read_text()
         assert f"skills/{name}" in summ.preserved
+        # No stray duplicate left in the live skills tree.
+        assert not list(skills_base.glob(f"{name}.pre-jacked*"))
     # jacked's own content now occupies the real dirs (user content is gone from them)
     assert "MY OWN" not in (skills_base / "demo-skill" / "SKILL.md").read_text()
     assert (skills_base / "demo-skill" / "measure.js").exists()  # jacked sidecar landed
@@ -1252,16 +1286,79 @@ def test_user_owned_skill_dir_preserved_as_pre_jacked(data_root, homes):
     summ2 = _install(data_root, homes)
     assert summ2.preserved == []
     for name in ("demo-skill", "dcr"):
-        backup = skills_base / f"{name}.pre-jacked"
-        assert (backup / "my-notes.txt").read_text() == "do not delete\n"
+        backups = _backups_of(skills_base, name)
+        assert len(backups) == 1
+        assert (backups[0] / "my-notes.txt").read_text() == "do not delete\n"
+
+
+def test_user_dir_created_after_an_install_is_still_preserved(data_root, homes):
+    """The name is in the prior manifest, but the CONTENT is the user's: they
+    created their own dir under a name jacked already shipped. Ownership is
+    decided by content, so the second install preserves it instead of
+    overwriting it."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    _install(data_root, homes)                       # records demo-skill + dcr
+    for name in ("demo-skill", "dcr"):
+        shutil.rmtree(skills_base / name)
+        d = skills_base / name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: MINE\n---\nmine\n")
+        (d / "my-notes.txt").write_text("do not delete\n")
+
+    summ = _install(data_root, homes)
+
+    for name in ("demo-skill", "dcr"):
+        backups = _backups_of(skills_base, name)
+        assert len(backups) == 1, f"{name} must be preserved, not overwritten"
+        assert (backups[0] / "my-notes.txt").read_text() == "do not delete\n"
+        assert f"skills/{name}" in summ.preserved
+        assert "MINE" not in (skills_base / name / "SKILL.md").read_text()
+
+
+def test_jacked_owned_dir_is_overwritten_in_place(data_root, homes):
+    """The counterpart: an untouched jacked dir, and a jacked dir whose SOURCE
+    moved (new content + a new sidecar), are both refreshed in place with no
+    backup."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    _install(data_root, homes)
+
+    src = data_root / "skills" / "demo-skill"
+    (src / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: a demo skill\n---\nbody v2\n"
+    )
+    (src / "extra.js").write_text("// added upstream\n")
+
+    summ = _install(data_root, homes)
+
+    assert summ.preserved == []
+    assert _backups_of(skills_base, "demo-skill") == []
+    assert "body v2" in (skills_base / "demo-skill" / "SKILL.md").read_text()
+    assert (skills_base / "demo-skill" / "extra.js").exists()
+
+
+def test_install_skips_a_failing_skill_and_continues(data_root, homes, monkeypatch):
+    """One unwritable skill must not abort the whole Codex pass."""
+    real = ins._copy_tree
+
+    def boom(src, dst):
+        if src.name == "demo-skill":
+            raise OSError(13, "Permission denied")
+        return real(src, dst)
+
+    monkeypatch.setattr(ins, "_copy_tree", boom)
+    summ = _install(data_root, homes)
+
+    assert "demo-skill" not in summ.skills     # skipped, and not recorded
+    assert "dcr" in summ.skills                # the command-derived skill landed
+    assert summ.rules and summ.prompts         # the rest of the pass completed
 
 
 def test_wrapper_skill_overwritten_by_command_not_self_preserved(data_root, homes):
     """Regression: the real data ships BOTH a pointer-wrapper skill and a same-name
     command (e.g. skills/dcr + commands/dcr.md). Step 1 writes the wrapper, step 2
     overwrites it with command content IN THE SAME RUN. jacked's own step-1 output
-    must NOT be mistaken for user content and backed up to <name>.pre-jacked just
-    because the (empty) prior manifest hasn't recorded it yet."""
+    must NOT be mistaken for user content and backed up just because the (empty)
+    prior manifest hasn't recorded it yet."""
     # Add a wrapper skill whose name collides with the fixture's dcr.md command.
     wrapper = data_root / "skills" / "dcr"
     wrapper.mkdir(parents=True)
@@ -1273,7 +1370,7 @@ def test_wrapper_skill_overwritten_by_command_not_self_preserved(data_root, home
     summ = _install(data_root, homes)  # fresh: no prior manifest, no user dirs
 
     # No spurious self-backup of jacked's own wrapper.
-    assert not (skills_base / "dcr.pre-jacked").exists()
+    assert _backups_of(skills_base, "dcr") == []
     assert summ.preserved == []
     # Command content won (precedence), wrapper content is gone.
     assert _body_after_frontmatter(
@@ -1281,25 +1378,30 @@ def test_wrapper_skill_overwritten_by_command_not_self_preserved(data_root, home
     ) == "run dcr\n"
 
 
-def test_preserve_does_not_clobber_existing_pre_jacked_backup(data_root, homes):
-    """A user owns BOTH ~/.agents/skills/demo-skill AND a pre-existing
-    demo-skill.pre-jacked (e.g. their own dir, or a prior preservation orphaned by
-    an uninstall). The new backup must NOT overwrite the existing .pre-jacked;
-    it falls back to .pre-jacked-2 so no earlier copy is silently destroyed."""
+def test_preserve_does_not_clobber_an_earlier_backup(homes):
+    """Two preservations of the same name must produce TWO backups. Even within
+    the same timestamp second, the second takes the next free suffix, so an
+    earlier preserved copy is never silently destroyed."""
     skills_base = ins.agents_skills_dir(homes["agents_home"])
-    d = skills_base / "demo-skill"
-    d.mkdir(parents=True)
-    (d / "SKILL.md").write_text("---\nname: demo-skill\ndescription: mine now\n---\nnow\n")
-    old_backup = skills_base / "demo-skill.pre-jacked"
-    old_backup.mkdir()
-    (old_backup / "SKILL.md").write_text("PRECIOUS EARLIER BACKUP\n")
 
-    _install(data_root, homes)
+    def _own(text: str) -> Path:
+        d = skills_base / "demo-skill"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(text)
+        return d
 
-    # The earlier backup is untouched; the new one took the next free suffix.
-    assert (old_backup / "SKILL.md").read_text() == "PRECIOUS EARLIER BACKUP\n"
-    assert (skills_base / "demo-skill.pre-jacked-2" / "SKILL.md").read_text() \
-        == "---\nname: demo-skill\ndescription: mine now\n---\nnow\n"
+    preserved: list = []
+    for body in ("PRECIOUS EARLIER COPY\n", "SECOND USER COPY\n"):
+        ins._preserve_user_skill_dir(
+            _own(body), "sha256:not-what-is-there", "demo-skill", {}, preserved,
+        )
+
+    backups = _backups_of(skills_base, "demo-skill")
+    assert len(backups) == 2
+    assert sorted(b.joinpath("SKILL.md").read_text() for b in backups) == [
+        "PRECIOUS EARLIER COPY\n", "SECOND USER COPY\n",
+    ]
+    assert preserved == ["skills/demo-skill", "skills/demo-skill"]
 
 
 def test_install_prune_keeps_user_modified_dropped_skill(data_root, homes):
@@ -1384,14 +1486,14 @@ def test_non_iterable_inner_hooks_does_not_crash(data_root, homes, group):
 
 def test_byte_identical_user_dir_not_backed_up(data_root, homes):
     """If a colliding dir already holds EXACTLY what jacked would install, there's
-    nothing to preserve: no .pre-jacked backup is made and nothing is reported."""
+    nothing to preserve: no backup is made and nothing is reported."""
     skills_base = ins.agents_skills_dir(homes["agents_home"])
     # Pre-place demo-skill byte-identical to the source skill dir.
     import shutil as _sh
     _sh.copytree(data_root / "skills" / "demo-skill", skills_base / "demo-skill")
     summ = _install(data_root, homes)
     assert "skills/demo-skill" not in summ.preserved
-    assert not (skills_base / "demo-skill.pre-jacked").exists()
+    assert _backups_of(skills_base, "demo-skill") == []
 
 
 def test_uninstall_leaves_user_modified_skill_dir(data_root, homes):

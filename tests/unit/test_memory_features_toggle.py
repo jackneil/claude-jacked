@@ -655,3 +655,34 @@ def test_init_already_initialized_reinstalls_hooks(menv):
     after = settings_io.read_settings(sp)
     assert hooks_config.has_capture_entry(after)
     assert hooks_config.has_recall_entry(after)
+
+
+def test_detect_diverts_to_jacked_home_when_settings_json_is_stock(tmp_path, monkeypatch):
+    """Pin the $JACKED_HOME divergence branch of memory_vault detection.
+
+    When SETTINGS_JSON sits at the STOCK location (Path.home()-derived) but
+    $JACKED_HOME redirects the memory engine elsewhere, detection must read
+    the engine's file — that is the original "checkbox misreports its own
+    toggle under a redirected home" bug. The sibling test above pins the
+    other branch (a re-pinned SETTINGS_JSON is authoritative); this one
+    keeps the divert body from becoming silently deletable dead code.
+    """
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    # SETTINGS_JSON == the stock location under the (patched) home: empty file.
+    stock = fake_home / ".claude" / "settings.json"
+    stock.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(features, "SETTINGS_JSON", stock)
+
+    # The engine's home is redirected — and ITS settings has the capture entry.
+    engine_home = tmp_path / "engine-home"
+    (engine_home / ".claude").mkdir(parents=True)
+    engine_settings: dict = {}
+    hooks_config.ensure_capture_entries(engine_settings, "jacked _hook memory_capture")
+    (engine_home / ".claude" / "settings.json").write_text(
+        json.dumps(engine_settings), encoding="utf-8"
+    )
+    monkeypatch.setenv("JACKED_HOME", str(engine_home))
+
+    assert features._detect_hook_installed({}, "memory_vault") is True

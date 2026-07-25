@@ -63,7 +63,11 @@ def _commit_count(vault):
 
 
 def _utc_today():
-    return datetime.now(timezone.utc).date()
+    # Must match rollup._today()'s clock, which is deliberately LOCAL (it
+    # mirrors capture's local today-file naming). Using UTC here made these
+    # tests fail every evening for negative-UTC users, when the UTC date
+    # runs a day ahead of the local date the code computes offsets from.
+    return rollup_mod._today()
 
 
 def _days_ago(n):

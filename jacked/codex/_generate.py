@@ -173,53 +173,81 @@ def _agent_toml(agent_md: Path) -> str:
 
 
 def _is_jacked_owned(
-    name: str, prior_manifest: Mapping, this_run: Optional[Mapping] = None
+    name: str, prior_manifest: Mapping, this_run: Optional[Mapping] = None,
+    target: Optional[Path] = None, src_dir: Optional[Path] = None,
 ) -> bool:
     """True iff overwriting `name` is replacing jacked's own copy, not the user's.
 
-    Jacked-owned means recorded as a jacked skill in the PRIOR manifest, OR
-    already written by an earlier pass of the CURRENT run (`this_run` is the
-    in-progress skills dict). The second case matters because step 1 writes a
-    pointer-wrapper skill dir that step 2 (command-derived skill) then overwrites
-    within the same install: without it, step 2 would mistake jacked's own
-    step-1 output for user content and back it up as a spurious `.pre-jacked`."""
-    if name in (prior_manifest.get("skills") or {}):
+    Ownership is decided by CONTENT, not by the name alone:
+      * written by an earlier pass of the CURRENT run (`this_run`, the in-progress
+        skills dict) - step 1 writes a pointer-wrapper skill dir that step 2
+        (command-derived skill) overwrites within the same install, and jacked's
+        own step-1 output must not be backed up as spurious user content;
+      * recorded in the PRIOR manifest AND `target` still hashes to the recorded
+        value (jacked wrote it and nobody replaced it since);
+      * recorded in the PRIOR manifest AND every file in `target` still matches
+        the same relative path in `src_dir` - the dir is jacked's, the SOURCE
+        just moved under it (a dev/editable checkout, a version bump).
+
+    A name recorded in the manifest is NOT enough: a user who creates their own
+    ~/.agents/skills/<name> after an install would otherwise have it silently
+    overwritten. `target=None` keeps the old name-only answer for callers with no
+    dir in hand."""
+    from jacked.install_manifest import is_source_subset, skill_content_hash
+
+    if this_run is not None and name in this_run:
         return True
-    return this_run is not None and name in this_run
+    recorded = (prior_manifest.get("skills") or {}).get(name)
+    if not isinstance(recorded, str):
+        return False
+    if target is None:
+        return True
+    if target.is_symlink() or not target.is_dir():
+        return False
+    # Strict hash first (matches how the manifest was recorded), then the
+    # droppings-tolerant hash: a .DS_Store Finder dropped into jacked's own dir
+    # must not flip ownership to "user's" and trigger a spurious backup. The
+    # tolerant hash equals _sha_dir on a clean dir, so recorded values from
+    # existing manifests match without migration.
+    if _sha_dir(target) == recorded or skill_content_hash(target) == recorded:
+        return True
+    return src_dir is not None and is_source_subset(target, src_dir)
 
 
 def _preserve_user_skill_dir(
     target: Path, expected_hash: str, name: str,
     prior_manifest: Mapping, preserved: list,
     this_run: Optional[Mapping] = None,
+    src_dir: Optional[Path] = None,
 ) -> None:
     """Never destroy a user's OWN ~/.agents/skills/<name> on a name collision.
 
     ~/.agents/skills is a shared surface; a user may own a dir whose name collides
-    with a jacked skill/command stem (pr, release, dcr, ...). Before jacked
-    overwrites `target`, if the dir exists, is NOT already jacked-owned (per the
-    prior manifest or written earlier this run via `this_run`), and is not already
-    byte-identical to what we'd install, move it aside to ``<target>.pre-jacked``
-    (replacing any stale backup first) so the user's copy survives. Records
-    ``skills/<name>`` in `preserved`. The caller then writes jacked's copy into
-    the now-vacant path."""
+    with a jacked skill/command stem (pr, release, dcr, ...) - including a dir they
+    create AFTER an install already recorded that name. Before jacked overwrites
+    `target`, if the dir exists, is NOT already jacked-owned (by content: manifest
+    hash, consistency with `src_dir`, or written earlier this run), and is not
+    byte-identical to what we'd install, move it aside to
+    ``~/.agents/jacked-backups/skills/<name>-<UTC timestamp>`` so the user's copy
+    survives. The backup lives OUTSIDE ~/.agents/skills on purpose: a copy left
+    beside the live skills is a discoverable duplicate skill, and those pile up
+    forever. Records ``skills/<name>`` in `preserved`. The caller then writes
+    jacked's copy into the now-vacant path."""
+    from jacked.install_manifest import backup_dir_for, skill_content_hash
+
     if not (target.exists() or target.is_symlink()):
         return
-    if _is_jacked_owned(name, prior_manifest, this_run):
+    if _is_jacked_owned(name, prior_manifest, this_run, target, src_dir):
         return
     if (target.is_dir() and not target.is_symlink()
-            and _sha_dir(target) == expected_hash):
-        return  # already exactly what we'd install -> no clobber, no backup
+            and (_sha_dir(target) == expected_hash
+                 or skill_content_hash(target) == expected_hash)):
+        return  # already what we'd install (droppings aside) -> no clobber, no backup
     # Never clobber a backup that already exists (it may be the user's own, or a
-    # prior preservation): pick the first free `.pre-jacked[-N]` suffix so no
-    # earlier preserved copy is silently destroyed.
-    backup = target.with_name(target.name + ".pre-jacked")
-    n = 2
-    while backup.exists() or backup.is_symlink():
-        backup = target.with_name(f"{target.name}.pre-jacked-{n}")
-        n += 1
+    # prior preservation): backup_dir_for picks the first free timestamped path
+    # so no earlier preserved copy is silently destroyed.
+    backup = backup_dir_for(target, name)
+    backup.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(target), str(backup))
-    logger.warning(
-        "preserved your existing ~/.agents/skills/%s as %s", name, backup.name
-    )
+    logger.warning("preserved your existing ~/.agents/skills/%s as %s", name, backup)
     preserved.append(f"skills/{name}")

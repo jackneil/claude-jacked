@@ -68,7 +68,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "console", Console(file=buf, width=200, highlight=False))
 
     # `install` does a lot of real filesystem/plugin work we don't exercise here.
-    monkeypatch.setattr(cli, "_run_install", lambda **k: None)
+    monkeypatch.setattr(cli, "_run_install", lambda **k: set())
     monkeypatch.setattr(cli, "_warn_required_plugins_missing", lambda *a, **k: None)
 
     return SimpleNamespace(home=home, buf=buf, monkeypatch=monkeypatch)
@@ -479,7 +479,7 @@ def test_uninstall_npx_missing_warns_and_deletes_state(env):
 def test_install_unknown_pack_exits_before_run_install(env):
     _fake_packs(env.monkeypatch)
     ran = []
-    env.monkeypatch.setattr(cli, "_run_install", lambda **k: ran.append(True))
+    env.monkeypatch.setattr(cli, "_run_install", lambda **k: (ran.append(True), set())[1])
     r = CliRunner().invoke(main, ["install", "--no-codex", "--packs", "bogus"])
     assert r.exit_code == 1
     # The sentinel proves validation short-circuited before the install ran.

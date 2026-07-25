@@ -1200,6 +1200,28 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     return "copied"
 
 
+def _copy_skill_tree(src_skill_root: Path, skill_dir: Path) -> int:
+    """Install one skill: SKILL.md AND every sidecar file (scripts, references/,
+    assets) — a skill that ships a measure.js etc. is broken without them.
+
+    `_link_or_copy` symlinks in editable mode and copies otherwise (plain
+    shutil.copy raises SameFileError if dst is already a symlink to src, which
+    broke the tray-triggered upgrade when a dev symlink was present). Returns the
+    number of files written; raises OSError, which the caller reports per skill.
+
+    >>> callable(_copy_skill_tree)
+    True
+    """
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for src_file in sorted(p for p in src_skill_root.rglob("*") if p.is_file()):
+        dst = skill_dir / src_file.relative_to(src_skill_root)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _link_or_copy(src_file, dst)
+        written += 1
+    return written
+
+
 def _install_asset_dir(
     src_dir: Path,
     dst_dir: Path,
@@ -2481,7 +2503,7 @@ def install(
     if as_json:
         console.quiet = True
     try:
-        _run_install(
+        _installed_skill_names = _run_install(
             home=home,
             pkg_root=pkg_root,
             sounds=sounds,
@@ -2498,8 +2520,23 @@ def install(
     # jacked installed before but no longer ships, then persist the new
     # manifest + the dashboard-readable last-install record.
     _current_hashes = _mani.hash_source(pkg_root)
+    # Full-dir hashes of the skill dirs we just wrote, so a later run can tell a
+    # user-edited SIDECAR from jacked's own content (SKILL.md alone can't).
+    # Hash ONLY the skills _run_install actually wrote: a skill skipped on
+    # OSError leaves the USER's dir at that path, and recording its hash would
+    # mark their dir jacked-owned — a later uninstall would then delete it.
+    _current_hashes[_mani.SKILLS_DIRS_KEY] = _mani.hash_installed_skill_dirs(
+        home,
+        {
+            n: h
+            for n, h in _current_hashes.get("skills", {}).items()
+            if n in _installed_skill_names
+        },
+    )
     _d = _mani.diff(_prior_manifest, _current_hashes)
-    _mani.prune_removed(_d, home)
+    # Pass the prior manifest so a skill dir the user modified/recreated is never
+    # deleted by the prune (upgrade runs this automatically — high exposure).
+    _mani.prune_removed(_d, home, _prior_manifest)
     _now = datetime.now(timezone.utc).isoformat()
     _mani.write(_manifest_path, _ver, _current_hashes, _now)
     _record = _isum.build_record(_d, _prior_version, _ver, _now)
@@ -2584,10 +2621,9 @@ def install(
                 f"→ ~/.codex/agents, rules → AGENTS.md{_mcp_suffix}"
             )
             for _item in _codex_summary.preserved:
-                _name = _item.split("/", 1)[-1]
                 console.print(
                     f"[yellow][!][/yellow] Codex: preserved your existing "
-                    f"~/.agents/{_item} as {_name}.pre-jacked"
+                    f"~/.agents/{_item} under ~/.agents/jacked-backups/skills/"
                 )
             if _codex_summary.hooks_added:
                 console.print(
@@ -2613,11 +2649,16 @@ def _run_install(
     force: bool,
     as_json: bool,
     no_tray: bool = False,
-) -> None:
+) -> set:
     """Run the artifact/hook/rules installation (no manifest, no summary).
 
     Split out of `install` so the change-summary orchestration can wrap it in
     a try/finally that always restores console state.
+
+    Returns the names of the skills actually WRITTEN this run. A skill that
+    hit the per-skill OSError skip is absent — the caller must not record a
+    dir hash for it, because the dir at that path is the USER's (recording it
+    would mark their dir jacked-owned and a later uninstall would delete it).
     """
     import json
     import shutil
@@ -2687,24 +2728,39 @@ def _run_install(
     # Claude Code expects skills in subdirectories with SKILL.md
     skills_src_dir = pkg_root / "skills"
     skill_count = 0
+    installed_skill_names: set = set()
     if skills_src_dir.exists():
+        # Prior manifest identifies which colliding dirs are jacked's OWN copies.
+        # It is still the pre-install manifest here: `install` rewrites it only
+        # after _run_install returns.
+        from jacked import install_manifest as _skill_mani
+
+        _prior_skills = _skill_mani.load(home / ".claude" / "jacked-manifest.json")
         for skill_md in skills_src_dir.glob("*/SKILL.md"):
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            src_skill_root = skill_md.parent
-            # Copy SKILL.md AND every sidecar file (scripts, references/, assets)
-            # — a skill that ships a measure.js etc. is broken without them.
-            # _link_or_copy symlinks in editable mode, copies otherwise (plain
-            # shutil.copy raises SameFileError if dst is already a symlink to src
-            # — broke the tray-triggered upgrade when a dev symlink was present).
-            for src_file in sorted(
-                p for p in src_skill_root.rglob("*") if p.is_file()
-            ):
-                dst = skill_dir / src_file.relative_to(src_skill_root)
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                _link_or_copy(src_file, dst)
+            # Never destroy a dir that isn't ours: a user's own same-named skill
+            # (or one they edited) is moved aside first, and the move is REPORTED
+            # immediately — a Ctrl-C later in the loop must not leave the user's
+            # dir relocated without them ever seeing where it went. One
+            # unwritable skill is skipped, not fatal to the whole install.
+            try:
+                _backup = _skill_mani.preserve_user_skill_dir(
+                    skill_dir, skill_name, skill_md.parent, _prior_skills,
+                )
+                if _backup:
+                    console.print(
+                        f"[yellow][!][/yellow] Preserved your existing skill "
+                        f"{skill_name} (not installed by jacked) at {_backup}"
+                    )
+                _copy_skill_tree(skill_md.parent, skill_dir)
+            except OSError as _skill_err:
+                console.print(
+                    f"[yellow][!][/yellow] Skipped skill {skill_name}: {_skill_err}"
+                )
+                continue
             skill_count += 1
+            installed_skill_names.add(skill_name)
     if skill_count > 0:
         console.print(f"[green][OK][/green] Installed {skill_count} skills")
     else:
@@ -2885,6 +2941,8 @@ def _run_install(
     # autostart and start the tray now. `--no-tray` opts out.
     if not no_tray:
         _setup_tray_autostart()
+
+    return installed_skill_names
 
 
 def _detect_codex_for_packs() -> bool:
@@ -3515,6 +3573,8 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     import json
     import shutil
 
+    from jacked import install_manifest as _mani
+
     home = _jacked_home()
     pkg_root = _get_data_root()
     settings_path = home / ".claude" / "settings.json"
@@ -3597,13 +3657,46 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     # Remove skill directories — iterate all skills/*/SKILL.md in data root
     skills_src_dir = pkg_root / "skills"
     skill_count = 0
+    _manifest_path = home / ".claude" / "jacked-manifest.json"
+    _uninstall_manifest, _manifest_status = _mani.load_with_status(_manifest_path)
+    if _manifest_status == "corrupt":
+        console.print(
+            f"[yellow][!][/yellow] The install manifest at {_manifest_path} is "
+            "unreadable. Skill removal falls back to a content comparison "
+            "against the packaged skills."
+        )
     if skills_src_dir.exists():
         for skill_md in skills_src_dir.glob("*/SKILL.md"):
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
-            if skill_dir.exists():
-                shutil.rmtree(skill_dir)
-                skill_count += 1
+            if not skill_dir.exists():
+                continue
+            # Delete only a dir jacked owns: one that still matches the manifest,
+            # or (no/unreadable manifest) one whose every file still matches the
+            # packaged source. Anything else stays, with an honest reason.
+            _remove, _keep_why = _mani.skill_removal_decision(
+                skill_dir, skill_name, _uninstall_manifest, skill_md.parent,
+            )
+            if _remove:
+                # A symlink gets unlinked, never rmtree'd: rmtree raises on a
+                # symlink argument, which pre-guard aborted the whole uninstall
+                # on an editable-install skill dir. One unremovable skill is
+                # reported and skipped, not fatal to the uninstall.
+                try:
+                    if skill_dir.is_symlink():
+                        skill_dir.unlink()
+                    else:
+                        shutil.rmtree(skill_dir)
+                    skill_count += 1
+                except OSError as _rm_err:
+                    console.print(
+                        f"[yellow][!][/yellow] Could not remove skill "
+                        f"{skill_name}: {_rm_err}"
+                    )
+            else:
+                console.print(
+                    f"[yellow][!][/yellow] Kept skill {skill_name}: {_keep_why}"
+                )
     if skill_count > 0:
         console.print(f"[green][OK][/green] Removed {skill_count} skills")
     else:
@@ -3688,16 +3781,14 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     # current source no longer ships (covers pruned-then-reinstalled history,
     # which the source-glob loops above would miss), then drop the bookkeeping
     # files so a fresh install starts clean.
-    from jacked import install_manifest as _mani
-
-    _manifest_path = home / ".claude" / "jacked-manifest.json"
-    _prior_manifest = _mani.load(_manifest_path)
+    _prior_manifest = _uninstall_manifest
     if _prior_manifest:
         # Treat current source as empty so every recorded artifact counts as
         # "removed" and gets pruned from ~/.claude.
         _empty = {cat.key: {} for cat in _mani.CATEGORIES}
         _d = _mani.diff(_prior_manifest, _empty)
-        _pruned = _mani.prune_removed(_d, home)
+        # Same hash-gate as the skills loop: a modified skill dir is left alone.
+        _pruned = _mani.prune_removed(_d, home, _prior_manifest)
         if _pruned:
             console.print(
                 f"[green][OK][/green] Removed {len(_pruned)} manifest-tracked artifacts"
@@ -5407,6 +5498,118 @@ def claude_cmd(account, claude_args):
         claude_args = claude_args[1:]
 
     launch_claude(config_dir, claude_args, db_path=str(db_path))
+
+
+# ── Subscription usage snapshot ────────────────────────────────────
+
+
+def _usage_row(acct: dict, now) -> dict:
+    """Shape one account row for `jacked usage` output.
+
+    Field-ALLOWLISTED on purpose: token columns must never reach stdout.
+    Percents are defensively coerced (SQLite dynamic typing can hand back
+    TEXT); cache_age_seconds is SIGNED — negative means clock skew, which
+    should be visible, not silently clamped to "fresh".
+    """
+    from jacked.service.usage_pacing import cache_age_seconds, coerce_pct
+
+    return {
+        "id": acct.get("id"),
+        "provider": acct.get("provider") or "claude",
+        "email": acct.get("email"),
+        "subscription_type": acct.get("subscription_type"),
+        "is_active": bool(acct.get("is_active", 1)),
+        "validation_status": acct.get("validation_status"),
+        "usage_5h_pct": coerce_pct(acct.get("cached_usage_5h")),
+        "usage_7d_pct": coerce_pct(acct.get("cached_usage_7d")),
+        "resets_5h_at": acct.get("cached_5h_resets_at"),
+        "resets_7d_at": acct.get("cached_7d_resets_at"),
+        "cache_age_seconds": cache_age_seconds(acct, now),
+    }
+
+
+def _render_usage_table(rows: list[dict], summary: dict) -> None:
+    """Human table for `jacked usage` (JSON mode is the machine contract)."""
+    from rich.table import Table as _Table
+
+    def _pct(v):
+        return f"{v:.0f}%" if isinstance(v, (int, float)) else "?"
+
+    t = _Table(title="Subscription usage (cached)")
+    for col in ("ID", "Provider", "Email", "Plan", "5h %", "7d %",
+                "5h resets (UTC)", "7d resets (UTC)", "Cache age"):
+        t.add_column(col)
+    for r in rows:
+        age_s = r["cache_age_seconds"]
+        # Negative age = clock skew (deliberately unclamped); label it.
+        age = "?" if age_s is None else ("skew" if age_s < 0 else f"{age_s // 60}m")
+        t.add_row(
+            str(r["id"]), r["provider"], r["email"] or "?",
+            r["subscription_type"] or "?",
+            _pct(r["usage_5h_pct"]), _pct(r["usage_7d_pct"]),
+            r["resets_5h_at"] or "?", r["resets_7d_at"] or "?", age,
+        )
+    console.print(t)
+    if summary.get("pause_until"):
+        # pause_until is set when ANY eligible window is constrained — it does
+        # NOT mean the whole fleet is exhausted, so the copy must not say so.
+        console.print(
+            f"Earliest constrained-window reset: [bold]{summary['pause_until']}[/bold]"
+        )
+
+
+@main.command(name="usage")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+@click.option(
+    "--include-inactive", is_flag=True,
+    help="Include accounts marked inactive in the dashboard.",
+)
+def usage_cmd(as_json, include_inactive):
+    """Show cached subscription usage per account (5h/7d windows + resets).
+
+    Reads the same cached rate-limit windows the dashboard shows. Does NOT
+    call any provider API — data is as fresh as the last dashboard/menubar
+    refresh (see cache_age_seconds). Autonomous loops (e.g. the night-shift
+    skill) use --json to decide whether to pause: summary.pause_until is the
+    earliest FUTURE reset among CONSTRAINED (>=90% effective) windows of
+    eligible accounts, staleness-adjusted (a past resets_at means the cached
+    percent is stale headroom). The JSON contract is pinned by
+    tests/unit/test_usage_cmd.py.
+
+    >>> # CLI command: jacked usage [--json] [--include-inactive]
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    from jacked.service.usage_pacing import compute_best_account_summary
+    from jacked.web.database import Database
+
+    db_path = Path.home() / ".claude" / "jacked.db"
+    if not db_path.exists():
+        payload = {"available": False, "reason": "jacked database not found; run 'jacked webux' once"}
+        if as_json:
+            click.echo(_json.dumps(payload))
+        else:
+            console.print("[yellow]jacked database not found. Run 'jacked webux' first.[/yellow]")
+        return
+
+    db = Database(str(db_path))
+    try:
+        accounts = db.list_accounts(include_inactive=include_inactive)
+    finally:
+        db.close()
+
+    now = datetime.now(timezone.utc)
+    rows = [_usage_row(a, now) for a in accounts]
+    summary = compute_best_account_summary(accounts, now=now)
+
+    if as_json:
+        click.echo(_json.dumps({"available": True, "accounts": rows, "summary": summary}))
+        return
+    if not rows:
+        console.print("[yellow]No accounts found.[/yellow]")
+        return
+    _render_usage_table(rows, summary)
 
 
 # ── Codex provider commands ──────────────────────────────────────────
