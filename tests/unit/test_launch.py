@@ -582,7 +582,12 @@ class TestPrepareAccountDir:
 
         with mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"):
             with mock.patch("jacked.launch.should_refresh", return_value=True):
-                with mock.patch("jacked.web.auth.refresh_account_token"):
+                # Plain MagicMock, NOT the auto-detected AsyncMock: an AsyncMock
+                # call creates a real coroutine that the mocked asyncio.run
+                # never awaits, which leaks a RuntimeWarning at gc.
+                with mock.patch(
+                    "jacked.web.auth.refresh_account_token", new=mock.MagicMock()
+                ):
                     with mock.patch("jacked.launch.asyncio") as mock_asyncio:
                         from jacked.launch import prepare_account_dir
 
@@ -764,6 +769,102 @@ class TestResolveAccount:
         with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
             with pytest.raises(click.ClickException, match="not found"):
                 resolve_account(3, db)
+
+    def test_id_not_found_lists_accounts(self, tmp_path):
+        """Unknown ID error names the launchable accounts — IDs are database
+        keys with holes after deletions, not row positions, so the user needs
+        the real roster to self-correct."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            with pytest.raises(click.ClickException) as exc:
+                resolve_account(999, db)
+        msg = str(exc.value)
+        assert "Available accounts" in msg
+        assert "alice@test.com" in msg
+        assert "bob@test.com" in msg
+        # Soft-deleted accounts never appear in the hint
+        assert "deleted@test.com" not in msg
+
+    def test_email_not_found_lists_accounts(self, tmp_path):
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            with pytest.raises(
+                click.ClickException, match="No account found for email"
+            ) as exc:
+                resolve_account("nobody@nowhere.com", db)
+        assert "Available accounts" in str(exc.value)
+
+    def test_substring_unique_match(self, tmp_path):
+        """A unique part of an email resolves the account."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            result = resolve_account("ali", db)
+        assert result["email"] == "alice@test.com"
+
+    def test_substring_case_insensitive(self, tmp_path):
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            result = resolve_account("ALICE", db)
+        assert result["email"] == "alice@test.com"
+
+    def test_substring_ambiguous_raises(self, tmp_path):
+        """A part that matches several Claude accounts lists them all."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            with pytest.raises(click.ClickException, match="more than one") as exc:
+                resolve_account("test.com", db)
+        msg = str(exc.value)
+        assert "alice@test.com" in msg
+        assert "bob@test.com" in msg
+
+    def test_substring_no_match_lists_accounts(self, tmp_path):
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            with pytest.raises(
+                click.ClickException, match="No account matches"
+            ) as exc:
+                resolve_account("zzz", db)
+        assert "Available accounts" in str(exc.value)
+
+    def test_substring_ignores_codex_for_winner(self, tmp_path):
+        """A same-email Codex account never makes a Claude match ambiguous —
+        same provider-scoping rule as the exact-email branch."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        db.create_account("alice@test.com", "codex-managed", 4102444800,
+                          provider="codex", organization_uuid="acct-AX")
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            result = resolve_account("ali", db)
+        assert result["email"] == "alice@test.com"
+        assert (result.get("provider") or "claude") == "claude"
+
+    def test_substring_codex_only_match_points_at_codex_launcher(self, tmp_path):
+        """A part that matches only a Codex account explains the Codex launcher
+        instead of claiming no account exists."""
+        db = _make_db(tmp_path)
+        from jacked.launch import resolve_account
+
+        codex = db.create_account("onlycodex@test.com", "codex-managed", 4102444800,
+                                  provider="codex", organization_uuid="acct-OC")
+        with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
+            with pytest.raises(
+                click.ClickException, match="jacked codex launch"
+            ) as exc:
+                resolve_account("onlycodex", db)
+        assert str(codex["id"]) in str(exc.value)
 
     def test_no_token_raises(self, tmp_path):
         db = _make_db(tmp_path)

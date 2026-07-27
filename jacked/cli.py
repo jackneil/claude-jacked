@@ -5448,14 +5448,16 @@ def lint_hook_init(repo: str, language: str, force: bool):
 def claude_cmd(account, claude_args):
     """Launch Claude Code with per-account credential isolation.
 
-    ACCOUNT can be an integer ID or email address. If omitted, uses
-    the currently active account (set via dashboard "Use" button).
+    ACCOUNT can be an account ID, a full email address, or a unique
+    part of an email. If omitted, uses the currently active account
+    (set via dashboard "Use" button).
 
     All additional arguments are passed through to claude.
 
     Examples:
         jacked claude 2
         jacked claude alice@test.com
+        jacked claude udifi
         jacked claude 2 -p editor
 
     >>> # CLI command: jacked claude [ACCOUNT] [CLAUDE_ARGS...]

@@ -504,11 +504,45 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     return config_dir
 
 
+def _account_hint(db: Database) -> str:
+    """Format the launchable accounts as a hint for error messages.
+
+    >>> # Tested via test_launch.py (TestResolveAccount)
+    """
+    try:
+        accounts = db.list_accounts(include_inactive=True)
+    except Exception:
+        return ""
+    if not accounts:
+        return ""
+    lines = [
+        f"  {a['id']}: {a.get('email') or '?'} ({a.get('provider') or 'claude'})"
+        for a in sorted(accounts, key=lambda a: a.get("id") or 0)
+    ]
+    return "\nAvailable accounts:\n" + "\n".join(lines)
+
+
+def _match_listing(accounts: list) -> str:
+    """Format substring-matched accounts as 'ID (email, org)' pairs.
+
+    >>> _match_listing([{"id": 2, "email": "a@x.com", "organization_name": "X"}])
+    '2 (a@x.com, X)'
+    >>> _match_listing([{"id": 3, "email": "b@y.com"}])
+    '3 (b@y.com)'
+    """
+    parts = []
+    for a in accounts:
+        org = a.get("organization_name")
+        label = f"{a['id']} ({a.get('email') or '?'}"
+        parts.append(label + (f", {org})" if org else ")"))
+    return ", ".join(parts)
+
+
 def resolve_account(account_ref, db: Database) -> dict:
     """Resolve account reference to a full account dict.
 
-    account_ref can be: int (ID), str with @ (email), str digits (ID),
-    or None (use currently active account).
+    account_ref can be: int (ID), str with @ (email), str without @
+    (unique part of an email), or None (use currently active account).
 
     >>> # Tested via test_launch.py
     """
@@ -576,7 +610,8 @@ def resolve_account(account_ref, db: Database) -> dict:
 
         if not account:
             raise click.ClickException(
-                "No active account detected. Specify an account: jacked claude <id>"
+                "No active account detected. Specify an account: jacked claude <id>."
+                + _account_hint(db)
             )
     elif isinstance(account_ref, str) and "@" in account_ref:
         try:
@@ -587,18 +622,55 @@ def resolve_account(account_ref, db: Database) -> dict:
             # Ambiguous: multiple orgs for the same email
             raise click.ClickException(str(exc))
         if not account:
-            raise click.ClickException(f"No account found for email: {account_ref}")
+            raise click.ClickException(
+                f"No account found for email: {account_ref}." + _account_hint(db)
+            )
     else:
-        # Try as integer ID
+        # Try as integer ID first
         try:
             acct_id = int(account_ref)
         except (ValueError, TypeError):
-            raise click.ClickException(
-                f"Invalid account reference: {account_ref}. Use an ID or email."
-            )
-        account = db.get_account(acct_id)
-        if not account:
-            raise click.ClickException(f"Account {acct_id} not found")
+            acct_id = None
+
+        if acct_id is not None:
+            account = db.get_account(acct_id)
+            if not account:
+                raise click.ClickException(
+                    f"Account {acct_id} not found. The number is the account ID "
+                    "(shown in 'jacked usage'), not the row position."
+                    + _account_hint(db)
+                )
+        else:
+            # Not an ID and not a full email: match a unique part of an email.
+            # Scope the winner to Claude accounts so a same-email Codex account
+            # never collides (same rule as the exact-email branch above).
+            needle = str(account_ref).lower()
+            matches = [
+                a
+                for a in db.list_accounts(include_inactive=True)
+                if needle in (a.get("email") or "").lower()
+            ]
+            claude_matches = [
+                a for a in matches if (a.get("provider") or "claude") == "claude"
+            ]
+            if len(claude_matches) == 1:
+                account = claude_matches[0]
+            elif len(claude_matches) > 1:
+                raise click.ClickException(
+                    f"'{account_ref}' matches more than one account: "
+                    f"{_match_listing(claude_matches)}. "
+                    "Use the account ID or the full email."
+                )
+            elif matches:
+                raise click.ClickException(
+                    f"'{account_ref}' matches only Codex accounts: "
+                    f"{_match_listing(matches)}. "
+                    "Launch Codex with: jacked codex launch <id>"
+                )
+            else:
+                raise click.ClickException(
+                    f"No account matches '{account_ref}'." + _account_hint(db)
+                )
 
     if account.get("is_deleted"):
         raise click.ClickException(

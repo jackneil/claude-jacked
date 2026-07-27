@@ -361,8 +361,8 @@ def prepare_codex_account_home(
         # Seed it from the shared root if this account is the one currently live.
         if not seed_codex_slot(account_id, base, env) or not slot.exists():
             raise CodexSwapError(
-                f"no stored credentials for Codex account {account_id} — "
-                "add it (`jacked codex add`) while it's logged in first"
+                f"no stored credentials for Codex account {account_id}. "
+                "Add it (`jacked codex add`) while it is logged in first."
             )
     ensure_file_storage(home, env)
     return home
