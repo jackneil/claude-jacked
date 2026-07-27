@@ -34,7 +34,7 @@ dependencies = [
     "uvicorn[standard]>=0.20,<1",
     "httpx>=0.24,<1",
     "aiohttp>=3.9,<4",
-    "packaging>=23.0,<26",
+    "packaging>=23.0,<27",
     "anthropic>=0.40,<1",
     # Tray icon is ON by default — pystray/Pillow are core so a bare
     # `uv tool install claude-jacked` lights up the tray with no extra needed.
@@ -47,8 +47,8 @@ dependencies = [
     # NSPanel hosting WKWebViews at /panel. Windows/Linux keep the existing
     # pystray tray and never resolve or install these (the marker gates them).
     "rumps>=0.4,<1; sys_platform == 'darwin'",
-    "pyobjc-framework-Cocoa>=10,<12; sys_platform == 'darwin'",
-    "pyobjc-framework-WebKit>=10,<12; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10,<13; sys_platform == 'darwin'",
+    "pyobjc-framework-WebKit>=10,<13; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
@@ -72,7 +72,9 @@ dev = [
     "Pillow>=9.0,<13",
     # Pinned ruff so the pre-push hook uses ONE deterministic version from
     # .venv instead of whatever stray conda env sorts first on PATH.
-    "ruff>=0.6,<1",
+    # <0.16: ruff 0.16 broadens the default rule set (~1,250 new findings on
+    # this tree). Raise the cap only together with that migration.
+    "ruff>=0.6,<0.16",
 ]
 
 [project.scripts]
