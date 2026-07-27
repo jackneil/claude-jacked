@@ -260,6 +260,10 @@ function rerenderAccountsView() {
     const savedRepoGroups = new Set(window.jackedState.expandedRepoGroups);
     // Save session lookup input value
     const savedLookupValue = document.getElementById('inp-session-lookup')?.value || '';
+    // Save the live OAuth banner nodes — an in-flight flow (especially manual
+    // code entry, which can sit for minutes) must survive a session-event
+    // re-render. Moving the nodes keeps their listeners and any typed code.
+    const savedOauthBanner = [...(document.getElementById('oauth-flow-status')?.childNodes || [])];
 
     content.innerHTML = renderAccounts(window.jackedState.accounts);
     if (typeof bindAccountEvents === 'function') bindAccountEvents();
@@ -287,6 +291,11 @@ function rerenderAccountsView() {
     // Restore session lookup input value
     const restoredInput = document.getElementById('inp-session-lookup');
     if (restoredInput && savedLookupValue) restoredInput.value = savedLookupValue;
+    // Restore the OAuth banner into the freshly rendered slot
+    if (savedOauthBanner.length) {
+        const oauthSlot = document.getElementById('oauth-flow-status');
+        if (oauthSlot) savedOauthBanner.forEach(node => oauthSlot.appendChild(node));
+    }
     // Restore repo group expansion
     window.jackedState.expandedRepoGroups = savedRepoGroups;
     savedRepoGroups.forEach(key => {
