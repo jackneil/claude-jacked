@@ -342,6 +342,21 @@ def test_copy_skill_tree_copies_sidecars_and_raises_on_bad_source(tmp_path):
 
 # --- end-to-end through the CLI --------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _keep_guardrails_out_of_the_real_home(monkeypatch):
+    """guardrails.deploy_templates resolves its destination from Path.home(),
+    NOT from $JACKED_HOME, so a `jacked install --force` in a test rewrites the
+    REAL ~/.claude/jacked-guardrails + ~/.claude/jacked-hooks (clobbering any
+    local edits the user made to those templates). Nothing here asserts on
+    template deployment, so stub it and keep the run inside tmp_path."""
+    from jacked import guardrails
+
+    monkeypatch.setattr(
+        guardrails, "deploy_templates",
+        lambda force=False: {"guardrails": [], "hooks": []},
+    )
+
+
 def _main():
     from jacked.cli import main
 

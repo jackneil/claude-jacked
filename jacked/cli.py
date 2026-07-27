@@ -2160,6 +2160,66 @@ def _remove_memory_hooks(settings_path: Path) -> bool:
     return False
 
 
+def _install_statusline(home: Path, existing: dict, settings_path: Path) -> None:
+    """Register the jacked statusline during ``jacked install``.
+
+    Mutates the SHARED in-memory settings dict (the installer discipline:
+    a file-only write would be clobbered by a later installer's stale
+    copy) and writes atomically. The engine decides what is safe:
+    a foreign statusLine is never replaced (the report says how to adopt
+    it), and an explicit disable is never overridden.
+    """
+    from jacked import statusline_setup
+
+    outcome = statusline_setup.sync_on_install(home, existing)
+    if outcome in ("installed", "migrated"):
+        _write_settings_atomic(settings_path, existing)
+        verb = "Registered" if outcome == "installed" else "Updated"
+        console.print(f"[green][OK][/green] {verb} Claude Code statusline")
+    elif outcome == "unchanged":
+        console.print("[dim][-][/dim] Statusline already registered")
+    elif outcome == "skipped_foreign":
+        console.print(
+            "[dim][-][/dim] Kept your existing statusline "
+            "(adopt jacked's with `jacked statusline enable`)"
+        )
+    elif outcome == "skipped_disabled":
+        console.print(
+            "[dim][-][/dim] Statusline disabled (enable with `jacked statusline enable`)"
+        )
+
+
+def _remove_statusline(settings_path: Path) -> bool:
+    """Remove the jacked statusline entry. Returns True if removed.
+
+    Only a jacked-owned command (marker: ``-m jacked.statusline``) is
+    removed; a foreign statusLine is untouched. A foreign entry that
+    jacked's enable took over and backed up is restored.
+    """
+    import json
+
+    if not settings_path.exists():
+        return False
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        console.print(
+            "[yellow]settings.json is unreadable; skipping statusline removal[/yellow]"
+        )
+        return False
+    if not isinstance(settings, dict):
+        return False
+
+    from jacked import statusline_setup
+
+    changed = statusline_setup.remove_on_uninstall(_jacked_home(), settings)
+    if changed:
+        _write_settings_atomic(settings_path, settings)
+        console.print("[green][OK][/green] Removed statusline registration")
+        return True
+    return False
+
+
 # Single source of truth for the chrome-devtools MCP npx package spec. The Codex
 # installer (jacked/codex/installer._mcp_block_body) imports this + the autoConnect
 # args below so the two CLIs never drift on the version/flags they register.
@@ -2405,6 +2465,11 @@ def _write_project_env(repo_path: str, env_path: str) -> bool:
     help="Skip registering/starting the tray icon (the tray is on by default)",
 )
 @click.option(
+    "--no-statusline",
+    is_flag=True,
+    help="Skip registering the Claude Code statusline (on by default; never replaces a statusline jacked does not own)",
+)
+@click.option(
     "--force",
     "-f",
     is_flag=True,
@@ -2436,6 +2501,7 @@ def install(
     sounds: bool,
     no_rules: bool,
     no_tray: bool,
+    no_statusline: bool,
     force: bool,
     as_json: bool,
     no_codex: bool,
@@ -2509,6 +2575,7 @@ def install(
             sounds=sounds,
             no_rules=no_rules,
             no_tray=no_tray,
+            no_statusline=no_statusline,
             force=force,
             as_json=as_json,
         )
@@ -2649,6 +2716,7 @@ def _run_install(
     force: bool,
     as_json: bool,
     no_tray: bool = False,
+    no_statusline: bool = False,
 ) -> set:
     """Run the artifact/hook/rules installation (no manifest, no summary).
 
@@ -2877,6 +2945,13 @@ def _run_install(
     # Re-wire the memory-vault hooks when the feature is already enabled
     # (upgrade parity; install never enables the feature itself).
     _rewire_memory_hooks_on_install(home, existing, settings_path)
+
+    # Statusline: ON by default. Registers `"<abs-python>" -m jacked.statusline`
+    # under statusLine, migrating a stale jacked-owned command in place. Never
+    # replaces a foreign statusLine and never overrides an explicit disable
+    # (dashboard toggle / `jacked statusline disable`).
+    if not no_statusline:
+        _install_statusline(home, existing, settings_path)
 
     # Install behavioral rules in CLAUDE.md (default on, --no-rules to skip)
     if not no_rules:
@@ -3622,6 +3697,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     # Remove the memory-vault hook entries unconditionally — stripping entries
     # for a tool being uninstalled is always correct (the vault files stay put).
     _remove_memory_hooks(settings_path)
+    _remove_statusline(settings_path)
     _remove_chrome_devtools_mcp()
     claude_md_path = home / ".claude" / "CLAUDE.md"
     if _remove_behavioral_rules(claude_md_path):
@@ -4035,6 +4111,77 @@ def packs_update(name: str | None):
     else:
         console.print(f"[red][FAIL][/red] {_rich_escape(res.message)}")
         raise SystemExit(1)
+
+
+@main.group(name="statusline")
+def statusline_group():
+    """Claude Code statusline: model, effort, context, rate limits, account."""
+
+
+@statusline_group.command(name="enable")
+def statusline_enable():
+    """Enable the statusline. Takes over a foreign statusline with a backup."""
+    from jacked import statusline_setup
+    from jacked.memory.settings_io import SettingsUnreadableError
+
+    home = _jacked_home()
+    try:
+        result = statusline_setup.enable(home)
+    except SettingsUnreadableError as exc:
+        console.print(f"[red][FAIL][/red] {exc}")
+        raise SystemExit(1)
+    if result["took_over_foreign"]:
+        console.print(
+            "[green][OK][/green] Statusline enabled "
+            "(your previous statusline was saved; `jacked statusline disable` restores it)"
+        )
+    elif result["changed"]:
+        console.print("[green][OK][/green] Statusline enabled")
+    else:
+        console.print("[dim][-][/dim] Statusline already enabled")
+
+
+@statusline_group.command(name="disable")
+def statusline_disable():
+    """Disable the statusline and restore a saved previous one, if any."""
+    from jacked import statusline_setup
+    from jacked.memory.settings_io import SettingsUnreadableError
+
+    home = _jacked_home()
+    try:
+        result = statusline_setup.disable(home)
+    except SettingsUnreadableError as exc:
+        console.print(f"[red][FAIL][/red] {exc}")
+        raise SystemExit(1)
+    if result["restored_previous"]:
+        console.print("[green][OK][/green] Statusline disabled; previous statusline restored")
+    elif result["changed"]:
+        console.print("[green][OK][/green] Statusline disabled")
+    else:
+        console.print("[dim][-][/dim] Statusline was not registered")
+
+
+@statusline_group.command(name="status")
+def statusline_status():
+    """Show the statusline registration state."""
+    import json as _json
+
+    from jacked import statusline_setup
+
+    home = _jacked_home()
+    settings_file = home / ".claude" / "settings.json"
+    try:
+        settings = _json.loads(settings_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    where = statusline_setup.entry_state(settings)
+    state = statusline_setup.load_state(home)["state"] or "default (on)"
+    console.print(f"Registration: {where}")
+    console.print(f"Preference:   {state}")
+    if where == "ours":
+        console.print(f"Command:      {settings['statusLine'].get('command', '')}")
 
 
 @main.group(name="memory")

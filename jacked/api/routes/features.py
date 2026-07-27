@@ -34,7 +34,7 @@ RULES_START_PREFIX = "# jacked-behaviors-v"
 RULES_END_MARKER = "# end-jacked-behaviors"
 
 # Valid hook/knowledge names (allowlist)
-VALID_HOOKS = {"sounds", "memory_vault"}
+VALID_HOOKS = {"sounds", "memory_vault", "statusline"}
 
 
 def _get_valid_skill_names() -> list[str]:
@@ -340,6 +340,23 @@ def _detect_hook_installed(settings: dict, hook_name: str) -> bool:
                 mem_settings = {}
         return hooks_config.has_capture_entry(mem_settings)
 
+    if hook_name == "statusline":
+        # Same home-divergence rule as memory_vault: the toggle engine writes
+        # through jacked_home(), so detection must read that same file when
+        # $JACKED_HOME redirects it and SETTINGS_JSON is still stock.
+        from jacked import statusline_setup
+
+        sl_settings = settings
+        sl_path = statusline_setup.jacked_home() / ".claude" / "settings.json"
+        stock_settings_json = Path.home() / ".claude" / "settings.json"
+        if sl_path != SETTINGS_JSON and SETTINGS_JSON == stock_settings_json:
+            try:
+                loaded = json.loads(sl_path.read_text(encoding="utf-8"))
+                sl_settings = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                sl_settings = {}
+        return statusline_setup.entry_state(sl_settings) == "ours"
+
     return False
 
 
@@ -445,8 +462,12 @@ async def list_features():
             "display_name": "Memory Vault",
             "description": "Cross-repo memory: capture on session end and merges, recall brief at session start",
         },
+        "statusline": {
+            "display_name": "Statusline",
+            "description": "One-line session status in Claude Code: model, effort, context use, rate limits, active account",
+        },
     }
-    for name in ("sounds", "memory_vault"):
+    for name in ("sounds", "memory_vault", "statusline"):
         meta = hook_meta[name]
         installed = _detect_hook_installed(settings, name)
         entry = {
@@ -597,6 +618,8 @@ async def _toggle_hook(name: str, enabled: bool, db=None):
     """Enable/disable a hook by adding/removing entries in settings.json."""
     if name == "memory_vault":
         return await _toggle_memory_vault(enabled)
+    if name == "statusline":
+        return await _toggle_statusline(enabled)
 
     async with _settings_lock:
         try:
@@ -645,6 +668,30 @@ async def _toggle_memory_vault(enabled: bool):
             return _settings_unreadable_response()
 
     return {"name": "memory_vault", "category": "hooks", "enabled": enabled, **result}
+
+
+async def _toggle_statusline(enabled: bool):
+    """Enable/disable the statusline via the shared setup engine.
+
+    Same shape as the memory-vault toggle: home from ``$JACKED_HOME`` so the
+    dashboard and CLI write the same files, engine off the event loop, the
+    settings lock held across the engine's settings.json write. The result
+    carries ``took_over_foreign`` / ``restored_previous`` so the dashboard
+    can tell the user what happened to a pre-existing statusline.
+    """
+    from jacked import statusline_setup
+
+    home = statusline_setup.jacked_home()
+    async with _settings_lock:
+        try:
+            if enabled:
+                result = await asyncio.to_thread(statusline_setup.enable, home)
+            else:
+                result = await asyncio.to_thread(statusline_setup.disable, home)
+        except SettingsUnreadableError:
+            return _settings_unreadable_response()
+
+    return {"name": "statusline", "category": "hooks", "enabled": enabled, **result}
 
 
 async def _toggle_knowledge(name: str, enabled: bool):

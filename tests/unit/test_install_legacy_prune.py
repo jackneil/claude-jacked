@@ -46,6 +46,16 @@ def _legacy_settings() -> dict:
 
 def test_install_prunes_retired_hooks_but_keeps_user_hooks(tmp_path, monkeypatch):
     monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    # guardrails.deploy_templates resolves its destination from Path.home(), NOT
+    # from $JACKED_HOME, so an unstubbed `install --force` here rewrites the REAL
+    # ~/.claude/jacked-guardrails + ~/.claude/jacked-hooks and clobbers any local
+    # edits to those templates. Irrelevant to hook pruning; keep it in tmp_path.
+    from jacked import guardrails
+
+    monkeypatch.setattr(
+        guardrails, "deploy_templates",
+        lambda force=False: {"guardrails": [], "hooks": []},
+    )
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir(parents=True)
     settings_path = claude_dir / "settings.json"
