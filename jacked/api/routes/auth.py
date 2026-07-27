@@ -205,8 +205,52 @@ class FlowStatusResponse(BaseModel):
     flow_id: str
     account_id: Optional[int] = None
     email: Optional[str] = None
+    organization_name: Optional[str] = None
+    redirected_from_account_id: Optional[int] = None
     error: Optional[str] = None
     cc_flow_id: Optional[str] = None
+    auth_url: Optional[str] = None
+    mode: Optional[str] = None
+    submit_error: Optional[str] = None
+
+
+def _flow_status_response(status_data: dict) -> FlowStatusResponse:
+    """Shape an OAuthFlow.get_status() dict into the response model."""
+    return FlowStatusResponse(
+        status=status_data["status"],
+        flow_id=status_data["flow_id"],
+        account_id=status_data.get("account_id"),
+        email=status_data.get("email"),
+        organization_name=status_data.get("organization_name"),
+        redirected_from_account_id=status_data.get("redirected_from_account_id"),
+        error=status_data.get("error"),
+        cc_flow_id=status_data.get("cc_flow_id"),
+        auth_url=status_data.get("auth_url"),
+        mode=status_data.get("mode"),
+        submit_error=status_data.get("submit_error"),
+    )
+
+
+class SubmitCodeRequest(BaseModel):
+    code: str
+
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
+
+
+def _manual_oauth(request: Request, remote: bool) -> bool:
+    """Whether an OAuth flow must use manual code entry.
+
+    Manual mode applies when the client asked for it (``remote=true``) or
+    when the request comes from a non-loopback address: for a remote user,
+    the server's own browser and localhost callback are useless.
+    ("testclient" is Starlette's TestClient — local by definition.)
+    """
+    if remote:
+        return True
+    client = request.client
+    host = client.host if client else ""
+    return host not in _LOOPBACK_HOSTS
 
 
 class RefreshResponse(BaseModel):
@@ -458,7 +502,9 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
 
 
 @router.post("/accounts/add")
-async def start_add_account(request: Request, provider: str = "claude"):
+async def start_add_account(
+    request: Request, provider: str = "claude", remote: bool = False
+):
     """Add an account.
 
     Claude (default): starts the Anthropic OAuth flow, returns a flow_id to poll.
@@ -493,7 +539,7 @@ async def start_add_account(request: Request, provider: str = "claude"):
             "plan": acct.get("subscription_type"),
         }
 
-    flow = OAuthFlow(db)
+    flow = OAuthFlow(db, manual=_manual_oauth(request, remote))
     result = await flow.start()
 
     if "error" in result:
@@ -508,7 +554,7 @@ async def start_add_account(request: Request, provider: str = "claude"):
 
 
 @router.post("/accounts/{account_id}/reauth")
-async def start_reauth(account_id: int, request: Request):
+async def start_reauth(account_id: int, request: Request, remote: bool = False):
     """Start OAuth re-auth flow for an existing account.
 
     Unlike /accounts/add, this targets a specific account by ID so the
@@ -536,7 +582,12 @@ async def start_reauth(account_id: int, request: Request):
             }},
         )
 
-    flow = OAuthFlow(db, purpose="primary", target_account_id=account_id)
+    flow = OAuthFlow(
+        db,
+        purpose="primary",
+        target_account_id=account_id,
+        manual=_manual_oauth(request, remote),
+    )
     result = await flow.start()
 
     if "error" in result:
@@ -557,15 +608,30 @@ async def get_flow_status(flow_id: str):
     if flow is None:
         return FlowStatusResponse(status="not_found", flow_id=flow_id)
 
-    status_data = flow.get_status()
-    return FlowStatusResponse(
-        status=status_data["status"],
-        flow_id=status_data["flow_id"],
-        account_id=status_data.get("account_id"),
-        email=status_data.get("email"),
-        error=status_data.get("error"),
-        cc_flow_id=status_data.get("cc_flow_id"),
-    )
+    return _flow_status_response(flow.get_status())
+
+
+@router.post("/flow/{flow_id}/code", response_model=FlowStatusResponse)
+async def submit_flow_code(flow_id: str, body: SubmitCodeRequest):
+    """Complete an OAuth flow from a manually pasted authorization code.
+
+    Used by manual (remote-dashboard) flows, and as a fallback when the
+    local browser redirect fails. A recoverable problem (bad paste, wrong
+    state) comes back as ``submit_error`` with the flow still pending.
+    """
+    flow = get_flow(flow_id)
+    if flow is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "error": {
+                    "message": "Authorization flow not found or expired.",
+                    "code": "NOT_FOUND",
+                }
+            },
+        )
+
+    return _flow_status_response(await flow.submit_code(body.code))
 
 
 @router.get("/accounts", response_model=list[AccountResponse])
@@ -1150,7 +1216,7 @@ async def validate_token(account_id: int, request: Request):
 
 
 @router.post("/accounts/{account_id}/authorize-cc")
-async def start_cc_auth(account_id: int, request: Request):
+async def start_cc_auth(account_id: int, request: Request, remote: bool = False):
     """Start OAuth flow for independent Claude Code tokens on existing account.
 
     Allows upgrading an existing account with separate CC tokens without
@@ -1178,8 +1244,13 @@ async def start_cc_auth(account_id: int, request: Request):
     from jacked.web.oauth import OAuthFlow
 
     # Always start a fresh flow — every click opens a new browser window.
-    # Old flows timeout after 2 minutes and clean up automatically.
-    flow = OAuthFlow(db, purpose="claude_code", target_account_id=account_id)
+    # Old flows time out and clean up automatically.
+    flow = OAuthFlow(
+        db,
+        purpose="claude_code",
+        target_account_id=account_id,
+        manual=_manual_oauth(request, remote),
+    )
     result = await flow.start()
     return result
 

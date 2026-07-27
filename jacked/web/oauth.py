@@ -23,7 +23,7 @@ import secrets
 import time
 import webbrowser
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 from aiohttp import web
@@ -45,6 +45,16 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 CALLBACK_PORT_RANGE = range(45100, 45200)
+# Anthropic's registered code-display redirect for this client id. Approving
+# with this redirect_uri renders the authorization code for manual copy-paste
+# — the only callback shape that works when the dashboard is opened from a
+# machine other than the one running jacked.
+MANUAL_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+BROWSER_TIMEOUT_SECONDS = 120  # localhost-callback flow
+MANUAL_TIMEOUT_SECONDS = 600  # a human copies a code across machines
+# Each code submission costs an outbound token-exchange call, and the dashboard
+# API is network-trusted (no per-request auth) — bound the attempts per flow.
+MAX_SUBMIT_ATTEMPTS = 10
 DEFAULT_TOKEN_TTL_SECONDS = 28800  # 8 hours — default token lifetime from Anthropic
 
 # organization_type → subscription_type mapping (design doc section 4e)
@@ -152,20 +162,33 @@ class OAuthFlow:
         db: Database,
         purpose: str = "primary",
         target_account_id: Optional[int] = None,
+        manual: bool = False,
     ):
         self.db = db
         self.purpose = purpose  # "primary" | "claude_code"
         self._target_account_id = target_account_id
+        # Manual mode (remote dashboards): no local callback server, no local
+        # browser. The user opens the auth link themselves and pastes the code
+        # that Anthropic's code page shows.
+        self.manual = manual
         self.flow_id = secrets.token_urlsafe(16)
         self._verifier: Optional[str] = None
         self._state: Optional[str] = None
         self._redirect_uri: Optional[str] = None
+        self._auth_url: Optional[str] = None
         self._status = "pending"  # pending | completed | error
         self._result: Optional[dict] = None
         self._error: Optional[str] = None
         self._cc_flow_id: Optional[str] = None
         self._event = asyncio.Event()
+        self._submit_lock = asyncio.Lock()
+        self._submit_attempts = 0
         self._created_at = time.time()
+
+    @property
+    def mode(self) -> str:
+        """Flow mode for the frontend: 'manual' or 'browser'."""
+        return "manual" if self.manual else "browser"
 
     def get_status(self) -> dict:
         """Get current flow status for polling.
@@ -175,11 +198,18 @@ class OAuthFlow:
         >>> flow.get_status()["status"]
         'pending'
         """
-        # 2-minute timeout
-        if self._status == "pending" and time.time() - self._created_at > 120:
+        # Manual flows get the longer window: a human copies a code across machines
+        limit = MANUAL_TIMEOUT_SECONDS if self.manual else BROWSER_TIMEOUT_SECONDS
+        if self._status == "pending" and time.time() - self._created_at > limit:
             self._status = "not_found"
 
-        result: dict = {"status": self._status, "flow_id": self.flow_id}
+        result: dict = {
+            "status": self._status,
+            "flow_id": self.flow_id,
+            "mode": self.mode,
+        }
+        if self._auth_url:
+            result["auth_url"] = self._auth_url
         if self._result:
             result["account_id"] = self._result.get("account_id") or self._result.get("id")
             result["email"] = self._result.get("email")
@@ -193,9 +223,14 @@ class OAuthFlow:
         return result
 
     async def start(self) -> dict:
-        """Start the OAuth flow: spin up callback server, open browser.
+        """Start the OAuth flow.
 
-        Returns dict with flow_id and auth_url for the frontend.
+        Browser mode: spin up the localhost callback server and open the
+        local browser. Manual mode (remote dashboards): no server and no
+        browser — the frontend shows the auth link and the user pastes the
+        code that Anthropic's code page displays.
+
+        Returns dict with flow_id, auth_url, and mode for the frontend.
         """
         self._verifier, challenge = generate_pkce()
         self._state = secrets.token_urlsafe(32)
@@ -203,30 +238,34 @@ class OAuthFlow:
         # Register this flow globally
         _active_flows[self.flow_id] = self
 
-        # Start callback server
-        app = web.Application()
-        app.router.add_get("/callback", self._handle_callback)
-        runner = web.AppRunner(app)
-        await runner.setup()
+        runner: Optional[web.AppRunner] = None
+        if self.manual:
+            self._redirect_uri = MANUAL_REDIRECT_URI
+        else:
+            # Start callback server
+            app = web.Application()
+            app.router.add_get("/callback", self._handle_callback)
+            runner = web.AppRunner(app)
+            await runner.setup()
 
-        port = None
-        for p in CALLBACK_PORT_RANGE:
-            try:
-                site = web.TCPSite(runner, "localhost", p)
-                await site.start()
-                port = p
-                break
-            except OSError:
-                continue
+            port = None
+            for p in CALLBACK_PORT_RANGE:
+                try:
+                    site = web.TCPSite(runner, "localhost", p)
+                    await site.start()
+                    port = p
+                    break
+                except OSError:
+                    continue
 
-        if port is None:
-            await runner.cleanup()
-            self._status = "error"
-            self._error = "No available port for callback server (45100-45199)"
-            return {"error": self._error, "flow_id": self.flow_id}
+            if port is None:
+                await runner.cleanup()
+                self._status = "error"
+                self._error = "No available port for callback server (45100-45199)"
+                return {"error": self._error, "flow_id": self.flow_id}
 
-        self._redirect_uri = f"http://localhost:{port}/callback"
-        logger.info(f"OAuth callback server started on port {port}")
+            self._redirect_uri = f"http://localhost:{port}/callback"
+            logger.info(f"OAuth callback server started on port {port}")
 
         # Build auth URL — note: code=true is REQUIRED (non-standard)
         params = {
@@ -239,21 +278,50 @@ class OAuthFlow:
             "code_challenge_method": "S256",
             "code": "true",
         }
-        auth_url = f"{AUTH_URL}?{urlencode(params)}"
+        self._auth_url = f"{AUTH_URL}?{urlencode(params)}"
 
-        # Open browser
-        webbrowser.open(auth_url)
-        logger.info("Opened browser for OAuth authorization")
+        if self.manual:
+            logger.info(
+                f"Manual OAuth flow started (remote dashboard, purpose={self.purpose})"
+            )
+            # Expire the flow ourselves — there is no callback server whose
+            # _wait_for_callback would do it.
+            asyncio.create_task(self._expire_manual_flow())
+        else:
+            # Best-effort: a headless server must not kill the flow — the
+            # frontend renders the auth link either way.
+            try:
+                webbrowser.open(self._auth_url)
+                logger.info("Opened browser for OAuth authorization")
+            except Exception as e:
+                logger.warning(f"Could not open a local browser for OAuth: {e}")
 
-        # Wait for callback in background — don't block the API response
-        asyncio.create_task(self._wait_for_callback(runner))
+            # Wait for callback in background — don't block the API response
+            asyncio.create_task(self._wait_for_callback(runner))
 
-        return {"flow_id": self.flow_id, "auth_url": auth_url}
+        return {
+            "flow_id": self.flow_id,
+            "auth_url": self._auth_url,
+            "mode": self.mode,
+        }
+
+    async def _expire_manual_flow(self) -> None:
+        """Expire a manual flow, mirroring _wait_for_callback's cleanup."""
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=MANUAL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            if self._status == "pending":
+                self._status = "not_found"
+                self._error = "OAuth flow timed out (10 minutes)"
+        finally:
+            # Clean up from global registry after a delay
+            await asyncio.sleep(30)
+            _active_flows.pop(self.flow_id, None)
 
     async def _wait_for_callback(self, runner: web.AppRunner) -> None:
         """Wait for the callback, then clean up the server."""
         try:
-            await asyncio.wait_for(self._event.wait(), timeout=120)
+            await asyncio.wait_for(self._event.wait(), timeout=BROWSER_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             self._status = "not_found"
             self._error = "OAuth flow timed out (2 minutes)"
@@ -320,6 +388,89 @@ class OAuthFlow:
                  "<script>window.close()</script>",
             content_type="text/html",
         )
+
+    @staticmethod
+    def parse_pasted_code(pasted: str) -> tuple[Optional[str], Optional[str]]:
+        """Parse a pasted authorization code into ``(code, state)``.
+
+        Accepts the three shapes a user can plausibly paste:
+        bare code, ``code#state`` (what the Anthropic code page shows),
+        and a full callback URL or query string.
+
+        >>> OAuthFlow.parse_pasted_code("abc123")
+        ('abc123', None)
+        >>> OAuthFlow.parse_pasted_code("abc123#xyz")
+        ('abc123', 'xyz')
+        >>> OAuthFlow.parse_pasted_code(
+        ...     "http://localhost:45100/callback?code=abc&state=xyz")
+        ('abc', 'xyz')
+        >>> OAuthFlow.parse_pasted_code("  ")
+        (None, None)
+        """
+        pasted = (pasted or "").strip()
+        if not pasted:
+            return None, None
+        if "code=" in pasted:
+            query = pasted.split("?", 1)[-1]
+            fields = parse_qs(query)
+            code = (fields.get("code") or [None])[0]
+            state = (fields.get("state") or [None])[0]
+            return code or None, state or None
+        if "#" in pasted:
+            code, _, state = pasted.partition("#")
+            return code.strip() or None, state.strip() or None
+        return pasted, None
+
+    async def submit_code(self, pasted: str) -> dict:
+        """Complete the flow from a manually pasted authorization code.
+
+        A parse or state failure returns an inline ``submit_error`` and keeps
+        the flow pending so the user can paste again; only a failed token
+        exchange marks the flow as error (matching the callback path). A
+        foreign code cannot complete the flow either way: PKCE binds every
+        exchangeable code to this flow's own code_challenge.
+        """
+
+        def _rejected(message: str) -> dict:
+            return {**self.get_status(), "submit_error": message}
+
+        if self._status != "pending":
+            return _rejected(f"Flow is {self._status}, not awaiting a code.")
+        if self._submit_lock.locked():
+            return _rejected("A code submission is already in progress.")
+        async with self._submit_lock:
+            if self._status != "pending":  # re-check after acquiring
+                return _rejected(f"Flow is {self._status}, not awaiting a code.")
+            self._submit_attempts += 1
+            if self._submit_attempts > MAX_SUBMIT_ATTEMPTS:
+                self._status = "error"
+                self._error = "Too many code submissions. Start the flow again."
+                self._event.set()
+                return self.get_status()
+            code, state = self.parse_pasted_code(pasted)
+            if not code:
+                return _rejected("No authorization code found in the pasted text.")
+            if state is not None and state != self._state:
+                # Same CSRF posture as _handle_callback, but a paste mistake
+                # must not brick the flow — report inline and stay pending.
+                return _rejected(
+                    "The pasted code belongs to a different authorization "
+                    "attempt. Open the authorization link again and paste "
+                    "the code it shows."
+                )
+            try:
+                result = await self._complete_auth(code)
+                self._result = result
+                self._status = "completed"
+            except Exception as e:
+                logger.error(
+                    f"OAuth manual completion failed for flow {self.flow_id} "
+                    f"(purpose={self.purpose}): {e}"
+                )
+                self._status = "error"
+                self._error = str(e)
+            self._event.set()
+            return self.get_status()
 
     def _should_become_active(self, account: dict) -> bool:
         """Whether this freshly-stored account should become the active one.

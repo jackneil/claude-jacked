@@ -167,6 +167,8 @@ Applying a change restarts the dashboard in place (a few seconds; the page recon
 
 Once enabled, browse to `http://<machine>:8321` using the MagicDNS short name, the full `<machine>.<tailnet>.ts.net` name, or the Tailscale IP.
 
+Account authorization works from a remote browser. When you open the dashboard from a different machine, the Add Account, Re-auth, and CC-token flows show an authorization link instead of opening a browser on the server. Click the link and approve in your own browser. Claude then shows a code. Copy the code and paste it into the dashboard to finish.
+
 Prefer the CLI? These write the same setting (no more baked hosts in autostart files):
 
 ```bash
