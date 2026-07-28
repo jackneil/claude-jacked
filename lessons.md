@@ -1,5 +1,6 @@
 # Lessons
 
+- [1x] /goal briefs: Jack ALWAYS wants the verbose, expansive, targeted brief written to `.claude/goals/<date>-<slug>.md` with a short self-bootstrapping pointer pasted into /goal — file-backed is the DEFAULT; never trim a brief to squeeze under the 4,000-char cap (2026-07-28; whats-next/goal-maker/bhag command docs rewritten to match).
 - [1x] PyPI publishing is handled via GitHub Actions trusted publishing. NEVER use twine to upload directly. Create a GitHub release and PyPI pulls it automatically.
 - [2x] Always run tests with `uv run python -m pytest` (NOT bare `python -m pytest`). Dev deps (pytest) are in `[dependency-groups] dev` which uv auto-includes. System/conda Python won't have project deps.
 - [1x] When the user picks a "PR first, then release"-style path, treat the PR as a REVIEW GATE — open it and STOP. Do not self-merge into master without an explicit, separate go-ahead. The auto-mode classifier will (correctly) block the merge otherwise. Build the whole thing on the branch, push, open the PR, then ask before merging.

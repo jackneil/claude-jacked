@@ -69,3 +69,15 @@ def test_separate_command_rationale(bhag: str):
     # documented reason it is its own command and not an auto-triggering skill
     assert "separate command" in low
     assert "auto-triggering skill" in low or "auto-trigger" in low
+
+
+def test_brief_is_file_backed_with_pointer(bhag: str):
+    """The loop brief is a verbose FILE (no size cap); /goal gets only a short
+    self-bootstrapping pointer that pastes the Loop/STOP/DONE criteria into the
+    transcript on turn one (the judge can't read files)."""
+    assert ".claude/goals/" in bhag
+    assert "verbose by design, no size cap" in bhag
+    assert "never squeeze the brief" in bhag
+    assert "pointer-goal" in bhag
+    assert "paste its complete Loop steps" in bhag
+    assert "wc -c" in bhag                     # the pointer is still measured
