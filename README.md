@@ -134,6 +134,7 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 | **27 Skills** | Engines and knowledge packs behind the commands, plus standalone ones: `night-shift`, `jack-it-up`, `coverage-matrix`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `clone-website`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
 | **Skill Packs** (optional, on by default) | Curated third-party skill collections pulled live from their upstream repos via the `npx skills` CLI, separate from the bundled suite: `marketing` (28 skills) + `design-extras`. Opt out with `--no-packs` or `jacked packs disable` |
 | **Memory Vault** (optional, opt in) | Cross-repo memory in a git-backed Markdown vault at `~/jacked-vault`. Event-triggered capture (session end plus merges to `main`), a budgeted SessionStart recall brief, and a `jacked memory` CLI. No database, no embeddings, Obsidian-compatible. Enable from the dashboard or `jacked memory init` |
+| **Statusline** (on by default) | One live status line inside every Claude Code session: model + effort, context use, 5h/7d rate limits with reset times, and the active account. Works on macOS, Linux, and Windows. Never replaces a statusline you set up yourself |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard - manage everything from your browser |
@@ -555,6 +556,27 @@ jacked memory migrate              # import existing .remember/ history (see bel
 
 **Migration is safe by construction.** `jacked memory migrate` imports every `.remember/` directory under your configured roots into the vault, flags core memories as semantic candidates, and verifies imported file and entry counts against the source, failing loud on any mismatch. It never modifies or deletes the source `.remember/` dirs. Retiring the third-party `remember` plugin happens only after migration verifies, and only after you confirm a printed summary of exactly what changes.
 
+### Statusline (session status at a glance, on by default)
+
+`jacked install` registers a status line that Claude Code shows at the bottom of every session:
+
+```
+Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | me@co.com · MyOrg · Max 5x
+```
+
+Model and effort, context-window pressure with real token counts, both rate-limit windows with their reset times, and the account the session runs on. Percentages are color-coded (green, then yellow at 60%, red at 85%). The renderer is a small stdlib-only Python module, registered with the absolute path of jacked's own interpreter, so it works the same on macOS, Linux, and Windows with no shell, `jq`, or PATH dependencies.
+
+The install is safe by design. If you already have a statusline, `jacked install` keeps it and tells you how to adopt jacked's. An explicit enable saves your previous statusline and restores it when you disable or uninstall. An explicit disable is durable: the next `jacked install` does not turn the statusline back on.
+
+```bash
+jacked install --no-statusline     # skip the statusline for this install
+jacked statusline enable           # adopt jacked's statusline (saves any existing one)
+jacked statusline disable          # remove it and restore a saved one, if any
+jacked statusline status           # registration state and the active command
+```
+
+The dashboard toggle lives at Settings > Features > Statusline.
+
 ### QA Browser Testing
 
 The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.
@@ -709,6 +731,9 @@ Your local database (`~/.claude/jacked.db`) stays intact - reinstall anytime wit
 jacked install --force             # Install skills, agents, commands, rules, tray
 jacked install --force --sounds    # Also add sound notifications
 jacked install --force --no-tray   # Install without the tray icon
+jacked install --no-statusline     # Install without the Claude Code statusline
+jacked statusline enable           # Adopt jacked's statusline (saves any existing one)
+jacked statusline disable          # Remove it; restores a saved one
 jacked uninstall                   # Remove from Claude Code
 jacked uninstall --sounds          # Remove only sounds
 jacked uninstall --security        # Remove a legacy gatekeeper hook (pre-0.70.0 installs)

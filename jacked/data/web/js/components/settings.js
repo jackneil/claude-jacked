@@ -227,6 +227,14 @@ function bindToggleEvents(container) {
                         showToast(`${skipped} repo(s) skipped post-merge hook install; run jacked memory status for details`, 'warning');
                     }
                 }
+                // Statusline enable can replace a pre-existing statusline; the
+                // engine saves it, and disable restores it. Say so out loud.
+                if (name === 'statusline' && res && res.took_over_foreign) {
+                    showToast('Your previous statusline was saved. Disable to restore it.', 'info');
+                }
+                if (name === 'statusline' && res && res.restored_previous) {
+                    showToast('Your previous statusline is back.', 'info');
+                }
                 await refreshFeatures();
                 // Re-render the current tab to reflect changes
                 const activeTab = localStorage.getItem(SETTINGS_TAB_KEY) || DEFAULT_TAB;
