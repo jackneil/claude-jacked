@@ -164,19 +164,21 @@ def test_step_8_big_but_convergent(engine: str) -> None:
 
 
 def test_step_8_char_limit(engine: str) -> None:
-    """Brief size is MEASURED (wc -c) and targeted directly UNDER /goal's hard
-    4,000-char cap — bytes >= chars, so a wc -c byte count under 4,000 guarantees
-    the char count is under 4,000 too. The old conservative 3,600-byte proxy is
-    gone: we measure exactly, so the full budget is used."""
+    """The brief is a verbose FILE with NO size budget; only the short
+    pointer-goal pasted into /goal is measured against the hard 4,000-char cap
+    (Jack's standing preference, 2026-07-28: never trim a brief to fit inline).
+    The old trim-to-fit HARD SIZE GATE must stay gone."""
     s = _section(engine, "## Step 8")
-    assert "3600" not in s and "3,600" not in s  # conservative proxy removed
-    assert "under 4,000" in s                    # targets the real cap directly
+    assert "3600" not in s and "3,600" not in s  # conservative proxy stays gone
     assert "4,000" in s or "4000" in s          # references the real hard cap
-    assert "wc -c" in s                          # mechanical measurement
-    assert "Measure it: `wc -c" in s             # the actual measure step, pinned
-    assert "HARD SIZE GATE" in s
-    assert "Never present a brief you have not just measured" in s
-    assert "Next phases:" in s                   # counted toward the limit, never dropped
+    assert "NO size budget" in s                 # the file itself is uncapped
+    assert "never trim substance" in s           # detail is never cut to fit
+    assert "verbose BY DESIGN" in s              # file-backed is the default posture
+    assert "wc -c" in s                          # the POINTER is still measured
+    assert "never present unmeasured text" in s  # measurement discipline retained
+    assert "HARD SIZE GATE" not in s             # trim-to-fit doctrine removed
+    assert "If the count is 4,000 or over" not in s  # no trim loop
+    assert "Next phases:" in s                   # sequencing survives in the file
 
 
 def test_step_8_staged_pr_posture(engine: str) -> None:
@@ -240,7 +242,7 @@ def test_step_8_paste_ready_goal(engine: str) -> None:
 
 def test_step_8_goal_fallback(engine: str) -> None:
     s = _section(engine, "## Step 8")
-    assert "the same brief works pasted as an ordinary message" in s
+    assert "the same pointer works pasted as an ordinary message" in s
     assert "/jack-it-up" in s
 
 
@@ -306,12 +308,14 @@ def test_setup_uses_strategic_emphasis_not_stale_tiers(engine: str) -> None:
 
 
 def test_step_8_file_backed_goal(engine: str) -> None:
-    """Oversized briefs are written to a file with a short, self-bootstrapping
+    """EVERY brief is written to a file with a short, self-bootstrapping
     pointer-goal — and the doc notes the evaluator can't read files itself, so
-    the criteria must be pasted into the transcript."""
+    the criteria (milestones + Verify + DONE) must be pasted into the
+    transcript on turn one."""
     s = _section(engine, "## Step 8")
     assert ".claude/goals/" in s
-    assert "paste its milestone list" in s          # self-bootstrapping into the transcript
+    assert "paste its complete milestone list" in s  # self-bootstrapping into the transcript
+    assert "AND its DONE conditions" in s            # DONE travels with the paste too
     low = s.lower()
     assert "can't read files" in low or "cannot read files" in low
 
@@ -324,9 +328,9 @@ def test_step_8_file_backed_not_committed(engine: str) -> None:
 
 
 def test_step_8_file_backed_still_convergent(engine: str) -> None:
-    """File-backing relaxes the char limit, not the convergence requirement."""
+    """File-backing removes the char pressure, not the convergence requirement."""
     s = _section(engine, "## Step 8")
-    assert "file-backing relaxes the char limit, not the spins-forever rule" in s
+    assert "file-backing removes the char pressure, not the spins-forever rule" in s
 
 
 def test_step_8_drives_to_completion_not_turn_capped(engine: str) -> None:
@@ -342,10 +346,11 @@ def test_step_8_drives_to_completion_not_turn_capped(engine: str) -> None:
     assert "BLOCKED" in s                       # a genuine block still halts (that item)
 
 
-def test_step_8_inline_and_filebacked_are_exclusive(engine: str) -> None:
-    """Inline brief and file-backed pointer-goal are either/or — a file-backed
-    run must NOT also emit the inline template (else the recipe's 'block above'
-    points at the oversized inline brief)."""
+def test_step_8_pointer_is_the_only_pasted_thing(engine: str) -> None:
+    """The user pastes ONLY the pointer-goal into /goal — never the file's
+    contents — and the template in the doc structures the brief FILE, not an
+    inline paste. The old inline-presentation path must stay gone."""
     s = _section(engine, "## Step 8")
-    assert "emit ONLY this pointer-goal block and skip the inline template" in s
-    assert "skip this entirely if you file-backed above" in s
+    assert "never the file's contents" in s
+    assert "The brief-file template." in s        # template = file structure
+    assert "Inline path (the common case" not in s  # inline-first doctrine removed

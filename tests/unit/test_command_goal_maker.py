@@ -4,7 +4,7 @@ default-PR / opt-in-merge toggle.
 
 These guard the contract: default is PR-only (merge is opt-in via the `merge`
 arg), auto-merge is always CI-gated and uses a true merge commit, the brief
-inherits /whats-next's hard 4,000-char measurement + file-backed fallback +
+is a verbose FILE (no size cap) handed to /goal as a short measured pointer +
 stuck-detection backstop (drives to completion, never caps successful work) +
 DATA-only rule, and the UI/UX/TDD quality bars are baked in.
 Like the other command tests, these are string-presence checks on the LLM
@@ -54,12 +54,15 @@ def test_merge_mode_is_ci_gated_and_uses_true_merge_commit(gm: str):
 
 
 def test_inherits_whatsnext_brief_engine(gm: str):
-    # hard char gate, measured not eyeballed
+    # verbose brief FILE by default; the measured pointer is what /goal gets
     assert "wc -c" in gm
     assert "4,000" in gm
     assert ".claude/goals/" in gm
-    # file-backed fallback for briefs that won't fit
     assert "pointer-goal" in gm
+    assert "never squeeze it into" in gm     # no trim-to-fit, ever
+    assert "NO size budget" in gm            # the file itself is uncapped
+    assert "never the file's contents" in gm  # only the pointer is pasted
+    assert "If 4,000+:" not in gm            # the old trim loop stays gone
     # bounded unattended run
     assert "backstop" in gm.lower()  # stuck-detection backstop (drives to completion, never caps successful work)
     assert "BLOCKED" in gm
