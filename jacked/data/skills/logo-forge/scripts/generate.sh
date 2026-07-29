@@ -20,7 +20,8 @@ PROMPT="${*:?need a prompt}"
 command -v higgsfield >/dev/null || { echo "needs Higgsfield CLI (npm i -g @higgsfield/cli; higgsfield auth login)"; exit 1; }
 MODEL="${MODEL:-flux_2}"
 ARGS=(generate create "$MODEL" --prompt "$PROMPT" --aspect_ratio "${AR:-1:1}" --wait --wait-timeout 7m)
-[ "$MODEL" = flux_2 ] && ARGS+=(--model "${TIER:-max}" --resolution "${RES:-2k}")
+# Higgsfield CLI renamed --model to --variant for flux_2 (verified 2026-07-27).
+[ "$MODEL" = flux_2 ] && ARGS+=(--variant "${TIER:-max}" --resolution "${RES:-2k}")
 [ "$BASE" != none ] && ARGS+=(--image "$BASE")
 echo "→ $MODEL ${TIER:+($TIER ${RES:-2k})}  base=$BASE"
 url="$(higgsfield "${ARGS[@]}" 2>/dev/null | grep -oE 'https://[^ ]+\.(svg|png|jpg|jpeg|webp)' | tail -1)"
