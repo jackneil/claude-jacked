@@ -1165,3 +1165,103 @@ def test_settings_js_toasts_the_statusline_takeover_flags(flag, copy):
     assert copy in toast
     # User-facing toast copy stays em-dash free.
     assert EM_DASH not in toast
+
+
+# --------------------------------------------------------------------------- #
+# F. Served-model segment: gateway fallback visibility
+# --------------------------------------------------------------------------- #
+
+def _transcript(tmp_path, models, name="t.jsonl", pad_first=False):
+    """Write a session JSONL whose assistant messages carry `models` in order.
+
+    pad_first inflates the first entry so the file exceeds the head window,
+    forcing the tail seek (and therefore a partial line at the boundary).
+    """
+    path = tmp_path / name
+    lines = []
+    for i, model in enumerate(models):
+        entry = {"type": "assistant", "message": {"model": model, "content": []}}
+        if pad_first and i == 0:
+            entry["message"]["content"] = ["x" * 70000]
+        lines.append(json.dumps(entry))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_served_segment_is_silent_when_the_model_never_changed(tmp_path, home):
+    """The common case renders nothing: the model segment already names it."""
+    tp = _transcript(tmp_path, ["claude-fable-5"] * 3)
+    assert statusline._served_segment({"transcript_path": tp}) == ""
+    line = _render({"model": {"display_name": "Fable 5"}, "transcript_path": tp}, home)
+    assert "FALLBACK" not in line
+
+
+def test_served_segment_flags_a_mid_session_switch(tmp_path, home):
+    """A gateway fallback names both models, since the payload cannot."""
+    tp = _transcript(
+        tmp_path,
+        ["deepseek/deepseek-v4-flash-0731"] * 2 + ["openai/gpt-5.6-luna"],
+    )
+    seg = statusline._served_segment({"transcript_path": tp})
+    assert "gpt-5.6-luna (FALLBACK, not deepseek-v4-flash-0731)" in seg
+    # Provider prefixes are stripped for display.
+    assert "openai/" not in seg and "deepseek/" not in seg
+    assert "FALLBACK" in _render({"transcript_path": tp}, home)
+
+
+def test_served_segment_clears_itself_when_routing_reverts(tmp_path, home):
+    """Routing is per-request, so the warning must disappear on revert."""
+    models = ["deepseek/v4"] * 2 + ["openai/luna"] + ["deepseek/v4"]
+    assert statusline._served_segment({"transcript_path": _transcript(tmp_path, models)}) == ""
+
+
+def test_served_segment_survives_a_partial_line_at_the_seek_boundary(tmp_path):
+    """A tail seek lands mid-line; that fragment must not abort detection."""
+    tp = _transcript(
+        tmp_path,
+        ["deepseek/v4"] + ["deepseek/v4"] * 3 + ["openai/luna"],
+        pad_first=True,
+    )
+    assert os.path.getsize(tp) > 65536      # head window really is exceeded
+    seg = statusline._served_segment({"transcript_path": tp})
+    assert "luna (FALLBACK, not v4)" in seg
+
+
+@pytest.mark.parametrize("payload", [
+    {},
+    {"transcript_path": None},
+    {"transcript_path": ""},
+    {"transcript_path": "/nonexistent/nope.jsonl"},
+    "not-a-dict",
+])
+def test_served_segment_treats_absence_as_normal(payload):
+    """Absence is never an error; the segment simply drops."""
+    assert statusline._served_segment(payload) == ""
+
+
+def test_served_segment_ignores_garbage_and_synthetic_entries(tmp_path):
+    """Unparseable lines and <synthetic> messages never name a model."""
+    path = tmp_path / "g.jsonl"
+    path.write_text(
+        "not json at all\n"
+        + json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + "\n"
+        + json.dumps({"type": "user", "message": {"model": "ignored/user"}}) + "\n",
+        encoding="utf-8",
+    )
+    assert statusline._served_segment({"transcript_path": str(path)}) == ""
+
+
+def test_served_segment_stays_fast_on_a_large_transcript(tmp_path):
+    """Bounded reads: cost must not scale with session length."""
+    path = tmp_path / "big.jsonl"
+    filler = json.dumps({"type": "user", "message": {"content": "y" * 900}})
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "assistant", "message": {"model": "a/first"}}) + "\n")
+        for _ in range(12000):                      # ~11MB of unrelated traffic
+            fh.write(filler + "\n")
+        fh.write(json.dumps({"type": "assistant", "message": {"model": "b/last"}}) + "\n")
+    started = time.monotonic()
+    seg = statusline._served_segment({"transcript_path": str(path)})
+    elapsed = time.monotonic() - started
+    assert "last (FALLBACK, not first)" in seg
+    assert elapsed < 0.25, f"took {elapsed:.3f}s; bounded reads regressed"

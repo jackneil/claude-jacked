@@ -6,6 +6,10 @@ stdin and prints one ANSI-colored line:
 
   Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | me@co.com · MyOrg · Max 5x
 
+A "<model> (FALLBACK, not <model>)" segment appears between the limits and
+the account when a gateway has switched the model mid-session (see
+_served_segment); it is absent on any session that never switched.
+
 The installer registers it as `"<abs-python>" -m jacked.statusline` with
 the absolute interpreter path resolved at install time (never a bare
 `python`/`python3` name -- name resolution is the cross-platform failure
@@ -205,6 +209,105 @@ def _account_segment(home: str) -> str:
     return segment
 
 
+def _models_in(chunk: str) -> list:
+    """Assistant model ids from whole JSONL lines inside a text chunk.
+
+    Lines that do not parse are skipped, which is what makes a partial line
+    at a seek boundary harmless. "<synthetic>" is Claude Code's marker for
+    locally-generated messages and never names a real model.
+
+    >>> _models_in('{"type":"assistant","message":{"model":"a/b"}}')
+    ['a/b']
+    >>> _models_in('{"type":"user","message":{"model":"a/b"}}')
+    []
+    >>> _models_in('trunc{"type":"assistant"\\n{"type":"assistant","message":{"model":"x"}}')
+    ['x']
+    >>> _models_in('{"type":"assistant","message":{"model":"<synthetic>"}}')
+    []
+    """
+    out = []
+    for line in chunk.split("\n"):
+        if '"model"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        model = message.get("model")
+        if isinstance(model, str) and model and model != "<synthetic>":
+            out.append(model)
+    return out
+
+
+def _served_segment(payload) -> str:
+    """Warn when the model answering is not the one the session started on.
+
+    Claude Code's payload only ever carries the model the session was
+    *configured* with, so a gateway that does fallback routing (OpenRouter
+    presets, claude-code-router, LiteLLM) can silently switch the model
+    that actually answers -- to a pricier or weaker one -- with nothing on
+    screen to show it. The transcript does record the serving model on
+    every assistant message, so compare the newest against the session's
+    first and speak up only when they differ.
+
+    Renders nothing in the normal case: on a session that never switched,
+    the model segment already names the model, and a second copy would be
+    noise. That also keeps this free for the majority of users.
+
+    Deliberately does NOT consult environment variables for the expected
+    model: a statusline subprocess is not guaranteed to inherit the
+    session's environment, and that would fail silently on exactly the
+    gateway setups this exists for. The session's own first turn is the
+    reliable baseline.
+
+    Reads are bounded to the head and tail of the file. Transcripts reach
+    100MB+ and this runs on every refresh, so a full scan would grow
+    without limit.
+    """
+    path = payload.get("transcript_path") if isinstance(payload, dict) else None
+    if not isinstance(path, str) or not path:
+        return ""
+    tail_bytes = 262144
+    # A single assistant message can be larger than the first window (a big
+    # file read, a long system prompt), and a window that lands mid-line
+    # yields nothing parseable. Grow the head read until a model turns up,
+    # with a hard cap so this stays bounded on any file.
+    head_windows = (65536, 262144, 1048576, 4194304)
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            first = []
+            read_bytes = 0
+            for window in head_windows:
+                if window > size and read_bytes >= size:
+                    break
+                fh.seek(0)
+                read_bytes = min(size, window)
+                first = _models_in(fh.read(read_bytes).decode("utf-8", "replace"))
+                if first or read_bytes >= size:
+                    break
+            if size > read_bytes:
+                fh.seek(max(0, size - tail_bytes))
+                last = _models_in(fh.read().decode("utf-8", "replace"))
+            else:
+                last = first
+    except (OSError, ValueError):
+        return ""
+    if not first or not last:
+        return ""
+    expected, served = first[0], last[-1]
+    if served == expected:
+        return ""
+    short_served = served.rsplit("/", 1)[-1]
+    short_expected = expected.rsplit("/", 1)[-1]
+    return f"{RED}{short_served} (FALLBACK, not {short_expected}){RESET}"
+
+
 def _caveman_segment(home: str) -> str:
     """Badge for the caveman plugin's flag file, when present."""
     flag = os.path.join(home, ".claude", ".caveman-active")
@@ -263,6 +366,10 @@ def render(payload, home: "str | None" = None, now: "float | None" = None) -> st
             if reset:
                 seg += f"{ARROW}{reset}"
             segments.append(seg)
+
+    served = _served_segment(payload)
+    if served:
+        segments.append(served)
 
     account = _account_segment(home)
     if account:
