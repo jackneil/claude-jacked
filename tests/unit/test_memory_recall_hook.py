@@ -175,6 +175,23 @@ def test_fit_to_budget_trims_lowest_priority_first():
     assert "[trimmed: index excerpt]" in out
 
 
+def test_fit_to_budget_emit_order_reorders_output_only():
+    sections = [("header", "H"), ("volatile", "V"), ("stable", "S")]
+    out = recall.fit_to_budget(sections, budget=1000, emit_order=["header", "stable", "volatile"])
+    assert out == "H\n\nS\n\nV"
+
+
+def test_fit_to_budget_emit_order_does_not_change_what_trims():
+    # Budget forces one drop. Trim priority is the SECTIONS order, so "stable"
+    # (last in priority) is cut even though emit_order would have shown it
+    # before "volatile".
+    sections = [("header", "H"), ("volatile", "x" * 100), ("stable", "y" * 100)]
+    budget = recall.estimate_tokens("H\n\n" + "x" * 100 + "\n\n[trimmed: stable]")
+    out = recall.fit_to_budget(sections, budget=budget, emit_order=["header", "stable", "volatile"])
+    assert "y" not in out
+    assert "[trimmed: stable]" in out
+
+
 def test_fit_to_budget_drops_empty_sections_without_marking_them():
     out = recall.fit_to_budget([("header", "H"), ("hot progress", ""), ("drift nudge", "nudge")], budget=1000)
     assert "H" in out and "nudge" in out
@@ -279,6 +296,44 @@ def test_drift_nudge_at_threshold(env):
     vault_mod.save_state(env.home, st)
     brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
     assert "memory-librarian" in brief
+
+
+def test_drift_nudge_is_byte_stable_as_drift_grows(env):
+    """The nudge must not carry live counts: the brief sits in the cached
+    prompt preamble, and a counter that ticks per captured note changes the
+    brief's bytes every session, defeating inference-side prefix caches."""
+    _seed_group(env)
+    st = vault_mod.load_state(env.home)
+    st["drift_added"] = st["drift_threshold"]
+    vault_mod.save_state(env.home, st)
+    nudge_at = recall._drift_section(vault_mod.load_state(env.home))
+
+    st = vault_mod.load_state(env.home)
+    st["drift_added"] = st["drift_threshold"] + 51
+    vault_mod.save_state(env.home, st)
+    nudge_over = recall._drift_section(vault_mod.load_state(env.home))
+
+    assert nudge_at and nudge_at == nudge_over
+    assert not any(ch.isdigit() for ch in nudge_at)
+
+
+def test_brief_emits_volatile_sections_last(env):
+    """Episodic entry (changes every session) and drift nudge must land AFTER
+    the stable sections, so the brief's front stays byte-identical across
+    sessions for prompt prefix caches."""
+    _seed_group(env)
+    st = vault_mod.load_state(env.home)
+    st["drift_added"] = st["drift_threshold"]
+    vault_mod.save_state(env.home, st)
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+
+    episodic_pos = brief.find(_LAST_EPISODIC)
+    assert episodic_pos != -1
+    for stable_marker in ("=== MEMORY VAULT", _DEFAULT_HOT, "](decision/"):
+        pos = brief.find(stable_marker)
+        assert pos != -1
+        assert pos < episodic_pos
+    assert brief.find("memory-librarian") > episodic_pos
 
 
 def test_drift_nudge_absent_below_threshold(env):

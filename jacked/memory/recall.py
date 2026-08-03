@@ -11,6 +11,11 @@ lowest-priority sections are trimmed until the whole thing fits the budget; when
 anything is cut the brief's final line names what was dropped (never a silent
 cut). The header + imperative line is priority 1 and never trimmed.
 
+EMISSION order is decoupled from trim priority: the per-session-volatile
+sections (last episodic entry, drift nudge) are emitted LAST so the stable
+front of the brief stays byte-identical across sessions for inference-side
+prompt prefix caches (see ``_EMIT_ORDER``).
+
 Recall is READ-ONLY over the vault except for one thing: an optional
 ``git pull --ff-only`` sync (guarded, timeout-bounded, every failure swallowed)
 that keeps a multi-machine vault fresh, plus the ``last_sync`` /
@@ -58,6 +63,17 @@ _L_DECISIONS = "top decisions"
 _L_INDEX = "index excerpt"
 _L_DRIFT = "drift nudge"
 
+# EMISSION order: stable sections first, per-session-volatile sections last.
+# The brief lands in the model's cached prompt preamble, and inference-side
+# prefix caches (Anthropic's, and self-hosted gateways like the hank lane)
+# match byte-for-byte from the front: one changed byte invalidates everything
+# after it. The episodic entry changes EVERY session and the drift nudge
+# toggles as notes accumulate, so placing them mid-brief was measured (on the
+# hank gateway, 2026-08-03) to cap cross-session cache reuse at the ~16% mark
+# of the hook block. Trim PRIORITY is unchanged and stays the
+# _assemble_sections list order; this only reorders what survives the budget.
+_EMIT_ORDER = [_L_HEADER, _L_HOT, _L_DECISIONS, _L_INDEX, _L_EPISODIC, _L_DRIFT]
+
 
 # --------------------------------------------------------------------------- #
 # Budget math (its own testable functions)
@@ -72,7 +88,11 @@ def _trim_marker(labels: list[str]) -> str:
     return "[trimmed: " + ", ".join(labels) + "]"
 
 
-def fit_to_budget(sections: list[tuple[str, str]], budget: int = TOKEN_BUDGET) -> str:
+def fit_to_budget(
+    sections: list[tuple[str, str]],
+    budget: int = TOKEN_BUDGET,
+    emit_order: list[str] | None = None,
+) -> str:
     """Join ``sections`` (``[(label, text), ...]``, highest priority first) into
     a brief that fits ``budget`` tokens.
 
@@ -82,16 +102,30 @@ def fit_to_budget(sections: list[tuple[str, str]], budget: int = TOKEN_BUDGET) -
     ``[trimmed: ...]`` line naming the cut sections (in priority order) is
     appended. A section that fits exactly at the budget is kept; one token over
     triggers a trim.
+
+    ``emit_order`` decouples OUTPUT order from trim priority: when given, the
+    surviving sections are emitted in that label order (labels it omits keep
+    their priority position, after the listed ones). Trimming still follows the
+    ``sections`` list order, so what gets cut under pressure is unchanged.
     """
     order = {label: i for i, (label, _) in enumerate(sections)}
     kept = [(label, text) for label, text in sections if text]
     if not kept:
         return ""
 
+    emit_rank = {label: i for i, label in enumerate(emit_order)} if emit_order else None
     dropped: list[str] = []
 
     def render() -> str:
-        body = "\n\n".join(text for _, text in kept)
+        out = kept
+        if emit_rank is not None:
+            out = sorted(
+                kept,
+                key=lambda lt: (
+                    emit_rank.get(lt[0], len(emit_rank) + order.get(lt[0], 0)),
+                ),
+            )
+        body = "\n\n".join(text for _, text in out)
         if dropped:
             ordered = sorted(dropped, key=lambda label: order.get(label, len(sections)))
             body = body + "\n\n" + _trim_marker(ordered)
@@ -136,7 +170,7 @@ def build_brief(cwd: str) -> str:
 
     repo_short = vault_mod.group_for_identity(identity)
     sections = _assemble_sections(vault, gdir, group, repo_short, state)
-    brief = fit_to_budget(sections, TOKEN_BUDGET)
+    brief = fit_to_budget(sections, TOKEN_BUDGET, emit_order=_EMIT_ORDER)
     # Vault content is injected into the session context; strip any control /
     # escape sequences a note body might carry (keeps tab/newline/CR).
     brief = vault_mod._CONTROL_CHARS_RE.sub("", brief)
@@ -339,10 +373,13 @@ def _drift_section(state: dict) -> str:
     threshold = int(state.get("drift_threshold", vault_mod.DEFAULT_DRIFT_THRESHOLD) or 0)
     if threshold <= 0 or added < threshold:
         return ""
+    # Deliberately no live counts: "(66/15 notes)" changed the brief's bytes on
+    # every captured note, and the brief sits in the cached prompt preamble
+    # (see _EMIT_ORDER). This line is byte-stable for as long as drift stays
+    # over threshold; the librarian skill reports the real numbers when run.
     return (
-        f"Memory drift is high ({added}/{threshold} notes added since the last "
-        "groom). Consider running the memory-librarian skill to reconcile and "
-        "re-index."
+        "Memory drift is over the groom threshold. Consider running the "
+        "memory-librarian skill to reconcile and re-index."
     )
 
 
