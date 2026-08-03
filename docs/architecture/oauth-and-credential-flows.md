@@ -1,7 +1,8 @@
 # OAuth and Credential Lifecycle — Canonical Architecture
 
-**Last updated:** 2026-04-16
-**Status:** Canonical reference. Every claim is cited file:line against the current tree. When prior docs disagree with the code, the code wins (disagreements are flagged inline).
+**Last source-wide audit:** 2026-04-16
+**2026-08-02 refresh scope:** §3.D (`oauthAccount` metadata) and the related store-diagram writer.
+**Status:** Canonical architecture snapshot. The refresh scope above is verified against the current tree; the remaining numeric citations retain the 2026-04 snapshot and require a full source-wide audit before being treated as current. <!-- docs-sync: unable to verify -->
 
 ---
 
@@ -9,7 +10,7 @@
 
 jacked manages multiple Claude Code accounts behind a single on-disk credential surface that Claude Code itself owns. Two independent OAuth token pairs live on each account row: a **primary pair** (`access_token` / `refresh_token` / `expires_at`) which jacked uses for its own upstream calls (profile, usage, optional long-lived API key) and a **CC pair** (`cc_access_token` / `cc_refresh_token` / `cc_expires_at`) which Claude Code consumes via the shared credential stores. The primary pair is obtained during the "primary" OAuth flow, which typically immediately mints a long-lived API key, overriding the short-lived OAuth tokens with a ~1-year API key (`jacked/web/oauth.py:411-444`). The CC pair is obtained via a separately-initiated OAuth flow with `purpose="claude_code"` (`jacked/web/oauth.py:336-354`, `jacked/api/routes/auth.py:791-812`) and must never be rotated by jacked's background loops on the active account — doing so consumes the single-use refresh token that Claude Code's own session depends on.
 
-The credentials are mirrored across five stores: (A) the jacked SQLite DB at `~/.claude/jacked.db` (the Account row; `jacked/web/database.py:38-74`), (B) the macOS Keychain entry `Claude Code-credentials` under the system username (`jacked/api/credential_helpers.py:97-112`, `437-486`), (C) the global credentials file at `~/.claude/.credentials.json` (`jacked/api/credential_helpers.py:585-603`), (D) the identity block in `~/.claude.json` under `oauthAccount` (`jacked/api/credential_helpers.py:162-229`), and (E) per-account isolation dirs at `~/.claude/accounts/<account_id>/` (`jacked/api/credential_helpers.py:624-651`, `jacked/launch.py:397-470`). The core safety invariant — established in `docs/superpowers/specs/2026-03-24-kill-background-credential-writes-design.md` and still holding in the current code — is that **jacked's background loops must never write to Claude Code's credential stores (B, C, D, E); they only persist to the DB (A)**. User-initiated actions (OAuth add/re-auth, dashboard "Use Account", `jacked claude <id>` launch, and in-band 429 recovery for the active account) are the only paths that touch CC-owned stores, and they do so under the cross-process `~/.claude.lock` mkdir lock (`jacked/api/credential_helpers.py:31-89`).
+Jacked coordinates credential data and non-secret active-account metadata across five stores: (A) the jacked SQLite DB at `~/.claude/jacked.db` (the Account row; `jacked/web/database.py:38-74`), (B) the macOS Keychain entry `Claude Code-credentials` under the system username (`jacked/api/credential_helpers.py:97-112`, `437-486`), (C) the global credentials file at `~/.claude/.credentials.json` (`jacked/api/credential_helpers.py:585-603`), (D) the identity-and-tier metadata block in `~/.claude.json` under `oauthAccount` (`jacked/api/credential_helpers.py:25-34`, `181-257`), and (E) per-account isolation dirs at `~/.claude/accounts/<account_id>/` (`jacked/api/credential_helpers.py:624-651`, `jacked/launch.py:397-470`). The core safety invariant — established in `docs/superpowers/specs/2026-03-24-kill-background-credential-writes-design.md` and still holding in the current code — is that **jacked's background loops must never write to Claude Code's credential stores (B, C, D, E); they only persist to the DB (A)**. User-initiated actions (OAuth add/re-auth, dashboard "Use Account", `jacked claude <id>` launch, and in-band 429 recovery for the active account) are the only paths that touch CC-owned stores, and they do so under the cross-process `~/.claude.lock` mkdir lock (`jacked/api/credential_helpers.py:31-89`).
 
 **The exception we must flag up front:** the periodic token refresh loop (`jacked/api/main.py:52-68`) calls `refresh_all_expiring_tokens` (`jacked/web/auth.py:1002-1080`) which in turn calls `refresh_cc_token` for *every* account whose CC token is nearing expiry — including the active one. `refresh_cc_token` does NOT write to CC credential stores (correctly, per the invariant), but exchanging the CC refresh token at Anthropic's OAuth endpoint rotates it upstream. Since jacked writes the new refresh token only to the DB (not Keychain), Claude Code's next refresh attempt with the stale Keychain value fails with `invalid_grant`. See §7 for the exact mechanism and §8 for the affected invariant.
 
@@ -39,7 +40,7 @@ The primary and CC token pairs live side-by-side on a single Account row. The fo
 
 ## 3. The Five Stores
 
-jacked maintains one authoritative source (DB) plus four mirrors that are Claude Code's property. Each mirror is updated only from user-initiated paths or, for the per-account dir, by `launch.py` wrappers.
+jacked maintains one authoritative source (DB) plus four Claude Code-owned credential or metadata surfaces. Each mirror is updated only from user-initiated paths or, for the per-account dir, by `launch.py` wrappers.
 
 ### A. SQLite DB (`~/.claude/jacked.db`) — Account row
 
@@ -91,14 +92,16 @@ Same payload as Keychain. The `_jackedAccountId` stamp is the primary ground tru
 
 **Shape:** a giant Claude Code config file. jacked only touches `oauthAccount`:
 ```json
-{"oauthAccount": {"emailAddress": "...", "displayName": "...", "organizationUuid": "...", "organizationName": "..."}, ...}
+{"oauthAccount": {"emailAddress": "...", "displayName": "...", "organizationUuid": "...", "organizationName": "...", "organizationRateLimitTier": "..."}, ...}
 ```
 
-Unlike `.credentials.json`, `~/.claude.json` is NOT overwritten by Claude Code during token refresh — only during login/logout (`jacked/api/routes/auth.py:1063-1072`). That's why layer 3 of active-account detection reads it.
+The tier key is `organizationRateLimitTier` when the account has an organization UUID; personal accounts use `userRateLimitTier` instead. A sync clears both tier keys before setting the applicable one, and omits both when the account has no `rate_limit_tier` (`jacked/api/credential_helpers.py:195-220`).
 
-**Reads:** `get_active_credential` layer 3 (`jacked/api/routes/auth.py:1062-1103`) falls back to email+org matching when `.credentials.json` and Keychain fail. `_seed_oauth_account` reads it to decide whether to overwrite (`jacked/launch.py:191-278`).
+Unlike `.credentials.json`, `~/.claude.json` is NOT overwritten by Claude Code during token refresh — only during login/logout (`jacked/api/routes/auth.py::get_active_credential`). That's why layer 3 of active-account detection reads it.
 
-**Writes:** `update_claude_config_email` (`jacked/api/credential_helpers.py:162-229`) — read-modify-write with atomic replace, preserves all other keys. Runs only as step 3 of `sync_credential_to_all_stores` (`jacked/api/credential_helpers.py:612-621`). Additionally, `_seed_oauth_account` writes a minimal `oauthAccount` block into the *per-account* `.claude.json` (`jacked/launch.py:191-278`) — this is the per-account dir variant, not the global file.
+**Reads:** `get_active_credential` layer 3 (`jacked/api/routes/auth.py::get_active_credential`) falls back to email+org matching when `.credentials.json` and Keychain fail. `_seed_oauth_account` reads it to decide whether to overwrite (`jacked/launch.py::_seed_oauth_account`). The internal statusline cache v2 derives its rendered email/org/tier segment from this `oauthAccount` metadata, bound to the exact config content; it never reads `.credentials.json` or OAuth token material, and is not another credential store (`jacked/statusline.py::_account_segment`).
+
+**Writes:** `sync_credential_to_all_stores` constructs the private frozen `_ClaudeConfigAccount` metadata projection and passes it to `_update_claude_config_account` (`jacked/api/credential_helpers.py::_ClaudeConfigAccount`, `jacked/api/credential_helpers.py::_update_claude_config_account`, `jacked/api/credential_helpers.py::sync_credential_to_all_stores`). This read-modify-write uses atomic replace and preserves all other config keys while synchronizing identity and tier metadata. `update_claude_config_email` remains a legacy identity-only wrapper that preserves existing tier metadata (`jacked/api/credential_helpers.py::update_claude_config_email`). Additionally, `_seed_oauth_account` writes a minimal `oauthAccount` block into the *per-account* `.claude.json` (`jacked/launch.py::_seed_oauth_account`) — this is the per-account dir variant, not the global file.
 
 ### E. `~/.claude/accounts/<id>/` — per-account isolation dirs
 
@@ -127,7 +130,7 @@ flowchart LR
 
     DB -- "sync_credential_to_all_stores<br/>(user-initiated only)" --> KC
     DB -- "sync_credential_to_all_stores<br/>(user-initiated only)" --> CF
-    DB -- "update_claude_config_email<br/>(user-initiated only)" --> CJ
+    DB -- "_update_claude_config_account<br/>(via sync_credential_to_all_stores; user-initiated only)" --> CJ
     DB -- "prepare_account_dir<br/>(jacked claude launch)" --> PD
 
     KC -- "read_platform_credentials" --> DB

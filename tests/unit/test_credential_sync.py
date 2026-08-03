@@ -11,7 +11,12 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
+from jacked import statusline
 from jacked.api.credential_helpers import (
+    _ClaudeConfigAccount,
+    _update_claude_config_account,
     build_oauth_data,
     read_fresh_active_token,
     read_platform_credentials,
@@ -157,11 +162,9 @@ def test_sync_writes_global_credential_file():
         assert data["claudeAiOauth"]["expiresAt"] == 1800000000000
 
 
-def test_sync_writes_claude_json_email():
-    """Updates ~/.claude.json with the active account's email.
-
-    >>> test_sync_writes_claude_json_email()
-    """
+@pytest.mark.parametrize("rate_limit_tier", ["t1", None])
+def test_sync_writes_initial_claude_json_metadata(rate_limit_tier):
+    """First activation writes coherent metadata even without a known tier."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
         tmp_path = Path(tmp)
         cred_dir = tmp_path / ".claude"
@@ -176,7 +179,7 @@ def test_sync_writes_claude_json_email():
             "expires_at": 1800000000,
             "scopes": None,
             "subscription_type": "max",
-            "rate_limit_tier": "t1",
+            "rate_limit_tier": rate_limit_tier,
         }
 
         with (
@@ -191,7 +194,148 @@ def test_sync_writes_claude_json_email():
         config_path = tmp_path / ".claude.json"
         assert config_path.exists()
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        assert config["oauthAccount"]["emailAddress"] == "alice@test.com"
+        oauth = config["oauthAccount"]
+        assert oauth["emailAddress"] == "alice@test.com"
+        if rate_limit_tier is None:
+            assert "userRateLimitTier" not in oauth
+            assert "organizationRateLimitTier" not in oauth
+            assert statusline.render({}, home=str(tmp_path)) == "alice@test.com"
+        else:
+            assert oauth["userRateLimitTier"] == rate_limit_tier
+
+
+def _prime_cached_statusline_account(tmp_path: Path) -> Path:
+    """Create the outgoing account and prime its rendered cache."""
+    (tmp_path / ".claude").mkdir()
+    config_path = tmp_path / ".claude.json"
+    config_path.write_text(
+        json.dumps({
+            "topLevelSetting": {"preserve": True},
+            "oauthAccount": {
+                "emailAddress": "old@test.com",
+                "organizationName": "Old Org",
+                "userRateLimitTier": "default_claude_max_5x",
+                "unrelatedAccountSetting": ["keep", 7],
+            },
+        }),
+        encoding="utf-8",
+    )
+    assert statusline.render({}, home=str(tmp_path)).endswith("Max 5x")
+    return config_path
+
+
+def _sync_statusline_target(
+    tmp_path: Path,
+    access_canary: str,
+    refresh_canary: str,
+) -> None:
+    """Activate the target through the real shared credential boundary."""
+    account = {
+        "email": "new@test.com",
+        "display_name": "New User",
+        "access_token": "primary-access",
+        "refresh_token": "primary-refresh",
+        "expires_at": 1800000000,
+        "cc_access_token": access_canary,
+        "cc_refresh_token": refresh_canary,
+        "cc_expires_at": 1800000000,
+        "scopes": None,
+        "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x",
+        "organization_uuid": "org-new",
+        "organization_name": "New Org",
+    }
+    with (
+        mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
+        mock.patch(
+            "jacked.api.credential_helpers.write_platform_credentials",
+            return_value=True,
+        ),
+    ):
+        sync_credential_to_all_stores(20, account)
+
+
+def test_sync_switches_cached_statusline_identity_and_tier_coherently():
+    """A real credential sync cannot mix the target email with the old tier."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        config_path = _prime_cached_statusline_account(tmp_path)
+        access_canary = "statusline-access-canary-7b8c"
+        refresh_canary = "statusline-refresh-canary-4d2a"
+        _sync_statusline_target(tmp_path, access_canary, refresh_canary)
+
+        line = statusline.render({}, home=str(tmp_path))
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        oauth = config["oauthAccount"]
+        config_text = config_path.read_text(encoding="utf-8")
+        cache_text = (tmp_path / ".claude" / "statusline-account.cache").read_text(
+            encoding="utf-8"
+        )
+        credential_text = (
+            tmp_path / ".claude" / ".credentials.json"
+        ).read_text(encoding="utf-8")
+
+        assert "new@test.com" in line
+        assert "New Org" in line
+        assert "Max 20x" in line
+        assert "old@test.com" not in line
+        assert "Max 5x" not in line
+        assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
+        assert "userRateLimitTier" not in oauth
+        assert config["topLevelSetting"] == {"preserve": True}
+        assert oauth["unrelatedAccountSetting"] == ["keep", 7]
+        assert access_canary in credential_text
+        assert refresh_canary in credential_text
+        for public_text in (config_text, cache_text, line):
+            assert access_canary not in public_text
+            assert refresh_canary not in public_text
+
+
+def test_sync_with_unknown_tier_clears_both_outgoing_tier_fields():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / ".claude").mkdir()
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(
+            json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "old@test.com",
+                    "userRateLimitTier": "default_claude_max_5x",
+                    "organizationRateLimitTier": "default_claude_max_20x",
+                    "preserved": {"nested": "value"},
+                },
+            }),
+            encoding="utf-8",
+        )
+        account = {
+            "email": "unknown-tier@test.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at": 1800000000,
+            "scopes": None,
+            "subscription_type": "max",
+            "rate_limit_tier": None,
+        }
+
+        with (
+            mock.patch(
+                "jacked.api.credential_helpers.Path.home", return_value=tmp_path
+            ),
+            mock.patch(
+                "jacked.api.credential_helpers.write_platform_credentials",
+                return_value=True,
+            ),
+        ):
+            sync_credential_to_all_stores(21, account)
+
+        oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
+        assert oauth["emailAddress"] == "unknown-tier@test.com"
+        assert "userRateLimitTier" not in oauth
+        assert "organizationRateLimitTier" not in oauth
+        assert oauth["preserved"] == {"nested": "value"}
+        line = statusline.render({}, home=str(tmp_path))
+        assert line == "unknown-tier@test.com"
+        assert "Max" not in line
 
 
 def test_sync_writes_per_account_dir():
@@ -542,6 +686,139 @@ def test_update_claude_config_email_preserves_keys():
         assert result["oauthAccount"]["emailAddress"] == "new@test.com"
         assert result["oauthAccount"]["displayName"] == "Old"  # preserved
         assert result["someOtherKey"] == "preserved"
+
+
+def test_update_claude_config_account_replaces_tier_field_for_organization():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(
+            json.dumps({
+                "topLevel": ["unchanged"],
+                "oauthAccount": {
+                    "emailAddress": "old@test.com",
+                    "userRateLimitTier": "default_claude_max_5x",
+                    "organizationRateLimitTier": "default_claude_pro",
+                    "unrelated": {"unchanged": True},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        with mock.patch(
+            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
+        ):
+            _update_claude_config_account(
+                _ClaudeConfigAccount(
+                    email="org@test.com",
+                    organization_uuid="org-20x",
+                    organization_name="Twenty Org",
+                    rate_limit_tier="default_claude_max_20x",
+                )
+            )
+
+        result = json.loads(config_path.read_text(encoding="utf-8"))
+        oauth = result["oauthAccount"]
+        assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
+        assert "userRateLimitTier" not in oauth
+        assert oauth["organizationUuid"] == "org-20x"
+        assert result["topLevel"] == ["unchanged"]
+        assert oauth["unrelated"] == {"unchanged": True}
+
+
+def test_update_claude_config_account_replaces_tier_field_for_personal_account():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(
+            json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "org@test.com",
+                    "organizationUuid": "old-org",
+                    "organizationName": "Old Org",
+                    "organizationRateLimitTier": "default_claude_max_20x",
+                    "unrelated": "keep",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        with mock.patch(
+            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
+        ):
+            _update_claude_config_account(
+                _ClaudeConfigAccount(
+                    email="personal@test.com",
+                    rate_limit_tier="default_claude_max_5x",
+                )
+            )
+
+        oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
+        assert oauth["userRateLimitTier"] == "default_claude_max_5x"
+        assert "organizationRateLimitTier" not in oauth
+        assert "organizationUuid" not in oauth
+        assert "organizationName" not in oauth
+        assert oauth["unrelated"] == "keep"
+
+
+def test_update_claude_config_account_explicit_null_clears_tier_fields():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(
+            json.dumps({
+                "topLevel": "keep",
+                "oauthAccount": {
+                    "emailAddress": "old@test.com",
+                    "userRateLimitTier": "default_claude_max_5x",
+                    "organizationRateLimitTier": "default_claude_max_20x",
+                    "unrelated": [1, 2, 3],
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        with mock.patch(
+            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
+        ):
+            _update_claude_config_account(
+                _ClaudeConfigAccount(
+                    email="unknown@test.com",
+                    rate_limit_tier=None,
+                )
+            )
+
+        result = json.loads(config_path.read_text(encoding="utf-8"))
+        oauth = result["oauthAccount"]
+        assert "userRateLimitTier" not in oauth
+        assert "organizationRateLimitTier" not in oauth
+        assert result["topLevel"] == "keep"
+        assert oauth["unrelated"] == [1, 2, 3]
+
+
+def test_update_claude_config_email_omitted_tier_preserves_existing_fields():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(
+            json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "old@test.com",
+                    "userRateLimitTier": "default_claude_max_5x",
+                    "organizationRateLimitTier": "default_claude_max_20x",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        with mock.patch(
+            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
+        ):
+            update_claude_config_email("identity-only@test.com")
+
+        oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
+        assert oauth["userRateLimitTier"] == "default_claude_max_5x"
+        assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
 
 
 def test_update_claude_config_email_refuses_symlink():

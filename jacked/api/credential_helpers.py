@@ -14,9 +14,23 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_RATE_LIMIT_TIER_UNSET = object()
+
+
+@dataclass(frozen=True)
+class _ClaudeConfigAccount:
+    """Account metadata mirrored into Claude's non-secret config."""
+
+    email: str
+    display_name: str | None = None
+    organization_uuid: str | None = None
+    organization_name: str | None = None
+    rate_limit_tier: object = _RATE_LIMIT_TIER_UNSET
 
 
 # ---------------------------------------------------------------------------
@@ -164,26 +178,8 @@ def _write_credential_file(cred_path: Path, data: dict) -> float:
     return cred_path.stat().st_mtime
 
 
-def update_claude_config_email(
-    email: str,
-    display_name: str = None,
-    organization_uuid: str = None,
-    organization_name: str = None,
-):
-    """Update or create ~/.claude.json with the active account's identity.
-
-    Writes emailAddress, organizationUuid, and organizationName to the
-    oauthAccount block.  If the file exists, preserves all other keys.
-    Refuses to write through symlinks.  Logs on failure instead of raising.
-
-    >>> update_claude_config_email("test@example.com")  # noqa: no side-effects in test env
-    """
-    claude_config = Path.home() / ".claude.json"
-
-    if claude_config.is_symlink():
-        logger.warning("Refusing to write ~/.claude.json — path is a symlink")
-        return
-
+def _read_claude_config(claude_config: Path) -> dict:
+    """Read Claude's config, retaining the established fresh-file fallback."""
     config: dict = {}
     if claude_config.exists():
         try:
@@ -193,45 +189,72 @@ def update_claude_config_email(
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read ~/.claude.json, creating fresh: %s", exc)
             config = {}
+    return config
 
-    if "oauthAccount" not in config:
-        config["oauthAccount"] = {}
-    config["oauthAccount"]["emailAddress"] = email
-    if display_name and "displayName" not in config["oauthAccount"]:
-        config["oauthAccount"]["displayName"] = display_name
 
-    # Write organization identity to oauthAccount block
-    if organization_uuid:
-        config["oauthAccount"]["organizationUuid"] = organization_uuid
-    elif "organizationUuid" in config["oauthAccount"]:
-        del config["oauthAccount"]["organizationUuid"]
-    if organization_name:
-        config["oauthAccount"]["organizationName"] = organization_name
-    elif "organizationName" in config["oauthAccount"]:
-        del config["oauthAccount"]["organizationName"]
+def _apply_claude_account(config: dict, metadata: _ClaudeConfigAccount) -> None:
+    """Replace active identity metadata in an already parsed config."""
+    account = config.setdefault("oauthAccount", {})
+    account["emailAddress"] = metadata.email
+    if metadata.display_name and "displayName" not in account:
+        account["displayName"] = metadata.display_name
+
+    if metadata.organization_uuid:
+        account["organizationUuid"] = metadata.organization_uuid
+    else:
+        account.pop("organizationUuid", None)
+    if metadata.organization_name:
+        account["organizationName"] = metadata.organization_name
+    else:
+        account.pop("organizationName", None)
+
+    if metadata.rate_limit_tier is not _RATE_LIMIT_TIER_UNSET:
+        account.pop("userRateLimitTier", None)
+        account.pop("organizationRateLimitTier", None)
+        if metadata.rate_limit_tier:
+            tier_field = (
+                "organizationRateLimitTier"
+                if metadata.organization_uuid
+                else "userRateLimitTier"
+            )
+            account[tier_field] = metadata.rate_limit_tier
+
+
+def _update_claude_config_account(metadata: _ClaudeConfigAccount) -> None:
+    """Atomically mirror one account's non-secret metadata to ~/.claude.json."""
+    claude_config = Path.home() / ".claude.json"
+
+    if claude_config.is_symlink():
+        logger.warning("Refusing to write ~/.claude.json — path is a symlink")
+        return
+
+    config = _read_claude_config(claude_config)
+    _apply_claude_account(config, metadata)
 
     try:
-        fd, tmp = tempfile.mkstemp(
-            dir=str(claude_config.parent),
-            prefix=".claude_tmp_",
-            suffix=".json",
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2)
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            _safe_replace(tmp, str(claude_config))
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _write_credential_file(claude_config, config)
     except Exception as exc:
         logger.warning("Failed to write ~/.claude.json: %s", exc)
+
+
+def update_claude_config_email(
+    email: str,
+    display_name: str = None,
+    organization_uuid: str = None,
+    organization_name: str = None,
+):
+    """Update Claude identity while preserving legacy tier metadata.
+
+    >>> update_claude_config_email("test@example.com")  # noqa: no side-effects in test env
+    """
+    _update_claude_config_account(
+        _ClaudeConfigAccount(
+            email=email,
+            display_name=display_name,
+            organization_uuid=organization_uuid,
+            organization_name=organization_name,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -657,11 +680,14 @@ def sync_credential_to_all_stores(
 
     # 3. Update ~/.claude.json with email + org identity
     try:
-        update_claude_config_email(
-            email,
-            display_name,
-            organization_uuid=account.get("organization_uuid") or None,
-            organization_name=account.get("organization_name"),
+        _update_claude_config_account(
+            _ClaudeConfigAccount(
+                email=email,
+                display_name=display_name,
+                organization_uuid=account.get("organization_uuid") or None,
+                organization_name=account.get("organization_name"),
+                rate_limit_tier=account.get("rate_limit_tier"),
+            )
         )
     except Exception as exc:
         logger.warning("Failed to update ~/.claude.json email: %s", exc)

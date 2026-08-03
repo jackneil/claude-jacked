@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Statusline Account Tier Refresh Plan</title>
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="complete">
+<meta name="jacked:branch" content="fix/statusline-account-usage-refresh">
+<meta name="jacked:date" content="2026-08-02">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root {
+    --fg: #1a1a1a; --fg-muted: #555; --bg: #fafaf7; --bg-card: #fff;
+    --accent: #2266aa; --accent-bg: #e7f0fa; --warn: #b3681c;
+    --warn-bg: #fcf3e7; --ok: #1f7a3f; --ok-bg: #e8f4ec;
+    --border: #d8d4cc; --code-bg: #f3efe8; --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px; --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1; --fg-muted: #a8a5a0; --bg: #161616; --bg-card: #1f1f1f;
+      --accent: #6aa8e8; --accent-bg: #1a2935; --warn: #e0a85b;
+      --warn-bg: #3a2d18; --ok: #6acd8e; --ok-bg: #1c3327;
+      --border: #2e2e2e; --code-bg: #232323; --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--sans); font-size: 16px; line-height: 1.6; color: var(--fg); background: var(--bg); margin: 0; padding: 2rem 1rem; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin: 0 0 .25rem; line-height: 1.2; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; padding-bottom: .35rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; color: var(--fg-muted); }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  .meta { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin: .5rem 0 2rem; padding: .75rem 1rem; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); font-size: .9rem; }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v, code, pre { font-family: var(--mono); }
+  .badge { display: inline-block; padding: .15rem .6rem; border-radius: 99px; font-size: .8rem; font-weight: 500; }
+  .badge.info { background: var(--accent-bg); color: var(--accent); }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  nav.toc, table, .diagram { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+  nav.toc { padding: 1rem 1.25rem; margin-bottom: 2rem; }
+  nav.toc h2 { margin: 0 0 .5rem; font-size: .9rem; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-muted); border: 0; padding: 0; }
+  nav.toc ol { margin: 0; padding-left: 1.5rem; }
+  aside.callout { margin: 1rem 0; padding: .9rem 1.1rem; border-left: 4px solid var(--accent); background: var(--accent-bg); border-radius: 0 var(--radius) var(--radius) 0; }
+  aside.callout.warn { border-color: var(--warn); background: var(--warn-bg); }
+  code { font-size: .92em; background: var(--code-bg); padding: .12em .35em; border-radius: 3px; }
+  pre { font-size: .88rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: .9rem 1rem; overflow-x: auto; line-height: 1.45; }
+  pre code { background: transparent; padding: 0; }
+  table { width: 100%; border-collapse: collapse; overflow: hidden; }
+  th, td { text-align: left; padding: .55rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--code-bg); }
+  tr:last-child td { border-bottom: 0; }
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li { padding: .25rem 0; display: flex; align-items: flex-start; gap: .6rem; }
+  ul.tasks input { margin-top: .4rem; }
+  .diagram { padding: 1rem; margin: 1rem 0; text-align: center; overflow-x: auto; }
+  .diagram pre.mermaid-source { display: none; text-align: left; }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+  @media print { body { background: white; color: black; padding: 0; } .wrap { max-width: none; } pre, table, aside, .diagram { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Statusline Account Tier Refresh</h1>
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge ok">complete</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-08-02</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">fix/statusline-account-usage-refresh</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec + implementation plan</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal and acceptance criteria</a></li>
+    <li><a href="#architecture">Root cause and design</a></li>
+    <li><a href="#files">Files and interfaces</a></li>
+    <li><a href="#tasks">Tasks and verification</a></li>
+    <li><a href="#non-goals">Non-goals and negative requirements</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal and acceptance criteria</h2>
+<p>When jacked switches the live Claude account, the installed statusline must show one coherent account identity. The email, organization, and Max/Pro tier badge must all describe the incoming account on the next render.</p>
+
+<h3>Acceptance criteria</h3>
+<ol>
+  <li>Given a primed statusline cache for an account with <code>Max 5x</code>, when the real credential-sync path switches to an account whose canonical tier is <code>default_claude_max_20x</code>, the next render contains the new email and <code>Max 20x</code>, and contains neither the old email nor <code>Max 5x</code>.</li>
+  <li>If the incoming account has no known rate-limit tier, credential sync removes both outgoing tier fields so the statusline cannot attribute the previous account's badge to the new email.</li>
+  <li>A personal target writes its canonical tier to <code>userRateLimitTier</code>; an organization-scoped target writes it to <code>organizationRateLimitTier</code>. Switching in either direction clears the other field first.</li>
+  <li>Both explicit-tier and explicit-null updates preserve unrelated top-level and <code>oauthAccount</code> keys in every successfully parsed dictionary. A direct identity-only call that omits tier metadata also preserves existing tier fields for backward compatibility.</li>
+  <li>Unique access-token and refresh-token canaries appear only in the credential stores. They never appear in <code>.claude.json</code>, the statusline account cache, or rendered output.</li>
+  <li>Manual account selection, automatic account swapping, OAuth activation, and active-token resync all inherit the fix through the shared <code>sync_credential_to_all_stores()</code> boundary.</li>
+  <li>The token-bearing credential files, platform keychain behavior, 5h/7d percentages, and statusline command registration remain unchanged.</li>
+  <li>The statusline cache records the exact source revision it was derived from and is reused only while that revision still matches <code>.claude.json</code>. The revision includes a compact content digest from the same opened descriptor, so future-dated caches, old in-flight writers, coarse timestamps, and reused file identifiers cannot pin subsequent renders to the outgoing account.</li>
+</ol>
+
+<aside class="callout warn">
+  <strong>Observed mixed state:</strong> the switch rewrites <code>emailAddress</code> and organization identity in <code>~/.claude.json</code>, but preserves the outgoing account's <code>userRateLimitTier</code> and <code>organizationRateLimitTier</code>. The file mtime advances, so the renderer correctly refreshes and caches the wrong mixed record. Cache invalidation is not the root cause.
+</aside>
+
+<h2 id="architecture">Root cause and design</h2>
+<div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+  A[Manual or automatic switch] --> B[sync_credential_to_all_stores]
+  B --> C[Credentials and keychain get target rateLimitTier]
+  B --> D[update_claude_config_email]
+  D --> E[Target email and org, outgoing tier remains]
+  E --> F[statusline reparses .claude.json]
+  F --> G[Mixed new email plus old Max badge]
+  D -. fix .-> H[Explicitly replace or clear tier fields]
+  H --> I[Source-versioned account cache]
+  I --> J[Coherent next render]
+  </pre>
+  <pre class="mermaid-source">Manual/auto switch -&gt; shared credential sync -&gt; atomic .claude.json identity and tier update -&gt; coherent statusline render</pre>
+</div>
+
+<p>The chosen fix keeps the existing four-argument <code>update_claude_config_email()</code> interface as an identity-only compatibility wrapper. A private immutable account-metadata object carries identity plus the tier into a one-argument atomic writer, satisfying the repository's argument-count guardrail without expanding the public API. Omitting tier metadata through the legacy wrapper preserves existing tier fields. An explicit value first removes both tier fields, then writes the canonical database tier to <code>organizationRateLimitTier</code> when <code>organization_uuid</code> is present or <code>userRateLimitTier</code> for a personal account. Passing an explicit null leaves both fields absent. The shared sync path always constructs the private metadata object with the account's <code>rate_limit_tier</code>, including null.</p>
+
+<p>The renderer replaces cache-mtime ordering with a versioned JSON cache containing the rendered segment and a source signature derived from the open <code>.claude.json</code> descriptor (mtime nanoseconds, ctime nanoseconds, size, device, inode, and a compact BLAKE2 content digest). A cache hit requires an exact match against the current source signature. The digest prevents coarse timestamp or reused file-identifier collisions while retaining the substantially cheaper cached path that skips JSON parsing. Legacy one-line caches and malformed caches miss safely and are rewritten. If an in-flight render parses the outgoing file and writes after a switch, it tags that entry with the outgoing signature, so the following render rejects it.</p>
+
+<h3>Alternatives rejected</h3>
+<table>
+  <thead><tr><th>Alternative</th><th>Why it is not selected</th></tr></thead>
+  <tbody>
+    <tr><td>Delete only <code>statusline-account.cache</code> on switch</td><td>The cache is already invalidated by the atomic <code>.claude.json</code> rewrite. Re-reading the same mixed metadata cannot fix it.</td></tr>
+    <tr><td>Read <code>.credentials.json</code> from the renderer</td><td>It introduces a second source of account identity, makes a hot-path renderer parse token-bearing data, and leaves <code>.claude.json</code> internally inconsistent.</td></tr>
+    <tr><td>Patch manual and auto-swap callers separately</td><td>It duplicates policy and misses OAuth activation and token-resync callers. The shared writer is the correct consistency boundary.</td></tr>
+    <tr><td>Write the canonical tier to both Claude fields</td><td>It would misrepresent organization-derived metadata as a user override. Clearing the stale override and writing the organization field preserves field meaning.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="files">Files and interfaces</h2>
+<table>
+  <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/api/credential_helpers.py</code></td><td>Extend the atomic <code>~/.claude.json</code> metadata update and pass the incoming account's tier from the shared credential sync.</td></tr>
+    <tr><td><code>jacked/statusline.py</code></td><td>Bind each cached account segment to the source config signature so stale or racing writers cannot survive a switch.</td></tr>
+    <tr><td><code>tests/unit/test_credential_sync.py</code></td><td>Reproduce the reported cached Max 5x to Max 20x switch and cover explicit missing-tier clearing plus unspecified-tier preservation.</td></tr>
+    <tr><td><code>tests/unit/test_statusline.py</code></td><td>Update the cache-format contract and cover legacy migration, future timestamps, source-signature mismatch, and the in-flight stale-writer interleaving.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="tasks">Tasks and verification</h2>
+
+<h3>Task 1: Lock the regression with tests</h3>
+<ul class="tasks">
+  <li><input type="checkbox" checked disabled> Prime the real statusline cache from an outgoing Max 5x account.</li>
+  <li><input type="checkbox" checked disabled> Run the real shared credential sync for a Max 20x target and assert one coherent next render.</li>
+  <li><input type="checkbox" checked disabled> Cover explicit null clearing, personal-to-organization field replacement, organization-to-personal replacement, and the identity-only preservation contract.</li>
+  <li><input type="checkbox" checked disabled> On explicit-tier and explicit-null paths, seed unrelated top-level and account keys and prove they remain byte-for-byte equivalent as values.</li>
+  <li><input type="checkbox" checked disabled> Seed unique token canaries and prove none reach <code>.claude.json</code>, the statusline cache, or rendered output.</li>
+  <li><input type="checkbox" checked disabled> Future-date the primed account cache, switch accounts, and prove source mismatch still forces the next render to the target account.</li>
+  <li><input type="checkbox" checked disabled> Deterministically pause an outgoing render after parsing, replace the account metadata, let the old render write its cache, and prove the following render rejects that old-signature entry.</li>
+  <li><input type="checkbox" checked disabled> Cover legacy plain-text and malformed cache migration as safe misses.</li>
+  <li><input type="checkbox" checked disabled> Run the focused tests and confirm the new switch regression fails before implementation.</li>
+</ul>
+
+<h3>Task 2: Implement the shared metadata invariant</h3>
+<ul class="tasks">
+  <li><input type="checkbox" checked disabled> Add a private immutable account-metadata object and retain the existing four-argument identity-only wrapper so omitted and explicitly null tier values remain distinguishable without expanding the public API.</li>
+  <li><input type="checkbox" checked disabled> Replace or clear the two tier fields in the same in-memory <code>oauthAccount</code> object as email and organization.</li>
+  <li><input type="checkbox" checked disabled> Pass <code>account.get("rate_limit_tier")</code> from <code>sync_credential_to_all_stores()</code>.</li>
+  <li><input type="checkbox" checked disabled> Keep the existing symlink refusal, independent credential-store error handling, and usage-event bump unchanged.</li>
+</ul>
+
+<h3>Task 3: Bind the account cache to its source revision</h3>
+<ul class="tasks">
+  <li><input type="checkbox" checked disabled> Add small stdlib-only helpers to derive a content-bound source signature and read/write the versioned JSON cache.</li>
+  <li><input type="checkbox" checked disabled> Derive the signature with <code>fstat()</code> from the same descriptor used to parse account metadata.</li>
+  <li><input type="checkbox" checked disabled> Reuse a cache only when its stored signature exactly matches the current config signature; treat all legacy or malformed entries as misses.</li>
+  <li><input type="checkbox" checked disabled> Preserve the renderer's fail-open behavior: cache errors fall back to parsing, and write errors never break the statusline.</li>
+</ul>
+
+<h3>Task 4: Prove behavior and review</h3>
+<ul class="tasks">
+  <li><input type="checkbox" checked disabled> Run <code>uv run python -m pytest tests/unit/test_credential_sync.py tests/unit/test_statusline.py</code>.</li>
+  <li><input type="checkbox" checked disabled> Run <code>uv run ruff check jacked/api/credential_helpers.py jacked/statusline.py tests/unit/test_credential_sync.py tests/unit/test_statusline.py</code>.</li>
+  <li><input type="checkbox" checked disabled> Run <code>uv run python -m pytest</code>.</li>
+  <li><input type="checkbox" checked disabled> Execute a temporary-home account-switch scenario through the repository code and capture the rendered line.</li>
+  <li><input type="checkbox" checked disabled> Run recursive implementation review and the security-sensitive credential-handling audit; address all blocking findings.</li>
+</ul>
+
+<h2 id="non-goals">Non-goals and negative requirements</h2>
+<ul>
+  <li>Do not change the 5h/7d utilization percentages supplied by Claude Code on statusline stdin. The Max badge is account metadata, not a percentage cache.</li>
+  <li>Do not read or expose OAuth tokens in the statusline process.</li>
+  <li>Do not alter account-selection policy, polling intervals, refresh-token rotation, installer command wiring, or menu-bar behavior.</li>
+  <li>Do not redesign the four independent credential/config writes as one transaction or change their established best-effort error contract.</li>
+  <li>Do not invent a user-vs-organization tier scope absent from the database. The existing <code>organization_uuid</code> selects the compatible Claude metadata field, while tests lock the effective display invariant.</li>
+  <li>Do not leave an outgoing account's tier attached to an incoming email, even when the incoming tier is unknown.</li>
+  <li>For a successfully parsed dictionary, do not clobber unrelated <code>~/.claude.json</code> keys or follow a symlink at that path.</li>
+  <li>Do not expand this fix into changing the established recovery policy for a pre-existing malformed, unreadable, or non-dictionary <code>~/.claude.json</code>; that separate behavior is not exercised by the reported mixed-account state.</li>
+</ul>
+
+<h2 id="open-questions">Open questions</h2>
+<p><span class="badge ok">None blocking</span> The account's organization UUID selects the semantically correct Claude field after both outgoing fields are cleared.</p>
+
+<hr>
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">Generated from the jacked HTML artifact template for the reviewed implementation cycle.</p>
+</div>
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({ startOnLoad: true, theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default", flowchart: { curve: "basis" }, securityLevel: "loose" });
+  } catch (err) {
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+</body>
+</html>
