@@ -25,9 +25,11 @@ Hard constraints:
   after /compact. A missing field drops its segment.
 """
 
+import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 
 RESET = "\033[0m"
@@ -51,6 +53,8 @@ _TIER_LABELS = {
     "pro": "Pro",
     "free": "Free",
 }
+
+_ACCOUNT_CACHE_VERSION = 2
 
 
 def _home() -> str:
@@ -163,32 +167,95 @@ def _tier_label(raw) -> str:
     return _TIER_LABELS.get(stripped, stripped)
 
 
+def _account_source_signature(stat_result, content: bytes) -> dict:
+    """Revision fields plus a digest that survives file-identifier reuse."""
+    return {
+        "mtime_ns": stat_result.st_mtime_ns,
+        "ctime_ns": stat_result.st_ctime_ns,
+        "size": stat_result.st_size,
+        "device": stat_result.st_dev,
+        "inode": stat_result.st_ino,
+        "digest": hashlib.blake2b(content, digest_size=16).hexdigest(),
+    }
+
+
+def _read_account_cache(cache_path: str, source: dict) -> "str | None":
+    """Return a cached segment only when it belongs to this source revision."""
+    try:
+        with open(cache_path, encoding="utf-8", errors="replace") as fh:
+            cached = json.load(fh)
+    except (OSError, RecursionError, ValueError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    if cached.get("version") != _ACCOUNT_CACHE_VERSION:
+        return None
+    if cached.get("source") != source:
+        return None
+    segment = cached.get("segment")
+    return segment if isinstance(segment, str) else None
+
+
+def _write_account_cache(
+    cache_path: str,
+    segment: str,
+    source: dict,
+) -> None:
+    """Atomically cache a segment without ever breaking the statusline."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(cache_path),
+            prefix=".statusline-account-",
+            suffix=".tmp",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "version": _ACCOUNT_CACHE_VERSION,
+                    "source": source,
+                    "segment": segment,
+                },
+                fh,
+                separators=(",", ":"),
+            )
+            fh.write("\n")
+        os.replace(tmp, cache_path)
+        tmp = None
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def _account_segment(home: str) -> str:
-    """"email · org · plan" from ~/.claude.json .oauthAccount, mtime-cached.
+    """"email · org · plan" from ~/.claude.json .oauthAccount, revision-cached.
 
     ~/.claude.json is multi-MB and rewritten constantly, so the parsed
-    result is cached and reused until that file's mtime moves past the
-    cache's. Never reads ~/.claude/.credentials.json (live OAuth tokens).
+    result is cached with a content-bound source signature and reused only
+    while that signature matches. Never reads ~/.claude/.credentials.json
+    (live OAuth tokens).
     """
     acc_path = os.path.join(home, ".claude.json")
     cache_path = os.path.join(home, ".claude", "statusline-account.cache")
     try:
-        acc_mtime = os.path.getmtime(acc_path)
+        with open(acc_path, "rb") as fh:
+            content = fh.read()
+            source = _account_source_signature(os.fstat(fh.fileno()), content)
     except OSError:
         return ""
-    try:
-        # Strictly newer: an equal mtime (coarse-granularity filesystems)
-        # re-parses rather than risking a stale account after a switch.
-        if os.path.getmtime(cache_path) > acc_mtime:
-            with open(cache_path, encoding="utf-8", errors="replace") as fh:
-                return fh.readline().strip("\n")
-    except OSError:
-        pass
+    cached = _read_account_cache(cache_path, source)
+    if cached is not None:
+        return cached
 
     segment = ""
     try:
-        with open(acc_path, encoding="utf-8", errors="replace") as fh:
-            account = (json.load(fh) or {}).get("oauthAccount") or {}
+        config = json.loads(content.decode("utf-8", errors="replace")) or {}
+        account = config.get("oauthAccount") or {}
         if isinstance(account, dict):
             tier = account.get("userRateLimitTier") or account.get(
                 "organizationRateLimitTier"
@@ -199,13 +266,9 @@ def _account_segment(home: str) -> str:
                 _tier_label(tier),
             ]
             segment = f" {MIDDOT} ".join(p for p in parts if p)
-    except (OSError, ValueError):
+    except (OSError, RecursionError, ValueError):
         return ""
-    try:
-        with open(cache_path, "w", encoding="utf-8") as fh:
-            fh.write(segment + "\n")
-    except OSError:
-        pass
+    _write_account_cache(cache_path, segment, source)
     return segment
 
 

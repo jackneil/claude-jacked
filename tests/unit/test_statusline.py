@@ -19,6 +19,7 @@ Isolation contract. Every test runs against a tmp home.
 Nothing here touches the real ``~/.claude``, the network, or npx.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -380,11 +381,27 @@ def test_account_segment_is_empty_without_claude_json(home):
     assert _render({}, home) == ""
 
 
-def test_account_segment_writes_the_mtime_cache(home):
+def test_account_segment_writes_a_versioned_source_cache(home):
     _write_account(home, emailAddress="me@co.com")
     segment = _render({}, home)
     assert segment == "me@co.com"
-    assert _cache_path(home).read_text(encoding="utf-8") == segment + "\n"
+    cached = json.loads(_cache_path(home).read_text(encoding="utf-8"))
+    source_stat = (home / ".claude.json").stat()
+
+    assert cached == {
+        "version": 2,
+        "source": {
+            "mtime_ns": source_stat.st_mtime_ns,
+            "ctime_ns": source_stat.st_ctime_ns,
+            "size": source_stat.st_size,
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+            "digest": hashlib.blake2b(
+                (home / ".claude.json").read_bytes(), digest_size=16
+            ).hexdigest(),
+        },
+        "segment": segment,
+    }
 
 
 def test_account_cache_refreshes_when_claude_json_moves_forward(home):
@@ -397,14 +414,128 @@ def test_account_cache_refreshes_when_claude_json_moves_forward(home):
     assert _render({}, home) == "new@co.com"
 
 
-def test_stale_claude_json_short_circuits_to_the_cache(home):
-    """A cache newer than .claude.json is used verbatim: the sentinel proves the
-    multi-MB file was never re-parsed."""
+def test_matching_source_signature_short_circuits_to_the_cache(home):
+    """A matching source revision reuses its rendered segment."""
     _write_account(home, emailAddress="disk@co.com")
-    _cache_path(home).write_text("SENTINEL-FROM-CACHE\n", encoding="utf-8")
+    assert _render({}, home) == "disk@co.com"
+
+    cached = json.loads(_cache_path(home).read_text(encoding="utf-8"))
+    cached["segment"] = "SENTINEL-FROM-CACHE"
+    _cache_path(home).write_text(json.dumps(cached), encoding="utf-8")
     _bump_mtime(_cache_path(home))
 
     assert _render({}, home) == "SENTINEL-FROM-CACHE"
+
+
+def test_future_dated_cache_cannot_pin_an_old_account(home):
+    _write_account(
+        home,
+        emailAddress="old@co.com",
+        userRateLimitTier="default_claude_max_5x",
+    )
+    assert _render({}, home) == f"old@co.com {MIDDOT} Max 5x"
+    _bump_mtime(_cache_path(home), seconds=3600)
+
+    _write_account(
+        home,
+        emailAddress="new-account@co.com",
+        userRateLimitTier="default_claude_max_20x",
+    )
+
+    assert _render({}, home) == f"new-account@co.com {MIDDOT} Max 20x"
+
+
+@pytest.mark.parametrize("legacy_cache", [
+    "OLD PLAIN-TEXT SEGMENT\n",
+    "{ malformed json",
+    json.dumps({"version": 2, "source": {}, "segment": "WRONG"}),
+])
+def test_legacy_or_malformed_account_cache_is_a_safe_miss(home, legacy_cache):
+    _write_account(home, emailAddress="disk@co.com")
+    _cache_path(home).write_text(legacy_cache, encoding="utf-8")
+    _bump_mtime(_cache_path(home))
+
+    assert _render({}, home) == "disk@co.com"
+    assert json.loads(_cache_path(home).read_text(encoding="utf-8"))[
+        "segment"
+    ] == "disk@co.com"
+
+
+def test_old_in_flight_writer_cannot_pin_subsequent_renders(home, monkeypatch):
+    _write_account(
+        home,
+        emailAddress="old@co.com",
+        userRateLimitTier="default_claude_max_5x",
+    )
+    original_write = statusline._write_account_cache
+    switched = False
+
+    def write_after_switch(cache_path, segment, source):
+        nonlocal switched
+        if not switched:
+            switched = True
+            _write_account(
+                home,
+                emailAddress="new@co.com",
+                userRateLimitTier="default_claude_max_20x",
+            )
+        original_write(cache_path, segment, source)
+
+    monkeypatch.setattr(statusline, "_write_account_cache", write_after_switch)
+
+    assert _render({}, home) == f"old@co.com {MIDDOT} Max 5x"
+    assert _render({}, home) == f"new@co.com {MIDDOT} Max 20x"
+
+
+def test_content_digest_prevents_reused_source_identity_collision(home, monkeypatch):
+    reused_identity = SimpleNamespace(
+        st_mtime_ns=1,
+        st_ctime_ns=1,
+        st_size=40,
+        st_dev=7,
+        st_ino=11,
+    )
+    original_signature = statusline._account_source_signature
+    monkeypatch.setattr(
+        statusline,
+        "_account_source_signature",
+        lambda _stat, content: original_signature(reused_identity, content),
+    )
+
+    _write_account(home, emailAddress="old@co.com")
+    assert _render({}, home) == "old@co.com"
+    old_cache = _cache_path(home).read_text(encoding="utf-8")
+
+    _write_account(home, emailAddress="new@co.com")
+    assert _render({}, home) == "new@co.com"
+    assert _cache_path(home).read_text(encoding="utf-8") != old_cache
+
+
+def test_account_cache_write_failure_does_not_hide_segment(home, monkeypatch):
+    _write_account(home, emailAddress="disk@co.com")
+
+    def fail_cache_write(*_args, **_kwargs):
+        raise OSError("cache unavailable")
+
+    monkeypatch.setattr(statusline.tempfile, "mkstemp", fail_cache_write)
+
+    assert _render({}, home) == "disk@co.com"
+    assert not _cache_path(home).exists()
+
+
+def test_recursive_account_cache_is_a_safe_miss(home, monkeypatch):
+    _write_account(home, emailAddress="disk@co.com")
+    _cache_path(home).write_text("{}", encoding="utf-8")
+    original_load = statusline.json.load
+
+    def recurse_for_cache(fh):
+        if fh.name == str(_cache_path(home)):
+            raise RecursionError("cache nesting")
+        return original_load(fh)
+
+    monkeypatch.setattr(statusline.json, "load", recurse_for_cache)
+
+    assert _render({}, home) == "disk@co.com"
 
 
 def test_corrupt_claude_json_yields_no_account_segment(home):
@@ -744,10 +875,8 @@ def test_remove_on_uninstall_never_clobbers_a_newer_foreign_with_the_backup(home
     assert settings["statusLine"] == newer
 
 
-def test_account_cache_with_an_equal_mtime_reparses(home):
-    """Equal mtimes must NOT count as fresh: a .claude.json rewritten in the
-    same coarse-filesystem tick as the cache write would otherwise pin a stale
-    account after a switch. Strict-newer fails in the safe direction."""
+def test_account_cache_ignores_equal_mtime_when_source_signature_changes(home):
+    """Cache-file timestamps cannot override a changed source signature."""
     _write_account(home, emailAddress="old@x.com")
     _render({}, home)  # populates the cache
     _write_account(home, emailAddress="new@x.com")

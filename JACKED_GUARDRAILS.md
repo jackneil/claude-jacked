@@ -8,7 +8,7 @@
 - Files: 300 lines target, 500 lines hard max. Split at that point.
 - Functions/methods: 30 lines average, 50 lines max. If longer, extract.
 - Classes: 200 lines target, 300 lines max.
-- Line length: follow project formatter (ruff default 88, prettier default 80).
+- Line length: follow the project formatter (ruff default 88).
 - Arguments: 4 max per function. Use a config object/dataclass beyond that.
 
 ## Structure
@@ -26,7 +26,7 @@
 ## Testing
 - Every new function gets a test. No exceptions.
 - Tests go in tests/ directory, mirroring source structure.
-- Use doctest format for simple pure-function tests.
+- Use doctest format for simple pure-function tests; call `doctest.testmod()` from a pytest test because pytest does not collect module doctests by default.
 - Mock external dependencies (network, filesystem, databases).
 - Test edge cases: empty input, None/null, boundary values.
 
@@ -50,7 +50,7 @@
 ## Python-Specific
 
 ### Tooling
-- Linter: ruff (not flake8/pylint — ruff replaces both, 100x faster).
+- Linter: ruff (not flake8/pylint).
 - Formatter: ruff format (not black — ruff format is drop-in replacement).
 - Type checking: mypy or pyright for critical modules.
 
