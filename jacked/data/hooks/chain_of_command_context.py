@@ -60,6 +60,35 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
+def render() -> str:
+    """Build the block to inject: the framing preamble plus the policy body.
+
+    Returns "" when the skill file is absent (the dashboard toggle removed it),
+    unreadable, or empty. The hook input is irrelevant here, so this takes no
+    payload. Split out of main() so the combined SessionStart hook
+    (``jacked.data.hooks.session_start``) can run this step in-process, in a
+    fixed order, without a second stdin read.
+
+    >>> isinstance(render(), str)
+    True
+    """
+    try:
+        skill_path = _skill_path()
+        if not skill_path.exists():
+            # Skill file removed via the dashboard toggle: stay silent.
+            return ""
+        raw = skill_path.read_text(encoding="utf-8")
+    except Exception:
+        # Permission, encoding, or any other read failure: never break startup.
+        return ""
+
+    body = _strip_frontmatter(raw).strip()
+    if not body:
+        return ""
+
+    return f"{PREAMBLE}\n\n{body}"
+
+
 def main():
     """Inject the chain-of-command policy into session context via stdout.
 
@@ -75,23 +104,9 @@ def main():
     except Exception:
         pass
 
-    try:
-        skill_path = _skill_path()
-        if not skill_path.exists():
-            # Skill file removed via the dashboard toggle: stay silent.
-            return
-        raw = skill_path.read_text(encoding="utf-8")
-    except Exception:
-        # Permission, encoding, or any other read failure: never break startup.
-        return
-
-    body = _strip_frontmatter(raw).strip()
-    if not body:
-        return
-
-    print(PREAMBLE)
-    print()
-    print(body)
+    block = render()
+    if block:
+        print(block)
 
 
 if __name__ == "__main__":

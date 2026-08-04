@@ -836,7 +836,7 @@ The `jacked install` command adds hooks to `~/.claude/settings.json`, written as
 }
 ```
 
-`jacked install` also registers lightweight session-tracker hooks (`SessionStart`, `UserPromptSubmit`, `Notification`, `SessionEnd`, `Stop`) that keep the dashboard's account/session views live, plus a `SessionStart` hook (`jacked _hook chain_of_command_context`) that injects the chain-of-command dispatch policy into every new session's context (toggle it off by disabling the chain-of-command skill in the dashboard). It prunes hooks from retired features (the pre-0.70.0 security gatekeeper and session-indexing entries) so a stale entry can never block or error.
+`jacked install` also registers lightweight session-tracker hooks (`UserPromptSubmit`, `Notification`, `SessionEnd`, `Stop`) that keep the dashboard's account/session views live, plus exactly one `SessionStart` hook (`jacked _hook session_start`). Claude Code runs the `SessionStart` entries at the same time and joins their output in completion order. One entry therefore runs every session-start step in a fixed order: it records the session account, then injects the chain-of-command dispatch policy, then injects the memory-vault recall brief. The fixed order keeps the injected preamble identical in every session, which keeps the prompt cache warm. To turn the policy off, disable the chain-of-command skill in the dashboard. The install also prunes hooks from retired features (the pre-0.70.0 security gatekeeper and session-indexing entries) and from the older multi-entry `SessionStart` layout, so a stale entry can never block or error.
 
 </details>
 

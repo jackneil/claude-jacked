@@ -1627,8 +1627,11 @@ def _session_tracker_marker() -> str:
     return "# jacked-session-tracker"
 
 
+# SessionStart is deliberately ABSENT: the tracker's session-start work runs
+# inside the single combined SessionStart entry (_install_session_start_hook),
+# because separate SessionStart entries run concurrently and their stdout is
+# concatenated in completion order (see _install_session_start_hook).
 SESSION_TRACKER_EVENTS = [
-    ("SessionStart", ""),
     ("Notification", "auth_success"),
     ("SessionEnd", ""),
     ("Stop", ""),
@@ -1637,11 +1640,13 @@ SESSION_TRACKER_EVENTS = [
 
 
 def _install_session_tracker_hook(existing: dict, settings_path: Path):
-    """Install session-account tracker hooks for SessionStart, Notification(auth_success), SessionEnd, and Stop (heartbeat).
+    """Install session-account tracker hooks for Notification(auth_success), SessionEnd, Stop (heartbeat), and UserPromptSubmit.
 
     Registers hooks that track which Anthropic account each Claude Code session
-    is using by reading ~/.claude/.credentials.json at session start and on re-auth.
+    is using by reading ~/.claude/.credentials.json on re-auth.
     The Stop hook fires a throttled heartbeat to keep sessions visible in the dashboard.
+    The tracker's SessionStart leg is NOT registered here: it runs inside the
+    single combined SessionStart entry (``_install_session_start_hook``).
     """
     marker = _session_tracker_marker()
     script_path = _get_data_root() / "hooks" / "session_account_tracker.py"
@@ -1728,10 +1733,10 @@ def _verify_session_tracker_hooks(settings: dict):
     entry.  Called after install to catch partial writes or manual edits.
 
     >>> _verify_session_tracker_hooks({"hooks": {
-    ...     "SessionStart": [{"hooks": [{"command": "session_account_tracker"}]}],
     ...     "Notification": [{"hooks": [{"command": "session_account_tracker"}]}],
     ...     "SessionEnd": [{"hooks": [{"command": "session_account_tracker"}]}],
     ...     "Stop": [{"hooks": [{"command": "session_account_tracker"}]}],
+    ...     "UserPromptSubmit": [{"hooks": [{"command": "session_account_tracker"}]}],
     ... }})
 
     >>> _verify_session_tracker_hooks({"hooks": {"SessionStart": []}})  # doctest: +SKIP
@@ -1751,69 +1756,89 @@ def _chain_of_command_marker() -> str:
     return "# jacked-chain-of-command"
 
 
-def _install_chain_of_command_hook(existing: dict, settings_path: Path):
-    """Install the SessionStart hook that auto-loads the chain-of-command policy.
+# The hook module behind the single combined SessionStart entry.
+SESSION_START_HOOK = "session_start"
 
-    Registers a SINGLE synchronous SessionStart hook that prints the
-    chain-of-command dispatch policy (from
-    ~/.claude/skills/chain-of-command/SKILL.md) into the session context at
-    startup. The entry is SYNCHRONOUS on purpose: async hooks do not inject
-    stdout into the session, and context injection is the whole point.
+# The single-purpose SessionStart hooks the combined entry replaced. An entry
+# whose command names one of these (and is jacked-managed) is a legacy layout
+# to migrate away — including the hand-written `bash -c` consolidation some
+# machines carry, which chains two of these names in one command string.
+_LEGACY_SESSION_START_HOOKS = (
+    "session_account_tracker",
+    "chain_of_command_context",
+    "memory_recall",
+)
 
-    The match is anchored to the chain_of_command_context command so this never
-    clobbers the session tracker's own SessionStart entry.
+
+def _is_jacked_session_start_entry(entry: dict) -> bool:
+    """True if this SessionStart entry is jacked's, in any layout we ever wrote.
+
+    Matches the current combined entry, the three legacy single-purpose entries,
+    and the hand-written ``bash -c`` consolidation (which names our hooks
+    through a jacked-managed command, so it matches on the same rule). Every
+    match requires a jacked-managed command path or one of our markers, so a
+    foreign SessionStart hook is NEVER claimed.
+
+    >>> _is_jacked_session_start_entry(
+    ...     {"hooks": [{"command": '"/b/jacked" _hook session_start'}]})
+    True
+    >>> _is_jacked_session_start_entry(
+    ...     {"hooks": [{"command": "/usr/local/bin/my-own-startup.sh"}]})
+    False
     """
-    marker = _chain_of_command_marker()
-    script_path = _get_data_root() / "hooks" / "chain_of_command_context.py"
+    if not isinstance(entry, dict):
+        return False
+
+    entry_str = str(entry)
+    if _chain_of_command_marker() in entry_str or _session_tracker_marker() in entry_str:
+        return True
+
+    names = (SESSION_START_HOOK,) + _LEGACY_SESSION_START_HOOKS
+    for h in entry.get("hooks", []) or []:
+        if not isinstance(h, dict):
+            continue
+        cmd = str(h.get("command", ""))
+        if not _is_jacked_managed_hook_path(cmd):
+            continue
+        if any(name in cmd for name in names):
+            return True
+    return False
+
+
+def _install_session_start_hook(existing: dict, settings_path: Path):
+    """Install THE jacked SessionStart entry: one synchronous, in-order hook.
+
+    Claude Code runs SessionStart hook ENTRIES concurrently and concatenates
+    their stdout in COMPLETION order, so the old three-entry layout (session
+    tracker + chain-of-command + memory recall) emitted its blocks in a random
+    order per session. That randomized the prompt preamble and defeated the
+    inference-side prompt prefix cache. ONE entry, running the steps
+    sequentially in-process (``jacked.data.hooks.session_start``), makes the
+    preamble byte-identical every session.
+
+    The entry is SYNCHRONOUS on purpose: an async hook's stdout is not injected
+    into the session context, and injection is the whole point. The tracker step
+    keeps its own daemon thread inside the module, so it still does not block.
+
+    Migration: EVERY jacked-managed SessionStart entry (the three legacy
+    single-purpose entries, a hand-written ``bash -c`` consolidation, or a stale
+    combined entry) is dropped and replaced by exactly one current entry.
+    Foreign SessionStart entries are left exactly where they are.
+    """
+    script_path = _get_data_root() / "hooks" / "session_start.py"
 
     if not script_path.exists():
         console.print(
-            f"[red][FAIL][/red] Chain-of-command script not found: {script_path}"
+            f"[red][FAIL][/red] Session start script not found: {script_path}"
         )
-        console.print("[yellow]Skipping chain-of-command hook installation[/yellow]")
+        console.print("[yellow]Skipping session start hook installation[/yellow]")
         return
 
-    command_str = _build_hook_command("chain_of_command_context")
+    command_str = _build_hook_command(SESSION_START_HOOK)
 
-    event_name = "SessionStart"
-    matcher = ""
-    if event_name not in existing["hooks"]:
-        existing["hooks"][event_name] = []
-
-    # Find an existing jacked chain-of-command entry for this event+matcher.
-    # Anchor on the command name so a sibling jacked SessionStart hook (the
-    # session tracker) is never mistaken for ours.
-    hook_index = None
-    needs_upgrade = False
-    for i, hook_entry in enumerate(existing["hooks"][event_name]):
-        if hook_entry.get("matcher", "") != matcher:
-            continue
-        entry_cmd = ""
-        for h in hook_entry.get("hooks", []):
-            entry_cmd = h.get("command", "")
-            break
-        hook_str = str(hook_entry)
-        is_ours = marker in hook_str or (
-            "chain_of_command_context" in entry_cmd
-            and _is_jacked_managed_hook_path(entry_cmd)
-        )
-        if is_ours:
-            hook_index = i
-            for h in hook_entry.get("hooks", []):
-                if h.get("command", "") != command_str:
-                    needs_upgrade = True
-            break
-
-    if hook_index is not None and not needs_upgrade:
-        console.print(
-            "[yellow][-][/yellow] Chain-of-command hook already configured"
-        )
-        return
-
-    # SYNCHRONOUS entry: no "async" key. Async hooks don't inject stdout into
-    # the session context, and injecting the policy is the entire purpose.
+    # SYNCHRONOUS entry: no "async" key.
     hook_entry = {
-        "matcher": matcher,
+        "matcher": "",
         "hooks": [
             {
                 "type": "command",
@@ -1822,14 +1847,25 @@ def _install_chain_of_command_hook(existing: dict, settings_path: Path):
         ],
     }
 
-    if hook_index is not None and needs_upgrade:
-        existing["hooks"][event_name][hook_index] = hook_entry
-    else:
-        existing["hooks"][event_name].append(hook_entry)
+    existing.setdefault("hooks", {})
+    entries = existing["hooks"].get("SessionStart")
+    if not isinstance(entries, list):
+        entries = []
+
+    ours = [e for e in entries if _is_jacked_session_start_entry(e)]
+    if len(ours) == 1 and ours[0] == hook_entry:
+        existing["hooks"]["SessionStart"] = entries
+        console.print("[yellow][-][/yellow] Session start hook already configured")
+        return
+
+    # Foreign entries keep their order; ours collapses to a single trailing entry.
+    kept = [e for e in entries if not _is_jacked_session_start_entry(e)]
+    kept.append(hook_entry)
+    existing["hooks"]["SessionStart"] = kept
 
     _write_settings_atomic(settings_path, existing)
     console.print(
-        "[green][OK][/green] Installed chain-of-command hook (SessionStart event)"
+        "[green][OK][/green] Installed session start hook (SessionStart event)"
     )
 
 
@@ -1994,12 +2030,50 @@ def _remove_qa_hook(settings_path: Path) -> bool:
     return False
 
 
+def _remove_session_start_hook(settings_path: Path) -> bool:
+    """Remove the jacked SessionStart entry, any layout. Returns True if removed.
+
+    The combined entry serves several features at once (chain-of-command policy,
+    memory recall, session tracking), so it is removed only when the LAST of
+    them goes: a single-feature teardown leaves it in place and the module's own
+    step no-ops while that feature is off. Full uninstall is that last-one-out
+    case, which is why this is called there and not from a per-feature remover.
+
+    Foreign SessionStart hooks are never touched.
+
+    >>> # Smoke test: function exists and is callable
+    >>> callable(_remove_session_start_hook)
+    True
+    """
+    import json
+
+    if not settings_path.exists():
+        return False
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    entries = settings.get("hooks", {}).get("SessionStart")
+    if not isinstance(entries, list):
+        return False
+
+    kept = [e for e in entries if not _is_jacked_session_start_entry(e)]
+    if len(kept) == len(entries):
+        return False
+
+    settings["hooks"]["SessionStart"] = kept
+    settings_path.write_text(json.dumps(settings, indent=2))
+    console.print("[green][OK][/green] Removed session start hook")
+    return True
+
+
 def _remove_chain_of_command_hook(settings_path: Path) -> bool:
-    """Remove the jacked chain-of-command SessionStart hook. Returns True if removed.
+    """Remove a LEGACY chain-of-command SessionStart hook. Returns True if removed.
 
     Matches only entries whose command is a jacked-managed path AND names the
-    chain_of_command_context hook, so foreign SessionStart hooks (and the
-    jacked session tracker's own SessionStart entry) are left intact.
+    chain_of_command_context hook, so foreign SessionStart hooks are left
+    intact. The current combined entry (``_hook session_start``) is NOT matched
+    here: it also carries other features, so only the full-uninstall path
+    (``_remove_session_start_hook``) may drop it.
 
     >>> # Smoke test: function exists and is callable
     >>> callable(_remove_chain_of_command_hook)
@@ -2075,7 +2149,9 @@ def _install_memory_recall_hook(existing: dict, settings_path: Path):
     into the session context: the group-scoped memory brief. The entry is
     SYNCHRONOUS on purpose (``hooks_config.ensure_recall_entry`` omits the
     ``async`` key) because async SessionStart hooks do not inject stdout, and
-    injecting the brief is the whole point. Entry math is delegated to
+    injecting the brief is the whole point. It is a NO-OP once the combined
+    ``session_start`` entry is installed: that entry already runs the brief, in
+    a fixed order with the other session-start steps. Entry math is delegated to
     ``jacked.memory.hooks_config`` so the CLI and the dashboard Features route
     (M7) share one implementation. Not wired into ``_run_install`` yet (M7
     handles install parity); directly testable in the meantime.
@@ -2936,8 +3012,10 @@ def _run_install(
     # Install session-account tracker hooks (always — lightweight, no deps)
     _install_session_tracker_hook(existing, settings_path)
 
-    # Install chain-of-command auto-load hook (SessionStart context injection)
-    _install_chain_of_command_hook(existing, settings_path)
+    # Install THE SessionStart hook: one synchronous entry that runs the tracker,
+    # the chain-of-command auto-load, and the memory recall brief IN ORDER
+    # (concurrent entries would randomize the injected preamble).
+    _install_session_start_hook(existing, settings_path)
 
     # Install QA suggestion hook (always — lightweight, no deps)
     _install_qa_hook(existing, settings_path)
@@ -3694,6 +3772,9 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     _remove_session_tracker_hooks(settings_path)
     _remove_qa_hook(settings_path)
     _remove_chain_of_command_hook(settings_path)
+    # Every feature the combined SessionStart entry serves is going away with
+    # this uninstall, so this is the last-one-out case that may drop it.
+    _remove_session_start_hook(settings_path)
     # Remove the memory-vault hook entries unconditionally — stripping entries
     # for a tool being uninstalled is always correct (the vault files stay put).
     _remove_memory_hooks(settings_path)

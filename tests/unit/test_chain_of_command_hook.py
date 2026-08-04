@@ -1,7 +1,9 @@
 """Tests for the chain-of-command SessionStart auto-load hook.
 
 Covers the hook module (context injection + silence when the skill file is
-absent) and the cli.py install/remove/registration plumbing.
+absent) and the cli.py remove/registration plumbing. INSTALL coverage lives in
+tests/unit/test_session_start_hook.py: the policy is injected by the single
+combined SessionStart entry now, not by an entry of its own.
 """
 
 import json
@@ -106,96 +108,6 @@ class TestHookMain:
 
         out = capsys.readouterr().out
         assert "SENTINEL_BODY_LINE the policy body starts here" in out
-
-
-class TestInstall:
-    def test_adds_synchronous_sessionstart_entry(self, tmp_path):
-        from jacked.cli import _install_chain_of_command_hook
-
-        settings_path = tmp_path / "settings.json"
-        existing = {"hooks": {}}
-        with patch("jacked.findbin.find_bin", return_value="/fake/bin/jacked"):
-            _install_chain_of_command_hook(existing, settings_path)
-
-        entries = existing["hooks"]["SessionStart"]
-        assert len(entries) == 1
-        entry = entries[0]
-        assert entry["matcher"] == ""
-        inner = entry["hooks"][0]
-        assert "chain_of_command_context" in inner["command"]
-        # SYNCHRONOUS: no async key, or context injection is lost.
-        assert "async" not in inner
-        # Persisted to disk.
-        persisted = json.loads(settings_path.read_text())
-        assert "chain_of_command_context" in json.dumps(persisted)
-
-    def test_is_idempotent(self, tmp_path):
-        from jacked.cli import _install_chain_of_command_hook
-
-        settings_path = tmp_path / "settings.json"
-        existing = {"hooks": {}}
-        with patch("jacked.findbin.find_bin", return_value="/fake/bin/jacked"):
-            _install_chain_of_command_hook(existing, settings_path)
-            _install_chain_of_command_hook(existing, settings_path)
-
-        assert len(existing["hooks"]["SessionStart"]) == 1
-
-    def test_upgrades_stale_command_path(self, tmp_path):
-        from jacked.cli import _install_chain_of_command_hook
-
-        settings_path = tmp_path / "settings.json"
-        stale_cmd = (
-            "/old/site-packages/jacked/data/hooks/chain_of_command_context.py"
-        )
-        existing = {
-            "hooks": {
-                "SessionStart": [
-                    {
-                        "matcher": "",
-                        "hooks": [{"type": "command", "command": stale_cmd}],
-                    }
-                ]
-            }
-        }
-        with patch("jacked.findbin.find_bin", return_value="/fake/bin/jacked"):
-            _install_chain_of_command_hook(existing, settings_path)
-
-        entries = existing["hooks"]["SessionStart"]
-        assert len(entries) == 1  # rewritten in place, not duplicated
-        cmd = entries[0]["hooks"][0]["command"]
-        assert "/fake/bin/jacked" in cmd
-        assert "_hook chain_of_command_context" in cmd
-
-    def test_does_not_clobber_session_tracker_entry(self, tmp_path):
-        """A sibling jacked SessionStart hook must survive our install."""
-        from jacked.cli import _install_chain_of_command_hook
-
-        settings_path = tmp_path / "settings.json"
-        tracker_cmd = '"/fake/bin/jacked" _hook session_account_tracker'
-        existing = {
-            "hooks": {
-                "SessionStart": [
-                    {
-                        "matcher": "",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": tracker_cmd,
-                                "async": True,
-                            }
-                        ],
-                    }
-                ]
-            }
-        }
-        with patch("jacked.findbin.find_bin", return_value="/fake/bin/jacked"):
-            _install_chain_of_command_hook(existing, settings_path)
-
-        entries = existing["hooks"]["SessionStart"]
-        assert len(entries) == 2
-        cmds = [e["hooks"][0]["command"] for e in entries]
-        assert any("session_account_tracker" in c for c in cmds)
-        assert any("chain_of_command_context" in c for c in cmds)
 
 
 class TestRemove:
