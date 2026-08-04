@@ -5,15 +5,18 @@ Features route (``jacked/api/routes/features.py``, wired in M7) both call these
 so the entry math lives in exactly one place and can't drift.
 
 Identification anchors on the module-name substring in the entry command
-(``memory_capture`` / ``memory_recall``), mirroring how the chain-of-command
-installer anchors on ``chain_of_command_context`` (cli.py:1774-1777). That keeps
-us from ever touching a foreign hook, or the sibling jacked hooks that also live
-under ``SessionStart``/``SessionEnd`` (the session tracker, chain-of-command).
+(``memory_capture`` / ``memory_recall``), mirroring how the CLI's SessionStart
+installer anchors on its own hook names (``cli._is_jacked_session_start_entry``).
+That keeps us from ever touching a foreign hook, or the sibling jacked hooks
+that also live under ``SessionStart``/``SessionEnd``.
 
 Capture entries are async (``"async": True``): Claude Code is not blocked while
 the SessionEnd/PreCompact triage runs. The recall entry is SYNCHRONOUS (no
 ``async`` key) because an async SessionStart hook's stdout is NOT injected into
-the session context, and injecting the brief is the entire point (cli.py:1791).
+the session context, and injecting the brief is the entire point. On a current
+install there is no standalone recall entry at all: jacked's ONE combined
+``session_start`` entry runs the brief in a fixed order with the other
+session-start steps, so the injected preamble is byte-identical every session.
 """
 from __future__ import annotations
 
@@ -26,6 +29,13 @@ RECALL_EVENT = ("SessionStart", "")
 
 _CAPTURE_ANCHOR = "memory_capture"
 _RECALL_ANCHOR = "memory_recall"
+
+# jacked's combined SessionStart entry (``jacked _hook session_start``) runs the
+# recall brief itself, in a fixed order with the other session-start steps, so
+# that recall never races a sibling entry. When it is present, recall is ALREADY
+# wired: a second standalone entry would inject the brief twice and put the
+# ordering race back. Enable therefore no-ops and detection reports installed.
+_SESSION_START_ANCHOR = "session_start"
 
 
 def _entry_has_anchor(entry: dict, anchor: str) -> bool:
@@ -121,12 +131,25 @@ def remove_capture_entries(settings: dict) -> bool:
 
 
 def ensure_recall_entry(settings: dict, command: str) -> bool:
-    """Ensure the SYNCHRONOUS SessionStart recall entry exists (no async key)."""
+    """Ensure the SYNCHRONOUS SessionStart recall entry exists (no async key).
+
+    No-op when the combined ``session_start`` entry is installed: it already
+    runs the brief, and a second entry would both duplicate the injection and
+    reintroduce the completion-order race between SessionStart entries.
+    """
+    if has_session_start_entry(settings):
+        return False
     return _ensure(settings, [RECALL_EVENT], command, _RECALL_ANCHOR, is_async=False)
 
 
 def remove_recall_entries(settings: dict) -> bool:
-    """Remove the jacked memory-recall entries. Returns True if changed."""
+    """Remove the STANDALONE jacked memory-recall entries. Returns True if changed.
+
+    The combined ``session_start`` entry is deliberately left alone: it serves
+    the other session-start features too, and its recall step already no-ops
+    while the vault is disabled. Only a full uninstall (the last feature out)
+    removes that entry.
+    """
     return _remove(settings, _RECALL_ANCHOR)
 
 
@@ -142,12 +165,18 @@ def has_capture_entry(settings: dict) -> bool:
 
 
 def has_recall_entry(settings: dict) -> bool:
-    """True if the jacked memory-recall entry is present in ``settings``.
+    """True if recall is wired: a standalone entry OR the combined one.
 
     Used by the status honesty cross-check: capture without recall means the
-    SessionStart brief silently never injects, which is worth a warning.
+    SessionStart brief silently never injects, which is worth a warning. The
+    combined ``session_start`` entry runs the brief itself, so it counts.
     """
-    return _has_entry(settings, _RECALL_ANCHOR)
+    return _has_entry(settings, _RECALL_ANCHOR) or has_session_start_entry(settings)
+
+
+def has_session_start_entry(settings: dict) -> bool:
+    """True if jacked's combined SessionStart entry is present in ``settings``."""
+    return _has_entry(settings, _SESSION_START_ANCHOR)
 
 
 def _has_entry(settings: dict, anchor: str) -> bool:

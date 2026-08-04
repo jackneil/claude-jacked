@@ -19,36 +19,55 @@ import os
 import sys
 
 
-def main(argv=None):
-    """Read the SessionStart payload from stdin and inject the brief. Never raises."""
+def render(data: dict | None = None) -> str:
+    """Build the recall brief for an already-parsed SessionStart payload.
+
+    ``data`` supplies ``cwd``; anything falsy falls back to ``os.getcwd()``.
+    Returns "" for a subagent session, a disabled/empty vault, or ANY failure
+    (fail open). Split out of main() so the combined SessionStart hook
+    (``jacked.data.hooks.session_start``) can run this step in-process, in a
+    fixed order, without a second stdin read.
+    """
     try:
         from jacked.memory import vault as _vault
         _vault.ensure_memory_file_logging()
-
-        # Drain stdin so the hook never blocks; keep the raw for cwd parsing.
-        try:
-            raw = sys.stdin.read()
-        except Exception:
-            raw = ""
 
         # A subagent session must not spend its context on the recall brief.
         if os.environ.get("CLAUDE_CODE_PARENT_SESSION_ID") or os.environ.get(
             "CLAUDE_CODE_AGENT_TYPE"
         ):
-            return
+            return ""
 
         cwd = os.getcwd()
-        if raw and raw.strip():
-            try:
-                payload = json.loads(raw)
-                if isinstance(payload, dict) and payload.get("cwd"):
-                    cwd = str(payload["cwd"])
-            except Exception:
-                pass
+        if isinstance(data, dict) and data.get("cwd"):
+            cwd = str(data["cwd"])
 
         from jacked.memory.recall import build_brief
 
-        brief = build_brief(cwd)
+        return build_brief(cwd)
+    except BaseException:  # noqa: BLE001 -- a hook must never crash the session
+        return ""
+
+
+def main(argv=None):
+    """Read the SessionStart payload from stdin and inject the brief. Never raises."""
+    # Drain stdin so the hook never blocks; keep the raw for cwd parsing.
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        raw = ""
+
+    data = None
+    if raw and raw.strip():
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                data = payload
+        except Exception:
+            pass
+
+    try:
+        brief = render(data)
         if brief:
             print(brief)
     except BaseException:  # noqa: BLE001 -- a hook must never crash the session
