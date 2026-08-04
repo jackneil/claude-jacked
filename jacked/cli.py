@@ -3400,7 +3400,7 @@ _REQUIRED_PLUGINS = {
     "superpowers@claude-plugins-official": "brainstorming, planning, TDD, subagent workflows",
     "playwright@claude-plugins-official": "/qa and /ux browser testing",
     "commit-commands@claude-plugins-official": "/commit, /commit-push-pr",
-    "code-review@claude-code-plugins": "/code-review multi-agent PR review",
+    "code-review@claude-plugins-official": "/code-review multi-agent PR review",
 }
 
 

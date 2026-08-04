@@ -23,8 +23,8 @@ def _ok(returncode=0, stdout="", stderr=""):
 class TestRequiredPluginIds:
     def test_review_plugin_is_the_real_code_review_id(self):
         # pr-review-toolkit@claude-plugins-official does not exist; the real
-        # review plugin is code-review@claude-code-plugins.
-        assert "code-review@claude-code-plugins" in _REQUIRED_PLUGINS
+        # review plugin is code-review@claude-plugins-official.
+        assert "code-review@claude-plugins-official" in _REQUIRED_PLUGINS
         assert not any("pr-review-toolkit" in p for p in _REQUIRED_PLUGINS)
 
     def test_firecrawl_is_no_longer_a_required_plugin(self):
@@ -88,7 +88,7 @@ class TestInstallRequiredPlugins:
         monkeypatch.setattr("jacked.cli._run_claude_plugin", fake_plugin)
         _install_required_plugins()
         assert set(installed_ids) == set(_REQUIRED_PLUGINS)
-        assert "code-review@claude-code-plugins" in installed_ids
+        assert "code-review@claude-plugins-official" in installed_ids
 
     def test_skips_already_configured(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/claude")
