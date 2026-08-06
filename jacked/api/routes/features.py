@@ -171,9 +171,15 @@ _settings_lock = asyncio.Lock()
 
 
 def reset_locks() -> None:
-    """Rebind to the current event loop — see routes.auth.reset_locks."""
-    global _settings_lock
+    """Rebind to the current event loop — see routes.auth.reset_locks.
+
+    ``_dcr_lock`` is defined further down (next to the DCR engine endpoints it
+    guards) but must be rebound here too — one reset_locks per module is the
+    contract enforced by tests/unit/api/test_reset_locks.py.
+    """
+    global _settings_lock, _dcr_lock
     _settings_lock = asyncio.Lock()
+    _dcr_lock = asyncio.Lock()
 
 
 # --- Pydantic models ---
@@ -1165,3 +1171,115 @@ async def remove_chrome_devtools_mcp():
             content={"error": {"message": "Failed to remove Chrome DevTools MCP"}},
         )
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# DCR review-engine endpoints — which engine /dcr runs its reviewer agents on
+#
+# Backed by <home>/.claude/jacked-dcr.json, a file of its own (NOT settings.json),
+# so it gets its own lock: a DCR write must not serialize behind, or race, a
+# settings.json write. ``keep_on_claude`` is read-only here on purpose — the lens
+# list is CLI-only for now.
+# ---------------------------------------------------------------------------
+
+_dcr_lock = asyncio.Lock()
+
+
+def _dcr_unreadable_response() -> JSONResponse:
+    """The 503 the DCR mutation endpoint returns when jacked-dcr.json exists but
+    cannot be parsed: refuse to modify it rather than clobber the user's real
+    config with a fresh file (mirrors ``_settings_unreadable_response``)."""
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": {
+            "message": (
+                "jacked-dcr.json is unreadable; refusing to modify it. "
+                "Fix the JSON or delete the file, then try again."
+            ),
+            "code": "DCR_SETTINGS_UNREADABLE",
+        }},
+    )
+
+
+class DcrEngineRequest(BaseModel):
+    # Keep in sync with ENGINE_CHOICES in jacked/dcr_settings.py
+    engine: Literal["claude", "codex"]
+    model: str | None = None
+    effort: str | None = None
+
+
+def _apply_dcr_engine(home: Path, engine: str, model, effort) -> dict:
+    """Merge the request into the DCR config, then return the fresh contract.
+
+    Delegates the read-merge-write to ``dcr_settings.update_config`` — the same
+    function the CLI uses — so the two surfaces cannot drift on merge semantics,
+    and so the write is serialized by the cross-process file lock (the asyncio
+    ``_dcr_lock`` only covers this process).
+
+    Blocking (file IO plus the codex preflight subprocess) — call it through
+    ``asyncio.to_thread``. Raises ``DcrSettingsUnreadableError`` on a corrupt
+    file, before anything is written, and ``DcrSettingsAccessError`` when the
+    filesystem refuses the write.
+    """
+    from jacked import dcr_settings
+
+    dcr_settings.update_config(home, engine=engine, model=model, effort=effort)
+    return dcr_settings.resolve(home)
+
+
+@router.get("/dcr-engine")
+async def get_dcr_engine():
+    """Return the resolved DCR engine contract (config plus codex preflight).
+
+    Read-only and never 500s on a bad file: a corrupt jacked-dcr.json resolves to
+    Claude with a ``reason`` the dashboard can show.
+    """
+    from jacked import dcr_settings
+
+    home = dcr_settings.jacked_home()
+    return await asyncio.to_thread(dcr_settings.resolve, home)
+
+
+@router.put("/dcr-engine")
+async def set_dcr_engine(body: DcrEngineRequest):
+    """Set the DCR review engine (and optionally its model and effort)."""
+    from jacked import dcr_settings
+    from jacked.dcr_settings import DcrSettingsAccessError, DcrSettingsUnreadableError
+
+    if body.effort is not None and body.effort not in dcr_settings.VALID_EFFORTS:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"error": {
+                "message": (
+                    f"Invalid effort '{body.effort}'. Valid values: "
+                    + ", ".join(dcr_settings.EFFORT_CHOICES)
+                ),
+                "code": "INVALID_VALUE",
+            }},
+        )
+
+    home = dcr_settings.jacked_home()
+    async with _dcr_lock:
+        try:
+            return await asyncio.to_thread(
+                _apply_dcr_engine, home, body.engine, body.model, body.effort
+            )
+        except DcrSettingsUnreadableError:
+            return _dcr_unreadable_response()
+        except DcrSettingsAccessError as exc:
+            # The filesystem refused the write (permissions, read-only volume,
+            # full disk). Nothing was changed; the message names the path and
+            # the directory whose permissions to check.
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"error": {
+                    "message": str(exc),
+                    "code": "DCR_SETTINGS_UNWRITABLE",
+                }},
+            )
+        except ValueError as exc:
+            # write_config rejected a field (an empty model is the reachable case).
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                content={"error": {"message": str(exc), "code": "INVALID_VALUE"}},
+            )

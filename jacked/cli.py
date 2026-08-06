@@ -16,6 +16,12 @@ import click
 from rich.console import Console
 from rich.panel import Panel
 
+# The only eager jacked import in this file: click.Choice needs these values at
+# decoration time (see the `jacked dcr engine set` command). jacked.dcr_settings
+# is stdlib-only at import time, so this costs nothing at startup.
+from jacked.dcr_settings import EFFORT_CHOICES as _DCR_EFFORT_CHOICES
+from jacked.dcr_settings import ENGINE_CHOICES as _DCR_ENGINE_CHOICES
+
 
 # Windows legacy consoles (cp1252 / cp437 OEM) can't encode glyphs like → or −;
 # without this, ANY jacked subcommand that prints one dies with
@@ -4263,6 +4269,136 @@ def statusline_status():
     console.print(f"Preference:   {state}")
     if where == "ours":
         console.print(f"Command:      {settings['statusLine'].get('command', '')}")
+
+
+@main.group(name="dcr")
+def dcr_group():
+    """Configure how /dcr runs its review agents."""
+
+
+def _dcr_print_status(resolved: dict) -> None:
+    """Print the friendly engine block shared by `dcr engine` and `dcr engine set`.
+
+    Takes the resolved contract (jacked.dcr_settings.resolve) so the human block
+    and the --json output can never describe different states.
+    """
+    if resolved.get("engine") == "codex":
+        console.print("DCR review engine: [cyan]Codex (OpenAI)[/cyan]")
+        console.print(f"  Model:  {_rich_escape(str(resolved.get('model') or ''))}")
+        console.print(f"  Effort: {_rich_escape(str(resolved.get('effort') or ''))}")
+        kept = resolved.get("keep_on_claude") or []
+        kept_text = ", ".join(_rich_escape(str(k)) for k in kept) if kept else "(none)"
+        console.print(f"  Kept on Claude: {kept_text}")
+        if resolved.get("usable"):
+            console.print("  Status: [green]ready[/green]  (codex CLI installed, signed in)")
+        else:
+            reason = _rich_escape(str(resolved.get("reason") or "the Codex CLI is not usable"))
+            console.print(f"  Status: [yellow]not usable - {reason}[/yellow]")
+            console.print(
+                "[yellow]Reviews will fall back to Claude until this is fixed.[/yellow]"
+            )
+        return
+
+    console.print("DCR review engine: [cyan]Claude (default)[/cyan]")
+    # A corrupt config resolves to Claude with a reason attached — surface it, or
+    # the user never learns why their codex setting stopped taking effect.
+    if resolved.get("reason"):
+        console.print(f"[yellow][!][/yellow] {_rich_escape(str(resolved['reason']))}")
+    console.print(
+        "Switch with: jacked dcr engine set codex --model gpt-5.6-luna --effort xhigh"
+    )
+
+
+@dcr_group.group(name="engine", invoke_without_command=True)
+@click.option("--json", "as_json", is_flag=True,
+              help="Print the resolved engine config as JSON (machine readable).")
+@click.pass_context
+def dcr_engine_group(ctx, as_json: bool):
+    """Show which engine /dcr reviewers run on."""
+    if ctx.invoked_subcommand is not None:
+        return
+
+    import json as _json
+
+    from jacked import dcr_settings as _dcr
+
+    resolved = _dcr.resolve(_jacked_home())
+    if as_json:
+        # The /dcr command parses this: JSON on stdout and nothing else.
+        click.echo(_json.dumps(resolved))
+        return
+    _dcr_print_status(resolved)
+
+
+@dcr_engine_group.command(name="set")
+@click.argument("engine", type=click.Choice(_DCR_ENGINE_CHOICES))
+@click.option("--model", default=None,
+              help="Model the codex reviewers run (for example gpt-5.6-luna).")
+@click.option("--effort", type=click.Choice(_DCR_EFFORT_CHOICES), default=None,
+              help="Reasoning effort the codex reviewers run at.")
+@click.option("--keep-on-claude", default=None,
+              help="Comma-separated lens names that always stay on Claude.")
+def dcr_engine_set(engine: str, model, effort, keep_on_claude):
+    """Set the review engine (claude or codex) and its model, effort, and lenses."""
+    from jacked import dcr_settings as _dcr
+
+    home = _jacked_home()
+    lenses = None
+    if keep_on_claude is not None:
+        lenses = [part.strip() for part in keep_on_claude.split(",") if part.strip()]
+
+    try:
+        # One shared read-merge-write (the dashboard calls the same function), so
+        # the two surfaces cannot drift on merge semantics.
+        config = _dcr.update_config(
+            home, engine=engine, model=model, effort=effort, keep_on_claude=lenses,
+        )
+    except _dcr.DcrSettingsUnreadableError as exc:
+        # NEVER overwrite a config we could not parse: the user's real settings
+        # would be gone. Say where the file is and stop. (Also catches the
+        # post-write verification failure, which must not surface as a traceback.)
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        console.print(
+            f"Nothing was written. Fix or delete {_rich_escape(str(_dcr.config_path(home)))}, "
+            "then run this command again."
+        )
+        raise SystemExit(1)
+    except _dcr.DcrSettingsAccessError as exc:
+        # The filesystem refused the write (permissions, read-only, full disk).
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        raise SystemExit(1)
+    except ValueError as exc:
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        raise SystemExit(1)
+
+    # Saving codex while the preflight fails is allowed: the /dcr runtime falls
+    # back to Claude, so the setting is kept and the warning is printed.
+    _dcr_print_status(_dcr.resolve(home))
+
+    # Emptying the carve-out list is allowed (an explicit user override), but it
+    # is the one setting that quietly moves the Security lens off Claude, so say
+    # so out loud instead of letting the user discover it in a review.
+    if config.get("engine") == "codex" and not config.get("keep_on_claude"):
+        console.print(
+            "[bold yellow]Warning: the keep-on-Claude list is empty. "
+            "EVERY lens, including Security, will run on Codex.[/bold yellow]"
+        )
+
+
+@dcr_engine_group.command(name="clear")
+def dcr_engine_clear():
+    """Delete the DCR engine config so reviews use Claude."""
+    from jacked import dcr_settings as _dcr
+
+    try:
+        existed = _dcr.clear_config(_jacked_home())
+    except _dcr.DcrSettingsAccessError as exc:
+        # Never claim the config was cleared when the filesystem refused.
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        raise SystemExit(1)
+    console.print("DCR engine config cleared. Reviews use Claude (default).")
+    if not existed:
+        console.print("[dim](No config file was present.)[/dim]")
 
 
 @main.group(name="memory")

@@ -164,6 +164,36 @@ async function refreshPacks() {
     return await loadPacks();
 }
 
+// --- DCR review engine data loading ---
+
+// Effort levels the Codex CLI accepts, weakest to strongest.
+const DCR_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+// A PUT is running: the card renders its controls disabled and refuses a second
+// concurrent write. Module-level (not per-render) so a re-render landing mid-save
+// cannot resurrect live-looking controls.
+let _dcrEngineSaving = false;
+// Message from the last failed PUT, shown inline in the card with a Retry link.
+let _dcrEngineSaveError = null;
+// Whether that failure is worth re-firing. A 4xx validation rejection can only
+// fail the identical way a second time, so it renders without a Retry link.
+let _dcrEngineSaveRetryable = true;
+// Body of the last PUT, re-fired by that Retry link.
+let _dcrEngineLastPayload = null;
+// A manual "Check again" GET is running: a second click is a no-op until it lands.
+let _dcrEngineRechecking = false;
+
+// Codex readiness (CLI installed? signed in?) is LIVE external state, not static
+// config, so this never caches: a user who runs `codex login` in a terminal and
+// comes back to the Features tab must see the new state without a full reload.
+// The fetched value is still published to jackedState so the rest of the card
+// (payload defaults, the in-place re-render) reads one shared latest copy.
+async function loadDcrEngine() {
+    const data = await api.get('/api/dcr-engine');
+    window.jackedState.dcrEngine = data;
+    return data;
+}
+
 // --- Claude Code settings data loading ---
 
 async function loadClaudeSettings() {
@@ -395,6 +425,28 @@ async function renderFeaturesTab(container) {
             ? _renderPacksError(packsError)
             : _renderPacksSection(packsData);
 
+        // The review-engine card has its own endpoint too. Same isolation rule as
+        // packs: a failed fetch renders the card's own inline error with a retry
+        // instead of blanking hooks/knowledge.
+        // The save-failure state is module-level, so without this a rejected PUT
+        // would resurface, error and all, every later time the user opens this
+        // tab. A save genuinely still in flight keeps its state.
+        if (!_dcrEngineSaving) {
+            _dcrEngineSaveError = null;
+            _dcrEngineSaveRetryable = true;
+            _dcrEngineLastPayload = null;
+        }
+        let dcrEngineData = null;
+        let dcrEngineError = null;
+        try {
+            dcrEngineData = await loadDcrEngine();
+        } catch (e) {
+            dcrEngineError = e.message || 'Failed to load review engine';
+        }
+        const dcrEngineSection = dcrEngineError
+            ? _renderDcrEngineError(dcrEngineError)
+            : _renderDcrEngineSection(dcrEngineData);
+
         const hookRows = hooks.map(h => {
             // Memory Vault: when installed and reporting a capture/sync failure,
             // surface a small muted status line under the description (mirrors the
@@ -446,6 +498,8 @@ async function renderFeaturesTab(container) {
                     </div>
                 </div>
 
+                ${dcrEngineSection}
+
                 <div>
                     <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Knowledge</h3>
                     <p class="text-xs text-slate-500 mb-3">Documents and rules that Claude reads for context and behavior. Installed to <code class="text-slate-300">~/.claude/</code>.</p>
@@ -460,6 +514,7 @@ async function renderFeaturesTab(container) {
 
         bindToggleEvents(container);
         _bindPackToggleEvents(container);
+        _bindDcrEngineEvents(container);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -658,6 +713,283 @@ function _bindPackToggleEvents(container) {
             _runPackToggle(toggle, input, name, displayName, true);
         });
     });
+}
+
+// --- DCR review engine section (rendered inside the Features tab) ---
+
+const DCR_ENGINE_URL = '/api/dcr-engine';
+
+function _renderDcrEngineError(message) {
+    return `
+        <div id="dcr-engine-section">
+            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Review Engine</h3>
+            <div class="text-xs text-red-400">
+                Failed to load review engine: ${escapeHtml(message)}
+                <button onclick="renderSettingsTab('features')" class="text-blue-400 hover:text-blue-300 ml-2 transition active:scale-[0.96]">Retry</button>
+            </div>
+        </div>
+    `;
+}
+
+function _renderDcrEngineSection(data) {
+    const engine = (data && data.engine === 'codex') ? 'codex' : 'claude';
+    const isCodex = engine === 'codex';
+    // Mid-save every control is inert, and the flag is module-level so a
+    // re-render landing during the PUT keeps them that way.
+    const disabledAttr = _dcrEngineSaving ? ' disabled' : '';
+
+    const engineOptions = [
+        ['claude', 'Claude (default)'],
+        ['codex', 'Codex (OpenAI)'],
+    ].map(([value, label]) =>
+        `<option value="${value}" ${engine === value ? 'selected' : ''}>${label}</option>`
+    ).join('');
+
+    // The API sanitizes stored values, so `effort` is always a known level here.
+    // The fallback is belt-and-braces: an unrecognized value must not render a
+    // select with nothing selected, which would silently PUT the first option.
+    const rawEffort = (data && data.effort) || '';
+    const effort = DCR_EFFORT_LEVELS.includes(rawEffort) ? rawEffort : 'xhigh';
+    const effortOptions = DCR_EFFORT_LEVELS.map(level =>
+        `<option value="${level}" ${effort === level ? 'selected' : ''}>${level}</option>`
+    ).join('');
+
+    // Model + effort only apply to Codex, so they are absent entirely on Claude
+    // rather than sitting there dead.
+    const codexFields = isCodex ? `
+                <div class="flex items-center justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                        <div class="text-sm text-white">Model</div>
+                        <div class="text-xs text-slate-400">Any Codex model name works. gpt-5.6-luna is fast and cheap; gpt-5.6-terra is stronger.</div>
+                    </div>
+                    <input type="text" id="dcr-engine-model" class="w-44 flex-shrink-0 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
+                           placeholder="gpt-5.6-luna" value="${escapeHtml((data && data.model) || '')}" aria-label="Codex model"${disabledAttr}>
+                </div>
+                <div class="flex items-center justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                        <div class="text-sm text-white">Effort</div>
+                        <div class="text-xs text-slate-400">How hard the model thinks. xhigh is the sweet spot for reviews.</div>
+                    </div>
+                    <select id="dcr-engine-effort" class="flex-shrink-0 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500" aria-label="Codex effort"${disabledAttr}>
+                        ${effortOptions}
+                    </select>
+                </div>
+    ` : '';
+
+    // Readiness only means something for Codex: on Claude there is nothing to be
+    // signed in to. `reason` is server-provided text, so it goes through escapeHtml.
+    let statusLine = '';
+    if (isCodex) {
+        statusLine = (data && data.usable)
+            ? `
+                <div class="flex items-center gap-2" role="status" aria-live="polite">
+                    <span class="w-2 h-2 rounded-full bg-green-400 flex-shrink-0"></span>
+                    <span class="text-xs text-green-400">Codex is ready</span>
+                </div>
+            `
+            : `
+                <div role="status" aria-live="polite">
+                    <div class="flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0"></span>
+                        <span class="text-xs text-amber-400">${escapeHtml((data && data.reason) || 'Codex is not available.')}</span>
+                        <a href="#" id="dcr-engine-recheck" class="text-xs text-blue-400 hover:text-blue-300 transition-colors">Check again</a>
+                    </div>
+                    <div class="text-xs text-slate-500 mt-1">Reviews fall back to Claude until this is fixed.</div>
+                </div>
+            `;
+    }
+
+    // A failed PUT reports here, next to the controls that caused it. Retry
+    // re-fires the very same request, so it appears only when repeating it could
+    // plausibly succeed: a 4xx rejection of this exact body cannot.
+    const retryLink = _dcrEngineSaveRetryable
+        ? '<a href="#" id="dcr-engine-retry" class="text-blue-400 hover:text-blue-300 ml-2 transition-colors">Retry</a>'
+        : '';
+    const saveError = _dcrEngineSaveError
+        ? `
+                <div class="text-xs text-red-400">
+                    ${escapeHtml(_dcrEngineSaveError)}
+                    ${retryLink}
+                </div>
+        `
+        : '';
+
+    // The PUT re-runs the Codex preflight and can take several seconds. Without
+    // a progress line the inert controls read as a broken card.
+    const savingLine = _dcrEngineSaving
+        ? '<div id="dcr-engine-saving" class="text-xs text-slate-400">Saving...</div>'
+        : '';
+
+    // Which lenses stay on Claude is server state, not a constant: the CLI can
+    // set the list to anything, including nothing. Rendering a fixed sentence
+    // here would tell the user that Security is protected when it may not be.
+    const keepOnClaude = (data && Array.isArray(data.keep_on_claude)) ? data.keep_on_claude : [];
+    let carveOutNote = '';
+    if (keepOnClaude.length) {
+        const names = keepOnClaude.map(name => escapeHtml(String(name))).join(' and ');
+        carveOutNote = `<div id="dcr-engine-carveout" class="text-xs text-slate-500">${names} reviews always stay on Claude for the highest quality judgment.</div>`;
+    } else if (isCodex) {
+        carveOutNote = '<div id="dcr-engine-carveout" class="text-xs text-amber-400">The keep-on-Claude list is empty: every review lens, including Security, runs on Codex. Restore it with: jacked dcr engine set codex --keep-on-claude "Security,Frontend Design"</div>';
+    }
+
+    return `
+        <div id="dcr-engine-section">
+            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Review Engine</h3>
+            <p class="text-xs text-slate-500 mb-3">Choose which AI runs your /dcr code reviews. Claude is the default and uses your Anthropic plan. Codex sends the review work to OpenAI instead, which saves your Anthropic usage and costs less.</p>
+            <div class="p-3 bg-slate-900/50 rounded border border-slate-700/50 space-y-3">
+                <div class="flex items-center justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                        <div class="text-sm text-white">Engine</div>
+                    </div>
+                    <select id="dcr-engine-select" class="flex-shrink-0 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500" aria-label="Review engine"${disabledAttr}>
+                        ${engineOptions}
+                    </select>
+                </div>
+                ${codexFields}
+                ${statusLine}
+                ${saveError}
+                ${savingLine}
+                ${carveOutNote}
+            </div>
+        </div>
+    `;
+}
+
+// Swap the card for a freshly rendered one and rebind. Scoped to the card so a
+// save never disturbs the hooks/knowledge/packs sections around it.
+function _rerenderDcrEngineCard() {
+    const el = document.getElementById('dcr-engine-section');
+    if (!el) return;
+    el.outerHTML = _renderDcrEngineSection(window.jackedState.dcrEngine);
+    const fresh = document.getElementById('dcr-engine-section');
+    if (fresh) _bindDcrEngineEvents(fresh);
+}
+
+// Mark the card as saving WITHOUT rebuilding it. Re-rendering here would replace
+// the very element the user's pointer is over: editing the model field and then
+// clicking the effort select fires the input's `change` on blur, and a rebuild
+// mid-gesture destroys the select before the click lands, silently swallowing it.
+function _markDcrEngineSaving() {
+    const el = document.getElementById('dcr-engine-section');
+    if (!el) return;
+    const controls = el.querySelectorAll('select, input');
+    if (controls && controls.forEach) {
+        controls.forEach(node => { node.disabled = true; });
+    }
+    if (el.querySelector('#dcr-engine-saving')) return;
+    const line = document.createElement('div');
+    line.id = 'dcr-engine-saving';
+    line.className = 'text-xs text-slate-400';
+    line.textContent = 'Saving...';
+    // Same slot the renderer uses, so the in-place card and a re-rendered one
+    // put the progress line in the same place.
+    const anchor = el.querySelector('#dcr-engine-carveout');
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(line, anchor);
+    } else {
+        // No carve-out note to anchor to (Claude engine, empty list): land in the
+        // card body rather than outside the bordered box.
+        (el.querySelector('.space-y-3') || el).appendChild(line);
+    }
+}
+
+async function _saveDcrEngine(payload) {
+    // Re-entry guard: a stale Retry link (or a fast second change) must not fire
+    // a second concurrent write.
+    if (_dcrEngineSaving) return;
+    _dcrEngineSaving = true;
+    _dcrEngineLastPayload = payload;
+    _dcrEngineSaveError = null;
+    _dcrEngineSaveRetryable = true;
+    // Inert controls plus a progress line, applied to the live nodes. The full
+    // re-render happens only once the PUT settles.
+    _markDcrEngineSaving();
+
+    try {
+        const fresh = await api.put(DCR_ENGINE_URL, payload);
+        window.jackedState.dcrEngine = fresh;
+        _dcrEngineSaveError = null;
+        _dcrEngineLastPayload = null;
+        showToast('Review engine updated', 'success');
+    } catch (e) {
+        // The cached state still holds the last known-good server values, so the
+        // re-render below shows those plus this error, never a half-applied UI.
+        _dcrEngineSaveError = e.message || 'Failed to save review engine';
+        // A 4xx means the server judged THIS body invalid, and the inline message
+        // names the offending value. Re-sending it can only fail identically, so
+        // no Retry: the user edits the field and the change handler re-fires.
+        // Timeouts (status 0) and 5xx are transient, so those keep Retry.
+        const status = (e && typeof e.status === 'number') ? e.status : 0;
+        _dcrEngineSaveRetryable = !(status >= 400 && status < 500);
+    } finally {
+        _dcrEngineSaving = false;
+        _rerenderDcrEngineCard();
+    }
+}
+
+function _bindDcrEngineEvents(container) {
+    const engineSelect = container.querySelector('#dcr-engine-select');
+    if (engineSelect && !engineSelect.disabled) {
+        engineSelect.addEventListener('change', () => {
+            _saveDcrEngine({ engine: engineSelect.value });
+        });
+    }
+
+    // Current engine for the codex-only fields: read the live select so a payload
+    // can never disagree with what the user is looking at.
+    const currentEngine = () => (engineSelect && engineSelect.value) ||
+        ((window.jackedState.dcrEngine && window.jackedState.dcrEngine.engine) || 'claude');
+
+    // `change` on a text input fires on blur once the value actually differs, so
+    // this covers both the change and blur cases without a redundant PUT.
+    const modelInput = container.querySelector('#dcr-engine-model');
+    if (modelInput && !modelInput.disabled) {
+        modelInput.addEventListener('change', () => {
+            const model = modelInput.value.trim();
+            const saved = (window.jackedState.dcrEngine && window.jackedState.dcrEngine.model) || '';
+            if (model === saved) return;
+            _saveDcrEngine({ engine: currentEngine(), model });
+        });
+    }
+
+    const effortSelect = container.querySelector('#dcr-engine-effort');
+    if (effortSelect && !effortSelect.disabled) {
+        effortSelect.addEventListener('change', () => {
+            _saveDcrEngine({ engine: currentEngine(), effort: effortSelect.value });
+        });
+    }
+
+    // Codex readiness can change out from under the page (the user runs
+    // `codex login` in a terminal), so the amber block offers an explicit
+    // re-check that refetches and redraws the card in place.
+    const recheckLink = container.querySelector('#dcr-engine-recheck');
+    if (recheckLink) {
+        recheckLink.addEventListener('click', async (e) => {
+            e.preventDefault();
+            // A running PUT owns the card; racing a GET into the cache behind it
+            // would show state the save is about to replace.
+            if (_dcrEngineSaving || _dcrEngineRechecking) return;
+            _dcrEngineRechecking = true;
+            try {
+                window.jackedState.dcrEngine = await api.get(DCR_ENGINE_URL);
+                _rerenderDcrEngineCard();
+            } catch (err) {
+                showToast(err.message || 'Failed to re-check Codex', 'error');
+            } finally {
+                _dcrEngineRechecking = false;
+            }
+        });
+    }
+
+    // Retry re-fires the exact request that failed, not a generic refetch.
+    const retryLink = container.querySelector('#dcr-engine-retry');
+    if (retryLink) {
+        retryLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            if (!_dcrEngineLastPayload) return;
+            _saveDcrEngine(_dcrEngineLastPayload);
+        });
+    }
 }
 
 // --- Tab: Plugins ---
