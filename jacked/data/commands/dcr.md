@@ -126,6 +126,48 @@ This avoids:
 
 You (the parent) can see cross-cutting concerns — e.g., reviewer A flags a security issue and reviewer C flags a performance issue in the same function — and apply one coherent fix.
 
+## REVIEW ENGINE (configurable)
+
+/dcr can run its reviewers on two engines. The parent dispatcher (you) ALWAYS stays in this session and keeps lens selection, finding validation, the fix phase, and the verdict — the engine only changes WHO executes the read-only reviewer briefs.
+
+- **claude** (default): reviewers spawn as parallel Task subagents, exactly as described in SPAWNING INSTRUCTIONS and the tiered-dispatch rules.
+- **codex**: reviewer briefs execute as parallel OpenAI Codex CLI jobs (the user configures the model, e.g. `gpt-5.6-luna`). Review findings come back as schema-validated JSON files. This keeps Anthropic usage in the parent loop only; the user pays for reviews with their OpenAI subscription instead.
+
+### ENGINE CHECK (once per /dcr run, before Wave 1)
+
+Skip this entire section when NOT running inside Claude Code (Codex or another runtime: there is no Task tool and you are already the review engine — review inline per the lens instructions).
+
+Run `jacked dcr engine --json` as one fast Bash call, then branch:
+- Command not found, or any `"engine"` value other than `"codex"` → use the Claude engine everywhere and do not mention engines at all (default path, zero noise — most users have no engine config, and a machine without jacked's CLI cannot have one either).
+- Command FOUND but it exits non-zero or prints unparseable output → use the Claude engine, but announce one line: `Engine check failed ([short error]) — reviewers run on Claude.` A jacked install is present on this machine, so a broken check is diagnosable signal the user needs, not noise.
+- `"engine": "codex"` with `"usable": false` → announce one line: `Codex engine configured but not usable ([reason]) — reviewers run on Claude this time.` Then use the Claude engine.
+- `"engine": "codex"` with `"usable": true` → use CODEX DISPATCH below for this run and add `Engine: Codex ([model], effort [effort])` to each wave announcement.
+
+Remember `model`, `effort`, `keep_on_claude`, and `schema_path` from the JSON — CODEX DISPATCH uses all four.
+
+### CODEX DISPATCH (replaces Task spawns for non-carve-out reviewers)
+
+Carve-outs stay as Claude Task dispatches regardless of engine: every lens listed in `keep_on_claude` (each gets its OWN single-lens Claude reviewer; Security still follows the tiered-dispatch model rules in step 4) and the conditional Frontend Design reviewer. Everything else — the standard lens-pair reviewers and the pre-mortem analyst — runs on Codex.
+
+**Carve-out BEFORE pairing:** when the Codex engine is active, remove the `keep_on_claude` lenses from the lens pool FIRST (each becomes its own single-lens Claude reviewer), then pair the REMAINING lenses for the Codex reviewers (step 4's pairing applies to this reduced pool). Every selected lens must appear exactly once across the wave — never dropped because its would-be pair partner was carved out, and never reviewed on both engines. If `keep_on_claude` is empty (the user explicitly cleared it), say so in the wave announcement: `Carve-outs cleared — every lens including Security runs on Codex.`
+
+For each Codex-engine reviewer in a wave:
+
+1. **Write the complete reviewer brief to a scratchpad file** (e.g. `<scratchpad>/dcr-wave1-reviewer-A.md`). Identical content to the Task prompt you would have written (SPAWNING INSTRUCTIONS items 1-12 as applicable: READ-ONLY, the 2 assigned lenses + lens details, phase, persona, wild card, PROJECT_CONTEXT, evidence requirement, the full DO NOT FLAG list, re-check context on wave 2+, pre-mortem instructions for the pre-mortem analyst). Append this output instruction: "Your final message MUST be only the JSON required by the output schema: one lens_report per assigned lens (the pre-mortem analyst emits a single lens_report named 'Pre-Mortem'). Put each finding's concrete trigger — the specific input, state, or call path — in `trigger`, and the exact location in `file`/`line_start`/`line_end`."
+2. **Launch the job** with Bash `run_in_background: true` (these are CLI processes, not subagents):
+   ```
+   codex exec --sandbox read-only --ephemeral --cd "<repo root>" \
+     -m "<model>" -c model_reasoning_effort="<effort>" \
+     --output-schema "<schema_path>" \
+     -o "<scratchpad>/dcr-wave1-reviewer-A.out.json" \
+     - < "<scratchpad>/dcr-wave1-reviewer-A.md"
+   ```
+   Launch ALL Codex jobs for the wave first, then spawn the wave's Claude carve-out Task calls in the same step so everything runs in parallel.
+3. **Collect**: as each job exits, Read its `.out.json` and parse the findings. A reviewer's lens_reports slot into the wave results exactly like a Task reviewer's report.
+4. **Per-job failure** = non-zero exit, missing or empty output file, or unparseable JSON. Respawn THAT reviewer once as a Claude Task subagent with the same brief and announce: `Reviewer [X] failed on Codex ([short reason]) — re-ran on Claude.` Never drop a lens silently and never count a failed reviewer as PASS. If one job is still running long after the rest of the wave finished (roughly 15+ minutes), treat it as hung: kill it and use the same Claude fallback.
+
+Codex findings enter FINDING VALIDATION (step 8b) exactly like Claude findings, and validation is MANDATORY for every Codex CRITICAL/MEDIUM: a cheaper review model is safe precisely because you, the parent, adjudicate each finding against the real code before the fix phase.
+
 ## SPAWNING INSTRUCTIONS
 
 When spawning each reviewer in a wave, include ALL of the following in the Task prompt:
@@ -275,6 +317,8 @@ Each matched specialist lens is added to the selected lens pool alongside the bu
 
 Each specialist lens becomes a reviewer instruction: "Additionally review through the **{lens.name}** lens. Use the following checklist and anti-patterns as your guide:\n{full lens file content}"
 
+3d-iii. **Engine check.** Run the ENGINE CHECK from the REVIEW ENGINE section (one `jacked dcr engine --json` Bash call; skip when not running inside Claude Code). Its result decides whether this run's non-carve-out reviewers spawn as Task subagents or as Codex CLI jobs. The check runs once and applies to EVERY wave in this run, re-check waves included.
+
 3e. **Announce selected lenses with reasoning:**
     ```
     **Lenses selected ([N] of 11):**
@@ -312,6 +356,7 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
    - Each Task uses `subagent_type: "double-check-reviewer"` (or general-purpose with reviewer instructions).
    - Each Task prompt includes the spawning instructions above.
    - **Pass the model explicitly on every spawn** per the tiered-dispatch rule in step 4: `model: "opus"` for standard reviewers and the pre-mortem analyst on a Fable-class session; `model: "fable"` for the Security lens reviewer and the Frontend Design reviewer. Never rely on inheritance - an agent definition's frontmatter `model:` pin silently beats parent inheritance.
+   - **Codex engine active** (step 3d-iii): non-carve-out reviewers launch as background Codex CLI jobs per CODEX DISPATCH instead of Task calls; the carve-out reviewers (`keep_on_claude` lenses, Frontend Design) still spawn as Task calls in this same step so the whole wave runs in parallel.
 
 #### CONDITIONAL: Frontend Design Reviewer (Wave 1 only)
 
@@ -423,7 +468,7 @@ Why: Fable-tier models run behind safety classifiers that can block security-fla
     - Group `needs_recheck` lenses into pairs (or singles if odd number)
     - Each pair gets a NEW persona (different from wave 1) and NEW wild card
     - Include re-check context in spawn prompt. Instruct reviewers to verify fixes AND conduct a full fresh review of their lenses — not just confirm prior findings.
-15. **Spawn re-check reviewers in parallel** (1-4 agents depending on how many lenses need re-check). The tiered-dispatch rule from step 4 applies to every wave, not just Wave 1: `model: "opus"` for standard re-check reviewers on a Fable-class session, `model: "fable"` when Security is among the re-checked lenses (own reviewer). Wait for results. → Go to FIX PHASE (step 9).
+15. **Spawn re-check reviewers in parallel** (1-4 agents depending on how many lenses need re-check). The tiered-dispatch rule from step 4 applies to every wave, not just Wave 1: `model: "opus"` for standard re-check reviewers on a Fable-class session, `model: "fable"` when Security is among the re-checked lenses (own reviewer). The engine decision from step 3d-iii also applies to every wave: with the Codex engine active, non-carve-out re-check reviewers run as Codex jobs per CODEX DISPATCH. Wait for results. → Go to FIX PHASE (step 9).
 
 ### REPORTING
 
@@ -448,6 +493,7 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
       ⊘ Maintainability — skipped (not relevant)
       ⊘ Observability & Debuggability — skipped (not relevant)
       ⊘ Data Integrity & Schema Safety — skipped (not relevant)
+    **Engine:** Codex ([model], effort [effort]; [N] reviewers, [N] Claude fallbacks) / Claude
     **Frontend design:** ✓ Reviewed (N findings) / ⊘ Skipped
     **Pre-mortem analysis:** ✓ [N] scenarios analyzed ([N] findings)
     **Diagnostics:** ✓ lint/type/tests green ([N] tests) / ⊘ no toolchain detected — skipped / n/a (not POST-IMPLEMENTATION)
@@ -466,6 +512,7 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
     ```
     ## DCR Cap Reached ([N] waves)
 
+    **Engine:** Codex ([model], effort [effort]; [N] reviewers, [N] Claude fallbacks) / Claude
     **Covered:** [list of covered lenses]
     **Still failing:** [list of lenses still in needs_recheck with latest issues]
     **Summary:** [what was fixed vs what remains]
@@ -479,8 +526,9 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
 - Do NOT ask "should I continue?" — the answer is always yes until all covered or user-configured cap.
 - LOW issues: Report them but do NOT block progress. Only CRITICAL/MEDIUM trigger re-checks.
 - Reviewers are READ-ONLY. Only you (the parent dispatcher) edit files.
-- Spawn all reviewers in a wave in ONE message (parallel Task calls).
+- Spawn all reviewers in a wave in ONE message (parallel Task calls; with the Codex engine, all Codex jobs plus carve-out Task calls together).
 - Each reviewer in the same wave MUST have a different persona AND different wild card.
+- The engine never moves judgment: lens selection, finding validation, fixes, and the verdict always run in the parent session regardless of engine.
 - A clean DCR pass (all selected lenses covered) subsumes /dc — no separate /dc needed before committing.
 
 > **Tip:** Run `/jacked-setup dcr` to pre-configure lens selection, context paths, and domain-specific wild cards for this repo.

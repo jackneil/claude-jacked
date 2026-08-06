@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jackneil/claude-jacked/schemas/dcr-review-output.schema.json",
+  "title": "DCR reviewer output",
+  "description": "Structured output a /dcr reviewer agent returns for one review wave. One lens report per lens the agent ran.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lens_reports"],
+  "properties": {
+    "lens_reports": {
+      "type": "array",
+      "description": "One entry per review lens.",
+      "items": { "$ref": "#/$defs/lens_report" }
+    }
+  },
+  "$defs": {
+    "lens_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lens", "status", "findings", "what_looks_good"],
+      "properties": {
+        "lens": {
+          "type": "string",
+          "description": "Name of the review lens, for example Security or Frontend Design."
+        },
+        "status": {
+          "type": "string",
+          "description": "PASS when the lens found no issue that must be fixed.",
+          "enum": ["PASS", "ISSUES_FOUND"]
+        },
+        "findings": {
+          "type": "array",
+          "description": "Issues this lens found. Empty when the status is PASS.",
+          "items": { "$ref": "#/$defs/finding" }
+        },
+        "what_looks_good": {
+          "type": "array",
+          "description": "Short notes about the parts of the change that are correct.",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "title",
+        "file",
+        "line_start",
+        "line_end",
+        "trigger",
+        "why",
+        "confidence",
+        "recommendation"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "description": "CRITICAL blocks the change. MEDIUM must be fixed soon. LOW is optional.",
+          "enum": ["CRITICAL", "MEDIUM", "LOW"]
+        },
+        "title": {
+          "type": "string",
+          "description": "One short sentence that states the defect.",
+          "minLength": 1
+        },
+        "file": {
+          "type": "string",
+          "description": "Path of the file that contains the defect, relative to the repository root.",
+          "minLength": 1
+        },
+        "line_start": {
+          "type": "integer",
+          "description": "First line of the defect. Lines start at 1.",
+          "minimum": 1
+        },
+        "line_end": {
+          "type": "integer",
+          "description": "Last line of the defect. Lines start at 1.",
+          "minimum": 1
+        },
+        "trigger": {
+          "type": "string",
+          "description": "The concrete input, state, or call path that produces the failure.",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string",
+          "description": "Why the code fails for that trigger.",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "number",
+          "description": "How sure the reviewer is that the finding is real, from 0 to 1.",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "recommendation": {
+          "type": "string",
+          "description": "The fix to apply."
+        }
+      }
+    }
+  }
+}

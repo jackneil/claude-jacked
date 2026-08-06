@@ -82,6 +82,7 @@ def test_reset_locks_rebinds_bulk_refresh_lock() -> None:
 # — the parametrized callable-exists tests above would still pass.
 _REBIND_CASES: tuple[tuple[str, str], ...] = (
     ("jacked.api.routes.features", "_settings_lock"),
+    ("jacked.api.routes.features", "_dcr_lock"),
     ("jacked.api.routes.permissions", "_project_settings_lock"),
     ("jacked.api.routes.system", "_upgrade_lock"),
 )

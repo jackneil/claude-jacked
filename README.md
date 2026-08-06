@@ -453,7 +453,7 @@ Type these directly in Claude Code:
 | Command | What It Does |
 |---------|--------------|
 | `/dc` | **Double-check** - Reviews your recent work for bugs, security issues, and problems |
-| `/dcr` | **Recursive Review** - Spawns parallel reviewers across 11 lenses (security, performance, logic, UX, observability, data integrity, etc.) in waves until all pass clean |
+| `/dcr` | **Recursive Review** - Spawns parallel reviewers across 11 lenses (security, performance, logic, UX, observability, data integrity, etc.) in waves until all pass clean. Reviewers run on Claude (default) or the OpenAI Codex CLI (`jacked dcr engine set codex`) |
 | `/swarm` | **Swarm** - Parallel implementation across 3-8 coordinated agents with file-level isolation |
 | `/swarm-research` | **Divergent Research** - Spawns 2-5 independent agents from different angles, synthesizes proposals, then verifies + attacks with devil's advocate |
 | `/qa` | **QA Testing** - Browser-based QA testing of UI changes with Playwright or Chrome DevTools MCP |
@@ -532,6 +532,22 @@ jacked packs update                # refresh enabled packs from upstream
 | `design-extras` | [emilkowalski/skills](https://github.com/emilkowalski/skills) | `improve-animations`: audits a whole codebase's motion and writes self-contained, prioritized fix plans any agent can execute. |
 
 Packs can also be toggled from the dashboard (Settings > Features > Skill Packs). Skills install for Codex too when it is present. Removal is source-checked against the skills CLI lockfile, so a same-named skill you installed yourself from another repo is never touched, and a skill directory you already own is never overwritten. Because packs are on by default, a plain `jacked install` pulls third-party content from those repos' main branch at install time; if that trust boundary matters for your environment, run `jacked install --no-packs` or disable the packs you do not want. A disable is durable: a pack you turn off stays off across future installs.
+
+### DCR Review Engine (run reviews on Codex, opt in)
+
+`/dcr` spawns several parallel review agents per wave. By default they run on Claude and spend your Anthropic plan. If you have the OpenAI Codex CLI installed and signed in, you can route the volume reviewers to a Codex model instead and pay for review fan-out with your OpenAI subscription:
+
+```bash
+jacked dcr engine set codex --model gpt-5.6-luna --effort xhigh
+jacked dcr engine          # show the current config and live Codex readiness
+jacked dcr engine clear    # back to Claude (the default)
+```
+
+Or use the dashboard: Settings > Features > Review Engine.
+
+What stays the same: the parent Claude session still selects the lenses, validates every finding against the real code before any fix, applies the fixes, and issues the verdict. Security and design reviews stay on Claude by default (the `keep_on_claude` list; you can change it with the CLI). What changes: the read-only reviewer briefs execute as `codex exec` jobs in a read-only sandbox, and findings come back as schema-validated JSON. With a fast, low-cost model like GPT-5.6 Luna at `xhigh` effort, a full review wave costs a fraction of the Claude equivalent.
+
+Safe by default: no config means pure Claude. Codex missing, signed out, a corrupt config file, or a failed or hung Codex job all fall back to Claude automatically. A review never blocks on the engine, and no review lens is silently dropped.
 
 ### Memory Vault (cross-repo memory, opt in)
 

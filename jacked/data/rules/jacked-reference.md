@@ -81,8 +81,29 @@ jacked service restart --host 0.0.0.0               # Expose dashboard beyond lo
 jacked init [--repo PATH] [--language LANG]          # Set up guardrails + lint hook in project
 jacked guardrails init [--repo PATH] [--force]       # Create JACKED_GUARDRAILS.md from templates
 jacked lint-hook init [--repo PATH] [--force]        # Install pre-push lint hook in .git/hooks/
+jacked dcr engine [--json]                          # Show the /dcr review engine config + Codex readiness
+jacked dcr engine set codex --model M --effort E    # Route /dcr volume reviewers to the Codex CLI
+jacked dcr engine clear                             # Back to Claude reviewers (the default)
 python -m jacked                                    # Alternative invocation
 ```
+
+DCR review engine (0.91.0+): `/dcr` can run its volume reviewers on the OpenAI
+Codex CLI instead of Claude Task subagents, so review fan-out spends the user's
+OpenAI subscription instead of their Anthropic plan. Config lives in
+`~/.claude/jacked-dcr.json`, written by `jacked dcr engine set` or the dashboard
+card (Settings > Features > Review Engine; GET/PUT /api/dcr-engine). At review
+time /dcr runs one `jacked dcr engine --json` call; the output carries
+engine/model/effort, the `keep_on_claude` lens list, a live Codex preflight
+(installed + signed in = `usable`), and the packaged findings-schema path
+(`jacked/data/schemas/dcr-review-output.schema.json`) that Codex jobs bind with
+`--output-schema`. Judgment never moves: lens selection, finding validation, the
+fix phase, and the verdict stay in the parent Claude session; `keep_on_claude`
+lenses (default Security + Frontend Design) always spawn as Claude reviewers.
+Every failure shape falls back to Claude - codex missing/unauthed, a corrupt
+config file, a failed or hung Codex job (that one reviewer re-runs as a Claude
+Task) - so a review never blocks on the engine and no lens is ever dropped.
+Defaults when enabling: model `gpt-5.6-luna`, effort `xhigh`. Any Codex model
+name is accepted; effort is one of none/minimal/low/medium/high/xhigh/max.
 
 Chain-of-command auto-load (0.76.0+): `jacked install` registers a synchronous
 SessionStart hook (`jacked _hook chain_of_command_context`) that injects the
