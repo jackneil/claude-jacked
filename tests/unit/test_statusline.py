@@ -22,6 +22,7 @@ Nothing here touches the real ``~/.claude``, the network, or npx.
 """
 
 import ast
+import builtins
 import datetime
 import hashlib
 import io
@@ -1314,22 +1315,188 @@ def test_settings_js_toasts_the_statusline_takeover_flags(flag, copy):
 # --------------------------------------------------------------------------- #
 # F. Served-model segment: gateway fallback visibility
 # --------------------------------------------------------------------------- #
+#
+# The baseline is the CONFIGURED model from the stdin payload
+# (model.id), not the session's first assistant turn. A first-turn baseline is
+# frozen for the life of the session, so it stuck on screen forever after one
+# deliberate /model switch and it labelled an UPGRADE as a downgrade
+# ("claude-fable-5 (FALLBACK, not claude-opus-5)"). Measured over 12 real
+# transcripts, the old baseline produced three warnings and all three were
+# deliberate user switches -- zero true positives. This segment exists to catch
+# a SERVING mismatch (a gateway answering with a model nobody asked for), never
+# the user's own model choice.
+#
+# The first-turn baseline survives only where the payload carries no usable
+# model id, and only that path still pays the growing head read.
 
-def _transcript(tmp_path, models, name="t.jsonl", pad_first=False):
+def _transcript(tmp_path, models, name="t.jsonl", pad_first=False, pad_bytes=70000):
     """Write a session JSONL whose assistant messages carry `models` in order.
 
-    pad_first inflates the first entry so the file exceeds the head window,
-    forcing the tail seek (and therefore a partial line at the boundary).
+    pad_first inflates the first entry by pad_bytes so the file exceeds the
+    head window, forcing the tail seek (and therefore a partial line at the
+    boundary). Push pad_bytes past the 256KB tail to also force the growing
+    head windows and a non-zero tail seek offset.
     """
     path = tmp_path / name
     lines = []
     for i, model in enumerate(models):
         entry = {"type": "assistant", "message": {"model": model, "content": []}}
         if pad_first and i == 0:
-            entry["message"]["content"] = ["x" * 70000]
+            entry["message"]["content"] = ["x" * pad_bytes]
         lines.append(json.dumps(entry))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(path)
+
+
+def _served_payload(transcript_path, model_id=None):
+    """A stdin-shaped payload: transcript plus the CONFIGURED model id.
+
+    Claude Code writes model: {"id": ..., "display_name": ...} and rewrites
+    it on every /model switch, which is why it is the baseline.
+    """
+    payload = {"transcript_path": transcript_path}
+    if model_id is not None:
+        payload["model"] = {"id": model_id, "display_name": model_id}
+    return payload
+
+
+class _ReadLog:
+    """Every seek/read `_served_segment` performed on the transcript."""
+
+    def __init__(self):
+        self.events = []
+
+    @property
+    def total_bytes(self):
+        return sum(n for kind, n in self.events if kind == "read")
+
+    @property
+    def head_seeks(self):
+        return self.events.count(("seek", 0))
+
+
+class _TracedFile:
+    """Read-tracing proxy; only the calls `_served_segment` makes exist here."""
+
+    def __init__(self, fh, log):
+        self._fh, self._log = fh, log
+
+    def read(self, *args):
+        data = self._fh.read(*args)
+        self._log.events.append(("read", len(data)))
+        return data
+
+    def seek(self, pos, *args):
+        self._log.events.append(("seek", pos))
+        return self._fh.seek(pos, *args)
+
+    def __enter__(self):
+        self._fh.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._fh.__exit__(*exc)
+
+
+def _trace_served_reads(monkeypatch, payload):
+    """Run `_served_segment` with every read of its transcript recorded."""
+    log = _ReadLog()
+    target = os.path.realpath(payload["transcript_path"])
+    real_open = builtins.open
+
+    def traced(file, *args, **kwargs):
+        fh = real_open(file, *args, **kwargs)
+        if os.path.realpath(str(file)) == target:
+            return _TracedFile(fh, log)
+        return fh
+
+    monkeypatch.setattr(builtins, "open", traced)
+    try:
+        segment = statusline._served_segment(payload)
+    finally:
+        monkeypatch.undo()
+    return segment, log
+
+
+# --- the configured-model baseline ----------------------------------------- #
+
+def test_served_segment_clears_after_a_deliberate_model_upgrade(tmp_path, home):
+    """Regression: the exact real transcript that rendered an INVERTED warning.
+
+    The session started on claude-opus-5 and the user UPGRADED to
+    claude-fable-5 with /model. Against a first-turn baseline this rendered
+    "claude-fable-5 (FALLBACK, not claude-opus-5)" -- calling the more capable,
+    deliberately chosen model a downgrade-fallback, and never clearing.
+    """
+    tp = _transcript(tmp_path, ["claude-opus-5"] * 2 + ["claude-fable-5"] * 2)
+    payload = _served_payload(tp, "claude-fable-5")
+
+    assert statusline._served_segment(payload) == ""
+    line = _render(dict(payload, model={"id": "claude-fable-5", "display_name": "Fable 5"}), home)
+    assert "FALLBACK" not in line
+
+
+def test_served_segment_clears_when_the_user_switches_back(tmp_path):
+    """Switching back is still a user choice, so nothing may linger."""
+    tp = _transcript(tmp_path, ["claude-fable-5"] * 3)
+    assert statusline._served_segment(_served_payload(tp, "claude-fable-5")) == ""
+
+
+def test_served_segment_flags_a_gateway_serving_another_model(tmp_path, home):
+    """The case this feature exists for: served != configured."""
+    tp = _transcript(tmp_path, ["claude-fable-5"] + ["claude-opus-5"] * 2)
+    payload = _served_payload(tp, "claude-fable-5")
+
+    seg = statusline._served_segment(payload)
+    assert seg == f"{RED}claude-opus-5 (FALLBACK, not claude-fable-5){RESET}"
+    assert "FALLBACK" in _render(payload, home)
+
+
+def test_served_segment_ignores_a_pure_namespace_difference(tmp_path):
+    """A gateway namespaces the SAME model; that is not a fallback."""
+    tp = _transcript(tmp_path, ["openrouter/anthropic/claude-opus-5"] * 2)
+    assert statusline._served_segment(_served_payload(tp, "claude-opus-5")) == ""
+    # Case and stray whitespace are not a mismatch either.
+    assert statusline._served_segment(_served_payload(tp, " Claude-Opus-5 ")) == ""
+
+
+def test_served_segment_flags_a_namespaced_model_that_really_differs(tmp_path):
+    """Namespace tolerance must not swallow a genuinely different model."""
+    tp = _transcript(tmp_path, ["openrouter/anthropic/claude-fable-5"])
+    seg = statusline._served_segment(_served_payload(tp, "claude-opus-5"))
+    assert "claude-fable-5 (FALLBACK, not claude-opus-5)" in seg
+    assert "openrouter/" not in seg
+
+
+def test_served_segment_uses_the_configured_model_not_the_display_name(tmp_path):
+    """display_name ("Fable 5") never matches a model id; only `id` counts."""
+    tp = _transcript(tmp_path, ["claude-fable-5"] * 2)
+    payload = {
+        "transcript_path": tp,
+        "model": {"id": "claude-fable-5", "display_name": "Fable 5"},
+    }
+    assert statusline._served_segment(payload) == ""
+
+
+# --- the first-turn fallback, for payloads with no model id ----------------- #
+
+@pytest.mark.parametrize("model", [
+    None,                                   # no model key at all
+    {},                                     # model object, no id
+    {"display_name": "Opus"},               # older Claude Code: name only
+    {"id": ""},                             # present but empty
+    {"id": "   "},                          # whitespace only
+    {"id": 5},                              # wrong type
+    "not-a-dict",
+])
+def test_served_segment_falls_back_to_the_first_turn_without_a_model_id(tmp_path, model):
+    """No usable payload id: keep the old baseline rather than drop the feature."""
+    # tmp_path is unique per parametrized case, so the default name is safe.
+    tp = _transcript(tmp_path, ["deepseek/v4"] * 2 + ["openai/luna"])
+    payload = {"transcript_path": tp}
+    if model is not None:
+        payload["model"] = model
+    assert "luna (FALLBACK, not v4)" in statusline._served_segment(payload)
 
 
 def test_served_segment_is_silent_when_the_model_never_changed(tmp_path, home):
@@ -1371,16 +1538,95 @@ def test_served_segment_survives_a_partial_line_at_the_seek_boundary(tmp_path):
     assert "luna (FALLBACK, not v4)" in seg
 
 
+# --- the head read is real work, and the payload path must not pay it ------ #
+
+def _head_beyond_the_windows(tmp_path, name):
+    """A transcript whose first assistant message is bigger than the tail read.
+
+    First turn claude-opus-5, newest claude-fable-5, and >256KB of padding in
+    between, so (a) the first model is only reachable through the GROWING head
+    windows and (b) the tail seek offset is non-zero -- which is what makes a
+    seek to 0 unambiguous evidence that the head was read.
+    """
+    tp = _transcript(
+        tmp_path,
+        ["claude-opus-5"] + ["claude-fable-5"] * 3,
+        name=name,
+        pad_first=True,
+        pad_bytes=300000,
+    )
+    assert os.path.getsize(tp) > 262144
+    return tp
+
+
+def test_served_segment_skips_the_head_read_when_the_payload_has_a_baseline(tmp_path, monkeypatch):
+    """Perf: no head read at all on the payload path -- tail only.
+
+    The head of this transcript says claude-opus-5, which would produce a
+    (wrong) warning if it were consulted. Both facts are asserted: the answer
+    is empty, and the file was never seeked back to 0.
+    """
+    tp = _head_beyond_the_windows(tmp_path, "skip.jsonl")
+
+    seg, log = _trace_served_reads(monkeypatch, _served_payload(tp, "claude-fable-5"))
+
+    assert seg == ""                                  # head baseline not used
+    assert log.head_seeks == 0                        # head never even read
+    assert log.total_bytes <= 262144, log.events      # tail window only
+    assert log.events[0][0] == "seek" and log.events[0][1] > 0
+
+
+def test_served_segment_grows_the_head_read_only_on_the_fallback_path(tmp_path, monkeypatch):
+    """Without a payload id the old behavior stands, growing windows included."""
+    tp = _head_beyond_the_windows(tmp_path, "grow.jsonl")
+    size = os.path.getsize(tp)
+
+    seg, log = _trace_served_reads(monkeypatch, {"transcript_path": tp})
+
+    assert "claude-fable-5 (FALLBACK, not claude-opus-5)" in seg
+    # 64KB and 256KB both land inside the padded first line; the 1MB window is
+    # what finally reaches the first model.
+    assert log.head_seeks == 3, log.events
+    assert log.total_bytes == 65536 + 262144 + size
+
+
+# --- robustness ------------------------------------------------------------ #
+
 @pytest.mark.parametrize("payload", [
     {},
     {"transcript_path": None},
     {"transcript_path": ""},
     {"transcript_path": "/nonexistent/nope.jsonl"},
+    {"transcript_path": "/nonexistent/nope.jsonl", "model": {"id": "claude-opus-5"}},
     "not-a-dict",
 ])
 def test_served_segment_treats_absence_as_normal(payload):
     """Absence is never an error; the segment simply drops."""
     assert statusline._served_segment(payload) == ""
+
+
+def test_served_segment_tolerates_an_empty_transcript(tmp_path):
+    """A zero-byte transcript has no served model, with or without a baseline."""
+    path = tmp_path / "empty.jsonl"
+    path.write_text("", encoding="utf-8")
+    assert statusline._served_segment({"transcript_path": str(path)}) == ""
+    assert statusline._served_segment(_served_payload(str(path), "claude-opus-5")) == ""
+
+
+def test_served_segment_tolerates_an_unreadable_transcript(tmp_path):
+    """A permission error drops the segment instead of raising."""
+    path = tmp_path / "locked.jsonl"
+    path.write_text(
+        json.dumps({"type": "assistant", "message": {"model": "claude-opus-5"}}) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0)
+    try:
+        if os.access(path, os.R_OK):
+            pytest.skip("running as a user that ignores file modes")
+        assert statusline._served_segment(_served_payload(str(path), "claude-fable-5")) == ""
+    finally:
+        path.chmod(0o644)
 
 
 def test_served_segment_ignores_garbage_and_synthetic_entries(tmp_path):
@@ -1393,6 +1639,8 @@ def test_served_segment_ignores_garbage_and_synthetic_entries(tmp_path):
         encoding="utf-8",
     )
     assert statusline._served_segment({"transcript_path": str(path)}) == ""
+    # A configured baseline must not conjure a warning out of no served model.
+    assert statusline._served_segment(_served_payload(str(path), "claude-opus-5")) == ""
 
 
 def test_served_segment_stays_fast_on_a_large_transcript(tmp_path):

@@ -6,9 +6,12 @@ stdin and prints one ANSI-colored line:
 
   Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | Fable 96%->Sat 10:59 | me@co.com · MyOrg · Max 5x
 
-A "<model> (FALLBACK, not <model>)" segment appears between the limits and
-the account when a gateway has switched the model mid-session (see
-_served_segment); it is absent on any session that never switched.
+A "<served> (FALLBACK, not <configured>)" segment appears between the limits
+and the account when the model actually ANSWERING is not the model the
+session is configured with right now -- a serving mismatch introduced by a
+gateway, never the user's own /model choice (see _served_segment). It is
+absent on every normally-served session, and it clears itself the moment the
+user switches models deliberately.
 
 The installer registers it as `"<abs-python>" -m jacked.statusline` with
 the absolute interpreter path resolved at install time (never a bare
@@ -643,26 +646,95 @@ def _models_in(chunk: str) -> list:
     return out
 
 
+def _configured_model(payload) -> str:
+    """The model id the session is configured with RIGHT NOW, or "".
+
+    Claude Code's stdin payload carries
+    model: {"id": "claude-opus-5", "display_name": "Opus"} and rewrites it
+    the moment the user runs /model, which is what makes it the only
+    baseline that follows a deliberate switch.
+
+    >>> _configured_model({"model": {"id": "claude-opus-5"}})
+    'claude-opus-5'
+    >>> _configured_model({"model": {"id": "  claude-opus-5  "}})
+    'claude-opus-5'
+    >>> _configured_model({"model": {"display_name": "Opus"}})
+    ''
+    >>> _configured_model({"model": {"id": ""}})
+    ''
+    >>> _configured_model({"model": {"id": 5}})
+    ''
+    >>> _configured_model({})
+    ''
+    >>> _configured_model("not-a-dict")
+    ''
+    """
+    model = payload.get("model") if isinstance(payload, dict) else None
+    raw = model.get("id") if isinstance(model, dict) else None
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def _model_key(name) -> str:
+    """Comparison key for a model id: namespace stripped, case folded.
+
+    A gateway reports the same model under its own namespace
+    ("openrouter/anthropic/claude-opus-5") that the payload names plainly
+    ("claude-opus-5"). Only the trailing segment identifies the model, so a
+    pure namespace difference must NOT read as a fallback -- otherwise every
+    gateway session would permanently warn against itself. This is the same
+    trailing-segment rule _served_segment already applies for DISPLAY, so
+    both sides of the comparison are reduced exactly the way both sides of
+    the message are.
+
+    >>> _model_key("openrouter/anthropic/claude-opus-5")
+    'claude-opus-5'
+    >>> _model_key("  Claude-Opus-5  ")
+    'claude-opus-5'
+    >>> _model_key("claude-opus-5") == _model_key("openrouter/anthropic/Claude-Opus-5")
+    True
+    >>> _model_key("claude-opus-5") == _model_key("openrouter/anthropic/claude-fable-5")
+    False
+    >>> _model_key(None)
+    ''
+    """
+    if not isinstance(name, str):
+        return ""
+    return name.strip().rsplit("/", 1)[-1].strip().casefold()
+
+
 def _served_segment(payload) -> str:
-    """Warn when the model answering is not the one the session started on.
+    """Warn when the model answering is not the model configured right now.
 
-    Claude Code's payload only ever carries the model the session was
-    *configured* with, so a gateway that does fallback routing (OpenRouter
-    presets, claude-code-router, LiteLLM) can silently switch the model
-    that actually answers -- to a pricier or weaker one -- with nothing on
-    screen to show it. The transcript does record the serving model on
-    every assistant message, so compare the newest against the session's
-    first and speak up only when they differ.
+    A gateway that does fallback routing (OpenRouter presets,
+    claude-code-router, LiteLLM) can silently answer with a different model
+    -- pricier or weaker -- from the one the session asked for, with nothing
+    on screen to show it. The transcript records the serving model on every
+    assistant message, so compare the NEWEST served model against the
+    CONFIGURED one and speak up only when they differ.
 
-    Renders nothing in the normal case: on a session that never switched,
-    the model segment already names the model, and a second copy would be
-    noise. That also keeps this free for the majority of users.
+    This detects a SERVING mismatch, never a user's own model choice. The
+    baseline is the payload's model id, which Claude Code rewrites on every
+    /model switch, so the warning self-clears the instant the user changes
+    models. An earlier version used the session's FIRST assistant turn as
+    the baseline; that baseline is frozen for the life of the session, so it
+    misreported every deliberate switch -- it stuck on screen forever after
+    one /model, and it labelled an UPGRADE ("claude-fable-5 (FALLBACK, not
+    claude-opus-5)") as a downgrade. Across 12 real transcripts it produced
+    three warnings, all three of them deliberate switches and none of them a
+    gateway fallback.
 
-    Deliberately does NOT consult environment variables for the expected
+    Both sides are compared through _model_key, so a gateway's namespaced id
+    for the configured model is not reported as a fallback.
+
+    Falls back to the session's first assistant turn ONLY when the payload
+    carries no usable model id (older Claude Code, malformed payload), which
+    keeps the feature working rather than dropping it silently where the
+    payload cannot help.
+
+    Deliberately does NOT consult environment variables for the configured
     model: a statusline subprocess is not guaranteed to inherit the
     session's environment, and that would fail silently on exactly the
-    gateway setups this exists for. The session's own first turn is the
-    reliable baseline.
+    gateway setups this exists for.
 
     Reads are bounded to the head and tail of the file. Transcripts reach
     100MB+ and this runs on every refresh, so a full scan would grow
@@ -671,6 +743,7 @@ def _served_segment(payload) -> str:
     path = payload.get("transcript_path") if isinstance(payload, dict) else None
     if not isinstance(path, str) or not path:
         return ""
+    expected = _configured_model(payload)
     tail_bytes = 262144
     # A single assistant message can be larger than the first window (a big
     # file read, a long system prompt), and a window that lands mid-line
@@ -682,14 +755,19 @@ def _served_segment(payload) -> str:
         with open(path, "rb") as fh:
             first = []
             read_bytes = 0
-            for window in head_windows:
-                if window > size and read_bytes >= size:
-                    break
-                fh.seek(0)
-                read_bytes = min(size, window)
-                first = _models_in(fh.read(read_bytes).decode("utf-8", "replace"))
-                if first or read_bytes >= size:
-                    break
+            # Perf: when the payload supplies the baseline, the head is not
+            # needed at all, so skip it entirely and read only the 256KB
+            # tail. That drops up to 4MB of reads off EVERY refresh -- the
+            # growing head windows are paid only on the fallback path below.
+            if not expected:
+                for window in head_windows:
+                    if window > size and read_bytes >= size:
+                        break
+                    fh.seek(0)
+                    read_bytes = min(size, window)
+                    first = _models_in(fh.read(read_bytes).decode("utf-8", "replace"))
+                    if first or read_bytes >= size:
+                        break
             if size > read_bytes:
                 fh.seek(max(0, size - tail_bytes))
                 last = _models_in(fh.read().decode("utf-8", "replace"))
@@ -697,10 +775,14 @@ def _served_segment(payload) -> str:
                 last = first
     except (OSError, ValueError):
         return ""
-    if not first or not last:
+    if not last:
         return ""
-    expected, served = first[0], last[-1]
-    if served == expected:
+    if not expected:
+        if not first:
+            return ""
+        expected = first[0]
+    served = last[-1]
+    if _model_key(served) == _model_key(expected):
         return ""
     short_served = served.rsplit("/", 1)[-1]
     short_expected = expected.rsplit("/", 1)[-1]
