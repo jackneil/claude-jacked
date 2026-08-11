@@ -238,14 +238,20 @@ function renderActionButtons(acct) {
     // const copyHtml = `<button class="btn-copy-cmd ...">...</button>`;
     const copyHtml = '';
 
-    // Re-auth button (if invalid/expired) — pills also handle this, keep for
-    // backward compat. NOT for Codex: its re-auth is `codex login` (the Codex
-    // pill's "re-login" tooltip guides that), not the Claude browser OAuth.
-    const showReauth = (status === 'invalid' || status === 'expired')
-        && (acct.provider || 'claude') !== 'codex';
+    // Re-auth button — always rendered for Claude accounts, not just when
+    // jacked thinks the token is bad. Validation lag (accounts revalidate at
+    // most hourly) means the DB can say 'valid' after the token actually died,
+    // and gating on status hid the only re-auth affordance exactly when state
+    // detection was wrong. Prominent blue when jacked knows re-auth is needed;
+    // subtle neutral otherwise. NOT for Codex: its re-auth is `codex login`
+    // (the Codex pill's "re-login" tooltip guides that), not browser OAuth.
     let reauthHtml = '';
-    if (showReauth) {
-        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
+    if ((acct.provider || 'claude') !== 'codex') {
+        const needsReauth = status === 'invalid' || status === 'expired';
+        const reauthClass = needsReauth
+            ? 'bg-blue-600/20 text-blue-400 hover:bg-blue-600/40'
+            : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700';
+        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 ${reauthClass} rounded transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}" title="Re-run browser sign-in for this account">Re-auth</button>`;
     }
 
     // Toggle active/disabled
