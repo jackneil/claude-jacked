@@ -30,10 +30,18 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip --only-binary=:all:
-          pip install --only-binary=:all: build hatchling cyclonedx-bom
+          pip install --only-binary=:all: build hatchling cyclonedx-bom twine
 
       - name: Build package
         run: python -m build
+
+      # Validate the built metadata HERE, in the reversible build job, rather
+      # than discovering it in the publish step after the GitHub Release (the
+      # irreversible trigger) has already been cut. v0.92.0 failed exactly that
+      # way: hatchling 1.32.0 emits Metadata-Version 2.5, and the publish
+      # action's pinned twine predated twine v7 and rejected it.
+      - name: Check distribution metadata
+        run: twine check dist/*
 
       - name: Generate CycloneDX SBOM
         # SBOM must live OUTSIDE dist/ — twine check rejects unknown files in dist/.
@@ -77,5 +85,8 @@ jobs:
           name: dist
           path: dist/
 
+      # v1.14.2 is the first release carrying twine v7 (upstream issue #416,
+      # closed 2026-07-28). The previous pin was cut 2026-02-18 and its twine
+      # rejected Metadata-Version 2.5, which current hatchling now emits.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
