@@ -186,7 +186,184 @@ function initPillHandlers() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Account overflow (kebab) menu
+//
+// The menu holds the rare actions (copy launch command, rename, re-auth,
+// enable/disable, delete). Each row keeps the legacy button class and data-*
+// attributes, so the handlers below bind to them exactly as before — this
+// block only handles open/close/focus.
+// ---------------------------------------------------------------------------
+
+// The single open menu, or null. Kept as a reference (not a DOM query) so the
+// stale-node case after a re-render is impossible to act on: every render
+// clears it in initAccountMenuHandlers().
+let _openAccountMenu = null;   // { btn, menu, card }
+// Document-level listeners survive re-renders, so they are bound exactly once.
+let _accountMenuGlobalsBound = false;
+
+function closeAccountMenu(opts) {
+    if (!_openAccountMenu) return;
+    const { btn, menu, card } = _openAccountMenu;
+    _openAccountMenu = null;
+    if (menu) menu.classList.add('hidden');
+    if (btn) {
+        btn.setAttribute('aria-expanded', 'false');
+        if (opts && opts.focusButton && typeof btn.focus === 'function') btn.focus();
+    }
+    if (card) card.classList.remove('menu-open');
+}
+
+function openAccountMenu(btn) {
+    const wrap = btn.closest('.account-menu-wrap');
+    const menu = wrap ? wrap.querySelector('.account-menu') : null;
+    if (!menu) return;
+    closeAccountMenu();          // only one menu open at a time
+    menu.classList.remove('hidden');
+    btn.setAttribute('aria-expanded', 'true');
+    const card = btn.closest('[data-account-id]');
+    if (card) card.classList.add('menu-open');
+    _openAccountMenu = { btn, menu, card };
+}
+
+function toggleAccountMenu(btn) {
+    if (_openAccountMenu && _openAccountMenu.btn === btn) {
+        closeAccountMenu();
+        return;
+    }
+    openAccountMenu(btn);
+}
+
+// The account id whose menu is open, or null. Callers that rebuild
+// #accounts-list (rerenderAccountsView) save this before the swap.
+function openAccountMenuId() {
+    if (!_openAccountMenu || !_openAccountMenu.btn) return null;
+    const id = _openAccountMenu.btn.dataset ? _openAccountMenu.btn.dataset.id : null;
+    return id === undefined ? null : id;
+}
+
+// Re-open the menu for `id` against the CURRENT DOM. This is the restore half of
+// the save/restore pair rerenderAccountsView uses for every other piece of
+// transient UI state (expanded details, repo groups, the lookup input, the live
+// OAuth banner) — without it a routine websocket re-render closes a menu the
+// user is still reading. Returns true when a menu was opened.
+//
+// The account can legitimately be gone (deleted, filtered out, disabled between
+// renders): that is a no-op, never a throw. Buttons are matched by dataset
+// rather than an interpolated attribute selector so an exotic id can't build a
+// malformed selector.
+function openAccountMenuForId(id) {
+    if (id === null || id === undefined || id === '') return false;
+    const wanted = String(id);
+    const scope = document.getElementById('accounts-list') || document;
+    if (!scope || typeof scope.querySelectorAll !== 'function') return false;
+    const buttons = Array.prototype.slice.call(scope.querySelectorAll('.btn-account-menu'));
+    const btn = buttons.find(b => b && b.dataset && String(b.dataset.id) === wanted);
+    if (!btn) return false;
+    openAccountMenu(btn);
+    return !!_openAccountMenu;
+}
+
+function _accountMenuItems() {
+    if (!_openAccountMenu || !_openAccountMenu.menu) return [];
+    return Array.prototype.slice.call(
+        _openAccountMenu.menu.querySelectorAll('[role="menuitem"]')
+    );
+}
+
+// delta = +1 (ArrowDown) / -1 (ArrowUp), wrapping at both ends. Focus starting
+// on the kebab button (index -1) enters the list at the matching edge.
+function _moveAccountMenuFocus(delta) {
+    const items = _accountMenuItems();
+    if (items.length === 0) return;
+    const current = items.indexOf(document.activeElement);
+    const next = current < 0
+        ? (delta > 0 ? 0 : items.length - 1)
+        : (current + delta + items.length) % items.length;
+    if (items[next] && typeof items[next].focus === 'function') items[next].focus();
+}
+
+function initAccountMenuHandlers() {
+    // Every render replaces #accounts-list wholesale, so a menu that was open
+    // belongs to a detached node — drop the reference so no menu can be stuck
+    // open (and no stale card keeps the raised z-index) across a poll.
+    // Re-opening the menu on the FRESH nodes is the caller's job: see the
+    // openAccountMenuId()/openAccountMenuForId() pair in rerenderAccountsView.
+    _openAccountMenu = null;
+
+    const list = document.getElementById('accounts-list');
+    if (list) {
+        // CAPTURE phase on purpose: the item handlers keep their own listeners
+        // (.btn-edit-label even calls stopPropagation()), so closing on the
+        // bubble would strand the menu open. Capture runs first and only
+        // toggles a class, leaving every existing handler untouched — the
+        // delete flow still renders its inline confirm into
+        // .delete-confirm-container, which sits outside the menu.
+        list.addEventListener('click', (e) => {
+            const target = e.target;
+            if (!target || typeof target.closest !== 'function') return;
+            const kebab = target.closest('.btn-account-menu');
+            if (kebab) {
+                toggleAccountMenu(kebab);
+                return;
+            }
+            if (target.closest('.account-menu')) closeAccountMenu();
+        }, true);
+
+        list.addEventListener('keydown', (e) => {
+            if (!_openAccountMenu) return;
+            const target = e.target;
+            if (!target || typeof target.closest !== 'function') return;
+            if (!target.closest('.account-menu') && !target.closest('.btn-account-menu')) return;
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                _moveAccountMenuFocus(1);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                _moveAccountMenuFocus(-1);
+            }
+            // Enter/Space fall through to native <button> activation.
+        });
+    }
+
+    // Delegation lives on #accounts-list (new element per render); these two
+    // are on document and must never be stacked up render after render.
+    if (_accountMenuGlobalsBound) return;
+    _accountMenuGlobalsBound = true;
+
+    // CAPTURE phase, for the same reason the list listener above uses it: an
+    // outside element whose OWN handler calls stopPropagation() would otherwise
+    // never let this run, stranding the menu open with its card still carrying
+    // .menu-open (z-index 40) painting over the card beneath it. The per-card
+    // .btn-refresh-single handler does exactly that, so opening card A's menu
+    // and then clicking card B's refresh icon used to leave A stuck open.
+    //
+    // Capture is safe because of the two guards below. On the click that OPENS a
+    // menu, _openAccountMenu is still null, so this returns before the list-level
+    // capture handler opens it. On a click of ANOTHER card's kebab, the guard
+    // compares against the currently tracked button — a different button falls
+    // through to closeAccountMenu(), and the list handler then opens the new one,
+    // which is the desired result.
+    document.addEventListener('click', (e) => {
+        if (!_openAccountMenu) return;
+        const target = e.target;
+        if (target && typeof target.closest === 'function') {
+            // Clicks on the open menu's own button or panel are handled by the
+            // list listener above; anything else counts as "outside".
+            if (target.closest('.btn-account-menu') === _openAccountMenu.btn) return;
+            if (target.closest('.account-menu') === _openAccountMenu.menu) return;
+        }
+        closeAccountMenu();
+    }, true);
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape' || !_openAccountMenu) return;
+        closeAccountMenu({ focusButton: true });
+    });
+}
+
 function bindAccountEvents() {
+    initAccountMenuHandlers();
     initPillHandlers();
     if (typeof bindSessionControlEvents === 'function') bindSessionControlEvents();
 

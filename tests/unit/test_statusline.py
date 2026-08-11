@@ -6,8 +6,10 @@ Isolation contract. Every test runs against a tmp home.
 * Renderer tests call ``statusline.render(payload, home=..., now=...)`` with an
   EXPLICIT home and an EXPLICIT ``now``, so no test reads the real
   ``~/.claude.json`` and no assertion depends on wall-clock time. The tmp home
-  starts without a ``.claude.json`` and without the caveman flag, so the account
-  and badge segments are empty unless the test creates them.
+  starts without a ``.claude.json``, without a ``jacked.db`` and without the
+  caveman flag, so the account, model-scoped usage and badge segments are empty
+  unless the test creates them. Nothing here ever opens the real
+  ``~/.claude/jacked.db``.
 * Engine, CLI, and route tests set ``$JACKED_HOME`` to the same tmp home the
   assertions read, so ``statusline_setup``, the CLI installer, and the route all
   converge on one ``settings.json``.
@@ -19,10 +21,16 @@ Isolation contract. Every test runs against a tmp home.
 Nothing here touches the real ``~/.claude``, the network, or npx.
 """
 
+import ast
+import builtins
+import datetime
 import hashlib
 import io
 import json
 import os
+import re
+import sqlite3
+import stat
 import sys
 import time
 from io import StringIO
@@ -382,14 +390,20 @@ def test_account_segment_is_empty_without_claude_json(home):
 
 
 def test_account_segment_writes_a_versioned_source_cache(home):
-    _write_account(home, emailAddress="me@co.com")
+    """The cache carries the identity too, so the model-scoped usage lookup
+    never re-reads (or re-parses) the multi-MB ~/.claude.json."""
+    _write_account(
+        home,
+        emailAddress="me@co.com",
+        organizationUuid="org-uuid-1",
+    )
     segment = _render({}, home)
     assert segment == "me@co.com"
     cached = json.loads(_cache_path(home).read_text(encoding="utf-8"))
     source_stat = (home / ".claude.json").stat()
 
     assert cached == {
-        "version": 2,
+        "version": 3,
         "source": {
             "mtime_ns": source_stat.st_mtime_ns,
             "ctime_ns": source_stat.st_ctime_ns,
@@ -401,6 +415,8 @@ def test_account_segment_writes_a_versioned_source_cache(home):
             ).hexdigest(),
         },
         "segment": segment,
+        "email": "me@co.com",
+        "org_uuid": "org-uuid-1",
     }
 
 
@@ -1299,22 +1315,188 @@ def test_settings_js_toasts_the_statusline_takeover_flags(flag, copy):
 # --------------------------------------------------------------------------- #
 # F. Served-model segment: gateway fallback visibility
 # --------------------------------------------------------------------------- #
+#
+# The baseline is the CONFIGURED model from the stdin payload
+# (model.id), not the session's first assistant turn. A first-turn baseline is
+# frozen for the life of the session, so it stuck on screen forever after one
+# deliberate /model switch and it labelled an UPGRADE as a downgrade
+# ("claude-fable-5 (FALLBACK, not claude-opus-5)"). Measured over 12 real
+# transcripts, the old baseline produced three warnings and all three were
+# deliberate user switches -- zero true positives. This segment exists to catch
+# a SERVING mismatch (a gateway answering with a model nobody asked for), never
+# the user's own model choice.
+#
+# The first-turn baseline survives only where the payload carries no usable
+# model id, and only that path still pays the growing head read.
 
-def _transcript(tmp_path, models, name="t.jsonl", pad_first=False):
+def _transcript(tmp_path, models, name="t.jsonl", pad_first=False, pad_bytes=70000):
     """Write a session JSONL whose assistant messages carry `models` in order.
 
-    pad_first inflates the first entry so the file exceeds the head window,
-    forcing the tail seek (and therefore a partial line at the boundary).
+    pad_first inflates the first entry by pad_bytes so the file exceeds the
+    head window, forcing the tail seek (and therefore a partial line at the
+    boundary). Push pad_bytes past the 256KB tail to also force the growing
+    head windows and a non-zero tail seek offset.
     """
     path = tmp_path / name
     lines = []
     for i, model in enumerate(models):
         entry = {"type": "assistant", "message": {"model": model, "content": []}}
         if pad_first and i == 0:
-            entry["message"]["content"] = ["x" * 70000]
+            entry["message"]["content"] = ["x" * pad_bytes]
         lines.append(json.dumps(entry))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(path)
+
+
+def _served_payload(transcript_path, model_id=None):
+    """A stdin-shaped payload: transcript plus the CONFIGURED model id.
+
+    Claude Code writes model: {"id": ..., "display_name": ...} and rewrites
+    it on every /model switch, which is why it is the baseline.
+    """
+    payload = {"transcript_path": transcript_path}
+    if model_id is not None:
+        payload["model"] = {"id": model_id, "display_name": model_id}
+    return payload
+
+
+class _ReadLog:
+    """Every seek/read `_served_segment` performed on the transcript."""
+
+    def __init__(self):
+        self.events = []
+
+    @property
+    def total_bytes(self):
+        return sum(n for kind, n in self.events if kind == "read")
+
+    @property
+    def head_seeks(self):
+        return self.events.count(("seek", 0))
+
+
+class _TracedFile:
+    """Read-tracing proxy; only the calls `_served_segment` makes exist here."""
+
+    def __init__(self, fh, log):
+        self._fh, self._log = fh, log
+
+    def read(self, *args):
+        data = self._fh.read(*args)
+        self._log.events.append(("read", len(data)))
+        return data
+
+    def seek(self, pos, *args):
+        self._log.events.append(("seek", pos))
+        return self._fh.seek(pos, *args)
+
+    def __enter__(self):
+        self._fh.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._fh.__exit__(*exc)
+
+
+def _trace_served_reads(monkeypatch, payload):
+    """Run `_served_segment` with every read of its transcript recorded."""
+    log = _ReadLog()
+    target = os.path.realpath(payload["transcript_path"])
+    real_open = builtins.open
+
+    def traced(file, *args, **kwargs):
+        fh = real_open(file, *args, **kwargs)
+        if os.path.realpath(str(file)) == target:
+            return _TracedFile(fh, log)
+        return fh
+
+    monkeypatch.setattr(builtins, "open", traced)
+    try:
+        segment = statusline._served_segment(payload)
+    finally:
+        monkeypatch.undo()
+    return segment, log
+
+
+# --- the configured-model baseline ----------------------------------------- #
+
+def test_served_segment_clears_after_a_deliberate_model_upgrade(tmp_path, home):
+    """Regression: the exact real transcript that rendered an INVERTED warning.
+
+    The session started on claude-opus-5 and the user UPGRADED to
+    claude-fable-5 with /model. Against a first-turn baseline this rendered
+    "claude-fable-5 (FALLBACK, not claude-opus-5)" -- calling the more capable,
+    deliberately chosen model a downgrade-fallback, and never clearing.
+    """
+    tp = _transcript(tmp_path, ["claude-opus-5"] * 2 + ["claude-fable-5"] * 2)
+    payload = _served_payload(tp, "claude-fable-5")
+
+    assert statusline._served_segment(payload) == ""
+    line = _render(dict(payload, model={"id": "claude-fable-5", "display_name": "Fable 5"}), home)
+    assert "FALLBACK" not in line
+
+
+def test_served_segment_clears_when_the_user_switches_back(tmp_path):
+    """Switching back is still a user choice, so nothing may linger."""
+    tp = _transcript(tmp_path, ["claude-fable-5"] * 3)
+    assert statusline._served_segment(_served_payload(tp, "claude-fable-5")) == ""
+
+
+def test_served_segment_flags_a_gateway_serving_another_model(tmp_path, home):
+    """The case this feature exists for: served != configured."""
+    tp = _transcript(tmp_path, ["claude-fable-5"] + ["claude-opus-5"] * 2)
+    payload = _served_payload(tp, "claude-fable-5")
+
+    seg = statusline._served_segment(payload)
+    assert seg == f"{RED}claude-opus-5 (FALLBACK, not claude-fable-5){RESET}"
+    assert "FALLBACK" in _render(payload, home)
+
+
+def test_served_segment_ignores_a_pure_namespace_difference(tmp_path):
+    """A gateway namespaces the SAME model; that is not a fallback."""
+    tp = _transcript(tmp_path, ["openrouter/anthropic/claude-opus-5"] * 2)
+    assert statusline._served_segment(_served_payload(tp, "claude-opus-5")) == ""
+    # Case and stray whitespace are not a mismatch either.
+    assert statusline._served_segment(_served_payload(tp, " Claude-Opus-5 ")) == ""
+
+
+def test_served_segment_flags_a_namespaced_model_that_really_differs(tmp_path):
+    """Namespace tolerance must not swallow a genuinely different model."""
+    tp = _transcript(tmp_path, ["openrouter/anthropic/claude-fable-5"])
+    seg = statusline._served_segment(_served_payload(tp, "claude-opus-5"))
+    assert "claude-fable-5 (FALLBACK, not claude-opus-5)" in seg
+    assert "openrouter/" not in seg
+
+
+def test_served_segment_uses_the_configured_model_not_the_display_name(tmp_path):
+    """display_name ("Fable 5") never matches a model id; only `id` counts."""
+    tp = _transcript(tmp_path, ["claude-fable-5"] * 2)
+    payload = {
+        "transcript_path": tp,
+        "model": {"id": "claude-fable-5", "display_name": "Fable 5"},
+    }
+    assert statusline._served_segment(payload) == ""
+
+
+# --- the first-turn fallback, for payloads with no model id ----------------- #
+
+@pytest.mark.parametrize("model", [
+    None,                                   # no model key at all
+    {},                                     # model object, no id
+    {"display_name": "Opus"},               # older Claude Code: name only
+    {"id": ""},                             # present but empty
+    {"id": "   "},                          # whitespace only
+    {"id": 5},                              # wrong type
+    "not-a-dict",
+])
+def test_served_segment_falls_back_to_the_first_turn_without_a_model_id(tmp_path, model):
+    """No usable payload id: keep the old baseline rather than drop the feature."""
+    # tmp_path is unique per parametrized case, so the default name is safe.
+    tp = _transcript(tmp_path, ["deepseek/v4"] * 2 + ["openai/luna"])
+    payload = {"transcript_path": tp}
+    if model is not None:
+        payload["model"] = model
+    assert "luna (FALLBACK, not v4)" in statusline._served_segment(payload)
 
 
 def test_served_segment_is_silent_when_the_model_never_changed(tmp_path, home):
@@ -1356,16 +1538,95 @@ def test_served_segment_survives_a_partial_line_at_the_seek_boundary(tmp_path):
     assert "luna (FALLBACK, not v4)" in seg
 
 
+# --- the head read is real work, and the payload path must not pay it ------ #
+
+def _head_beyond_the_windows(tmp_path, name):
+    """A transcript whose first assistant message is bigger than the tail read.
+
+    First turn claude-opus-5, newest claude-fable-5, and >256KB of padding in
+    between, so (a) the first model is only reachable through the GROWING head
+    windows and (b) the tail seek offset is non-zero -- which is what makes a
+    seek to 0 unambiguous evidence that the head was read.
+    """
+    tp = _transcript(
+        tmp_path,
+        ["claude-opus-5"] + ["claude-fable-5"] * 3,
+        name=name,
+        pad_first=True,
+        pad_bytes=300000,
+    )
+    assert os.path.getsize(tp) > 262144
+    return tp
+
+
+def test_served_segment_skips_the_head_read_when_the_payload_has_a_baseline(tmp_path, monkeypatch):
+    """Perf: no head read at all on the payload path -- tail only.
+
+    The head of this transcript says claude-opus-5, which would produce a
+    (wrong) warning if it were consulted. Both facts are asserted: the answer
+    is empty, and the file was never seeked back to 0.
+    """
+    tp = _head_beyond_the_windows(tmp_path, "skip.jsonl")
+
+    seg, log = _trace_served_reads(monkeypatch, _served_payload(tp, "claude-fable-5"))
+
+    assert seg == ""                                  # head baseline not used
+    assert log.head_seeks == 0                        # head never even read
+    assert log.total_bytes <= 262144, log.events      # tail window only
+    assert log.events[0][0] == "seek" and log.events[0][1] > 0
+
+
+def test_served_segment_grows_the_head_read_only_on_the_fallback_path(tmp_path, monkeypatch):
+    """Without a payload id the old behavior stands, growing windows included."""
+    tp = _head_beyond_the_windows(tmp_path, "grow.jsonl")
+    size = os.path.getsize(tp)
+
+    seg, log = _trace_served_reads(monkeypatch, {"transcript_path": tp})
+
+    assert "claude-fable-5 (FALLBACK, not claude-opus-5)" in seg
+    # 64KB and 256KB both land inside the padded first line; the 1MB window is
+    # what finally reaches the first model.
+    assert log.head_seeks == 3, log.events
+    assert log.total_bytes == 65536 + 262144 + size
+
+
+# --- robustness ------------------------------------------------------------ #
+
 @pytest.mark.parametrize("payload", [
     {},
     {"transcript_path": None},
     {"transcript_path": ""},
     {"transcript_path": "/nonexistent/nope.jsonl"},
+    {"transcript_path": "/nonexistent/nope.jsonl", "model": {"id": "claude-opus-5"}},
     "not-a-dict",
 ])
 def test_served_segment_treats_absence_as_normal(payload):
     """Absence is never an error; the segment simply drops."""
     assert statusline._served_segment(payload) == ""
+
+
+def test_served_segment_tolerates_an_empty_transcript(tmp_path):
+    """A zero-byte transcript has no served model, with or without a baseline."""
+    path = tmp_path / "empty.jsonl"
+    path.write_text("", encoding="utf-8")
+    assert statusline._served_segment({"transcript_path": str(path)}) == ""
+    assert statusline._served_segment(_served_payload(str(path), "claude-opus-5")) == ""
+
+
+def test_served_segment_tolerates_an_unreadable_transcript(tmp_path):
+    """A permission error drops the segment instead of raising."""
+    path = tmp_path / "locked.jsonl"
+    path.write_text(
+        json.dumps({"type": "assistant", "message": {"model": "claude-opus-5"}}) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0)
+    try:
+        if os.access(path, os.R_OK):
+            pytest.skip("running as a user that ignores file modes")
+        assert statusline._served_segment(_served_payload(str(path), "claude-fable-5")) == ""
+    finally:
+        path.chmod(0o644)
 
 
 def test_served_segment_ignores_garbage_and_synthetic_entries(tmp_path):
@@ -1378,6 +1639,8 @@ def test_served_segment_ignores_garbage_and_synthetic_entries(tmp_path):
         encoding="utf-8",
     )
     assert statusline._served_segment({"transcript_path": str(path)}) == ""
+    # A configured baseline must not conjure a warning out of no served model.
+    assert statusline._served_segment(_served_payload(str(path), "claude-opus-5")) == ""
 
 
 def test_served_segment_stays_fast_on_a_large_transcript(tmp_path):
@@ -1394,3 +1657,807 @@ def test_served_segment_stays_fast_on_a_large_transcript(tmp_path):
     elapsed = time.monotonic() - started
     assert "last (FALLBACK, not first)" in seg
     assert elapsed < 0.25, f"took {elapsed:.3f}s; bounded reads regressed"
+
+
+# --------------------------------------------------------------------------- #
+# G. Model-scoped weekly usage: the limit the payload cannot see
+# --------------------------------------------------------------------------- #
+#
+# Claude Code's stdin payload carries only five_hour and seven_day, and its
+# seven_day number is the AGGREGATE. On every real account measured, the
+# model-scoped weekly percentage runs higher (96% vs 76%, 100% vs 90%), so the
+# aggregate under-reports the limit that actually stops the session. jacked
+# already polls and caches the usage API that carries the scoped number, in
+# ~/.claude/jacked.db, which this segment reads read-only.
+
+EMAIL = "me@co.com"
+ORG = "d9e88fe1-7971-42b8-900d-70f3be280306"
+OTHER_ORG = "f352d25d-06b5-4f62-86b7-c9d1f03447ad"
+
+SESSION_RESET = NOW + 3600            # under 24h -> "%H:%M"
+SCOPED_RESET = NOW + 4 * 86400        # over 24h  -> "%a %H:%M"
+FRESH_AT = NOW - 60
+
+
+def _iso(epoch):
+    """Epoch -> the ISO-8601-with-offset shape the Anthropic usage API emits."""
+    return datetime.datetime.fromtimestamp(
+        epoch, datetime.timezone.utc
+    ).isoformat()
+
+
+def _expect_reset(epoch, now=NOW):
+    """The reset text _fmt_reset produces, derived the same way it is."""
+    fmt = "%H:%M" if (epoch - now) < 86400 else "%a %H:%M"
+    return time.strftime(fmt, time.localtime(epoch))
+
+
+def _session_limit(percent=27):
+    return {
+        "kind": "session", "group": "session", "percent": percent,
+        "severity": "normal", "resets_at": _iso(SESSION_RESET),
+        "scope": None, "is_active": False,
+    }
+
+
+def _weekly_all(percent=76):
+    return {
+        "kind": "weekly_all", "group": "weekly", "percent": percent,
+        "severity": "warning", "resets_at": _iso(SCOPED_RESET),
+        "scope": None, "is_active": False,
+    }
+
+
+_DEFAULT_RESET = object()
+
+
+def _weekly_scoped(model="Fable", percent=96, is_active=True,
+                   resets_at=_DEFAULT_RESET):
+    """A weekly_scoped entry shaped exactly like the live API's."""
+    return {
+        "kind": "weekly_scoped", "group": "weekly", "percent": percent,
+        "severity": "critical",
+        "resets_at": _iso(SCOPED_RESET) if resets_at is _DEFAULT_RESET else resets_at,
+        "scope": {"model": {"id": None, "display_name": model}, "surface": None},
+        "is_active": is_active,
+    }
+
+
+def _raw(*entries):
+    """A cached_usage_raw blob carrying the given limits."""
+    return json.dumps({"five_hour": {}, "seven_day": {}, "limits": list(entries)})
+
+
+def _write_db(home_dir, rows, path=None):
+    """Build a jacked.db-shaped accounts table holding `rows`.
+
+    rows: (email, organization_uuid, cached_usage_raw, usage_cached_at).
+    """
+    db = Path(path) if path is not None else home_dir / ".claude" / "jacked.db"
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE accounts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, "
+            "organization_uuid TEXT DEFAULT '', cached_usage_raw TEXT, "
+            "usage_cached_at INTEGER)"
+        )
+        con.executemany(
+            "INSERT INTO accounts "
+            "(email, organization_uuid, cached_usage_raw, usage_cached_at) "
+            "VALUES (?, ?, ?, ?)",
+            list(rows),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return db
+
+
+def _usage_home(home_dir, limits=None, cached_at=FRESH_AT, email=EMAIL, org=ORG):
+    """A tmp home wired up like a signed-in machine with jacked polling."""
+    _write_account(
+        home_dir,
+        emailAddress=email,
+        organizationUuid=org,
+        userRateLimitTier="default_claude_max_5x",
+    )
+    _write_db(
+        home_dir,
+        [(
+            email,
+            org,
+            _raw(*(limits if limits is not None else (
+                _session_limit(), _weekly_all(), _weekly_scoped(),
+            ))),
+            cached_at,
+        )],
+    )
+    return home_dir
+
+
+def _usage_cache_path(home_dir):
+    return home_dir / ".claude" / "statusline-usage.cache"
+
+
+def _scoped(label="Fable", pct=96, color=RED, reset=SCOPED_RESET, marker=""):
+    return (
+        f"{marker}{label} {color}{pct}%{RESET}{ARROW}{_expect_reset(reset)}"
+    )
+
+
+# --- placement ------------------------------------------------------------- #
+
+def test_scoped_usage_lands_between_the_seven_day_and_account_segments(home):
+    _usage_home(home)
+    line = _render(_full_payload(), home)
+
+    assert line.split(SEP) == [
+        f"{BOLD_CYAN}Fable 5{RESET} {YELLOW}[xhigh]{RESET} {MAGENTA}[fast]{RESET}",
+        f"ctx {YELLOW}63%{RESET} (633k/1.0M)",
+        f"5h {GREEN}7%{RESET}{ARROW}"
+        + time.strftime("%H:%M", time.localtime(NOW + 3600)),
+        f"7d {RED}88%{RESET}{ARROW}"
+        + time.strftime("%a %H:%M", time.localtime(NOW + 3 * 86400)),
+        _scoped(),
+        f"{EMAIL} {MIDDOT} Max 5x",
+    ]
+
+
+def test_scoped_usage_reports_higher_than_the_aggregate_seven_day(home):
+    """The whole point: 7d alone hides the binding constraint."""
+    _usage_home(home, limits=(_weekly_all(76), _weekly_scoped("Fable", 96)))
+    payload = _full_payload()
+    payload["rate_limits"]["seven_day"]["used_percentage"] = 76.0
+
+    line = _render(payload, home)
+
+    assert f"7d {YELLOW}76%{RESET}" in line
+    assert f"Fable {RED}96%{RESET}" in line
+
+
+def test_scoped_usage_precedes_a_fallback_warning(home):
+    """Order stays limits -> scoped -> FALLBACK -> account."""
+    _usage_home(home)
+    tp = _transcript(home, ["a/one", "b/two"], name="fb.jsonl")
+    line = _render(
+        {"model": {"display_name": "Fable 5"}, "transcript_path": tp}, home
+    )
+    parts = line.split(SEP)
+    assert parts[1] == _scoped()
+    assert "FALLBACK" in parts[2]
+
+
+# --- model matching -------------------------------------------------------- #
+
+@pytest.mark.parametrize("payload_model,bucket_model", [
+    ("Fable 5", "Fable"),
+    ("Fable", "Fable"),
+    ("fable 5", "FABLE"),
+    ("Opus", "Claude Opus 4.5"),
+    ("Claude Opus 4.5", "Opus"),
+])
+def test_a_fuller_payload_name_still_matches_its_bucket(
+    home, payload_model, bucket_model
+):
+    _usage_home(home, limits=(_weekly_scoped(bucket_model, 96, is_active=False),))
+    line = _render({"model": {"display_name": payload_model}}, home)
+    assert _scoped(label=bucket_model) in line
+
+
+def test_a_non_matching_model_falls_back_to_the_active_bucket(home):
+    _usage_home(home, limits=(
+        _weekly_all(76),
+        _weekly_scoped("Fable", 96, is_active=True),
+    ))
+    line = _render({"model": {"display_name": "Sonnet 5"}}, home)
+    assert _scoped(label="Fable", pct=96) in line
+
+
+def test_the_session_model_beats_the_active_bucket(home):
+    """A matching bucket wins even when another one is flagged active."""
+    _usage_home(home, limits=(
+        _weekly_scoped("Opus", 100, is_active=True),
+        _weekly_scoped("Fable", 96, is_active=False),
+    ))
+    line = _render({"model": {"display_name": "Fable 5"}}, home)
+    assert _scoped(label="Fable", pct=96) in line
+    assert "Opus" not in line
+
+
+def test_no_scoped_bucket_at_all_drops_the_segment(home):
+    _usage_home(home, limits=(_session_limit(), _weekly_all(76)))
+    line = _render(_full_payload(), home)
+    assert "%" in line                       # the payload's own segments survive
+    assert line.split(SEP)[-1] == f"{EMAIL} {MIDDOT} Max 5x"
+    assert "Fable 5" in line                 # only the model segment names it
+    assert line.count("Fable") == 1
+
+
+def test_no_match_and_no_active_bucket_drops_the_segment(home):
+    _usage_home(home, limits=(_weekly_scoped("Opus", 100, is_active=False),))
+    assert "Opus" not in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+def test_a_missing_model_name_still_shows_the_active_bucket(home):
+    """No model in the payload is not a reason to hide the binding limit."""
+    _usage_home(home, limits=(_weekly_scoped("Fable", 96, is_active=True),))
+    assert _scoped() in _render({}, home)
+
+
+def test_a_bucket_without_a_display_name_is_dropped(home):
+    """An unlabeled percentage beside 7d is noise, not information."""
+    bucket = _weekly_scoped("Fable", 96, is_active=True)
+    bucket["scope"]["model"]["display_name"] = None
+    _usage_home(home, limits=(bucket,))
+    assert _render({"model": {"display_name": "Fable 5"}}, home) == (
+        f"{BOLD_CYAN}Fable 5{RESET}{SEP}{EMAIL} {MIDDOT} Max 5x"
+    )
+
+
+@pytest.mark.parametrize("pct,color", [(10, GREEN), (70, YELLOW), (96, RED)])
+def test_scoped_usage_uses_the_shared_pressure_colors(home, pct, color):
+    _usage_home(home, limits=(_weekly_scoped("Fable", pct),))
+    assert _scoped(pct=pct, color=color) in _render(
+        {"model": {"display_name": "Fable 5"}}, home
+    )
+
+
+def test_scoped_percent_is_rounded_like_every_other_percentage(home):
+    _usage_home(home, limits=(_weekly_scoped("Fable", 84.6),))
+    assert _scoped(pct=85, color=RED) in _render(
+        {"model": {"display_name": "Fable 5"}}, home
+    )
+
+
+@pytest.mark.parametrize("percent", [None, "96", True, [96]])
+def test_a_non_numeric_percent_drops_the_segment(home, percent):
+    _usage_home(home, limits=(_weekly_scoped("Fable", percent),))
+    assert "Fable 9" not in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+# --- account disambiguation ------------------------------------------------ #
+
+def test_org_uuid_disambiguates_two_accounts_sharing_one_email(home):
+    """Real situation on this machine: one address, two organizations.
+
+    Matching on the email alone would show the other org's numbers.
+    """
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    _write_db(home, [
+        (EMAIL, OTHER_ORG, _raw(_weekly_scoped("Opus", 100)), FRESH_AT),
+        (EMAIL, ORG, _raw(_weekly_scoped("Fable", 96)), FRESH_AT),
+    ])
+
+    line = _render({"model": {"display_name": "Fable 5"}}, home)
+
+    assert _scoped(label="Fable", pct=96) in line
+    assert "100%" not in line
+
+
+def test_the_other_org_row_is_selected_when_claude_json_points_there(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=OTHER_ORG)
+    _write_db(home, [
+        (EMAIL, OTHER_ORG, _raw(_weekly_scoped("Opus", 100)), FRESH_AT),
+        (EMAIL, ORG, _raw(_weekly_scoped("Fable", 96)), FRESH_AT),
+    ])
+
+    line = _render({"model": {"display_name": "Opus 4.5"}}, home)
+
+    assert _scoped(label="Opus", pct=100) in line
+    assert "96%" not in line
+
+
+def test_an_unknown_org_uuid_drops_the_segment(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid="not-in-the-db")
+    _write_db(home, [(EMAIL, ORG, _raw(_weekly_scoped()), FRESH_AT)])
+    assert "96%" not in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+def test_a_claude_json_without_an_org_uuid_drops_the_segment(home):
+    """Email alone resolves ambiguously, so it is never enough on its own."""
+    _write_account(home, emailAddress=EMAIL)
+    _write_db(home, [(EMAIL, ORG, _raw(_weekly_scoped()), FRESH_AT)])
+    assert "96%" not in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+def test_a_missing_oauth_account_drops_the_segment(home):
+    (home / ".claude.json").write_text(json.dumps({"projects": {}}), encoding="utf-8")
+    _write_db(home, [(EMAIL, ORG, _raw(_weekly_scoped()), FRESH_AT)])
+    line = _render(_full_payload(), home)
+    assert "96%" not in line
+    assert "ctx " in line
+
+
+# --- staleness ------------------------------------------------------------- #
+
+def test_fresh_usage_renders_without_a_stale_marker(home):
+    _usage_home(home, cached_at=NOW - 2 * 3600)     # exactly at the boundary
+    line = _render({"model": {"display_name": "Fable 5"}}, home)
+    assert _scoped() in line
+    assert "~" not in line
+
+
+def test_usage_older_than_two_hours_renders_behind_a_dim_marker(home):
+    _usage_home(home, cached_at=NOW - 2 * 3600 - 1)
+    line = _render({"model": {"display_name": "Fable 5"}}, home)
+    assert _scoped(marker=f"{statusline.DIM}~{RESET}") in line
+
+
+def test_usage_older_than_a_day_is_dropped_rather_than_shown_stale(home):
+    _usage_home(home, cached_at=NOW - 24 * 3600 - 1)
+    line = _render(_full_payload(), home)
+    assert "96%" not in line
+    assert "~" not in line
+    assert "ctx " in line                            # other segments survive
+
+
+@pytest.mark.parametrize("cached_at", [None, "recently", True])
+def test_a_missing_usage_timestamp_drops_the_segment(home, cached_at):
+    _usage_home(home, cached_at=cached_at)
+    assert "96%" not in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+def test_a_future_dated_cache_is_treated_as_fresh(home):
+    """Clock skew must not print a stale marker on live data."""
+    _usage_home(home, cached_at=NOW + 300)
+    assert "~" not in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+# --- ISO-8601 reset conversion --------------------------------------------- #
+
+def test_iso_to_epoch_round_trips_the_api_format():
+    assert statusline._iso_to_epoch("2026-08-15T14:59:59.089483+00:00") == (
+        datetime.datetime(
+            2026, 8, 15, 14, 59, 59, 89483, tzinfo=datetime.timezone.utc
+        ).timestamp()
+    )
+
+
+def test_iso_to_epoch_accepts_a_z_suffix_and_assumes_utc_when_naive():
+    expected = datetime.datetime(
+        2026, 8, 15, 14, 59, 59, tzinfo=datetime.timezone.utc
+    ).timestamp()
+    assert statusline._iso_to_epoch("2026-08-15T14:59:59Z") == expected
+    assert statusline._iso_to_epoch("2026-08-15T14:59:59") == expected
+
+
+@pytest.mark.parametrize("value", [
+    None, "", "   ", "not a timestamp", "2026-13-45T99:99:99+00:00",
+    1786805999, True, ["2026-08-15T14:59:59+00:00"],
+])
+def test_iso_to_epoch_rejects_everything_unparseable(value):
+    assert statusline._iso_to_epoch(value) is None
+
+
+def test_a_reset_under_a_day_away_renders_the_clock_form(home):
+    soon = NOW + 3600
+    _usage_home(home, limits=(_weekly_scoped("Fable", 96, resets_at=_iso(soon)),))
+    line = _render({"model": {"display_name": "Fable 5"}}, home)
+    assert _scoped(reset=soon) in line
+    assert line.endswith(_expect_reset(soon)) is False   # account segment follows
+    assert f"{ARROW}{_expect_reset(soon)}" in line
+
+
+@pytest.mark.parametrize("resets_at", [None, "", "whenever", 1786805999])
+def test_a_broken_reset_drops_the_arrow_not_the_segment(home, resets_at):
+    _usage_home(home, limits=(_weekly_scoped("Fable", 96, resets_at=resets_at),))
+    line = _render({"model": {"display_name": "Fable 5"}}, home)
+    assert f"Fable {RED}96%{RESET}" in line
+    assert ARROW not in line
+
+
+# --- robustness: absence is normal, never an error ------------------------- #
+
+def test_no_database_drops_the_segment(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    assert not (home / ".claude" / "jacked.db").exists()
+    line = _render(_full_payload(), home)
+    assert isinstance(line, str)
+    assert "ctx " in line
+    assert not (home / ".claude" / "jacked.db").exists()   # never created
+
+
+def test_a_file_that_is_not_a_database_drops_the_segment(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    (home / ".claude" / "jacked.db").write_bytes(b"this is not a database\x00\xff")
+    line = _render(_full_payload(), home)
+    assert isinstance(line, str)
+    assert "ctx " in line
+
+
+def test_a_database_without_an_accounts_table_drops_the_segment(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    con = sqlite3.connect(str(home / ".claude" / "jacked.db"))
+    con.execute("CREATE TABLE something_else (id INTEGER)")
+    con.commit()
+    con.close()
+    assert "ctx " in _render(_full_payload(), home)
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores file permissions",
+)
+def test_an_unreadable_database_drops_the_segment(home):
+    _usage_home(home)
+    db = home / ".claude" / "jacked.db"
+    db.chmod(0o000)
+    try:
+        line = _render(_full_payload(), home)
+    finally:
+        db.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    assert isinstance(line, str)
+    assert "96%" not in line
+    assert "ctx " in line
+
+
+def test_a_locked_database_drops_the_segment_without_hanging(home):
+    """The jacked service writes this file concurrently."""
+    _usage_home(home)
+    writer = sqlite3.connect(str(home / ".claude" / "jacked.db"), timeout=0.1)
+    writer.execute("BEGIN EXCLUSIVE")
+    writer.execute("UPDATE accounts SET usage_cached_at = 1")
+    try:
+        started = time.monotonic()
+        line = _render(_full_payload(), home)
+        elapsed = time.monotonic() - started
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert isinstance(line, str)
+    assert "96%" not in line
+    assert "ctx " in line
+    assert elapsed < 2.0, f"took {elapsed:.3f}s; the read timeout regressed"
+
+
+@pytest.mark.parametrize("raw", [
+    None,
+    "",
+    "{ not json",
+    "[1, 2, 3]",
+    '"a string"',
+    json.dumps({"limits": None}),
+    json.dumps({"limits": "weekly"}),
+    json.dumps({"limits": [None, 7, "x"]}),
+    json.dumps({"limits": [{"kind": "weekly_scoped", "scope": "Fable"}]}),
+    json.dumps({"limits": [{"kind": "weekly_scoped", "scope": {"model": None}}]}),
+    json.dumps({}),
+])
+def test_malformed_cached_usage_raw_drops_the_segment(home, raw):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    _write_db(home, [(EMAIL, ORG, raw, FRESH_AT)])
+    line = _render(_full_payload(), home)
+    assert isinstance(line, str)
+    assert "ctx " in line
+    assert line.count("Fable") == 1                  # the model segment only
+
+
+def test_no_row_for_this_account_drops_the_segment(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    _write_db(home, [])
+    assert "96%" not in _render(_full_payload(), home)
+
+
+def test_the_scoped_segment_never_raises_on_a_directory_in_place_of_the_db(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    (home / ".claude" / "jacked.db").mkdir()
+    assert "ctx " in _render(_full_payload(), home)
+
+
+# --- caching --------------------------------------------------------------- #
+
+def test_the_usage_segment_is_cached_in_its_own_file(home):
+    _usage_home(home)
+    assert _scoped() in _render({"model": {"display_name": "Fable 5"}}, home)
+
+    cached = json.loads(_usage_cache_path(home).read_text(encoding="utf-8"))
+    assert cached["version"] == 1
+    assert cached["segment"] == _scoped()
+    # The account cache is a different file with a different version, and the
+    # usage cache must never clobber it.
+    assert _cache_path(home).exists()
+    assert _usage_cache_path(home) != _cache_path(home)
+    assert json.loads(_cache_path(home).read_text(encoding="utf-8"))["version"] == 3
+
+
+def test_a_matching_usage_revision_short_circuits_to_the_cache(home):
+    _usage_home(home)
+    _render({"model": {"display_name": "Fable 5"}}, home)
+
+    cached = json.loads(_usage_cache_path(home).read_text(encoding="utf-8"))
+    cached["segment"] = "SENTINEL-FROM-USAGE-CACHE"
+    _usage_cache_path(home).write_text(json.dumps(cached), encoding="utf-8")
+
+    assert "SENTINEL-FROM-USAGE-CACHE" in _render(
+        {"model": {"display_name": "Fable 5"}}, home
+    )
+
+
+def test_a_database_write_invalidates_the_usage_cache(home):
+    _usage_home(home)
+    assert _scoped(pct=96) in _render({"model": {"display_name": "Fable 5"}}, home)
+
+    con = sqlite3.connect(str(home / ".claude" / "jacked.db"))
+    con.execute(
+        "UPDATE accounts SET cached_usage_raw = ?",
+        (_raw(_weekly_scoped("Fable", 100)),),
+    )
+    con.commit()
+    con.close()
+    _bump_mtime(home / ".claude" / "jacked.db")
+
+    assert _scoped(pct=100) in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+def test_switching_models_invalidates_the_usage_cache(home):
+    _usage_home(home, limits=(
+        _weekly_scoped("Opus", 100, is_active=False),
+        _weekly_scoped("Fable", 96, is_active=False),
+    ))
+    assert _scoped(label="Fable", pct=96) in _render(
+        {"model": {"display_name": "Fable 5"}}, home
+    )
+    assert _scoped(label="Opus", pct=100) in _render(
+        {"model": {"display_name": "Opus 4.5"}}, home
+    )
+
+
+def test_switching_accounts_invalidates_the_usage_cache(home):
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    _write_db(home, [
+        (EMAIL, ORG, _raw(_weekly_scoped("Fable", 96)), FRESH_AT),
+        (EMAIL, OTHER_ORG, _raw(_weekly_scoped("Fable", 12)), FRESH_AT),
+    ])
+    assert _scoped(pct=96) in _render({"model": {"display_name": "Fable 5"}}, home)
+
+    _write_account(home, emailAddress=EMAIL, organizationUuid=OTHER_ORG)
+    _bump_mtime(home / ".claude.json")
+
+    assert _scoped(pct=12, color=GREEN) in _render(
+        {"model": {"display_name": "Fable 5"}}, home
+    )
+
+
+def test_a_cached_segment_cannot_stay_fresh_forever(home):
+    """With the jacked service stopped the database mtime freezes, so the
+    cache key carries a wall-clock bucket and staleness is re-evaluated."""
+    cached_at = NOW - 3600
+    _usage_home(home, cached_at=cached_at)
+    payload = {"model": {"display_name": "Fable 5"}}
+
+    assert "~" not in _render(payload, home, now=NOW)
+
+    later = cached_at + 2 * 3600 + 601        # past 2h, past one clock bucket
+    line = _render(payload, home, now=later)
+    assert f"{statusline.DIM}~{RESET}Fable " in line
+
+
+@pytest.mark.parametrize("legacy_cache", [
+    "OLD PLAIN TEXT\n",
+    "{ malformed json",
+    json.dumps({"version": 0, "source": {}, "segment": "WRONG"}),
+    json.dumps({"version": 1, "source": {}, "segment": "WRONG"}),
+    json.dumps({"version": 1, "segment": "WRONG"}),
+    json.dumps(["not", "a", "dict"]),
+])
+def test_a_malformed_usage_cache_is_a_safe_miss(home, legacy_cache):
+    _usage_home(home)
+    _usage_cache_path(home).write_text(legacy_cache, encoding="utf-8")
+
+    line = _render({"model": {"display_name": "Fable 5"}}, home)
+
+    assert _scoped() in line
+    assert "WRONG" not in line
+
+
+def test_a_usage_cache_write_failure_does_not_hide_the_segment(home, monkeypatch):
+    _usage_home(home)
+    monkeypatch.setattr(
+        statusline.tempfile, "mkstemp",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("cache unavailable")),
+    )
+    assert _scoped() in _render({"model": {"display_name": "Fable 5"}}, home)
+    assert not _usage_cache_path(home).exists()
+
+
+def _count_config_parses(monkeypatch, home_dir, payload):
+    """Render once, returning how often ~/.claude.json itself was parsed."""
+    config_text = (home_dir / ".claude.json").read_text(encoding="utf-8")
+    real_loads = statusline.json.loads
+    seen = []
+
+    def counting_loads(text, *args, **kwargs):
+        seen.append(text)
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(statusline.json, "loads", counting_loads)
+    try:
+        line = _render(payload, home_dir)
+    finally:
+        monkeypatch.undo()
+    return line, seen.count(config_text)
+
+
+def test_claude_json_is_parsed_at_most_once_per_render(home, monkeypatch):
+    """~/.claude.json is multi-MB. The account segment and the usage lookup
+    share ONE read and ONE parse of it, never two."""
+    _usage_home(home)
+    payload = {"model": {"display_name": "Fable 5"}}
+
+    line, cold_parses = _count_config_parses(monkeypatch, home, payload)
+    assert _scoped() in line
+    assert cold_parses == 1
+
+    # Only the usage half recomputes now; the account half stays cached, so
+    # the big file must not be parsed at all.
+    _usage_cache_path(home).unlink()
+    line, warm_parses = _count_config_parses(monkeypatch, home, payload)
+    assert _scoped() in line
+    assert warm_parses == 0
+
+
+# --- real schema ----------------------------------------------------------- #
+
+def test_the_query_runs_against_the_real_jacked_schema(home, tmp_path):
+    """Pin the live column names: a rename in the accounts table must fail
+    here, not silently blank the segment on every user's machine."""
+    from jacked.web.database import Database
+
+    db_path = home / ".claude" / "jacked.db"
+    Database(str(db_path))          # creates the real schema, then closes
+
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            "INSERT INTO accounts (email, organization_uuid, access_token, "
+            "expires_at, cached_usage_raw, usage_cached_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (EMAIL, ORG, "not-a-real-token", 0,
+             _raw(_session_limit(), _weekly_all(76), _weekly_scoped("Fable", 96)),
+             FRESH_AT),
+        )
+        con.commit()
+    finally:
+        con.close()
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+
+    assert _scoped() in _render({"model": {"display_name": "Fable 5"}}, home)
+
+
+# --- safety and security contracts ----------------------------------------- #
+
+def _statusline_source():
+    return (REPO_ROOT / "jacked" / "statusline.py").read_text(encoding="utf-8")
+
+
+def _code_string_literals(source):
+    """Every string literal the module EXECUTES, docstrings excluded.
+
+    Comments never reach the AST, so what survives here is exactly the text
+    the module can act on.
+    """
+    tree = ast.parse(source)
+    docstrings = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            docstrings.add(id(body[0].value))
+    return [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+def test_the_statusline_never_reads_the_credentials_file():
+    """~/.claude/.credentials.json holds live OAuth tokens. The statusline
+    resolves identity from ~/.claude.json instead; that boundary is a
+    security contract, not an implementation detail."""
+    source = _statusline_source()
+
+    for literal in _code_string_literals(source):
+        assert "credential" not in literal.lower(), literal
+
+    # And the boundary stays documented, so it cannot be dropped quietly.
+    assert ".credentials.json" in ast.get_docstring(ast.parse(source))
+
+
+def test_every_database_connection_is_opened_read_only():
+    """jacked's service owns jacked.db. The statusline may look, never touch."""
+    source = _statusline_source()
+    opens = [i for i in range(len(source)) if source.startswith("sqlite3.connect", i)]
+
+    assert opens, "the database open moved; re-point this contract test"
+    for start in opens:
+        # The URI is built a few lines above the call, so look both ways.
+        window = source[max(0, start - 600):start + 200]
+        assert "uri=True" in window, window
+        assert "?mode=ro" in window, window
+    assert "?mode=ro" in "".join(_code_string_literals(source))
+
+
+def test_the_statusline_issues_exactly_one_read_only_query():
+    """It reads a database another process owns. One SELECT, nothing else."""
+    keywords = re.compile(
+        r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|REPLACE"
+        r"|PRAGMA|ATTACH|VACUUM|BEGIN|COMMIT)\b"
+    )
+    sql = [
+        literal
+        for literal in _code_string_literals(_statusline_source())
+        if keywords.search(literal)
+    ]
+
+    assert len(sql) == 1, sql
+    assert sql[0].startswith("SELECT ")
+    assert " FROM accounts " in sql[0]
+    assert not keywords.search(sql[0][len("SELECT"):])
+
+
+def test_the_statusline_imports_nothing_heavy_at_module_scope():
+    """click/rich cost ~50ms and sqlite3 ~12ms; the budget cannot afford them
+    on a render that never reaches the database."""
+    tree = ast.parse(_statusline_source())
+    top_level = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            top_level.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top_level.add(node.module.split(".")[0])
+
+    assert top_level == {"hashlib", "json", "os", "sys", "tempfile", "time"}
+
+
+def test_a_full_render_stays_well_inside_the_refresh_budget(home):
+    """Claude Code re-runs this on every refresh, budget ~300ms including
+    interpreter start, so the render itself must be a small fraction."""
+    _usage_home(home)
+    # A realistically bloated ~/.claude.json: the real one carries per-project
+    # history and reaches megabytes.
+    config = {
+        "oauthAccount": {
+            "emailAddress": EMAIL,
+            "organizationUuid": ORG,
+            "organizationName": "MyOrg",
+            "userRateLimitTier": "default_claude_max_5x",
+        },
+        "projects": {f"/p/{i}": {"history": ["x" * 400]} for i in range(4000)},
+    }
+    (home / ".claude.json").write_text(json.dumps(config), encoding="utf-8")
+    assert (home / ".claude.json").stat().st_size > 1_500_000
+    payload = _full_payload()
+
+    started = time.monotonic()
+    cold = _render(payload, home)
+    cold_elapsed = time.monotonic() - started
+
+    started = time.monotonic()
+    warm = _render(payload, home)
+    warm_elapsed = time.monotonic() - started
+
+    assert _scoped() in cold and _scoped() in warm
+    assert cold_elapsed < 0.15, f"cold render took {cold_elapsed:.3f}s"
+    assert warm_elapsed < 0.05, f"warm render took {warm_elapsed:.3f}s"
+
+
+def test_statusline_doctests_run():
+    """CI runs bare pytest with testpaths=["tests"] and no --doctest-modules,
+    so the renderer's own doctests would otherwise never execute."""
+    import doctest
+
+    results = doctest.testmod(statusline)
+    assert results.attempted > 0
+    assert results.failed == 0

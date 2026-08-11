@@ -4,25 +4,51 @@ Claude Code runs the registered statusline command on every refresh and
 shows the first line of stdout. This module reads the session JSON on
 stdin and prints one ANSI-colored line:
 
-  Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | me@co.com · MyOrg · Max 5x
+  Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | Fable 96%->Sat 10:59 | me@co.com · MyOrg · Max 5x
 
-A "<model> (FALLBACK, not <model>)" segment appears between the limits and
-the account when a gateway has switched the model mid-session (see
-_served_segment); it is absent on any session that never switched.
+A "<served> (FALLBACK, not <configured>)" segment appears between the limits
+and the account when the model actually ANSWERING is not the model the
+session is configured with right now -- a serving mismatch introduced by a
+gateway, never the user's own /model choice (see _served_segment). It is
+absent on every normally-served session, and it clears itself the moment the
+user switches models deliberately.
 
 The installer registers it as `"<abs-python>" -m jacked.statusline` with
 the absolute interpreter path resolved at install time (never a bare
 `python`/`python3` name -- name resolution is the cross-platform failure
 mode this design avoids).
 
+Data sources:
+- stdin (Claude Code): model, effort, context window, and the ONLY two
+  rate-limit windows the payload carries -- five_hour and seven_day.
+- ~/.claude.json: the signed-in account (email, organization, plan tier).
+- ~/.claude/jacked.db, READ-ONLY: jacked's cache of the Anthropic usage
+  API, which is where the "Fable 96%" model-scoped weekly segment comes
+  from. The stdin payload has no model-scoped limit at all, and its
+  aggregate seven_day number systematically UNDER-reports the binding
+  constraint: on every real account measured, the model-scoped weekly
+  percentage sits above the aggregate one (96% vs 76%, 100% vs 90%), so
+  "7d" alone hides the limit that actually stops the session. jacked polls
+  that API on a timer, so the segment is marked stale past
+  _USAGE_FRESH_SECONDS and dropped past _USAGE_MAX_AGE_SECONDS rather
+  than presenting a lagging number as live.
+
 Hard constraints:
 - stdlib only, and never import jacked.cli (click + rich cost ~50ms per
-  render; this must stay well under the ~300ms refresh budget).
+  render; this must stay well under the ~300ms refresh budget). sqlite3
+  costs ~12ms to import and is therefore deferred to the one code path
+  that needs it.
 - Always exit 0 with whatever could be rendered. A broken statusline
   must never break or spam the session.
 - Absence is normal, not an error: rate_limits appears only after the
   first API response, current_usage is null before the first call and
-  after /compact. A missing field drops its segment.
+  after /compact. A missing field, a missing database, a locked database
+  or a missing row drops its segment silently.
+- Never write to jacked.db, never create it, never migrate it. The jacked
+  service owns that file and writes it concurrently.
+- Never read ~/.claude/.credentials.json. That file holds live OAuth
+  tokens; the statusline resolves the account from ~/.claude.json
+  instead. This is a deliberate security boundary, not an oversight.
 """
 
 import hashlib
@@ -54,7 +80,24 @@ _TIER_LABELS = {
     "free": "Free",
 }
 
-_ACCOUNT_CACHE_VERSION = 2
+_ACCOUNT_CACHE_VERSION = 3
+_USAGE_CACHE_VERSION = 1
+
+# How far behind jacked's cached copy of the usage API may fall before the
+# model-scoped segment stops being presented as live. Fresh renders plain,
+# stale renders behind a dim "~", anything older is dropped rather than
+# shown as if it were current.
+_USAGE_FRESH_SECONDS = 2 * 3600
+_USAGE_MAX_AGE_SECONDS = 24 * 3600
+
+# The usage cache key carries a coarse wall-clock bucket as well as the
+# database revision. Without it, a segment cached while the jacked service
+# is stopped (frozen database mtime) would keep claiming to be fresh
+# forever; with it, staleness is re-evaluated at worst this many seconds
+# late while a running service still invalidates instantly on every write.
+_USAGE_CACHE_BUCKET_SECONDS = 600
+
+_EMPTY_ACCOUNT_FACTS = {"segment": "", "email": "", "org_uuid": ""}
 
 
 def _home() -> str:
@@ -179,8 +222,8 @@ def _account_source_signature(stat_result, content: bytes) -> dict:
     }
 
 
-def _read_account_cache(cache_path: str, source: dict) -> "str | None":
-    """Return a cached segment only when it belongs to this source revision."""
+def _read_cache(cache_path: str, version: int, source: dict) -> "dict | None":
+    """Return a cache record only when it belongs to this source revision."""
     try:
         with open(cache_path, encoding="utf-8", errors="replace") as fh:
             cached = json.load(fh)
@@ -188,37 +231,36 @@ def _read_account_cache(cache_path: str, source: dict) -> "str | None":
         return None
     if not isinstance(cached, dict):
         return None
-    if cached.get("version") != _ACCOUNT_CACHE_VERSION:
+    if cached.get("version") != version:
         return None
     if cached.get("source") != source:
         return None
-    segment = cached.get("segment")
-    return segment if isinstance(segment, str) else None
+    return cached
 
 
-def _write_account_cache(
+def _write_cache(
     cache_path: str,
-    segment: str,
+    prefix: str,
+    version: int,
     source: dict,
+    payload: dict,
 ) -> None:
-    """Atomically cache a segment without ever breaking the statusline."""
+    """Atomically cache a record without ever breaking the statusline.
+
+    Every failure is swallowed: a cache that cannot be written is a
+    slower render, never a broken one.
+    """
+    record = {"version": version, "source": source}
+    record.update(payload)
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(
             dir=os.path.dirname(cache_path),
-            prefix=".statusline-account-",
+            prefix=prefix,
             suffix=".tmp",
         )
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(
-                {
-                    "version": _ACCOUNT_CACHE_VERSION,
-                    "source": source,
-                    "segment": segment,
-                },
-                fh,
-                separators=(",", ":"),
-            )
+            json.dump(record, fh, separators=(",", ":"))
             fh.write("\n")
         os.replace(tmp, cache_path)
         tmp = None
@@ -232,13 +274,43 @@ def _write_account_cache(
                 pass
 
 
-def _account_segment(home: str) -> str:
-    """"email · org · plan" from ~/.claude.json .oauthAccount, revision-cached.
+def _read_account_cache(cache_path: str, source: dict) -> "dict | None":
+    """Cached account facts for this source revision, or None on any miss."""
+    cached = _read_cache(cache_path, _ACCOUNT_CACHE_VERSION, source)
+    if cached is None:
+        return None
+    facts = {}
+    for key in _EMPTY_ACCOUNT_FACTS:
+        value = cached.get(key)
+        if not isinstance(value, str):
+            return None
+        facts[key] = value
+    return facts
 
-    ~/.claude.json is multi-MB and rewritten constantly, so the parsed
-    result is cached with a content-bound source signature and reused only
-    while that signature matches. Never reads ~/.claude/.credentials.json
-    (live OAuth tokens).
+
+def _write_account_cache(cache_path: str, facts: dict, source: dict) -> None:
+    """Persist the parsed ~/.claude.json facts against their revision."""
+    _write_cache(
+        cache_path,
+        ".statusline-account-",
+        _ACCOUNT_CACHE_VERSION,
+        source,
+        facts,
+    )
+
+
+def _account_facts(home: str) -> dict:
+    """Everything the statusline needs out of ~/.claude.json, parsed ONCE.
+
+    Returns {"segment", "email", "org_uuid"}: the rendered
+    "email · org · plan" segment, plus the identity the model-scoped usage
+    lookup matches on. Both come from the same parse deliberately --
+    ~/.claude.json is multi-MB and rewritten constantly, so a second reader
+    doing its own read + parse would blow the refresh budget.
+
+    The result is cached with a content-bound source signature and reused
+    only while that signature matches. Never reads
+    ~/.claude/.credentials.json (live OAuth tokens).
     """
     acc_path = os.path.join(home, ".claude.json")
     cache_path = os.path.join(home, ".claude", "statusline-account.cache")
@@ -247,28 +319,295 @@ def _account_segment(home: str) -> str:
             content = fh.read()
             source = _account_source_signature(os.fstat(fh.fileno()), content)
     except OSError:
-        return ""
+        return dict(_EMPTY_ACCOUNT_FACTS)
     cached = _read_account_cache(cache_path, source)
     if cached is not None:
         return cached
 
-    segment = ""
+    facts = dict(_EMPTY_ACCOUNT_FACTS)
     try:
         config = json.loads(content.decode("utf-8", errors="replace")) or {}
-        account = config.get("oauthAccount") or {}
+        account = config.get("oauthAccount") if isinstance(config, dict) else None
         if isinstance(account, dict):
             tier = account.get("userRateLimitTier") or account.get(
                 "organizationRateLimitTier"
             )
+            facts["email"] = str(account.get("emailAddress") or "")
+            facts["org_uuid"] = str(account.get("organizationUuid") or "")
             parts = [
-                str(account.get("emailAddress") or ""),
+                facts["email"],
                 str(account.get("organizationName") or ""),
                 _tier_label(tier),
             ]
-            segment = f" {MIDDOT} ".join(p for p in parts if p)
+            facts["segment"] = f" {MIDDOT} ".join(p for p in parts if p)
     except (OSError, RecursionError, ValueError):
+        return dict(_EMPTY_ACCOUNT_FACTS)
+    _write_account_cache(cache_path, facts, source)
+    return facts
+
+
+def _iso_to_epoch(value) -> "float | None":
+    """ISO-8601 timestamp string -> epoch seconds, or None if unparseable.
+
+    The stdin payload gives resets_at as epoch seconds, but the Anthropic
+    usage API (and so jacked's cache of it) gives an ISO-8601 string with
+    an offset, e.g. "2026-08-15T14:59:59.089483+00:00". A timestamp with
+    no offset is read as UTC, which is what that API emits.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    # Deferred: only the database path needs datetime, and most renders
+    # never reach it.
+    import datetime
+
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return parsed.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _normalize_model(name) -> str:
+    """Lowercased alphanumerics only, for tolerant model-name comparison.
+
+    >>> _normalize_model("Fable 5")
+    'fable5'
+    >>> _normalize_model("Claude Opus 4.5")
+    'claudeopus45'
+    >>> _normalize_model(None)
+    ''
+    """
+    if not isinstance(name, str):
         return ""
-    _write_account_cache(cache_path, segment, source)
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _model_matches(payload_name, bucket_name) -> bool:
+    """True when two model names plausibly name the same model.
+
+    The stdin payload names the model more fully than the usage API's
+    scope does ("Fable 5" vs "Fable"), and either side may be the longer
+    one as naming shifts, so normalized containment in EITHER direction
+    counts as a match. Case, spaces, dots and dashes are ignored.
+
+    >>> _model_matches("Fable 5", "Fable")
+    True
+    >>> _model_matches("Opus", "Claude Opus 4.5")
+    True
+    >>> _model_matches("Sonnet 5", "Fable")
+    False
+    >>> _model_matches("", "Fable")
+    False
+    """
+    left = _normalize_model(payload_name)
+    right = _normalize_model(bucket_name)
+    if not left or not right:
+        return False
+    return left in right or right in left
+
+
+def _bucket_model_name(entry) -> str:
+    """The display name a weekly_scoped limit is scoped to, or ""."""
+    scope = entry.get("scope") if isinstance(entry, dict) else None
+    model = scope.get("model") if isinstance(scope, dict) else None
+    name = model.get("display_name") if isinstance(model, dict) else None
+    return name if isinstance(name, str) else ""
+
+
+def _scoped_bucket(limits, model_name) -> "dict | None":
+    """Pick the model-scoped weekly limit worth showing, or None.
+
+    Prefers the bucket scoped to the model this session is actually
+    running; falls back to whichever scoped bucket the API marks active.
+    """
+    if not isinstance(limits, list):
+        return None
+    active = None
+    for entry in limits:
+        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+            continue
+        if _model_matches(model_name, _bucket_model_name(entry)):
+            return entry
+        if active is None and entry.get("is_active") is True:
+            active = entry
+    return active
+
+
+def _usage_source_signature(
+    stat_result,
+    email: str,
+    org_uuid: str,
+    model_name: str,
+    now: float,
+) -> dict:
+    """Revision key for the model-scoped usage segment.
+
+    Deliberately stats the database rather than digesting it: jacked.db
+    reaches tens of megabytes and hashing it on every refresh would cost
+    more than the query it is meant to avoid. Every jacked write bumps
+    mtime_ns, which is the revision signal that matters. The account and
+    the model are part of the key because switching either one changes
+    which number is correct, and the wall-clock bucket is part of it so a
+    cached segment cannot claim to be fresh forever.
+    """
+    return {
+        "mtime_ns": stat_result.st_mtime_ns,
+        "size": stat_result.st_size,
+        "device": stat_result.st_dev,
+        "inode": stat_result.st_ino,
+        "account": email + "\x00" + org_uuid,
+        "model": model_name,
+        "clock": int(now // _USAGE_CACHE_BUCKET_SECONDS),
+    }
+
+
+def _read_usage_cache(cache_path: str, source: dict) -> "str | None":
+    """Cached usage segment for this revision, or None on any miss."""
+    cached = _read_cache(cache_path, _USAGE_CACHE_VERSION, source)
+    if cached is None:
+        return None
+    segment = cached.get("segment")
+    return segment if isinstance(segment, str) else None
+
+
+def _write_usage_cache(cache_path: str, segment: str, source: dict) -> None:
+    """Persist the usage segment against its revision (empty ones too)."""
+    _write_cache(
+        cache_path,
+        ".statusline-usage-",
+        _USAGE_CACHE_VERSION,
+        source,
+        {"segment": segment},
+    )
+
+
+def _read_cached_usage(db_path: str, email: str, org_uuid: str):
+    """One account's cached usage limits from jacked.db, or (None, None).
+
+    Opens the database READ-ONLY with a short timeout and never writes,
+    creates or migrates it -- the jacked service owns that file and writes
+    it concurrently, so a lock, a partial write or schema drift must
+    degrade to no segment rather than to an exception or a hang.
+
+    Matches on email AND organization_uuid together. One email can own
+    several organizations (this machine has two under one address), so the
+    email alone resolves ambiguously and would show another org's numbers.
+    Newest cache wins if the pair somehow matches more than one row.
+    """
+    # Deferred: importing sqlite3 costs ~12ms, and a render that hits the
+    # cache or has no database must not pay it.
+    import sqlite3
+
+    # "?" and "#" would otherwise be read as URI syntax rather than as
+    # part of the path.
+    uri = "file:" + db_path.replace("?", "%3f").replace("#", "%23") + "?mode=ro"
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=0.25)
+    except (sqlite3.Error, OSError, ValueError):
+        return None, None
+    try:
+        row = con.execute(
+            "SELECT cached_usage_raw, usage_cached_at FROM accounts "
+            "WHERE email = ? AND organization_uuid = ? "
+            "ORDER BY usage_cached_at DESC LIMIT 1",
+            (email, org_uuid),
+        ).fetchone()
+    except (sqlite3.Error, OSError, ValueError):
+        return None, None
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    if not row:
+        return None, None
+    raw, cached_at = row[0], row[1]
+    if not isinstance(raw, str) or not raw:
+        return None, None
+    try:
+        blob = json.loads(raw)
+    except (RecursionError, ValueError):
+        return None, None
+    if not isinstance(blob, dict):
+        return None, None
+    return blob.get("limits"), cached_at
+
+
+def _build_usage_segment(
+    db_path: str,
+    email: str,
+    org_uuid: str,
+    model_name: str,
+    now: float,
+) -> str:
+    """Render "Fable 96%->Sat 10:59" from jacked's cached usage, or ""."""
+    limits, cached_at = _read_cached_usage(db_path, email, org_uuid)
+    if limits is None:
+        return ""
+    if isinstance(cached_at, bool) or not isinstance(cached_at, (int, float)):
+        return ""
+    age = now - cached_at
+    if age > _USAGE_MAX_AGE_SECONDS:
+        # More than a day behind: drop it rather than mislead.
+        return ""
+    bucket = _scoped_bucket(limits, model_name)
+    if bucket is None:
+        return ""
+    pct = _round_pct(bucket.get("percent"))
+    if pct is None:
+        return ""
+    label = _bucket_model_name(bucket)
+    if not label:
+        # The whole point of this segment is naming WHICH model's weekly
+        # cap is binding. An unlabeled percentage beside the existing 7d
+        # number is noise, so drop it.
+        return ""
+    seg = f"{label} {_pct_color(pct)}{pct}%{RESET}"
+    if age > _USAGE_FRESH_SECONDS:
+        seg = f"{DIM}~{RESET}" + seg
+    reset = _fmt_reset(_iso_to_epoch(bucket.get("resets_at")), now)
+    if reset:
+        seg += f"{ARROW}{reset}"
+    return seg
+
+
+def _model_usage_segment(home: str, facts: dict, model_name: str, now: float) -> str:
+    """Model-scoped weekly usage for this session's model, revision-cached.
+
+    Claude Code's payload carries no model-scoped rate limit at all, and
+    its aggregate seven_day number under-reports the binding constraint --
+    the per-model weekly percentage runs higher on every real account
+    measured. jacked already polls and caches the usage API that does
+    carry it, so read that cache instead of inventing a new API call.
+    """
+    email = facts.get("email") or ""
+    org_uuid = facts.get("org_uuid") or ""
+    if not email or not org_uuid:
+        return ""
+    db_path = os.path.join(home, ".claude", "jacked.db")
+    cache_path = os.path.join(home, ".claude", "statusline-usage.cache")
+    try:
+        source = _usage_source_signature(
+            os.stat(db_path), email, org_uuid, model_name, now
+        )
+    except (OSError, ValueError):
+        return ""
+    cached = _read_usage_cache(cache_path, source)
+    if cached is not None:
+        return cached
+    try:
+        segment = _build_usage_segment(db_path, email, org_uuid, model_name, now)
+    except (OSError, ValueError):
+        return ""
+    _write_usage_cache(cache_path, segment, source)
     return segment
 
 
@@ -307,26 +646,95 @@ def _models_in(chunk: str) -> list:
     return out
 
 
+def _configured_model(payload) -> str:
+    """The model id the session is configured with RIGHT NOW, or "".
+
+    Claude Code's stdin payload carries
+    model: {"id": "claude-opus-5", "display_name": "Opus"} and rewrites it
+    the moment the user runs /model, which is what makes it the only
+    baseline that follows a deliberate switch.
+
+    >>> _configured_model({"model": {"id": "claude-opus-5"}})
+    'claude-opus-5'
+    >>> _configured_model({"model": {"id": "  claude-opus-5  "}})
+    'claude-opus-5'
+    >>> _configured_model({"model": {"display_name": "Opus"}})
+    ''
+    >>> _configured_model({"model": {"id": ""}})
+    ''
+    >>> _configured_model({"model": {"id": 5}})
+    ''
+    >>> _configured_model({})
+    ''
+    >>> _configured_model("not-a-dict")
+    ''
+    """
+    model = payload.get("model") if isinstance(payload, dict) else None
+    raw = model.get("id") if isinstance(model, dict) else None
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def _model_key(name) -> str:
+    """Comparison key for a model id: namespace stripped, case folded.
+
+    A gateway reports the same model under its own namespace
+    ("openrouter/anthropic/claude-opus-5") that the payload names plainly
+    ("claude-opus-5"). Only the trailing segment identifies the model, so a
+    pure namespace difference must NOT read as a fallback -- otherwise every
+    gateway session would permanently warn against itself. This is the same
+    trailing-segment rule _served_segment already applies for DISPLAY, so
+    both sides of the comparison are reduced exactly the way both sides of
+    the message are.
+
+    >>> _model_key("openrouter/anthropic/claude-opus-5")
+    'claude-opus-5'
+    >>> _model_key("  Claude-Opus-5  ")
+    'claude-opus-5'
+    >>> _model_key("claude-opus-5") == _model_key("openrouter/anthropic/Claude-Opus-5")
+    True
+    >>> _model_key("claude-opus-5") == _model_key("openrouter/anthropic/claude-fable-5")
+    False
+    >>> _model_key(None)
+    ''
+    """
+    if not isinstance(name, str):
+        return ""
+    return name.strip().rsplit("/", 1)[-1].strip().casefold()
+
+
 def _served_segment(payload) -> str:
-    """Warn when the model answering is not the one the session started on.
+    """Warn when the model answering is not the model configured right now.
 
-    Claude Code's payload only ever carries the model the session was
-    *configured* with, so a gateway that does fallback routing (OpenRouter
-    presets, claude-code-router, LiteLLM) can silently switch the model
-    that actually answers -- to a pricier or weaker one -- with nothing on
-    screen to show it. The transcript does record the serving model on
-    every assistant message, so compare the newest against the session's
-    first and speak up only when they differ.
+    A gateway that does fallback routing (OpenRouter presets,
+    claude-code-router, LiteLLM) can silently answer with a different model
+    -- pricier or weaker -- from the one the session asked for, with nothing
+    on screen to show it. The transcript records the serving model on every
+    assistant message, so compare the NEWEST served model against the
+    CONFIGURED one and speak up only when they differ.
 
-    Renders nothing in the normal case: on a session that never switched,
-    the model segment already names the model, and a second copy would be
-    noise. That also keeps this free for the majority of users.
+    This detects a SERVING mismatch, never a user's own model choice. The
+    baseline is the payload's model id, which Claude Code rewrites on every
+    /model switch, so the warning self-clears the instant the user changes
+    models. An earlier version used the session's FIRST assistant turn as
+    the baseline; that baseline is frozen for the life of the session, so it
+    misreported every deliberate switch -- it stuck on screen forever after
+    one /model, and it labelled an UPGRADE ("claude-fable-5 (FALLBACK, not
+    claude-opus-5)") as a downgrade. Across 12 real transcripts it produced
+    three warnings, all three of them deliberate switches and none of them a
+    gateway fallback.
 
-    Deliberately does NOT consult environment variables for the expected
+    Both sides are compared through _model_key, so a gateway's namespaced id
+    for the configured model is not reported as a fallback.
+
+    Falls back to the session's first assistant turn ONLY when the payload
+    carries no usable model id (older Claude Code, malformed payload), which
+    keeps the feature working rather than dropping it silently where the
+    payload cannot help.
+
+    Deliberately does NOT consult environment variables for the configured
     model: a statusline subprocess is not guaranteed to inherit the
     session's environment, and that would fail silently on exactly the
-    gateway setups this exists for. The session's own first turn is the
-    reliable baseline.
+    gateway setups this exists for.
 
     Reads are bounded to the head and tail of the file. Transcripts reach
     100MB+ and this runs on every refresh, so a full scan would grow
@@ -335,6 +743,7 @@ def _served_segment(payload) -> str:
     path = payload.get("transcript_path") if isinstance(payload, dict) else None
     if not isinstance(path, str) or not path:
         return ""
+    expected = _configured_model(payload)
     tail_bytes = 262144
     # A single assistant message can be larger than the first window (a big
     # file read, a long system prompt), and a window that lands mid-line
@@ -346,14 +755,19 @@ def _served_segment(payload) -> str:
         with open(path, "rb") as fh:
             first = []
             read_bytes = 0
-            for window in head_windows:
-                if window > size and read_bytes >= size:
-                    break
-                fh.seek(0)
-                read_bytes = min(size, window)
-                first = _models_in(fh.read(read_bytes).decode("utf-8", "replace"))
-                if first or read_bytes >= size:
-                    break
+            # Perf: when the payload supplies the baseline, the head is not
+            # needed at all, so skip it entirely and read only the 256KB
+            # tail. That drops up to 4MB of reads off EVERY refresh -- the
+            # growing head windows are paid only on the fallback path below.
+            if not expected:
+                for window in head_windows:
+                    if window > size and read_bytes >= size:
+                        break
+                    fh.seek(0)
+                    read_bytes = min(size, window)
+                    first = _models_in(fh.read(read_bytes).decode("utf-8", "replace"))
+                    if first or read_bytes >= size:
+                        break
             if size > read_bytes:
                 fh.seek(max(0, size - tail_bytes))
                 last = _models_in(fh.read().decode("utf-8", "replace"))
@@ -361,10 +775,14 @@ def _served_segment(payload) -> str:
                 last = first
     except (OSError, ValueError):
         return ""
-    if not first or not last:
+    if not last:
         return ""
-    expected, served = first[0], last[-1]
-    if served == expected:
+    if not expected:
+        if not first:
+            return ""
+        expected = first[0]
+    served = last[-1]
+    if _model_key(served) == _model_key(expected):
         return ""
     short_served = served.rsplit("/", 1)[-1]
     short_expected = expected.rsplit("/", 1)[-1]
@@ -388,12 +806,15 @@ def render(payload, home: "str | None" = None, now: "float | None" = None) -> st
     """Build the one-line statusline from a parsed payload dict."""
     if home is None:
         home = _home()
+    if now is None:
+        now = time.time()
     if not isinstance(payload, dict):
         payload = {}
     segments = []
 
     model = payload.get("model") or {}
     name = model.get("display_name") if isinstance(model, dict) else None
+    model_name = name if isinstance(name, str) else ""
     if isinstance(name, str) and name:
         seg = f"{BOLD_CYAN}{name}{RESET}"
         effort = payload.get("effort") or {}
@@ -430,11 +851,19 @@ def render(payload, home: "str | None" = None, now: "float | None" = None) -> st
                 seg += f"{ARROW}{reset}"
             segments.append(seg)
 
+    # Parsed once here so the account segment and the model-scoped usage
+    # lookup share a single read of the multi-MB ~/.claude.json.
+    facts = _account_facts(home)
+
+    scoped = _model_usage_segment(home, facts, model_name, now)
+    if scoped:
+        segments.append(scoped)
+
     served = _served_segment(payload)
     if served:
         segments.append(served)
 
-    account = _account_segment(home)
+    account = facts["segment"]
     if account:
         segments.append(account)
     badge = _caveman_segment(home)

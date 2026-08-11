@@ -3,9 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- Apply the saved color theme before first paint to avoid a flash of the
+    <!-- Apply the CACHED color theme before first paint to avoid a flash of the
          wrong scheme. Unset defaults to America 250 (red/white/blue); only an
-         explicit 'classic' opts out. Key mirrors settings.js's COLOR_THEME_KEY. -->
+         explicit 'classic' opts out. This localStorage key is a cache, not the
+         source of truth: settings.js reconciles it against the server setting
+         'color_theme' right after load, because the menu-bar panel's WKWebView
+         has its own separate localStorage and can only learn the choice from
+         the server. Key mirrors settings.js's COLOR_THEME_KEY. -->
     <script>
         (function () {
             try {

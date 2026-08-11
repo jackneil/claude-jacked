@@ -180,8 +180,9 @@ body {
 }
 
 /* Provider identity (Claude vs Codex) — shared mark from js/util/provider.js.
-   --provider-color is set inline per provider; the chip + left-edge accent
-   carry the brand color so the provider reads at a glance. */
+   --provider-color is set inline per provider, and the labeled chip in the card
+   header carries it. The chip is the ONLY provider cue: it names the provider in
+   words, so the card needs no decorative edge stripe on top of it. */
 .provider-badge {
     display: inline-flex;
     align-items: center;
@@ -203,10 +204,38 @@ body {
     flex: 0 0 auto;
 }
 .provider-label { line-height: 1; }
-/* Left-edge accent on the card itself — the "backdrop" cue. */
-.provider-card { border-left-width: 3px; }
-.provider-card.provider-claude { border-left-color: #a78bfa; }
-.provider-card.provider-codex { border-left-color: #60a5fa; }
+/* No colored left-edge accent on .provider-card on purpose. The card's own
+   Tailwind `border border-slate-700` stays uniform on all four sides: a colored
+   left border is the most recognizable AI-design tell, and it was redundant with
+   the labeled provider chip that already names Claude or Codex in the header. */
+
+/* Account overflow (kebab) menu.
+   Panel geometry and colors are Tailwind utilities on the element itself (see
+   renderAccountMenu in accounts.js), including z-30 — high enough to clear the
+   sibling cards in .accounts-grid, which carry no z-index of their own.
+   Nothing here sets `display`: the panel toggles with Tailwind's .hidden. */
+
+/* Attention dot on the kebab: solid 6px, no glow. Present only when the
+   account is invalid/expired, so the Re-auth row hidden inside the menu is
+   still discoverable at a glance. */
+.account-menu-dot {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background-color: #3b82f6;
+    pointer-events: none;
+}
+
+/* A disabled card carries opacity-60, which opens its own stacking context —
+   the panel's z-30 cannot then lift it above the next card in the grid. Raise
+   the whole card while its menu is open instead. */
+.provider-card.menu-open {
+    position: relative;
+    z-index: 40;
+}
 
 /* Delete confirmation inline */
 .delete-confirm {

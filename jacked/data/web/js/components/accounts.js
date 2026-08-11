@@ -216,10 +216,146 @@ function renderExpandableDetails(acct) {
 }
 
 /**
- * Render action buttons for an account card.
+ * Organization label for an account: the org name when the API returned one,
+ * otherwise a truncated org UUID, otherwise ''. Shared by the card body and
+ * the overflow menu's metadata header.
+ */
+function accountOrgLabel(acct) {
+    if (acct.organization_name) return acct.organization_name;
+    if (acct.organization_uuid) return acct.organization_uuid.slice(0, 8) + '…';
+    return '';
+}
+
+// Icon paths for the overflow-menu rows (same stroke style as the rest of the
+// card: fill="none", stroke="currentColor", viewBox 0 0 24 24).
+const ACCOUNT_MENU_ICONS = {
+    copy: 'M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z',
+    rename: 'M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z',
+    reauth: 'M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15',
+    disable: 'M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636',
+    enable: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
+    delete: 'M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16',
+};
+
+/**
+ * Render one overflow-menu row.
+ *
+ * `cls` MUST stay the legacy button class (btn-copy-cmd, btn-edit-label,
+ * btn-reauth, btn-toggle, btn-delete) and `attrs` MUST carry the same data-*
+ * attributes the old inline buttons carried — the handlers in
+ * account-actions.js bind by those classes and read those attributes.
+ */
+function renderAccountMenuItem(cls, attrs, iconKey, text, colorCls) {
+    const color = colorCls || 'text-slate-300 hover:bg-slate-700/60';
+    return `<button class="${cls} account-menu-item w-full flex items-center gap-2.5 px-3 py-2 text-xs text-left ${color} transition-colors" role="menuitem" ${attrs}>
+                <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${ACCOUNT_MENU_ICONS[iconKey]}"/></svg>
+                <span>${text}</span>
+            </button>`;
+}
+
+/**
+ * Render the kebab (three-dot) overflow menu for an account card.
+ *
+ * Everything the user does rarely lives here instead of on the card face:
+ * copy launch command, rename, re-auth, enable/disable, delete — plus the
+ * account id and organization, which are worth seeing occasionally but not
+ * worth permanent card space.
+ *
+ * Re-auth is ALWAYS present for Claude accounts, never gated on
+ * validation_status: accounts revalidate at most hourly, so the DB can still
+ * say 'valid' after a token died, and gating the only re-auth affordance on
+ * jacked's own state hid it exactly when that state was wrong. The kebab
+ * carries a small attention dot when jacked does know re-auth is needed, so
+ * the now-hidden action stays discoverable at a glance.
+ */
+function renderAccountMenu(acct) {
+    const status = getAccountStatus(acct);
+    const needsAttention = status === 'invalid' || status === 'expired';
+    const provider = acct.provider || 'claude';
+    const hasCustomLabel = acct.display_name && acct.display_name !== acct.email;
+    const orgLabel = accountOrgLabel(acct);
+
+    // Metadata header — non-interactive. The account id is here because the
+    // REST fallback (`jacked claude <id>`, PATCH /api/auth/accounts/<id>)
+    // needs it and nothing else on the card shows it.
+    const orgLine = orgLabel
+        ? `<div class="text-[11px] text-slate-500 truncate" title="${escapeHtml(orgLabel)}">${escapeHtml(orgLabel)}</div>`
+        : '';
+    const header = `<div class="px-3 py-2 border-b border-slate-700" role="presentation">
+                <div class="text-xs text-slate-500">Account #${escapeHtml(String(acct.id))}</div>
+                ${orgLine}
+            </div>`;
+
+    let items = renderAccountMenuItem(
+        'btn-copy-cmd',
+        `data-id="${acct.id}" data-cmd="jacked claude ${acct.id}"`,
+        'copy',
+        'Copy launch command',
+    );
+
+    items += renderAccountMenuItem(
+        'btn-edit-label',
+        `data-id="${acct.id}" data-label="${escapeHtml(hasCustomLabel ? acct.display_name : '')}"`,
+        'rename',
+        hasCustomLabel ? 'Rename' : 'Add label',
+    );
+
+    // Codex re-auth is `codex login` in a terminal (the Codex pill's
+    // "re-login" tooltip guides that); the backend rejects browser OAuth for
+    // it, so the row is omitted entirely rather than rendered and failing.
+    if (provider !== 'codex') {
+        items += renderAccountMenuItem(
+            'btn-reauth',
+            `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}"`,
+            'reauth',
+            'Re-auth',
+        );
+    }
+
+    items += renderAccountMenuItem(
+        'btn-toggle',
+        `data-id="${acct.id}" data-active="${acct.is_active}"`,
+        acct.is_active ? 'disable' : 'enable',
+        acct.is_active ? 'Disable' : 'Enable',
+    );
+
+    items += '<div class="border-t border-slate-700 my-1" role="separator"></div>';
+
+    items += renderAccountMenuItem(
+        'btn-delete',
+        `data-id="${acct.id}"`,
+        'delete',
+        'Delete account',
+        'text-red-400 hover:text-red-300 hover:bg-red-900/30',
+    );
+
+    const dot = needsAttention
+        ? '<span class="account-menu-dot" aria-hidden="true"></span>'
+        : '';
+
+    // z-30 clears the sibling cards in .accounts-grid (they carry no z-index).
+    // A disabled card also gets opacity-60, which opens its own stacking
+    // context — .provider-card.menu-open in style.css lifts the whole card
+    // while its menu is open so the panel still paints over the next card.
+    return `
+        <div class="account-menu-wrap relative">
+            <button class="btn-account-menu relative p-1.5 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors" data-id="${acct.id}" aria-haspopup="menu" aria-expanded="false" aria-label="Account actions" title="More actions">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z"/></svg>
+                ${dot}
+            </button>
+            <div class="account-menu hidden absolute right-0 top-full mt-1 min-w-[13rem] py-1 bg-slate-800 border border-slate-700 rounded-md shadow-lg z-30" role="menu" aria-label="Account actions" data-menu-for="${acct.id}">
+                ${header}
+                ${items}
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Render the action row for an account card: the one action people take often
+ * (Use Account) on the left, everything else behind the kebab on the right.
  */
 function renderActionButtons(acct) {
-    const status = getAccountStatus(acct);
     const isActiveInCC = window.jackedState.activeCredentialAccountId === acct.id;
 
     // "Use Account" button or "Active" badge.
@@ -232,36 +368,11 @@ function renderActionButtons(acct) {
         setActiveHtml = `<button class="btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 border border-teal-600/30 rounded font-medium transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Use Account</button>`;
     }
 
-    // Copy launch command — hidden now that dashboard switching works.
-    // Kept commented for future use (per-account isolated sessions).
-    // const copyCmd = `jacked claude ${acct.id}`;
-    // const copyHtml = `<button class="btn-copy-cmd ...">...</button>`;
-    const copyHtml = '';
-
-    // Re-auth button (if invalid/expired) — pills also handle this, keep for
-    // backward compat. NOT for Codex: its re-auth is `codex login` (the Codex
-    // pill's "re-login" tooltip guides that), not the Claude browser OAuth.
-    const showReauth = (status === 'invalid' || status === 'expired')
-        && (acct.provider || 'claude') !== 'codex';
-    let reauthHtml = '';
-    if (showReauth) {
-        reauthHtml = `<button class="btn-reauth text-xs px-3 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Re-auth</button>`;
-    }
-
-    // Toggle active/disabled
-    const toggleLabel = acct.is_active ? 'Disable' : 'Enable';
-    const toggleClass = acct.is_active ? 'text-yellow-400 hover:text-yellow-300' : 'text-green-400 hover:text-green-300';
-
     return `
-        <div class="flex items-center flex-wrap gap-2 mt-2 pt-2 border-t border-slate-700/50">
+        <div class="flex items-center gap-2 mt-2 pt-2 border-t border-slate-700/50">
             ${setActiveHtml}
-            ${copyHtml}
             <div class="flex-1"></div>
-            ${reauthHtml}
-            <button class="btn-toggle text-xs px-3 py-1.5 ${toggleClass} hover:bg-slate-700 rounded transition active:scale-[0.96]" data-id="${acct.id}" data-active="${acct.is_active}">${toggleLabel}</button>
-            <button class="btn-delete text-xs px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded transition active:scale-[0.96]" data-id="${acct.id}" title="Delete account">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-            </button>
+            ${renderAccountMenu(acct)}
         </div>
     `;
 }
@@ -275,11 +386,7 @@ function renderAccountCard(acct, idx, total) {
     // Show display_name as custom label only when it differs from email
     const hasCustomLabel = acct.display_name && acct.display_name !== acct.email;
     const label = hasCustomLabel ? acct.display_name : '';
-    const orgLabel = acct.organization_name
-        ? acct.organization_name
-        : acct.organization_uuid
-            ? acct.organization_uuid.slice(0, 8) + '…'
-            : '';
+    const orgLabel = accountOrgLabel(acct);
     const subDisplay = getSubDisplay(acct);
     const priorityBadge = getPriorityBadge(acct.priority || 0);
 
@@ -340,9 +447,6 @@ function renderAccountCard(acct, idx, total) {
                         ${providerBadge(provider)}
                         <span class="status-dot ${status}"></span>
                         <span class="font-medium text-white truncate max-w-[300px]" title="${escapeHtml(primaryName)}">${escapeHtml(primaryName)}</span>
-                        <button class="btn-edit-label p-1 rounded ${label ? 'text-slate-500 hover:text-slate-300' : 'text-slate-600 hover:text-slate-400'} transition-colors relative" data-id="${acct.id}" data-label="${escapeHtml(label)}" aria-label="${label ? 'Edit label' : 'Add label'}" title="${label ? 'Edit label' : 'Add label'}">
-                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
-                        </button>
                         ${priorityBadge}
                         ${disabledBadge}
                         ${pillsHtml}

@@ -5,10 +5,26 @@
 
 const SETTINGS_TAB_KEY = 'jacked_settings_tab';
 const DEFAULT_TAB = 'agents';
-// Color theme for account-usage bars + labels. Unset defaults to 'america250'
-// (the red/white/blue semiquincentennial scheme); the early-apply <head> snippet
-// in index.html/panel.html reads the same key so the two never disagree.
-const COLOR_THEME_KEY = 'jacked_color_theme';
+
+// Color theme for account-usage bars + labels ('america250' | 'classic';
+// unset means 'america250', the red/white/blue semiquincentennial scheme).
+//
+// The SERVER is the source of truth: the value lives in the jacked settings
+// table under 'color_theme' (GET /api/settings, PUT /api/settings/color_theme).
+// localStorage is only a per-webview PRE-PAINT CACHE so the <head> snippet in
+// index.html/panel.html can set the html class before first paint without
+// waiting on a fetch.
+//
+// This split is not optional. The dashboard runs in the user's browser, while
+// the menu-bar dropdown and side panel are WKWebViews created inside the jacked
+// Python process (service/menubar_mac.py) that load /panel. A WKWebView has its
+// OWN localStorage store, completely separate from Chrome's — a theme written
+// only to localStorage in the browser is invisible to the tray forever. The
+// server is the one store both surfaces can read, so it arbitrates; each
+// surface then refreshes its own cache for the next pre-paint.
+const COLOR_THEME_KEY = 'jacked_color_theme';   // localStorage pre-paint cache
+const COLOR_THEME_SETTING = 'color_theme';      // server settings key (authority)
+const DEFAULT_COLOR_THEME = 'america250';
 
 // --- Main render ---
 
@@ -22,8 +38,178 @@ function _resolveSettingsTab() {
     return tab;
 }
 
-function _resolveColorTheme() {
-    return localStorage.getItem(COLOR_THEME_KEY) === 'classic' ? 'classic' : 'america250';
+// --- Color theme (server-authoritative, localStorage = pre-paint cache) ---
+
+/** Coerce anything to a known theme name. Only 'classic' opts out of the default. */
+function _normalizeColorTheme(value) {
+    return String(value == null ? '' : value) === 'classic' ? 'classic' : DEFAULT_COLOR_THEME;
+}
+
+/** The cached (pre-paint) theme for THIS webview, or null when never cached. */
+function _cachedColorTheme() {
+    try {
+        const raw = localStorage.getItem(COLOR_THEME_KEY);
+        return raw === null ? null : _normalizeColorTheme(raw);
+    } catch (e) {
+        return null;   // private mode / storage disabled
+    }
+}
+
+/**
+ * Pull 'color_theme' out of a GET /api/settings payload.
+ * Accepts the raw list of {key, value} rows or a plain key→value map.
+ * Returns null when the server has no opinion yet — that null is what drives
+ * the one-time migration of an existing localStorage-only choice.
+ */
+function colorThemeFromSettings(settings) {
+    if (!settings) return null;
+    let raw;
+    if (Array.isArray(settings)) {
+        const row = settings.find(r => r && r.key === COLOR_THEME_SETTING);
+        raw = row ? row.value : undefined;
+    } else if (typeof settings === 'object') {
+        raw = settings[COLOR_THEME_SETTING];
+    }
+    if (raw === undefined || raw === null) return null;
+    // GET /api/settings JSON-decodes values, but a row written by an older
+    // client can still arrive as a quoted string — tolerate both.
+    const value = String(raw).replace(/^"(.*)"$/, '$1');
+    return value === 'classic' || value === 'america250' ? value : null;
+}
+
+/**
+ * The theme that should be applied: the server value when it has one, else this
+ * webview's cache, else the default. Pure — the reconcile paths call it.
+ */
+function resolveColorTheme(settings, cached) {
+    const remote = colorThemeFromSettings(settings);
+    if (remote) return remote;
+    return cached ? _normalizeColorTheme(cached) : DEFAULT_COLOR_THEME;
+}
+
+/** The theme currently painted on this page (the html class is the live truth). */
+function _appliedColorTheme() {
+    try {
+        if (document.documentElement.classList.contains('theme-america250')) return 'america250';
+        return 'classic';
+    } catch (e) {
+        return _cachedColorTheme() || DEFAULT_COLOR_THEME;
+    }
+}
+
+/** Paint a theme and refresh this webview's pre-paint cache. Returns the theme. */
+function applyColorTheme(value) {
+    const theme = _normalizeColorTheme(value);
+    document.documentElement.classList.toggle('theme-america250', theme !== 'classic');
+    try {
+        localStorage.setItem(COLOR_THEME_KEY, theme);
+    } catch (e) {
+        /* no storage — the next pre-paint just falls back to the default */
+    }
+    return theme;
+}
+
+/** Write the theme to the server so the tray WKWebView can read it. */
+async function persistColorTheme(theme) {
+    await api.put(`/api/settings/${encodeURIComponent(COLOR_THEME_SETTING)}`, { value: theme });
+}
+
+/**
+ * Reconcile this page against the server exactly once per page load.
+ *
+ * - Server has a value → paint it and refresh the cache (the pre-paint class may
+ *   have been wrong if the choice was made in another browser/webview).
+ * - Server has none but this device does → push the local choice up ONCE, so an
+ *   existing user's theme reaches the tray without re-clicking it.
+ *
+ * The one-shot flag is set BEFORE any await, so a repeated call (poll, re-render,
+ * route change) can never loop or re-issue the migration PUT.
+ */
+let _colorThemeSynced = false;
+
+// Set the instant the user picks a theme in the Appearance tab, BEFORE the paint.
+// The reconcile GET can take seconds (busy DB; the api client allows up to 60s),
+// and a pick made while it is in flight must not be silently reverted by a value
+// that was already stale when it was read: the click's own PUT is what the server
+// ends up holding, so applying the older remote value would leave the painted
+// class, the localStorage cache, the picker's Active badge and the server all
+// disagreeing until a reload. The user's choice always wins.
+let _colorThemeUserPicked = false;
+
+/**
+ * Rebuild the surfaces that bake theme classes into their HTML.
+ *
+ * Flipping the html class restyles everything CSS drives (the usage bars) at
+ * once, but the percent LABELS are Tailwind classes chosen in JS at render time
+ * (usageTextClass in js/components/usage.js), so they keep the old palette until
+ * something re-renders — up to a full poll cycle. The tray panel already forces
+ * this; the dashboard must too.
+ *
+ * Every call is guarded: settings.js is loaded standalone by the node test
+ * harness, where neither the accounts view nor a settings container exists.
+ */
+function _repaintThemedSurfaces() {
+    try {
+        // Only when the accounts view is really on screen. The reconcile resolves
+        // on DOMContentLoaded, possibly BEFORE app.js has finished its own first
+        // render — rendering an empty accounts list there would just be a flash,
+        // and that first render already picks up the theme we just painted.
+        if (typeof rerenderAccountsView === 'function'
+                && document.getElementById('accounts-list')) {
+            rerenderAccountsView();
+        }
+    } catch (e) {
+        /* the accounts view is not mounted (or mid-navigation) — nothing to repaint */
+    }
+    try {
+        if (typeof renderAppearanceTab !== 'function') return;
+        // Only when Appearance is the tab actually showing: its ring + Active
+        // badge are rendered from the painted theme, so a reconcile that changed
+        // the theme leaves them marking the wrong option.
+        if (_resolveSettingsTab() !== 'appearance') return;
+        const container = document.getElementById('settings-tab-content');
+        if (container) renderAppearanceTab(container);
+    } catch (e) {
+        /* no settings container on this page — nothing to repaint */
+    }
+}
+
+async function syncColorThemeFromServer() {
+    if (_colorThemeSynced) return null;
+    _colorThemeSynced = true;
+
+    let settings;
+    try {
+        settings = await api.get('/api/settings');
+    } catch (e) {
+        return null;   // server unreachable — the cached pre-paint class stands
+    }
+
+    const remote = colorThemeFromSettings(settings);
+    if (remote) {
+        // A pick made while the GET was in flight is newer than this response.
+        if (_colorThemeUserPicked) return null;
+        const before = _appliedColorTheme();
+        const applied = applyColorTheme(remote);
+        // Only when the reconcile actually CHANGED the painted theme: re-rendering
+        // the accounts view on every page load for a value that already matches is
+        // pointless churn (and would fight the user's scroll/expansion state).
+        if (applied !== before) _repaintThemedSurfaces();
+        return applied;
+    }
+
+    const cached = _cachedColorTheme();
+    if (!cached) return null;   // nobody has an opinion — leave the default alone
+    try {
+        await persistColorTheme(cached);
+    } catch (e) {
+        /* migration is best-effort; the next page load retries it */
+    }
+    return cached;
+}
+
+if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('DOMContentLoaded', () => { syncColorThemeFromServer(); });
 }
 
 function renderSettings(settings) {
@@ -1793,10 +1979,11 @@ async function _loadRawEditor() {
 
 // --- Tab: Appearance ---
 
-// Two-option segmented picker for the account-usage color scheme. Pure client
-// preference (localStorage, no API) — synchronous like renderAdvancedTab.
+// Two-option segmented picker for the account-usage color scheme. Renders from
+// the theme currently painted on the page (which syncColorThemeFromServer has
+// already reconciled against the server), so it stays synchronous.
 function renderAppearanceTab(container) {
-    const theme = _resolveColorTheme();
+    const theme = _appliedColorTheme();
 
     // Each option previews its usage-bar palette so the choice is obvious; the
     // selected one carries a blue ring + "Active" badge.
@@ -1818,9 +2005,9 @@ function renderAppearanceTab(container) {
     };
 
     container.innerHTML = `
-        <p class="text-xs text-slate-500 mb-4 text-pretty">Color scheme for account-usage bars and their percentages. Applies instantly and is remembered on this device.</p>
+        <p class="text-xs text-slate-500 mb-4 text-pretty">Color scheme for account-usage bars and their percentages. Applies instantly here and to the menu-bar panel.</p>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-            ${option('america250', 'America 250', 'Red, white &amp; blue for the 2026 U.S. semiquincentennial — healthy is blue, warning white, critical red.', ['#3b82f6', '#ffffff', '#ef4444'])}
+            ${option('america250', 'America 250', 'Red, white &amp; blue for the 2026 U.S. semiquincentennial: healthy is blue, warning white, critical red.', ['#3b82f6', '#ffffff', '#ef4444'])}
             ${option('classic', 'Classic', 'The original green / amber / red usage palette.', ['#22c55e', '#eab308', '#ef4444'])}
         </div>
     `;
@@ -1830,14 +2017,29 @@ function renderAppearanceTab(container) {
 
 function _bindAppearanceEvents(container) {
     container.querySelectorAll('.appearance-option').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const value = btn.dataset.theme;
-            localStorage.setItem(COLOR_THEME_KEY, value);
-            // Bars restyle live via CSS the moment the class flips; the JS-emitted
-            // percent-label classes catch up on the next render of accounts/panel.
-            document.documentElement.classList.toggle('theme-america250', value !== 'classic');
-            showToast(value === 'classic' ? 'Classic theme applied' : 'America 250 theme applied', 'success');
+        btn.addEventListener('click', async () => {
+            // Claim the theme for the user BEFORE painting: a reconcile GET that
+            // was issued before this click can still be in flight, and it must
+            // not overwrite the choice being made right now.
+            _colorThemeUserPicked = true;
+            // Paint + cache first so the choice is instant and survives a reload,
+            // then persist to the server so the tray WKWebView (its own separate
+            // localStorage) picks it up on its next refresh. Bars restyle live via
+            // CSS the moment the class flips; the JS-emitted percent-label classes
+            // catch up on the next render of accounts/panel.
+            const theme = applyColorTheme(btn.dataset.theme);
+            showToast(theme === 'classic' ? 'Classic theme applied' : 'America 250 theme applied', 'success');
             renderAppearanceTab(container);
+            try {
+                await persistColorTheme(theme);
+            } catch (e) {
+                showToast(
+                    'Saved on this device only'
+                    + (e && e.message ? ': ' + e.message : '')
+                    + '. The menu-bar panel may keep the old colors.',
+                    'warning',
+                );
+            }
         });
     });
 }
