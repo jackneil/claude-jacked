@@ -17,11 +17,43 @@
 
 const PANEL_REFRESH_MS = 15000;
 
+// Color theme. This webview is created inside the jacked process, so its
+// localStorage is a DIFFERENT store from the browser the dashboard runs in — a
+// theme picked in the dashboard can only reach us through the server. So the
+// server setting 'color_theme' is the source of truth and localStorage here is
+// only the pre-paint cache that panel.html's <head> snippet reads (no flash).
+const PANEL_COLOR_THEME_KEY = 'jacked_color_theme';
+const PANEL_COLOR_THEME_SETTING = 'color_theme';
+
 /** Minimal JSON fetch wrapper (panel is standalone; no app.js `api`). */
 async function panelFetch(path) {
     const resp = await fetch(path, { headers: { Accept: 'application/json' } });
     if (!resp.ok) throw new Error('HTTP ' + resp.status + ' for ' + path);
     return resp.json();
+}
+
+/** Read 'color_theme' from a GET /api/settings payload, or null when unset. */
+function panelColorThemeFromSettings(settings) {
+    if (!Array.isArray(settings)) return null;
+    const row = settings.find((r) => r && r.key === PANEL_COLOR_THEME_SETTING);
+    if (!row || row.value === undefined || row.value === null) return null;
+    const value = String(row.value).replace(/^"(.*)"$/, '$1');
+    return value === 'classic' || value === 'america250' ? value : null;
+}
+
+/** Paint a theme on this webview and refresh its pre-paint cache.
+ * Returns true when the painted theme actually changed. */
+function applyPanelColorTheme(theme) {
+    const wantA250 = theme !== 'classic';
+    const root = document.documentElement;
+    const changed = root.classList.contains('theme-america250') !== wantA250;
+    root.classList.toggle('theme-america250', wantA250);
+    try {
+        localStorage.setItem(PANEL_COLOR_THEME_KEY, wantA250 ? 'america250' : 'classic');
+    } catch (e) {
+        /* no storage — only the next pre-paint loses out */
+    }
+    return changed;
 }
 
 /** Compact "Max 20x" style plan badge from subscription_type + rate_limit_tier. */
@@ -169,19 +201,29 @@ function panelErrorHtml(message) {
         </div>`;
 }
 
-/** Fetch accounts + the menu-bar summary (active id + next-refresh), group, render.
+/** Fetch accounts + the menu-bar summary (active id + next-refresh) + settings,
+ * group, render.
  * Multiple triggers can race (interval, native reload nudge, visibilitychange) —
  * a sequence counter drops any fetch that finished after a newer one started, so
- * a slow stale response never overwrites fresher data. */
+ * a slow stale response never overwrites fresher data.
+ *
+ * The color theme rides along on this same refresh (no extra polling): a theme
+ * change made in the browser reaches the tray within one cycle. It is applied
+ * BEFORE the render below, so the JS-emitted percent-label classes (usage.js
+ * reads the html class at render time) come out in the new theme too — the panel
+ * rebuilds its HTML on every load, so no separate re-render is needed. */
 let _loadSeq = 0;
 async function loadPanel(container) {
     const seq = ++_loadSeq;
     try {
-        const [accounts, summary] = await Promise.all([
+        const [accounts, summary, settings] = await Promise.all([
             panelFetch('/api/auth/accounts'),
             panelFetch('/api/menubar-summary').catch(() => ({})),
+            panelFetch('/api/settings').catch(() => null),
         ]);
         if (seq !== _loadSeq) return; // superseded by a newer load
+        const theme = panelColorThemeFromSettings(settings);
+        if (theme) applyPanelColorTheme(theme);
         const activeId =
             summary && summary.active_account_id != null ? summary.active_account_id : null;
         const nextRefreshAt =
@@ -336,5 +378,8 @@ if (typeof module !== 'undefined' && module.exports) {
         setupMenuButton,
         setupRefreshButton,
         doManualRefresh,
+        panelColorThemeFromSettings,
+        applyPanelColorTheme,
+        loadPanel,
     };
 }

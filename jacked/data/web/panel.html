@@ -3,9 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<!-- Apply the saved color theme before first paint (no flash of the wrong
+<!-- Apply the CACHED color theme before first paint (no flash of the wrong
      scheme). Unset defaults to America 250; only explicit 'classic' opts out.
-     Key mirrors settings.js / index.html. -->
+     This webview's localStorage is a separate store from the browser running
+     the dashboard, so it is only a cache: panel.js reads the server setting
+     'color_theme' on every refresh, repaints if it disagrees, and rewrites this
+     key for the next pre-paint. Key mirrors settings.js / index.html. -->
 <script>
     (function () {
         try {

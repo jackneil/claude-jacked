@@ -264,6 +264,10 @@ function rerenderAccountsView() {
     // code entry, which can sit for minutes) must survive a session-event
     // re-render. Moving the nodes keeps their listeners and any typed code.
     const savedOauthBanner = [...(document.getElementById('oauth-flow-status')?.childNodes || [])];
+    // Save the open account (kebab) menu. This runs on routine websocket events
+    // (a Claude Code session starting or stopping), so without this the menu
+    // vanishes under the user's pointer with no action of their own.
+    const savedOpenMenuId = typeof openAccountMenuId === 'function' ? openAccountMenuId() : null;
 
     content.innerHTML = renderAccounts(window.jackedState.accounts);
     if (typeof bindAccountEvents === 'function') bindAccountEvents();
@@ -295,6 +299,12 @@ function rerenderAccountsView() {
     if (savedOauthBanner.length) {
         const oauthSlot = document.getElementById('oauth-flow-status');
         if (oauthSlot) savedOauthBanner.forEach(node => oauthSlot.appendChild(node));
+    }
+    // Restore the open account menu on the freshly rendered card. bindAccountEvents()
+    // above dropped the reference to the detached node, so this re-opens against the
+    // new DOM. A no-op when that account is gone from the list (deleted or filtered).
+    if (savedOpenMenuId !== null && typeof openAccountMenuForId === 'function') {
+        openAccountMenuForId(savedOpenMenuId);
     }
     // Restore repo group expansion
     window.jackedState.expandedRepoGroups = savedRepoGroups;

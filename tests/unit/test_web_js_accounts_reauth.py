@@ -1,12 +1,17 @@
-"""The account-card Re-auth button is an always-available escape hatch.
+"""Re-auth is an always-available escape hatch — now inside the kebab menu.
 
 Regression for: the Re-auth button only rendered when the DB said the token
 was invalid/expired. Accounts revalidate at most hourly, so a token that died
 inside that window left the dashboard showing 'valid' with no re-auth
 affordance — the escape hatch was hidden exactly when state detection was
-wrong. The button now renders unconditionally for Claude accounts (subtle
-when healthy, alert-blue when jacked knows re-auth is needed) and never for
-Codex accounts (their re-auth is `codex login`, not browser OAuth).
+wrong.
+
+The affordance later moved off the card face (a permanently-visible Re-auth
+button was noise) into the account overflow menu. The always-available
+property is unchanged: the Re-auth row renders for every Claude account
+regardless of validation_status, and never for Codex accounts (their re-auth
+is `codex login`, not browser OAuth). When jacked DOES know re-auth is needed,
+the kebab carries an attention dot so the hidden row stays discoverable.
 """
 
 import json
@@ -23,7 +28,7 @@ ACCOUNTS_JS = (
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 
-ALERT_CLASS = "bg-blue-600/20"
+ATTENTION_DOT = '<span class="account-menu-dot"'
 
 
 def _render_actions(tmp_path, acct):
@@ -49,8 +54,15 @@ def _render_actions(tmp_path, acct):
     return json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
 
 
-def _reauth_button(html):
-    """Extract the btn-reauth button tag from rendered HTML, or None."""
+def _menu_panel(html):
+    """Everything from the <div class="account-menu ..."> panel onward."""
+    marker = '<div class="account-menu '
+    assert marker in html, "every card renders an overflow menu panel"
+    return html[html.index(marker):]
+
+
+def _reauth_item(html):
+    """Extract the btn-reauth menu item from rendered HTML, or None."""
     marker = "btn-reauth"
     if marker not in html:
         return None
@@ -64,52 +76,64 @@ def test_node_syntax_check():
     assert proc.returncode == 0, proc.stderr
 
 
-def test_valid_claude_account_still_gets_reauth_button(tmp_path):
+def test_valid_claude_account_still_gets_reauth(tmp_path):
     html = _render_actions(tmp_path, {
         "id": 1, "email": "a@x.com", "provider": "claude", "is_active": True,
         "validation_status": "valid", "is_expired": False,
         "has_refresh_token": True, "expires_in_seconds": 999999,
     })
-    btn = _reauth_button(html)
-    assert btn is not None, "Re-auth must render even when jacked thinks the token is valid"
-    assert ALERT_CLASS not in btn, "healthy account gets subtle styling, not alert blue"
-    assert 'data-id="1"' in btn and 'data-email="a@x.com"' in btn
+    item = _reauth_item(html)
+    assert item is not None, "Re-auth must render even when jacked thinks the token is valid"
+    assert 'data-id="1"' in item and 'data-email="a@x.com"' in item
+    # It lives in the menu, not on the card face
+    assert "btn-reauth" in _menu_panel(html)
+    assert 'role="menuitem"' in item
+    # A healthy account gets no attention dot on the kebab
+    assert ATTENTION_DOT not in html
 
 
-def test_invalid_account_gets_alert_styled_reauth(tmp_path):
+def test_invalid_account_gets_attention_dot(tmp_path):
     html = _render_actions(tmp_path, {
         "id": 2, "email": "b@x.com", "provider": "claude", "is_active": True,
         "validation_status": "invalid",
     })
-    btn = _reauth_button(html)
-    assert btn is not None
-    assert ALERT_CLASS in btn, "invalid account keeps the prominent alert styling"
+    assert _reauth_item(html) is not None
+    assert ATTENTION_DOT in html, "invalid account flags the kebab so Re-auth stays discoverable"
 
 
-def test_expired_api_key_account_gets_alert_styled_reauth(tmp_path):
+def test_expired_api_key_account_gets_attention_dot(tmp_path):
     html = _render_actions(tmp_path, {
         "id": 3, "email": "c@x.com", "provider": "claude", "is_active": True,
         "validation_status": "valid", "is_expired": True, "has_refresh_token": False,
     })
-    btn = _reauth_button(html)
-    assert btn is not None
-    assert ALERT_CLASS in btn
+    assert _reauth_item(html) is not None
+    assert ATTENTION_DOT in html
 
 
-def test_disabled_account_still_gets_reauth_button(tmp_path):
+def test_disabled_account_still_gets_reauth(tmp_path):
     html = _render_actions(tmp_path, {
         "id": 4, "email": "d@x.com", "provider": "claude", "is_active": False,
         "validation_status": "valid",
     })
-    assert _reauth_button(html) is not None, "escape hatch stays available on disabled accounts"
+    assert _reauth_item(html) is not None, "escape hatch stays available on disabled accounts"
 
 
-def test_codex_account_never_gets_reauth_button(tmp_path):
+def test_codex_account_never_gets_reauth(tmp_path):
     for status in ("valid", "invalid"):
         html = _render_actions(tmp_path, {
             "id": 5, "email": "e@x.com", "provider": "codex", "is_active": True,
             "validation_status": status,
         })
-        assert _reauth_button(html) is None, (
+        assert _reauth_item(html) is None, (
             f"Codex ({status}) must not render browser-OAuth Re-auth; its re-auth is `codex login`"
         )
+
+
+def test_reauth_is_not_a_standalone_card_button(tmp_path):
+    """The old always-visible Re-auth button on the card face is gone."""
+    html = _render_actions(tmp_path, {
+        "id": 6, "email": "f@x.com", "provider": "claude", "is_active": True,
+        "validation_status": "valid",
+    })
+    before_menu = html[:html.index('<div class="account-menu-wrap')]
+    assert "btn-reauth" not in before_menu
