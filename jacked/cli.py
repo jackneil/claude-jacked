@@ -100,6 +100,12 @@ def _log_to_db(table: str, **kwargs):
 @click.pass_context
 def main(ctx, verbose: bool):
     """Jacked - Cross-machine context for Claude Code sessions."""
+    # Idempotent, and already done by `python -m jacked`. Repeated here because
+    # the `jacked.exe` console-script entry point skips __main__.py entirely,
+    # and a GUI-spawned exe can also land here with None std streams.
+    from jacked.headless import ensure_std_streams
+
+    ensure_std_streams()
     setup_logging(verbose)
     # First-run nudge: `pip`/`uv tool install` run no code, so this is the
     # earliest point we can tell a user the install isn't finished. Loud banner
@@ -128,6 +134,32 @@ def _is_headless() -> bool:
     return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _is_interactive_tty() -> bool:
+    """True only when a real human terminal is on both stdin and stdout.
+
+    Must never raise: this runs in the top-level ``main()`` callback, so an
+    exception here kills EVERY subcommand before it dispatches.
+
+    Under Windows' console-less ``pythonw.exe`` — which is exactly what the
+    login autostart VBS uses to launch ``-m jacked service start`` — both
+    ``sys.stdin`` and ``sys.stdout`` are ``None``, so the old
+    ``sys.stdin.isatty()`` raised AttributeError and took the tray icon down
+    with it, silently, on every boot (there is no console to print the
+    traceback to). Streams can also be closed or replaced by objects with no
+    ``isatty`` under test runners and hook shims, hence the broad guard.
+    """
+    for stream in (sys.stdin, sys.stdout):
+        if stream is None:
+            return False
+        try:
+            if not stream.isatty():
+                return False
+        except (AttributeError, ValueError, OSError):
+            # ValueError: I/O operation on closed file.
+            return False
+    return True
+
+
 def _maybe_prompt_first_run(ctx) -> None:
     """When jacked is on disk but `jacked install` has never run, show a loud
     banner and (interactively) offer to run it now.
@@ -139,7 +171,7 @@ def _maybe_prompt_first_run(ctx) -> None:
     sub = ctx.invoked_subcommand
     if sub and (sub.startswith("_") or sub == "install"):
         return
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not _is_interactive_tty():
         return
     if _already_installed():
         return
@@ -3593,6 +3625,20 @@ def _recommend_external_tools():
             console.print(t)
 
 
+def _port_owner_hint(port: int | None = None) -> str:
+    """Return the platform's command for "who is listening on this port".
+
+    The old hardcoded ``lsof`` line was macOS/Linux-only, so the one message
+    a stuck Windows user most needed handed them a command that doesn't exist.
+    """
+    from jacked.service import DEFAULT_PORT
+
+    port = DEFAULT_PORT if port is None else port
+    if sys.platform == "win32":
+        return f"netstat -ano | findstr :{port}"
+    return f"lsof -iTCP:{port} -sTCP:LISTEN"
+
+
 @main.command()
 def doctor():
     """Diagnose a broken jacked install and print recovery commands.
@@ -3600,6 +3646,11 @@ def doctor():
     Checks version, install method, launchd/systemd plist/unit, and
     service running state (via PID + HTTP probe, not just port).
     Prints exact commands to paste for any detected issue.
+
+    A 200 on the port is NOT sufficient to call the service healthy: a
+    foreground ``jacked webux`` serves the same dashboard but runs no tray
+    icon and writes no PID file, so the HTTP probe is cross-checked against
+    a live PID file before reporting HEALTHY.
 
     Read-only diagnostic — does not attempt any repair.
     """
@@ -3666,10 +3717,41 @@ def doctor():
                 f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/api/version",
                 timeout=2.0,
             )
-            if resp.status_code == 200:
+            if resp.status_code == 200 and pid_alive:
                 console.print(
                     f"[bold]Service:[/bold] [green]HEALTHY[/green] "
-                    f"(port {DEFAULT_PORT}, HTTP 200)"
+                    f"(port {DEFAULT_PORT}, HTTP 200, pid {pid_info['pid']})"
+                )
+            elif resp.status_code == 200:
+                # Port answers, but nothing we manage owns it. The usual
+                # culprit is a hand-run `jacked webux`: it serves this exact
+                # dashboard, so the HTTP probe passes, but it has no tray icon
+                # and writes no PID file — and while it squats the port every
+                # `service start` dies with "port already in use".  Reporting
+                # HEALTHY here is what let that hide for days.
+                console.print(
+                    f"[bold]Service:[/bold] [yellow]DASHBOARD UP, "
+                    f"NO TRAY SERVICE[/yellow] (port {DEFAULT_PORT}, HTTP 200)"
+                )
+                if pid_info is None:
+                    console.print(f"  No PID file at {PID_FILE}.")
+                else:
+                    console.print(
+                        f"  Stale PID file at {PID_FILE} "
+                        f"(pid {pid_info['pid']} is dead)."
+                    )
+                console.print(
+                    "  Something is serving the dashboard, but it is not the "
+                    "managed service — so there is no tray icon."
+                )
+                console.print(
+                    "  Most likely a foreground [cyan]jacked webux[/cyan] "
+                    "holding the port."
+                )
+                console.print(f"  Find the owner: [cyan]{_port_owner_hint()}[/cyan]")
+                console.print(
+                    "  Recovery: stop that process, then "
+                    "[cyan]jacked service start[/cyan]"
                 )
             else:
                 console.print(
@@ -3691,7 +3773,7 @@ def doctor():
                 console.print(
                     f"  Port held by a process that is NOT the jacked service "
                     f"(our PID file is stale or missing).  "
-                    f"Run [cyan]lsof -iTCP:{DEFAULT_PORT} -sTCP:LISTEN[/cyan] "
+                    f"Run [cyan]{_port_owner_hint()}[/cyan] "
                     "to see the owner."
                 )
             console.print("  Recovery: [cyan]jacked service restart[/cyan]")

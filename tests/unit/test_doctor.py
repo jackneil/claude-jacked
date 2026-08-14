@@ -29,14 +29,72 @@ def test_doctor_plist_missing_recommends_install(tmp_path, monkeypatch):
 
 
 def test_doctor_service_healthy_via_http_probe(monkeypatch):
-    """If HTTP probe returns 200, doctor reports HEALTHY."""
+    """HTTP 200 *and* a live PID file → HEALTHY.
+
+    Both halves are patched deliberately: before the webux fix this test
+    passed on any machine whose PID file happened to be live, which made it
+    silently environment-dependent.
+    """
     from jacked.cli import main
     fake_resp = MagicMock(status_code=200)
     fake_resp.json.return_value = {"current": "0.41.24"}
     with patch("jacked.service.process.is_port_available", return_value=False), \
+         patch("jacked.service.process.read_pid",
+               return_value={"pid": 4321, "port": 8321}), \
+         patch("jacked.service.process.is_process_alive", return_value=True), \
          patch("httpx.get", return_value=fake_resp):
         result = CliRunner().invoke(main, ["doctor"])
-    assert "healthy" in result.output.lower() or "running" in result.output.lower()
+    assert "healthy" in result.output.lower()
+
+
+def test_doctor_http_200_without_pid_is_not_healthy():
+    """Regression: a stray `jacked webux` must not be reported HEALTHY.
+
+    webux serves the same dashboard (so the HTTP probe returns 200) but runs
+    no tray icon and writes no PID file. Reporting HEALTHY here hid a dead
+    tray for 8 days while webux squatted port 8321.
+    """
+    from jacked.cli import main
+    fake_resp = MagicMock(status_code=200)
+    with patch("jacked.service.process.is_port_available", return_value=False), \
+         patch("jacked.service.process.read_pid", return_value=None), \
+         patch("httpx.get", return_value=fake_resp):
+        result = CliRunner().invoke(main, ["doctor"])
+    out = result.output.lower()
+    assert "healthy" not in out
+    assert "no tray service" in out
+    assert "webux" in out
+    assert "jacked service start" in out
+
+
+def test_doctor_http_200_with_dead_pid_reports_stale():
+    """HTTP 200 but the PID file points at a dead process → not healthy."""
+    from jacked.cli import main
+    fake_resp = MagicMock(status_code=200)
+    with patch("jacked.service.process.is_port_available", return_value=False), \
+         patch("jacked.service.process.read_pid",
+               return_value={"pid": 999999, "port": 8321}), \
+         patch("jacked.service.process.is_process_alive", return_value=False), \
+         patch("httpx.get", return_value=fake_resp):
+        result = CliRunner().invoke(main, ["doctor"])
+    out = result.output.lower()
+    assert "healthy" not in out
+    assert "no tray service" in out
+    assert "stale pid file" in out
+    assert "999999" in result.output
+
+
+def test_port_owner_hint_is_platform_correct(monkeypatch):
+    """Windows users get netstat, not a macOS-only lsof they cannot run."""
+    import sys as _sys
+
+    from jacked.cli import _port_owner_hint
+
+    monkeypatch.setattr(_sys, "platform", "win32")
+    assert _port_owner_hint(8321) == "netstat -ano | findstr :8321"
+
+    monkeypatch.setattr(_sys, "platform", "darwin")
+    assert _port_owner_hint(8321) == "lsof -iTCP:8321 -sTCP:LISTEN"
 
 
 def test_doctor_port_held_but_http_dead():

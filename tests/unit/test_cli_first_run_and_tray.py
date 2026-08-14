@@ -138,3 +138,64 @@ def test_bare_jacked_shows_help_not_usage_error(tmp_path, monkeypatch):
     r = CliRunner().invoke(main, [])
     assert r.exit_code == 0
     assert "Usage:" in r.output or "Commands:" in r.output
+
+
+# --- console-less (pythonw.exe) std streams ---------------------------------
+#
+# Regression: `_maybe_prompt_first_run` ran `sys.stdin.isatty()` unguarded from
+# the top-level main() callback. Under pythonw.exe — what the Windows login
+# autostart VBS uses for `-m jacked service start` — the std streams are None,
+# so this raised AttributeError and killed EVERY subcommand before dispatch.
+# The tray never started, on every boot, with no console to report it to.
+
+def test_is_interactive_tty_false_when_streams_are_none(monkeypatch):
+    monkeypatch.setattr(cli.sys, "stdin", None)
+    monkeypatch.setattr(cli.sys, "stdout", None)
+    assert cli._is_interactive_tty() is False
+
+
+def test_is_interactive_tty_survives_streams_without_isatty(monkeypatch):
+    """Hook shims and odd test doubles can swap in objects with no isatty."""
+    monkeypatch.setattr(cli.sys, "stdin", object())
+    monkeypatch.setattr(cli.sys, "stdout", object())
+    assert cli._is_interactive_tty() is False
+
+
+def test_is_interactive_tty_survives_closed_streams(monkeypatch):
+    """A closed file raises ValueError from isatty() rather than returning."""
+    class _Closed:
+        def isatty(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(cli.sys, "stdin", _Closed())
+    monkeypatch.setattr(cli.sys, "stdout", _Closed())
+    assert cli._is_interactive_tty() is False
+
+
+def test_is_interactive_tty_true_only_when_both_are_ttys(monkeypatch):
+    class _Tty:
+        def __init__(self, v):
+            self._v = v
+
+        def isatty(self):
+            return self._v
+
+    monkeypatch.setattr(cli.sys, "stdin", _Tty(True))
+    monkeypatch.setattr(cli.sys, "stdout", _Tty(True))
+    assert cli._is_interactive_tty() is True
+
+    monkeypatch.setattr(cli.sys, "stdout", _Tty(False))
+    assert cli._is_interactive_tty() is False
+
+
+def test_first_run_nag_does_not_raise_on_none_streams(monkeypatch):
+    """The actual crash: this must return quietly, not blow up main()."""
+    monkeypatch.setattr(cli.sys, "stdin", None)
+    monkeypatch.setattr(cli.sys, "stdout", None)
+    monkeypatch.setattr(cli, "_already_installed", lambda: False)
+    buf = io.StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=buf))
+
+    cli._maybe_prompt_first_run(_ctx("service"))  # must not raise
+
+    assert buf.getvalue() == ""
