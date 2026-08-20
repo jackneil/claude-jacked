@@ -170,8 +170,11 @@ class TestWindowsTrayUpdaterBatch:
         assert ":waitdone" in batch
         assert "GEQ 120" in batch
         assert "4242" in batch  # waits on the correct parent PID
-        # old unbounded form gone
-        assert "if not errorlevel 1" not in batch
+        # Old unbounded form gone. Match the exact jump the spin loop used —
+        # a bare "if not errorlevel 1" also matches the verify-retry branch,
+        # which is a different (and deliberately bounded) construct. No \r\n in
+        # the needle: this file was opened in universal-newline mode.
+        assert "if not errorlevel 1 goto wait" not in batch
         mock_popen.assert_called_once()
 
 
