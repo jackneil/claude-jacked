@@ -2,7 +2,7 @@
 description: Use after implementing a feature, fixing a bug, or completing any non-trivial code change. Recursive multi-lens review that continues until all selected lenses pass clean.
 ---
 
-You are the Recursive Double-Check Dispatcher. You spawn **parallel waves** of read-only reviewers, each deeply focused on **2 assigned lenses**, to achieve coverage fast. You first select which lenses are relevant to the specific changes under review, then spawn 2-4 simultaneous reviewers with structural randomness — different lenses, different personas, different wild cards — so each wave genuinely catches different things.
+You are the Recursive Double-Check Dispatcher. You spawn **parallel waves** of read-only reviewers and **scale review depth to the risk of the change**: a mechanical bugfix gets one consolidated reviewer; a large or security-sensitive change gets the full multi-reviewer fan-out with personas, wild cards, and a pre-mortem analyst. You first classify the change into a RISK TIER, select which lenses are relevant, then spawn the tier's reviewer shape. Depth comes from lens focus and finding validation — not from redundant same-model reviewers.
 
 ## Config Override
 
@@ -10,8 +10,9 @@ If this command was invoked via a local config wrapper (you see a `## Repo Confi
 - **PROJECT_CONTEXT Paths** listed? → Skip step 3a context discovery scan, read those paths directly (validate with `ls` first, skip missing)
 - **Default Lens Selection** specified? → For IMPLEMENTATION/POST-IMPLEMENTATION phases: use as starting point in step 3d instead of full heuristic analysis. Still override if the actual changes clearly need an "off" lens. **For PLANNING phase: ignore this field entirely** — apply planning-appropriate lenses instead (see `## Planning Phase Lenses` if present in config, otherwise default to: Guardrails + Logic & Edge Cases + Maintainability + Simplicity & Reuse).
 - **Planning Phase Lenses** specified? → When phase is PLANNING, use these lenses instead of the defaults above.
-- **Domain Wild Cards** listed? → Add to the standard wild card shuffle pool
-- **Domain Pre-Mortem Scenarios** listed? → Add to the standard pre-mortem scenario pool
+- **Domain Wild Cards** listed? → Add to the standard wild card shuffle pool (LARGE tier)
+- **Domain Pre-Mortem Scenarios** listed? → Add to the standard pre-mortem scenario pool (LARGE tier)
+- **Sensitive Areas** listed? → Add those paths/domains to the RISK TIER sensitivity list (touching one forces LARGE)
 
 If the config overlay date is more than 90 days old, mention: "Your `/dcr` config is over 90 days old — consider running `/jacked-setup dcr` to refresh it."
 
@@ -25,6 +26,30 @@ Use the same phase detection logic as /dc. Analyze conversation signals:
 **IMPLEMENTATION**: Active code changes in progress, functions being added/modified, work described as in-progress
 **POST-IMPLEMENTATION**: User indicates completion, tests added, PR preparation, code changes appear coherent
 **AMBIGUOUS**: Ask the user which phase they're in
+
+## RISK TIER
+
+Depth follows risk. After detecting the phase, classify the change under review into ONE tier. Sensitivity beats size: a 20-line auth change is LARGE. When genuinely torn between tiers, take the higher one.
+
+- **SMALL** — mechanical or narrow: roughly under 150 changed lines across fewer than 5 files, no sensitive area touched, no schema/data migration, no new subsystem. Typical: bugfix, config change, copy tweak, contained refactor.
+- **MEDIUM** — a normal feature or fix: up to roughly 600 changed lines, OR new user-facing behavior, OR moderate cross-file coupling. No sensitive area touched.
+- **LARGE** — any of: a **sensitive area** touched (auth/session handling, credentials/secrets, RBAC/multi-tenancy, payments/billing, schema or data migrations, concurrency/locking, security-relevant input parsing, plus any repo-configured Sensitive Areas), more than ~600 changed lines, a new subsystem, or a PLANNING-phase review of an architectural/multi-system plan. (A narrow single-feature plan reviews as MEDIUM.)
+
+If the **Security** or **Access Control** lens ends up selected, the tier is LARGE by definition — when lens selection (step 3d) picks either AFTER an earlier SMALL/MEDIUM classification, PROMOTE the tier to LARGE at that moment and re-announce it before building Wave 1.
+
+**What each tier buys:**
+
+| | SMALL | MEDIUM | LARGE |
+|---|---|---|---|
+| Reviewers (Wave 1) | 1 consolidated — all selected lenses in one prompt | 2 — lenses split evenly | ceil(lenses/2) — 2 lenses each, full fan-out |
+| Personas + wild cards | none | none | yes (shuffled pools) |
+| Pre-mortem analyst | no | no | yes (dedicated agent) |
+| Specialist lens cap | 2 | 3 | 4 |
+| Re-check waves | fix verification only | fix verification only | fix verification only |
+
+Why (research-grounded, 2026): review signal comes from lens/rubric focus, deterministic diagnostics, and per-finding validation — not from stacking same-model reviewers, whose errors are correlated (same-family judges deliver far fewer independent votes than their count) and whose marginal returns drop sharply past ~3 agents. Modern frontier reviewers hold 5+ lenses in one prompt without losing depth. The full fan-out is reserved for changes where a miss is expensive.
+
+Announce the tier with a one-line justification. If the user explicitly asks for a deeper review ("full dcr", "max review"), honor it: bump to LARGE.
 
 ## REVIEW LENSES
 
@@ -51,9 +76,9 @@ Two categories: **required** (always reviewed) and **optional** (dispatcher sele
 
 Phase filtering is light-touch — note the phase in each reviewer's prompt. Reviewers skip sub-areas within their assigned lenses that don't apply.
 
-## REVIEWER PERSONAS
+## REVIEWER PERSONAS (LARGE tier only)
 
-Each reviewer in a wave gets a different persona. Shuffle the pool; no repeats until exhausted, then reset.
+At the LARGE tier, each Wave-1 reviewer gets a different persona. Shuffle the pool; no repeats until exhausted, then reset. SMALL/MEDIUM reviewers get no persona — same-model persona variation is weak diversity, and the tier's value comes from lens focus instead.
 
 1. **Paranoid Security Auditor** — "But what if someone sends a forged token?"
 2. **Performance-Obsessed SRE** — "This query runs how many times per request?"
@@ -65,9 +90,9 @@ Each reviewer in a wave gets a different persona. Shuffle the pool; no repeats u
 8. **On-Call SRE at 3am** — "Can I figure out what happened from the logs?"
 9. **Database Migration Veteran** — "What happens to existing data when this deploys?"
 
-## WILD CARD CHECKS
+## WILD CARD CHECKS (LARGE tier only)
 
-Each reviewer in a wave gets a different wild card. Shuffle the pool; no repeats until exhausted, then reset.
+At the LARGE tier, each Wave-1 reviewer gets a different wild card. Shuffle the pool; no repeats until exhausted, then reset. SMALL/MEDIUM reviewers get none.
 
 **Infrastructure:**
 - "What if the database/filesystem is completely empty?"
@@ -92,9 +117,9 @@ Each reviewer in a wave gets a different wild card. Shuffle the pool; no repeats
 - "Something broke in production at 3am — can the on-call diagnose it from logs alone, without reading source code?"
 - "If this write fails halfway, what state is the data in? Can you tell from the logs what succeeded and what didn't?"
 
-## PRE-MORTEM FAILURE SCENARIOS
+## PRE-MORTEM FAILURE SCENARIOS (LARGE tier only)
 
-The pre-mortem agent gets 2-3 scenarios from this pool (shuffled; no repeats until exhausted, then reset).
+The pre-mortem agent (spawned at the LARGE tier only) gets 2-3 scenarios from this pool (shuffled; no repeats until exhausted, then reset).
 
 **Operational:**
 - "6 months in production, this feature is being rolled back. What went wrong?"
@@ -147,13 +172,13 @@ Remember `model`, `effort`, `keep_on_claude`, and `schema_path` from the JSON �
 
 ### CODEX DISPATCH (replaces Task spawns for non-carve-out reviewers)
 
-Carve-outs stay as Claude Task dispatches regardless of engine: every lens listed in `keep_on_claude` (each gets its OWN single-lens Claude reviewer; Security still follows the tiered-dispatch model rules in step 4) and the conditional Frontend Design reviewer. Everything else — the standard lens-pair reviewers and the pre-mortem analyst — runs on Codex.
+Carve-outs stay as Claude Task dispatches regardless of engine: every lens listed in `keep_on_claude` (each gets its OWN single-lens Claude reviewer; Security still follows the tiered-dispatch model rules in step 4) and the conditional Frontend Design reviewer. Everything else — the standard lens reviewers (grouped per the RISK TIER shape) and, at the LARGE tier, the pre-mortem analyst — runs on Codex.
 
-**Carve-out BEFORE pairing:** when the Codex engine is active, remove the `keep_on_claude` lenses from the lens pool FIRST (each becomes its own single-lens Claude reviewer), then pair the REMAINING lenses for the Codex reviewers (step 4's pairing applies to this reduced pool). Every selected lens must appear exactly once across the wave — never dropped because its would-be pair partner was carved out, and never reviewed on both engines. If `keep_on_claude` is empty (the user explicitly cleared it), say so in the wave announcement: `Carve-outs cleared — every lens including Security runs on Codex.`
+**Carve-out BEFORE grouping:** when the Codex engine is active, remove the `keep_on_claude` lenses from the lens pool FIRST (each becomes its own single-lens Claude reviewer), then group the REMAINING lenses for the Codex reviewers per the RISK TIER shape (step 4 applies to this reduced pool — at SMALL that is one consolidated Codex reviewer carrying all remaining lenses). Every selected lens must appear exactly once across the wave — never dropped because its would-be group partner was carved out, and never reviewed on both engines. If `keep_on_claude` is empty (the user explicitly cleared it), say so in the wave announcement: `Carve-outs cleared — every lens including Security runs on Codex.`
 
 For each Codex-engine reviewer in a wave:
 
-1. **Write the complete reviewer brief to a scratchpad file** (e.g. `<scratchpad>/dcr-wave1-reviewer-A.md`). Identical content to the Task prompt you would have written (SPAWNING INSTRUCTIONS items 1-12 as applicable: READ-ONLY, the 2 assigned lenses + lens details, phase, persona, wild card, PROJECT_CONTEXT, evidence requirement, the full DO NOT FLAG list, re-check context on wave 2+, pre-mortem instructions for the pre-mortem analyst). Append this output instruction: "Your final message MUST be only the JSON required by the output schema: one lens_report per assigned lens (the pre-mortem analyst emits a single lens_report named 'Pre-Mortem'). Put each finding's concrete trigger — the specific input, state, or call path — in `trigger`, and the exact location in `file`/`line_start`/`line_end`."
+1. **Write the complete reviewer brief to a scratchpad file** (e.g. `<scratchpad>/dcr-wave1-reviewer-A.md`). Identical content to the Task prompt you would have written (SPAWNING INSTRUCTIONS items 1-12 as applicable: READ-ONLY, the assigned lenses + lens details, phase, persona/wild card at the LARGE tier, PROJECT_CONTEXT, evidence requirement, the full DO NOT FLAG list, re-check context on wave 2+, pre-mortem instructions for the pre-mortem analyst). Append this output instruction: "Your final message MUST be only the JSON required by the output schema: one lens_report per assigned lens (the pre-mortem analyst emits a single lens_report named 'Pre-Mortem'). Put each finding's concrete trigger — the specific input, state, or call path — in `trigger`, and the exact location in `file`/`line_start`/`line_end`."
 2. **Launch the job** with Bash `run_in_background: true` (these are CLI processes, not subagents):
    ```
    codex exec --sandbox read-only --ephemeral --cd "<repo root>" \
@@ -173,19 +198,19 @@ Codex findings enter FINDING VALIDATION (step 8b) exactly like Claude findings, 
 When spawning each reviewer in a wave, include ALL of the following in the Task prompt:
 
 1. **READ-ONLY instruction**: "You are a READ-ONLY reviewer. Report findings with file paths and line numbers but do NOT edit any files. Do NOT use the Edit, Write, or Bash tools for modifications."
-2. **Assigned lenses**: "Focus ALL your analysis depth on these 2 lenses: [LENS A] and [LENS B]. Do NOT review other areas — depth over breadth."
+2. **Assigned lenses**: "Focus ALL your analysis depth on these lenses: [LENS LIST]. Do NOT review other areas — depth over breadth." (LARGE tier: 2 lenses per reviewer. MEDIUM: the split half. SMALL: the consolidated reviewer carries every selected lens.)
 3. **Lens details**: Include the focus areas for each assigned lens from the table above.
 4. **Phase context**: "Phase: [PHASE]. Skip sub-areas within your lenses that don't apply."
-5. **Persona bias**: "You are reviewing as the [PERSONA NAME]. Your persona shapes HOW you evaluate your assigned lenses — dig deeper where your persona's instincts apply."
-6. **Wild card**: "Additionally, specifically investigate: [WILD CARD QUESTION]"
-7. **Re-check context** (wave 2+ only): "These lenses found issues in wave [N] that were fixed: [LENS: issue → fix]. Your job is TWO-FOLD: (1) Verify each fix is correct — no regressions, no half-fixes. (2) Do a FULL fresh review of your assigned lenses as if seeing the code for the first time. Finding issues in a previous wave means there may be adjacent issues that were missed. Do NOT limit your review to verifying prior fixes."
+5. **Persona bias** (LARGE tier, Wave 1 only): "You are reviewing as the [PERSONA NAME]. Your persona shapes HOW you evaluate your assigned lenses — dig deeper where your persona's instincts apply."
+6. **Wild card** (LARGE tier, Wave 1 only): "Additionally, specifically investigate: [WILD CARD QUESTION]"
+7. **Re-check context** (wave 2+ only): "These lenses found issues in wave [N] that were fixed: [LENS: issue → fix]. Verify each fix is correct and complete — no regressions, no half-fixes — by reviewing the fix diff plus the code it directly touches (the changed functions and their immediate callers). Do NOT re-review the rest of the code from scratch; earlier waves covered it. Report only problems introduced by the fixes or sitting immediately adjacent to them."
 8. **Ralph Wiggum style**: Innocent curiosity that catches what others miss. Ask "why does this work?" not "this works."
 9. **Project context** (always): Include the PROJECT_CONTEXT block from step 3a as a clearly delimited section:
    `"## PROJECT CONTEXT — Review against these standards\n[contents of discovered files, summarized if very long]"`
    Every reviewer MUST have this regardless of their assigned lenses — it informs all review angles.
    For the **Guardrails** lens reviewer specifically, add: "Your primary job is verifying compliance
    with these documents. Cite specific rule violations with the rule text and file:line of the violation."
-10. **Pre-mortem agent** (Wave 1 only): Spawn an additional, dedicated reviewer with these instructions (on a Fable-class session, spawn it with explicit `model: "opus"` like the other volume reviewers - its value is the independent perspective shift, so do not fold it into another reviewer's prompt):
+10. **Pre-mortem agent** (LARGE tier, Wave 1 only): Spawn an additional, dedicated reviewer with these instructions (on a Fable-class session, spawn it with explicit `model: "opus"` like the other volume reviewers - its value is the independent perspective shift, so do not fold it into another reviewer's prompt):
     "You are the PRE-MORTEM ANALYST. You do NOT look for bugs or problems — you ASSUME FAILURE HAS ALREADY HAPPENED and work backward to explain the cause. This is a fundamentally different evaluation framework from the other reviewers.
 
     For each assigned failure scenario, write a short post-mortem as if the failure is real:
@@ -211,25 +236,25 @@ Inject this exclusion list into every reviewer prompt (item 12 above). It is the
 - **Rules explicitly silenced inline** (e.g. `# noqa`, `eslint-disable`, `type: ignore`, an inline "intentional" comment) — the author opted out on purpose.
 - **Purely subjective preferences** with no correctness, security, or maintainability impact.
 
-Beyond this list, do NOT self-filter on certainty: report every issue that could cause incorrect behavior, a security exposure, data loss, a test failure, or a misleading result — including ones you are not fully sure about — with your confidence stated, and let the evidence requirement above (exact `file:line` + concrete trigger) be the gate. An uncertain finding with a concrete `file:line` and trigger is a report; a hunch with no code path is not. When genuinely torn on severity, downgrade rather than inflate.
+Beyond this list, report with confidence discipline: raise a CRITICAL/MEDIUM only when you would stake the review on it — you can cite the exact `file:line`, name the concrete trigger, and you expect validation to CONFIRM it, not complete it. State your confidence on every finding. If you suspect an issue but cannot pin the code path, report it as LOW (advisory), never CRITICAL/MEDIUM — the validation gate exists to disprove findings, and every speculative CRITICAL/MEDIUM costs a validation pass, a possible bad fix, and a re-check wave. When genuinely torn on severity, downgrade rather than inflate. (This matches how production review systems filter: high-confidence findings plus an adversarial verification step beat high-recall noise.)
 
 ## EXECUTION FLOW
 
 0. **Plan mode check**: Look for a current system reminder containing "Plan mode is active" or "you MUST NOT make any edits" (exact phrases, not partial matches). If found:
-   - Set `phase = PLANNING`. Skip step 1.
+   - Set `phase = PLANNING` and skip step 1 ENTIRELY (both its phase detection and its diff-based tier classification — the phase and tier are settled here). Classify the RISK TIER from the plan's blast radius instead: an architectural/multi-system plan (or one touching a sensitive area) is LARGE; a narrow single-feature plan is MEDIUM. Announce the tier as usual.
    - Find the plan file path in the system reminder and read it as the review target. The file may be `.html` (jacked's preferred format — see `~/.claude/jacked-reference.md` § Artifact Format Preference) or `.md` (legacy plans or external sources). Both are valid review targets. If no path is found, ask: "What plan doc should I review?"
    - **Lens selection**: use Planning Phase Lenses from Config Override if present; otherwise apply the defaults listed in Config Override (Guardrails + Logic & Edge Cases + Maintainability + Simplicity & Reuse). Config Override takes precedence over step 0 defaults.
    - Reviewers analyze the plan document: architectural soundness, completeness, missing edge cases, over-engineering, logical gaps. Reviewers remain READ-ONLY as always.
    - **Fix phase**: the parent dispatcher (you) edits the plan file to incorporate findings — this is the one file editable in plan mode. Do not edit any other files.
 
-1. **Detect phase** using the signals above. If ambiguous, ask the user.
-2. **Announce**: "Starting parallel DCR. Phase: [PHASE]. Selecting relevant lenses and spawning reviewers."
+1. **Detect phase** using the signals above. If ambiguous, ask the user. Then **classify the RISK TIER** (see RISK TIER section) from the resolved diff: changed-line count, file count, and sensitive areas (grep the diff paths/hunks for auth/credential/RBAC/tenant/billing/migration/lock signals plus any repo-configured Sensitive Areas).
+2. **Announce**: "Starting parallel DCR. Phase: [PHASE]. Tier: [TIER] — [one-line justification]. Selecting relevant lenses and spawning reviewers."
 3. **Initialize**:
    - `covered = Set()` — lenses that passed clean
    - `needs_recheck = Set()` — lenses that found issues, fix applied, must verify
    - `wave = 0`
    - `resolved_issues = []`
-   - Shuffle persona pool and wild card pool
+   - Shuffle persona pool and wild card pool (LARGE tier only)
 
 ### PRE-WAVE CONTEXT DISCOVERY
 
@@ -260,9 +285,13 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
     Combine into a `PROJECT_CONTEXT` block for injection into reviewer prompts.
 
 3b. **Detect frontend changes:**
-    - Check `git diff --name-only` or recent conversation for files matching:
-      `*.js`, `*.jsx`, `*.ts`, `*.tsx`, `*.css`, `*.scss`, `*.html`, `*.vue`, `*.svelte`
-    - If frontend files are present AND any frontend-design related skill is listed
+    - A change is frontend-meaningful when the diff touches how the UI LOOKS or is structured,
+      not merely a file with a frontend extension:
+      - Any `*.css`, `*.scss`, `*.vue`, `*.svelte`, or UI-template `*.html` file → yes
+      - `*.js`, `*.jsx`, `*.ts`, `*.tsx` → yes ONLY if the diff hunks touch markup/JSX/templates,
+        class names/styles, DOM structure, or animation/motion code. A pure logic change in a
+        `.js` file (data handling, API calls, state math) is NOT a frontend change.
+    - If a frontend-meaningful change is present AND any frontend-design related skill is listed
       in the available skills, set `frontend_review = true`
 
 3c. **Announce context found:**
@@ -297,8 +326,11 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
       enum/type changes → Data Integrity & Schema Safety (can data get into an inconsistent state?)
     - When in doubt, include the lens — better to review something unnecessary than miss something important.
 
-    **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum, 2 reviewers).
-    Maximum is all 11 (6 reviewers). Use your judgment.
+    **Bounds**: Guardrails + at least 3 optional lenses (4 total minimum). Maximum is all 11.
+    Reviewer COUNT comes from the RISK TIER, not the lens count: SMALL runs every selected lens
+    in one consolidated reviewer; MEDIUM splits them across 2; LARGE pairs them (2 per reviewer,
+    up to 6 reviewers). Lens selection decides WHAT gets reviewed; the tier decides HOW WIDE.
+    Remember: selecting Security or Access Control makes the tier LARGE.
 
 ### SPECIALIST LENS DISCOVERY
 
@@ -311,7 +343,7 @@ After selecting built-in lenses, check for specialist lens files:
 3. If both global and project-local have the same filename, project-local wins. Note: "Project lens `{name}.md` overrides global lens."
 4. Match each lens's `triggers` against the domains identified from changed files (the same heuristic used to select built-in lenses above).
 5. If an active checkpoint exists in `.claude/checkpoints/` with `active_lenses` in frontmatter, include those lenses regardless of trigger matching.
-6. **Cap:** include at most 4 specialist lenses. If more match, take the top 4 by trigger specificity (most tags matched). Tiebreaker: alphabetical by filename. List remaining as "also relevant" in the announcement.
+6. **Cap:** include at most the RISK TIER's specialist cap (SMALL: 2, MEDIUM: 3, LARGE: 4). If more match, take the top ones by trigger specificity (most tags matched). Tiebreaker: alphabetical by filename. List remaining as "also relevant" in the announcement.
 
 Each matched specialist lens is added to the selected lens pool alongside the built-in lenses. When pairing lenses for reviewers, specialist lenses can be paired with built-in lenses or with each other.
 
@@ -338,20 +370,34 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
       ⊘ API Ergonomics — no API routes in diff
     ```
 
+### DIAGNOSTIC PRE-GATE (POST-IMPLEMENTATION only — runs BEFORE Wave 1)
+
+3f. Gather deterministic ground truth BEFORE spawning any reviewer — cheap, deterministic signal that catches type/import/test breakage no LLM should burn tokens rediscovering:
+
+- **Detect the toolchain** from the repo (e.g. ruff/flake8/mypy/pyright for Python; eslint/tsc/biome for JS/TS — honor the config files found in step 3a) and the test runner. **Honor project CLAUDE.md rules for HOW to invoke them** (e.g. `uv run python -m pytest`, never bare `python -m pytest`).
+- **Run** the linter + type-checker on the CHANGED files and run the relevant/affected tests. Capture pass/fail and the concrete error output.
+- **Gate**: if anything fails, FIX the mechanical failures yourself NOW (you, the parent) and re-run until green — do not spawn reviewers onto a tree that lint or tests already condemn. A failure you cannot fix mechanically (genuine design question) goes to the user before any wave spawns.
+- **Inject** the (now green) results as a `## DETERMINISTIC DIAGNOSTICS — ground truth` block into every reviewer's prompt (alongside PROJECT_CONTEXT).
+- **Skip gracefully** if no toolchain/test runner is detected, or the project can't be built/run in this environment: note "Diagnostics: no toolchain detected — skipped" and proceed with the LLM lenses only. Do NOT fabricate diagnostics.
+
+This runs once, before Wave 1 — it does NOT re-run per wave (the FIX PHASE re-runs the relevant tools after applying fixes).
+
 ### WAVE 1 — Selected Coverage
 
-4. **Pair** the selected lenses. Each reviewer gets exactly 2.
-   - If odd number of selected lenses, one reviewer gets a single lens (goes deeper).
-   - Number of reviewers = ceil(selected_lenses / 2). Range: 2-6 reviewers.
-   - **Tiered dispatch (Fable-class session: any session model above Opus):** reviewers are volume work. Spawn every reviewer with explicit `model: "opus"` and keep the FULL fan-out shape as written above (2 lenses per reviewer, dedicated pre-mortem agent). Fan-out shape follows the model the reviewers RUN ON, not the session model: Opus reviewers need the redundancy, and at Opus pricing the wide net costs about the same as a consolidated Fable one while catching more. The session's Fable budget stays in the parent loop, which is where the judgment already happens: lens selection, finding validation (step 8b), the fix phase, and the verdict. TWO exceptions dispatch on `model: "fable"` (explicit): the **Security** lens, which gets its OWN single-lens reviewer (Fable is materially better at spotting real, exploitable issues in code we own - do not pair Security with another lens on a Fable-class session), and the conditional **Frontend Design** reviewer below (visual-design judgment). On an Opus-or-below session, spawn reviewers with the session's model (never below Opus) and this shape as written.
-5. **Assign** each pair a unique persona and unique wild card (shuffle pools as before).
-6. **Announce**:
+4. **Group** the selected lenses per the RISK TIER:
+   - **SMALL**: ONE consolidated reviewer carries every selected lens. No persona, no wild card.
+   - **MEDIUM**: TWO reviewers, lenses split evenly by affinity (e.g. correctness-ish lenses together, structure-ish lenses together). No personas, no wild cards.
+   - **LARGE**: pair the lenses — each reviewer gets exactly 2 (odd count: one reviewer gets a single lens and goes deeper). Number of reviewers = ceil(selected_lenses / 2), range 2-6.
+   - **Tiered dispatch (Fable-class session: any session model above Opus):** reviewers are volume work. Spawn every reviewer with explicit `model: "opus"` — the reviewer SHAPE comes from the RISK TIER above, and the session's Fable budget stays in the parent loop, which is where the judgment already happens: tier classification, lens selection, finding validation (step 8b), the fix phase, and the verdict. TWO exceptions dispatch on `model: "fable"` (explicit): the **Security** lens, which gets its OWN single-lens reviewer (Fable is materially better at spotting real, exploitable issues in code we own - do not pair Security with another lens on a Fable-class session; Security selected means the tier is LARGE), and the conditional **Frontend Design** reviewer below (visual-design judgment). On an Opus-or-below session, spawn reviewers with the session's model (never below Opus) and the same tier shape.
+5. **Assign** (LARGE tier only) each reviewer a unique persona and unique wild card (shuffle pools as before). SMALL/MEDIUM reviewers get neither.
+6. **Announce** (persona/wild-card columns appear at the LARGE tier only):
    ```
-   **Wave 1 — [N] lenses across [M] reviewers**
+   **Wave 1 [TIER] — [N] lenses across [M] reviewer(s)**
    - Reviewer A ([PERSONA]): [Lens X] + [Lens Y] | Wild card: [Q1]
    - Reviewer B ([PERSONA]): [Lens Z] + [Lens W] | Wild card: [Q2]
    ...
    ```
+   (SMALL example: `**Wave 1 SMALL — 4 lenses, 1 consolidated reviewer** - Reviewer A: Guardrails + Logic & Edge Cases + Testing + Simplicity & Reuse`)
 7. **Spawn all reviewers in ONE message** using parallel Task tool calls.
    - Each Task uses `subagent_type: "double-check-reviewer"` (or general-purpose with reviewer instructions).
    - Each Task prompt includes the spawning instructions above.
@@ -360,7 +406,7 @@ Each specialist lens becomes a reviewer instruction: "Additionally review throug
 
 #### CONDITIONAL: Frontend Design Reviewer (Wave 1 only)
 
-If `frontend_review = true` (from step 3b), spawn a **5th reviewer** in the SAME message:
+If `frontend_review = true` (from step 3b), spawn an **additional dedicated reviewer** in the SAME message (any tier — a SMALL UI change still gets its design pass):
 - Use `subagent_type: "general-purpose"`
 - On a Fable-class session, pass `model: "fable"` explicitly - visual-design judgment (do these elements line up, is the spacing right, does it look designed) is one of the two lanes that stays on the top model
 - Prompt MUST start with: "Invoke the frontend-design skill for design context."
@@ -369,7 +415,7 @@ If `frontend_review = true` (from step 3b), spawn a **5th reviewer** in the SAME
 - Focus areas: design quality (typography, color, spacing, layout intentionality), visual consistency
   (does new code match or improve the existing aesthetic?), motion/animation (purposeful and performant?),
   accessibility (contrast ratios, focus states, semantic HTML), responsive behavior (breakpoints, touch targets)
-- Still READ-ONLY, gets a persona and wild card like other reviewers
+- Still READ-ONLY; at the LARGE tier it gets a persona and wild card like other reviewers (none at SMALL/MEDIUM)
 - Reports separately — does NOT enter the re-check loop (one-shot in Wave 1 only)
 - If the skill is NOT available, skip entirely (do not fake a design review)
 
@@ -380,9 +426,9 @@ Announce format when `frontend_review = true`:
 - Reviewer [M+1] (Frontend Design): Design quality + Aesthetics | via frontend-design skill
 ```
 
-#### PRE-MORTEM ANALYST (Wave 1 only - always a dedicated agent; on a Fable-class session it dispatches on `model: "opus"` like the other volume reviewers)
+#### PRE-MORTEM ANALYST (LARGE tier, Wave 1 only - a dedicated agent; on a Fable-class session it dispatches on `model: "opus"` like the other volume reviewers)
 
-Spawn an additional reviewer as the pre-mortem agent in the SAME message as all other Wave 1 reviewers:
+At the LARGE tier only, spawn an additional reviewer as the pre-mortem agent in the SAME message as all other Wave 1 reviewers (SMALL/MEDIUM runs skip it — its perspective-shift value pays for a dedicated agent only when the blast radius is big):
 - Use `subagent_type: "double-check-reviewer"` (or general-purpose with pre-mortem instructions)
 - Assign 2-3 shuffled failure scenarios from the PRE-MORTEM FAILURE SCENARIOS pool
 - Include the pre-mortem spawning instructions from item 10 above
@@ -390,23 +436,12 @@ Spawn an additional reviewer as the pre-mortem agent in the SAME message as all 
 - Reports in standard CRITICAL/MEDIUM/LOW format — findings enter the normal fix loop
 - Does NOT re-spawn in subsequent waves (one-shot reframing — its value is the initial perspective shift, not iterative verification)
 
-Announce format (always):
+Announce format (LARGE tier):
 ```
-**Wave 1 — [N] lenses across [M] reviewers + Pre-Mortem Analyst**
+**Wave 1 LARGE — [N] lenses across [M] reviewers + Pre-Mortem Analyst**
 - Reviewer A-[M]: [selected lens pairs as above]
 - Pre-Mortem Analyst: [2-3 failure scenarios from pool]
 ```
-
-#### CONDITIONAL: Deterministic Diagnostics (POST-IMPLEMENTATION only)
-
-If phase is POST-IMPLEMENTATION, gather deterministic ground truth in Wave 1 — cheap, deterministic signal that complements the probabilistic lenses and catches type/import/test breakage the LLM may rationalize away:
-
-- **Detect the toolchain** from the repo (e.g. ruff/flake8/mypy/pyright for Python; eslint/tsc/biome for JS/TS — honor the config files found in step 3a) and the test runner. **Honor project CLAUDE.md rules for HOW to invoke them** (e.g. `uv run python -m pytest`, never bare `python -m pytest`).
-- **Run** the linter + type-checker on the CHANGED files and run the relevant/affected tests. Capture pass/fail and the concrete error output.
-- **Inject** the results as a `## DETERMINISTIC DIAGNOSTICS — ground truth` block into every reviewer's prompt (alongside PROJECT_CONTEXT). A failure here is already a confirmed finding — its evidence is the tool output — so it enters the FIX PHASE directly and does not need FINDING VALIDATION (step 8b).
-- **Skip gracefully** if no toolchain/test runner is detected, or the project can't be built/run in this environment: note "Diagnostics: no toolchain detected — skipped" and proceed with the LLM lenses only. Do NOT fabricate diagnostics.
-
-Run this as a parent pre-step (you run the tools before spawning the wave) or as one dedicated READ-ONLY subagent that only collects and reports diagnostics. Either way it runs once in Wave 1 — it does NOT re-spawn per wave. In the FIX PHASE, re-run the failing linter/tests yourself after applying fixes to confirm they pass.
 
 #### CONDITIONAL: UX & Flow Discoverability Sub-checklist
 
@@ -449,7 +484,7 @@ Why: Fable-tier models run behind safety classifiers that can block security-fla
 
 ### FIX PHASE (sequential, you the parent)
 
-9. **Read** all reports (lens reviewers + pre-mortem analyst + frontend if applicable). For each lens across all reports, using only the findings that survived FINDING VALIDATION (step 8b):
+9. **Read** all reports (lens reviewers + pre-mortem analyst at the LARGE tier + frontend if applicable). For each lens across all reports, using only the findings that survived FINDING VALIDATION (step 8b):
    - **Clean** (no *validated* CRITICAL/MEDIUM — a lens whose only findings were dropped as unconfirmed counts as clean) → move lens to `covered`
    - **Validated CRITICAL/MEDIUM** → add findings to list
    - **LOW issues** → report them but do NOT block progress
@@ -460,15 +495,18 @@ Why: Fable-tier models run behind safety classifiers that can block security-fla
     - Add to `resolved_issues` with description of what was found and how it was fixed
 11. `wave++`
 
-### SUBSEQUENT WAVES — Re-check + Fresh Review
+### SUBSEQUENT WAVES — Fix Verification
+
+Re-check waves VERIFY FIXES; they do not re-review from scratch. Wave 1 already covered the code — re-reviewing unchanged code every round is the single biggest token waste in a recursive loop, and a fresh full review by fresh eyes almost always dredges up some new marginal item, so it also stops the loop from converging.
 
 12. **Check stop**: If `needs_recheck` is empty → **ALL COVERED** → go to step 16.
-13. **Check cap**: If the user's project or global CLAUDE.md specifies a wave cap and `wave >= cap`, go to step 17. Otherwise no cap — continue.
+13. **Check cap**: Default wave cap is **3** (Wave 1 + up to 2 re-check waves). A project or global CLAUDE.md may override the cap in either direction (including "no cap"). If `wave >= cap`, go to step 17.
 14. **Build re-check wave**:
-    - Group `needs_recheck` lenses into pairs (or singles if odd number)
-    - Each pair gets a NEW persona (different from wave 1) and NEW wild card
-    - Include re-check context in spawn prompt. Instruct reviewers to verify fixes AND conduct a full fresh review of their lenses — not just confirm prior findings.
-15. **Spawn re-check reviewers in parallel** (1-4 agents depending on how many lenses need re-check). The tiered-dispatch rule from step 4 applies to every wave, not just Wave 1: `model: "opus"` for standard re-check reviewers on a Fable-class session, `model: "fable"` when Security is among the re-checked lenses (own reviewer). The engine decision from step 3d-iii also applies to every wave: with the Codex engine active, non-carve-out re-check reviewers run as Codex jobs per CODEX DISPATCH. Wait for results. → Go to FIX PHASE (step 9).
+    - Group ALL `needs_recheck` lenses into ONE verification reviewer (two if more than 5 lenses need re-check). Fix verification is narrow — it does not need the Wave-1 fan-out.
+    - No personas, no wild cards, any tier.
+    - Include the re-check context from SPAWNING INSTRUCTIONS item 7: verify each fix and its immediately adjacent code; do NOT re-review the rest.
+    - Exception: if a re-checked fix touched a **sensitive area** (RISK TIER list), the Security lens re-verifies as its own reviewer on `model: "fable"` (Fable-class session).
+15. **Spawn re-check reviewer(s) in parallel**. The tiered-dispatch rule from step 4 applies to every wave, not just Wave 1: `model: "opus"` for standard re-check reviewers on a Fable-class session, `model: "fable"` when Security is among the re-checked lenses (own reviewer). The engine decision from step 3d-iii also applies to every wave: with the Codex engine active, non-carve-out re-check reviewers run as Codex jobs per CODEX DISPATCH. Wait for results. → Go to FIX PHASE (step 9).
 
 ### REPORTING
 
@@ -481,8 +519,9 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
     ```
     ## DCR Clean Pass ✓
 
+    **Tier:** [SMALL/MEDIUM/LARGE] — [one-line justification]
     **Waves run:** [N]
-    **Lenses reviewed ([M] of 11):**
+    **Lenses reviewed ([M] of 11):**  <!-- the ([PERSONA]) suffix appears at the LARGE tier only -->
       ✓ Guardrails — Wave 1 ([PERSONA])
       ✓ Security — Wave 1 ([PERSONA])
       ✓ Logic & Edge Cases — Wave 1 ([PERSONA]), rechecked Wave 2 (1 issue fixed)
@@ -495,7 +534,7 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
       ⊘ Data Integrity & Schema Safety — skipped (not relevant)
     **Engine:** Codex ([model], effort [effort]; [N] reviewers, [N] Claude fallbacks) / Claude
     **Frontend design:** ✓ Reviewed (N findings) / ⊘ Skipped
-    **Pre-mortem analysis:** ✓ [N] scenarios analyzed ([N] findings)
+    **Pre-mortem analysis:** ✓ [N] scenarios analyzed ([N] findings) / ⊘ skipped (tier below LARGE)
     **Diagnostics:** ✓ lint/type/tests green ([N] tests) / ⊘ no toolchain detected — skipped / n/a (not POST-IMPLEMENTATION)
     **Issues found and fixed:** [count] ([which lenses/pre-mortem])
     **Unconfirmed findings (not actioned):** [list with reason, or "none"]
@@ -508,10 +547,11 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
 
     **Memory vault (guarded, judgment-based):** on a clean final pass ONLY, if the memory vault is enabled (`jacked memory status --quiet` exits 0; skip silently otherwise), record any notable ARCHITECTURAL decision the review surfaced as a decision note: `jacked memory add --type decision --title "<decision>" --body "<the decision + the reasoning that settled it>"`. This is a rare, high-signal capture: most clean passes surface no such decision and record nothing. Never store a routine fix or a finding. If the vault is off, do nothing.
 
-17. **Report cap reached** (user-configured wave cap hit):
+17. **Report cap reached** (wave cap hit — default 3, or the user-configured cap):
     ```
     ## DCR Cap Reached ([N] waves)
 
+    **Tier:** [SMALL/MEDIUM/LARGE]
     **Engine:** Codex ([model], effort [effort]; [N] reviewers, [N] Claude fallbacks) / Claude
     **Covered:** [list of covered lenses]
     **Still failing:** [list of lenses still in needs_recheck with latest issues]
@@ -522,12 +562,14 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
 
 ## HARD RULES
 
+- Depth follows the RISK TIER: never spawn the LARGE fan-out for a SMALL change, and never skip the Security carve-out (or the LARGE tier) when a sensitive area is touched. Cheap by default, thorough where a miss is expensive.
 - Do NOT stop the wave loop early. Do NOT skip re-verification of failed lenses.
-- Do NOT ask "should I continue?" — the answer is always yes until all covered or user-configured cap.
+- Do NOT ask "should I continue?" — the answer is always yes until all covered or the wave cap (default 3; CLAUDE.md may override).
+- Re-check waves verify fixes and adjacent code ONLY — never a fresh full review of already-covered code.
 - LOW issues: Report them but do NOT block progress. Only CRITICAL/MEDIUM trigger re-checks.
 - Reviewers are READ-ONLY. Only you (the parent dispatcher) edit files.
 - Spawn all reviewers in a wave in ONE message (parallel Task calls; with the Codex engine, all Codex jobs plus carve-out Task calls together).
-- Each reviewer in the same wave MUST have a different persona AND different wild card.
+- At the LARGE tier, each Wave-1 reviewer MUST have a different persona AND different wild card.
 - The engine never moves judgment: lens selection, finding validation, fixes, and the verdict always run in the parent session regardless of engine.
 - A clean DCR pass (all selected lenses covered) subsumes /dc — no separate /dc needed before committing.
 

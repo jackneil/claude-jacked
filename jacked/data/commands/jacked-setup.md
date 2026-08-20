@@ -239,6 +239,8 @@ ls CLAUDE.md .claude/CLAUDE.md GUARDRAILS.md JACKED_GUARDRAILS.md CONTRIBUTING.m
 find docs design .claude/plans \( -name "*.md" -o -name "*.html" \) -maxdepth 2 2>/dev/null | head -10
 ```
 
+From the security/auth and multi-tenancy grep results above, derive the **Sensitive Areas** list for the template: the concrete paths/domains in THIS repo whose changes must force the LARGE risk tier (auth/credential flows, RBAC/tenant isolation, payment/billing code, schema/migration paths, concurrency-critical modules). Write real globs/paths, not the placeholder.
+
 From these results, determine default lens weights:
 - Multi-tenant signals found → **Access Control** always on
 - API routes found → **Security** always on
@@ -631,6 +633,10 @@ In addition to the standard pool, include:
 ## Domain Pre-Mortem Scenarios
 In addition to the standard pool, include:
 <1-2 repo-specific failure scenarios based on project type>
+
+## Sensitive Areas
+Touching any of these forces the LARGE risk tier (full reviewer fan-out):
+<repo-specific paths/domains from the security/auth/multi-tenancy analysis, e.g. "jacked/web/auth*.py", "anything under migrations/", "credential/OAuth flows">
 
 <!-- Staleness fingerprint — the engine compares these against the live repo on each run -->
 - **Generated at commit**: <git rev-parse HEAD from Step 2>

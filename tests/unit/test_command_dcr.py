@@ -102,3 +102,112 @@ def test_repo_wrapper_carries_engine_section():
         "Respawn THAT reviewer once as a Claude Task subagent",
     ):
         assert anchor in wrapper, f"repo dcr wrapper missing engine anchor: {anchor}"
+
+
+# ---------------------------------------------------------------------------
+# RISK TIER contract (2026-08-20 efficiency rework): depth scales with the
+# risk of the change. These pin the cost-control doctrine — small changes get
+# one consolidated reviewer, the full fan-out is reserved for LARGE, re-check
+# waves verify fixes instead of re-reviewing from scratch, and the wave loop
+# has a default cap. Losing any of these silently reverts /dcr to spending
+# LARGE-tier tokens on every bugfix.
+# ---------------------------------------------------------------------------
+
+
+def test_risk_tier_section_present(dcr: str):
+    assert "## RISK TIER" in dcr
+    for tier in ("**SMALL**", "**MEDIUM**", "**LARGE**"):
+        assert tier in dcr
+    # sensitivity dominates size, and ambiguity escalates
+    assert "Sensitivity beats size" in dcr
+    assert "take the higher one" in dcr
+
+
+def test_small_tier_runs_one_consolidated_reviewer(dcr: str):
+    assert "ONE consolidated reviewer carries every selected lens" in dcr
+    # lens selection decides WHAT, tier decides HOW WIDE
+    assert "Reviewer COUNT comes from the RISK TIER, not the lens count" in dcr
+
+
+def test_security_selection_forces_large_tier(dcr: str):
+    assert (
+        "If the **Security** or **Access Control** lens ends up selected, "
+        "the tier is LARGE by definition" in dcr
+    )
+    # late selection must promote an earlier SMALL/MEDIUM classification
+    assert "PROMOTE the tier to LARGE" in dcr
+
+
+def test_personas_and_wild_cards_are_large_tier_only(dcr: str):
+    assert "## REVIEWER PERSONAS (LARGE tier only)" in dcr
+    assert "## WILD CARD CHECKS (LARGE tier only)" in dcr
+
+
+def test_pre_mortem_is_large_tier_only(dcr: str):
+    assert "## PRE-MORTEM FAILURE SCENARIOS (LARGE tier only)" in dcr
+    assert "PRE-MORTEM ANALYST (LARGE tier, Wave 1 only" in dcr
+
+
+def test_recheck_waves_verify_fixes_not_fresh_review(dcr: str):
+    assert "### SUBSEQUENT WAVES — Fix Verification" in dcr
+    assert "Do NOT re-review the rest of the code from scratch" in dcr
+    # the old doctrine must be gone
+    assert "Do NOT limit your review to verifying prior fixes" not in dcr
+
+
+def test_default_wave_cap_is_three(dcr: str):
+    assert "Default wave cap is **3**" in dcr
+
+
+def test_diagnostics_run_as_pre_gate_before_wave_one(dcr: str):
+    assert "### DIAGNOSTIC PRE-GATE (POST-IMPLEMENTATION only — runs BEFORE Wave 1)" in dcr
+    assert "do not spawn reviewers onto a tree that lint or tests already condemn" in dcr
+    assert "Do NOT fabricate diagnostics" in dcr
+
+
+def test_findings_are_confidence_first(dcr: str):
+    assert "raise a CRITICAL/MEDIUM only when you would stake the review on it" in dcr
+    assert "downgrade rather than inflate" in dcr
+    # the old high-recall doctrine must be gone
+    assert "including ones you are not fully sure about" not in dcr
+
+
+def test_frontend_reviewer_needs_ui_meaningful_diff(dcr: str):
+    assert "is NOT a frontend change" in dcr
+    assert "frontend-meaningful" in dcr
+
+
+def test_repo_wrapper_carries_tier_contract():
+    wrapper = REPO_WRAPPER.read_text(encoding="utf-8")
+    for anchor in (
+        "## RISK TIER",
+        "ONE consolidated reviewer carries every selected lens",
+        "### SUBSEQUENT WAVES — Fix Verification",
+        "Default wave cap is **3**",
+    ):
+        assert anchor in wrapper, f"repo dcr wrapper missing tier anchor: {anchor}"
+
+
+def test_repo_wrapper_embeds_engine_body_verbatim():
+    """The wrapper contract is 'repo-config header + the shipped engine body
+    verbatim (front matter stripped)'. Anchor checks alone let the two drift on
+    any non-anchor line; containment makes desync impossible to miss."""
+    shipped = CMD.read_text(encoding="utf-8")
+    assert shipped.startswith("---\n")
+    body = shipped[shipped.index("\n---\n", 4) + len("\n---\n"):].lstrip("\n")
+    wrapper = REPO_WRAPPER.read_text(encoding="utf-8")
+    assert body in wrapper, (
+        "repo .claude/commands/dcr.md no longer embeds the shipped engine body "
+        "verbatim — rebuild the wrapper (or re-run /jacked-setup dcr)"
+    )
+
+
+def test_diagnostic_pre_gate_appears_before_wave_one(dcr: str):
+    gate = dcr.index("### DIAGNOSTIC PRE-GATE")
+    wave1 = dcr.index("### WAVE 1")
+    assert gate < wave1, "diagnostics must be specified before Wave 1 spawning"
+
+
+def test_frontend_trigger_pins_js_logic_exclusion(dcr: str):
+    # the .js/.ts path must be conditional on UI-meaningful hunks, not extension alone
+    assert "yes ONLY if the diff hunks touch markup/JSX/templates" in dcr

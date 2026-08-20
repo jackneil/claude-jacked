@@ -233,7 +233,7 @@ The innocent observation that breaks the whole design
 
 ## PRE-MORTEM ANALYST
 
-In addition to the main reviewer, always run a pre-mortem analysis as a dedicated parallel agent (on a Fable-class session, spawn it with explicit `model: "opus"` - its value is the independent perspective shift, so do not fold it into the main reviewer's prompt). The pre-mortem uses a fundamentally different evaluation framework - it does NOT look for bugs but ASSUMES FAILURE HAS ALREADY HAPPENED and works backward to explain the cause.
+Run a pre-mortem analysis as a dedicated parallel agent when the change warrants it: the diff is large (more than ~600 changed lines or a new subsystem), touches a sensitive area (auth/session handling, credentials/secrets, RBAC/multi-tenancy, payments/billing, schema or data migrations, concurrency/locking), or the review target is an architectural plan. For a small or mechanical change, SKIP the pre-mortem — its perspective-shift value pays for a dedicated agent only when the blast radius is big. When spawned on a Fable-class session, pass explicit `model: "opus"` - its value is the independent perspective shift, so do not fold it into the main reviewer's prompt. The pre-mortem uses a fundamentally different evaluation framework - it does NOT look for bugs but ASSUMES FAILURE HAS ALREADY HAPPENED and works backward to explain the cause.
 
 **Failure scenarios** (assign 2-3, shuffled; no repeats until exhausted):
 
@@ -277,11 +277,11 @@ The pre-mortem agent spawns once (cycle 1 only). Its findings merge with the mai
 3. **Discover project context** using PRE-REVIEW CONTEXT DISCOVERY above. Announce what was found.
 4. **Run the DETERMINISM GATE** (Build & Test) on the resolved scope — skip only for PLANNING phase and GRILL mode. Announce results. Carry any failures forward as findings (failing type-check/compile/tests → CRITICAL; lint errors → MEDIUM).
 5. Identify if multiple threads are needed
-6. Spawn TWO reviewers in parallel (one message, two Task calls). Pass the resolved diff (`## REVIEW SCOPE`) and discovered context to each:
+6. Spawn the reviewers in parallel (one message). Pass the resolved diff (`## REVIEW SCOPE`) and discovered context to each:
    a. **Main reviewer**: double-check-reviewer with phase-appropriate instructions + scope + discovered context
-   b. **Pre-mortem analyst**: double-check-reviewer with pre-mortem instructions from the PRE-MORTEM ANALYST section above, with 2-3 shuffled failure scenarios + scope + discovered context
-7. If the main review needs additional threads (multi-domain), spawn those too — the pre-mortem agent is always additive
-8. When ALL reviewer results come back (main + pre-mortem), merge them with the determinism-gate findings and emit a **VERDICT**:
+   b. **Pre-mortem analyst** (only when the PRE-MORTEM ANALYST section's criteria are met — large, sensitive, or architectural): double-check-reviewer with pre-mortem instructions, 2-3 shuffled failure scenarios + scope + discovered context. Announce "Pre-mortem: skipped (small/contained change)" when not spawned.
+7. If the main review needs additional threads (multi-domain), spawn those too — the pre-mortem agent, when spawned, is always additive
+8. When ALL reviewer results come back (main + pre-mortem when spawned), merge them with the determinism-gate findings and emit a **VERDICT**:
    - **READY** — no CRITICAL/MEDIUM findings and the determinism gate is green. Suggestions (LOW) optional. Report clean pass. Done.
    - **NEEDS ATTENTION** — MEDIUM findings or important suggestions, but no CRITICAL and the gate is green. Proceed to the findings step.
    - **NEEDS WORK** — any CRITICAL, or the determinism gate is failing (type-check/compile/tests red). Proceed to the findings step.
@@ -301,7 +301,7 @@ The pre-mortem agent spawns once (cycle 1 only). Its findings merge with the mai
 
 Do NOT fix code directly. Instead, follow this pipeline:
 
-9a. **Document all findings** — Compile a structured summary of every CRITICAL and MEDIUM issue from the main reviewer, the pre-mortem analyst, and the determinism gate. Include file:line references, severity, and a one-line description of each. LOW issues are listed but marked as non-blocking.
+9a. **Document all findings** — Compile a structured summary of every CRITICAL and MEDIUM issue from the main reviewer, the pre-mortem analyst (if spawned), and the determinism gate. Include file:line references, severity, and a one-line description of each. LOW issues are listed but marked as non-blocking.
 
 9b. **Create a fix plan** — Invoke the `superpowers:writing-plans` skill, passing the documented findings as the spec. The plan should turn each CRITICAL/MEDIUM finding into a concrete task with tests and code. **Save as HTML, not Markdown.** Start from `~/.claude/jacked-templates/plan-template.html` and write to `docs/superpowers/plans/YYYY-MM-DD-<feature>-fixes.html`. Explicitly tell the sub-skill: "Output the plan as HTML using the jacked template — do not produce Markdown."
 
@@ -313,8 +313,8 @@ Do NOT fix code directly. Instead, follow this pipeline:
 
 This step applies only when step 9 fixed a plan directly (PLANNING PHASE):
 
-10. **Re-spawn the main double-check-reviewer only** (NOT the pre-mortem agent — it's one-shot) with the same phase instructions + scope + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Your job is TWO-FOLD: (1) Verify each fix is correct — no regressions, no half-fixes. (2) Do a FULL fresh review as if seeing this for the first time. Prior waves found issues, so there may be adjacent problems that were missed. Do NOT limit your scope to verifying prior fixes."
-11. **Repeat from step 8** until the reviewer returns READY (no CRITICAL/MEDIUM and the determinism gate green).
+10. **Re-spawn the main double-check-reviewer only** (NOT the pre-mortem agent — it's one-shot) with the same phase instructions + scope + discovered context. Include a note: "Previous review found these issues which have been fixed: [list]. Verify each fix is correct and complete — no regressions, no half-fixes — by reviewing the fixed sections and the content immediately adjacent to them. Do NOT re-review the rest of the plan from scratch; the first cycle covered it. Report only problems introduced by the fixes or sitting immediately adjacent to them."
+11. **Repeat from step 8** until the reviewer returns READY (no CRITICAL/MEDIUM and the determinism gate green), up to a default cap of 3 total review cycles (a project or global CLAUDE.md may override the cap). If the cap is hit with findings still open, report NEEDS WORK with the open findings instead of looping.
 12. Report final clean pass with a summary of all cycles.
 
 HARD RULE: Do NOT stop the loop early. Do NOT skip re-verification. Do NOT ask the user "should I continue?" — the answer is always yes for planning-phase fix loops. For implementation-phase findings, the pipeline produces a reviewed plan and waits for user approval. If the user's project or global CLAUDE.md specifies a wave/cycle cap, respect it.
