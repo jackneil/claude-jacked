@@ -791,6 +791,7 @@ def _spawn_windows_upgrade_helper(
     import subprocess
     import tempfile
     from jacked.service import CLAUDE_DIR
+    from jacked.service.updater import UPDATE_LOG, wait_for_parent_block
 
     my_pid = os.getpid()
     log_path = CLAUDE_DIR / "jacked-update.log"
@@ -801,54 +802,50 @@ def _spawn_windows_upgrade_helper(
     # element must be individually quoted to survive cmd's tokenization.
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
 
+    # Everything below writes to plain stdout, which the Popen at the bottom
+    # binds to the update log. Do NOT reintroduce `>> "%LOGFILE%"` on any step:
+    # cmd.exe cannot open a redirection target that another handle already holds
+    # for writing, and it SKIPS the command while leaving ERRORLEVEL at 0 — so
+    # the step silently no-ops and every `if errorlevel 1` guard sails past it.
+    # That exact mistake shipped in the tray updater and cost a user their whole
+    # install (no upgrade, no settings migration, no service, no tray icon).
+    # %LOGFILE% stays defined only for the recovery-file message text, and the
+    # recovery file is a different path nothing else holds open.
     restart_line = (
         'if "%SKIP_SERVICE%"=="" (\r\n'
-        '    echo [%date% %time%] service restart >> "%LOGFILE%"\r\n'
-        '    jacked service restart >> "%LOGFILE%" 2>&1\r\n'
+        '    echo [%date% %time%] service restart\r\n'
+        '    jacked service restart 2>&1\r\n'
         ')\r\n'
     )
     batch_body = (
         '@echo off\r\n'
         'set LOGFILE=' + str(log_path) + '\r\n'
         'set SKIP_SERVICE=' + ("1" if skip_service else "") + '\r\n'
-        'echo [%date% %time%] jacked upgrade helper starting (parent PID ' + str(my_pid) + ') >> "%LOGFILE%"\r\n'
-        'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
-        # Bounded poll: a bare `find "<pid>"` matches ANY process that later
-        # reuses this PID, so an unbounded loop can spin forever (each iter
-        # spawning a visible find/tasklist console) long after the real parent
-        # died. Cap the wait and proceed anyway — same "give up and continue"
-        # contract as the POSIX updater's wait_for_exit timeout.
-        'set /a JACKED_WAITED=0\r\n'
-        ':wait\r\n'
-        'tasklist /FI "PID eq ' + str(my_pid) + '" 2>NUL | find "' + str(my_pid) + '" >NUL\r\n'
-        'if errorlevel 1 goto waitdone\r\n'
-        'set /a JACKED_WAITED+=1\r\n'
-        'if %JACKED_WAITED% GEQ 120 (\r\n'
-        '    echo [%date% %time%] WARNING: parent ' + str(my_pid) + ' still listed after 120s; proceeding (PID may be reused) >> "%LOGFILE%"\r\n'
-        '    goto waitdone\r\n'
-        ')\r\n'
-        'timeout /t 1 /nobreak >NUL\r\n'
-        'goto wait\r\n'
-        ':waitdone\r\n'
-        'echo [%date% %time%] parent exited, running upgrade command >> "%LOGFILE%"\r\n'
-        + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
+        'echo [%date% %time%] jacked upgrade helper starting (parent PID ' + str(my_pid) + ')\r\n'
+        'echo [%date% %time%] upgrade command: ' + label + '\r\n'
+        + wait_for_parent_block(my_pid) +
+        'echo [%date% %time%] parent exited, running upgrade command\r\n'
+        + upgrade_line + ' 2>&1\r\n'
         'if errorlevel 1 (\r\n'
-        '    echo [%date% %time%] ERROR: upgrade command failed >> "%LOGFILE%"\r\n'
+        '    echo [%date% %time%] ERROR: upgrade command failed\r\n'
         '    echo Jacked upgrade failed. See %LOGFILE% for details. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 1\r\n'
         ')\r\n'
-        'echo [%date% %time%] running jacked install --force >> "%LOGFILE%"\r\n'
-        'jacked install --force >> "%LOGFILE%" 2>&1\r\n'
+        'echo [%date% %time%] running jacked install --force\r\n'
+        'jacked install --force 2>&1\r\n'
         + restart_line +
-        'echo [%date% %time%] upgrade complete >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] upgrade complete\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
     )
 
     # Write the batch file to %TEMP% — it deletes itself at the end.
     fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-upgrade-")
     try:
-        with os.fdopen(fd, "w", newline="\r\n") as f:
+        # newline="" — batch_body already carries explicit \r\n. Translating on
+        # top of that wrote \r\r\n; cmd.exe tolerates the stray CR but nothing
+        # here should depend on that.
+        with os.fdopen(fd, "w", newline="") as f:
             f.write(batch_body)
     except Exception:
         try:
@@ -871,24 +868,40 @@ def _spawn_windows_upgrade_helper(
     # back to DETACHED_PROCESS, or the windows come right back.
     NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    # Capture the batch's stdout/stderr into the update log by handing cmd.exe
+    # an inherited handle on it — the same pattern the tray updater uses. This
+    # is what makes the batch's bare `echo`/command output land in the log, and
+    # it is precisely why no step inside the batch may redirect to %LOGFILE%.
+    try:
+        _lf = open(UPDATE_LOG, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        _lf = subprocess.DEVNULL
     _helper_kwargs = dict(
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=_lf,
+        stderr=subprocess.STDOUT,
         close_fds=True,
     )
     try:
-        subprocess.Popen(
-            ["cmd.exe", "/c", batch_path],
-            creationflags=NO_WINDOW | BREAKAWAY,
-            **_helper_kwargs,
-        )
-    except OSError:
-        subprocess.Popen(
-            ["cmd.exe", "/c", batch_path],
-            creationflags=NO_WINDOW,
-            **_helper_kwargs,
-        )
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", batch_path],
+                creationflags=NO_WINDOW | BREAKAWAY,
+                **_helper_kwargs,
+            )
+        except OSError:
+            subprocess.Popen(
+                ["cmd.exe", "/c", batch_path],
+                creationflags=NO_WINDOW,
+                **_helper_kwargs,
+            )
+    finally:
+        # cmd.exe holds its own inherited copy of the handle; close ours.
+        if _lf is not subprocess.DEVNULL:
+            try:
+                _lf.close()
+            except OSError:
+                pass
 
     console.print(
         "[yellow]Windows upgrade:[/yellow] spawned detached helper. "

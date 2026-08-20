@@ -22,7 +22,66 @@ from jacked.winproc import NO_WINDOW
 UPDATE_LOG = CLAUDE_DIR / "jacked-update.log"
 RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
 
+# One-second sleep for a detached batch. NOT `timeout /t 1 /nobreak`: timeout
+# reads the keyboard, so the moment stdin is anything but a real console — and
+# every helper here is spawned with stdin=DEVNULL — it bails instantly with
+# "ERROR: Input redirection is not supported, exiting the process immediately."
+# That turns a bounded 120-second poll into 120 back-to-back no-ops, so the
+# batch stops waiting for the tray to die and races `uv tool install --force`
+# against a live python.exe (the classic Windows "Access denied" upgrade).
+# `ping -n 2 127.0.0.1` needs no console and sleeps ~1s between its two pings.
+_SLEEP_1S = 'ping -n 2 127.0.0.1 >NUL\r\n'
+
+# Absolute paths for the two tools whose EXIT CODE steers the wait loop. Git
+# Bash, Cygwin and GnuWin32 all put a `find` on PATH that takes different flags
+# and returns different codes; if one shadows System32's, `if errorlevel 1`
+# reads as "parent is gone" on the very first pass and the batch stops waiting
+# for the tray to die. Same failure the `timeout` bug caused, different cause.
+_TASKLIST = '%SystemRoot%\\System32\\tasklist.exe'
+_FIND = '%SystemRoot%\\System32\\find.exe'
+
 logger = logging.getLogger(__name__)
+
+
+def _verify_service_block(port: int) -> str:
+    """Batch line that polls ``/api/version`` for up to 20s. Exit 0 = healthy."""
+    return (
+        'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++)'
+        '{try{$r=Invoke-WebRequest -UseBasicParsing '
+        f'http://127.0.0.1:{port}/api/version'
+        ' -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}'
+        'Start-Sleep -Milliseconds 500} exit 1"\r\n'
+    )
+
+
+def wait_for_parent_block(pid: int) -> str:
+    """Batch lines that block until *pid* exits, capped at ~120s.
+
+    Shared by BOTH Windows helpers (the tray updater here and
+    ``jacked upgrade``'s helper in cli.py) so the two cannot drift apart —
+    they have independently regressed on the same poll loop twice already.
+
+    A bare ``find "<pid>"`` matches any process that later reuses this PID, so
+    an unbounded loop can spin forever after the real parent died. Cap it and
+    proceed, mirroring the POSIX :func:`wait_for_exit` timeout.
+
+    Emits progress on stdout; callers must NOT redirect it to the update log
+    (see the warning in ``_spawn_windows_tray_updater``).
+    """
+    return (
+        'set /a JACKED_WAITED=0\r\n'
+        ':wait\r\n'
+        f'{_TASKLIST} /FI "PID eq {pid}" 2>NUL | {_FIND} "{pid}" >NUL\r\n'
+        'if errorlevel 1 goto waitdone\r\n'
+        'set /a JACKED_WAITED+=1\r\n'
+        'if %JACKED_WAITED% GEQ 120 (\r\n'
+        f'    echo [%date% %time%] WARNING: parent {pid} still listed after 120s; proceeding (PID may be reused)\r\n'
+        '    goto waitdone\r\n'
+        ')\r\n'
+        + _SLEEP_1S +
+        'goto wait\r\n'
+        ':waitdone\r\n'
+    )
 
 
 def wait_for_exit(pid: int, timeout: float = 30.0) -> bool:
@@ -584,16 +643,30 @@ def _spawn_windows_tray_updater(
     # hiccup could silently kill the whole tray update (service left down, no
     # further log). Log it and keep going; the real work steps (upgrade,
     # install, verify) have their own dedicated error handling below.
+    # NEVER redirect a step to %LOGFILE% in THIS batch. cmd.exe is spawned with
+    # its stdout already bound to an inherited handle on that same file (see the
+    # Popen below), and cmd opens redirection targets with a share mode that
+    # collides with an existing writer. Every `>> "%LOGFILE%"` therefore fails
+    # with "The process cannot access the file because it is being used by
+    # another process" — and cmd SKIPS the command while leaving ERRORLEVEL at 0,
+    # so `if errorlevel 1` never fires and the batch marches on marking each
+    # phase "ok". That is exactly how a tray update silently no-opped the
+    # upgrade, the settings migration AND the service start, leaving the user on
+    # the old version with no tray icon at all.
+    #
+    # Bare output is correct here: it lands on cmd's stdout, which IS the log.
+    # %LOGFILE% survives only as text inside the recovery-file messages, and the
+    # recovery file itself is a DIFFERENT path that nothing else holds open.
     DRIFT_GUARD = (
         'if errorlevel 1 (\r\n'
-        '    echo [%date% %time%] WARN: _update_status shim returned non-zero (continuing) >> "%LOGFILE%"\r\n'
+        '    echo [%date% %time%] WARN: _update_status shim returned non-zero (continuing)\r\n'
         ')\r\n'
     )
     batch_body = (
         '@echo off\r\n'
         'set LOGFILE=' + log_path + '\r\n'
-        'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ', method ' + method + ') >> "%LOGFILE%"\r\n'
-        'echo [%date% %time%] upgrade command: ' + label + ' >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ', method ' + method + ')\r\n'
+        'echo [%date% %time%] upgrade command: ' + label + '\r\n'
         'jacked _update_status_init "' + current_version + '" "' + to_version + '" ' + method + ' --log-path "' + log_path + '"\r\n'
         'if errorlevel 2 (\r\n'
         '    echo Another jacked updater is already in progress. Aborting. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
@@ -601,33 +674,18 @@ def _spawn_windows_tray_updater(
         ')\r\n'
         # Phase: waiting_for_parent
         'jacked _update_status waiting_for_parent in_progress\r\n'
-        + DRIFT_GUARD +
-        # Bounded poll — see _spawn_windows_upgrade_helper in cli.py. A bare
-        # `find "<pid>"` matches any process that reuses this PID, so an
-        # unbounded loop can spin forever after the real parent died. Cap it
-        # and proceed (mirrors the POSIX wait_for_exit timeout).
-        'set /a JACKED_WAITED=0\r\n'
-        ':wait\r\n'
-        'tasklist /FI "PID eq ' + str(parent_pid) + '" 2>NUL | find "' + str(parent_pid) + '" >NUL\r\n'
-        'if errorlevel 1 goto waitdone\r\n'
-        'set /a JACKED_WAITED+=1\r\n'
-        'if %JACKED_WAITED% GEQ 120 (\r\n'
-        '    echo [%date% %time%] WARNING: parent ' + str(parent_pid) + ' still listed after 120s; proceeding (PID may be reused) >> "%LOGFILE%"\r\n'
-        '    goto waitdone\r\n'
-        ')\r\n'
-        'timeout /t 1 /nobreak >NUL\r\n'
-        'goto wait\r\n'
-        ':waitdone\r\n'
+        + DRIFT_GUARD
+        + wait_for_parent_block(parent_pid) +
         'jacked _update_status waiting_for_parent ok\r\n'
         + DRIFT_GUARD +
-        'echo [%date% %time%] parent exited >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] parent exited\r\n'
         # Phase: installing_package
         'jacked _update_status installing_package in_progress\r\n'
         + DRIFT_GUARD
-        + upgrade_line + ' >> "%LOGFILE%" 2>&1\r\n'
+        + upgrade_line + ' 2>&1\r\n'
         'if errorlevel 1 (\r\n'
         '    jacked _update_status installing_package failed --error "upgrade command failed" --recovery "' + label_for_batch + '"\r\n'
-        '    echo [%date% %time%] ERROR: upgrade command failed >> "%LOGFILE%"\r\n'
+        '    echo [%date% %time%] ERROR: upgrade command failed\r\n'
         '    echo Jacked tray update failed. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 1\r\n'
@@ -637,7 +695,7 @@ def _spawn_windows_tray_updater(
         # Phase: migrating_settings
         'jacked _update_status migrating_settings in_progress\r\n'
         + DRIFT_GUARD +
-        'jacked install --force >> "%LOGFILE%" 2>&1\r\n'
+        'jacked install --force 2>&1\r\n'
         'if errorlevel 1 (\r\n'
         '    jacked _update_status migrating_settings failed --error "jacked install --force failed" --recovery "jacked install --force"\r\n'
         '    exit /b 1\r\n'
@@ -646,20 +704,33 @@ def _spawn_windows_tray_updater(
         + DRIFT_GUARD +
         # Phase: waiting_port_free
         'jacked _update_status waiting_port_free in_progress\r\n'
-        + DRIFT_GUARD +
-        'timeout /t 1 /nobreak >NUL\r\n'
+        + DRIFT_GUARD
+        + _SLEEP_1S +
         'jacked _update_status waiting_port_free ok\r\n'
         + DRIFT_GUARD +
         # Phase: starting_service
         'jacked _update_status starting_service in_progress\r\n'
         + DRIFT_GUARD +
-        'start "" /B jacked service start >> "%LOGFILE%" 2>&1\r\n'
+        'start "" /B jacked service start\r\n'
         'jacked _update_status starting_service ok\r\n'
         + DRIFT_GUARD +
         # Phase: verifying_service
         'jacked _update_status verifying_service in_progress\r\n'
         + DRIFT_GUARD +
-        'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++){try{$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:' + str(port) + '/api/version -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}Start-Sleep -Milliseconds 500} exit 1"\r\n'
+        _verify_service_block(port) +
+        # One retry before declaring defeat. A tray update that ends with NO
+        # service is the worst possible outcome — the user loses the icon and
+        # every entry point to fix it. Re-issuing `service start` is safe: the
+        # port-bind guard makes a second instance a no-op if one is already up.
+        # Plain labels, not a nested `if (...)` block: the verify line is a
+        # powershell one-liner stuffed with parentheses, and burying it inside a
+        # parenthesised block is exactly the kind of cmd.exe parsing trap that
+        # produced this bug in the first place.
+        'if not errorlevel 1 goto verifyok\r\n'
+        'echo [%date% %time%] verify failed; retrying service start once\r\n'
+        'start "" /B jacked service start\r\n'
+        + _verify_service_block(port) +
+        ':verifyok\r\n'
         'if errorlevel 1 (\r\n'
         '    jacked _update_status verifying_service failed --error "service did not bind :' + str(port) + ' in 20s" --recovery "jacked service start"\r\n'
         '    echo Jacked tray update: service did not come up. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
@@ -668,13 +739,16 @@ def _spawn_windows_tray_updater(
         'jacked _update_status verifying_service ok\r\n'
         + DRIFT_GUARD +
         'jacked _update_status_succeed\r\n'
-        'echo [%date% %time%] tray update complete >> "%LOGFILE%"\r\n'
+        'echo [%date% %time%] tray update complete\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
     )
 
     fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-tray-update-")
     try:
-        with os.fdopen(fd, "w", newline="\r\n") as f:
+        # newline="" — batch_body already carries explicit \r\n. Translating on
+        # top of that wrote \r\r\n; cmd.exe tolerates the stray CR but nothing
+        # here should depend on that.
+        with os.fdopen(fd, "w", newline="") as f:
             f.write(batch_body)
     except Exception:
         try:
