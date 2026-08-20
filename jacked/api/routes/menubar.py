@@ -26,7 +26,7 @@ async def menubar_summary(request: Request):
 
     Returns ``{"active": {...}|null, "active_account_id": N|null,
     "worst": {...}|null, "account_count": N}``. ``active`` is what the pill
-    renders (its ``color`` tints the "J" icon); it's null when no active account
+    renders (its ``color`` tints the arm icon); it's null when no active account
     is detected or it has no usage yet. A missing DB yields 503 so the agent can
     show a degraded pill rather than a wrong number.
     """

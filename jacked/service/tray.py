@@ -20,11 +20,12 @@ from jacked.version_check import check_version_cached
 logger = logging.getLogger(__name__)
 
 # PIL and pystray are guarded separately: icon rendering is pure Pillow and
-# works headless (menubar_mac borrows _load_glyph_font), while pystray needs
-# a display — it resolves its GUI backend at import time, and on a headless
-# box (no $DISPLAY) that raises Xlib.error.DisplayNameError, not ImportError.
+# works headless (the mark renderer lives in jacked.service.icon), while
+# pystray needs a display — it resolves its GUI backend at import time, and
+# on a headless box (no $DISPLAY) that raises Xlib.error.DisplayNameError,
+# not ImportError.
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     _PIL_AVAILABLE = True
 except ImportError:
@@ -79,49 +80,14 @@ def _mac_menubar_available() -> bool:
         return False
 
 
-# Icon color schemes per state
+# Icon fill per service state. The mark is a bare silhouette (no box), so
+# one solid color per state is the whole scheme. Green = up, amber =
+# starting, gray = stopped.
 _ICON_COLORS = {
-    "running": ("#6366f1", "#8b5cf6"),  # Purple gradient
-    "starting": ("#f59e0b", "#d97706"),  # Amber
-    "stopped": ("#555555", "#666666"),  # Gray
+    "running": (34, 197, 94, 255),
+    "starting": (245, 158, 11, 255),
+    "stopped": (130, 130, 130, 255),
 }
-
-# Font files to try, in order, for the tray "J" glyph. Bare family names
-# like "Arial" ONLY resolve on macOS — Pillow on Windows/Linux raises
-# OSError('cannot open resource') unless given the actual filename. That
-# was the long-standing Windows bug: the J fell back to the ~10px bitmap
-# default and shrank to an invisible speck in the system tray. DejaVuSans
-# ships bundled inside Pillow, so it's the last truetype attempt.
-_GLYPH_FONT_CANDIDATES = (
-    "arial.ttf",            # Windows (C:\Windows\Fonts), also macOS
-    "Arial.ttf",
-    "Arial",                # macOS family-name resolution
-    "Helvetica.ttc",        # macOS
-    "DejaVuSans-Bold.ttf",  # Linux + Pillow-bundled
-    "DejaVuSans.ttf",
-)
-
-
-def _load_glyph_font(size: int) -> "ImageFont.FreeTypeFont":
-    """Load a scalable TrueType font for the tray glyph at *size* px.
-
-    The font MUST be a real scalable face at the requested size. The legacy
-    argless ``ImageFont.load_default()`` returns a ~10px bitmap font, which
-    downscales to nothing in the tray — the exact reason the "J" was
-    invisible on Windows. We try real font filenames first, then fall back
-    to Pillow's bundled DejaVu at the requested size (Pillow >= 10.1).
-    """
-    for name in _GLYPH_FONT_CANDIDATES:
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            continue
-    # Pillow >= 10.1 honors `size` here and returns a scalable DejaVu face.
-    # Older Pillow ignores it (10px bitmap) — still better than crashing.
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        return ImageFont.load_default()
 
 
 def check_tray_deps() -> None:
@@ -134,7 +100,11 @@ def check_tray_deps() -> None:
 
 
 def create_icon_image(state: str, update_available: bool = False) -> "Image.Image":
-    """Generate a 64x64 tray icon with a J glyph.
+    """Generate a 64x64 tray icon: the jacked arm mark tinted by state.
+
+    The mark is a bold silhouette (see jacked.service.icon) — bold geometry
+    survives the OS downscale to the 16px Windows tray, where the previous
+    font-rendered "J" glyph turned into an invisible smudge.
 
     Args:
         state: One of 'running', 'starting', 'stopped'.
@@ -142,33 +112,12 @@ def create_icon_image(state: str, update_available: bool = False) -> "Image.Imag
             top-right — parity with the macOS menu-bar icon
             (menubar_mac.render_status_icon).
     """
-    colors = _ICON_COLORS.get(state, _ICON_COLORS["stopped"])
+    from jacked.service.icon import render_mark
+
+    fill = _ICON_COLORS.get(state, _ICON_COLORS["stopped"])
     size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    img = render_mark(fill, size)
     draw = ImageDraw.Draw(img)
-
-    # Rounded rectangle background
-    draw.rounded_rectangle(
-        [(0, 0), (size - 1, size - 1)],
-        radius=12,
-        fill=colors[0],
-    )
-    # Slight gradient effect — smaller inner rect
-    draw.rounded_rectangle(
-        [(2, 2), (size - 3, size // 2)],
-        radius=10,
-        fill=colors[1],
-    )
-
-    # Draw "J" glyph centered
-    font = _load_glyph_font(36)
-
-    bbox = draw.textbbox((0, 0), "J", font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    x = (size - tw) // 2
-    y = (size - th) // 2 - bbox[1]
-    draw.text((x, y), "J", fill="white", font=font)
 
     if update_available:
         # Same white-ring + blue-dot badge as menubar_mac, scaled for the

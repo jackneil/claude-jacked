@@ -65,47 +65,57 @@ class TestCreateIcon:
         assert plain.getpixel((51, 13)) != (59, 130, 246, 255)
 
 
-class TestGlyphFont:
-    """Regression: the tray 'J' must render at full size, not the ~10px
-    bitmap default.
+class TestMarkVisibility:
+    """Regression: the tray mark must survive the OS downscale to a 16px
+    Windows tray cell.
 
-    Pillow only resolves the bare family name 'Arial' on macOS; on Windows
-    and Linux it raises OSError, so the old code fell back to
-    ``ImageFont.load_default()`` (a ~10px bitmap face) and the 'J' shrank to
-    an invisible speck in the system tray. See _load_glyph_font.
+    History: the icon used to be a font-rendered 'J'. Thin font strokes plus
+    font-resolution failures on Windows (bare 'Arial' only resolves on
+    macOS) shrank it to an invisible speck. The mark is now a bold shipped
+    silhouette (jacked.service.icon) — these tests pin its visibility at
+    both the render size and the tray-cell size, independent of any font.
     """
 
-    def test_glyph_font_is_requested_size_not_tiny_default(self):
-        _skip_if_no_tray()
-        from jacked.service.tray import _load_glyph_font
-        font = _load_glyph_font(36)
-        # The legacy argless load_default() is a ~10px bitmap face — the bug.
-        assert getattr(font, "size", 0) == 36
+    def _coverage(self, img, size):
+        """Fraction of pixels with meaningful alpha after LANCZOS downscale."""
+        from PIL import Image
+        small = img.convert("RGBA").resize((size, size), Image.LANCZOS)
+        data = small.tobytes()
+        solid = sum(1 for i in range(0, len(data), 4) if data[i + 3] > 128)
+        return solid / (size * size)
 
-    def test_running_icon_has_visible_white_glyph(self):
-        """The white 'J' must occupy a real chunk of the 64x64 icon, not a
-        2px speck. Counts near-white glyph pixels over the purple bg.
-
-        Calibration on Windows: old 10px default -> 10 white px;
-        fixed 36px arial -> 107 white px. Threshold of 60 separates them
-        with margin for DejaVu's slightly different glyph on Linux CI.
-        """
+    def test_running_icon_is_bold_at_full_size(self):
         _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
-        img = create_icon_image("running").convert("RGBA")
-        # Iterate raw RGBA bytes — avoids getdata() (deprecated in Pillow 14)
-        # and get_flattened_data() (too new for our >=9.0 floor).
-        data = img.tobytes()
-        white = sum(
-            1
-            for i in range(0, len(data), 4)
-            if data[i + 3] > 200
-            and data[i] > 220 and data[i + 1] > 220 and data[i + 2] > 220
-        )
-        assert white > 60, (
-            f"glyph too small ({white} white px) — font fell back to the "
-            "bitmap default instead of a scalable 36px face"
-        )
+        cov = self._coverage(create_icon_image("running"), 64)
+        assert cov > 0.15, f"mark covers only {cov:.0%} of the 64px canvas"
+
+    def test_running_icon_survives_16px_tray_downscale(self):
+        """The Windows tray renders at 16px — the actual bug surface. The
+        old 10px-bitmap 'J' covered ~2% of a 16px cell; the shipped arm
+        silhouette measures ~42%."""
+        _skip_if_no_tray()
+        from jacked.service.tray import create_icon_image
+        # Calibration: shipped mark ~42% of a 16px cell, the old font-bug
+        # speck ~2%. 15% floor separates them with margin for redesigns.
+        cov = self._coverage(create_icon_image("running"), 16)
+        assert cov > 0.15, f"mark covers only {cov:.0%} of a 16px tray cell"
+
+    def test_all_three_states_render_distinct_tints(self):
+        """running/starting/stopped must each get their own fill — pins the
+        amber 'starting' tint, not just running-vs-stopped."""
+        _skip_if_no_tray()
+        from jacked.service.tray import create_icon_image
+        imgs = {s: create_icon_image(s).tobytes() for s in ("running", "starting", "stopped")}
+        assert len(set(imgs.values())) == 3, "two service states share a tint"
+
+    def test_icon_renders_without_any_font(self):
+        """The mark renderer must not touch font machinery at all — font
+        resolution was the Windows failure class. jacked.service.tray no
+        longer defines _load_glyph_font."""
+        _skip_if_no_tray()
+        from jacked.service import tray
+        assert not hasattr(tray, "_load_glyph_font")
 
 
 class TestBuildMenu:

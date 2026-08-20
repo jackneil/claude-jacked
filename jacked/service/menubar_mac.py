@@ -3,7 +3,7 @@
 The native face of the jacked service on macOS. Replaces the cross-platform
 pystray tray with a real menu-bar app:
 
-* a live **pill**: a "J" icon tinted green/yellow/red by the **active** account's
+* a live **pill**: the jacked arm mark tinted green/yellow/red by the **active** account's
   usage, plus that account's ``5h·7d`` % as text — refreshed on a timer from
   ``/api/menubar-summary``. It tracks the account you're actually using, not the
   worst account in the fleet.
@@ -49,7 +49,7 @@ PANEL_WIDTH = 360  # side-panel / popover width in points
 POPOVER_HEIGHT = 700  # dropdown height — headroom for a per-model binding row
 # per hot account (~17px each) on top of the 5h/7d bars; scrolls past ~7 accounts
 
-# RGB fills for the "J" status icon, keyed by usage color class.
+# RGB fills for the arm status icon, keyed by usage color class.
 _ICON_FILL = {
     "green": (34, 197, 94),
     "yellow": (234, 179, 8),
@@ -126,44 +126,69 @@ _PROVIDER_DOT = {
 }
 
 
+_legacy_sweep_done = False
+
+
+def _sweep_legacy_icon_cache(cache_dir) -> None:
+    """One-time deletion of pre-arm "jacked-menubar-*.png" cache files (the
+    old rounded-rect "J" icons) so they don't sit in ~/.claude forever.
+
+    Narrows (does not fully close) the cross-version race with a
+    still-running pre-upgrade menubar process: sweep at most once per
+    process, and only files untouched for 10+ minutes — a live writer's
+    file is always fresher than that. A stat-to-unlink TOCTOU window
+    remains; its worst case is the OLD process losing one cached PNG and
+    re-rendering it on its next refresh, which is not worth file locking."""
+    global _legacy_sweep_done
+    if _legacy_sweep_done:
+        return
+    _legacy_sweep_done = True
+    import time
+
+    cutoff = time.time() - 600
+    for stale in cache_dir.glob("jacked-menubar-*.png"):
+        if "-arm-" in stale.name:
+            continue
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            pass
+
+
 def _render_status_icon(
     color: str, update: bool = False, provider: str = "claude"
 ) -> "str | None":
-    """Draw a rounded-rect "J" glyph filled with the status color; return a PNG
+    """Draw the jacked arm mark filled with the status color; return a PNG
     path (cached per color+update+provider under ~/.claude). When *update* is set,
     overlay an "update available" badge (a blue dot with a white ring, top-right)
     so the menu bar makes a waiting update obvious without opening the menu. When
     the active account's *provider* isn't Claude (e.g. Codex), overlay a small
     brand-colored dot (bottom-left) so the pill shows which provider you're on.
-    The Claude icon is unchanged (same cache path). Returns None if rendering
-    fails — the caller then falls back to text only."""
+    Claude accounts use the unsuffixed cache name; other providers get a
+    provider suffix. Returns None if rendering fails — the caller then falls
+    back to text only."""
     try:
-        from PIL import Image, ImageDraw
+        from PIL import ImageDraw
 
         from jacked.service import CLAUDE_DIR
-        from jacked.service.tray import _load_glyph_font
+        from jacked.service.icon import render_mark
 
         provider = provider or "claude"
         prov_suffix = "" if provider == "claude" else f"-{provider}"
         CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        _sweep_legacy_icon_cache(CLAUDE_DIR)
         path = (
             CLAUDE_DIR
-            / f"jacked-menubar-{color}{'-upd' if update else ''}{prov_suffix}.png"
+            / f"jacked-menubar-arm-{color}{'-upd' if update else ''}{prov_suffix}.png"
         )
         if path.exists():
             return str(path)
 
         fill = _ICON_FILL.get(color, _ICON_FILL["gray"])
         size = 44  # retina-friendly; macOS scales to the menu-bar height
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        img = render_mark((*fill, 255) if len(fill) == 3 else fill, size)
         draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle([(3, 3), (size - 4, size - 4)], radius=11, fill=fill)
-        font = _load_glyph_font(26)
-        bbox = draw.textbbox((0, 0), "J", font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        x = (size - tw) // 2 - bbox[0]
-        y = (size - th) // 2 - bbox[1]
-        draw.text((x, y), "J", fill="white", font=font)
         if update:
             # Update-available badge: blue dot + white ring, top-right corner.
             # Sized to stay legible when macOS scales the icon to ~18px tall.
@@ -331,7 +356,7 @@ if RUMPS_AVAILABLE:
 
         def _refresh_pill(self, _timer):
             """Poll the summary; set the active account's % as text and tint the
-            "J" icon by its color. Degrade to a gray "J" + em-dash if down."""
+            arm icon by its color. Degrade to a gray arm + em-dash if down."""
             from jacked.service.menubar_summary import menubar_title
 
             upd = self._update_available()
@@ -391,7 +416,7 @@ if RUMPS_AVAILABLE:
                     logger.debug("panel webview reload nudge failed", exc_info=True)
 
         def _set_icon(self, color, update=False, provider="claude"):
-            """Set the colored "J" icon (+ update badge + provider dot), only when
+            """Set the colored arm icon (+ update badge + provider dot), only when
             it changed."""
             key = (color, update, provider)
             if key == self._current_icon_key:
