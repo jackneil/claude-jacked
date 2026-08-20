@@ -47,7 +47,7 @@ function _renderHealthBanner(overview) {
     const gradeColor = grade <= 'B' ? 'text-teal-400' : grade <= 'C' ? 'text-yellow-400' : 'text-red-400';
     const bgColor = grade <= 'B' ? 'bg-teal-900/30 border-teal-800' : grade <= 'C' ? 'bg-yellow-900/30 border-yellow-800' : 'bg-red-900/30 border-red-800';
 
-    const totalTokens = (overview.total_input || 0) + (overview.total_output || 0) + (overview.total_cache_read || 0) + (overview.total_cache_create || 0);
+    const totalTokens = overview.total_tokens || 0;
     const tokenStr = totalTokens > 1000000 ? (totalTokens / 1000000).toFixed(1) + 'M' : totalTokens > 1000 ? (totalTokens / 1000).toFixed(0) + 'K' : totalTokens;
     const costStr = '$' + (overview.total_cost || 0).toFixed(2);
 

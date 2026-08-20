@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS messages (
     output_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_create_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0,
+    cost_usd REAL,
+    cost_source TEXT DEFAULT 'estimate',
     is_subagent INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp);
@@ -47,6 +50,7 @@ CREATE TABLE IF NOT EXISTS daily_summaries (
     output_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_create_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0,
     cache_hit_ratio REAL,
     PRIMARY KEY (date, project_hash, model)
@@ -260,6 +264,21 @@ class AnalyticsDB:
     def _init_schema(self) -> None:
         with self._writer() as conn:
             conn.executescript(SCHEMA_SQL)
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(messages)")
+            }
+            if "total_tokens" not in columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN total_tokens INTEGER DEFAULT 0")
+            if "cost_usd" not in columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN cost_usd REAL")
+            if "cost_source" not in columns:
+                conn.execute(
+                    "ALTER TABLE messages ADD COLUMN cost_source TEXT DEFAULT 'estimate'"
+                )
+            conn.execute(
+                "UPDATE messages SET cost_source = 'estimate' "
+                "WHERE cost_source IS NULL"
+            )
 
     # ------------------------------------------------------------------
     # Messages
@@ -274,14 +293,16 @@ class AnalyticsDB:
                 "INSERT OR IGNORE INTO messages "
                 "(id, session_id, project_hash, timestamp, model, "
                 " input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, "
-                " estimated_cost_usd, is_subagent) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " total_tokens, estimated_cost_usd, cost_usd, cost_source, is_subagent) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         m["id"], m["session_id"], m["project_hash"], m["timestamp"],
                         m.get("model"), m.get("input_tokens", 0), m.get("output_tokens", 0),
                         m.get("cache_read_tokens", 0), m.get("cache_create_tokens", 0),
-                        m.get("estimated_cost_usd", 0), m.get("is_subagent", 0),
+                        m.get("total_tokens", m.get("input_tokens", 0) + m.get("output_tokens", 0) + m.get("cache_read_tokens", 0) + m.get("cache_create_tokens", 0)),
+                        m.get("estimated_cost_usd", 0), m.get("cost_usd"),
+                        m.get("cost_source", "estimate"), m.get("is_subagent", 0),
                     )
                     for m in messages
                 ],
@@ -310,7 +331,7 @@ class AnalyticsDB:
                 "  COALESCE(SUM(output_tokens), 0) AS total_output, "
                 "  COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read, "
                 "  COALESCE(SUM(cache_create_tokens), 0) AS total_cache_create, "
-                "  COALESCE(SUM(estimated_cost_usd), 0) AS total_cost, "
+                "  COALESCE(SUM(COALESCE(cost_usd, estimated_cost_usd)), 0) AS total_cost, "
                 "  COUNT(DISTINCT session_id) AS session_count, "
                 "  COUNT(*) AS message_count "
                 "FROM messages WHERE timestamp >= ?",
@@ -321,7 +342,10 @@ class AnalyticsDB:
             total_output = row["total_output"]
             total_cache_read = row["total_cache_read"]
             total_cache_create = row["total_cache_create"]
-            total_tokens = total_input + total_output + total_cache_read + total_cache_create
+            total_tokens = conn.execute(
+                "SELECT COALESCE(SUM(total_tokens), 0) AS total FROM messages "
+                "WHERE timestamp >= ?", (cutoff,)
+            ).fetchone()["total"]
 
             # Cache hit ratio
             total_all_input = total_input + total_cache_read + total_cache_create
@@ -332,7 +356,7 @@ class AnalyticsDB:
                 "SELECT project_hash, "
                 "  COUNT(*) AS messages, "
                 "  COUNT(DISTINCT session_id) AS sessions, "
-                "  COALESCE(SUM(estimated_cost_usd), 0) AS cost "
+                "  COALESCE(SUM(COALESCE(cost_usd, estimated_cost_usd)), 0) AS cost "
                 "FROM messages WHERE timestamp >= ? "
                 "GROUP BY project_hash ORDER BY cost DESC",
                 (cutoff,),
@@ -383,7 +407,7 @@ class AnalyticsDB:
                 "  COUNT(*) AS message_count, "
                 "  COALESCE(SUM(m.input_tokens), 0) AS input_tokens, "
                 "  COALESCE(SUM(m.output_tokens), 0) AS output_tokens, "
-                "  COALESCE(SUM(m.estimated_cost_usd), 0) AS total_cost, "
+                "  COALESCE(SUM(COALESCE(m.cost_usd, m.estimated_cost_usd)), 0) AS total_cost, "
                 "  MIN(m.timestamp) AS first_message, "
                 "  MAX(m.timestamp) AS last_message "
                 f"FROM messages m INNER JOIN flags f ON f.session_id = m.session_id AND f.resolved_at IS NULL "
@@ -398,7 +422,7 @@ class AnalyticsDB:
                 "  COUNT(*) AS message_count, "
                 "  COALESCE(SUM(m.input_tokens), 0) AS input_tokens, "
                 "  COALESCE(SUM(m.output_tokens), 0) AS output_tokens, "
-                "  COALESCE(SUM(m.estimated_cost_usd), 0) AS total_cost, "
+                "  COALESCE(SUM(COALESCE(m.cost_usd, m.estimated_cost_usd)), 0) AS total_cost, "
                 "  MIN(m.timestamp) AS first_message, "
                 "  MAX(m.timestamp) AS last_message "
                 f"FROM messages m "
@@ -441,7 +465,7 @@ class AnalyticsDB:
                 "  COALESCE(SUM(output_tokens), 0) AS output_tokens, "
                 "  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
                 "  COALESCE(SUM(cache_create_tokens), 0) AS cache_create_tokens, "
-                "  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd "
+                "  COALESCE(SUM(COALESCE(cost_usd, estimated_cost_usd)), 0) AS estimated_cost_usd "
                 "FROM messages "
                 "WHERE timestamp >= ? AND timestamp < ? "
                 "GROUP BY project_hash, model",

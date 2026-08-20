@@ -334,6 +334,15 @@ def test_sum_usage_tolerates_partial_counters(usage, total):
     assert statusline._sum_usage(usage) == total
 
 
+def test_sum_usage_supports_openrouter_total_tokens_without_double_counting():
+    assert statusline._sum_usage({
+        "prompt_tokens": 1200,
+        "completion_tokens": 340,
+        "total_tokens": 1540,
+        "prompt_tokens_details": {"cached_tokens": 900},
+    }) == 1540
+
+
 def test_sum_usage_returns_none_for_non_dicts():
     assert statusline._sum_usage(None) is None
     assert statusline._sum_usage("x") is None

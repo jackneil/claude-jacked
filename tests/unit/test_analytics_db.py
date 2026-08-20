@@ -30,7 +30,7 @@ def _ts(days_ago=0, hours_ago=0):
 def _msg(msg_id="m1", session_id="s1", project_hash="proj1",
          timestamp=None, model="claude-opus-4-6", input_tokens=1000,
          output_tokens=500, cache_read_tokens=0, cache_create_tokens=0,
-         estimated_cost_usd=0.0, is_subagent=0):
+         estimated_cost_usd=0.0, cost_usd=None, cost_source="estimate", is_subagent=0):
     return {
         "id": msg_id,
         "session_id": session_id,
@@ -42,6 +42,8 @@ def _msg(msg_id="m1", session_id="s1", project_hash="proj1",
         "cache_read_tokens": cache_read_tokens,
         "cache_create_tokens": cache_create_tokens,
         "estimated_cost_usd": estimated_cost_usd,
+        "cost_usd": cost_usd,
+        "cost_source": cost_source,
         "is_subagent": is_subagent,
     }
 
@@ -163,7 +165,10 @@ class TestOverview:
         ov = db.get_overview(days=1)
         # total_tokens = input + output + cache_read + cache_create
         assert ov["total_tokens"] == (1000 + 500 + 200 + 100) + (2000 + 1000) + (500 + 250)
+
         assert ov["total_cost_usd"] == pytest.approx(0.17)
+        assert ov["session_count"] == 2
+        assert len(ov["project_breakdown"]) == 2
         assert ov["session_count"] == 2
         assert len(ov["project_breakdown"]) == 2
         db.close()
@@ -174,6 +179,18 @@ class TestOverview:
 # ---------------------------------------------------------------------------
 
 class TestSessionList:
+    def test_authoritative_provider_cost_replaces_estimate_in_session_totals(self):
+        db = _make_db()
+        db.insert_messages([
+            _msg("provider", estimated_cost_usd=9.99, cost_usd=0.12,
+                 cost_source="provider"),
+        ])
+
+        result = db.get_session_list(days=1)
+
+        assert result[0]["total_cost"] == pytest.approx(0.12)
+        db.close()
+
     def test_session_list_empty(self):
         db = _make_db()
         result = db.get_session_list(days=1)

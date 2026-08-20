@@ -45,6 +45,7 @@ class TestOpenRouterChatCompletionsUsage:
         assert result is not None
         assert result["input_tokens"] == 1200
         assert result["output_tokens"] == 340
+        assert result["total_tokens"] == 1540
 
     def test_maps_cached_prompt_tokens_from_prompt_details(self):
         result = _parse_assistant_message(
@@ -157,6 +158,17 @@ class TestCostProvenance:
         assert result["cost_source"] == "estimate"
         assert result["cost_is_authoritative"] is False
         assert result["estimated_cost_usd"] > 0
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+    def test_nonfinite_token_values_are_ignored(self, bad):
+        result = _parse_assistant_message(
+            _record(usage={"prompt_tokens": bad, "completion_tokens": 1}),
+            "session-openrouter",
+            "project-openrouter",
+            is_subagent=False,
+        )
+        assert result["input_tokens"] == 0
+        assert result["output_tokens"] == 1
 
     def test_provider_cost_is_not_replaced_by_local_model_estimate(self):
         result = _parse_assistant_message(

@@ -173,9 +173,13 @@ def _fmt_reset(epoch, now: "float | None" = None) -> str:
 
 
 def _sum_usage(usage) -> "int | None":
-    """Sum the four token counters of context_window.current_usage."""
+    """Return context tokens without double-counting provider cache details."""
     if not isinstance(usage, dict):
         return None
+    if "total_tokens" in usage:
+        value = usage.get("total_tokens")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
     total = 0
     for key in (
         "input_tokens",
@@ -611,6 +615,44 @@ def _model_usage_segment(home: str, facts: dict, model_name: str, now: float) ->
     return segment
 
 
+def _latest_transcript_cost(payload) -> float | None:
+    """Return the newest provider-reported transcript cost, if preserved."""
+    path = payload.get("transcript_path") if isinstance(payload, dict) else None
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - 262144))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except (OSError, ValueError):
+        return None
+    from jacked.usage_normalizer import normalize_usage
+
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message = record.get("message")
+        usage = message.get("usage") if isinstance(message, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        normalized = normalize_usage(usage)
+        return normalized["cost_usd"]
+    return None
+
+
+def _cost_segment(payload) -> str:
+    """Render authoritative gateway cost preserved in the transcript."""
+    cost = _latest_transcript_cost(payload)
+    if cost is None:
+        return ""
+    return f"cost ${cost:.4f}"
+
+
 def _models_in(chunk: str) -> list:
     """Assistant model ids from whole JSONL lines inside a text chunk.
 
@@ -862,6 +904,10 @@ def render(payload, home: "str | None" = None, now: "float | None" = None) -> st
     served = _served_segment(payload)
     if served:
         segments.append(served)
+
+    cost = _cost_segment(payload)
+    if cost:
+        segments.append(cost)
 
     account = facts["segment"]
     if account:

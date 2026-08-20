@@ -18,6 +18,7 @@ import json
 import logging
 from pathlib import Path
 
+from jacked.usage_normalizer import normalize_usage
 from jacked.web.analytics_db import AnalyticsDB, estimate_cost
 
 logger = logging.getLogger(__name__)
@@ -53,10 +54,13 @@ def _parse_assistant_message(
         return None
 
     model = message.get("model", "unknown")
-    input_t = usage.get("input_tokens", 0)
-    output_t = usage.get("output_tokens", 0)
-    cache_read_t = usage.get("cache_read_input_tokens", 0)
-    cache_create_t = usage.get("cache_creation_input_tokens", 0)
+    normalized = normalize_usage(usage)
+    input_t = normalized["input_tokens"]
+    output_t = normalized["output_tokens"]
+    cache_read_t = normalized["cache_read_tokens"]
+    cache_create_t = normalized["cache_create_tokens"]
+    estimated = estimate_cost(model, input_t, output_t, cache_read_t, cache_create_t,
+                              at=record.get("timestamp") or None)
 
     return {
         "id": msg_id,
@@ -68,8 +72,11 @@ def _parse_assistant_message(
         "output_tokens": output_t,
         "cache_read_tokens": cache_read_t,
         "cache_create_tokens": cache_create_t,
-        "estimated_cost_usd": estimate_cost(model, input_t, output_t, cache_read_t, cache_create_t,
-                                            at=record.get("timestamp") or None),
+        "total_tokens": normalized["total_tokens"],
+        "estimated_cost_usd": estimated,
+        "cost_usd": normalized["cost_usd"],
+        "cost_source": "provider" if normalized["cost_usd"] is not None else "estimate",
+        "cost_is_authoritative": normalized["cost_usd"] is not None,
         "is_subagent": 1 if is_subagent else 0,
     }
 

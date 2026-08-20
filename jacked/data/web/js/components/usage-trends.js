@@ -29,8 +29,8 @@ async function renderUsageTrends(container) {
     for (const s of summaries) {
         if (!byDate[s.date]) byDate[s.date] = { tokens: 0, cost: 0, cache_ratio: 0, count: 0 };
         const d = byDate[s.date];
-        d.tokens += (s.input_tokens || 0) + (s.output_tokens || 0) + (s.cache_read_tokens || 0) + (s.cache_create_tokens || 0);
-        d.cost += s.estimated_cost_usd || 0;
+        d.tokens += s.total_tokens ?? ((s.input_tokens || 0) + (s.output_tokens || 0) + (s.cache_read_tokens || 0) + (s.cache_create_tokens || 0));
+        d.cost += (s.cost_usd ?? s.estimated_cost_usd) || 0;
         d.cache_ratio += (s.cache_hit_ratio || 0);
         d.count++;
     }

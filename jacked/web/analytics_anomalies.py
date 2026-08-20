@@ -188,7 +188,7 @@ def _detect_cost_outlier(db: AnalyticsDB, session_ids: list[str] | None = None) 
         sessions = conn.execute(
             f"SELECT session_id, project_hash, "
             f"  COUNT(*) AS msg_count, "
-            f"  SUM(estimated_cost_usd) AS total_cost, "
+            f"  SUM(COALESCE(cost_usd, estimated_cost_usd)) AS total_cost, "
             f"  MIN(timestamp) AS first_ts, "
             f"  MAX(timestamp) AS last_ts "
             f"FROM messages {where_clause} "
