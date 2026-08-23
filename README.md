@@ -1,6 +1,8 @@
-# claude-jacked
+# claude-jacked - multi-account manager and skills suite for Claude Code
 
-**Multi-account manager + skills suite for Claude Code (and Codex).** Juggle several Claude accounts with live usage tracking, automatic account switching, and a macOS menu-bar app with a full fleet panel one click away. Plus a curated set of 29 slash commands, 27 skills, and 10 review agents installed into Claude Code, all managed from a web dashboard.
+**When you hit a Claude Code usage limit, jacked switches you to another account instead of making you wait out the reset.** Run every Claude and Codex account you own as a single pool, watch each one's 5-hour, 7-day, and per-model usage live, and let auto-swap rotate to a fresh account before a limit stops you. The whole fleet stays one click away in a macOS menu-bar app, or a system-tray app on Windows and Linux.
+
+It is also a skills manager for Claude Code: one `jacked install` deploys 30 curated slash commands, 28 skills, and 10 review agents into `~/.claude`, mirrors them into Codex when Codex is installed, and keeps them updated from a web dashboard.
 
 <table>
 <tr>
