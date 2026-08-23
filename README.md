@@ -13,17 +13,17 @@ It is also a skills manager for Claude Code: one `jacked install` deploys 30 cur
 
 ---
 
-## What You Get
+## What you get: multi-account Claude Code, live usage tracking, and a skills suite
 
 - **Run multiple Claude accounts like one.** Add every account you own, watch each one's 5-hour, 7-day, and per-model usage live, and let auto-swap rotate to a fresh account before you hit a limit. Works for Codex accounts too, side by side with Claude.
 - **A menu-bar app that actually earns its pixels.** A live pill shows your active account's usage next to the clock (`18%·4%`, tinted green/yellow/red). Left-click drops the whole fleet down in a compact panel: every account, every org, per-model caps, reset times, and who's active. Right-click for actions, or pin the panel to your screen edge. It refreshes within about a second of any account switch or usage change, and it tells you when a new jacked version ships: a badge on the icon, a notification banner, and a one-click update.
-- **A curated skills suite, one command to install.** `jacked install` puts 29 battle-tested slash commands, 27 skills, and 10 review agents into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills) and a website-cloning skill adapted with credit from [JCodesMore's ai-website-cloner-template](https://github.com/JCodesMore/ai-website-cloner-template). When Codex is installed too, the same pass deploys the suite into Codex's native formats: skills into `~/.agents/skills`, commands as both prompts and command-derived skills, the behavioral rules (Codex-adapted) into `~/.codex/AGENTS.md`, the 10 review agents as Codex TOML custom agents, the chrome-devtools MCP server, and a `$qa` suggestion hook, with a few Claude-only helpers held back and everything tracked in a Codex manifest so `jacked uninstall` reverses it. Upgrades diff cleanly: added/changed/removed, never touching your own files. On top of the bundled suite, `jacked install` also installs curated third-party skill packs live from their upstream repos (a 28-skill `marketing` pack and a `design-extras` pack, on by default), opt out with `--no-packs` or `jacked packs disable`.
+- **A curated skills suite, one command to install.** `jacked install` puts 30 battle-tested slash commands, 28 skills, and 10 review agents into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills) and a website-cloning skill adapted with credit from [JCodesMore's ai-website-cloner-template](https://github.com/JCodesMore/ai-website-cloner-template). When Codex is installed too, the same pass deploys the suite into Codex's native formats: skills into `~/.agents/skills`, commands as both prompts and command-derived skills, the behavioral rules (Codex-adapted) into `~/.codex/AGENTS.md`, the 10 review agents as Codex TOML custom agents, the chrome-devtools MCP server, and a `$qa` suggestion hook, with a few Claude-only helpers held back and everything tracked in a Codex manifest so `jacked uninstall` reverses it. Upgrades diff cleanly: added/changed/removed, never touching your own files. On top of the bundled suite, `jacked install` also installs curated third-party skill packs live from their upstream repos (a 28-skill `marketing` pack and a `design-extras` pack, on by default), opt out with `--no-packs` or `jacked packs disable`.
 - **Manage everything from a web dashboard.** Accounts, usage analytics, feature toggles, appearance themes, swap history, logs, all from your browser. No config files, no terminal commands.
 - **Permission hygiene built in.** `jacked permissions audit` finds (and can prune) dangerously broad Bash wildcards in your Claude Code permission allowlists, and the dashboard's Permissions panel manages allow rules with project vs global scope.
 
 ---
 
-## Quick Start
+## Quick start: install jacked and add your Claude accounts
 
 ### Option 1: Let Claude Install It
 
@@ -72,7 +72,7 @@ Commands are namespaced as `/jacked:dcr`, `/jacked:qa`, etc. Includes all 29 com
 
 ---
 
-## Your Dashboard
+## Your dashboard: accounts, usage analytics, and feature toggles
 
 The web dashboard ships with every install. Run `jacked webux` to open it.
 
@@ -119,6 +119,7 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 - [Upgrading](#upgrading)
 - [Built-in Reviewers and Commands](#built-in-reviewers-and-commands)
 - [Sound Notifications](#sound-notifications)
+- [FAQ](#faq)
 - [Uninstall / Troubleshooting](#uninstall--troubleshooting)
 - [Version History](#version-history)
 - [Advanced / Technical Reference](#advanced--technical-reference)
@@ -132,8 +133,8 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 | Feature | What It Does |
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
-| **29 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/blindspot`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
-| **27 Skills** | Engines and knowledge packs behind the commands, plus standalone ones: `night-shift`, `jack-it-up`, `coverage-matrix`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `clone-website`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
+| **30 Slash Commands** | `/dc`, `/dcr`, `/docs-sync`, `/pr`, `/learn`, `/blindspot`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/qa`, `/qa-video`, `/demo-video`, `/ux`, `/swarm`, `/swarm-research`, `/release`, `/whats-next`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/lockdown`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
+| **28 Skills** | Engines and knowledge packs behind the commands, plus standalone ones: `night-shift`, `jack-it-up`, `coverage-matrix`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `clone-website`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
 | **Skill Packs** (optional, on by default) | Curated third-party skill collections pulled live from their upstream repos via the `npx skills` CLI, separate from the bundled suite: `marketing` (28 skills) + `design-extras`. Opt out with `--no-packs` or `jacked packs disable` |
 | **Memory Vault** (optional, opt in) | Cross-repo memory in a git-backed Markdown vault at `~/jacked-vault`. Event-triggered capture (session end plus merges to `main`), a budgeted SessionStart recall brief, and a `jacked memory` CLI. No database, no embeddings, Obsidian-compatible. Enable from the dashboard or `jacked memory init` |
 | **Statusline** (on by default) | One live status line inside every Claude Code session: model + effort, context use, 5h/7d rate limits with reset times, and the active account. Works on macOS, Linux, and Windows. Never replaces a statusline you set up yourself |
@@ -617,6 +618,54 @@ jacked install --force --sounds
 - **Completion sound** - Plays when Claude finishes a task
 
 Works on Windows, Mac, and Linux. To remove: `jacked uninstall --sounds`
+
+---
+
+## FAQ
+
+### How do I run multiple Claude Code accounts?
+
+Install jacked, then add each account from the dashboard (`jacked webux`, Accounts page) or let it walk you through the OAuth flow. Every account you own becomes part of one pool, and `jacked claude <part-of-email>` launches Claude Code on a specific one.
+
+### What happens when I hit my Claude Code usage limit?
+
+Instead of waiting out the reset, jacked swaps you to another account that still has headroom. Auto-swap rotates before a limit stops you, so a long session keeps going.
+
+### Can jacked switch Claude accounts automatically?
+
+Yes. Auto-swap watches each account's remaining 5-hour and 7-day headroom and rotates to a fresh account before the active one runs out. You can also switch by hand from the dashboard or the tray.
+
+### How do I check how much Claude usage I have left?
+
+Three places: the statusline inside every Claude Code session, the tray or menu-bar pill next to your clock, and the dashboard's Accounts page. All of them show the 5-hour window, the 7-day window, per-model caps, and reset times.
+
+### Does jacked work with Codex?
+
+Yes. Codex accounts sit side by side with Claude accounts in the same pool. When Codex is installed, `jacked install` also deploys the suite into Codex's native formats (`~/.agents/skills`, `~/.codex/AGENTS.md`, Codex custom-agent TOMLs).
+
+### Does the tray icon work on Windows and Linux, or only macOS?
+
+All three. macOS gets a native menu-bar agent; Windows and Linux get a system-tray icon through pystray. The statusline is cross-platform too, with no bash, `jq`, or PATH dependency.
+
+### Can I open the dashboard from another machine?
+
+Yes, over Tailscale. Remote account authorization works too: the dashboard shows an authorization link instead of trying to open a browser on the server, and you paste back the code Claude gives you.
+
+### How do I install the slash commands, skills, and review agents?
+
+`uv tool install claude-jacked` then `jacked install`. That deploys 30 slash commands, 28 skills, and 10 review agents into `~/.claude`. Teams can install it as a Claude Code plugin instead, with no Python required.
+
+### Will jacked overwrite my own Claude Code settings?
+
+No. Upgrades diff cleanly (added, changed, removed) and never touch files you wrote. If you already have a statusline, jacked keeps yours and tells you how to adopt its own. A colliding skill directory you own is preserved rather than clobbered.
+
+### How do I uninstall jacked?
+
+```bash
+jacked uninstall && uv tool uninstall claude-jacked
+```
+
+Your database at `~/.claude/jacked.db` stays intact, so reinstalling later keeps your accounts and history.
 
 ---
 
