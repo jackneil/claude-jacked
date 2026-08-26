@@ -686,6 +686,18 @@ document.addEventListener('visibilitychange', () => {
 
         // Skip full re-render if bulk usage refresh is in progress — it will call refreshAndRender() itself
         if (window.jackedState && window.jackedState._usageRefreshInProgress) return;
+        // Same for an in-flight account action, and the manual OAuth flow is
+        // exactly why. A remote dashboard sends the user to Claude's
+        // authorization page in ANOTHER TAB, so switching back here fires this
+        // handler mid-flow. renderRoute() rebuilds the accounts view wholesale
+        // and takes #oauth-flow-status with it, destroying the auth link and
+        // the code paste box at the precise moment the user returns holding the
+        // code — the flow keeps polling invisibly until it times out, with
+        // nowhere left to paste. rerenderAccountsView() carries that banner
+        // across a re-render; renderRoute() does not, so while a flow is live
+        // the only safe move is not to re-render at all. startPolling() already
+        // guards on this same flag for the same reason.
+        if (window.jackedState && window.jackedState._accountActionInFlight) return;
         if (typeof loadAllData === 'function') {
             loadAllData().then(() => {
                 if (typeof renderRoute === 'function' && typeof getRoute === 'function') {

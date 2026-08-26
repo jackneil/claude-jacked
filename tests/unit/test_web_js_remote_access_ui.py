@@ -778,3 +778,62 @@ out({
         # Already on the tailnet, or a MagicDNS name: still covered -> poll.
         assert result["tailnetScopeSwitch"] == {"terminals": 0, "modals": 1, "polled": 1}
         assert result["magicDnsScopeSwitch"] == {"terminals": 0, "modals": 1, "polled": 1}
+
+
+def test_visibilitychange_does_not_nuke_an_inflight_oauth_banner():
+    """The visibilitychange handler must bail out on ``_accountActionInFlight``
+    BEFORE it re-renders the route.
+
+    Regression: a remote dashboard runs the OAuth flow in manual mode, which
+    sends the user to Claude's authorization page in a SECOND TAB. Switching
+    back to the dashboard fires ``visibilitychange`` mid-flow, and the handler's
+    ``renderRoute()`` rebuilds the accounts view wholesale -- taking
+    ``#oauth-flow-status`` with it and destroying the authorization link and the
+    code paste box at the exact moment the user returns holding the code. The
+    flow then polls invisibly until it times out with nowhere to paste, which
+    makes adding or re-authing an account from another machine impossible.
+
+    ``rerenderAccountsView()`` preserves that banner across a re-render;
+    ``renderRoute()`` does not. So while an account action is live the handler
+    must not re-render at all -- exactly what ``startPolling()`` already does
+    with this same flag.
+
+    Source-level assertion on purpose: the shared DOM stub in
+    ``test_web_js_swap_ui`` makes ``document.addEventListener`` a no-op, so the
+    handler is never captured and cannot be dispatched. Same approach as the
+    ``window.addEventListener('storage'`` guard in the swap-ui suite.
+    """
+    src = WEBSOCKET_JS.read_text(encoding="utf-8")
+
+    marker = "document.addEventListener('visibilitychange'"
+    start = src.index(marker)
+    # The handler is the last top-level listener in the file; bound the block at
+    # the next top-level statement if one is ever added below it.
+    end = src.find("\ndocument.addEventListener", start + len(marker))
+    block = src[start:] if end == -1 else src[start:end]
+
+    # Strip line comments before measuring order. The guard's own explanatory
+    # comment names renderRoute(), and matching that prose instead of the call
+    # inverts the result.
+    code = "\n".join(
+        ln for ln in block.split("\n") if not ln.strip().startswith("//")
+    )
+
+    guard = code.find("_accountActionInFlight")
+    render = code.find("renderRoute(")
+
+    assert guard != -1, (
+        "visibilitychange handler lost its _accountActionInFlight guard; an "
+        "in-flight OAuth code-entry banner will be destroyed when the user "
+        "returns from the authorization tab"
+    )
+    assert render != -1, "expected the handler to re-render via renderRoute()"
+    assert guard < render, (
+        "the _accountActionInFlight guard must come BEFORE renderRoute(), "
+        "otherwise the re-render still nukes the paste box"
+    )
+    # The guard has to be an early return, not just a mention.
+    guard_line = code[guard:].split("\n", 1)[0]
+    assert "return" in guard_line, (
+        f"expected an early return on the in-flight guard, got: {guard_line!r}"
+    )
