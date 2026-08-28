@@ -28,6 +28,7 @@ import pytest
 
 from jacked import dcr_settings
 from jacked.dcr_settings import DcrSettingsAccessError, DcrSettingsUnreadableError
+from tests._platform import requires_posix_dir_permissions, requires_posix_file_read_permissions
 
 # The exact contract keys resolve() promises the /dcr command and the dashboard.
 RESOLVE_KEYS = {
@@ -224,6 +225,7 @@ def test_clear_reports_whether_a_file_existed(tmp_path):
 
 
 @skip_as_root
+@requires_posix_dir_permissions
 def test_clear_raises_a_named_access_error_when_the_delete_is_refused(tmp_path):
     """Never report "cleared" when the filesystem said no — and never leak a raw
     PermissionError traceback at the user."""
@@ -246,6 +248,7 @@ def test_clear_raises_a_named_access_error_when_the_delete_is_refused(tmp_path):
 # --------------------------------------------------------------------------- #
 
 @skip_as_root
+@requires_posix_dir_permissions
 def test_write_raises_a_named_access_error_when_the_home_is_unwritable(tmp_path):
     """PermissionError must not escape: both surfaces catch one named error and
     turn it into a friendly failure (CLI [FAIL] + exit 1, API 503)."""
@@ -361,6 +364,7 @@ def test_update_heals_before_it_applies_so_the_update_still_wins(tmp_path):
 
 
 @skip_as_root
+@requires_posix_dir_permissions
 def test_update_surfaces_a_filesystem_refusal_as_an_access_error(tmp_path):
     home = tmp_path / "locked"
     home.mkdir(mode=0o500)
@@ -640,6 +644,7 @@ def test_resolve_on_a_corrupt_config_logs_nothing(tmp_path, caplog):
 
 
 @skip_as_root
+@requires_posix_file_read_permissions
 def test_resolve_on_an_unreadable_file_reports_the_access_error(tmp_path):
     """A permission problem must not be reported as a JSON syntax problem: the
     user would hunt for a typo that is not there."""

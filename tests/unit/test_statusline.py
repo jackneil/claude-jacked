@@ -49,6 +49,7 @@ from jacked.api.routes import features
 from jacked.api.routes.features import router
 from jacked.cli import main
 from jacked.memory.settings_io import SettingsUnreadableError, settings_path
+from tests._platform import requires_posix_file_read_permissions
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA = REPO_ROOT / "jacked" / "data"
@@ -2088,6 +2089,7 @@ def test_a_database_without_an_accounts_table_drops_the_segment(home):
     hasattr(os, "geteuid") and os.geteuid() == 0,
     reason="root ignores file permissions",
 )
+@requires_posix_file_read_permissions
 def test_an_unreadable_database_drops_the_segment(home):
     _usage_home(home)
     db = home / ".claude" / "jacked.db"

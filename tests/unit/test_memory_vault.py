@@ -20,10 +20,22 @@ from rich.console import Console
 import jacked.cli as cli
 from jacked import memory
 from jacked.cli import main
+
+
 from jacked.memory import vault as vault_mod
 
 # Repo root, so a spawned `python -c` subprocess resolves the editable jacked.
 REPO_ROOT_VAULT = Path(__file__).resolve().parents[2]
+
+
+def _posix(text: str) -> str:
+    """Normalize path separators so an assertion about a vault-relative path
+    reads the same on Windows as on POSIX.
+
+    ``memory.search`` returns OS-native paths, which is correct for a CLI; it is
+    the assertions that were POSIX-only.
+    """
+    return text.replace("\\", "/")
 
 
 # --------------------------------------------------------------------------- #
@@ -446,7 +458,9 @@ def _seed_search_vault(env):
 def test_search_finds_body_keyword(env):
     _seed_search_vault(env)
     res = memory.search(env.vault, "zephyr")
-    paths = {r[0] for r in res}
+    # Vault-relative paths come back OS-native, so compare separator-agnostically
+    # rather than asserting POSIX and failing on Windows for no real reason.
+    paths = {_posix(r[0]) for r in res}
     assert any("g1/decision/d-one.md" in p for p in paths)
     assert any("g1/convention/c-one.md" in p for p in paths)
 
@@ -473,10 +487,10 @@ def test_search_hot_and_index_tiers(env):
     )
     # hot.md tier
     hot = memory.search(env.vault, "hotword")
-    assert hot and hot[0][0].endswith("g1/hot.md")
+    assert hot and _posix(hot[0][0]).endswith("g1/hot.md")
     # index tier: the title appears in the index line
     idx = memory.search(env.vault, "D one")
-    assert any(p.endswith("g1/index.md") for p, _, _ in idx)
+    assert any(_posix(p).endswith("g1/index.md") for p, _, _ in idx)
 
 
 def test_search_limit(env):
@@ -496,7 +510,7 @@ def test_cli_search_prints_path_line(env):
     env.buf.seek(0)
     r = CliRunner().invoke(main, ["memory", "search", "zephyr"])
     assert r.exit_code == 0
-    out = env.buf.getvalue()
+    out = _posix(env.buf.getvalue())
     assert "zephyr" in out
     assert "decision/d-one.md:" in out or "convention/c-one.md:" in out
 

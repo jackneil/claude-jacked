@@ -18,6 +18,7 @@ import pytest
 from click.testing import CliRunner
 
 from jacked import install_manifest as m
+from tests._platform import requires_symlinks
 
 
 def _skills_base(tmp_path: Path) -> Path:
@@ -182,6 +183,7 @@ def test_is_source_subset_rules(tmp_path):
     assert m.is_source_subset(tmp_path / "nope", src) is False
 
 
+@requires_symlinks
 def test_editable_install_source_moved_does_not_back_up_jacked_dir(tmp_path):
     """Reviewer's repro: an editable install symlinks the dest at the source, then
     a `git pull` changes SKILL.md AND the file set. Both recorded hashes miss, but
@@ -504,6 +506,7 @@ def test_skipped_skill_is_not_recorded_and_survives_uninstall(tmp_path, monkeypa
     assert not (tmp_path / ".claude" / "skills" / "dcr").exists()
 
 
+@requires_symlinks
 def test_uninstall_unlinks_a_symlinked_skill_and_survives_a_locked_one(
     tmp_path, monkeypatch
 ):

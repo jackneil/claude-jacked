@@ -1,7 +1,8 @@
 """Tests for jacked.packs — skill-pack registry, state, and npx orchestration.
 
 No network and no real npx. A fake ``npx`` shim (a small Python script written
-into tmp_path, run via its shebang) emulates the verified vercel-labs/skills
+into tmp_path, run via its shebang on POSIX and a ``.cmd`` launcher on Windows,
+see ``tests/_platform.write_python_shim``) emulates the verified vercel-labs/skills
 behavior: ``add`` creates ~/.agents/skills/<name>/SKILL.md + a relative symlink
 under ~/.claude/skills and updates the lockfile; ``remove`` deletes them + the
 lock entry; ``update`` touches updatedAt. A JSON "scenario" (pointed at by the
@@ -11,8 +12,6 @@ named skill while still exiting 0 (the rc=0 gotcha), exit non-zero, or hang.
 import json
 import os
 import shutil
-import stat
-import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from jacked import packs
+from tests._platform import requires_symlinks, write_python_shim
 
 DATA_ROOT = Path(packs.__file__).resolve().parent / "data"
 
@@ -192,15 +192,23 @@ sys.exit(0)
 '''
 
 
+def _write_npx_shim(tmp_path):
+    """Write the fake npx and return the path ``find_npx`` should hand back.
+
+    The cross-platform mechanics (shebang on POSIX, .cmd launcher on Windows)
+    live in ``tests/_platform.py`` so this suite and the codex round-trip tests
+    cannot drift apart on how they fake a binary.
+    """
+    return write_python_shim(tmp_path, "npx", _SHIM_BODY)
+
+
 @pytest.fixture
 def skills_env(tmp_path, monkeypatch):
     """A tmp HOME + a fake npx shim wired into jacked.packs.find_npx."""
     home = tmp_path / "home"
     home.mkdir()
 
-    shim = tmp_path / "npx"
-    shim.write_text(f"#!{sys.executable}\n" + _SHIM_BODY, encoding="utf-8")
-    shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IRUSR)
+    shim = _write_npx_shim(tmp_path)
 
     monkeypatch.setattr(packs, "find_npx", lambda: str(shim))
     scenario_path = tmp_path / "scenario.json"
@@ -619,6 +627,7 @@ def test_run_skills_launch_oserror(skills_env, monkeypatch, tmp_path):
     assert "Failed to run npx" in res.message
 
 
+@requires_symlinks
 def test_remove_pack_refuses_foreign_source(skills_env):
     env = skills_env
     # "alpha" is on disk but installed from a DIFFERENT repo than the pack claims.
@@ -648,6 +657,7 @@ def test_remove_pack_no_lockfile(skills_env):
 # update_packs
 # --------------------------------------------------------------------------- #
 
+@requires_symlinks
 def test_update_packs_repair_reinstalls_missing(skills_env):
     env = skills_env
     p = _pack(skills=("alpha", "beta", "gamma"))
@@ -712,6 +722,7 @@ def test_pack_status_not_installed(tmp_path):
         assert row["updated_at"] is None
 
 
+@requires_symlinks
 def test_pack_status_foreign_source(skills_env):
     env = skills_env
     _seed_installed(env.home, "alpha", source="someone/else")
@@ -723,6 +734,7 @@ def test_pack_status_foreign_source(skills_env):
     assert st["installed_count"] == 1
 
 
+@requires_symlinks
 def test_pack_status_claude_real_dir_no_canonical_is_installed(skills_env):
     # The claude-code-only layout the skills CLI produces on a REAL jacked
     # install: a real ~/.claude/skills/<n>/ dir with NO ~/.agents canonical
@@ -824,6 +836,7 @@ def test_install_collision_guard_user_dir_skipped(skills_env):
     assert (userdir / "SKILL.md").read_text() == "MY OWN WORK\n"
 
 
+@requires_symlinks
 def test_install_collision_guard_foreign_source_skipped(skills_env):
     env = skills_env
     _seed_installed(env.home, "alpha", source="someone/else")
@@ -851,6 +864,7 @@ def test_install_collision_guard_own_source_refreshes(skills_env):
     assert "alpha" in add_calls[1]
 
 
+@requires_symlinks
 def test_install_collision_guard_all_skipped_no_subprocess(skills_env):
     env = skills_env
     _seed_installed(env.home, "alpha", source="someone/else")
@@ -867,6 +881,7 @@ def test_install_collision_guard_all_skipped_no_subprocess(skills_env):
 # update_packs per-pack attribution
 # --------------------------------------------------------------------------- #
 
+@requires_symlinks
 def test_update_packs_per_pack_attribution(skills_env):
     env = skills_env
     good = _pack(skills=("alpha",), source="acme/skills", name="good")
@@ -990,6 +1005,7 @@ def test_registry_default_non_bool_coerced_to_false_with_warning(tmp_path, caplo
     assert any("'default' is not a bool" in r.getMessage() for r in caplog.records)
 
 
+@requires_symlinks
 def test_install_pack_skips_dangling_symlink_no_lock(skills_env):
     """A dangling symlink at ~/.claude/skills/<n> with no own-source lock entry
     must be treated as a pre-existing trace the guard refuses to overwrite (not
