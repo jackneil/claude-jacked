@@ -200,6 +200,17 @@ def _parse_frontmatter(path: Path) -> dict:
     >>> fm['name'], fm['model']
     ('test-agent', 'haiku')
     >>> os.unlink(str(p))
+
+    A YAML folded scalar keeps its value on the following indented lines; the
+    indicator itself is not the description.
+
+    >>> p2 = Path(tempfile.mktemp(suffix='.md'))
+    >>> _ = p2.write_text(
+    ...     '---\\nname: s\\ndescription: >-\\n  First line\\n  second line.\\n---\\nBody.',
+    ...     encoding='utf-8')
+    >>> _parse_frontmatter(p2)['description']
+    'First line second line.'
+    >>> os.unlink(str(p2))
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -212,15 +223,37 @@ def _parse_frontmatter(path: Path) -> dict:
         return {}
     block = text[3:end].strip()
     result = {}
-    for line in block.split("\n"):
+    lines = block.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
         if ":" not in line:
             continue
         key, _, val = line.partition(":")
-        val = val.strip().strip('"').strip("'")
+        key = key.strip()
+        val = val.strip()
+        # YAML block scalars ('>', '>-', '|', '|-', ...) carry their value on the
+        # FOLLOWING indented lines. Reading one line at a time stored the
+        # indicator itself, so a skill whose frontmatter wraps its description
+        # that way rendered a description of literally ">-" in the dashboard
+        # (deploy-to-railway did exactly this). Fold the continuation into one
+        # line: every consumer here is single-line UI copy, so '>' and '|' are
+        # deliberately treated the same.
+        if val[:1] in (">", "|") and val.strip("><|+-") == "":
+            parts = []
+            while i < len(lines) and (
+                lines[i].strip() == "" or lines[i][:1] in (" ", "\t")
+            ):
+                parts.append(lines[i].strip())
+                i += 1
+            val = " ".join(p for p in parts if p)
+        else:
+            val = val.strip('"').strip("'")
         # Truncate long descriptions
-        if key.strip() == "description" and len(val) > 120:
+        if key == "description" and len(val) > 120:
             val = val[:117] + "..."
-        result[key.strip()] = val
+        result[key] = val
     return result
 
 

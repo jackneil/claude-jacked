@@ -16,6 +16,14 @@
       "homepage": "https://github.com/emilkowalski/skills",
       "default": true,
       "skills": ["improve-animations"]
+    },
+    "ui-skills": {
+      "display_name": "UI Skills",
+      "description": "ibelick's design-engineering skills: a fast UI cleanup pass, a WCAG accessibility audit, an animation-performance audit, and a DESIGN.md generator that gives coding agents persistent design context. Deliberately a subset - improve-ui, ui-skills-root and fixing-metadata are held back as duplicates of what jacked already ships.",
+      "source": "ibelick/ui-skills",
+      "homepage": "https://github.com/ibelick/ui-skills",
+      "default": true,
+      "skills": ["baseline-ui", "create-design-md", "fixing-accessibility", "fixing-motion-performance"]
     }
   }
 }
