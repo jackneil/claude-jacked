@@ -267,11 +267,23 @@ def _seed_installed(home, name, source):
 
 def test_registry_load_happy():
     reg = packs.load_registry(DATA_ROOT)
-    assert set(reg) == {"marketing", "design-extras"}
+    assert set(reg) == {"marketing", "design-extras", "ui-skills"}
     mk = reg["marketing"]
     assert mk.source == "coreyhaines31/marketingskills"
     assert isinstance(mk.skills, tuple) and "pricing" in mk.skills
     assert reg["design-extras"].skills == ("improve-animations",)
+    ui = reg["ui-skills"]
+    assert ui.source == "ibelick/ui-skills"
+    # A deliberate 4-of-7 subset. The three held back each duplicate something
+    # already installed: improve-ui vs aesthetic-dogfood-audit/ux,
+    # fixing-metadata vs the marketing pack's seo-audit + schema, and
+    # ui-skills-root shells out to an `npx ui-skills` CLI jacked does not ship.
+    assert ui.skills == (
+        "baseline-ui",
+        "create-design-md",
+        "fixing-accessibility",
+        "fixing-motion-performance",
+    )
 
 
 def test_registry_load_missing_file(tmp_path):
