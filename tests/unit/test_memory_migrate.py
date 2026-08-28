@@ -21,6 +21,7 @@ import jacked.cli as cli
 from jacked.cli import main
 from jacked.memory import migrate as migrate_mod
 from jacked.memory import vault as vault_mod
+from tests._platform import requires_symlinks
 
 
 # --------------------------------------------------------------------------- #
@@ -587,6 +588,7 @@ def test_status_no_migration_line_when_none(env):
 # Symlinked sources are refused (CSO hardening)
 # --------------------------------------------------------------------------- #
 
+@requires_symlinks
 def test_symlinked_source_file_is_skipped_never_copied(env):
     """A symlink planted in .remember (e.g. today-x.md -> a sensitive file)
     migrates NOTHING for that link: the target's content must never be copied
@@ -616,6 +618,7 @@ def test_symlinked_source_file_is_skipped_never_copied(env):
     assert link.is_symlink()
 
 
+@requires_symlinks
 def test_symlinked_now_md_is_skipped(env):
     root, repo = _fixture_repo(env)
     secret = env.tmp / "sensitive2.txt"

@@ -14,6 +14,7 @@ import pytest
 from jacked.codex import switching as sw
 from jacked.codex.switching import CodexSwapError
 from jacked.web.database import Database
+from tests._platform import requires_posix_file_modes
 
 
 def _b64url(obj):
@@ -226,6 +227,7 @@ def test_swap_skips_capture_for_unknown_live_account(tmp_path, db):
     assert json.loads(sw.codex_slot_auth_path(t["id"], base).read_text()) == t_good
 
 
+@requires_posix_file_modes
 def test_accounts_container_locked_0700(tmp_path):
     """Hardening: the accounts/ container (created at umask by mkdir) is 0700."""
     import os

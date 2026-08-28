@@ -18,6 +18,7 @@ from click.testing import CliRunner
 
 from jacked import dcr_settings
 from jacked.cli import main
+from tests._platform import requires_posix_dir_permissions, requires_posix_file_read_permissions
 
 RESOLVE_KEYS = {
     "engine", "model", "effort", "keep_on_claude", "usable", "reason",
@@ -188,6 +189,7 @@ def test_engine_json_on_a_corrupt_config_degrades_to_claude(isolated_home):
 
 
 @skip_as_root
+@requires_posix_file_read_permissions
 def test_engine_json_on_an_unreadable_file_still_emits_only_json(isolated_home):
     """Same merged-stream contract for a permission failure, and the reason names
     the REAL cause instead of blaming the JSON syntax."""
@@ -303,6 +305,7 @@ def test_set_switches_engine_even_with_a_stale_invalid_stored_effort(isolated_ho
 
 
 @skip_as_root
+@requires_posix_dir_permissions
 def test_set_on_an_unwritable_home_fails_friendly_without_a_traceback(isolated_home):
     isolated_home.chmod(0o500)
     try:
@@ -319,6 +322,7 @@ def test_set_on_an_unwritable_home_fails_friendly_without_a_traceback(isolated_h
 
 
 @skip_as_root
+@requires_posix_dir_permissions
 def test_clear_on_an_unwritable_dir_fails_friendly_and_never_claims_success(
     isolated_home,
 ):

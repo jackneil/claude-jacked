@@ -20,6 +20,7 @@ from starlette.testclient import TestClient
 
 from jacked import dcr_settings
 from jacked.api.routes.features import DcrEngineRequest, router
+from tests._platform import requires_posix_dir_permissions
 
 RESOLVE_KEYS = {
     "engine", "model", "effort", "keep_on_claude", "usable", "reason",
@@ -231,6 +232,7 @@ def test_put_switches_engine_even_with_a_stale_invalid_stored_effort(client, hom
 
 
 @skip_as_root
+@requires_posix_dir_permissions
 def test_put_on_an_unwritable_home_is_503_unwritable(client, home):
     """A filesystem refusal is a 503 the dashboard can explain, never a 500 with
     a PermissionError traceback."""

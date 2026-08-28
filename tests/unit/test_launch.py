@@ -15,36 +15,9 @@ import click
 import pytest
 
 from jacked.web.database import Database
+from tests._platform import requires_symlinks
 
 # Windows holds SQLite file locks
-_WIN = os.name == "nt"
-
-
-def _symlinks_supported() -> bool:
-    """True if this process can create symlinks.
-
-    Windows requires admin or Developer Mode; without it os.symlink raises
-    OSError (WinError 1314). Probed once so symlink-specific tests skip
-    cleanly instead of erroring in setup.
-    """
-    if not _WIN:
-        return True
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as _d:
-        _src = Path(_d) / "s"
-        _src.write_text("x")
-        try:
-            (Path(_d) / "l").symlink_to(_src)
-            return True
-        except OSError:
-            return False
-
-
-requires_symlinks = pytest.mark.skipif(
-    not _symlinks_supported(),
-    reason="symlinks require admin or Developer Mode on Windows",
-)
 
 
 def _make_db(tmp_path: Path) -> Database:

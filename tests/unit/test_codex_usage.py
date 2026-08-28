@@ -11,14 +11,13 @@ account live in the shared root is polled; non-active ones keep their cache).
 import asyncio
 import base64
 import json
-import stat
-import sys
 from datetime import datetime, timezone
 
 import pytest
 
 from jacked.codex import usage as cu
 from jacked.web.database import Database
+from tests._platform import write_python_shim
 
 # Verbatim result captured from a live `codex app-server` 0.142.3
 # account/rateLimits/read (token values were never in this payload).
@@ -574,12 +573,11 @@ for line in sys.stdin:
 
 
 def _write_fake_codex(tmp_path):
-    p = tmp_path / "codex_fake.py"
-    # Use this interpreter's path in the shebang so the fake runs even when
-    # `python3` isn't on PATH (skip cleanly nowhere — it must work, not error).
-    p.write_text(f"#!{sys.executable}\n{_FAKE_CODEX}")
-    p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IRUSR)
-    return str(p)
+    # Runs on this interpreter so the fake works even when `python3` is not on
+    # PATH, and via a .cmd launcher on Windows, which has no shebang support
+    # (exec'ing a shebang script there raises WinError 193). Shared with the
+    # pack tests' fake npx so the two cannot drift.
+    return str(write_python_shim(tmp_path, "codex_fake", _FAKE_CODEX))
 
 
 def test_read_rate_limits_real_subprocess_roundtrip(tmp_path):
@@ -651,9 +649,9 @@ def test_fetch_usage_dispatches_codex_active_only(db, tmp_path, monkeypatch):
 
 def test_read_rate_limits_passes_codex_home_env(tmp_path):
     # A fake that echoes CODEX_HOME back as the plan, proving env wiring.
-    script = tmp_path / "echo_home.py"
-    script.write_text(
-        f"#!{sys.executable}\n"
+    script = write_python_shim(
+        tmp_path,
+        "echo_home",
         "import sys, json, os\n"
         "for line in sys.stdin:\n"
         "    line=line.strip()\n"
@@ -662,9 +660,8 @@ def test_read_rate_limits_passes_codex_home_env(tmp_path):
         "    if m.get('method')=='initialize':\n"
         "        print(json.dumps({'id':mid,'result':{}}), flush=True)\n"
         "    elif m.get('method')=='account/rateLimits/read':\n"
-        "        print(json.dumps({'id':mid,'result':{'rateLimits':{'planType':os.environ.get('CODEX_HOME','')}}}), flush=True)\n"
+        "        print(json.dumps({'id':mid,'result':{'rateLimits':{'planType':os.environ.get('CODEX_HOME','')}}}), flush=True)\n",
     )
-    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRUSR)
     home = tmp_path / "my-codex-home"
     home.mkdir()
     result = asyncio.run(cu.read_codex_rate_limits(home=home, codex_bin=str(script)))

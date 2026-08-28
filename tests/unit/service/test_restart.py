@@ -5,6 +5,7 @@ import logging
 import pytest
 
 from jacked.service import restart as restart_mod
+from tests._platform import requires_posix_exec_bit
 
 
 @pytest.fixture(autouse=True)
@@ -114,6 +115,7 @@ def test_exec_target_python_dash_m(monkeypatch, tmp_path):
     assert argv == [sys.executable, "-m", "jacked", "webux", "--port", "8399"]
 
 
+@requires_posix_exec_bit
 def test_exec_target_nonexecutable_argv0(monkeypatch, tmp_path):
     """A non-executable argv[0] of any name falls back to the interpreter."""
     import sys
