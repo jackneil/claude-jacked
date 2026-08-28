@@ -508,12 +508,14 @@ async function renderAgentsTab(container) {
 
         container.innerHTML = `
             <p class="text-xs text-slate-500 mb-4 text-pretty">Specialized agents installed to <code class="text-slate-300">~/.claude/agents/</code>. Toggle to enable or disable individual agents.</p>
+            ${_renderFeatureFilter('Filter agents...')}
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 ${cardsHtml}
             </div>
         `;
 
         bindToggleEvents(container);
+        _bindFeatureFilter(container);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -557,12 +559,14 @@ async function renderCommandsTab(container) {
 
         container.innerHTML = `
             <p class="text-xs text-slate-500 mb-4 text-pretty">Slash commands installed to <code class="text-slate-300">~/.claude/commands/</code>. Use these with <code class="text-slate-300">/command-name</code> in Claude Code.</p>
+            ${_renderFeatureFilter('Filter commands...')}
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 ${cardsHtml}
             </div>
         `;
 
         bindToggleEvents(container);
+        _bindFeatureFilter(container);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -571,6 +575,61 @@ async function renderCommandsTab(container) {
             </div>
         `;
     }
+}
+
+// --- Shared: filter over feature rows ---
+//
+// Agents (10), Commands (30) and the knowledge/skills lists (30+) are long
+// enough that finding one item meant scrolling the whole tab. Every row in
+// every tab already carries `data-feature-row`, so one filter works across all
+// of them without touching the row markup.
+//
+// Matching is on the row's rendered textContent, which covers the display name
+// AND the description, so "browser" finds the QA skill without needing to know
+// its name. Sections tagged `data-feature-section` collapse when every row
+// inside them is filtered out, so a heading never hangs over empty space.
+
+// The `knowledge` category the API returns is a grab bag: the behavioral rules
+// and the jacked reference doc, PLUS every bundled skill as `skill_<name>`.
+// This is the one rule that decides which half a row belongs to, kept at module
+// scope so it is directly testable rather than buried in an async renderer.
+function _isSkillFeature(k) {
+    return !!k && typeof k.name === 'string' && k.name.startsWith('skill_');
+}
+
+function _renderFeatureFilter(placeholder) {
+    return `
+        <div class="mb-4">
+            <input type="text" data-feature-filter
+                   class="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
+                   placeholder="${escapeHtml(placeholder)}" autocomplete="off" spellcheck="false">
+            <div data-feature-filter-empty class="text-xs text-slate-500 mt-3 hidden">No matches.</div>
+        </div>
+    `;
+}
+
+function _bindFeatureFilter(container) {
+    const input = container.querySelector('[data-feature-filter]');
+    if (!input) return;
+    const empty = container.querySelector('[data-feature-filter-empty]');
+    const rows = [...container.querySelectorAll('[data-feature-row]')];
+    const sections = [...container.querySelectorAll('[data-feature-section]')];
+
+    input.addEventListener('input', () => {
+        const q = input.value.trim().toLowerCase();
+        let visible = 0;
+        rows.forEach(row => {
+            const hit = !q || row.textContent.toLowerCase().includes(q);
+            row.classList.toggle('hidden', !hit);
+            if (hit) visible++;
+        });
+        sections.forEach(sec => {
+            const any = [...sec.querySelectorAll('[data-feature-row]')]
+                .some(r => !r.classList.contains('hidden'));
+            sec.classList.toggle('hidden', !any);
+        });
+        if (empty) empty.classList.toggle('hidden', visible !== 0);
+    });
 }
 
 // --- Tab: Features ---
@@ -657,7 +716,20 @@ async function renderFeaturesTab(container) {
         `;
         }).join('');
 
-        const knowledgeRows = knowledge.map(k => {
+        // The knowledge category is a grab bag: the behavioral rules and the
+        // jacked reference doc, PLUS every bundled skill as a `skill_<name>`
+        // entry. Rendering all of it in one list under "Documents and rules"
+        // buried 28 skills in a section whose own description does not describe
+        // them, and disagreed with the Installations page, which already treats
+        // Skills as a first-class group. Split on the prefix the API hands us.
+        //
+        // The toggle category stays `knowledge` for BOTH halves: that is what
+        // PUT /api/features/{category}/{name} accepts, and its Literal has no
+        // `skills` member. This is a presentation split, not an API change.
+        const skillEntries = knowledge.filter(_isSkillFeature);
+        const docEntries = knowledge.filter(k => !_isSkillFeature(k));
+
+        const knowledgeRow = (k) => {
             let note = '';
             if (k.name === 'rules' && k.corrupt) {
                 note = '<span class="text-xs text-red-400 ml-2">Corrupt markers detected</span>';
@@ -671,12 +743,15 @@ async function renderFeaturesTab(container) {
                     ${renderToggle(k.name, 'knowledge', k.installed, k.source_available)}
                 </div>
             `;
-        }).join('');
+        };
+        const knowledgeRows = docEntries.map(knowledgeRow).join('');
+        const skillRows = skillEntries.map(knowledgeRow).join('');
 
         container.innerHTML = `
             <div class="space-y-6">
                 ${settingsWarning}
-                <div>
+                ${_renderFeatureFilter('Filter hooks, knowledge and skills...')}
+                <div data-feature-section>
                     <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Hooks</h3>
                     <p class="text-xs text-slate-500 mb-3">Background hooks that run automatically during Claude Code sessions.</p>
                     <div class="space-y-2">
@@ -686,11 +761,19 @@ async function renderFeaturesTab(container) {
 
                 ${dcrEngineSection}
 
-                <div>
+                <div data-feature-section>
                     <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Knowledge</h3>
                     <p class="text-xs text-slate-500 mb-3">Documents and rules that Claude reads for context and behavior. Installed to <code class="text-slate-300">~/.claude/</code>.</p>
                     <div class="space-y-2">
                         ${knowledgeRows}
+                    </div>
+                </div>
+
+                <div data-feature-section>
+                    <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Skills</h3>
+                    <p class="text-xs text-slate-500 mb-3">Skills bundled with jacked, installed to <code class="text-slate-300">~/.claude/skills/</code>. Toggle one off to stop Claude loading it.</p>
+                    <div class="space-y-2">
+                        ${skillRows}
                     </div>
                 </div>
 
@@ -701,6 +784,7 @@ async function renderFeaturesTab(container) {
         bindToggleEvents(container);
         _bindPackToggleEvents(container);
         _bindDcrEngineEvents(container);
+        _bindFeatureFilter(container);
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">

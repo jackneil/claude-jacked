@@ -65,6 +65,17 @@ function renderGlobalInstallationCard(gi) {
     const cmdsInstalled = gi.commands.filter(c => c.installed).length;
     const cmdsTotal = gi.commands.length;
 
+    // Agents and Commands are too numerous to chip out the way hooks/knowledge/
+    // skills are (40 chips would wreck the 4-column grid cell they live in), but
+    // "8/10" alone cannot answer the only question the number raises: WHICH two
+    // are off. Everything is installed by default, so the disabled set is short
+    // when it exists at all and empty the rest of the time.
+    const offList = (items) => {
+        const off = (items || []).filter(i => !i.installed).map(i => i.display_name);
+        if (!off.length) return '';
+        return `<div class="text-xs text-amber-400/80 mt-1 break-words">${off.length} off: ${escapeHtml(off.join(', '))}</div>`;
+    };
+
     const hookChips = gi.hooks.map(h => {
         const color = h.installed ? 'bg-green-900/50 text-green-300 border-green-700' : 'bg-slate-800 text-slate-500 border-slate-700';
         const icon = h.installed ? '&#10003;' : '&#10005;';
@@ -101,10 +112,12 @@ function renderGlobalInstallationCard(gi) {
                 <div>
                     <div class="text-xs text-slate-400 mb-1">Agents</div>
                     <div class="text-lg font-bold text-white tabular-nums">${agentsInstalled}<span class="text-sm text-slate-500">/${agentsTotal}</span></div>
+                    ${offList(gi.agents)}
                 </div>
                 <div>
                     <div class="text-xs text-slate-400 mb-1">Commands</div>
                     <div class="text-lg font-bold text-white tabular-nums">${cmdsInstalled}<span class="text-sm text-slate-500">/${cmdsTotal}</span></div>
+                    ${offList(gi.commands)}
                 </div>
                 <div>
                     <div class="text-xs text-slate-400 mb-1">Hooks</div>
