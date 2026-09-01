@@ -86,3 +86,35 @@ def test_prune_removed_deletes_only_listed(tmp_path):
     assert not (home / ".claude" / "commands" / "old.md").exists()
     assert (home / ".claude" / "skills" / "mine").exists()   # untouched
     assert set(pruned) == {"skills/gone", "commands/old.md"}
+
+
+def test_migrated_command_pruned_from_installed_tree(tmp_path):
+    """A command that became a skill must not linger in ~/.claude/commands.
+
+    The 2026-09-01 migration moved /dcr (and nine others) out of data/commands
+    into data/skills. On an upgrade, the prior manifest still lists the command
+    and the current source no longer has it, so the diff must report it removed
+    and prune_removed must delete the stale installed copy — otherwise the old
+    command file keeps shadowing the new skill on every existing install.
+    """
+    home = tmp_path / "home"
+    source = tmp_path / "data"
+    _make_source(source)
+    (source / "skills" / "dcr").mkdir()
+    (source / "skills" / "dcr" / "SKILL.md").write_text("dcr engine", encoding="utf-8")
+
+    (home / ".claude" / "commands").mkdir(parents=True)
+    (home / ".claude" / "commands" / "dcr.md").write_text("stale dcr", encoding="utf-8")
+
+    prior = {"version": "0.95.0", "artifacts": {
+        "skills": {"recover": "sha256:x"},
+        "commands": {"dc.md": "sha256:x", "dcr.md": "sha256:x"},
+        "agents": {}, "lenses": {}, "templates": {},
+    }}
+    d = m.diff(prior, m.hash_source(source))
+    assert d.by_category["commands"].removed == ["dcr.md"]
+    assert "dcr" in d.by_category["skills"].added
+
+    pruned = m.prune_removed(d, home)
+    assert not (home / ".claude" / "commands" / "dcr.md").exists()
+    assert "commands/dcr.md" in pruned

@@ -4,24 +4,30 @@ whats-next + jacked-setup instruction files.
 These are intentionally string-presence checks: the files are LLM instruction
 documents, not code. The tests guard against regression (accidental deletion of
 the critical sections) — the behavior itself is enforced by the model at
-runtime. They are scoped to the SHIPPED command files under jacked/data/commands.
+runtime. They are scoped to the SHIPPED files under jacked/data: whats-next now
+ships as a skill (`skills/whats-next/SKILL.md`, engine below `<!-- ENGINE -->`),
+jacked-setup is still a command file.
 """
 from pathlib import Path
 
 import pytest
 
-DATA = Path(__file__).resolve().parents[2] / "jacked" / "data" / "commands"
+DATA = Path(__file__).resolve().parents[2] / "jacked" / "data"
 ROOT = Path(__file__).resolve().parents[2]
+
+ENGINE_MARKER = "<!-- ENGINE -->"
 
 
 @pytest.fixture(scope="module")
 def whats_next() -> str:
-    return (DATA / "whats-next.md").read_text(encoding="utf-8")
+    text = (DATA / "skills" / "whats-next" / "SKILL.md").read_text(encoding="utf-8")
+    assert ENGINE_MARKER in text, f"whats-next skill is missing its {ENGINE_MARKER} marker"
+    return text.split(ENGINE_MARKER, 1)[1].lstrip("\n")
 
 
 @pytest.fixture(scope="module")
 def jacked_setup() -> str:
-    return (DATA / "jacked-setup.md").read_text(encoding="utf-8")
+    return (DATA / "commands" / "jacked-setup.md").read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
