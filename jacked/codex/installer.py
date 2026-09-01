@@ -234,6 +234,14 @@ def install_codex(
             _copy_tree(skill_md.parent, skills_base / name)
         except OSError as e:
             logger.warning("skipping Codex skill %s: %s", name, e)
+            # Carry prior hashes forward: a transient write failure must not let
+            # the prune below delete the existing good dir or prompt.
+            _prev_skill = ((prior or {}).get("skills") or {}).get(name)
+            if _prev_skill:
+                skills[name] = _prev_skill
+            _prev_prompt = ((prior or {}).get("prompts") or {}).get(f"{name}.md")
+            if _prev_prompt:
+                prompts[f"{name}.md"] = _prev_prompt
             continue
         skills[name] = expected
         engine = _skill_engine_prompt(skill_md)
@@ -278,10 +286,14 @@ def install_codex(
             except OSError as e:
                 logger.warning("skipping Codex command %s: %s", cmd.name, e)
                 # Same transient-failure guard as the skills pass: keep the
-                # existing good prompt out of the prune's reach.
+                # existing good prompt AND command-derived skill dir out of the
+                # prune's reach.
                 _prev = ((prior or {}).get("prompts") or {}).get(cmd.name)
                 if _prev:
                     prompts[cmd.name] = _prev
+                _prev_skill = ((prior or {}).get("skills") or {}).get(cmd.stem)
+                if _prev_skill:
+                    skills[cmd.stem] = _prev_skill
                 continue
             try:
                 prompts[cmd.name] = _sha_file(cmd)
@@ -298,6 +310,9 @@ def install_codex(
                 logger.warning(
                     "skipping Codex command-derived skill %s: %s", cmd.stem, e
                 )
+                _prev_skill = ((prior or {}).get("skills") or {}).get(cmd.stem)
+                if _prev_skill:
+                    skills[cmd.stem] = _prev_skill
                 continue
             skills[cmd.stem] = _sha_dir(skill_dir)
 

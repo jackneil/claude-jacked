@@ -157,6 +157,11 @@ def _skill_engine_prompt(skill_md: Path) -> Optional[str]:
     The frontmatter block is recovered as the text `_split_command_frontmatter`
     consumed, so there is one parser for both halves."""
     text = skill_md.read_text(encoding="utf-8")
+    if "\r\n" in text:
+        # An autocrlf=true checkout would fail the "---\n" fence match and turn
+        # every prompt into a silent prune; normalize instead (LF prompts are
+        # what wheel installs emit anyway).
+        text = text.replace("\r\n", "\n")
     meta, body = _split_command_frontmatter(text)
     if not meta:
         # Unparseable/missing frontmatter would emit a nameless prompt; refuse

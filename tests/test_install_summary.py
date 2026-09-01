@@ -100,6 +100,10 @@ def test_cli_install_writes_manifest_and_summary(tmp_path, monkeypatch):
     rec = json.loads(last.read_text(encoding="utf-8"))
     assert rec["from_version"] is None
     assert "recover" in rec["changes"]["skills"]["added"]
+    # Outcome reporting: the record carries what the prune/sweep actually did,
+    # not just the diff's intent (all empty on a fresh install).
+    assert rec["pruned"] == [] and rec["preserved"] == []
+    assert rec["stale_commands"] == []
     assert "installed" in r1.output.lower()
     # Old banner must be gone.
     assert "What you get" not in r1.output

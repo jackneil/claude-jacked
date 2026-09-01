@@ -2732,20 +2732,27 @@ def install(
     # deleted by the prune (upgrade runs this automatically — high exposure).
     _pruned, _preserved = _mani.prune_removed(_d, home, _prior_manifest)
     # Belt-and-braces: with no usable prior manifest the diff prunes nothing, and
-    # writing the new manifest below would strand any command file whose name now
-    # ships as a skill — permanently, since no later diff (or uninstall) can see
-    # it. Sweep those by the producer's own rule (the shipped skill set).
-    _swept, _swept_kept = _mani.sweep_migrated_commands(
-        home, _current_hashes.get("skills", {}), _prior_manifest,
+    # writing the new manifest below would strand a stale command copy of a
+    # migrated name forever (no later diff or uninstall can see it). The sweep
+    # deletes only manifest-proven jacked copies; anything unproven is left in
+    # place and reported as stale (the skill shadows it, so it is inert).
+    _swept, _stale_cmds = _mani.sweep_migrated_commands(
+        home, _mani.migrated_skill_names(pkg_root), _prior_manifest,
     )
     _pruned += _swept
-    _preserved += _swept_kept
     _now = datetime.now(timezone.utc).isoformat()
     _mani.write(_manifest_path, _ver, _current_hashes, _now)
     _record = _isum.build_record(_d, _prior_version, _ver, _now)
-    # Outcome, not intent: the diff says what SHOULD go; record what actually did.
+    # Outcome, not intent: the diff says what SHOULD go; record what actually
+    # did, and keep the rendered "removed" lines honest for preserved files.
     _record["pruned"] = _pruned
     _record["preserved"] = _preserved
+    _record["stale_commands"] = _stale_cmds
+    for _item in _preserved:
+        _cat, _, _nm = _item.partition("/")
+        _rm = _record["changes"].get(_cat, {}).get("removed")
+        if _rm and _nm in _rm:
+            _rm.remove(_nm)
     _isum.write_last_install(_record, home / ".claude" / "jacked-last-install.json")
 
     # --- Codex pass (auto-detected) ---
@@ -2810,15 +2817,24 @@ def install(
     else:
         console.print("")
         console.print(_isum.render_terminal(_record))
-        if _pruned:
+        # render_terminal already lists diff-driven removals; only the sweep's
+        # extra deletions and the not-deleted outcomes need their own lines.
+        if _swept:
             console.print(
-                f"[green][OK][/green] Removed {len(_pruned)} no-longer-shipped: "
-                + ", ".join(_pruned)
+                f"[green][OK][/green] Removed {len(_swept)} stale command "
+                "cop(ies) of names that ship as skills now: " + ", ".join(_swept)
             )
         for _item in _preserved:
             console.print(
                 f"[yellow][!][/yellow] Preserved your modified {_item} under "
-                "~/.claude/jacked-backups/ (jacked no longer ships it)"
+                "~/.claude/jacked-backups/ (no longer matches what jacked installed)"
+            )
+        for _item in _stale_cmds:
+            console.print(
+                f"[yellow][!][/yellow] ~/.claude/{_item} collides with a shipped "
+                "skill of the same name (the skill wins in Claude Code). jacked "
+                "can't confirm it's jacked's old copy, so it was left alone — "
+                "delete it yourself if it's a pre-0.96 leftover."
             )
         if _codex_summary is not None:
             _mcp = _codex_summary.mcp
@@ -3999,15 +4015,25 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     agents_dst = home / ".claude" / "agents"
     if agents_src.exists() and agents_dst.exists():
         agent_count = 0
+        _agents_kept: list[str] = []
         for agent_file in agents_src.glob("*.md"):
-            dst_file = agents_dst / agent_file.name
-            if dst_file.exists() or dst_file.is_symlink():
-                dst_file.unlink()
+            _act = _mani.remove_or_preserve_flat(
+                agents_dst / agent_file.name, "agents", agent_file.name,
+                _uninstall_manifest, src=agent_file,
+            )
+            if _act == "removed":
                 agent_count += 1
+            elif _act == "preserved":
+                _agents_kept.append(agent_file.name)
         if agent_count > 0:
             console.print(f"[green][OK][/green] Removed {agent_count} agents")
         else:
             console.print("[yellow][-][/yellow] No jacked agents found")
+        for _n in _agents_kept:
+            console.print(
+                f"[yellow][!][/yellow] Preserved your modified agents/{_n} under "
+                "~/.claude/jacked-backups/"
+            )
     else:
         console.print("[yellow][-][/yellow] Agents directory not found")
 
@@ -4016,15 +4042,25 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     commands_dst = home / ".claude" / "commands"
     if commands_src.exists() and commands_dst.exists():
         cmd_count = 0
+        _cmds_kept: list[str] = []
         for cmd_file in commands_src.glob("*.md"):
-            dst_file = commands_dst / cmd_file.name
-            if dst_file.exists() or dst_file.is_symlink():
-                dst_file.unlink()
+            _act = _mani.remove_or_preserve_flat(
+                commands_dst / cmd_file.name, "commands", cmd_file.name,
+                _uninstall_manifest, src=cmd_file,
+            )
+            if _act == "removed":
                 cmd_count += 1
+            elif _act == "preserved":
+                _cmds_kept.append(cmd_file.name)
         if cmd_count > 0:
             console.print(f"[green][OK][/green] Removed {cmd_count} commands")
         else:
             console.print("[yellow][-][/yellow] No jacked commands found")
+        for _n in _cmds_kept:
+            console.print(
+                f"[yellow][!][/yellow] Preserved your modified commands/{_n} under "
+                "~/.claude/jacked-backups/"
+            )
     else:
         console.print("[yellow][-][/yellow] Commands directory not found")
 
@@ -4033,15 +4069,25 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     lenses_dst = home / ".claude" / "lenses"
     if lenses_src.exists() and lenses_dst.exists():
         lens_count = 0
+        _lenses_kept: list[str] = []
         for lens_file in lenses_src.glob("*.md"):
-            dst_file = lenses_dst / lens_file.name
-            if dst_file.exists() or dst_file.is_symlink():
-                dst_file.unlink()
+            _act = _mani.remove_or_preserve_flat(
+                lenses_dst / lens_file.name, "lenses", lens_file.name,
+                _uninstall_manifest, src=lens_file,
+            )
+            if _act == "removed":
                 lens_count += 1
+            elif _act == "preserved":
+                _lenses_kept.append(lens_file.name)
         if lens_count > 0:
             console.print(f"[green][OK][/green] Removed {lens_count} lenses")
         else:
             console.print("[yellow][-][/yellow] No jacked lenses found")
+        for _n in _lenses_kept:
+            console.print(
+                f"[yellow][!][/yellow] Preserved your modified lenses/{_n} under "
+                "~/.claude/jacked-backups/"
+            )
     else:
         console.print("[yellow][-][/yellow] Lenses directory not found")
 
@@ -4050,13 +4096,23 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     templates_dst = home / ".claude" / "jacked-templates"
     if templates_src.exists() and templates_dst.exists():
         tpl_count = 0
+        _tpls_kept: list[str] = []
         for tpl_file in templates_src.glob("*.html"):
-            dst_file = templates_dst / tpl_file.name
-            if dst_file.exists() or dst_file.is_symlink():
-                dst_file.unlink()
+            _act = _mani.remove_or_preserve_flat(
+                templates_dst / tpl_file.name, "templates", tpl_file.name,
+                _uninstall_manifest, src=tpl_file,
+            )
+            if _act == "removed":
                 tpl_count += 1
+            elif _act == "preserved":
+                _tpls_kept.append(tpl_file.name)
         if tpl_count > 0:
             console.print(f"[green][OK][/green] Removed {tpl_count} HTML templates")
+        for _n in _tpls_kept:
+            console.print(
+                f"[yellow][!][/yellow] Preserved your modified templates/{_n} under "
+                "~/.claude/jacked-backups/"
+            )
         # Drop the dir only if it's now empty so user-added templates survive.
         try:
             templates_dst.rmdir()

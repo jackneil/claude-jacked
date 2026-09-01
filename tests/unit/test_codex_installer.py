@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from jacked.codex import _generate as gen
 from jacked.codex import installer as ins
 
 
@@ -471,6 +472,74 @@ def test_engine_skill_prompts_idempotent(data_root, homes):
     _add_engine_skill(data_root)
     assert _install(data_root, homes).changed is True
     assert _install(data_root, homes).changed is False
+
+
+def test_skill_copy_failure_keeps_existing_skill_and_prompt(data_root, homes, monkeypatch):
+    """A transient _copy_tree failure must not let the prune delete the existing
+    good ~/.agents/skills dir OR its skill-derived prompt: prior hashes are
+    carried forward for both."""
+    _add_engine_skill(data_root)
+    _install(data_root, homes)
+    skill_dir = _skill_dir(homes, "engined")
+    prompt = ins.codex_prompts_dir(homes["home"]) / "engined.md"
+    assert skill_dir.exists() and prompt.exists()
+
+    real_copy = ins._copy_tree
+
+    def _flaky(src, dst):
+        if Path(dst).name == "engined":
+            raise OSError("locked")
+        return real_copy(src, dst)
+
+    monkeypatch.setattr(ins, "_copy_tree", _flaky)
+    summ = _install(data_root, homes)
+    assert skill_dir.exists(), "prune deleted the good skill dir after a write failure"
+    assert prompt.exists()
+    assert "engined" in _manifest(homes)["skills"]
+    assert "engined.md" in _manifest(homes)["prompts"]
+    assert "skills/engined" not in summ.removed
+
+
+def test_command_copy_failure_keeps_derived_skill(data_root, homes, monkeypatch):
+    """The command loop's copy failure must carry the command-derived skill's
+    prior hash forward too — otherwise the prune rmtree's a good dir and install
+    reports the deletion as intentional."""
+    _install(data_root, homes)
+    skill_dir = _skill_dir(homes, "dcr")
+    prompt = ins.codex_prompts_dir(homes["home"]) / "dcr.md"
+    assert skill_dir.exists() and prompt.exists()
+
+    real_copy = shutil.copy
+
+    def _flaky(src, dst):
+        if Path(src).name == "dcr.md":
+            raise OSError("locked")
+        return real_copy(src, dst)
+
+    monkeypatch.setattr(ins.shutil, "copy", _flaky)
+    summ = _install(data_root, homes)
+    assert skill_dir.exists()
+    assert prompt.exists()
+    assert "dcr" in _manifest(homes)["skills"]
+    assert "dcr.md" in _manifest(homes)["prompts"]
+    assert "skills/dcr" not in summ.removed and "prompts/dcr.md" not in summ.removed
+
+
+def test_engine_prompt_handles_crlf_and_refuses_no_frontmatter(tmp_path):
+    """CRLF checkouts (autocrlf=true) must still emit prompts — a parse miss
+    here would cascade into pruning every installed prompt — and a SKILL.md
+    with no frontmatter fence yields None rather than a nameless prompt."""
+    crlf = tmp_path / "SKILL.md"
+    crlf.write_bytes(
+        b"---\r\nname: x\r\ndescription: d\r\n---\r\npreamble\r\n"
+        b"<!-- ENGINE -->\r\nengine body\r\n"
+    )
+    prompt = gen._skill_engine_prompt(crlf)
+    assert prompt is not None and "engine body" in prompt and "preamble" not in prompt
+
+    bare = tmp_path / "BARE.md"
+    bare.write_text("no fence here\n<!-- ENGINE -->\nengine\n", encoding="utf-8")
+    assert gen._skill_engine_prompt(bare) is None
 
 
 def test_engine_prompt_write_failure_keeps_existing_prompt(data_root, homes, monkeypatch):
