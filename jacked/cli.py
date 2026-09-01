@@ -2748,11 +2748,21 @@ def install(
     _record["pruned"] = _pruned
     _record["preserved"] = _preserved
     _record["stale_commands"] = _stale_cmds
-    for _item in _preserved:
-        _cat, _, _nm = _item.partition("/")
-        _rm = _record["changes"].get(_cat, {}).get("removed")
-        if _rm and _nm in _rm:
-            _rm.remove(_nm)
+    # Strip every intended removal that did not actually happen (preserved to
+    # backups, kept-in-place modified skill dir, or a locked file the prune
+    # could not touch) so neither the render nor the dashboard claims it's gone.
+    _kept_in_place: list[str] = []
+    for _cat, _ch in _record["changes"].items():
+        _rm = _ch.get("removed")
+        if not _rm:
+            continue
+        for _nm in list(_rm):
+            _id = f"{_cat}/{_nm}"
+            if _id not in _pruned:
+                _rm.remove(_nm)
+                if _id not in _preserved:
+                    _kept_in_place.append(_id)
+    _record["kept_in_place"] = _kept_in_place
     _isum.write_last_install(_record, home / ".claude" / "jacked-last-install.json")
 
     # --- Codex pass (auto-detected) ---
@@ -2829,12 +2839,17 @@ def install(
                 f"[yellow][!][/yellow] Preserved your modified {_item} under "
                 "~/.claude/jacked-backups/ (no longer matches what jacked installed)"
             )
+        for _item in _kept_in_place:
+            console.print(
+                f"[yellow][!][/yellow] Left {_item} in place (modified or "
+                "locked; see the log for the exact reason)"
+            )
         for _item in _stale_cmds:
             console.print(
                 f"[yellow][!][/yellow] ~/.claude/{_item} collides with a shipped "
                 "skill of the same name (the skill wins in Claude Code). jacked "
-                "can't confirm it's jacked's old copy, so it was left alone — "
-                "delete it yourself if it's a pre-0.96 leftover."
+                "can't confirm it's jacked's old copy, so it was left alone. "
+                "Delete it yourself if it's a pre-0.96 leftover."
             )
         if _codex_summary is not None:
             _mcp = _codex_summary.mcp
@@ -4027,7 +4042,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                 _agents_kept.append(agent_file.name)
         if agent_count > 0:
             console.print(f"[green][OK][/green] Removed {agent_count} agents")
-        else:
+        elif not _agents_kept:
             console.print("[yellow][-][/yellow] No jacked agents found")
         for _n in _agents_kept:
             console.print(
@@ -4054,7 +4069,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                 _cmds_kept.append(cmd_file.name)
         if cmd_count > 0:
             console.print(f"[green][OK][/green] Removed {cmd_count} commands")
-        else:
+        elif not _cmds_kept:
             console.print("[yellow][-][/yellow] No jacked commands found")
         for _n in _cmds_kept:
             console.print(
@@ -4081,7 +4096,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                 _lenses_kept.append(lens_file.name)
         if lens_count > 0:
             console.print(f"[green][OK][/green] Removed {lens_count} lenses")
-        else:
+        elif not _lenses_kept:
             console.print("[yellow][-][/yellow] No jacked lenses found")
         for _n in _lenses_kept:
             console.print(

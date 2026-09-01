@@ -427,6 +427,28 @@ def test_uninstall_without_manifest_deletes_pristine_keeps_modified(tmp_path, mo
     assert "no install manifest found for qa" in res.output
 
 
+def test_uninstall_preserves_modified_flat_lens(tmp_path, monkeypatch):
+    """The flat categories get the same uninstall gate as skill dirs: a lens the
+    user edited is moved to jacked-backups (never unlinked), the console names
+    it, and the 'No jacked lenses found' line must not fire alongside it."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    runner = CliRunner()
+    assert _install(runner).exit_code == 0
+    lenses = tmp_path / ".claude" / "lenses"
+    target = next(lenses.glob("*.md"))
+    # Replace, don't write through: an editable install symlinks to the repo.
+    target.unlink()
+    target.write_text("# my tuned lens\n", encoding="utf-8")
+
+    res = runner.invoke(_main(), ["uninstall", "--yes"])
+    assert res.exit_code == 0, res.output
+    assert f"Preserved your modified lenses/{target.name}" in res.output
+    assert "No jacked lenses found" not in res.output
+    assert not target.exists()
+    backups = list((tmp_path / ".claude" / "jacked-backups" / "lenses").glob("*.md"))
+    assert any(b.read_text(encoding="utf-8") == "# my tuned lens\n" for b in backups)
+
+
 def test_uninstall_warns_once_on_a_corrupt_manifest(tmp_path, monkeypatch):
     monkeypatch.setenv("JACKED_HOME", str(tmp_path))
     runner = CliRunner()

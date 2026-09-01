@@ -70,6 +70,11 @@ def _split_command_frontmatter(text: str) -> tuple[dict, str]:
     description): continuation lines fold to spaces per YAML semantics and the
     surrounding quote pair is stripped, so consumers see the full clean text
     instead of a truncated fragment with a stray quote."""
+    if "\r\n" in text:
+        # An autocrlf=true checkout would miss the "---\n" fence and every
+        # consumer (prompts, command-derived skills, agent TOML) would emit
+        # garbage; normalize here so all three see the same LF text.
+        text = text.replace("\r\n", "\n")
     if not text.startswith("---\n"):
         return {}, text
     end = text.find("\n---\n", 4)

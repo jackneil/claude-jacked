@@ -484,7 +484,7 @@ def migrated_skill_names(data_root) -> set[str]:
     for skill_md in Path(data_root).glob("skills/*/SKILL.md"):
         try:
             text = skill_md.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
         if any(line.strip() == "<!-- ENGINE -->" for line in text.splitlines()):
             out.add(skill_md.parent.name)
