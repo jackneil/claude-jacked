@@ -430,6 +430,10 @@ def test_windows_starts_a_focus_thread_for_the_spawned_browser(profile_root, mon
     the launcher has to go raise it — on a thread, because the caller is
     answering an HTTP request."""
     monkeypatch.setattr(bl.sys, "platform", "win32")
+    # subprocess.DETACHED_PROCESS only exists on Windows; the platform is
+    # faked here so the Popen kwargs must be too, or Linux CI takes the
+    # launch-failed fallback path instead of the one under test.
+    monkeypatch.setattr(bl, "_detach_kwargs", lambda: {})
     with patch.object(bl, "find_browser", return_value=CHROME),             patch.object(bl.subprocess, "Popen") as popen,             patch.object(bl, "_bring_to_front_windows") as focus,             patch.object(bl.threading, "Thread") as thread,             patch.object(bl.webbrowser, "open"):
         popen.return_value.pid = 4321
         result = open_auth_url(URL, {"email": "j@x.com"}, FakeDb("profile"))
@@ -458,6 +462,10 @@ def test_non_windows_platforms_start_no_focus_thread(profile_root, monkeypatch):
 def test_a_failed_spawn_starts_no_focus_thread(profile_root, monkeypatch):
     """There is no window to raise when nothing launched."""
     monkeypatch.setattr(bl.sys, "platform", "win32")
+    # subprocess.DETACHED_PROCESS only exists on Windows; the platform is
+    # faked here so the Popen kwargs must be too, or Linux CI takes the
+    # launch-failed fallback path instead of the one under test.
+    monkeypatch.setattr(bl, "_detach_kwargs", lambda: {})
     with patch.object(bl, "find_browser", return_value=CHROME),             patch.object(bl.subprocess, "Popen", side_effect=OSError("boom")),             patch.object(bl.threading, "Thread") as thread,             patch.object(bl.webbrowser, "open") as wb:
         result = open_auth_url(URL, {"email": "j@x.com"}, FakeDb("profile"))
 
