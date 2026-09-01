@@ -2,13 +2,13 @@
 description: Use when setting up jacked in a new repo or after significant codebase changes. Analyzes the repo and generates faster, customized versions of jacked commands.
 ---
 
-You are a repo analyzer. Your job is to examine the current repo's structure, tech stack, and conventions, then generate fully standalone command files that embed the engine logic with repo-specific config pre-filled.
+You are a repo analyzer. Your job is to examine the current repo's structure, tech stack, and conventions, then generate fully standalone skill files that embed the engine logic with repo-specific config pre-filled.
 
-> **How it works:** Each generated file is fully standalone — it embeds the complete engine logic with repo-specific config pre-filled. No jacked installation required to USE the generated commands. Commit these files to your repo so collaborators can use them without installing jacked. To get engine updates, upgrade jacked and re-run `/jacked-setup`. The engine's `## Config Override` section detects the `## Repo Config` header and skips discovery automatically.
+> **How it works:** Each target produces ONE file — `.claude/skills/<target>/SKILL.md` — and it is fully standalone: it embeds the complete engine logic with repo-specific config pre-filled. No jacked installation required to USE the generated skills. Commit these files to your repo so collaborators can use them without installing jacked. To get engine updates, upgrade jacked and re-run `/jacked-setup`. The engine's `## Config Override` section detects the `## Repo Config` header and skips discovery automatically.
 >
 > **Living document, not a one-time setup:** an outdated config is worse than a lean one. Each generated file stamps a repo fingerprint (generation commit + manifest set) and carries a self-contained staleness check so it can flag when the codebase has drifted away from the cached config. Re-run `/jacked-setup` as the project evolves — see the "When to re-run" triggers in Step 6.
 >
-> **Note:** Generated command files are exempt from the 300/500-line code guardrail — they are markdown command documents, not code files.
+> **Note:** Generated skill files are exempt from the 300/500-line code guardrail — they are markdown skill documents, not code files.
 
 ## Step 1: Parse Argument
 
@@ -316,25 +316,34 @@ From the signals, record in the generated `## Repo Config`:
 ## Step 4: Check for Existing Local Files
 
 ```bash
-ls .claude/commands/whats-next.md .claude/commands/qa.md .claude/commands/ux.md .claude/commands/dcr.md .claude/commands/docs-sync.md 2>/dev/null
-ls .claude/skills/whats-next/SKILL.md .claude/skills/qa/SKILL.md .claude/skills/ux/SKILL.md .claude/skills/dcr/SKILL.md .claude/skills/docs-sync/SKILL.md 2>/dev/null
+ls .claude/skills/whats-next/SKILL.md .claude/skills/qa/SKILL.md .claude/skills/ux/SKILL.md .claude/skills/dcr/SKILL.md .claude/skills/docs-sync/SKILL.md .claude/skills/release/SKILL.md 2>/dev/null
+ls .claude/commands/whats-next.md .claude/commands/qa.md .claude/commands/ux.md .claude/commands/dcr.md .claude/commands/docs-sync.md .claude/commands/release.md 2>/dev/null
 ```
 
-Only check the **target(s) being generated** (not all files found by the `ls`). For any command file that exists, determine its format using a positive signal:
+Only check the **target(s) being generated** (not all files found by the `ls`). For any skill file that exists, determine its format using a positive signal:
 ```bash
-# New standalone files always have ## Repo Config; old overlays do not
-grep -q '## Repo Config' .claude/commands/<target>.md 2>/dev/null && echo "STANDALONE" || echo "OLD_FORMAT"
+# Current-format skills always have ## Repo Config; old stubs and overlays do not
+grep -q '## Repo Config' .claude/skills/<target>/SKILL.md 2>/dev/null && echo "STANDALONE" || echo "OLD_FORMAT"
 ```
+
+**Legacy dual-format detection.** A `.claude/commands/<target>.md` file is output from an older
+`/jacked-setup` that wrote two files per target. If one exists, this target must be MIGRATED, not
+just regenerated:
+1. Read the legacy `.claude/commands/<target>.md` and preserve its `## Repo Config` block (it is the
+   config of record — it may carry hand-edits the thin skill stub does not).
+2. Write the new single file at `.claude/skills/<target>/SKILL.md` (Step 5 structure).
+3. DELETE the legacy `.claude/commands/<target>.md`.
+4. Say so in the Step 6 announce.
 
 **qa and ux are always a pair — handle their consent as one decision:**
-- Run the format check for whichever of `qa.md` and `ux.md` exist
-- If EITHER is `OLD_FORMAT` (old overlay, missing, or hand-crafted without `## Repo Config`): show ONE combined warning — "⚠️ Your existing `/qa` and/or `/ux` command files depend on jacked being installed on every developer's machine. Regenerating makes them fully standalone — repo cloners can use them without jacked." Ask: "Regenerate both?"
-- If BOTH are `STANDALONE`: ask conversationally: "Both `/qa` and `/ux` already exist. Replace with fresh versions?"
+- Run the format check for whichever of `qa` and `ux` exist (skill file, or legacy command file)
+- If EITHER is `OLD_FORMAT` (old stub, old overlay, missing, or hand-crafted without `## Repo Config`), or EITHER has a legacy command file: show ONE combined warning — "⚠️ Your existing `/qa` and/or `/ux` files are the old format that depends on jacked being installed on every developer's machine. Regenerating makes them fully standalone — repo cloners can use them without jacked." Ask: "Regenerate both?"
+- If BOTH are current-format `STANDALONE` skills: ask conversationally: "Both `/qa` and `/ux` already exist. Replace with fresh versions?"
 - If yes → generate both; if no → skip both. Never generate one without the other.
 
-**For non-paired targets (`whats-next`, `dcr`, `docs-sync`):** if the command **or** skill file already exists:
-- **If command file exists and is `OLD_FORMAT`**: Warn — "⚠️ Your existing `/<target>` depends on jacked being installed on every developer's machine. Regenerating makes it fully standalone." Ask: "Regenerate now?"
-- **If `STANDALONE` (or only skill file exists, no command file to check)**: Ask conversationally: "A `/<target>` already exists. Replace with a fresh version?"
+**For non-paired targets (`whats-next`, `dcr`, `docs-sync`, `release`):** if the skill **or** a legacy command file already exists:
+- **If it is `OLD_FORMAT`, or a legacy `.claude/commands/<target>.md` exists**: Warn — "⚠️ Your existing `/<target>` is the old format that depends on jacked being installed on every developer's machine. Regenerating makes it a single standalone skill." Ask: "Regenerate now?"
+- **If `STANDALONE`**: Ask conversationally: "A `/<target>` already exists. Replace with a fresh version?"
 - If yes → proceed; if no → skip that target, move to next (if doing `all`)
 
 **Regenerating a `STANDALONE` file is a MERGE, not a clobber.** When the existing target already
@@ -346,7 +355,7 @@ has a `## Repo Config` the user may have hand-edited, do NOT blindly overwrite i
    hand-fixed paths/ports — carrying them into the regenerated file rather than discarding them.
    When in doubt, keep the user's value and flag the inferred alternative as a comment.
 
-## Step 5: Generate Standalone Command and Skill Files
+## Step 5: Generate the Standalone Skill File
 
 **Confirm high-risk inferred values before writing.** After Step 3 inference, echo the key
 inferred values back to the user — detected dev-server port, build/test commands (if surfaced),
@@ -356,9 +365,8 @@ dirs still exist using the `ls` results already gathered in Step 2). Don't bake 
 into a committed file.
 
 
-Create the directories if needed:
+Create the directory if needed:
 ```bash
-mkdir -p .claude/commands
 mkdir -p .claude/skills/<target>
 ```
 
@@ -371,20 +379,21 @@ echo "unknown"
 Use this as `<VERSION>` in the header below.
 
 **Read the engine file:**
-Use the Read tool to read `~/.claude/commands/<target>.md`. If the file is not found, stop and tell the user: "Engine file `~/.claude/commands/<target>.md` not found — run `jacked install` first." Do NOT proceed without reading the actual file.
+Use the Read tool to read `~/.claude/skills/<target>/SKILL.md`. If the file is not found, stop and tell the user: "Engine file `~/.claude/skills/<target>/SKILL.md` not found — run `jacked install` first." Do NOT proceed without reading the actual file.
 
 **Prepare the engine body:**
-From the engine file content:
-1. Strip the front matter block — remove everything from line 1 through the second `---` line (inclusive), plus any immediately following blank line.
-2. Anywhere in the file (typically in the preamble, before `## Config Override`), omit any `> **Note:**` block that references the old delegation model (e.g. a block starting "If `.claude/commands/<target>.md` exists in the current repo..."). This describes a flow that no longer applies in standalone files. If no such block exists, skip this step.
+The engine body is **everything AFTER the line that is exactly `<!-- ENGINE -->`** in that file. Everything before it — the YAML front matter, the global repo-dispatch preamble ("First, check if a repo-scoped version exists…"), and any positioning text — is dropped. The generated file MUST NOT contain that dispatch preamble: it IS the repo-scoped version, so a dispatch check would be circular.
 
-**Write the generated file** in this structure:
+If the source file has no `<!-- ENGINE -->` line, stop and tell the user: "Engine file `~/.claude/skills/<target>/SKILL.md` has no `<!-- ENGINE -->` marker — upgrade jacked and re-run `jacked install`."
+
+**Write the generated file** to `.claude/skills/<target>/SKILL.md` in this structure:
 
 ```markdown
 ---
-description: "<standalone description — see per-target templates below>"
+name: <target>
+description: "<the target's one-line description, suffixed ' (repo)' — see per-target templates below>"
 ---
-# Generated by /jacked-setup — <today's date> | Template v1 | Engine: jacked v<VERSION>
+# Generated by /jacked-setup — <today's date> | Template v2 | Engine: jacked v<VERSION>
 # Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup <target>
 
 ## Repo Config
@@ -397,7 +406,7 @@ description: "<standalone description — see per-target templates below>"
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-<engine body, front matter and delegation Note stripped — embedded verbatim from ~/.claude/commands/<target>.md>
+<engine body — everything after the `<!-- ENGINE -->` line of ~/.claude/skills/<target>/SKILL.md, embedded verbatim>
 ```
 
 **Critical:** Use the Read tool output verbatim for the engine body. Do NOT reproduce it from memory. The engine body is injected as-is after the `<!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->` marker.
@@ -414,15 +423,14 @@ Before using the config above, run a lightweight drift check (advisory only — 
    If the generated commit is unreachable (history rewritten) or the manifest set changed, surface the nudge regardless of commit count. Never stop or skip the run on a staleness mismatch.
 ```
 
-**Also write a local skill file** after the command file. Use `mkdir -p .claude/skills/<target>` first. Local skills use RELATIVE paths — do NOT use `~/.claude/commands/`. Do NOT add Glob fallback checks to local skills (those are only for global skills). See per-target skill bodies below.
-
 ### whats-next standalone template:
 
 ```markdown
 ---
-description: "Roadmap advisor — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+name: whats-next
+description: "Roadmap advisor — weighs a coverage-matrix read plus plans, issues, commits, and lifecycle to decide the single highest-leverage initiative and forge a ready-to-run /goal brief. (repo)"
 ---
-# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Generated by /jacked-setup — <date> | Template v2 | Engine: jacked v<VERSION>
 # Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup whats-next
 
 ## Repo Config
@@ -468,25 +476,17 @@ Lifecycle lean: <where to weight the Step 6 decision based on lifecycle — e.g.
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-[Engine body from `~/.claude/commands/whats-next.md` embedded here — front matter and delegation Note stripped]
-```
-
-**whats-next local skill** (write to `.claude/skills/whats-next/SKILL.md`):
-```markdown
----
-name: whats-next
-description: "Roadmap advisor — weighs a coverage-matrix read plus plans, issues, commits, and lifecycle to decide the single highest-leverage initiative and forge a ready-to-run /goal brief. (repo)"
----
-Read `.claude/commands/whats-next.md` and follow it.
+[Engine body from `~/.claude/skills/whats-next/SKILL.md` embedded here — everything after its `<!-- ENGINE -->` line]
 ```
 
 ### qa standalone template:
 
 ```markdown
 ---
-description: "Browser QA — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+name: qa
+description: "Browser-based QA testing — targeted single-component check (/qa) or parallel multi-aspect review (/ux). (repo)"
 ---
-# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Generated by /jacked-setup — <date> | Template v2 | Engine: jacked v<VERSION>
 # Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup qa
 
 ## Repo Config
@@ -523,33 +523,17 @@ Start ALL of these before browser QA — a frontend pointed at a dead backend fa
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-[Engine body from `~/.claude/commands/qa.md` embedded here — front matter and delegation Note stripped]
-```
-
-**qa local skill** (write to `.claude/skills/qa/SKILL.md`):
-```markdown
----
-name: qa
-description: "Browser-based QA testing — targeted single-component check (/qa) or parallel multi-aspect review (/ux). (repo)"
----
-Two commands are available — read the appropriate one and follow it:
-- `.claude/commands/qa.md` — Quick, focused QA pass (single agent). Best for targeted fixes or single-feature verification.
-- `.claude/commands/ux.md` — Thorough parallel UX review (multiple agents). Best when changes touch layout, navigation, or multiple components.
-
-Both are read-only detection tools — they return a detailed issue list but do NOT fix code.
-
-Decision guide:
-- Changed button styling or a single component? → `/qa`
-- Changed layout, interactions, AND multiple pages? → `/ux`
+[Engine body from `~/.claude/skills/qa/SKILL.md` embedded here — everything after its `<!-- ENGINE -->` line]
 ```
 
 ### ux standalone template:
 
 ```markdown
 ---
-description: "Parallel UX checks — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+name: ux
+description: "Parallel browser-based UX checks — spawns focused agents to test different UX aspects simultaneously. (repo)"
 ---
-# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Generated by /jacked-setup — <date> | Template v2 | Engine: jacked v<VERSION>
 # Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup ux
 
 ## Repo Config
@@ -583,25 +567,17 @@ Start ALL of these before browser QA — a frontend pointed at a dead backend fa
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-[Engine body from `~/.claude/commands/ux.md` embedded here — front matter and delegation Note stripped]
-```
-
-**ux local skill** (write to `.claude/skills/ux/SKILL.md`):
-```markdown
----
-name: ux
-description: "Parallel browser-based UX checks — spawns focused agents to test different UX aspects simultaneously. (repo)"
----
-Read `.claude/commands/ux.md` and follow it.
+[Engine body from `~/.claude/skills/ux/SKILL.md` embedded here — everything after its `<!-- ENGINE -->` line]
 ```
 
 ### dcr standalone template:
 
 ```markdown
 ---
-description: "Parallel recursive review — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+name: dcr
+description: "Parallel recursive review — selects relevant lenses, spawns focused reviewers per wave until all selected lenses pass clean. (repo)"
 ---
-# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Generated by /jacked-setup — <date> | Template v2 | Engine: jacked v<VERSION>
 # Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup dcr
 
 ## Repo Config
@@ -644,25 +620,17 @@ Touching any of these forces the LARGE risk tier (full reviewer fan-out):
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-[Engine body from `~/.claude/commands/dcr.md` embedded here — front matter and delegation Note stripped]
-```
-
-**dcr local skill** (write to `.claude/skills/dcr/SKILL.md`):
-```markdown
----
-name: dcr
-description: "Parallel recursive review — selects relevant lenses, spawns focused reviewers per wave until all selected lenses pass clean. (repo)"
----
-Read `.claude/commands/dcr.md` and follow it.
+[Engine body from `~/.claude/skills/dcr/SKILL.md` embedded here — everything after its `<!-- ENGINE -->` line]
 ```
 
 ### docs-sync standalone template:
 
 ```markdown
 ---
-description: "Docs sync — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+name: docs-sync
+description: "Sync docs with code changes — diffs branch, maps to affected docs, spawns parallel update agents. (repo)"
 ---
-# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Generated by /jacked-setup — <date> | Template v2 | Engine: jacked v<VERSION>
 # Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup docs-sync
 
 ## Repo Config
@@ -698,25 +666,17 @@ Examples:
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-[Engine body from `~/.claude/commands/docs-sync.md` embedded here — front matter and delegation Note stripped]
-```
-
-**docs-sync local skill** (write to `.claude/skills/docs-sync/SKILL.md`):
-```markdown
----
-name: docs-sync
-description: "Sync docs with code changes — diffs branch, maps to affected docs, spawns parallel update agents. (repo)"
----
-Read `.claude/commands/docs-sync.md` and follow it.
+[Engine body from `~/.claude/skills/docs-sync/SKILL.md` embedded here — everything after its `<!-- ENGINE -->` line]
 ```
 
 ### release standalone template:
 
 ```markdown
 ---
-description: "Release manager — standalone (generated <date>; upgrade jacked + re-run /jacked-setup to update)"
+name: release
+description: "Cut a release the way this repo actually ships — detects PyPI/npm/changesets/CalVer/Cargo/Go-tag/PR-to-main, gates on the repo's own build+test, then publishes/deploys and verifies it landed. (repo)"
 ---
-# Generated by /jacked-setup — <date> | Template v1 | Engine: jacked v<VERSION>
+# Generated by /jacked-setup — <date> | Template v2 | Engine: jacked v<VERSION>
 # Standalone — no dependencies. Commit this file. To update: uv tool install --upgrade claude-jacked && jacked install && /jacked-setup release
 
 ## Repo Config
@@ -735,16 +695,7 @@ description: "Release manager — standalone (generated <date>; upgrade jacked +
 
 <!-- ENGINE — DO NOT EDIT BELOW THIS LINE -->
 ---
-[Engine body from `~/.claude/commands/release.md` embedded here — front matter and delegation Note stripped]
-```
-
-**release local skill** (write to `.claude/skills/release/SKILL.md`):
-```markdown
----
-name: release
-description: "Cut a release the way this repo actually ships — detects PyPI/npm/changesets/CalVer/Cargo/Go-tag/PR-to-main, gates on the repo's own build+test, then publishes/deploys and verifies it landed. (repo)"
----
-Read `.claude/commands/release.md` and follow it.
+[Engine body from `~/.claude/skills/release/SKILL.md` embedded here — everything after its `<!-- ENGINE -->` line]
 ```
 
 ## Step 6: Announce Results
@@ -752,10 +703,14 @@ Read `.claude/commands/release.md` and follow it.
 For each generated target, announce:
 
 ```
-Saved standalone `/<target>` at `.claude/commands/<target>.md` (Engine: jacked v<VERSION>).
-Also saved local skill at `.claude/skills/<target>/SKILL.md`.
-**Commit both `.claude/commands/` and `.claude/skills/`** — repo cloners get slash commands AND auto-triggering without jacked installed.
+Saved standalone `/<target>` at `.claude/skills/<target>/SKILL.md` (Engine: jacked v<VERSION>).
+**Commit `.claude/skills/`** — repo cloners get the skill without jacked installed.
 To pick up future engine improvements: `uv tool install --upgrade claude-jacked && jacked install` then re-run `/jacked-setup <target>`.
+```
+
+If a legacy `.claude/commands/<target>.md` was migrated and deleted, add a line:
+```
+Migrated from the old dual-file format — deleted `.claude/commands/<target>.md` (its `## Repo Config` was carried over). Commit the deletion.
 ```
 
 If generating `all`, list all six results together (`whats-next`, `qa`, `ux`, `dcr`, `docs-sync`, `release`).
@@ -779,13 +734,13 @@ If the repo is greenfield (<10 commits), add: "This is a young repo — re-run `
 
 ## HARD RULES
 
-- Generated files MUST be fully standalone — embed the full engine body (front matter stripped, delegation Note stripped) from `~/.claude/commands/<target>.md` after the `## Repo Config` section. Do NOT include a delegation line — the file must work without jacked installed.
+- Generated files MUST be fully standalone — embed the full engine body from `~/.claude/skills/<target>/SKILL.md` (the engine is everything AFTER its `<!-- ENGINE -->` line) after the `## Repo Config` section. Do NOT include a delegation line — the file must work without jacked installed.
 - Use the Read tool to read the engine at generation time; do NOT reproduce it from memory. If the engine file is not found, stop with an error: "Engine file not found — run `jacked install` first."
 - The `## Repo Config` section name is a stable contract — the embedded engine's `## Config Override` section depends on detecting this exact header. Do not rename this section without providing a migration path.
 - Never log credential values — only variable names from env files.
 - All `find` and `grep` commands must use `-maxdepth` or `--exclude-dir` to prevent hanging on large repos.
 - If the repo passes the floor check but has minimal context, write a config with defaults. If it fails the floor check (zero manifests, zero source files, zero commits), do NOT generate — tell the user to add code first.
-- Do NOT silently overwrite existing local files — always ask first (check both command and skill files).
-- Each target generates TWO files: `.claude/commands/<target>.md` (standalone command) AND `.claude/skills/<target>/SKILL.md` (local skill). Both must be committed for cloners to get full functionality.
-- Local skill files MUST use relative paths (`.claude/commands/<target>.md`). Do NOT use `~/.claude/commands/`. Do NOT add Glob fallback checks to local skills — that pattern belongs only in global skills.
-- `qa` and `ux` are always paired — generating either one generates both (they share one analysis pass and the qa skill routes to both commands).
+- Do NOT silently overwrite existing local files — always ask first (check the skill file AND any legacy `.claude/commands/<target>.md`).
+- Each target generates ONE file: `.claude/skills/<target>/SKILL.md`. When a legacy `.claude/commands/<target>.md` exists, carry its `## Repo Config` over and delete it.
+- Generated skills are standalone: they carry the engine inline, so they must NOT contain the global repo-dispatch preamble, any Glob fallback checks, or any `~/.claude/` reference.
+- `qa` and `ux` are always paired — `/jacked-setup qa` generates BOTH `.claude/skills/qa/SKILL.md` and `.claude/skills/ux/SKILL.md` (they share one analysis pass), and so does `/jacked-setup ux`.

@@ -28,7 +28,7 @@ The behaviors above and the jacked skills in ~/.agents/skills were authored for 
 - "Task tool" / "Agent tool" / `subagent_type: "..."` means your subagent mechanism: spawn parallel subagents natively. Custom agent definitions live in ~/.codex/agents/*.toml. Where a named Claude agent (e.g. double-check-reviewer) is unavailable, inline its described role into the subagent prompt.
 - Claude model dispatch (`model: "opus"`, `"fable"`, `"sonnet"`, `"haiku"`) does not apply: ignore Anthropic model names and pick your own model/reasoning effort per task - cheap and fast for mechanical sweeps, strongest for judgment and review.
 - Browser tooling: `mcp__plugin_playwright_playwright__*` tools and Claude-in-Chrome do not exist here. Use the MCP servers from your own config (~/.codex/config.toml); `mcp__chrome-devtools__*` names resolve once a `chrome-devtools` MCP server is registered. Where instructions say `claude mcp add ...`, use `codex mcp add ...`.
-- File references to ~/.claude/commands/<name>.md: the same content ships at ~/.agents/skills/<name>/SKILL.md.
+- File references to ~/.claude/skills/<name>/SKILL.md (or the older ~/.claude/commands/<name>.md): the same content ships at ~/.agents/skills/<name>/SKILL.md.
 - "Plan mode" exists here too (the `plan` permission mode) - use it where the behaviors call for it.
 - Where a rule or skill says CLAUDE.md, your instruction file is AGENTS.md (~/.codex/AGENTS.md globally, the repo's AGENTS.md per project).
 """
@@ -138,6 +138,31 @@ def _command_skill_md(cmd: Path) -> str:
         # "[--flag]" would parse as a YAML flow sequence, not a string.
         lines.append(f"argument-hint: {json.dumps(hint, ensure_ascii=False)}")
     return "---\n" + "\n".join(lines) + "\n---\n" + body
+
+
+# A skill whose SKILL.md carries this as a whole line absorbed the body of a
+# former data/commands/<name>.md: everything after it is the engine that used to
+# be the command file, everything before it is Claude-side repo-dispatch prose.
+_ENGINE_MARKER = "<!-- ENGINE -->"
+
+
+def _skill_engine_prompt(skill_md: Path) -> Optional[str]:
+    """Rebuild the ~/.codex/prompts/<name>.md content for a migrated skill.
+
+    Returns the SKILL.md's own frontmatter block verbatim (so Codex still shows a
+    description for `/prompts:<name>`) followed by everything after the
+    `<!-- ENGINE -->` line - i.e. the old command file, minus the repo-dispatch
+    preamble and positioning prose that only Claude Code acts on. Returns None
+    when the skill carries no marker: an ordinary skill ships as a skill only.
+    The frontmatter block is recovered as the text `_split_command_frontmatter`
+    consumed, so there is one parser for both halves."""
+    text = skill_md.read_text(encoding="utf-8")
+    _, body = _split_command_frontmatter(text)
+    lines = body.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.strip() == _ENGINE_MARKER:
+            return text[:len(text) - len(body)] + "".join(lines[i + 1:])
+    return None
 
 
 # ---------------------------------------------------------------------------

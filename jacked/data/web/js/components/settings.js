@@ -558,7 +558,7 @@ async function renderCommandsTab(container) {
         `).join('');
 
         container.innerHTML = `
-            <p class="text-xs text-slate-500 mb-4 text-pretty">Slash commands installed to <code class="text-slate-300">~/.claude/commands/</code>. Use these with <code class="text-slate-300">/command-name</code> in Claude Code.</p>
+            <p class="text-xs text-slate-500 mb-4 text-pretty">Slash commands installed to <code class="text-slate-300">~/.claude/commands/</code>. Use these with <code class="text-slate-300">/command-name</code> in Claude Code. Skills are slash-invocable too and live under Features.</p>
             ${_renderFeatureFilter('Filter commands...')}
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 ${cardsHtml}
@@ -579,7 +579,7 @@ async function renderCommandsTab(container) {
 
 // --- Shared: filter over feature rows ---
 //
-// Agents (10), Commands (30) and the knowledge/skills lists (30+) are long
+// Agents (10), Commands (20) and the knowledge/skills lists (30) are long
 // enough that finding one item meant scrolling the whole tab. Every row in
 // every tab already carries `data-feature-row`, so one filter works across all
 // of them without touching the row markup.

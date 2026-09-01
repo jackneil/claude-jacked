@@ -377,6 +377,145 @@ def test_uninstall_removes_owned_dir_despite_ds_store(data_root, homes):
     assert "skills/dcr" in out["removed"]
 
 
+# --------------------------------------------------------------------------
+# Migrated skills ALSO ship as Codex prompts. The 10 dual-shipped commands were
+# folded into their SKILL.md behind an `<!-- ENGINE -->` line; Codex users would
+# otherwise silently lose $dcr, $qa, ... so a marker-carrying skill re-emits
+# ~/.codex/prompts/<name>.md as frontmatter + engine (no repo-dispatch preamble).
+# --------------------------------------------------------------------------
+
+_ENGINE_SKILL = (
+    "---\nname: engined\ndescription: an engined skill\n---\n\n"
+    "First, check for a repo-scoped version:\n"
+    "1. If `.claude/skills/engined/SKILL.md` exists -> follow it instead.\n\n"
+    "<!-- ENGINE -->\n\n"
+    "You are the engine. Do the engine things.\n"
+)
+
+
+def _add_engine_skill(data_root, name="engined", text=_ENGINE_SKILL):
+    d = data_root / "skills" / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(text)
+
+
+def test_engine_skill_emits_prompt_of_frontmatter_plus_engine(data_root, homes):
+    """A skill carrying the marker yields ~/.codex/prompts/<name>.md holding its
+    frontmatter block plus everything AFTER the marker line - the repo-dispatch
+    preamble is dropped - and is recorded in manifest["prompts"]."""
+    _add_engine_skill(data_root)
+    summ = _install(data_root, homes)
+    prompt = ins.codex_prompts_dir(homes["home"]) / "engined.md"
+    assert prompt.exists()
+    text = prompt.read_text()
+    assert text == (
+        "---\nname: engined\ndescription: an engined skill\n---\n"
+        "\nYou are the engine. Do the engine things.\n"
+    )
+    assert "repo-scoped" not in text                 # preamble dropped
+    assert "<!-- ENGINE -->" not in text             # marker itself dropped
+    assert _frontmatter(text)["description"] == "an engined skill"
+    assert "engined.md" in summ.prompts
+    assert "engined.md" in _manifest(homes)["prompts"]
+    # the skill itself still ships in full (preamble included) to ~/.agents/skills
+    assert "<!-- ENGINE -->" in (_skill_dir(homes, "engined") / "SKILL.md").read_text()
+
+
+def test_skill_without_engine_marker_emits_no_prompt(data_root, homes):
+    """The ordinary marker-less demo-skill produces no prompt file or entry."""
+    summ = _install(data_root, homes)
+    assert not (ins.codex_prompts_dir(homes["home"]) / "demo-skill.md").exists()
+    assert "demo-skill.md" not in summ.prompts
+    assert "demo-skill.md" not in _manifest(homes)["prompts"]
+
+
+def test_same_name_command_wins_over_engine_skill(data_root, homes):
+    """A command and a marker-carrying skill of the same name both target
+    prompts/<name>.md: the COMMAND content wins (step 2 runs last)."""
+    _add_engine_skill(data_root, "dcr", _ENGINE_SKILL.replace("engined", "dcr"))
+    _install(data_root, homes)
+    text = (ins.codex_prompts_dir(homes["home"]) / "dcr.md").read_text()
+    assert text == (data_root / "commands" / "dcr.md").read_text()
+    assert "You are the engine" not in text
+    assert len([n for n in _manifest(homes)["prompts"] if n == "dcr.md"]) == 1
+
+
+def test_engine_skill_prompt_pruned_on_source_removal(data_root, homes):
+    """Removing the skill from the source prunes its prompt on reinstall and
+    reports it in summary.removed."""
+    _add_engine_skill(data_root)
+    _install(data_root, homes)
+    prompt = ins.codex_prompts_dir(homes["home"]) / "engined.md"
+    assert prompt.exists()
+    shutil.rmtree(data_root / "skills" / "engined")
+    summ = _install(data_root, homes)
+    assert "prompts/engined.md" in summ.removed
+    assert not prompt.exists()
+    assert "engined.md" not in _manifest(homes)["prompts"]
+
+
+def test_uninstall_removes_engine_skill_prompt(data_root, homes):
+    """Uninstall (manifest-driven) removes the skill-derived prompt too."""
+    _add_engine_skill(data_root)
+    _install(data_root, homes)
+    prompt = ins.codex_prompts_dir(homes["home"]) / "engined.md"
+    assert prompt.exists()
+    out = ins.uninstall_codex(home=homes["home"], agents_home=homes["agents_home"])
+    assert not prompt.exists()
+    assert "prompts/engined.md" in out["removed"]
+
+
+def test_engine_skill_prompts_idempotent(data_root, homes):
+    """A skill-derived prompt folds into the changed computation like any other:
+    a second unchanged install still reports changed=False."""
+    _add_engine_skill(data_root)
+    assert _install(data_root, homes).changed is True
+    assert _install(data_root, homes).changed is False
+
+
+def test_real_migrated_skills_generate_parseable_prompts():
+    """Integration guard against the REAL data/skills: each of the 10 skills that
+    absorbed a command body yields a prompt whose frontmatter yaml.safe_load parses
+    with name == the skill name and a non-empty description, and whose body carries
+    neither the marker nor the repo-dispatch preamble."""
+    import jacked
+
+    skills_dir = Path(jacked.__file__).parent / "data" / "skills"
+    migrated = [
+        "dcr", "qa", "ux", "whats-next", "docs-sync",
+        "lockdown", "demo-video", "qa-video", "swarm-research", "release",
+    ]
+    for name in migrated:
+        skill_md = skills_dir / name / "SKILL.md"
+        assert skill_md.exists(), name
+        prompt = ins._skill_engine_prompt(skill_md)
+        assert prompt is not None, f"{name} lost its <!-- ENGINE --> marker"
+        meta = _frontmatter(prompt)
+        assert meta.get("name") == name, name
+        assert isinstance(meta.get("description"), str) and meta["description"].strip(), \
+            name
+        body = _body_after_frontmatter(prompt)
+        assert "<!-- ENGINE -->" not in body, name
+        assert body.strip(), name
+
+
+def test_real_engine_marker_set_matches_migrated_names():
+    """The marker is the producer's rule: every marker-carrying real skill is one
+    of the 10 migrated names and vice versa, so a new marker (or a lost one) fails
+    here instead of silently changing what Codex gets."""
+    import jacked
+
+    skills_dir = Path(jacked.__file__).parent / "data" / "skills"
+    marked = {
+        p.parent.name for p in sorted(skills_dir.glob("*/SKILL.md"))
+        if ins._skill_engine_prompt(p) is not None
+    }
+    assert marked == {
+        "dcr", "qa", "ux", "whats-next", "docs-sync",
+        "lockdown", "demo-video", "qa-video", "swarm-research", "release",
+    }
+
+
 def test_real_commands_generate_parseable_skill_frontmatter():
     """Integration guard against the REAL data/commands: every non-excluded
     command's _command_skill_md yields frontmatter yaml.safe_load parses with a
