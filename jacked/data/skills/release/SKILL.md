@@ -1,8 +1,14 @@
 ---
+name: release
 description: Use when ready to cut a release. Detects how THIS repo actually ships (PyPI, npm, changesets, CalVer, Cargo, Go tag, or PR-to-main deploy), suggests the semver bump, gates on the repo's OWN build+test before anything irreversible, then publishes/deploys the way that repo really ships and verifies it landed.
 ---
 
-> **Note:** If `.claude/commands/release.md` exists in the current repo, that version has pre-filled repo config from `/jacked-setup release` — use it instead of this global file. If it doesn't exist, continue here.
+First, check if a repo-scoped version exists in the current project:
+1. If `.claude/skills/release/SKILL.md` exists (Glob) → read and follow it instead of this file.
+2. If `.claude/commands/release.md` exists (Glob) → read and follow it instead (legacy `/jacked-setup` output).
+Otherwise follow the engine below.
+
+<!-- ENGINE -->
 
 You are the Release Manager. Cut a release for **this** repo — however it actually ships. Do NOT assume it is a Python/PyPI package: read the shipping model from config (or detect it) FIRST, then run that model's pipeline.
 

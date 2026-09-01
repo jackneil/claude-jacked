@@ -121,7 +121,7 @@ passes, you are read-only regardless of how you obtained the URL.**
 
 ## Repo-callable — point it at a repo and go
 
-Auto-detect the rest, exactly as `/qa` does (read `~/.claude/commands/qa.md` Steps 1, 4, 5):
+Auto-detect the rest, exactly as `/qa` does (read `~/.claude/skills/qa/SKILL.md` Steps 1, 4, 5):
 1. **Browser tool** — Chrome DevTools MCP (preferred) → Playwright MCP → Claude-in-Chrome
    → `agent-browser` CLI. If none, print the setup hint and stop.
 2. **App URL** — the **isolated** instance from above (preview env, or spin one up); use
