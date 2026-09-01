@@ -2161,6 +2161,7 @@ function renderAdvancedTab(container) {
 
     container.innerHTML = `
         <div id="remote-access-card" class="bg-slate-800 border border-slate-700 rounded-lg p-4 mb-4"></div>
+        <div id="oauth-browser-card" class="bg-slate-800 border border-slate-700 rounded-lg p-4 mb-4"></div>
 
         <div class="bg-slate-800 border border-slate-700 rounded-lg overflow-x-auto">
             ${tableHtml}
@@ -2183,7 +2184,97 @@ function renderAdvancedTab(container) {
         renderRemoteAccessCard(raCard);
     }
 
+    const browserCard = document.getElementById('oauth-browser-card');
+    if (browserCard) {
+        renderOAuthBrowserCard(browserCard);
+    }
+
     bindAdvancedTabEvents();
+}
+
+// Where re-auth opens the Claude login. A dedicated profile per account is the
+// point of the feature, so it is the default and the recommended option.
+const OAUTH_BROWSER_MODES = [
+    ['profile', 'Dedicated profile per account (recommended)'],
+    ['incognito', 'Private window'],
+    ['default', 'System default browser'],
+];
+const OAUTH_BROWSER_SELECT_CLASS = 'w-full bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500';
+
+function _oauthBrowserModeValue(settings) {
+    const pairs = Array.isArray(settings)
+        ? settings.map(s => [s.key, s.value])
+        : Object.entries(settings || {});
+    const hit = pairs.find(([key]) => key === 'oauth_browser_mode');
+    const value = hit ? String(hit[1] == null ? '' : hit[1]) : '';
+    return OAUTH_BROWSER_MODES.some(([mode]) => mode === value) ? value : 'profile';
+}
+
+// Built node by node rather than with innerHTML — same posture as the OAuth
+// banner: no interpolated data ever reaches an HTML parser.
+function _oauthBrowserText(tag, className, text) {
+    const el = document.createElement(tag);
+    el.className = className;
+    el.textContent = text;
+    return el;
+}
+
+function renderOAuthBrowserCard(card) {
+    const current = _oauthBrowserModeValue(window.jackedState.settings);
+
+    card.textContent = '';
+    card.appendChild(_oauthBrowserText(
+        'h3', 'text-sm font-medium text-slate-300 mb-3 text-balance', 'Re-auth browser'));
+    card.appendChild(_oauthBrowserText(
+        'p', 'text-xs text-slate-400 mb-3 text-pretty',
+        'Where jacked opens the Claude login when you add or re-authenticate an account.'));
+
+    const select = document.createElement('select');
+    select.id = 'oauth-browser-mode';
+    select.className = OAUTH_BROWSER_SELECT_CLASS;
+    select.setAttribute('aria-label', 'Re-auth browser');
+    OAUTH_BROWSER_MODES.forEach(([mode, label]) => {
+        const option = document.createElement('option');
+        option.value = mode;
+        option.textContent = label;
+        if (mode === current) option.selected = true;
+        select.appendChild(option);
+    });
+    card.appendChild(select);
+
+    card.appendChild(_oauthBrowserText(
+        'p', 'text-xs text-slate-500 mt-2 text-pretty',
+        'A dedicated profile keeps each account signed in to claude.ai on its own '
+        + 'cookies, so re-auth is one click. Profiles live in '
+        + '~/.claude/jacked-browser-profiles.'));
+
+    select.addEventListener('change', async () => {
+        const value = select.value;
+        const match = OAUTH_BROWSER_MODES.find(([mode]) => mode === value);
+        const label = match ? match[1] : value;
+        try {
+            await api.put('/api/settings/oauth_browser_mode', { value });
+            _rememberOAuthBrowserMode(value);
+            showToast('Re-auth browser: ' + label, 'success');
+        } catch (e) {
+            showToast('Could not save: ' + e.message, 'error');
+        }
+    });
+}
+
+// Keep the in-memory settings in step with the server so a re-render of the
+// Advanced tab shows the mode that was just chosen.
+function _rememberOAuthBrowserMode(value) {
+    const settings = window.jackedState.settings;
+    if (Array.isArray(settings)) {
+        const row = settings.find(s => s.key === 'oauth_browser_mode');
+        if (row) row.value = value;
+        else settings.push({ key: 'oauth_browser_mode', value });
+    } else if (settings && typeof settings === 'object') {
+        settings.oauth_browser_mode = value;
+    } else {
+        window.jackedState.settings = { oauth_browser_mode: value };
+    }
 }
 
 function bindAdvancedTabEvents() {
@@ -2286,7 +2377,7 @@ function renderSettingRow(key, value) {
 // access card). They are protected server-side, so editing them in the raw
 // table only dead-ends in a 422; hide them here so the card is the single place
 // they are changed. The card renders their live state directly above.
-const RAW_TABLE_HIDDEN_KEYS = new Set(['remote_access_enabled', 'remote_access_scope']);
+const RAW_TABLE_HIDDEN_KEYS = new Set(['remote_access_enabled', 'remote_access_scope', 'oauth_browser_mode']);
 
 function settingsToEntries(settings) {
     if (!settings) return [];

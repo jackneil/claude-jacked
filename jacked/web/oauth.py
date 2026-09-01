@@ -21,7 +21,6 @@ import json
 import logging
 import secrets
 import time
-import webbrowser
 from typing import Optional
 from urllib.parse import parse_qs, urlencode
 
@@ -64,6 +63,33 @@ ORG_TYPE_MAP = {
     "claude_enterprise": "enterprise",
     "claude_team": "team",
 }
+
+
+def identity_hint_params(account: Optional[dict]) -> dict:
+    """Extra authorize-URL params that pre-select the account being re-authed.
+
+    login_hint pre-fills the claude.ai email box and forces account selection;
+    orgUUID pre-selects the org (matters for one email with several orgs).
+
+    >>> identity_hint_params(None)
+    {}
+    >>> identity_hint_params({"email": "a@b.com", "organization_uuid": ""})
+    {'login_hint': 'a@b.com'}
+    >>> identity_hint_params({"email": "a@b.com", "organization_uuid": "org-1"})
+    {'login_hint': 'a@b.com', 'orgUUID': 'org-1'}
+    >>> identity_hint_params({"email": "", "organization_uuid": "org-1"})
+    {'orgUUID': 'org-1'}
+    """
+    if not account:
+        return {}
+    params: dict = {}
+    email = account.get("email") or ""
+    if email:
+        params["login_hint"] = email
+    org_uuid = account.get("organization_uuid") or ""
+    if org_uuid:
+        params["orgUUID"] = org_uuid
+    return params
 
 
 def generate_pkce() -> tuple[str, str]:
@@ -167,6 +193,19 @@ class OAuthFlow:
         self.db = db
         self.purpose = purpose  # "primary" | "claude_code"
         self._target_account_id = target_account_id
+        # Re-auth flows know whose account they are for. That identity drives
+        # the login_hint/orgUUID params and the per-account browser profile.
+        self._target_account: Optional[dict] = None
+        if target_account_id:
+            try:
+                self._target_account = db.get_account(target_account_id)
+            except Exception as e:
+                logger.debug(
+                    "Could not load re-auth target account %s: %s",
+                    target_account_id, e,
+                )
+                self._target_account = None
+        self._browser_mode: Optional[str] = None
         # Manual mode (remote dashboards): no local callback server, no local
         # browser. The user opens the auth link themselves and pastes the code
         # that Anthropic's code page shows.
@@ -190,6 +229,19 @@ class OAuthFlow:
         """Flow mode for the frontend: 'manual' or 'browser'."""
         return "manual" if self.manual else "browser"
 
+    def _identity_fields(self) -> dict:
+        """Who this flow is authorizing, for the dashboard's waiting banner."""
+        fields: dict = {"purpose": self.purpose}
+        if self._target_account:
+            fields["target_account_id"] = self._target_account.get("id")
+            fields["target_email"] = self._target_account.get("email")
+            fields["target_org_name"] = (
+                self._target_account.get("organization_name") or None
+            )
+        if self._browser_mode is not None:
+            fields["browser_mode"] = self._browser_mode
+        return fields
+
     def get_status(self) -> dict:
         """Get current flow status for polling.
 
@@ -207,6 +259,7 @@ class OAuthFlow:
             "status": self._status,
             "flow_id": self.flow_id,
             "mode": self.mode,
+            **self._identity_fields(),
         }
         if self._auth_url:
             result["auth_url"] = self._auth_url
@@ -278,6 +331,7 @@ class OAuthFlow:
             "code_challenge_method": "S256",
             "code": "true",
         }
+        params.update(identity_hint_params(self._target_account))
         self._auth_url = f"{AUTH_URL}?{urlencode(params)}"
 
         if self.manual:
@@ -291,8 +345,15 @@ class OAuthFlow:
             # Best-effort: a headless server must not kill the flow — the
             # frontend renders the auth link either way.
             try:
-                webbrowser.open(self._auth_url)
-                logger.info("Opened browser for OAuth authorization")
+                from jacked.web.browser_launch import open_auth_url
+
+                self._browser_mode = open_auth_url(
+                    self._auth_url, self._target_account, self.db
+                )
+                logger.info(
+                    "Opened browser for OAuth authorization (mode=%s)",
+                    self._browser_mode,
+                )
             except Exception as e:
                 logger.warning(f"Could not open a local browser for OAuth: {e}")
 
@@ -303,6 +364,7 @@ class OAuthFlow:
             "flow_id": self.flow_id,
             "auth_url": self._auth_url,
             "mode": self.mode,
+            **self._identity_fields(),
         }
 
     async def _expire_manual_flow(self) -> None:

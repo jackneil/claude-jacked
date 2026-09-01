@@ -71,16 +71,43 @@ function buildOAuthBanner(statusEl, accent, titleText) {
 // Mode copy, the authorization link, and the paste-a-code row. Code entry shows
 // in both modes: it's the only way home for a manual flow, and a working
 // fallback when a local browser redirect never lands.
-function buildOAuthCodeEntry(textDiv, accent, authUrl, manual) {
+function buildOAuthCodeEntry(textDiv, accent, authUrl, manual, identity) {
+    const email = (identity && identity.email) || '';
+    const orgName = (identity && identity.orgName) || '';
+    const browserMode = (identity && identity.browserMode) || '';
+
+    // Which account is being authorized, above the instructions: the login
+    // page is now pre-filled with this email, so the banner has to say whose.
+    if (email) {
+        const who = document.createElement('div');
+        who.className = 'text-sm font-medium text-white';
+        who.textContent = 'Authorizing ' + email;
+        if (orgName) {
+            const org = document.createElement('span');
+            org.className = 'text-slate-400 font-normal';
+            org.textContent = ' · ' + orgName;
+            who.appendChild(org);
+        }
+        textDiv.appendChild(who);
+    }
+
     const subtitle = document.createElement('div');
     subtitle.className = accent.subtitle;
-    subtitle.textContent = manual ? OAUTH_SUBTITLE_MANUAL : OAUTH_SUBTITLE_BROWSER;
+    let subtitleText = manual ? OAUTH_SUBTITLE_MANUAL : OAUTH_SUBTITLE_BROWSER;
+    if (browserMode === 'profile') {
+        subtitleText += ' Opened in a dedicated browser profile for this account.';
+    } else if (browserMode === 'incognito') {
+        subtitleText += ' Opened in a private browser window.';
+    }
+    subtitle.textContent = subtitleText;
     textDiv.appendChild(subtitle);
 
     if (authUrl) {
         const link = document.createElement('a');
         link.className = accent.link;
-        link.textContent = 'Open the authorization page';
+        link.textContent = email
+            ? 'Open the authorization page for ' + email
+            : 'Open the authorization page';
         link.target = '_blank';
         link.rel = 'noopener';
         link.href = authUrl;
@@ -200,7 +227,11 @@ async function runOAuthFlow(opts) {
     const waitLabel = Math.round(maxWait / 60) + ' minutes';
 
     const { codeInput, submitBtn, submitError } =
-        buildOAuthCodeEntry(textDiv, opts.accent, start.auth_url, manual);
+        buildOAuthCodeEntry(textDiv, opts.accent, start.auth_url, manual, {
+            email: start.target_email,
+            orgName: start.target_org_name,
+            browserMode: start.browser_mode,
+        });
 
     // Server verdict, shared by the poller and the code submission.
     // Returns true once the flow is done and the banner has been replaced.
