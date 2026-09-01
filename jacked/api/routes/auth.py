@@ -212,6 +212,13 @@ class FlowStatusResponse(BaseModel):
     auth_url: Optional[str] = None
     mode: Optional[str] = None
     submit_error: Optional[str] = None
+    purpose: Optional[str] = None
+    target_account_id: Optional[int] = None
+    target_email: Optional[str] = None
+    target_org_name: Optional[str] = None
+    browser_mode: Optional[str] = None
+    browser_name: Optional[str] = None
+    reopen_error: Optional[str] = None
 
 
 def _flow_status_response(status_data: dict) -> FlowStatusResponse:
@@ -228,6 +235,13 @@ def _flow_status_response(status_data: dict) -> FlowStatusResponse:
         auth_url=status_data.get("auth_url"),
         mode=status_data.get("mode"),
         submit_error=status_data.get("submit_error"),
+        purpose=status_data.get("purpose"),
+        target_account_id=status_data.get("target_account_id"),
+        target_email=status_data.get("target_email"),
+        target_org_name=status_data.get("target_org_name"),
+        browser_mode=status_data.get("browser_mode"),
+        browser_name=status_data.get("browser_name"),
+        reopen_error=status_data.get("reopen_error"),
     )
 
 
@@ -632,6 +646,31 @@ async def submit_flow_code(flow_id: str, body: SubmitCodeRequest):
         )
 
     return _flow_status_response(await flow.submit_code(body.code))
+
+
+@router.post("/flow/{flow_id}/open", response_model=FlowStatusResponse)
+async def reopen_flow_browser(flow_id: str):
+    """Open the sign-in window again for a flow that is still pending.
+
+    Windows will not let a background service raise the window it launched,
+    so the user may never see it. This re-launches into the same per-account
+    profile and pulls the window forward, which is the only safe way back:
+    the dashboard's own browser is signed in to whatever account it is signed
+    in to, and using it authorizes the wrong one.
+    """
+    flow = get_flow(flow_id)
+    if flow is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "error": {
+                    "message": "Authorization flow not found or expired.",
+                    "code": "NOT_FOUND",
+                }
+            },
+        )
+
+    return _flow_status_response(await flow.reopen_browser())
 
 
 @router.get("/accounts", response_model=list[AccountResponse])

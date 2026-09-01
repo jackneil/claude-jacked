@@ -199,10 +199,12 @@ def test_authorize_cc_without_remote_flag_stays_automatic(client, db, started_fl
 class _StubStatusFlow:
     """A flow whose get_status()/submit_code() return canned payloads."""
 
-    def __init__(self, status=None, submit_result=None):
+    def __init__(self, status=None, submit_result=None, reopen_result=None):
         self._status = status or {}
         self._submit_result = submit_result or {}
+        self._reopen_result = reopen_result or {}
         self.submitted = None
+        self.reopened = 0
 
     def get_status(self):
         return dict(self._status)
@@ -210,6 +212,10 @@ class _StubStatusFlow:
     async def submit_code(self, pasted):
         self.submitted = pasted
         return dict(self._submit_result)
+
+    async def reopen_browser(self):
+        self.reopened += 1
+        return dict(self._reopen_result)
 
 
 def test_flow_status_returns_every_field_the_flow_reports(client, monkeypatch):
@@ -227,6 +233,12 @@ def test_flow_status_returns_every_field_the_flow_reports(client, monkeypatch):
             "organization_name": "Acme",
             "redirected_from_account_id": 3,
             "cc_flow_id": "cc-flow-1",
+            "purpose": "primary",
+            "target_account_id": 4,
+            "target_email": "jack@example.com",
+            "target_org_name": "Acme",
+            "browser_mode": "profile",
+            "browser_name": "Chrome",
         }
     )
     monkeypatch.setattr(routes_auth, "get_flow", lambda flow_id: flow)
@@ -242,6 +254,12 @@ def test_flow_status_returns_every_field_the_flow_reports(client, monkeypatch):
     assert body["organization_name"] == "Acme"
     assert body["redirected_from_account_id"] == 3
     assert body["cc_flow_id"] == "cc-flow-1"
+    assert body["purpose"] == "primary"
+    assert body["target_account_id"] == 4
+    assert body["target_email"] == "jack@example.com"
+    assert body["target_org_name"] == "Acme"
+    assert body["browser_mode"] == "profile"
+    assert body["browser_name"] == "Chrome"
 
 
 def test_flow_status_for_an_unknown_flow_is_not_found(client, monkeypatch):
@@ -330,3 +348,64 @@ def test_submit_code_requires_a_code_field(client, monkeypatch):
 
     assert resp.status_code == 422
     assert flow.submitted is None
+
+
+# ---------------------------------------------------------------------------
+# POST /flow/{id}/open: raising the sign-in window again
+# ---------------------------------------------------------------------------
+
+
+def test_reopen_unknown_flow_returns_404(client, monkeypatch):
+    monkeypatch.setattr(routes_auth, "get_flow", lambda flow_id: None)
+
+    resp = client.post("/api/auth/flow/nope/open")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_reopen_returns_the_browser_it_opened(client, monkeypatch):
+    """The banner needs the browser name back: "Bring up the Chrome window"
+    is only honest if the reopen actually used Chrome."""
+    flow = _StubStatusFlow(
+        reopen_result={
+            "status": "pending",
+            "flow_id": "flow-1",
+            "mode": "browser",
+            "target_email": "jack@example.com",
+            "browser_mode": "profile",
+            "browser_name": "Chrome",
+        }
+    )
+    monkeypatch.setattr(routes_auth, "get_flow", lambda flow_id: flow)
+
+    resp = client.post("/api/auth/flow/flow-1/open")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["browser_mode"] == "profile"
+    assert body["browser_name"] == "Chrome"
+    assert body["target_email"] == "jack@example.com"
+    assert body["reopen_error"] is None
+    assert flow.reopened == 1
+
+
+def test_reopen_surfaces_a_refusal_without_failing_the_request(client, monkeypatch):
+    """A manual or finished flow has nothing to reopen; the UI shows the
+    reason and the flow stays exactly as it was."""
+    flow = _StubStatusFlow(
+        reopen_result={
+            "status": "pending",
+            "flow_id": "flow-1",
+            "mode": "manual",
+            "reopen_error": "This flow has no local browser to reopen.",
+        }
+    )
+    monkeypatch.setattr(routes_auth, "get_flow", lambda flow_id: flow)
+
+    resp = client.post("/api/auth/flow/flow-1/open")
+
+    assert resp.status_code == 200
+    assert resp.json()["reopen_error"] == "This flow has no local browser to reopen."
+    assert resp.json()["status"] == "pending"
