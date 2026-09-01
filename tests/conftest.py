@@ -31,3 +31,18 @@ def _block_browser_open():
     """
     with patch("webbrowser.open", return_value=True):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _block_profile_browser_launch():
+    """Prevent any test from spawning a real browser process.
+
+    Browser-mode OAuth now launches a per-account browser profile through
+    jacked.web.browser_launch, which uses subprocess.Popen rather than
+    webbrowser.open. Reporting "no browser installed" sends open_auth_url
+    down its webbrowser fallback, which the fixture above already blocks.
+    Tests that exercise the launcher itself patch find_browser locally,
+    which overrides this.
+    """
+    with patch("jacked.web.browser_launch.find_browser", return_value=None):
+        yield
