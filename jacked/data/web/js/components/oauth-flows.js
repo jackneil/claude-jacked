@@ -75,6 +75,8 @@ function buildOAuthCodeEntry(textDiv, accent, authUrl, manual, identity) {
     const email = (identity && identity.email) || '';
     const orgName = (identity && identity.orgName) || '';
     const browserMode = (identity && identity.browserMode) || '';
+    const browserName = (identity && identity.browserName) || '';
+    const flowId = (identity && identity.flowId) || '';
 
     // Which account is being authorized, above the instructions: the login
     // page is now pre-filled with this email, so the banner has to say whose.
@@ -95,14 +97,59 @@ function buildOAuthCodeEntry(textDiv, accent, authUrl, manual, identity) {
     subtitle.className = accent.subtitle;
     let subtitleText = manual ? OAUTH_SUBTITLE_MANUAL : OAUTH_SUBTITLE_BROWSER;
     if (browserMode === 'profile') {
-        subtitleText += ' Opened in a dedicated browser profile for this account.';
+        subtitleText += ' A dedicated ' + (browserName || 'browser') + ' window opened for '
+            + (email || 'this login') + '. It may be behind this window or on the taskbar.';
     } else if (browserMode === 'incognito') {
-        subtitleText += ' Opened in a private browser window.';
+        subtitleText += ' A private ' + (browserName || 'browser')
+            + ' window opened for this login. It may be behind this window or on the taskbar.';
     }
     subtitle.textContent = subtitleText;
     textDiv.appendChild(subtitle);
 
-    if (authUrl) {
+    // A window jacked launched itself is the only one signed in to the right
+    // account. Windows refuses foreground to a window opened by a background
+    // service, so the primary action is "raise that window", and the raw link
+    // drops to a labelled last resort — clicking it authorizes whichever
+    // account this dashboard's browser happens to be signed in to.
+    const canReopen = !manual && (browserMode === 'profile' || browserMode === 'incognito') && flowId;
+
+    if (canReopen) {
+        const reopenRow = document.createElement('div');
+        reopenRow.className = 'mt-2';
+        const reopenBtn = document.createElement('button');
+        reopenBtn.type = 'button';
+        reopenBtn.className = OAUTH_CODE_BUTTON_CLASS;
+        reopenBtn.textContent = 'Bring up the sign-in window';
+        reopenBtn.addEventListener('click', async () => {
+            reopenBtn.disabled = true;
+            try {
+                const result = await api.post('/api/auth/flow/' + flowId + '/open');
+                if (result && result.reopen_error) showToast(result.reopen_error, 'warning');
+            } catch (e) {
+                showToast('Could not reopen the sign-in window: ' + e.message, 'error');
+            } finally {
+                reopenBtn.disabled = false;
+            }
+        });
+        reopenRow.appendChild(reopenBtn);
+        textDiv.appendChild(reopenRow);
+    }
+
+    if (authUrl && canReopen) {
+        const fallback = document.createElement('div');
+        fallback.className = 'text-xs text-slate-400 mt-1';
+        const link = document.createElement('a');
+        link.className = accent.link;
+        link.textContent = 'Open in this browser instead';
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.href = authUrl;
+        fallback.appendChild(link);
+        fallback.appendChild(
+            document.createTextNode(' (uses whatever account this browser is already signed in to)')
+        );
+        textDiv.appendChild(fallback);
+    } else if (authUrl) {
         const link = document.createElement('a');
         link.className = accent.link;
         link.textContent = email
@@ -231,6 +278,8 @@ async function runOAuthFlow(opts) {
             email: start.target_email,
             orgName: start.target_org_name,
             browserMode: start.browser_mode,
+            browserName: start.browser_name,
+            flowId: flowId,
         });
 
     // Server verdict, shared by the poller and the code submission.

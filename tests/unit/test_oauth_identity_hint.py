@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from jacked.web import browser_launch
 from jacked.web import oauth as oauth_mod
 from jacked.web.database import Database
 from jacked.web.oauth import OAuthFlow, identity_hint_params
@@ -207,3 +208,147 @@ def test_cc_flows_hint_the_same_account():
     assert query["login_hint"] == ["jack@example.com"]
     assert result["purpose"] == "claude_code"
     assert result["target_email"] == "jack@example.com"
+
+
+# ---------------------------------------------------------------------------
+# reopen_browser: getting the user back to the window jacked opened
+# ---------------------------------------------------------------------------
+
+
+def _pending_browser_flow(db, target_account_id=None):
+    """A browser-mode flow parked where start() would leave it.
+
+    start() is skipped deliberately: it binds a real socket in 45100-45199 and
+    spawns a background task. reopen_browser only reads _auth_url and _status.
+    """
+    flow = OAuthFlow(
+        db, purpose="primary", target_account_id=target_account_id, manual=False
+    )
+    flow._auth_url = "https://claude.com/cai/oauth/authorize?state=abc"
+    flow._status = "pending"
+    return flow
+
+
+def test_reopen_relaunches_the_browser_and_reports_which_one(monkeypatch):
+    db, account = _make_db()
+    flow = _pending_browser_flow(db, account["id"])
+    calls = []
+
+    def _fake_open(url, acct, database):
+        calls.append((url, acct, database))
+        return browser_launch.LaunchResult("profile", "Chrome")
+
+    monkeypatch.setattr(browser_launch, "open_auth_url", _fake_open)
+
+    status = run_async(flow.reopen_browser)
+
+    assert len(calls) == 1
+    assert calls[0][0] == flow._auth_url
+    assert calls[0][1]["email"] == "jack@example.com"
+    assert "reopen_error" not in status
+    assert status["status"] == "pending"
+    assert status["browser_mode"] == "profile"
+    assert status["browser_name"] == "Chrome"
+    # The identity fields the banner already renders survive the reopen.
+    assert status["target_email"] == "jack@example.com"
+
+
+def test_reopen_reports_the_fallback_mode_it_actually_got(monkeypatch):
+    """No installed browser means the system default opened, and the banner
+    must stop claiming a dedicated window exists."""
+    db, account = _make_db()
+    flow = _pending_browser_flow(db, account["id"])
+    flow._browser_mode = "profile"
+    flow._browser_name = "Chrome"
+    monkeypatch.setattr(
+        browser_launch,
+        "open_auth_url",
+        lambda *a: browser_launch.LaunchResult("default", None),
+    )
+
+    status = run_async(flow.reopen_browser)
+
+    assert status["browser_mode"] == "default"
+    assert "browser_name" not in status
+
+
+def test_reopen_refuses_a_manual_flow(monkeypatch):
+    """A manual flow runs on someone else's machine; there is no window here
+    to raise and nothing useful to launch."""
+    db, account = _make_db()
+    flow = OAuthFlow(db, target_account_id=account["id"], manual=True)
+    flow._auth_url = "https://claude.com/cai/oauth/authorize?state=abc"
+    calls = []
+    monkeypatch.setattr(
+        browser_launch, "open_auth_url", lambda *a: calls.append(a)
+    )
+
+    status = run_async(flow.reopen_browser)
+
+    assert calls == []
+    assert status["reopen_error"]
+    assert status["status"] == "pending"
+
+
+@pytest.mark.parametrize("state", ["completed", "error", "not_found"])
+def test_reopen_refuses_a_finished_flow(monkeypatch, state):
+    db, account = _make_db()
+    flow = _pending_browser_flow(db, account["id"])
+    flow._status = state
+    calls = []
+    monkeypatch.setattr(
+        browser_launch, "open_auth_url", lambda *a: calls.append(a)
+    )
+
+    status = run_async(flow.reopen_browser)
+
+    assert calls == []
+    assert state in status["reopen_error"]
+
+
+def test_reopen_refuses_a_flow_with_no_auth_url_yet(monkeypatch):
+    db, account = _make_db()
+    flow = _pending_browser_flow(db, account["id"])
+    flow._auth_url = None
+    calls = []
+    monkeypatch.setattr(
+        browser_launch, "open_auth_url", lambda *a: calls.append(a)
+    )
+
+    status = run_async(flow.reopen_browser)
+
+    assert calls == []
+    assert status["reopen_error"]
+
+
+def test_reopen_survives_a_launcher_that_blows_up(monkeypatch):
+    """A broken browser install must not turn a recoverable flow into an
+    error the user has to restart from."""
+    db, account = _make_db()
+    flow = _pending_browser_flow(db, account["id"])
+
+    def _boom(*a):
+        raise OSError("chrome.exe is mid-upgrade")
+
+    monkeypatch.setattr(browser_launch, "open_auth_url", _boom)
+
+    status = run_async(flow.reopen_browser)
+
+    assert status["reopen_error"]
+    assert status["status"] == "pending"
+
+
+def test_reopen_never_leaks_the_authorize_url_into_the_logs(monkeypatch, caplog):
+    db, account = _make_db()
+    flow = _pending_browser_flow(db, account["id"])
+    monkeypatch.setattr(
+        browser_launch,
+        "open_auth_url",
+        lambda *a: browser_launch.LaunchResult("profile", "Chrome"),
+    )
+    caplog.set_level("DEBUG")
+
+    run_async(flow.reopen_browser)
+
+    assert flow._auth_url not in caplog.text
+    assert "state=abc" not in caplog.text

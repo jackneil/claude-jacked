@@ -23,10 +23,13 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from jacked.web.window_focus import bring_to_front_windows as _bring_to_front_windows
 
 logger = logging.getLogger("jacked.oauth.browser")
 
@@ -298,6 +301,71 @@ def build_command(
     return [spec.path, private_flag, "--new-window", url]
 
 
+def _app_bundle_for(path: str) -> Optional[str]:
+    """The ``.app`` bundle containing this executable, or None.
+
+    >>> _app_bundle_for("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    '/Applications/Google Chrome.app'
+    >>> _app_bundle_for("/usr/bin/google-chrome") is None
+    True
+    >>> _app_bundle_for("/Applications/Firefox.app") is None
+    True
+    """
+    if "/Contents/MacOS/" not in path:
+        return None
+    index = path.find(".app/")
+    if index == -1:
+        return None
+    return path[: index + len(".app")]
+
+
+def launch_argv(
+    spec: BrowserSpec,
+    url: str,
+    mode: str,
+    profile_dir: Optional[Path],
+    platform: str = sys.platform,
+) -> list[str]:
+    """Argv to spawn, adapted to how the platform activates a new window.
+
+    macOS ignores a window opened by a background process just like Windows
+    does, but ``open -n -a`` asks Launch Services to start and *activate* the
+    app, so the sign-in window comes to the front on its own. Everywhere else
+    the executable is invoked directly.
+
+    >>> mac = BrowserSpec(
+    ...     "Chrome",
+    ...     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ...     "chromium",
+    ... )
+    >>> launch_argv(mac, "u", "incognito", None, platform="darwin")
+    ['open', '-n', '-a', '/Applications/Google Chrome.app', '--args', '--incognito', '--new-window', 'u']
+    >>> nix = BrowserSpec("Chrome", "/usr/bin/google-chrome", "chromium")
+    >>> launch_argv(nix, "u", "incognito", None, platform="darwin")
+    ['/usr/bin/google-chrome', '--incognito', '--new-window', 'u']
+    >>> launch_argv(mac, "u", "incognito", None, platform="win32")[0] == mac.path
+    True
+    """
+    cmd = build_command(spec, url, mode, profile_dir)
+    if platform == "darwin":
+        bundle = _app_bundle_for(spec.path)
+        if bundle is not None:
+            return ["open", "-n", "-a", bundle, "--args", *cmd[1:]]
+    return cmd
+
+
+@dataclass(frozen=True)
+class LaunchResult:
+    """What the launch actually did: the mode used, and the browser driven.
+
+    ``browser`` is None whenever no controlled browser was involved, which is
+    every path that fell back to the system default.
+    """
+
+    mode: str
+    browser: Optional[str] = None
+
+
 def _detach_kwargs() -> dict:
     """Popen kwargs that let the browser outlive the jacked process."""
     if sys.platform == "win32":
@@ -308,22 +376,23 @@ def _detach_kwargs() -> dict:
     return {"start_new_session": True}
 
 
-def open_auth_url(url: str, account: Optional[dict], db) -> str:
-    """Open the authorize URL, returning the mode actually used.
+def open_auth_url(url: str, account: Optional[dict], db) -> LaunchResult:
+    """Open the authorize URL, reporting what actually happened.
 
-    The return value is what the dashboard tells the user, so it reports the
-    fallback that happened rather than the mode that was asked for.
+    The result is what the dashboard tells the user, so it reports the
+    fallback that happened rather than the mode that was asked for, and names
+    the browser so the banner can say which window to look for.
     """
     mode = read_mode(db)
     if mode == "default":
         webbrowser.open(url)
-        return "default"
+        return LaunchResult("default")
 
     spec = find_browser()
     if spec is None:
         logger.info("OAuth browser: no supported browser found, using system default")
         webbrowser.open(url)
-        return "default"
+        return LaunchResult("default")
 
     profile_dir = profile_dir_for(account)
     effective = mode
@@ -340,8 +409,8 @@ def open_auth_url(url: str, account: Optional[dict], db) -> str:
                 profile_dir.chmod(0o700)
             except OSError as e:  # Windows/ACL filesystems may refuse
                 logger.debug("Could not tighten profile dir permissions: %s", e)
-        cmd = build_command(spec, url, effective, profile_dir)
-        subprocess.Popen(
+        cmd = launch_argv(spec, url, effective, profile_dir)
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -352,7 +421,7 @@ def open_auth_url(url: str, account: Optional[dict], db) -> str:
     except Exception as e:
         logger.warning("OAuth browser launch failed (%s), using system default: %s", spec.name, e)
         webbrowser.open(url)
-        return "default"
+        return LaunchResult("default")
 
     logger.info(
         "OAuth browser: mode=%s browser=%s profile=%s",
@@ -360,4 +429,15 @@ def open_auth_url(url: str, account: Optional[dict], db) -> str:
         spec.name,
         str(profile_dir) if profile_dir else "-",
     )
-    return effective
+    if sys.platform == "win32":
+        # Windows denies foreground activation to a window opened by a
+        # background process (the tray service), so the sign-in window lands
+        # behind the dashboard and the user never sees it. Raising it takes
+        # seconds of polling, so it must not hold up the API response.
+        threading.Thread(
+            target=_bring_to_front_windows,
+            args=(proc.pid, spec.path),
+            daemon=True,
+            name="jacked-oauth-focus",
+        ).start()
+    return LaunchResult(effective, spec.name)

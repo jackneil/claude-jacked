@@ -206,6 +206,7 @@ class OAuthFlow:
                 )
                 self._target_account = None
         self._browser_mode: Optional[str] = None
+        self._browser_name: Optional[str] = None
         # Manual mode (remote dashboards): no local callback server, no local
         # browser. The user opens the auth link themselves and pastes the code
         # that Anthropic's code page shows.
@@ -240,6 +241,8 @@ class OAuthFlow:
             )
         if self._browser_mode is not None:
             fields["browser_mode"] = self._browser_mode
+        if self._browser_name is not None:
+            fields["browser_name"] = self._browser_name
         return fields
 
     def get_status(self) -> dict:
@@ -347,9 +350,11 @@ class OAuthFlow:
             try:
                 from jacked.web.browser_launch import open_auth_url
 
-                self._browser_mode = open_auth_url(
+                launched = open_auth_url(
                     self._auth_url, self._target_account, self.db
                 )
+                self._browser_mode = launched.mode
+                self._browser_name = launched.browser
                 logger.info(
                     "Opened browser for OAuth authorization (mode=%s)",
                     self._browser_mode,
@@ -366,6 +371,49 @@ class OAuthFlow:
             "mode": self.mode,
             **self._identity_fields(),
         }
+
+    async def reopen_browser(self) -> dict:
+        """Open the sign-in window again for a flow that is still waiting.
+
+        Windows can refuse to raise a window opened by a background service,
+        so the user may never see the one start() launched. Re-launching is
+        cheap and correct: Chrome, Edge and Brave hand the URL to the instance
+        already running that profile, which opens a tab and gets focused, and
+        the launcher's focus pass runs again either way.
+        """
+        if self.manual:
+            return {
+                **self.get_status(),
+                "reopen_error": "This flow has no local browser to reopen.",
+            }
+        if self._status != "pending":
+            return {
+                **self.get_status(),
+                "reopen_error": f"Flow is {self._status}, not awaiting sign-in.",
+            }
+        if not self._auth_url:
+            return {
+                **self.get_status(),
+                "reopen_error": "This flow has no authorization URL yet.",
+            }
+
+        try:
+            from jacked.web.browser_launch import open_auth_url
+
+            launched = open_auth_url(
+                self._auth_url, self._target_account, self.db
+            )
+        except Exception as e:
+            logger.warning("Could not re-open the OAuth browser: %s", e)
+            return {
+                **self.get_status(),
+                "reopen_error": "Could not open a browser on the jacked machine.",
+            }
+
+        self._browser_mode = launched.mode
+        self._browser_name = launched.browser
+        logger.info("Re-opened OAuth browser (mode=%s)", launched.mode)
+        return self.get_status()
 
     async def _expire_manual_flow(self) -> None:
         """Expire a manual flow, mirroring _wait_for_callback's cleanup."""
