@@ -473,6 +473,38 @@ def test_engine_skill_prompts_idempotent(data_root, homes):
     assert _install(data_root, homes).changed is False
 
 
+def test_engine_prompt_write_failure_keeps_existing_prompt(data_root, homes, monkeypatch):
+    """A transient write failure (AV lock, read-only file) must NOT convert into
+    a deletion: the prior hash is carried forward into the manifest so the prune
+    leaves the existing good prompt alone."""
+    _add_engine_skill(data_root)
+    _install(data_root, homes)
+    prompt = ins.codex_prompts_dir(homes["home"]) / "engined.md"
+    assert prompt.exists()
+
+    real_write = ins._atomic_write_text
+
+    def _flaky(path, text):
+        if Path(path).name == "engined.md":
+            raise OSError("locked")
+        return real_write(path, text)
+
+    monkeypatch.setattr(ins, "_atomic_write_text", _flaky)
+    summ = _install(data_root, homes)
+    assert prompt.exists(), "prune deleted the good prompt after a write failure"
+    assert "engined.md" in _manifest(homes)["prompts"]
+    assert "prompts/engined.md" not in summ.removed
+
+
+# The 10 names that absorbed a command body in the 0.96 migration. Single source
+# for the real-data contract tests below — edit HERE when a name migrates, and
+# test_real_engine_marker_set_matches_migrated_names will hold you to it.
+_MIGRATED = frozenset({
+    "dcr", "qa", "ux", "whats-next", "docs-sync",
+    "lockdown", "demo-video", "qa-video", "swarm-research", "release",
+})
+
+
 def test_real_migrated_skills_generate_parseable_prompts():
     """Integration guard against the REAL data/skills: each of the 10 skills that
     absorbed a command body yields a prompt whose frontmatter yaml.safe_load parses
@@ -481,11 +513,7 @@ def test_real_migrated_skills_generate_parseable_prompts():
     import jacked
 
     skills_dir = Path(jacked.__file__).parent / "data" / "skills"
-    migrated = [
-        "dcr", "qa", "ux", "whats-next", "docs-sync",
-        "lockdown", "demo-video", "qa-video", "swarm-research", "release",
-    ]
-    for name in migrated:
+    for name in sorted(_MIGRATED):
         skill_md = skills_dir / name / "SKILL.md"
         assert skill_md.exists(), name
         prompt = ins._skill_engine_prompt(skill_md)
@@ -496,24 +524,34 @@ def test_real_migrated_skills_generate_parseable_prompts():
             name
         body = _body_after_frontmatter(prompt)
         assert "<!-- ENGINE -->" not in body, name
+        assert "repo-scoped" not in body, (
+            f"{name}: the Claude-only repo-dispatch preamble leaked into the "
+            "Codex prompt — the <!-- ENGINE --> marker sits above it"
+        )
         assert body.strip(), name
 
 
 def test_real_engine_marker_set_matches_migrated_names():
     """The marker is the producer's rule: every marker-carrying real skill is one
     of the 10 migrated names and vice versa, so a new marker (or a lost one) fails
-    here instead of silently changing what Codex gets."""
+    here instead of silently changing what Codex gets. Each file must carry the
+    marker exactly ONCE — a second one (say, inside a fenced example) would
+    silently truncate the emitted engine at the wrong line."""
     import jacked
 
     skills_dir = Path(jacked.__file__).parent / "data" / "skills"
-    marked = {
-        p.parent.name for p in sorted(skills_dir.glob("*/SKILL.md"))
-        if ins._skill_engine_prompt(p) is not None
-    }
-    assert marked == {
-        "dcr", "qa", "ux", "whats-next", "docs-sync",
-        "lockdown", "demo-video", "qa-video", "swarm-research", "release",
-    }
+    marked = set()
+    for p in sorted(skills_dir.glob("*/SKILL.md")):
+        text = p.read_text(encoding="utf-8")
+        n = sum(1 for line in text.splitlines() if line.strip() == "<!-- ENGINE -->")
+        assert n <= 1, f"{p.parent.name}: {n} engine markers — must be exactly one"
+        if ins._skill_engine_prompt(p) is not None:
+            assert n == 1, p.parent.name
+            marked.add(p.parent.name)
+    assert marked == set(_MIGRATED), (
+        "marker-carrying skills diverged from _MIGRATED (defined above) — "
+        "update both the data tree and that constant together"
+    )
 
 
 def test_real_commands_generate_parseable_skill_frontmatter():

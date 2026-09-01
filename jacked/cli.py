@@ -2730,10 +2730,22 @@ def install(
     _d = _mani.diff(_prior_manifest, _current_hashes)
     # Pass the prior manifest so a skill dir the user modified/recreated is never
     # deleted by the prune (upgrade runs this automatically — high exposure).
-    _mani.prune_removed(_d, home, _prior_manifest)
+    _pruned, _preserved = _mani.prune_removed(_d, home, _prior_manifest)
+    # Belt-and-braces: with no usable prior manifest the diff prunes nothing, and
+    # writing the new manifest below would strand any command file whose name now
+    # ships as a skill — permanently, since no later diff (or uninstall) can see
+    # it. Sweep those by the producer's own rule (the shipped skill set).
+    _swept, _swept_kept = _mani.sweep_migrated_commands(
+        home, _current_hashes.get("skills", {}), _prior_manifest,
+    )
+    _pruned += _swept
+    _preserved += _swept_kept
     _now = datetime.now(timezone.utc).isoformat()
     _mani.write(_manifest_path, _ver, _current_hashes, _now)
     _record = _isum.build_record(_d, _prior_version, _ver, _now)
+    # Outcome, not intent: the diff says what SHOULD go; record what actually did.
+    _record["pruned"] = _pruned
+    _record["preserved"] = _preserved
     _isum.write_last_install(_record, home / ".claude" / "jacked-last-install.json")
 
     # --- Codex pass (auto-detected) ---
@@ -2798,6 +2810,16 @@ def install(
     else:
         console.print("")
         console.print(_isum.render_terminal(_record))
+        if _pruned:
+            console.print(
+                f"[green][OK][/green] Removed {len(_pruned)} no-longer-shipped: "
+                + ", ".join(_pruned)
+            )
+        for _item in _preserved:
+            console.print(
+                f"[yellow][!][/yellow] Preserved your modified {_item} under "
+                "~/.claude/jacked-backups/ (jacked no longer ships it)"
+            )
         if _codex_summary is not None:
             _mcp = _codex_summary.mcp
             if _mcp in ("added", "updated"):
@@ -2814,6 +2836,12 @@ def install(
                 f"→ ~/.codex/prompts, {len(_codex_summary.agents)} agents "
                 f"→ ~/.codex/agents, rules → AGENTS.md{_mcp_suffix}"
             )
+            if _codex_summary.removed:
+                console.print(
+                    f"[green][OK][/green] Codex: removed "
+                    f"{len(_codex_summary.removed)} no-longer-shipped: "
+                    + ", ".join(_codex_summary.removed)
+                )
             for _item in _codex_summary.preserved:
                 console.print(
                     f"[yellow][!][/yellow] Codex: preserved your existing "
@@ -4045,11 +4073,17 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         # "removed" and gets pruned from ~/.claude.
         _empty = {cat.key: {} for cat in _mani.CATEGORIES}
         _d = _mani.diff(_prior_manifest, _empty)
-        # Same hash-gate as the skills loop: a modified skill dir is left alone.
-        _pruned = _mani.prune_removed(_d, home, _prior_manifest)
+        # Same hash-gate as the skills loop: a modified skill dir is left alone,
+        # and a modified flat file is moved into ~/.claude/jacked-backups/.
+        _pruned, _kept = _mani.prune_removed(_d, home, _prior_manifest)
         if _pruned:
             console.print(
                 f"[green][OK][/green] Removed {len(_pruned)} manifest-tracked artifacts"
+            )
+        for _item in _kept:
+            console.print(
+                f"[yellow][!][/yellow] Preserved your modified {_item} under "
+                "~/.claude/jacked-backups/ (no longer matches what jacked installed)"
             )
     if _manifest_path.exists():
         _manifest_path.unlink()

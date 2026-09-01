@@ -81,11 +81,12 @@ def test_prune_removed_deletes_only_listed(tmp_path):
         "commands": m.CategoryDiff(removed=["old.md"]),
         "agents": m.CategoryDiff(), "lenses": m.CategoryDiff(), "templates": m.CategoryDiff(),
     })
-    pruned = m.prune_removed(d, home)
+    pruned, preserved = m.prune_removed(d, home)
     assert not (home / ".claude" / "skills" / "gone").exists()
     assert not (home / ".claude" / "commands" / "old.md").exists()
     assert (home / ".claude" / "skills" / "mine").exists()   # untouched
     assert set(pruned) == {"skills/gone", "commands/old.md"}
+    assert preserved == []
 
 
 def test_migrated_command_pruned_from_installed_tree(tmp_path):
@@ -94,8 +95,8 @@ def test_migrated_command_pruned_from_installed_tree(tmp_path):
     The 2026-09-01 migration moved /dcr (and nine others) out of data/commands
     into data/skills. On an upgrade, the prior manifest still lists the command
     and the current source no longer has it, so the diff must report it removed
-    and prune_removed must delete the stale installed copy — otherwise the old
-    command file keeps shadowing the new skill on every existing install.
+    and prune_removed must delete the stale installed copy — otherwise it sits
+    there forever as cruft no later diff (or uninstall) can reach.
     """
     home = tmp_path / "home"
     source = tmp_path / "data"
@@ -104,17 +105,84 @@ def test_migrated_command_pruned_from_installed_tree(tmp_path):
     (source / "skills" / "dcr" / "SKILL.md").write_text("dcr engine", encoding="utf-8")
 
     (home / ".claude" / "commands").mkdir(parents=True)
-    (home / ".claude" / "commands" / "dcr.md").write_text("stale dcr", encoding="utf-8")
+    stale = home / ".claude" / "commands" / "dcr.md"
+    stale.write_text("the 0.95 dcr command", encoding="utf-8")
 
     prior = {"version": "0.95.0", "artifacts": {
         "skills": {"recover": "sha256:x"},
-        "commands": {"dc.md": "sha256:x", "dcr.md": "sha256:x"},
+        # the recorded hash matches the installed copy: it is jacked's own file
+        "commands": {"dc.md": "sha256:x", "dcr.md": m._sha256_file(stale)},
         "agents": {}, "lenses": {}, "templates": {},
     }}
     d = m.diff(prior, m.hash_source(source))
     assert d.by_category["commands"].removed == ["dcr.md"]
     assert "dcr" in d.by_category["skills"].added
 
-    pruned = m.prune_removed(d, home)
-    assert not (home / ".claude" / "commands" / "dcr.md").exists()
+    pruned, preserved = m.prune_removed(d, home, prior)
+    assert not stale.exists()
     assert "commands/dcr.md" in pruned
+    assert preserved == []
+
+
+def test_prune_preserves_user_modified_flat_file(tmp_path):
+    """A flat artifact whose bytes no longer match the recorded hash was edited
+    by the user: it moves into ~/.claude/jacked-backups/<category>/ instead of
+    being unlinked, and is reported in `preserved` — never a silent delete."""
+    home = tmp_path
+    (home / ".claude" / "commands").mkdir(parents=True)
+    edited = home / ".claude" / "commands" / "dcr.md"
+    edited.write_text("my hand-tuned dcr", encoding="utf-8")
+    prior = {"version": "0.95.0", "artifacts": {
+        "skills": {}, "commands": {"dcr.md": "sha256:what-jacked-shipped"},
+        "agents": {}, "lenses": {}, "templates": {},
+    }}
+    d = m.ManifestDiff({
+        "skills": m.CategoryDiff(), "commands": m.CategoryDiff(removed=["dcr.md"]),
+        "agents": m.CategoryDiff(), "lenses": m.CategoryDiff(), "templates": m.CategoryDiff(),
+    })
+    pruned, preserved = m.prune_removed(d, home, prior)
+    assert not edited.exists()
+    backups = list((home / ".claude" / "jacked-backups" / "commands").glob("dcr-*.md"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "my hand-tuned dcr"
+    assert preserved == ["commands/dcr.md"]
+    assert pruned == []
+
+
+def test_sweep_migrated_commands_without_manifest_preserves(tmp_path):
+    """The belt-and-braces sweep: with NO usable prior manifest the diff prunes
+    nothing, so a command file colliding with a shipped skill name must be moved
+    aside (provenance unknown — never blind-deleted), leaving the commands tree
+    clean before the new manifest makes the orphan permanent."""
+    home = tmp_path
+    (home / ".claude" / "commands").mkdir(parents=True)
+    orphan = home / ".claude" / "commands" / "dcr.md"
+    orphan.write_text("pre-manifest 0.95 dcr", encoding="utf-8")
+    (home / ".claude" / "commands" / "dc.md").write_text("still shipped", encoding="utf-8")
+
+    removed, preserved = m.sweep_migrated_commands(home, {"dcr", "qa"}, None)
+    assert not orphan.exists()
+    assert preserved == ["commands/dcr.md"]
+    assert removed == []
+    backups = list((home / ".claude" / "jacked-backups" / "commands").glob("dcr-*.md"))
+    assert len(backups) == 1
+    # a command whose name is NOT a shipped skill is untouched
+    assert (home / ".claude" / "commands" / "dc.md").exists()
+
+
+def test_sweep_migrated_commands_with_manifest_deletes_jacked_copy(tmp_path):
+    """With a prior manifest proving the colliding file is jacked's unmodified
+    copy, the sweep deletes it outright (no backup litter)."""
+    home = tmp_path
+    (home / ".claude" / "commands").mkdir(parents=True)
+    stale = home / ".claude" / "commands" / "dcr.md"
+    stale.write_text("the 0.95 dcr command", encoding="utf-8")
+    prior = {"version": "0.95.0", "artifacts": {
+        "skills": {}, "commands": {"dcr.md": m._sha256_file(stale)},
+        "agents": {}, "lenses": {}, "templates": {},
+    }}
+    removed, preserved = m.sweep_migrated_commands(home, {"dcr"}, prior)
+    assert not stale.exists()
+    assert removed == ["commands/dcr.md"]
+    assert preserved == []
+    assert not (home / ".claude" / "jacked-backups").exists()

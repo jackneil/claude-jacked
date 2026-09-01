@@ -157,7 +157,11 @@ def _skill_engine_prompt(skill_md: Path) -> Optional[str]:
     The frontmatter block is recovered as the text `_split_command_frontmatter`
     consumed, so there is one parser for both halves."""
     text = skill_md.read_text(encoding="utf-8")
-    _, body = _split_command_frontmatter(text)
+    meta, body = _split_command_frontmatter(text)
+    if not meta:
+        # Unparseable/missing frontmatter would emit a nameless prompt; refuse
+        # instead — the exact-marker-set contract test then fails loudly in CI.
+        return None
     lines = body.splitlines(keepends=True)
     for i, line in enumerate(lines):
         if line.strip() == _ENGINE_MARKER:

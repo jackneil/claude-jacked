@@ -134,7 +134,7 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 |---------|--------------|
 | **10 Code Reviewers** | Automatic checks for bugs, security issues, complexity, missing tests |
 | **20 Slash Commands** | `/dc`, `/pr`, `/learn`, `/remember`, `/blindspot`, `/redo`, `/retry`, `/techdebt`, `/audit-rules`, `/cleanup`, `/swarm`, `/goal-maker`, `/bhag`, `/jacked-setup`, `/cso`, `/retro`, `/canary`, `/benchmark`, `/land-and-deploy`, `/browser-reset` |
-| **28 Skills** | Knowledge packs and engines Claude invokes by name or picks up automatically, 10 of them also slash-invocable: `/dcr`, `/qa`, `/ux`, `/qa-video`, `/demo-video`, `/docs-sync`, `/swarm-research`, `/release`, `/whats-next`, `/lockdown`. The rest stand alone: `night-shift`, `jack-it-up`, `coverage-matrix`, `recursive-10-10-product-hardening`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `clone-website`, `claude-md-optimizer`, `memory-librarian`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
+| **28 Skills** | Knowledge packs and engines Claude picks up automatically, every one also typeable as `/name`. Ten used to ship as commands and keep their familiar slash workflow: `/dcr`, `/qa`, `/ux`, `/qa-video`, `/demo-video`, `/docs-sync`, `/swarm-research`, `/release`, `/whats-next`, `/lockdown`. The rest stand alone: `night-shift`, `jack-it-up`, `coverage-matrix`, `recursive-10-10-product-hardening`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `clone-website`, `claude-md-optimizer`, `memory-librarian`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
 | **Skill Packs** (optional, on by default) | Curated third-party skill collections pulled live from their upstream repos via the `npx skills` CLI, separate from the bundled suite: `marketing` (28 skills) + `design-extras`. Opt out with `--no-packs` or `jacked packs disable` |
 | **Memory Vault** (optional, opt in) | Cross-repo memory in a git-backed Markdown vault at `~/jacked-vault`. Event-triggered capture (session end plus merges to `main`), a budgeted SessionStart recall brief, and a `jacked memory` CLI. No database, no embeddings, Obsidian-compatible. Enable from the dashboard or `jacked memory init` |
 | **Statusline** (on by default) | One live status line inside every Claude Code session: model + effort, context use, 5h/7d rate limits with reset times, and the active account. Works on macOS, Linux, and Windows. Never replaces a statusline you set up yourself |
@@ -494,7 +494,7 @@ Use the double-check reviewer to review what we just built
 
 ### Skills
 
-Alongside the commands, `jacked install` ships 28 skills: knowledge packs and engines Claude invokes by name or picks up automatically when the task fits. Ten of them are also slash-invocable, so you can type them the same way you type a command:
+Alongside the commands, `jacked install` ships 28 skills: knowledge packs and engines Claude invokes by name or picks up automatically when the task fits. Every skill answers to `/name`; these ten used to ship as commands and keep their familiar slash workflow:
 
 | Skill | What It Does |
 |-------|--------------|

@@ -309,21 +309,21 @@ def _removed_diff(name: str) -> m.ManifestDiff:
 def test_prune_removed_deletes_hash_matching_skill(tmp_path):
     d = _skill(_skills_base(tmp_path), "gone", "jacked body")
     prior = _manifest({"gone": m.skill_dir_hash(d)})
-    assert m.prune_removed(_removed_diff("gone"), tmp_path, prior) == ["skills/gone"]
+    assert m.prune_removed(_removed_diff("gone"), tmp_path, prior) == (["skills/gone"], [])
     assert not d.exists()
 
 
 def test_prune_removed_keeps_modified_skill(tmp_path):
     d = _skill(_skills_base(tmp_path), "gone", "user rewrote this")
     prior = _manifest({"gone": "sha256:whatever-jacked-shipped"})
-    assert m.prune_removed(_removed_diff("gone"), tmp_path, prior) == []
+    assert m.prune_removed(_removed_diff("gone"), tmp_path, prior) == ([], [])
     assert (d / "SKILL.md").read_text() == "user rewrote this"
 
 
 def test_prune_removed_ignores_unsafe_names(tmp_path):
     victim = _skill(tmp_path, "outside", "not yours")
     d = _removed_diff("../outside")
-    assert m.prune_removed(d, tmp_path / ".claude", _manifest({})) == []
+    assert m.prune_removed(d, tmp_path / ".claude", _manifest({})) == ([], [])
     assert victim.exists()
 
 

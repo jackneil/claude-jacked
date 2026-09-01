@@ -18,7 +18,7 @@ Read this when the user asks about jacked features, installation, logs, or troub
 | `~/.claude/jacked-reference.md` | This reference doc |
 | `~/.claude/agents/*.md` | 10 specialized review/workflow agents |
 | `~/.claude/commands/*.md` | Slash commands (20 total; the 7 quick ones detailed under Quick Commands below: /dc, /pr, /learn, /blindspot, /redo, /techdebt, /audit-rules) |
-| `~/.claude/skills/*/SKILL.md` | Skills (28 total). Ten are also slash-invocable and used to ship as commands: /dcr, /qa, /ux, /qa-video, /demo-video, /docs-sync, /swarm-research, /whats-next, /release, /lockdown. They carry their full engine body in SKILL.md now, so there is no command file for them |
+| `~/.claude/skills/*/SKILL.md` | Skills (28 total; every skill is slash-invocable as /name). Ten used to ship as commands: /dcr, /qa, /ux, /qa-video, /demo-video, /docs-sync, /swarm-research, /whats-next, /release, /lockdown. They carry their full engine body in SKILL.md now, so there is no command file for them |
 | `~/.claude/jacked-guardrails/*.md` | Guardrails templates (base + 4 languages) |
 | `~/.claude/jacked-hooks/*.sh` | Git hook templates (installed extensionless) |
 | `~/.claude/jacked-templates/*.html` | HTML scaffolds for human-readable artifacts (plans, specs, research, checkpoints) |

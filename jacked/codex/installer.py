@@ -131,8 +131,8 @@ _CLAUDE_ONLY_SKILLS = frozenset({"chain-of-command", "recover"})
 #                      completion-condition engine.
 #   browser-reset.md - diagnoses Claude Code's MCP plumbing (Claude log paths, the
 #                      `claude mcp` CLI, plugin MCP servers).
-#   jacked-setup.md  - generates a repo-local .claude/commands + .claude/skills
-#                      layout that Codex never reads.
+#   jacked-setup.md  - generates repo-local .claude/skills files that Codex
+#                      never reads.
 # Excluded names never enter the Codex prompts dict, so they're never written to
 # ~/.codex/prompts and never recorded in the Codex manifest.
 _CLAUDE_ONLY_COMMANDS = frozenset(
@@ -244,6 +244,12 @@ def install_codex(
             _atomic_write_text(prompts_dst / f"{name}.md", engine)
         except OSError as e:
             logger.warning("skipping Codex prompt %s.md: %s", name, e)
+            # Carry the prior hash forward so a transient write failure (AV
+            # lock, read-only file) keeps the existing good prompt instead of
+            # letting the prune below delete it.
+            _prev = ((prior or {}).get("prompts") or {}).get(f"{name}.md")
+            if _prev:
+                prompts[f"{name}.md"] = _prev
             continue
         prompts[f"{name}.md"] = _sha_text(engine)
 
@@ -269,6 +275,15 @@ def install_codex(
             content = _command_skill_md(cmd)
             try:
                 shutil.copy(cmd, prompts_dst / cmd.name)
+            except OSError as e:
+                logger.warning("skipping Codex command %s: %s", cmd.name, e)
+                # Same transient-failure guard as the skills pass: keep the
+                # existing good prompt out of the prune's reach.
+                _prev = ((prior or {}).get("prompts") or {}).get(cmd.name)
+                if _prev:
+                    prompts[cmd.name] = _prev
+                continue
+            try:
                 prompts[cmd.name] = _sha_file(cmd)
                 # this_run=skills: a wrapper dir step 1 wrote this run is jacked's
                 # own, not user content, so overwriting it must not spawn a backup.
@@ -280,7 +295,9 @@ def install_codex(
                 )
                 _write_solo_skill(skill_dir, content)
             except OSError as e:
-                logger.warning("skipping Codex command %s: %s", cmd.name, e)
+                logger.warning(
+                    "skipping Codex command-derived skill %s: %s", cmd.stem, e
+                )
                 continue
             skills[cmd.stem] = _sha_dir(skill_dir)
 
