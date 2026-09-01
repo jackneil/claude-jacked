@@ -17,12 +17,21 @@ from pathlib import Path
 
 import pytest
 
-DATA = Path(__file__).resolve().parents[2] / "jacked" / "data" / "commands"
+DATA = Path(__file__).resolve().parents[2] / "jacked" / "data"
+WHATS_NEXT = DATA / "skills" / "whats-next" / "SKILL.md"
+
+ENGINE_MARKER = "<!-- ENGINE -->"
 
 
 @pytest.fixture(scope="module")
 def engine() -> str:
-    return (DATA / "whats-next.md").read_text(encoding="utf-8")
+    """The engine body only — the shipped skill prefixes frontmatter and a
+    repo-dispatch preamble above `<!-- ENGINE -->`, and neither is part of the
+    engine contract these tests guard (the intro assertions in particular read
+    the first characters of the engine, not of the file)."""
+    text = WHATS_NEXT.read_text(encoding="utf-8")
+    assert ENGINE_MARKER in text, f"{WHATS_NEXT} is missing its {ENGINE_MARKER} marker"
+    return text.split(ENGINE_MARKER, 1)[1].lstrip("\n")
 
 
 def _section(engine: str, header: str) -> str:
@@ -299,7 +308,7 @@ def test_setup_uses_strategic_emphasis_not_stale_tiers(engine: str) -> None:
     """The /jacked-setup whats-next standalone template must emit the new
     Strategic Emphasis block, not the stale tier-weight vocabulary that the
     redesigned engine no longer understands (config-contract integrity)."""
-    setup = (DATA / "jacked-setup.md").read_text(encoding="utf-8")
+    setup = (DATA / "commands" / "jacked-setup.md").read_text(encoding="utf-8")
     start = setup.index("### whats-next standalone template:")
     after = setup.find("\n### ", start + 1)
     template = setup[start:after if after != -1 else None]

@@ -5,7 +5,10 @@ Codex pass when Codex is present, writing the native Codex installables:
 
 - skills   -> ~/.agents/skills/<name>/   (FULL dir incl. sidecar files: the
              agentskills.io standard Codex discovers; jacked's SKILL.md already
-             carries name+description frontmatter)
+             carries name+description frontmatter). A skill whose SKILL.md holds
+             an `<!-- ENGINE -->` line also emits ~/.codex/prompts/<name>.md from
+             its frontmatter + engine (those skills absorbed former command
+             bodies, and Codex users keep the $<name> prompt).
 - commands -> BOTH ~/.codex/prompts/<name>.md (invoked /prompts:<name> in Codex)
              AND ~/.agents/skills/<stem>/SKILL.md. OpenAI deprecated the
              ~/.codex/prompts surface on 2026-01-22 in favor of skills, so each
@@ -81,6 +84,7 @@ from ._generate import (
     _first_nonempty_line as _first_nonempty_line,
     _is_jacked_owned as _is_jacked_owned,
     _preserve_user_skill_dir as _preserve_user_skill_dir,
+    _skill_engine_prompt as _skill_engine_prompt,
     _split_command_frontmatter as _split_command_frontmatter,
 )
 from ._managed import (
@@ -127,8 +131,8 @@ _CLAUDE_ONLY_SKILLS = frozenset({"chain-of-command", "recover"})
 #                      completion-condition engine.
 #   browser-reset.md - diagnoses Claude Code's MCP plumbing (Claude log paths, the
 #                      `claude mcp` CLI, plugin MCP servers).
-#   jacked-setup.md  - generates a repo-local .claude/commands + .claude/skills
-#                      layout that Codex never reads.
+#   jacked-setup.md  - generates repo-local .claude/skills files that Codex
+#                      never reads.
 # Excluded names never enter the Codex prompts dict, so they're never written to
 # ~/.codex/prompts and never recorded in the Codex manifest.
 _CLAUDE_ONLY_COMMANDS = frozenset(
@@ -208,7 +212,14 @@ def install_codex(
     #    Before overwriting a target, `_preserve_user_skill_dir` moves aside any
     #    NON-jacked dir that collides with a skill name (shared ~/.agents/skills),
     #    so a user's own dir is never silently destroyed.
+    #    A skill whose SKILL.md carries the `<!-- ENGINE -->` marker absorbed a
+    #    former command body, so it ALSO ships as a ~/.codex/prompts/<name>.md
+    #    (frontmatter + engine, dropping the Claude-side repo-dispatch preamble)
+    #    and is recorded in `prompts` exactly like a command-derived one. Driven
+    #    by the marker, never a name list, so the prompt set can't drift from what
+    #    data/skills actually ships.
     skills: dict = {}
+    prompts: dict = {}
     for skill_md in sorted((data_root / "skills").glob("*/SKILL.md")):
         name = skill_md.parent.name
         if name in _CLAUDE_ONLY_SKILLS:
@@ -223,8 +234,32 @@ def install_codex(
             _copy_tree(skill_md.parent, skills_base / name)
         except OSError as e:
             logger.warning("skipping Codex skill %s: %s", name, e)
+            # Carry prior hashes forward: a transient write failure must not let
+            # the prune below delete the existing good dir or prompt.
+            _prev_skill = ((prior or {}).get("skills") or {}).get(name)
+            if _prev_skill:
+                skills[name] = _prev_skill
+            _prev_prompt = ((prior or {}).get("prompts") or {}).get(f"{name}.md")
+            if _prev_prompt:
+                prompts[f"{name}.md"] = _prev_prompt
             continue
         skills[name] = expected
+        engine = _skill_engine_prompt(skill_md)
+        if engine is None:
+            continue
+        try:
+            prompts_dst.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(prompts_dst / f"{name}.md", engine)
+        except OSError as e:
+            logger.warning("skipping Codex prompt %s.md: %s", name, e)
+            # Carry the prior hash forward so a transient write failure (AV
+            # lock, read-only file) keeps the existing good prompt instead of
+            # letting the prune below delete it.
+            _prev = ((prior or {}).get("prompts") or {}).get(f"{name}.md")
+            if _prev:
+                prompts[f"{name}.md"] = _prev
+            continue
+        prompts[f"{name}.md"] = _sha_text(engine)
 
     # 2. Commands -> prompts AND command-derived skills. Claude-only commands are
     #    skipped so they never land in Codex (and the prune loop below deletes any
@@ -235,7 +270,10 @@ def install_codex(
     #    pointer-wrapper dir, leaving only the generated SKILL.md, and is recorded
     #    in the SAME `skills` manifest dict (keyed by stem) so a changed command
     #    changes the hash and a removed command is pruned like any other skill.
-    prompts: dict = {}
+    #    A command and a marker-carrying skill of the same name both want
+    #    ~/.codex/prompts/<name>.md; this pass runs second, so the COMMAND wins
+    #    (file and manifest entry both overwritten) - the precedence the prompts
+    #    surface has always had, kept stable rather than left to dict ordering.
     if (data_root / "commands").exists():
         prompts_dst.mkdir(parents=True, exist_ok=True)
         for cmd in sorted((data_root / "commands").glob("*.md")):
@@ -245,6 +283,19 @@ def install_codex(
             content = _command_skill_md(cmd)
             try:
                 shutil.copy(cmd, prompts_dst / cmd.name)
+            except OSError as e:
+                logger.warning("skipping Codex command %s: %s", cmd.name, e)
+                # Same transient-failure guard as the skills pass: keep the
+                # existing good prompt AND command-derived skill dir out of the
+                # prune's reach.
+                _prev = ((prior or {}).get("prompts") or {}).get(cmd.name)
+                if _prev:
+                    prompts[cmd.name] = _prev
+                _prev_skill = ((prior or {}).get("skills") or {}).get(cmd.stem)
+                if _prev_skill:
+                    skills[cmd.stem] = _prev_skill
+                continue
+            try:
                 prompts[cmd.name] = _sha_file(cmd)
                 # this_run=skills: a wrapper dir step 1 wrote this run is jacked's
                 # own, not user content, so overwriting it must not spawn a backup.
@@ -256,7 +307,12 @@ def install_codex(
                 )
                 _write_solo_skill(skill_dir, content)
             except OSError as e:
-                logger.warning("skipping Codex command %s: %s", cmd.name, e)
+                logger.warning(
+                    "skipping Codex command-derived skill %s: %s", cmd.stem, e
+                )
+                _prev_skill = ((prior or {}).get("skills") or {}).get(cmd.stem)
+                if _prev_skill:
+                    skills[cmd.stem] = _prev_skill
                 continue
             skills[cmd.stem] = _sha_dir(skill_dir)
 

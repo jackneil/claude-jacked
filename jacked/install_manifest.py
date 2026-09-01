@@ -357,14 +357,40 @@ def write(path, version: str, current_hashes: dict, now_iso: str) -> None:
     tmp.replace(path)
 
 
-def prune_removed(d: ManifestDiff, home, prior: Optional[dict] = None) -> list[str]:
+def _move_aside_flat(target: Path, key: str, now=None) -> Path:
+    """Move a flat artifact to ``~/.claude/jacked-backups/<key>/<stem>-<ts><ext>``.
+
+    Same contract as `backup_dir_for`: outside the live tree, never clobbers an
+    earlier backup."""
+    from datetime import datetime, timezone
+
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    root = target.parents[1] / "jacked-backups" / key
+    base = root / f"{target.stem}-{stamp}{target.suffix}"
+    backup, n = base, 2
+    while backup.exists() or backup.is_symlink():
+        backup = base.with_name(f"{target.stem}-{stamp}-{n}{target.suffix}")
+        n += 1
+    root.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(target), str(backup))
+    return backup
+
+
+def prune_removed(
+    d: ManifestDiff, home, prior: Optional[dict] = None
+) -> tuple[list[str], list[str]]:
     """Delete artifacts jacked shipped before but no longer ships.
 
-    When `prior` (the manifest that recorded them) is supplied, a skill DIR is
-    deleted only if its content still matches what jacked installed; a dir the
-    user modified or recreated is left in place and logged."""
+    Returns ``(pruned, preserved)``. When `prior` (the manifest that recorded
+    them) is supplied, a skill DIR is deleted only if its content still matches
+    what jacked installed; a dir the user modified or recreated is left in place
+    and logged. A FLAT artifact (command/agent/lens/template) whose bytes no
+    longer match the recorded hash was edited by the user: it is moved into
+    ``~/.claude/jacked-backups/<category>/`` instead of unlinked, and reported
+    in `preserved`."""
     home = Path(home)
     pruned: list[str] = []
+    preserved: list[str] = []
     cat_by_key = {c.key: c for c in CATEGORIES}
     for key, cd in d.by_category.items():
         cat = cat_by_key.get(key)
@@ -390,8 +416,116 @@ def prune_removed(d: ManifestDiff, home, prior: Optional[dict] = None) -> list[s
                     shutil.rmtree(target)
                     pruned.append(f"{key}/{name}")
                 elif target.exists():
-                    target.unlink()
-                    pruned.append(f"{key}/{name}")
+                    # Positive proof only: delete when the bytes still match the
+                    # recorded hash; anything else (edited file, unreadable file,
+                    # malformed manifest value) is moved aside, never unlinked.
+                    recorded = _recorded(prior, key, name)
+                    try:
+                        current = _sha256_file(target)
+                    except OSError:
+                        current = None
+                    if recorded is not None and current == recorded:
+                        target.unlink()
+                        pruned.append(f"{key}/{name}")
+                    else:
+                        backup = _move_aside_flat(target, key)
+                        logger.warning(
+                            "preserved your modified %s as %s (jacked no longer "
+                            "ships it)", target, backup,
+                        )
+                        preserved.append(f"{key}/{name}")
             except OSError as e:
                 logger.warning("Could not prune %s: %s", target, e)
-    return pruned
+    return pruned, preserved
+
+
+def remove_or_preserve_flat(target, key, name, prior: Optional[dict], src=None) -> Optional[str]:
+    """Uninstall's gate for one flat artifact: ``"removed"``, ``"preserved"``,
+    or None when nothing exists at the path (or it could not be removed).
+
+    Mirrors `skill_removal_decision` for files: a symlink (jacked's own
+    editable-install mechanism) is unlinked; a real file is unlinked only when
+    its bytes match the recorded manifest hash OR the packaged source `src`
+    (the pre-manifest-install fallback). Anything else was edited by the user
+    and is moved into ``~/.claude/jacked-backups/<category>/`` instead."""
+    target = Path(target)
+    if not (target.exists() or target.is_symlink()):
+        return None
+    try:
+        if target.is_symlink():
+            target.unlink()
+            return "removed"
+        current = _sha256_file(target)
+        if _recorded(prior, key, name) == current:
+            target.unlink()
+            return "removed"
+        if src is not None:
+            try:
+                if current == _sha256_file(Path(src)):
+                    target.unlink()
+                    return "removed"
+            except OSError:
+                pass
+        backup = _move_aside_flat(target, key)
+        logger.warning("preserved your modified %s as %s", target, backup)
+        return "preserved"
+    except OSError as e:
+        logger.warning("Could not remove %s: %s", target, e)
+        return None
+
+
+def migrated_skill_names(data_root) -> set[str]:
+    """Names of shipped skills that absorbed a former command body.
+
+    The ``<!-- ENGINE -->`` marker line IS the producer's record of the
+    migration, so the set is derived from the data tree rather than restated as
+    a list that could drift."""
+    out: set[str] = set()
+    for skill_md in Path(data_root).glob("skills/*/SKILL.md"):
+        try:
+            text = skill_md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if any(line.strip() == "<!-- ENGINE -->" for line in text.splitlines()):
+            out.add(skill_md.parent.name)
+    return out
+
+
+def sweep_migrated_commands(home, skill_names, prior: Optional[dict]) -> tuple[list[str], list[str]]:
+    """Belt-and-braces cleanup for commands that became skills.
+
+    A ``~/.claude/commands/<name>.md`` whose name is one of the MIGRATED skills
+    (`migrated_skill_names`) is usually a leftover from an older dual-shipped
+    install. With a usable prior manifest the diff-driven prune already handled
+    it; without one (missing or corrupt manifest) `diff` reports nothing
+    removed, the file survives forever, and the freshly written manifest —
+    which no longer lists it — makes it unreachable by every later prune AND by
+    uninstall. This sweep closes that hole with positive proof only: the file
+    (or symlink target) is deleted when its bytes still match the recorded
+    manifest hash. Anything unproven — no manifest, edited bytes, a user's own
+    file or dotfile symlink that merely shares the name — is LEFT IN PLACE and
+    reported in `stale` so the caller can tell the user about it (the shipped
+    skill shadows it in Claude Code, so it is inert; touching it without proof
+    would be worse than the clutter). Returns ``(removed, stale)``."""
+    home = Path(home)
+    removed: list[str] = []
+    stale: list[str] = []
+    for name in sorted(skill_names):
+        if not _is_safe_name(name):
+            continue
+        target = home / ".claude" / "commands" / f"{name}.md"
+        if not (target.exists() or target.is_symlink()):
+            continue
+        try:
+            recorded = _recorded(prior, "commands", f"{name}.md")
+            # _sha256_file reads THROUGH a symlink, so jacked's own
+            # editable-install links match their recorded source hash too.
+            if recorded is not None and _sha256_file(target) == recorded:
+                target.unlink()
+                removed.append(f"commands/{name}.md")
+            else:
+                stale.append(f"commands/{name}.md")
+        except OSError as e:
+            logger.warning("Could not sweep %s: %s", target, e)
+            stale.append(f"commands/{name}.md")
+    return removed, stale

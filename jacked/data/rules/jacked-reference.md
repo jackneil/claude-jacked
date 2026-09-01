@@ -17,7 +17,8 @@ Read this when the user asks about jacked features, installation, logs, or troub
 | `~/.claude/CLAUDE.md` | Behavioral rules (between `# jacked-behaviors-v2` markers) |
 | `~/.claude/jacked-reference.md` | This reference doc |
 | `~/.claude/agents/*.md` | 10 specialized review/workflow agents |
-| `~/.claude/commands/*.md` | Slash commands (29 total; the 7 quick ones detailed under Quick Commands below: /dc, /pr, /learn, /blindspot, /redo, /techdebt, /audit-rules) |
+| `~/.claude/commands/*.md` | Slash commands (20 total; the 7 quick ones detailed under Quick Commands below: /dc, /pr, /learn, /blindspot, /redo, /techdebt, /audit-rules) |
+| `~/.claude/skills/*/SKILL.md` | Skills (28 total; every skill is slash-invocable as /name). Ten used to ship as commands: /dcr, /qa, /ux, /qa-video, /demo-video, /docs-sync, /swarm-research, /whats-next, /release, /lockdown. They carry their full engine body in SKILL.md now, so there is no command file for them |
 | `~/.claude/jacked-guardrails/*.md` | Guardrails templates (base + 4 languages) |
 | `~/.claude/jacked-hooks/*.sh` | Git hook templates (installed extensionless) |
 | `~/.claude/jacked-templates/*.html` | HTML scaffolds for human-readable artifacts (plans, specs, research, checkpoints) |
@@ -161,7 +162,7 @@ What ships to Codex:
 | jacked artifact | Codex target | Notes |
 |------|------|------|
 | Skills | `~/.agents/skills/<name>/` | Full directory copy (sidecar files included), the agentskills.io format Codex discovers. |
-| Commands | `~/.codex/prompts/<name>.md` AND `~/.agents/skills/<stem>/SKILL.md` | OpenAI deprecated `~/.codex/prompts` on 2026-01-22 in favor of skills, so each non-excluded command also ships as a command-derived skill; the prompts copy stays for back-compat during the deprecation window. The command-derived skill replaces the same-name thin pointer-wrapper skill (command content wins). |
+| Commands | `~/.codex/prompts/<name>.md` AND `~/.agents/skills/<stem>/SKILL.md` | OpenAI deprecated `~/.codex/prompts` on 2026-01-22 in favor of skills, so each non-excluded command also ships as a command-derived skill; the prompts copy stays for back-compat during the deprecation window. This applies to the command files only. The ten migrated names (`dcr`, `qa`, `ux`, `qa-video`, `demo-video`, `docs-sync`, `swarm-research`, `whats-next`, `release`, `lockdown`) are skills now and ship their full content straight across, with their `$name` prompts generated from the skill. |
 | Rules | managed block in `~/.codex/AGENTS.md` | The Claude-authored behaviors, adapted for Codex: `CLAUDE.md` references rewritten to `AGENTS.md`, plus a "Codex runtime adapter" section that maps Claude vocabulary to Codex equivalents (slash commands to `$skill` invocations, the Task/Agent tool to native subagents, Claude model lanes ignored, `mcp__chrome-devtools__*` names, plan mode). |
 | Review agents | `~/.codex/agents/<name>.toml` | The 10 review agents converted to Codex custom-agent TOML (`name`, `description`, `developer_instructions`), with no model pin so Codex picks its own. |
 | chrome-devtools MCP | jacked-managed marker block in `~/.codex/config.toml` | Registers the same npx server the Claude side uses, so Codex skills referencing `mcp__chrome-devtools__*` resolve. A user's own chrome-devtools entry is never touched, and a write that would break the TOML is rolled back. |

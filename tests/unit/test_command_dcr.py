@@ -8,6 +8,10 @@ back to a Claude reviewer instead of silently dropping a lens, and Codex
 findings still pass finding validation before any fix. Like the other command
 tests, these are string-presence checks on the LLM instruction document, not
 runtime-behavior assertions.
+
+/dcr ships as a SKILL (`jacked/data/skills/dcr/SKILL.md`), not a command file,
+so every content assertion here is scoped to the engine body below the
+`<!-- ENGINE -->` marker rather than the repo-dispatch preamble above it.
 """
 
 from pathlib import Path
@@ -15,17 +19,46 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CMD = REPO_ROOT / "jacked" / "data" / "commands" / "dcr.md"
-REPO_WRAPPER = REPO_ROOT / ".claude" / "commands" / "dcr.md"
+CMD = REPO_ROOT / "jacked" / "data" / "skills" / "dcr" / "SKILL.md"
+REPO_WRAPPER = REPO_ROOT / ".claude" / "skills" / "dcr" / "SKILL.md"
+
+ENGINE_MARKER = "<!-- ENGINE -->"
+
+
+def _engine_body(text: str) -> str:
+    """The shipped engine: everything after the `<!-- ENGINE -->` marker.
+
+    A shipped skill is `frontmatter + repo-dispatch preamble + <!-- ENGINE --> +
+    engine body`. The content contract below is about the ENGINE, so the
+    preamble must not be able to satisfy (or break) an assertion.
+    """
+    assert ENGINE_MARKER in text, f"shipped skill is missing its {ENGINE_MARKER} marker"
+    return text.split(ENGINE_MARKER, 1)[1].lstrip("\n")
 
 
 @pytest.fixture(scope="module")
 def dcr() -> str:
-    return CMD.read_text(encoding="utf-8")
+    return _engine_body(CMD.read_text(encoding="utf-8"))
 
 
-def test_dcr_command_exists():
-    assert CMD.exists(), "jacked/data/commands/dcr.md must exist (ships via the install glob)"
+def test_dcr_skill_exists():
+    assert CMD.exists(), "jacked/data/skills/dcr/SKILL.md must exist (ships via the install glob)"
+
+
+def test_shipped_skill_shape_is_preamble_then_single_engine_marker():
+    """Pin the migrated file shape: frontmatter, then the repo-dispatch preamble
+    that redirects to a `/jacked-setup`-generated repo skill, then exactly one
+    `<!-- ENGINE -->` line. Two markers (or a preamble below the marker) would
+    make every engine-scoped assertion in this file read the wrong half."""
+    text = CMD.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    markers = [i for i, line in enumerate(lines) if line.strip() == ENGINE_MARKER]
+    assert len(markers) == 1, f"expected exactly one {ENGINE_MARKER} line, found {len(markers)}"
+    head = "\n".join(lines[: markers[0]])
+    assert head.startswith("---\n")
+    assert "`.claude/skills/dcr/SKILL.md` exists" in head, (
+        "repo-dispatch preamble must sit ABOVE the engine marker"
+    )
 
 
 def test_engine_section_present_with_both_engines(dcr: str):
@@ -92,8 +125,8 @@ def test_report_names_the_engine(dcr: str):
 
 
 def test_repo_wrapper_carries_engine_section():
-    """The repo's generated .claude/commands/dcr.md wrapper must stay in sync
-    on the engine contract (it embeds the full command body)."""
+    """The repo's generated .claude/skills/dcr/SKILL.md wrapper must stay in sync
+    on the engine contract (it embeds the full engine body)."""
     wrapper = REPO_WRAPPER.read_text(encoding="utf-8")
     for anchor in (
         "## REVIEW ENGINE",
@@ -190,14 +223,16 @@ def test_repo_wrapper_carries_tier_contract():
 
 def test_repo_wrapper_embeds_engine_body_verbatim():
     """The wrapper contract is 'repo-config header + the shipped engine body
-    verbatim (front matter stripped)'. Anchor checks alone let the two drift on
-    any non-anchor line; containment makes desync impossible to miss."""
+    verbatim' — the engine being everything below the data skill's
+    `<!-- ENGINE -->` marker (frontmatter and repo-dispatch preamble dropped).
+    Anchor checks alone let the two drift on any non-anchor line; containment
+    makes desync impossible to miss."""
     shipped = CMD.read_text(encoding="utf-8")
     assert shipped.startswith("---\n")
-    body = shipped[shipped.index("\n---\n", 4) + len("\n---\n"):].lstrip("\n")
+    body = _engine_body(shipped)
     wrapper = REPO_WRAPPER.read_text(encoding="utf-8")
     assert body in wrapper, (
-        "repo .claude/commands/dcr.md no longer embeds the shipped engine body "
+        "repo .claude/skills/dcr/SKILL.md no longer embeds the shipped engine body "
         "verbatim — rebuild the wrapper (or re-run /jacked-setup dcr)"
     )
 

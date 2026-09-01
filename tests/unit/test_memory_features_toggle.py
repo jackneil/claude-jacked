@@ -410,8 +410,8 @@ EDITED_MD = [
     DATA / "commands" / "learn.md",
     DATA / "commands" / "goal-maker.md",
     DATA / "commands" / "bhag.md",
-    DATA / "commands" / "dcr.md",
-    DATA / "commands" / "release.md",
+    DATA / "skills" / "dcr" / "SKILL.md",
+    DATA / "skills" / "release" / "SKILL.md",
     DATA / "skills" / "checkpoint" / "SKILL.md",
 ]
 
@@ -420,14 +420,19 @@ EDITED_MD = [
 _VAULT_TOKENS = ("jacked memory", "memory vault", "memory migrate")
 
 
-@pytest.mark.parametrize("path", EDITED_MD, ids=lambda p: p.name)
+def _mid(p):
+    """Test id: a skill's identity is its directory, not the SKILL.md filename."""
+    return p.parent.name if p.name == "SKILL.md" else p.name
+
+
+@pytest.mark.parametrize("path", EDITED_MD, ids=_mid)
 def test_command_file_has_guarded_memory_block(path):
     text = path.read_text(encoding="utf-8")
     assert "jacked memory status --quiet" in text
     assert "jacked memory add" in text
 
 
-@pytest.mark.parametrize("path", EDITED_MD, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", EDITED_MD, ids=_mid)
 def test_memory_block_lines_have_no_em_dash(path):
     for line in path.read_text(encoding="utf-8").splitlines():
         if any(tok in line.lower() for tok in _VAULT_TOKENS):
