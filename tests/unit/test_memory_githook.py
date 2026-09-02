@@ -116,7 +116,7 @@ def _mock_distill(monkeypatch, raw):
     """Monkeypatch the single claude -p call. call_claude returns ``(text, cause)``;
     a canned string is a success (cause None), ``None`` models distillation
     unavailable (the deterministic fallback then fires regardless of cause)."""
-    monkeypatch.setattr(capture, "call_claude", lambda prompt, model: (raw, None))
+    monkeypatch.setattr(capture, "call_claude", lambda prompt, model, **kw: (raw, None))
 
 
 # --------------------------------------------------------------------------- #
@@ -472,7 +472,7 @@ def test_capture_merge_preserves_concurrent_processed_sha(env, no_gh, monkeypatc
     repo = _merge_repo(env.tmp / "widget")
     _do_merge(repo)
 
-    def _distill_and_inject(prompt, model):
+    def _distill_and_inject(prompt, model, **kw):
         # A concurrent hook records shaA between our initial load and our save.
         st = memory.load_state(env.home)
         pm = dict(st.get("processed_merges") or {})

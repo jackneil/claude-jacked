@@ -349,9 +349,9 @@ def test_step_8_drives_to_completion_not_turn_capped(engine: str) -> None:
     worklist; completed work never triggers a stop."""
     s = _section(engine, "## Step 8")
     assert "blocked after <N> turns" not in s   # the old success-cap is gone
-    assert "TRUE completion" in s               # drive to completion, not a turn budget
-    assert "no-progress" in s.lower()           # the only loop-halt is stuck-detection
-    assert "stuck-detection" in s.lower()
+    assert "completed milestones are success" in s.lower()  # drive to completion, not a turn budget
+    assert "no-progress" in s.lower()           # the only loop-halt is a stuck run
+    assert "stuck run" in s.lower()
     assert "BLOCKED" in s                       # a genuine block still halts (that item)
 
 

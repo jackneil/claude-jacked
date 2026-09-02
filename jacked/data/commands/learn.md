@@ -47,18 +47,18 @@ Either way, note this in your output: "This lesson is graduating from <lessons.m
 
 Write a concise rule following these principles:
 - **1-3 lines maximum** - if it takes a paragraph, it's too vague
-- **Lead with ALWAYS or NEVER** when possible - directives, not suggestions
+- **Write it as a plain directive with its reason** - "use X because Y", not a suggestion. Reserve `ALWAYS`/`NEVER` for a hard constraint (safety, data, compliance, a destructive command) that has actually recurred; a prompt full of capitalised absolutes stops carrying information and makes the model rigid in the gray areas the rule never anticipated
 - **Lead with WHY** - the reason makes the rule stick
-- **Be concrete** - "ALWAYS use pydantic v2 for model definitions" not "use modern libraries"
+- **Be concrete** - "use pydantic v2 for model definitions (v1 validators are deprecated)" not "use modern libraries"
 - **Be actionable** - Claude should know exactly what to do differently
 - **Match firmness to proven confidence** - a lesson that has recurred 2-3x (graduating from lessons.md or auto-memory) has earned a hard `ALWAYS`/`NEVER`. A first-time, single-observation lesson is a *hypothesis*, not a law: write it as a softer note (e.g. "prefer X over Y" / "this repo seems to use pnpm") or leave it in lessons.md/auto-memory to mature — do NOT promote a one-off into an enforced rule. One light inline marker is enough; don't invent a confidence schema.
 - **NEVER hardcode machine-specific paths** (e.g. `/Users/jack/...`, `/home/user/...`, `~/.local/share/uv/tools/...`). Use generic references like "the project root", "the Claude config directory", or `~/.claude/` when referring to well-known locations. These files get synced to the repo and must work for any contributor.
 
 Good examples:
 ```
-- ALWAYS use absolute paths when calling Edit tool (relative paths cause bugs on Windows)
-- NEVER commit .env files - use .env.example with placeholder values instead
-- when creating pydantic models, ALWAYS use pydantic v2 field validators (v1 @validator is deprecated)
+- use absolute paths when calling the Edit tool (relative paths break on Windows)
+- NEVER commit .env files - use .env.example with placeholder values instead (leaked credentials)
+- when creating pydantic models, use pydantic v2 field validators (v1 @validator is deprecated)
 ```
 
 Bad examples:

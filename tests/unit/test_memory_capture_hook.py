@@ -109,7 +109,7 @@ def _mock_triage(env, response, cause=None):
     """
     if response is None and cause is None:
         cause = "claude exited 1"
-    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model: (response, cause))
+    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model, **kw: (response, cause))
 
 
 def _episodic_files(env, group="myrepo", repo_short="myrepo"):
@@ -473,6 +473,33 @@ def test_call_claude_returns_stdout_and_no_cause_on_success(env):
         text, cause = capture.call_claude("prompt", "haiku")
     assert text == '{"episodic": "ok", "semantic": null}'
     assert cause is None
+
+
+def test_call_claude_passes_schema_as_structured_output_flags(env):
+    """A schema turns on the CLI's structured output; without one argv is bare."""
+    seen = {}
+
+    class _P:
+        returncode = 0
+        stdout = "{}"
+
+    def _run(argv, **kw):
+        seen["argv"] = argv
+        return _P()
+
+    with patch("subprocess.run", side_effect=_run):
+        capture.call_claude("prompt", "haiku", schema={"type": "object"})
+    assert "--json-schema" in seen["argv"] and "--output-format" in seen["argv"]
+    with patch("subprocess.run", side_effect=_run):
+        capture.call_claude("prompt", "haiku")
+    assert "--json-schema" not in seen["argv"]
+
+
+def test_parse_triage_unwraps_cli_envelope():
+    env_json = '{"result": "{\\"episodic\\": \\"ok\\", \\"semantic\\": null}"}'
+    assert capture.parse_triage(env_json) == {"episodic": "ok", "semantic": None}
+    structured = '{"structured_output": {"episodic": "ok", "semantic": null}}'
+    assert capture.parse_triage(structured) == {"episodic": "ok", "semantic": None}
 
 
 # --------------------------------------------------------------------------- #

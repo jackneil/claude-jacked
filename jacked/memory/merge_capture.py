@@ -56,6 +56,28 @@ _PRUNE_DAYS = 90
 
 _MAIN_BRANCHES = ("main", "master")
 
+# Output contract for the distillation pass, enforced by the CLI (--json-schema).
+MERGE_SCHEMA = {
+    "anyOf": [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["skip"],
+            "properties": {"skip": {"type": "boolean", "enum": [True]}},
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["title", "body", "tags"],
+            "properties": {
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    ]
+}
+
 # "Merge pull request #123 from owner/branch"
 _PR_RE = re.compile(r"Merge pull request #(\d+) from (\S+)")
 # "Merge branch 'feature/x'" (optionally "... into main")
@@ -147,7 +169,7 @@ def _capture_one_merge(
     prompt = _build_prompt(
         subject, merged_branch, pr_number, pr_title, pr_body, pr_trimmed, changed
     )
-    text, cause = capture.call_claude(prompt, model)
+    text, cause = capture.call_claude(prompt, model, schema=MERGE_SCHEMA)
     if cause is not None:
         logger.warning(
             "memory merge-capture: distillation failed (%s); using the deterministic fallback note",
@@ -302,7 +324,7 @@ def _build_prompt(
         "vault. A merge just landed on the main branch. Decide whether it is "
         "worth remembering as ONE durable decision note.\n\n"
         f"{capture.DATA_FRAMING}\n\n"
-        "Return STRICT JSON ONLY -- no prose, no markdown fences -- either:\n"
+        "Return one of these two JSON shapes:\n"
         '{"skip": true}   when nothing durable is worth keeping, OR\n'
         '{"title": "<short title>", "body": "<what landed and why it matters, in '
         'the vocabulary a future search would use>", "tags": ["<tag>", "..."]}\n\n'
@@ -314,7 +336,6 @@ def _build_prompt(
         "```\n"
         f"{meta}\n"
         "```\n"
-        "Return only the JSON object."
     )
 
 

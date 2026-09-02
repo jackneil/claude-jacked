@@ -147,3 +147,94 @@ Before adding any new commands, establish:
 - Reviewer B: Gary Tan's gstack analysis, UX/flow review of proposals
 - Reviewer C: Maintainability audit, cross-command coupling analysis, marketplace overlap
 - Pre-mortem: Feature bloat scenario, Anthropic overlap scenario, new user overwhelm scenario
+
+
+---
+
+## Proposal: teach `jacked install` about graphify, and about subscription billing
+
+> Added 2026-08-20 from a live hank-hq session that built a 2,500-node company
+> graph. Two separate proposals; the second is the one that costs users money
+> today.
+
+### 1. Offer graphify wiring in per-repo setup, where it earns its keep
+
+`jacked` does not mention graphify anywhere today (verified: zero hits across
+`jacked/`, `docs/`, `design/`). The graphify skill installs itself in its own
+Step 1. That is fine for a user who already knows it exists, and invisible to
+everyone else.
+
+**This costs zero command surface**, which matters given the 15-18 entity
+budget and the "subtract, don't add" finding above. graphify is a third-party
+tool; the proposal is that `/jacked-setup` *detects and offers* it, not that
+jacked absorbs it as a command.
+
+Where it pays off, and where it does not:
+
+- **Worth offering:** repos with a substantial prose corpus — contracts, board
+  minutes, investor updates, research notes, policy documents. In the source
+  session, a graph over an investor-update tree answered "which cyber policy is
+  in force and who is the named insured" across documents nobody had read
+  individually, and surfaced a partnership's status from an all-hands deck that
+  no one thought to look in.
+- **Not worth offering:** code-only repos. graphify extracts code structurally
+  via AST with no LLM and no key, so the semantic pass — the expensive part —
+  has nothing to do. Offering it there is noise.
+- **Detection heuristic:** count non-code files (`.md`, `.txt`, `.pdf`, `.docx`)
+  outside `node_modules`/`.git`. Offer above some threshold; stay silent below.
+
+Setup should also warn about the operational trap that bit this session: the
+sync/serve sides of a corpus drift silently. A glob uploads any file while a
+hardcoded allowlist serves only named ones, so a document lands and is
+unreachable with nothing failing to say so.
+
+### 2. Recommend subscription auth over API keys — everywhere, not just graphify
+
+**This is the load-bearing half.** Users on this box pay for Claude Code and
+Codex subscriptions. Any tool that reaches for a provider API key bills them a
+second time, per token, for work a subscription already covers.
+
+graphify's skill is a concrete example of the anti-pattern: it auto-selects the
+Gemini backend the moment `GEMINI_API_KEY` is set, with no prompt. Following it
+in the source session spent pay-as-you-go OpenAI credit on extraction the
+user's Codex subscription would have covered. A key being present is not
+consent to spend it.
+
+**Proposal:** `jacked install` / `/jacked-setup` should detect subscription
+auth and prefer it, in this order:
+
+1. `codex` CLI present and signed in -> `codex exec` (this is what `/dcr`'s
+   codex engine already does, so the pattern is proven in-tree)
+2. `claude` CLI -> plan auth (graphify ships a `claude-cli` backend priced
+   `0.0/0.0` for exactly this reason)
+3. provider API keys — last, and only with an explicit "this will spend API
+   credit" line before the first call
+
+`/dcr`'s review-engine card is the precedent worth generalising: it already
+frames the choice as "spend an OpenAI subscription instead of the Anthropic
+plan." That framing belongs at install time for every tool jacked touches, not
+just the review engine.
+
+### Measured notes, so nobody re-derives them
+
+Extraction quality and cost, same 26KB document, `gpt-5.6-luna` via graphify's
+`openai` backend:
+
+| reasoning_effort | nodes | edges | output tokens | substantive facts |
+| --- | --- | --- | --- | --- |
+| omitted (stock config) | 16 | 21 | 5,092 | 4/7 |
+| low | 9 | 10 | 4,164 | 2/7 |
+| high | 23 | 43 | 12,656 | 4/7 |
+| xhigh | 0 | 0 | 131,072 | 0/7 |
+
+- graphify's `openai` backend sets **no** `reasoning_effort` (its `gemini`
+  backend sets `"low"`), so a stock run is at the API default, not any
+  considered setting.
+- The `xhigh` row is a **ceiling artifact, not a model verdict**: `max_tokens`
+  is 16,384, reasoning tokens bill as output against that same cap, so the
+  model spent its whole budget thinking and emitted nothing. 131,072 / 16,384 =
+  exactly 8 calls, each pinned at the ceiling as adaptive retry bisected. Raise
+  the ceiling before judging high-effort modes.
+- Even at `high`, the cheap model captured 4/7 of the substantive facts against
+  7/7 for a frontier model. Route mechanical sweeps and drafts cheap; keep
+  extraction whose value is in the caveats on a frontier model.

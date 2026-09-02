@@ -115,7 +115,7 @@ For the highest-priority ready item:
 
 Regenerate `.night-shift/morning-report.html` at every run end (and keep it current at phase boundaries so a killed run still reports). Contents, in order: **what landed** (with evidence links), **decisions for you** (the User-decides queue, each with a recommendation), **what's queued** (top of the queue with the filing brain's case), **what's blocked** (with root-cause notes), **self-modifications** (learnings written, rules added, roster changes), and the night's cost/iteration counts. This is the product of the night — write it for a human who was asleep, not for a log parser.
 
-## Backstop — stuck-detection ONLY; NEVER cap successful work
+## Backstop: it catches a stuck run, never a productive one
 
 **Run end is defined here and ONLY here: a run ends when one of the four conditions below fires. Nothing else is a run end.** Not clock time, not "it's morning", not "the user will wake soon", not token/cost totals, not context exhaustion (the state substrate exists precisely so a fresh iteration continues from HOOK.md), and not a count of successes. The user's wake time is a *reporting* boundary — keep the morning report current — never a merge, verification, or stopping boundary. Do not ask the user mid-run "want me to continue?" — a polite question that functions as a stop is a stop.
 

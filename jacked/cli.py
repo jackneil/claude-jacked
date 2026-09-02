@@ -1121,6 +1121,7 @@ _JACKED_HOOK_PATH_MARKERS = (
     # security_gatekeeper.py living outside a jacked/data/hooks/ directory.
     "/jacked/data/hooks/",
     "jacked\" _hook ",                      # shim form we write: "<path>/jacked" _hook <name>
+    "jacked.exe\" _hook ",                  # same shim on Windows, where find_bin returns jacked.EXE
     "-m jacked _hook ",                     # fallback form (dev without PATH shim)
 )
 
@@ -1130,10 +1131,21 @@ def _is_jacked_managed_hook_path(command: str) -> bool:
 
     Anchored to path substrings we write — won't falsely match a user's
     own script named security_gatekeeper.py in an unrelated directory.
+    Case-insensitive: the Windows shim is written as ``jacked.EXE``, and a
+    case-sensitive match let every ``jacked install`` append one more
+    SessionStart entry instead of collapsing the ones it already owned.
+
+    >>> _is_jacked_managed_hook_path('"/home/u/.local/bin/jacked" _hook session_start')
+    True
+    >>> _is_jacked_managed_hook_path('"C:\\\\Users\\\\u\\\\.local\\\\bin\\\\jacked.EXE" _hook session_start')
+    True
+    >>> _is_jacked_managed_hook_path("/usr/local/bin/my-own-startup.sh")
+    False
     """
     if not command:
         return False
-    return any(marker in command for marker in _JACKED_HOOK_PATH_MARKERS)
+    lowered = command.lower()
+    return any(marker in lowered for marker in _JACKED_HOOK_PATH_MARKERS)
 
 
 def _build_hook_command(hook_name: str) -> str:
