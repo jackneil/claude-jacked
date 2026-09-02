@@ -438,7 +438,7 @@ def _payload(transcript, cwd, event="SessionEnd"):
 
 def _mock_triage(env, response):
     # call_claude now returns (text, cause); these rollup tests only use success.
-    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model: (response, None))
+    env.monkeypatch.setattr(capture, "call_claude", lambda prompt, model, **kw: (response, None))
 
 
 def test_session_end_invokes_rollup(env):

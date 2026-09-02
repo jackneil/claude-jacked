@@ -59,9 +59,9 @@ def test_per_iteration_guardrails(bhag: str):
     assert "A red iteration is NEVER merged" in bhag
     assert "force-push" in bhag                              # never force-push / rewrite history
     assert "BLOCKED" in bhag                                 # stop, don't merge a bad iteration
-    assert "backstop" in bhag.lower()                        # stuck-detection backstop (never caps successful work)
-    assert "stuck-detection" in bhag.lower()                 # backstop = stuck-detection, NOT a turn/merge/cost cap
-    assert "cap on successful work" in bhag.lower()          # explicit: completed cells are success, never a halt
+    assert "stuck-detection" in bhag.lower()                 # the only early stop is a stuck cell, NOT a turn/merge/cost cap
+    assert "completed cells are success" in bhag.lower()     # explicit: success never triggers a halt
+    assert "never halts on a count of merges" in bhag.lower()  # no cap on successful work
 
 
 def test_separate_command_rationale(bhag: str):

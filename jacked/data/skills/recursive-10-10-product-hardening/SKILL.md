@@ -108,9 +108,9 @@ After the spec baseline is complete, iterate until clean:
 
 **Status flow:** `Spec'd → Tested-Pass / Tested-Fail → Fixed → Verified`. Use the project's existing status vocabulary if it has a comparable one, preserving the semantics.
 
-### Backstop — stuck-detection ONLY; NEVER cap successful work
+### Backstop: it catches a stuck run, never a productive one
 
-This runs to **TRUE completion**: keep working until every feature row is `Verified` or genuinely blocked, however many turns/iterations that takes. **NEVER** halt on a count of *successful* progress — no "stop after N fixes", no "N total turns", no time/cost ceiling. Completed rows are success, and success never triggers a halt. The **only** legitimate halts are:
+Keep working until every feature row is `Verified` or genuinely blocked, however many iterations that takes. Completed rows are success, so there is no halt on a count of fixes, turns, time, or cost. The only stop conditions are:
 
 1. **No-progress loop** — the same story still fails after **3** consecutive fix/re-test iterations with **no new narrowed failure** and no product decision available → mark it blocked/`Tested-Fail` with root-cause notes, continue independent stories.
 2. **Unsafe / destructive / out-of-scope step** → STOP and ask.

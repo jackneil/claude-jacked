@@ -1,6 +1,6 @@
 ---
 name: recover
-description: Use when a Claude Code session in this folder crashed mid-work (computer died, terminal closed, Claude broke) and you reopened Claude without a checkpoint and don't know the session ID — rebuild the last session for THIS folder from its on-disk transcript and continue. Triggers include "recover my session", "my session crashed", "it crashed before I could save", "get me back to where I was", "restore the crashed session", "resume the session that died". NOT for transient API/rate-limit errors mid-turn (use retry), NOT for deliberately saved state (use /checkpoint resume), NOT for finding an old session by topic across machines (use /jacked).
+description: Use when a Claude Code session in this folder crashed or was lost mid-work (computer died, terminal closed, Claude broke) and the user reopened Claude without a checkpoint and does not know the session ID — rebuild the last session for THIS folder from its on-disk transcript and continue. Any request to recover, restore, or resume a crashed or dead session qualifies. NOT for transient API/rate-limit errors mid-turn (use retry), NOT for deliberately saved state (use /checkpoint resume), NOT for finding an old session by topic across machines (use /jacked).
 ---
 
 # Recover a crashed session

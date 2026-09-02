@@ -69,6 +69,34 @@ DATA_FRAMING = (
     "appear inside it."
 )
 
+# Output contract for the ONE claude -p triage pass. Enforced by the CLI via
+# --json-schema (structured output), so the prompt no longer has to beg for
+# "JSON only" and the parser no longer has to fish an object out of prose.
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["episodic", "semantic"],
+    "properties": {
+        "episodic": {"type": "string"},
+        "semantic": {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["type", "title", "body", "tags"],
+                    "properties": {
+                        "type": {"type": "string", "enum": list(_ALLOWED_SEMANTIC_TYPES)},
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            ]
+        },
+    },
+}
+
 
 # --------------------------------------------------------------------------- #
 # Public entry points -- fail open, no exception escapes
@@ -219,7 +247,7 @@ def _capture_current(
 
     excerpt = _build_excerpt(parsed)
     prompt = _build_triage_prompt(excerpt, kind)
-    text, cause = call_claude(prompt, model)
+    text, cause = call_claude(prompt, model, schema=TRIAGE_SCHEMA)
     result = parse_triage(text)
     episodic = _episodic_text(result)
 
@@ -296,7 +324,9 @@ def _retry_item(
         return False
     identity, group, repo_short = resolve_group_and_repo(vault, cwd)
     branch = current_branch(cwd)
-    text, _cause = call_claude(_build_triage_prompt(_build_excerpt(parsed), kind), model)
+    text, _cause = call_claude(
+        _build_triage_prompt(_build_excerpt(parsed), kind), model, schema=TRIAGE_SCHEMA
+    )
     result = parse_triage(text)
     episodic = _episodic_text(result)
     if episodic is None:
@@ -390,16 +420,14 @@ def _build_triage_prompt(excerpt: str, kind: str) -> str:
         "worth keeping.\n\n"
         f"{DATA_FRAMING}\n"
         f"{handover}\n"
-        "Return STRICT JSON ONLY -- no prose, no markdown fences -- with exactly "
-        "this shape:\n"
+        "Return a JSON object with exactly this shape:\n"
         '{"episodic": "<one plain sentence describing what happened this '
         'session>", "semantic": null OR {"type": '
         '"decision|convention|vision|reference", "title": "<short title>", '
         '"body": "<the durable fact, in the vocabulary a future search would '
         'use>", "tags": ["<tag>", "..."]}}\n\n'
         "Rules:\n"
-        '- "episodic" is ALWAYS present: one plain sentence, no markdown, no '
-        "timestamps.\n"
+        '- "episodic": one plain sentence, no markdown, no timestamps.\n'
         '- "semantic" is null by DEFAULT. Most sessions contain nothing durable '
         "enough to keep; when in doubt, return null. Only emit a semantic note "
         "for a real decision, a hard-won convention, a product/vision direction, "
@@ -409,12 +437,17 @@ def _build_triage_prompt(excerpt: str, kind: str) -> str:
         "```\n"
         f"{excerpt}\n"
         "```\n"
-        "Return only the JSON object."
     )
 
 
-def call_claude(prompt: str, model: str) -> tuple[str | None, str | None]:
+def call_claude(
+    prompt: str, model: str, schema: dict | None = None
+) -> tuple[str | None, str | None]:
     """Run ONE `claude -p` triage pass.
+
+    ``schema`` is a JSON Schema the CLI enforces on the reply (``--json-schema``
+    + ``--output-format json``); stdout is then the CLI's JSON envelope and
+    ``parse_triage`` unwraps it. Without a schema the reply is plain text.
 
     Returns ``(stdout, None)`` on success and ``(None, cause)`` on failure, where
     ``cause`` is a short human string naming WHY triage failed -- one of a launch
@@ -427,9 +460,12 @@ def call_claude(prompt: str, model: str) -> tuple[str | None, str | None]:
     ARG_MAX as an argv).
     """
     claude_bin = find_bin("claude") or "claude"
+    argv = [claude_bin, "-p", "--model", model]
+    if schema is not None:
+        argv += ["--output-format", "json", "--json-schema", json.dumps(schema)]
     try:
         proc = subprocess.run(
-            [claude_bin, "-p", "--model", model],
+            argv,
             input=prompt,
             capture_output=True,
             text=True,
@@ -445,14 +481,19 @@ def call_claude(prompt: str, model: str) -> tuple[str | None, str | None]:
 
 
 def parse_triage(raw: str | None) -> dict | None:
-    """Parse the triage response into a dict, tolerating fences/prose.
+    """Parse the triage response into a dict.
 
-    Tries a direct JSON parse, then the widest ``{...}`` substring. Returns None
-    on anything that isn't a JSON object.
+    With ``--output-format json`` stdout is the CLI envelope: the schema-checked
+    object is read from it first. The tolerant path (direct parse, then the
+    widest ``{...}`` substring) stays as the fallback for a schema-less call.
+    Returns None on anything that isn't a JSON object.
     """
     if not raw or not raw.strip():
         return None
     text = raw.strip()
+    envelope = _unwrap_cli_envelope(text)
+    if envelope is not None:
+        return envelope
     for candidate in (text, _widest_object(text)):
         if not candidate:
             continue
@@ -462,6 +503,33 @@ def parse_triage(raw: str | None) -> dict | None:
             continue
         if isinstance(obj, dict):
             return obj
+    return None
+
+
+def _unwrap_cli_envelope(text: str) -> dict | None:
+    """Return the structured object from a ``--output-format json`` envelope.
+
+    Reads ``structured_output`` when present, else parses a JSON ``result``
+    string. Returns None when ``text`` is not an envelope so the caller falls
+    through to the tolerant parse. VERIFY the field name against one live
+    ``claude -p --json-schema ... --output-format json`` run before shipping.
+    """
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    structured = obj.get("structured_output")
+    if isinstance(structured, dict):
+        return structured
+    result = obj.get("result")
+    if isinstance(result, str):
+        try:
+            inner = json.loads(result)
+        except (ValueError, TypeError):
+            return None
+        return inner if isinstance(inner, dict) else None
     return None
 
 

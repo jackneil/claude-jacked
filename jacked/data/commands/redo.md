@@ -19,7 +19,7 @@ Before anything else:
 
 ### Step 1: Preserve Current Work
 
-**This is non-negotiable. NEVER destroy work without saving it first.**
+**Save the current work before anything destructive.** A redo that loses the first attempt also loses the baseline and the salvage material the later steps depend on.
 
 1. Run `git status` to check for uncommitted changes.
 2. If there are uncommitted changes, stash them:
@@ -43,9 +43,9 @@ Create a new branch for the clean re-implementation. Follow the user's branch na
 
 This gives you a clean canvas while keeping the old approach accessible.
 
-### Step 4: Structured Reflection (MANDATORY)
+### Step 4: Structured Reflection
 
-**You MUST complete this reflection BEFORE writing any new code.** No skipping, no shortcuts.
+**Complete this reflection before writing any new code, even when the user asks to "just redo it".** The reflection is what makes a redo different from a second attempt: without it the new code tends to repeat the first attempt's mistakes.
 
 Answer these four questions explicitly:
 
@@ -111,11 +111,9 @@ Tell the user:
 
 ## SAFETY RAILS
 
-- ALWAYS stash/preserve before doing anything destructive
-- ALWAYS create a new branch - never redo on the same branch
-- ALWAYS capture the old approach's working behavior before scrapping, and verify the redo reproduces it before recommending a merge
-- ALWAYS complete the reflection - including the salvage pass that harvests what the old code got right - before writing code
-- NEVER skip the reflection step even if the user says "just redo it"
-- NEVER let the redo absorb new scope: parity first; wish-list items go on a separate "after the redo" list
-- PREFER a targeted fix or a single-slice redo when the failure is localized; reserve full scrap for pervasive failures
-- If `git stash` fails for some reason, STOP and tell the user - don't proceed without preserving their work
+- Stash or otherwise preserve before anything destructive; if `git stash` fails, stop and tell the user rather than proceed without a backup
+- Redo on a new branch, never the same one
+- Capture the old approach's working behavior before scrapping it, and verify the redo reproduces it before recommending a merge
+- Complete the reflection, including the salvage pass, before writing code, even when the user asks to skip it
+- Parity first: wish-list items go on a separate "after the redo" list
+- Prefer a targeted fix or a single-slice redo when the failure is localized; reserve a full scrap for pervasive failures

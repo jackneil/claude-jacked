@@ -41,7 +41,7 @@ Run through these checks:
 - Suggest: resolve the contradiction, keep one
 
 **Vague rules** - Rules that aren't actionable:
-- No concrete action (missing ALWAYS/NEVER/WHEN)
+- No concrete action (no verb saying what to do differently, or no trigger saying when)
 - Too broad to follow ("write good code", "be careful with paths")
 - Missing context for WHY
 - **Negative phrasing** - a rule framed as "never X" / "don't X" is measurably weaker than the positive "always Y": it forces the model to dwell on the prohibited action. Where a clean positive equivalent exists, suggest reframing ("don't use relative paths" -> "always use absolute paths").

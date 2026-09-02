@@ -40,7 +40,7 @@ Two kinds of work read like "review you could hand to Opus" but are Fable-grade 
 
 ## Hard rules
 
-1. **Pass the model on EVERY dispatch.** `model: "opus"` on Agent tool calls; `model: 'opus'` in Workflow `agent()` opts. NEVER rely on inheritance: an agent definition's frontmatter `model:` pin silently BEATS parent inheritance (this burned us 2026-07-02 with a stale `model: opus` pin; the same mechanism can silently upgrade OR downgrade). Explicit beats assumed, both directions.
+1. **Pass the model on EVERY dispatch.** `model: "opus"` on Agent tool calls; `model: 'opus'` in Workflow `agent()` opts. Never rely on inheritance: an agent definition's frontmatter `model:` pin silently overrides the parent's model, in either direction, so an unstated model can land on a cheaper or a pricier tier than intended.
 2. **Floor is Opus for anything that understands, judges, or produces.** The cheap-tier lane above is not an exception to this - it exists precisely because pure locate/sweep does none of those three. USE it: dispatching a grep fan-out on Opus wastes 5x Haiku's price on work the deterministic tools are doing anyway. But the moment interpretation creeps in, the floor applies - when in doubt, Opus.
 3. **No Fable dispatches for volume work.** Do not pass `model: "fable"` to subagents for code, tests, search, or bulk review - the main loop IS the Fable budget for that, and it does inline anything else that needs Fable-grade judgment. The one exception is the two Fable-grade review kinds above (security audits, UI/design judgment): when they need fan-out, their agents run on Fable, not Opus.
 4. **Verify before trusting.** Everything an Opus agent returns (code, findings, claims of green tests) gets checked by the main loop: read the diff or run the gate yourself before building on it. Opus output is draft until the main loop confirms it.
@@ -52,7 +52,7 @@ Two kinds of work read like "review you could hand to Opus" but are Fable-grade 
 
 - Applies for the remainder of the current session/conversation from the moment this skill is invoked.
 - The user can revoke or amend it at any time ("back to normal models", "all fable") - their live instruction wins.
-- The global CLAUDE.md model-selection rule encodes these same lanes as standing doctrine (as of 2026-07-04); invoking this skill makes them explicit and binding for the session even where that doctrine is absent or stale. The non-negotiables travel with it: never silently downgrade below Opus for work that understands, judges, or produces; explicit model on every dispatch.
+- The global CLAUDE.md model-selection rule encodes these same lanes as standing doctrine; invoking this skill makes them explicit and binding for the session even where that doctrine is absent or stale. The non-negotiables travel with it: never silently downgrade below Opus for work that understands, judges, or produces; explicit model on every dispatch.
 
 ## Acknowledgement
 
