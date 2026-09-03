@@ -393,13 +393,19 @@ function bindAccountEvents() {
         });
     });
 
-    // Re-auth buttons
+    // Re-auth rows (kebab menu). Same targeted flow the token pill uses:
+    // /accounts/{id}/reauth carries the account identity, so the launcher
+    // opens that account's browser profile with a login hint and the callback
+    // updates the existing row. The untargeted add-account flow has no
+    // identity, falls back to an incognito window, and can create a duplicate
+    // account instead of re-authing the one that was clicked.
     document.querySelectorAll('.btn-reauth').forEach(btn => {
         btn.addEventListener('click', async () => {
             if (window.jackedState._accountActionInFlight) {
                 showToast('Another action is in progress', 'warning', 2000);
                 return;
             }
+            const id = btn.dataset.id;
             const email = btn.dataset.email || '';
             try {
                 const result = await _confirmReauth(email);
@@ -408,7 +414,7 @@ function bindAccountEvents() {
                     showToast('Another action started — please try again', 'warning', 2000);
                     return;
                 }
-                startAddAccountFlow();
+                startReauthFlow(id, email);
             } catch (err) {
                 console.error('Reauth confirmation error:', err);
                 showToast('Something went wrong — please try again', 'error');
@@ -472,7 +478,10 @@ function bindAccountEvents() {
     document.querySelectorAll('.btn-use-account').forEach(btn => {
         btn.addEventListener('click', async () => {
             if (window.jackedState._accountActionInFlight) {
-                showToast('Another action is in progress', 'warning', 2000);
+                // Long enough to read, and it names the way out: a two-second
+                // "in progress" toast was easy to miss, and a Use click that
+                // seemed to do nothing sent people to the reload button.
+                showToast('Another action is still running. Finish it, or cancel the sign-in banner above, then try again.', 'warning', 4000);
                 return;
             }
             const id = btn.dataset.id;
