@@ -86,6 +86,16 @@ def test_manual_oauth_defaults_to_manual_without_a_client():
     assert routes_auth._manual_oauth(_request(None), remote=False) is True
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost", "testclient"])
+def test_credential_activation_allowed_only_for_loopback(host):
+    assert routes_auth._local_mutation_allowed(_request(host)) is True
+
+
+@pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.20", None])
+def test_credential_activation_denied_for_remote_or_unknown_client(host):
+    assert routes_auth._local_mutation_allowed(_request(host)) is False
+
+
 # ---------------------------------------------------------------------------
 # remote= on the flow-starting routes
 # ---------------------------------------------------------------------------
@@ -104,10 +114,18 @@ def started_flows(monkeypatch):
     created = []
 
     class _StubFlow:
-        def __init__(self, db, purpose="primary", target_account_id=None, manual=False):
+        def __init__(
+            self,
+            db,
+            purpose="primary",
+            target_account_id=None,
+            manual=False,
+            allow_credential_activation=True,
+        ):
             self.purpose = purpose
             self.target_account_id = target_account_id
             self.manual = manual
+            self.allow_credential_activation = allow_credential_activation
             self.flow_id = "stub-flow-id"
             created.append(self)
 
@@ -239,6 +257,9 @@ def test_flow_status_returns_every_field_the_flow_reports(client, monkeypatch):
             "target_org_name": "Acme",
             "browser_mode": "profile",
             "browser_name": "Chrome",
+            "activation_status": "observed_target_unfenced",
+            "activation_operation_id": "oauth-operation-123",
+            "activation_message": "target observed",
         }
     )
     monkeypatch.setattr(routes_auth, "get_flow", lambda flow_id: flow)
@@ -260,6 +281,9 @@ def test_flow_status_returns_every_field_the_flow_reports(client, monkeypatch):
     assert body["target_org_name"] == "Acme"
     assert body["browser_mode"] == "profile"
     assert body["browser_name"] == "Chrome"
+    assert body["activation_status"] == "observed_target_unfenced"
+    assert body["activation_operation_id"] == "oauth-operation-123"
+    assert body["activation_message"] == "target observed"
 
 
 def test_flow_status_for_an_unknown_flow_is_not_found(client, monkeypatch):

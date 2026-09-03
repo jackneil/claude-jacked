@@ -49,7 +49,9 @@ def usage_color_class(pct: Optional[float]) -> str:
 
 def _eligible(acct: dict) -> bool:
     """True if an account should count toward the pill (enabled, not deleted)."""
-    return bool(acct) and not acct.get("is_deleted") and acct.get("is_active") is not False
+    return (
+        bool(acct) and not acct.get("is_deleted") and acct.get("is_active") is not False
+    )
 
 
 def summarize_account(acct: dict) -> Optional[dict]:
@@ -240,14 +242,16 @@ def _claude_scoped_models(raw: dict) -> list[dict]:
         label = model.get("display_name") if isinstance(model, dict) else None
         if not label:
             continue
-        out.append({
-            "key": str(label).lower(),
-            "label": label,
-            "utilization": _as_num(lim.get("percent")),
-            "resets_at": lim.get("resets_at"),
-            "severity": lim.get("severity"),
-            "is_active": bool(lim.get("is_active")),
-        })
+        out.append(
+            {
+                "key": str(label).lower(),
+                "label": label,
+                "utilization": _as_num(lim.get("percent")),
+                "resets_at": lim.get("resets_at"),
+                "severity": lim.get("severity"),
+                "is_active": bool(lim.get("is_active")),
+            }
+        )
     return out
 
 
@@ -266,15 +270,19 @@ def _codex_named_models(raw: dict) -> list[dict]:
         # Prefer the weekly (secondary) window; fall back to primary (5h).
         window = entry.get("secondary")
         if not isinstance(window, dict) or window.get("usedPercent") is None:
-            window = entry.get("primary") if isinstance(entry.get("primary"), dict) else {}
-        out.append({
-            "key": str(limit_id).lower(),
-            "label": label,
-            "utilization": _as_num(window.get("usedPercent")),
-            "resets_at": _epoch_to_iso(window.get("resetsAt")),
-            "severity": None,
-            "is_active": False,
-        })
+            window = (
+                entry.get("primary") if isinstance(entry.get("primary"), dict) else {}
+            )
+        out.append(
+            {
+                "key": str(limit_id).lower(),
+                "label": label,
+                "utilization": _as_num(window.get("usedPercent")),
+                "resets_at": _epoch_to_iso(window.get("resetsAt")),
+                "severity": None,
+                "is_active": False,
+            }
+        )
     return out
 
 
@@ -284,17 +292,27 @@ def _legacy_seven_day_models(raw: dict) -> list[dict]:
     for suffix, label in _LEGACY_MODEL_LABELS.items():
         val = raw.get(f"seven_day_{suffix}")
         if isinstance(val, dict):
-            out.append({
-                "key": suffix, "label": label,
-                "utilization": _as_num(val.get("utilization")),
-                "resets_at": val.get("resets_at"),
-                "severity": None, "is_active": False,
-            })
+            out.append(
+                {
+                    "key": suffix,
+                    "label": label,
+                    "utilization": _as_num(val.get("utilization")),
+                    "resets_at": val.get("resets_at"),
+                    "severity": None,
+                    "is_active": False,
+                }
+            )
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
-            out.append({
-                "key": suffix, "label": label, "utilization": val,
-                "resets_at": None, "severity": None, "is_active": False,
-            })
+            out.append(
+                {
+                    "key": suffix,
+                    "label": label,
+                    "utilization": val,
+                    "resets_at": None,
+                    "severity": None,
+                    "is_active": False,
+                }
+            )
     return out
 
 
@@ -397,4 +415,3 @@ def binding_model_compact(raw: Optional[dict]) -> Optional[dict]:
         "resets_at": bm.get("resets_at"),
         "severity": bm.get("severity"),
     }
-

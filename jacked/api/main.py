@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from jacked import __version__
+from jacked.api.session_observer import session_observation_loop
 from jacked.api.watchers import (
     logs_watch_loop,
     process_alive_sweeper_loop,
@@ -98,7 +99,8 @@ async def _heal_sweep_loop():
             # background (persisting any rotated token and releasing its
             # per-account lock) — the loop self-heals from a wedged pass.
             logger.error(
-                "Heal sweep exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT,
+                "Heal sweep exceeded %ds and was cancelled",
+                SWEEP_PASS_TIMEOUT,
             )
         except Exception as e:
             logger.warning("Heal sweep error: %s", e)
@@ -120,7 +122,8 @@ async def _stuck_checking_watchdog_loop(app):
                 count = await reset_stale_checking_accounts(db, threshold_seconds=120)
                 if count > 0:
                     logger.info(
-                        "Stuck-checking watchdog reset %d account(s)", count,
+                        "Stuck-checking watchdog reset %d account(s)",
+                        count,
                     )
         except asyncio.CancelledError:
             logger.info("Stuck-checking watchdog cancelled — shutting down")
@@ -165,6 +168,7 @@ async def lifespan(app: FastAPI):
     modules_to_reset: list = []
     import_failed: list[str] = []
     import importlib
+
     for mod_path in _module_specs:
         try:
             modules_to_reset.append(importlib.import_module(mod_path))
@@ -190,13 +194,19 @@ async def lifespan(app: FastAPI):
         logger.error(
             "Lifespan lock reset #%d SKIPPED (pid=%d) — every lock-owning "
             "module failed to import: %s",
-            startup_n, os.getpid(), import_failed,
+            startup_n,
+            os.getpid(),
+            import_failed,
         )
     else:
         logger.info(
             "Lifespan lock reset #%d (pid=%d): ok=%d failed=%d imports_failed=%d modules=%s",
-            startup_n, os.getpid(), len(reset_ok), len(reset_failed),
-            len(import_failed), reset_ok,
+            startup_n,
+            os.getpid(),
+            len(reset_ok),
+            len(reset_failed),
+            len(import_failed),
+            reset_ok,
         )
     if reset_failed:
         logger.error("Lock reset failures in: %s", reset_failed)
@@ -238,7 +248,9 @@ async def lifespan(app: FastAPI):
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         _fh = logging.handlers.RotatingFileHandler(
-            log_path, maxBytes=LOG_FILE_MAX_BYTES, backupCount=LOG_FILE_BACKUP_COUNT,
+            log_path,
+            maxBytes=LOG_FILE_MAX_BYTES,
+            backupCount=LOG_FILE_BACKUP_COUNT,
         )
         _fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         _fmt.converter = time.gmtime
@@ -269,6 +281,7 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     refresh_task = asyncio.create_task(_token_refresh_loop())
     session_watch_task = asyncio.create_task(session_accounts_watch_loop(app))
+    session_observer_task = asyncio.create_task(session_observation_loop(app))
     logs_watch_task = asyncio.create_task(logs_watch_loop(app))
     sweeper_task = asyncio.create_task(process_alive_sweeper_loop(app))
     heal_task = asyncio.create_task(_heal_sweep_loop())
@@ -285,6 +298,7 @@ async def lifespan(app: FastAPI):
     stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
+    logger.info("Started session observation resolver (every 10s)")
     logger.info("Started logs watcher (every 3s)")
     logger.info("Started process-alive sweeper (every 60s)")
     logger.info("Started heal sweep (every 5min)")
@@ -299,6 +313,7 @@ async def lifespan(app: FastAPI):
     analytics_monitor_task = None
     try:
         from jacked.web.analytics_monitor import initial_scan_loop, live_monitor_loop
+
         analytics_scan_task = asyncio.create_task(initial_scan_loop(app))
         analytics_monitor_task = asyncio.create_task(live_monitor_loop(app))
         logger.info("Started analytics scanner + live monitor")
@@ -311,7 +326,11 @@ async def lifespan(app: FastAPI):
     # from app.state — the watchdog may have respawned it during the run,
     # so the local `active_poll_task` reference can be stale.
     tasks_to_cancel = [
-        refresh_task, session_watch_task, logs_watch_task, sweeper_task,
+        refresh_task,
+        session_watch_task,
+        session_observer_task,
+        logs_watch_task,
+        sweeper_task,
         heal_task,
         getattr(app.state, "active_poll_task", active_poll_task),
         active_poll_watchdog_task,
@@ -430,6 +449,7 @@ async def websocket_endpoint(ws: WebSocket):
     )
 
     try:
+
         async def _keepalive():
             while True:
                 await asyncio.sleep(WS_KEEPALIVE_INTERVAL)
@@ -457,7 +477,15 @@ async def websocket_endpoint(ws: WebSocket):
 
 # --- Include route modules ---
 
-from jacked.api.routes import system, analytics, features, logs, permissions, menubar, packs  # noqa: E402
+from jacked.api.routes import (  # noqa: E402
+    system,
+    analytics,
+    features,
+    logs,
+    permissions,
+    menubar,
+    packs,
+)
 from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
 from jacked.api.routes.settings_remote import router as remote_access_router  # noqa: E402
 

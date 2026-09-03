@@ -394,31 +394,13 @@ async def _refresh_token_flow(
 
                 logger.info("Account %d: %s token refreshed", account_id, mode.value)
 
-                # 4h. Post-DB-write actions (still under lock)
-                if mode == RefreshMode.CC_OR_PRIMARY_429:
-                    try:
-                        from jacked.api.credential_helpers import (
-                            acquire_claude_lock,
-                            read_platform_credentials,
-                            sync_credential_to_all_stores,
-                        )
-                        live = read_platform_credentials()
-                        if live and live.get("_jackedAccountId") == account_id:
-                            with acquire_claude_lock() as locked:
-                                if locked:
-                                    updated_account = db.get_account(account_id)
-                                    if updated_account:
-                                        sync_credential_to_all_stores(
-                                            account_id, updated_account,
-                                            email=updated_account.get("email"),
-                                        )
-                    except Exception as cred_err:
-                        logger.warning(
-                            "Account %d: credential store sync failed (non-fatal): %s",
-                            account_id, cred_err,
-                        )
+                # Credential refresh is DB-only. A 429 or maintenance path must
+                # never mutate Claude's live stores: doing so races Claude Code's
+                # own refresh-token lifecycle and can silently rebind sessions.
+                # Store activation is reserved for the explicit transaction
+                # engine used by local foreground account actions.
 
-                # 4i. Success — returning releases the lock via the finally;
+                # 4h. Success — returning releases the lock via the finally;
                 # the PRIMARY post-refresh profile fetch happens in step 6,
                 # in the caller, after the shielded task completes.
                 exchanged = True

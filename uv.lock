@@ -244,6 +244,8 @@ dependencies = [
     { name = "packaging" },
     { name = "pillow" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
+    { name = "pyobjc-framework-localauthentication", marker = "sys_platform == 'darwin'" },
+    { name = "pyobjc-framework-security", marker = "sys_platform == 'darwin'" },
     { name = "pyobjc-framework-webkit", marker = "sys_platform == 'darwin'" },
     { name = "pystray" },
     { name = "python-dotenv" },
@@ -273,6 +275,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=23.0,<27" },
     { name = "pillow", specifier = ">=9.0,<13" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'", specifier = ">=10,<13" },
+    { name = "pyobjc-framework-localauthentication", marker = "sys_platform == 'darwin'", specifier = ">=10,<13" },
+    { name = "pyobjc-framework-security", marker = "sys_platform == 'darwin'", specifier = ">=10,<13" },
     { name = "pyobjc-framework-webkit", marker = "sys_platform == 'darwin'", specifier = ">=10,<13" },
     { name = "pystray", specifier = ">=0.19,<1" },
     { name = "python-dotenv", specifier = ">=1.2.2,<2" },
@@ -1377,6 +1381,26 @@ wheels = [
 ]
 
 [[package]]
+name = "pyobjc-framework-localauthentication"
+version = "12.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
+    { name = "pyobjc-framework-security" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8d/0e/7e5d9a58bb3d5b79a75d925557ef68084171526191b1c0929a887a553d4f/pyobjc_framework_localauthentication-12.1.tar.gz", hash = "sha256:2284f587d8e1206166e4495b33f420c1de486c36c28c4921d09eec858a699d05", size = 29947, upload-time = "2025-11-14T10:16:54.923Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/bd/f5b5b2bdce4340b917dedbd95cca90ea74dc549fa33235315a3013871fbb/pyobjc_framework_localauthentication-12.1-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:b1b24c9b453c3b3eb862a78a3a7387f357a90b99ec61cd1950b38e1cf08307ec", size = 10762, upload-time = "2025-11-14T09:53:30.228Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/cb/cf9d13943e13dc868a68844448a7714c16f4ee6ecac384d21aaa5ac43796/pyobjc_framework_localauthentication-12.1-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:2d7e1b3f987dc387361517525c2c38550dc44dfb3ba42dec3a9fbf35015831a6", size = 10762, upload-time = "2025-11-14T09:53:32.035Z" },
+    { url = "https://files.pythonhosted.org/packages/05/93/91761ad4e5fa1c3ec25819865d1ccfbee033987147087bff4fcce67a4dc4/pyobjc_framework_localauthentication-12.1-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:3af1acd287d830cc7f912f46cde0dab054952bde0adaf66c8e8524311a68d279", size = 10773, upload-time = "2025-11-14T09:53:34.074Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/f5/a12c76525e4839c7fc902c6b0f0c441414a4dd9bc9a2d89ae697f6cd8850/pyobjc_framework_localauthentication-12.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:e26e746717f4774cce0568debec711f1d8effc430559ad634ff6b06fefd0a0bf", size = 10792, upload-time = "2025-11-14T09:53:35.876Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/ed/2714934b027afc6a99d0d817e42bf482d08c711422795fe777e3cd9ad8be/pyobjc_framework_localauthentication-12.1-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:02357cddc979aa169782bf09f380aab1c3af475c9eb6ffb07c77084ed10f6a6a", size = 10931, upload-time = "2025-11-14T09:53:37.672Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/58/6dfb304103b4cdaee44acd7f5093c07f3053df0cc9648c87876f1e5fc690/pyobjc_framework_localauthentication-12.1-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:f8d525ed2ad5cd56e420436187b534454d1f7d1fae6e585df82397d6d92c6e54", size = 10841, upload-time = "2025-11-14T09:53:39.337Z" },
+    { url = "https://files.pythonhosted.org/packages/17/af/1c7ce26b46cc978852895017212cf3637d5334274213265234149e0937d4/pyobjc_framework_localauthentication-12.1-cp314-cp314t-macosx_10_15_universal2.whl", hash = "sha256:93c5470a9d60b53afa0faf31d95dc8d6fc3a7ff85c425ab157ea491b6dc3af39", size = 10975, upload-time = "2025-11-14T09:53:41.177Z" },
+]
+
+[[package]]
 name = "pyobjc-framework-quartz"
 version = "11.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1393,6 +1417,25 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/b8/8a/1d15e42496bef31246f7401aad1ebf0f9e11566ce0de41c18431715aafbc/pyobjc_framework_quartz-11.1-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:b23d81c30c564adf6336e00b357f355b35aad10075dd7e837cfd52a9912863e5", size = 221941, upload-time = "2025-06-14T20:53:38.34Z" },
     { url = "https://files.pythonhosted.org/packages/32/a8/a3f84d06e567efc12c104799c7fd015f9bea272a75f799eda8b79e8163c6/pyobjc_framework_quartz-11.1-cp314-cp314-macosx_11_0_universal2.whl", hash = "sha256:07cbda78b4a8fcf3a2d96e047a2ff01f44e3e1820f46f0f4b3b6d77ff6ece07c", size = 221312, upload-time = "2025-06-14T20:53:39.435Z" },
     { url = "https://files.pythonhosted.org/packages/76/ef/8c08d4f255bb3efe8806609d1f0b1ddd29684ab0f9ffb5e26d3ad7957b29/pyobjc_framework_quartz-11.1-cp314-cp314t-macosx_11_0_universal2.whl", hash = "sha256:39d02a3df4b5e3eee1e0da0fb150259476910d2a9aa638ab94153c24317a9561", size = 226353, upload-time = "2025-06-14T20:53:40.655Z" },
+]
+
+[[package]]
+name = "pyobjc-framework-security"
+version = "12.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/80/aa/796e09a3e3d5cee32ebeebb7dcf421b48ea86e28c387924608a05e3f668b/pyobjc_framework_security-12.1.tar.gz", hash = "sha256:7fecb982bd2f7c4354513faf90ba4c53c190b7e88167984c2d0da99741de6da9", size = 168044, upload-time = "2025-11-14T10:22:06.334Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2e/67/31928b689b72a932c80e35662430355de09163bec8ee334f0994d16c4036/pyobjc_framework_security-12.1-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:787e9d873535247e2caca2036cbcdc956bcc92d0c06044bec7eefe0a456856b0", size = 41288, upload-time = "2025-11-14T10:02:50.693Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/3d/8d3a39cd292d7c76ab76233498189bc7170fc80f573b415308464f68c7ee/pyobjc_framework_security-12.1-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:1b2d8819f0fb7b619ec7627a0d8c1cac1a57c5143579ce8ac21548165680684b", size = 41287, upload-time = "2025-11-14T10:02:54.491Z" },
+    { url = "https://files.pythonhosted.org/packages/76/66/5160c0f938fc0515fe8d9af146aac1b093f7ef285ce797fedae161b6c0e8/pyobjc_framework_security-12.1-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:ab42e55f5b782332be5442750fcd9637ee33247d57c7b1d5801bc0e24ee13278", size = 41280, upload-time = "2025-11-14T10:02:58.097Z" },
+    { url = "https://files.pythonhosted.org/packages/32/48/b294ed75247c5cfa00d51925a10237337d24f54961d49a179b20a4307642/pyobjc_framework_security-12.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:afc36661cc6eb98cd794bed1d6668791e96557d6f72d9ac70aa49022d26af1d4", size = 41284, upload-time = "2025-11-14T10:03:01.722Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/57/0d3ef78779cf5c3bba878b2f824137e50978ad4a21dabe65d8b5ae0fc0d1/pyobjc_framework_security-12.1-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:9510c98ab56921d1d416437372605cc1c1f6c1ad8d3061ee56b17bf423dd5427", size = 42162, upload-time = "2025-11-14T10:03:05.337Z" },
+    { url = "https://files.pythonhosted.org/packages/66/4d/63c15f9449c191e7448a05ff8af4a82c39a51bb627bc96dc9697586c0f79/pyobjc_framework_security-12.1-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:6319a34508fd87ab6ca3cda6f54e707196197a65b792b292705af967e225438a", size = 41348, upload-time = "2025-11-14T10:03:08.926Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/d8/5aaa2a8124ed04a9d6ca7053dc0fa64e42be51497ed8263a24b744a95598/pyobjc_framework_security-12.1-cp314-cp314t-macosx_10_15_universal2.whl", hash = "sha256:03d166371cefdef24908825148eb848f99ee2c0b865870a09dcbb94334dd3e0a", size = 42908, upload-time = "2025-11-14T10:03:13.01Z" },
 ]
 
 [[package]]

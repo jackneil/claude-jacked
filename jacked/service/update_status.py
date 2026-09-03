@@ -195,12 +195,14 @@ def init_or_adopt_status(
 def begin_phase(path: Path, phase: str) -> None:
     data = _read_raw(path) or {}
     phases = data.get("phases", [])
-    phases.append({
-        "name": phase,
-        "started_at": _now_iso(),
-        "finished_at": None,
-        "status": "in_progress",
-    })
+    phases.append(
+        {
+            "name": phase,
+            "started_at": _now_iso(),
+            "finished_at": None,
+            "status": "in_progress",
+        }
+    )
     data["phases"] = phases
     data["current_phase"] = phase
     _atomic_write(path, data)

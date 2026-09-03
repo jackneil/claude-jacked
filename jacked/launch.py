@@ -1,7 +1,8 @@
-"""Launch Claude Code with per-account credential isolation.
+"""Launch Claude Code with evidence-qualified account selection.
 
-Uses CLAUDE_CONFIG_DIR to give each account its own credential file,
-preventing sessions on different accounts from overwriting each other.
+CLAUDE_CONFIG_DIR still separates configuration and local credential inputs.
+The currently certified macOS Claude build uses a global credential authority,
+so launch activation explicitly updates and verifies that authority first.
 
 Directory structure:
     ~/.claude/accounts/<account_id>/.credentials.json
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time as _time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,8 +27,6 @@ from jacked.findbin import find_bin
 from jacked.api.credential_helpers import (
     _safe_replace,
     build_oauth_data,
-    read_platform_credentials,
-    write_platform_credentials,
 )
 from jacked.web.auth import should_refresh, should_refresh_cc
 from jacked.web.database import Database
@@ -34,6 +34,23 @@ from jacked.web.database import Database
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
+
+
+def _activate_launch_credentials(account: dict, db: Database):
+    """Activate the certified credential authority before starting Claude.
+
+    Kept as a small boundary so launch tests can prove behavior without ever
+    touching a developer's real Keychain.
+    """
+    from jacked.credentials.models import SwitchContext
+    from jacked.credentials.runtime import activate_account
+
+    return activate_account(
+        db,
+        account,
+        SwitchContext.LAUNCH,
+        f"launch-{uuid.uuid4().hex}",
+    )
 
 # Keys safe to copy from global .claude.json into per-account dirs.
 # Excludes identity (userID, anonymousId, oauthAccount), project permissions,
@@ -344,7 +361,7 @@ def _ensure_shared_symlinks(config_dir: Path) -> None:
 
 
 def prepare_account_dir(account: dict, db: Database) -> Path:
-    """Create per-account config dir and write credentials.
+    """Create account config and verify its certified credential authority.
 
     Returns the directory path (for use as CLAUDE_CONFIG_DIR).
 
@@ -492,13 +509,69 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             pass
         raise
 
-    # macOS: also write to Keychain so Claude Code finds creds on first run.
-    # Claude Code reads Keychain before the config-dir file on macOS.
-    if not write_platform_credentials(existing):
+    # The exact certified Claude build reads the global macOS Keychain before
+    # CLAUDE_CONFIG_DIR. A scoped file alone therefore cannot establish the
+    # runtime identity. Use the same durable, read-back transaction as /use and
+    # OAuth. Unknown builds fail closed instead of launching with stale global
+    # credentials.
+    from jacked.credentials.models import SwitchOutcome
+
+    activation = _activate_launch_credentials(account, db)
+    truthful_outcomes = {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.COMMITTED_DEGRADED,
+        SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+    }
+    if (
+        activation.outcome not in truthful_outcomes
+        or activation.observed_identity.account_id != account_id
+    ):
+        reason = activation.message or activation.outcome.value.replace("_", " ")
+        raise click.ClickException(
+            f"Could not establish Claude credentials for account {account_id}: {reason}"
+        )
+
+    click.echo(
+        "Note: this certified Claude build uses the global credential authority. "
+        "Launching this account also changes the default for future Claude "
+        "sessions; existing sessions keep their current credentials.",
+        err=True,
+    )
+
+    # Publish the transaction's token-free observation beside the launch
+    # directory for session hooks. This is deliberately labelled global: the
+    # scoped file is a launch input, not the certified credential authority.
+    try:
+        from jacked.credentials.models import CredentialIdentity
+        from jacked.credentials.resolver import (
+            FileResolverSnapshotSink,
+            ResolverState,
+            SnapshotUpdate,
+        )
+
+        identity = CredentialIdentity(
+            account_id=account_id,
+            email=account.get("email"),
+            organization_id=account.get("organization_uuid") or None,
+        )
+        FileResolverSnapshotSink(config_dir / "jacked-resolver-snapshot.json").publish(
+            SnapshotUpdate(
+                scope="global",
+                state=ResolverState.RESOLVED,
+                evidence=(
+                    "launch:scoped-file-readback",
+                    f"launch:global-authority:{activation.outcome.value}",
+                ),
+                credential_revision=f"switch:{activation.operation_id}",
+                desired=identity,
+                observed=activation.observed_identity,
+            )
+        )
+    except OSError as exc:
         logger.warning(
-            "Keychain write failed for account %d — Claude Code may use "
-            "stale credentials from a previous session",
+            "Failed to publish launch credential evidence for account %d: %s",
             account_id,
+            exc,
         )
 
     return config_dir
@@ -554,59 +627,14 @@ def resolve_account(account_ref, db: Database) -> dict:
     account = None
 
     if account_ref is None:
-        acct_id = None
+        # No file/DB/Keychain precedence or token matching is allowed here.
+        # An omitted account means the exact-build canonical resolver must have
+        # reached consensus on one stamped account.
+        from jacked.api.credential_helpers import read_active_account_id
 
-        # Layer 1: File stamp (fast, but Claude Code may delete the file)
-        cred_path = Path.home() / ".claude" / ".credentials.json"
-        if cred_path.exists() and not cred_path.is_symlink():
-            try:
-                data = json.loads(cred_path.read_text(encoding="utf-8"))
-                acct_id = data.get("_jackedAccountId")
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        # Layer 2: DB settings (immune to Claude Code credential management)
-        if acct_id is None:
-            try:
-                stored = db.get_setting("active_account_id")
-                if stored:
-                    acct_id = int(stored)
-            except (ValueError, TypeError, Exception):
-                pass
-
-        # Layer 3: Keychain stamp
-        if acct_id is None:
-            try:
-                kc_data = read_platform_credentials()
-                if kc_data:
-                    acct_id = kc_data.get("_jackedAccountId")
-            except Exception:
-                pass
-
+        acct_id = read_active_account_id()
         if acct_id is not None:
             account = db.get_account(acct_id)
-
-        # Layer 4: Keychain token → DB match (last resort)
-        # Credential files/Keychain contain CC tokens, so check cc_access_token
-        # first (preferred), then fall back to primary access_token.
-        if not account:
-            try:
-                kc_data = read_platform_credentials()
-                if kc_data:
-                    token = kc_data.get("claudeAiOauth", {}).get("accessToken")
-                    if token:
-                        accounts_list = db.list_accounts(include_inactive=False)
-                        for acct in accounts_list:
-                            if acct.get("cc_access_token") == token:
-                                account = acct
-                                break
-                        if not account:
-                            for acct in accounts_list:
-                                if acct.get("access_token") == token:
-                                    account = acct
-                                    break
-            except Exception:
-                pass
 
         if not account:
             raise click.ClickException(
@@ -979,6 +1007,46 @@ def launch_claude(
     """
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    # Never inherit a parent shell's certification/binding claims. The current
+    # launch is global unless this exact snapshot proves otherwise.
+    for key in (
+        "JACKED_CREDENTIAL_SCOPE",
+        "JACKED_LAUNCH_NONCE",
+        "JACKED_CREDENTIAL_REVISION",
+        "JACKED_SCOPED_CREDENTIAL_CERTIFIED",
+    ):
+        env.pop(key, None)
+    env["JACKED_CREDENTIAL_SCOPE"] = "unknown"
+    try:
+        snapshot = json.loads(
+            (config_dir / "jacked-resolver-snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        observed = snapshot.get("observed")
+        revision = snapshot.get("credential_revision")
+        now = _time.time()
+        expected_account_id = int(config_dir.name)
+        valid_global_observation = (
+            snapshot.get("schema_version") == 1
+            and snapshot.get("scope") == "global"
+            and snapshot.get("state") == "resolved"
+            and isinstance(observed, dict)
+            and observed.get("account_id") == expected_account_id
+            and not isinstance(snapshot.get("published_at"), bool)
+            and isinstance(snapshot.get("published_at"), (int, float))
+            and snapshot["published_at"] <= now + 300
+            and not isinstance(snapshot.get("fresh_until"), bool)
+            and isinstance(snapshot.get("fresh_until"), (int, float))
+            and snapshot["fresh_until"] >= now
+            and isinstance(revision, str)
+            and bool(revision)
+        )
+        if valid_global_observation:
+            env["JACKED_CREDENTIAL_SCOPE"] = "global"
+            env["JACKED_CREDENTIAL_REVISION"] = revision
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
 
     proc = subprocess.Popen(["claude", *claude_args], env=env)
 

@@ -1,6 +1,6 @@
 # claude-jacked - multi-account manager and skills suite for Claude Code
 
-**When you hit a Claude Code usage limit, jacked switches you to another account instead of making you wait out the reset.** Run every Claude and Codex account you own as a single pool, watch each one's 5-hour, 7-day, and per-model usage live, and let auto-swap rotate to a fresh account before a limit stops you. The whole fleet stays one click away in a macOS menu-bar app, or a system-tray app on Windows and Linux.
+**When you hit a Claude Code usage limit, jacked shows which account has headroom and helps you move deliberately instead of guessing which credentials a session is using.** Run every Claude and Codex account you own as one fleet, watch each account's 5-hour, 7-day, and per-model usage live, and get an auto-swap recommendation before a limit stops you. The whole fleet stays one click away in a macOS menu-bar app, or a system-tray app on Windows and Linux.
 
 It is also a skills manager for Claude Code: one `jacked install` deploys 20 curated slash commands, 28 skills, and 10 review agents into `~/.claude`, mirrors them into Codex when Codex is installed, and keeps them updated from a web dashboard.
 
@@ -15,8 +15,8 @@ It is also a skills manager for Claude Code: one `jacked install` deploys 20 cur
 
 ## What you get: multi-account Claude Code, live usage tracking, and a skills suite
 
-- **Run multiple Claude accounts like one.** Add every account you own, watch each one's 5-hour, 7-day, and per-model usage live, and let auto-swap rotate to a fresh account before you hit a limit. Works for Codex accounts too, side by side with Claude.
-- **A menu-bar app that actually earns its pixels.** A live pill shows your active account's usage next to the clock (`18%·4%`, tinted green/yellow/red). Left-click drops the whole fleet down in a compact panel: every account, every org, per-model caps, reset times, and who's active. Right-click for actions, or pin the panel to your screen edge. It refreshes within about a second of any account switch or usage change, and it tells you when a new jacked version ships: a badge on the icon, a notification banner, and a one-click update.
+- **Run multiple Claude accounts without losing account truth.** Add every account you own, watch each account's 5-hour, 7-day, and per-model usage live, and let auto-swap recommend a fresh account before you hit a limit. Credential changes report what was actually verified, and session cards distinguish where a session started, what configuration was later observed, and whether the provider runtime is still unverified. Works for Codex accounts too, side by side with Claude.
+- **A menu-bar app that actually earns its pixels.** A live pill shows usage for the account jacked can currently resolve next to the clock (`18%·4%`, tinted green/yellow/red). Left-click drops the whole fleet down in a compact panel: every account, every org, per-model caps, reset times, and the current credential state. Right-click for actions, or pin the panel to your screen edge. It refreshes within about a second of any account switch or usage change, and it tells you when a new jacked version ships: a badge on the icon, a notification banner, and a one-click update.
 - **A curated skills suite, one command to install.** `jacked install` puts 20 battle-tested slash commands, 28 skills, and 10 review agents into Claude Code (`/dcr` recursive multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more; skills are slash-invocable too, so all 48 answer to a `/name`), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills) and a website-cloning skill adapted with credit from [JCodesMore's ai-website-cloner-template](https://github.com/JCodesMore/ai-website-cloner-template). When Codex is installed too, the same pass deploys the suite into Codex's native formats: skills into `~/.agents/skills`, commands as both prompts and command-derived skills, the behavioral rules (Codex-adapted) into `~/.codex/AGENTS.md`, the 10 review agents as Codex TOML custom agents, the chrome-devtools MCP server, and a `$qa` suggestion hook, with a few Claude-only helpers held back and everything tracked in a Codex manifest so `jacked uninstall` reverses it. Upgrades diff cleanly: added/changed/removed, never touching your own files. On top of the bundled suite, `jacked install` also installs curated third-party skill packs live from their upstream repos (a 28-skill `marketing` pack and a `design-extras` pack, on by default), opt out with `--no-packs` or `jacked packs disable`.
 - **Manage everything from a web dashboard.** Accounts, usage analytics, feature toggles, appearance themes, swap history, logs, all from your browser. No config files, no terminal commands.
 - **Permission hygiene built in.** `jacked permissions audit` finds (and can prune) dangerously broad Bash wildcards in your Claude Code permission allowlists, and the dashboard's Permissions panel manages allow rules with project vs global scope.
@@ -35,19 +35,22 @@ Install claude-jacked for me:
 1. First check if uv and jacked are already installed (if uv is missing: curl -LsSf https://astral.sh/uv/install.sh | sh)
 2. Install: uv tool install claude-jacked && jacked install --force
 3. Verify with: jacked --help
-4. Launch the dashboard: jacked webux
-5. Walk me through adding my Claude accounts from the Accounts page
+4. Confirm the service URL with: jacked service status
+5. Open the reported dashboard URL in my browser
+6. Walk me through adding my Claude accounts from the Accounts page
 ```
 
 ### Option 2: Manual Install
 
-Run once from anywhere - installs globally to `~/.claude/` and applies to all your Claude Code sessions:
+Run once from anywhere. This installs the shared skills, hooks, dashboard, and tray integration under `~/.claude/`:
 
 ```bash
 uv tool install claude-jacked   # tray icon + background service included by default
 jacked install --force          # deploys skills/commands/agents/hooks AND starts the tray
-jacked webux                    # opens your dashboard at localhost:8321
+jacked service status           # prints the running dashboard URL
 ```
+
+Open the URL printed by `jacked service status`, or choose **Open Dashboard** from the tray. Use `jacked webux` only when you want a foreground dashboard instead of the background service; both cannot own the same port at once.
 
 > **The tray is on by default.** A bare `uv tool install claude-jacked` now ships the tray (no `[tray]` extra needed), and `jacked install` registers login-autostart and starts it. Don't want the icon (or on a headless box)? `jacked install --force --no-tray`. **You MUST run `jacked install`** - `uv tool`/`pip install` only drop the package on disk; running `jacked` before that prints a loud banner reminding you.
 
@@ -74,7 +77,7 @@ Everything is namespaced under `jacked:`, so a command is `/jacked:pr` and a ski
 
 ## Your dashboard: accounts, usage analytics, and feature toggles
 
-The web dashboard ships with every install. Run `jacked webux` to open it.
+The web dashboard ships with every install. Open it from the tray, or run `jacked service status` and browse to the reported URL. To run the dashboard in the foreground without the tray service, stop that service first and use `jacked webux`.
 
 ### Toggle Features On and Off
 
@@ -137,7 +140,7 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 | **28 Skills** | Knowledge packs and engines Claude picks up automatically, every one also typeable as `/name`. Ten used to ship as commands and keep their familiar slash workflow: `/dcr`, `/qa`, `/ux`, `/qa-video`, `/demo-video`, `/docs-sync`, `/swarm-research`, `/release`, `/whats-next`, `/lockdown`. The rest stand alone: `night-shift`, `jack-it-up`, `coverage-matrix`, `recursive-10-10-product-hardening`, `aesthetic-dogfood-audit`, `chain-of-command`, `deploy-to-railway`, `launch-post`, `logo-forge`, `clone-website`, `claude-md-optimizer`, `memory-librarian`, `checkpoint`, `recover`, and the design-engineering set (`emil-design-eng`, `review-animations`, `animation-vocabulary`, `apple-design`) |
 | **Skill Packs** (optional, on by default) | Curated third-party skill collections pulled live from their upstream repos via the `npx skills` CLI, separate from the bundled suite: `marketing` (28 skills) + `design-extras`. Opt out with `--no-packs` or `jacked packs disable` |
 | **Memory Vault** (optional, opt in) | Cross-repo memory in a git-backed Markdown vault at `~/jacked-vault`. Event-triggered capture (session end plus merges to `main`), a budgeted SessionStart recall brief, and a `jacked memory` CLI. No database, no embeddings, Obsidian-compatible. Enable from the dashboard or `jacked memory init` |
-| **Statusline** (on by default) | One live status line inside every Claude Code session: model + effort, context use, 5h/7d rate limits with reset times, and the active account. Works on macOS, Linux, and Windows. Never replaces a statusline you set up yourself |
+| **Statusline** (on by default) | One live status line inside every Claude Code session: model + effort, context use, 5h/7d rate limits with reset times, and evidence-qualified account state. Works on macOS, Linux, and Windows. Never replaces a statusline you set up yourself |
 | **Behavioral Rules** | Smart defaults that make Claude follow better workflows |
 | **Sound Notifications** | Audio alerts when Claude needs input or finishes (via `--sounds`) |
 | **Web Dashboard** | 5-page local dashboard - manage everything from your browser |
@@ -151,7 +154,7 @@ Token usage and estimated cost per session, agent activity, hook health, and com
 ## Web Dashboard
 
 ```bash
-jacked webux                    # Opens dashboard at localhost:8321
+jacked webux                    # Foreground dashboard at localhost:8321
 jacked webux --port 9000        # Custom port
 jacked webux --no-browser       # Start server without opening browser
 ```
@@ -181,7 +184,7 @@ jacked service restart --host <100.x IP>  # sets Remote access: Tailscale only, 
 jacked service restart --host 127.0.0.1   # turns Remote access off, then restarts
 ```
 
-A one-shot override for the current run only (never persisted): `jacked webux --host <addr>` or `jacked start --host <addr>`.
+A one-shot override for a foreground dashboard only (never persisted): `jacked webux --host <addr>`.
 
 The dashboard has **no authentication layer**, so restrict who can reach it at the network layer. A Tailscale ACL scoped to the port does exactly that:
 
@@ -189,12 +192,30 @@ The dashboard has **no authentication layer**, so restrict who can reach it at t
 { "action": "accept", "src": ["your-laptop", "your-phone"], "dst": ["your-server:8321"] }
 ```
 
-A network bind is hardened server-side: CORS is never wildcarded (the frontend is same-origin by construction), WebSocket handshakes enforce same-origin, cross-site state-changing requests are rejected by Origin check, and untrusted `Host` headers are refused (DNS-rebinding guard). Two escape hatches for unusual setups, both comma-separated env vars on the service process:
+A network bind is hardened server-side: CORS is never wildcarded (the frontend is same-origin by construction), WebSocket handshakes enforce same-origin, cross-site state-changing requests are rejected by Origin check, and untrusted `Host` headers are refused (DNS-rebinding guard). Two escape hatches exist for unusual manual or foreground setups, both comma-separated environment variables set directly on that process. Native managed definitions intentionally do not inherit arbitrary shell variables:
 
 - `JACKED_ALLOWED_ORIGINS`: extra exact origins (`scheme://host[:port]`) allowed cross-origin API/WebSocket access. Needed behind a reverse proxy that rewrites `Host` to the loopback upstream (symptom: page loads but every write and the live WebSocket fail with 403; `tailscale serve` preserves `Host` and needs nothing).
 - `JACKED_ALLOWED_HOSTS`: extra hostnames accepted in the `Host` header, e.g. a custom DNS name pointing at the machine.
 
 Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bound dashboard to your tailnet over HTTPS with no jacked configuration changes.
+
+### Account switching, auto-swap, and session truth
+
+**Use Account** requests a change to the default Claude credential stores. The result is evidence-qualified: the dashboard says whether the target was committed, merely observed without a complete writer fence, needs interaction, or is unsupported. It never turns a database selection into a false claim that running sessions changed. Credential mutation is local-only, so a remotely opened dashboard can manage and inspect accounts but cannot switch credentials.
+
+Current support is deliberately conservative. The exact Claude Code 2.1.259 macOS arm64 build can report `observed_target_unfenced`: the requested credentials were read back, but another writer cannot be ruled out, so existing sessions remain unverified and a restart is recommended. An unknown executable, build, platform, architecture, or configuration mode fails closed instead of guessing how that Claude Code version stores credentials.
+
+For a specific account, launch Claude Code through jacked:
+
+```bash
+jacked claude 2                    # account ID
+jacked claude jack@example.com     # full email
+jacked claude udifi --resume       # unique email substring + Claude arguments
+```
+
+The launcher prepares a per-account `CLAUDE_CONFIG_DIR` and passes every remaining argument through to Claude Code. That records the intended scoped target, but it does not claim the provider runtime used that identity until an exact-build capability can prove it. Session cards therefore show **Started as**, **Observed configuration**, **Pending next activity**, and **Runtime unverified** separately. A default-credential change marks known global sessions pending; the next hook activity refreshes configuration evidence, not proof of which identity served the provider request.
+
+Auto-swap still evaluates account headroom and records a recommendation. It performs the credential mutation only when a certified cooperative transaction engine and writer fence are installed for the exact runtime. Without that capability, it stays recommendation-only.
 
 ---
 
@@ -215,11 +236,11 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 
 ### What You Get (macOS menu bar)
 
-- **A live usage pill, always visible.** The menu-bar item is a colored "J" plus your active account's usage as `5h%·7d%` (e.g. `18%·4%`). The J tints green, yellow, or red on the worse of the two windows, so a glance at the clock tells you whether you're about to hit a limit. It tracks the account that is actually active in Claude Code, and a small dot marks the corner when the active account is a Codex account.
+- **A live usage pill, always visible.** The menu-bar item is a colored "J" plus the resolved account's usage as `5h%·7d%` (e.g. `18%·4%`). The J tints green, yellow, or red on the worse of the two windows, so a glance at the clock tells you whether you're about to hit a limit. A small dot marks the corner when the resolved account is a Codex account.
 - **Left-click: the fleet dropdown.** A compact panel (the screenshot up top) drops down with every account you've added: 5h and 7d bars with reset times, per-model caps (your Fable or Codex model usage inline), plan badges, multi-org accounts grouped under one login, an `active` badge with a live countdown to the next usage refresh, and a refresh-all button. It's pre-warmed, so it opens instantly.
 - **Pin it as a side panel.** "Toggle Side Panel" docks the same panel to the right edge of your screen, floating above other windows and on every Space, for a permanent fleet view while you work.
 - **Right-click: the actions menu.** Open Usage Dropdown, Toggle Side Panel, Open Dashboard, Add Account, an Auto-swap toggle, Start on Login, Restart, Quit, the version line, "Last checked", and **Check for updates...** to force a fresh PyPI poll on demand.
-- **It never goes stale.** The pill and panel update within about one second of any usage refresh, account switch, or Codex swap (an in-process change counter, no polling lag), with a 30-second heartbeat backstop and a 10-minute background refresh across the whole fleet.
+- **It never goes stale.** The pill and panel update within about one second of any usage refresh, credential-state change, or Codex swap (an in-process change counter, no polling lag), with a 30-second heartbeat backstop and a 10-minute background refresh across the whole fleet.
 - **Update notifications you'll actually see.** When a new version ships: a blue badge appears on the J icon, a macOS notification banner fires, and the version line in the menu flips to a clickable `v{current} -> v{latest} (update)`. One click runs the full upgrade (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced, with a live progress page in your browser that reconnects on its own while the service restarts.
 
 ### On Windows and Linux
@@ -229,73 +250,60 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 
 ### Service behavior
 
-- **Auto-start on login** - `jacked service install` writes a macOS launchd plist (`~/Library/LaunchAgents/ai.hank.jacked.plist`) or a Windows startup VBS script. Service runs on reboot too.
-- **Crash recovery, not nag-ware** - KeepAlive is scoped to `SuccessfulExit=false`, so a clean stop from the tray or CLI *won't* trigger a respawn. Only actual crashes come back.
+- **Exact, per-user auto-start** - `jacked service install` generates an owned launchd definition on macOS, a systemd user unit on Linux, or a Task Scheduler definition on Windows from the current package version and interpreter.
+- **One managed background API owner per OS user** - a lifetime lease makes competing managed starters lose cleanly. Installation can hand off a verified manual v2 instance before activating the native supervisor, so an upgrade does not create two owners.
+- **Authenticated lifecycle control** - status, stop, and restart discover the running instance through a private manifest, lifetime lease, and per-user control channel, not by trusting whichever process occupies a port. They refuse PID-only process control when ownership cannot be proved.
+- **Safe port collisions** - the owned service uses port 8321 when available. If that port belongs to an ambiguous or foreign process, jacked starts on a dynamic quarantine port for the configured bind and `jacked service status` reports the actual dashboard URL.
+- **Secret-negative startup** - native service definitions start isolated Python with a small reviewed environment. Tokens and unrelated shell environment variables are not inherited into the long-lived service.
+- **Crash recovery, not nag-ware** - each native supervisor restarts failed runs but respects a clean user stop. On launchd this is `KeepAlive` scoped to `SuccessfulExit=false`; systemd and Task Scheduler carry matching failure-only restart policies.
+- **Non-destructive recovery** - `jacked service recover` reconciles drift only when the native definition is provably jacked-owned. It refuses legacy or foreign same-name artifacts, prints the exact path that needs operator review, and never adopts, deletes, or signals them automatically.
 - **CLI equivalent** - `jacked upgrade` does the same three-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
 - **Recovery file** - if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
 
 ### Commands
 
 ```bash
-jacked service install     # configure auto-start on login (launchd / Startup folder)
-jacked service uninstall   # remove auto-start config
+jacked service install     # configure auto-start (launchd / systemd user / Task Scheduler)
 jacked service start       # start the service with tray icon (foreground - blocks)
 jacked service stop        # stop the running service
 jacked service restart     # stop + detached start (returns immediately)
 jacked service restart --foreground   # same but runs in foreground like service start
-jacked service status      # show PID, port, uptime, autostart state
+jacked service status      # show evidence-qualified state, build, protocol, port, autostart
+jacked service recover     # safely reconcile a provably owned native definition
 ```
 
 ### Troubleshooting
 
-If the tray icon disappears, won't come back, or claims the port is in use, work through these in order:
+If the tray icon disappears, will not come back, or port 8321 is already occupied, start with evidence instead of a PID file:
 
 ```bash
-# 1. What's holding port 8321?
-lsof -i :8321 -sTCP:LISTEN            # macOS / Linux
-netstat -ano | findstr :8321          # Windows
-
-# 2. On macOS, stop launchd's KeepAlive loop so it doesn't fight you:
-launchctl unload ~/Library/LaunchAgents/ai.hank.jacked.plist
-
-# 3. Kill whatever's on the port (use the PID from step 1):
-kill -9 <PID>                         # POSIX
-taskkill /PID <PID> /F                # Windows
-
-# 4. Clear stale PID file:
-rm -f ~/.claude/jacked-service.pid    # POSIX
-del %USERPROFILE%\.claude\jacked-service.pid   # Windows
-
-# 5. Wait a couple seconds, then confirm the port is free:
-lsof -i :8321 -sTCP:LISTEN   # should print nothing
-
-# 6. Start fresh:
-jacked service start
+jacked service status      # reports running, quarantined, stopped, or indeterminate
+jacked service restart     # uses the authenticated control channel when ownership is proven
+jacked service recover     # reconcile owned drift without PID- or port-based control
 ```
+
+If status says **quarantined**, use the dashboard URL it prints. Another process owns 8321, and jacked deliberately leaves that process alone. If status says **ownership indeterminate**, run `jacked service recover`. Recovery refuses a legacy or foreign supervisor artifact and prints its exact path; stop that service from its own tray menu, inspect and move the artifact to a backup path, then retry recovery. Do not kill a PID copied from the legacy diagnostic file at `~/.claude/jacked-service.pid`.
 
 Common issues:
 
-- **Tray icon never appears after install** - the tray ships by default now, so the usual causes are: (a) you passed `jacked install --no-tray`, (b) you're on a **headless** box (no `DISPLAY`/Wayland) where the icon is skipped on purpose - the service still runs, reach it at `http://127.0.0.1:8321`, or (c) the service isn't running: `jacked service start`. Confirm with `curl -s http://127.0.0.1:8321/api/version`.
-- **Tray shows a wrong version** - the menu anchors on the running process's `__version__`, so if it shows "v0.41.2" and you just upgraded, the running process is stale. The tray is still the *old* binary. Fix: `jacked service stop && jacked service start`, or `jacked service restart`. `Check for updates...` in the menu forces a fresh PyPI poll (useful if only the cached "latest" is stale).
-- **`jacked upgrade` said "Upgrade complete" but the tray is still running the old version** - this was the 0.41.6→0.41.9 bug. `jacked service stop` sends SIGTERM, but pystray on macOS runs the AppKit NSRunLoop on the main thread, which can silently swallow Python signals. The upgrade's port-wait timed out and the detached `service start` hit "port in use." Fixed in 0.41.10+: graceful stop now polls for actual PID death and escalates to SIGKILL if SIGTERM is ignored. Confirm the fix took with `curl -s http://127.0.0.1:8321/api/version` and check the `current` field matches your installed version. If you're stuck on an older upgrade, follow the port-recovery sequence above and then `jacked service start`.
-- **"Port 8321 in use" after `jacked upgrade`** - an old tray didn't fully release the socket. Resolved in 0.41.6+ for service restart, and in 0.41.10+ for the upgrade path specifically (with SIGKILL escalation). Run `jacked upgrade` once more to pick up the fix.
-- **Auto-update ran but tray never came back** - the updater's detached `service start` hit the port race. Fixed in 0.41.4+ and hardened again in 0.41.13 (force-kills stuck parent + port squatter, verifies new service actually binds). If you're still stuck, follow the cleanup steps above, then run `jacked service start`.
+- **Tray icon never appears after install** - the tray ships by default now, so the usual causes are: (a) you passed `jacked install --no-tray`, (b) you're on a **headless** box (no `DISPLAY`/Wayland) where the icon is skipped on purpose, or (c) the service is not running. Run `jacked service status`; use the reported dashboard URL if the service is quarantined, or run `jacked service start` if it is stopped.
+- **Tray shows a wrong version after an upgrade** - run `jacked service status` to compare the owned service build with the installed version. If ownership is proven, `jacked service restart` performs an authenticated handoff. If ownership is indeterminate, use `jacked service recover`; do not signal a PID manually.
+- **"Port 8321 in use"** - run `jacked service status`. A v2 service quarantines itself onto a discoverable dynamic port instead of killing the listener, so use the dashboard URL status prints.
+- **Auto-update ran but the tray never came back** - run `jacked service status`, then `jacked service recover` to reconcile a provably owned native definition. Recovery stops with exact-path guidance if it finds a legacy or foreign artifact.
 - **Claude Code keeps asking me to log in** - jacked was rotating the active account's CC refresh token out from under Claude Code. Fixed in 0.41.2+. Update and the issue goes away. Architecture doc at `docs/architecture/oauth-and-credential-flows.md` §7.1-7.3 explains the full mechanism.
 - **Auto-update failed** - read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file lists the exact commands to finish the upgrade manually.
 
 Verify what's actually running:
 
 ```bash
-# What version is the live tray reporting?
-curl -s http://127.0.0.1:8321/api/version
-# {"current":"0.41.10","latest":"0.41.10","outdated":false,...}
+# What endpoint and version is the live tray reporting?
+jacked service status
+curl -s http://127.0.0.1:8321/api/version   # use the Port value reported above
+# {"current":"0.99.0","latest":"0.99.0","outdated":false,...}
 
-# Which PID owns the port, and when did it start?
-lsof -iTCP:8321 -sTCP:LISTEN                   # macOS / Linux
-ps -p <PID> -o pid,lstart,command               # when did it launch?
 ```
 
-If `current` is older than the version your `uv tool list` shows, the running tray predates the install - stop + start it.
+If `current` is older than the version your `uv tool list` shows, the running tray predates the install. Use the authenticated restart or recovery flow above.
 
 ### Installing from scratch
 
@@ -320,12 +328,11 @@ uv tool install claude-jacked
 
 # 5. Wire up Claude Code hooks + the launchd auto-start + tray
 jacked install
-jacked service install
 ```
 
 Notes:
 - uv's installer adds `~/.local/bin` to your shell rc automatically. If `jacked --version` says "command not found" after step 5, run `uv tool update-shell && source ~/.zshrc` or open a fresh terminal.
-- Auto-start plist goes to `~/Library/LaunchAgents/ai.hank.jacked.plist`. Removes cleanly via `jacked service uninstall`.
+- The owned launchd definition lives at `~/Library/LaunchAgents/ai.hank.jacked.plist`. If it conflicts with a legacy or foreign definition, `jacked service recover` refuses to replace it and prints that exact path for review.
 
 ---
 
@@ -344,14 +351,13 @@ uv --version
 # 4. Install jacked (tray icon ships by default)
 uv tool install claude-jacked
 
-# 5. Wire up Claude Code hooks + start the tray
+# 5. Wire up Claude Code hooks + the systemd user service + tray
 jacked install
-jacked service start
 ```
 
 Notes:
-- Requires a system tray provider (most desktop environments ship one - GNOME may need the AppIndicator extension; KDE/Cinnamon/XFCE work out of the box). On distros without tray support, uvicorn still runs headless and the dashboard is reachable at `http://localhost:8321` - check `~/.claude/jacked-service.log`.
-- `jacked service install` isn't wired for Linux yet - for boot-time auto-start, add `jacked service start` to your DE's Startup Applications, or drop a systemd user unit yourself (see issue tracker).
+- Requires a system tray provider (most desktop environments ship one - GNOME may need the AppIndicator extension; KDE/Cinnamon/XFCE work out of the box). On a headless box, run `jacked service start`, then use `jacked service status` for the actual dashboard URL and `~/.claude/jacked-service.log` for logs.
+- `jacked service install` reconciles and enables a per-user systemd unit. It never needs a root system service.
 
 ---
 
@@ -370,22 +376,21 @@ uv --version
 # 4. Install jacked (tray icon ships by default)
 uv tool install claude-jacked
 
-# 5. Wire up Claude Code hooks + Startup-folder auto-start + tray
+# 5. Wire up Claude Code hooks + Task Scheduler auto-start + tray
 jacked install
-jacked service install
 ```
 
 Notes:
 - After step 4, `jacked.exe` lives at `%USERPROFILE%\.local\bin\jacked.exe`. uv's installer adds that dir to PATH - if `jacked --version` fails, open a new terminal (PATH changes don't propagate into open ones).
-- `jacked service install` writes a `.vbs` launcher into `shell:startup` (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\jacked.vbs`). It re-runs on login. Remove via `jacked service uninstall`.
+- `jacked service install` registers a current-user, least-privilege Task Scheduler definition backed by a private, hash-verified PowerShell launcher.
 - **PowerShell execution policy warning**: if `irm | iex` is blocked, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` first, or download and run the installer script manually from [astral.sh/uv/install.ps1](https://astral.sh/uv/install.ps1).
-- If the tray icon doesn't appear, the service is still running headless - check `%USERPROFILE%\.claude\jacked-service.log` and hit `http://127.0.0.1:8321` in your browser.
+- If the tray icon does not appear, run `jacked service status` first. Use the dashboard URL it reports when the service is running or quarantined, and check `%USERPROFILE%\.claude\jacked-service.log` for details.
 
 ---
 
 #### After install (all platforms)
 
-Dashboard is at `http://localhost:8321`. The tray icon's right-click menu has Open Dashboard, Restart, Stop, Start on Login, version + "Check for updates...", and the clickable "Update to vX.Y.Z ->" item when a newer version hits PyPI.
+Run `jacked service status` for the dashboard's actual URL. It normally uses `http://localhost:8321`; a safe quarantine start uses a reported dynamic loopback port instead. The tray icon's right-click menu has Open Dashboard, Restart, Stop, Start on Login, version + "Check for updates...", and the clickable "Update to vX.Y.Z ->" item when a newer version hits PyPI.
 
 Upgrading later is one command: `jacked upgrade` (from the terminal) or click the Update line in the tray menu. Both auto-detect that you installed via uv and re-use it. Don't have uv anymore? Reinstall it first: same curl/powershell commands as step 1.
 
@@ -589,7 +594,7 @@ jacked memory migrate              # import existing .remember/ history (see bel
 Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | me@co.com · MyOrg · Max 5x
 ```
 
-Model and effort, context-window pressure with real token counts, both rate-limit windows with their reset times, and the account the session runs on. Percentages are color-coded (green, then yellow at 60%, red at 85%). The renderer is a small stdlib-only Python module, registered with the absolute path of jacked's own interpreter, so it works the same on macOS, Linux, and Windows with no shell, `jq`, or PATH dependencies.
+Model and effort, context-window pressure with real token counts, both rate-limit windows with their reset times, and the latest evidence-qualified account state. A fresh global resolved snapshot can show the observed email. A scoped launch shows the desired account with `runtime unknown` unless its exact launch nonce, credential revision, and evidence binding are certified. Stale, conflicting, missing, or unusable evidence also stays visibly unresolved. Percentages are color-coded (green, then yellow at 60%, red at 85%). The renderer is a small stdlib-only Python module, registered with the absolute path of jacked's own interpreter, so it works the same on macOS, Linux, and Windows with no shell, `jq`, or PATH dependencies.
 
 The install is safe by design. If you already have a statusline, `jacked install` keeps it and tells you how to adopt jacked's. An explicit enable saves your previous statusline and restores it when you disable or uninstall. An explicit disable is durable: the next `jacked install` does not turn the statusline back on.
 
@@ -631,15 +636,15 @@ Works on Windows, Mac, and Linux. To remove: `jacked uninstall --sounds`
 
 ### How do I run multiple Claude Code accounts?
 
-Install jacked, then add each account from the dashboard (`jacked webux`, Accounts page) or let it walk you through the OAuth flow. Every account you own becomes part of one pool, and `jacked claude <part-of-email>` launches Claude Code on a specific one.
+Install jacked, then add each account from the dashboard's Accounts page or let it walk you through the OAuth flow. Every account you own becomes part of one fleet. Use `jacked claude <id-or-email>` when you want a specific account target; the session remains runtime-unverified until exact-build evidence can certify which identity served it.
 
 ### What happens when I hit my Claude Code usage limit?
 
-Instead of waiting out the reset, jacked swaps you to another account that still has headroom. Auto-swap rotates before a limit stops you, so a long session keeps going.
+Jacked identifies an eligible account that still has headroom and records an auto-swap recommendation. Automatic credential mutation happens only when the exact runtime has a certified cooperative transaction engine and writer fence. Otherwise jacked leaves credentials unchanged and tells you which account to choose.
 
 ### Can jacked switch Claude accounts automatically?
 
-Yes. Auto-swap watches each account's remaining 5-hour and 7-day headroom and rotates to a fresh account before the active one runs out. You can also switch by hand from the dashboard or the tray.
+Only on a runtime with a certified cooperative credential capability. Auto-swap always watches the 5-hour and 7-day headroom, but current unsupported or unfenced builds stay recommendation-only. Manual **Use Account** requests are local-only and return the exact outcome instead of claiming success from a database setting.
 
 ### How do I check how much Claude usage I have left?
 
@@ -697,6 +702,7 @@ Your local database (`~/.claude/jacked.db`) stays intact - reinstall anytime wit
 
 | Version | Changes |
 |---------|---------|
+| **0.99.0** | **Evidence-safe account switching and cross-platform service ownership.** Claude credential changes now run through an exact-build capability registry and a typed transaction result, with idempotent dashboard actions and separate desired, stored, committed, existing-session, and provider-verification states. The certified Claude Code 2.1.259 macOS arm64 topology can report `observed_target_unfenced`; unknown builds, platforms, architectures, and config modes fail closed. Auto-swap remains recommendation-only unless a certified cooperative transaction engine and writer fence are installed. Session hooks now consume a bounded, token-free resolver snapshot and the Accounts page separates **Started as**, **Observed configuration**, **Pending next activity**, and **Runtime unverified** instead of presenting a changed default as proof about live sessions. `jacked claude <id-or-email>` still prepares a scoped per-account config and passes Claude arguments through, but does not call that runtime identity proven without certified nonce, revision, and evidence binding. The background service now has a content-addressed service specification, isolated secret-negative startup environment, lifetime ownership lease, private manifest, authenticated per-user control channel, and a quarantine port when 8321 has ambiguous ownership. Installation hands a verified manual v2 instance off before native activation, while `jacked service recover` reconciles only provably owned drift and refuses legacy or foreign supervisor artifacts with exact-path guidance. Native definitions cover launchd, systemd user services, and Windows Task Scheduler, and CI runs the test suite on Ubuntu, macOS, and Windows. |
 | **0.98.1** | **`fix(dashboard)`: the Re-auth row in an account's overflow menu now re-authenticates that account, instead of opening a blank Add Account window in incognito.** The token pill's re-auth went through `startReauthFlow(id, email)`, which POSTs to `/api/auth/accounts/{id}/reauth` so the flow knows whose token it is refreshing. The kebab menu's row, built by the same code and carrying the same `data-id`, threw that id away and called `startAddAccountFlow()`. With no target account the launcher has no identity to pre-fill and no dedicated profile to open, so it deliberately falls back to a private window (the rule from 0.97.0 that Add Account must never authorize whoever a shared profile is signed in as), the banner shows no email, and the OAuth callback can create a duplicate row instead of updating the one you clicked. The row now calls the targeted flow like the pill does. Two behavior tests in `tests/unit/test_web_js_account_menu.py` click the row through the real handler and assert it starts the targeted flow with the right id and email, never the add flow, and that cancelling the confirm starts nothing; the first one fails against the old handler. **Also: Use Account no longer plays dead after a CC token re-auth.** Reported on macOS: re-auth the CC token, click Use Account, nothing happens, no toast, and only a page reload and a second click switch the account. While an OAuth flow is pending the dashboard refuses every other account action with a two-second "in progress" toast, and three things kept that guard up after the sign-in had actually finished. The verdict was read only by a one-second timer, but the sign-in window takes the foreground, and a hidden tab's timers are throttled or frozen, so a completed flow could sit unread for minutes; the server also forgot a finished flow 30 seconds after the callback, so a late poll came back "expired" with the tokens already stored; and the guard was released only after the full account refresh, which on macOS runs Keychain reconciliation. Now the server keeps a finished flow pollable for five minutes (`FLOW_RETENTION_SECONDS`), the dashboard polls the instant the tab becomes visible or focused, the guard drops on the server's verdict rather than after the refresh, the banner carries a Cancel button so a stuck flow never needs a reload, and the refusal toast lasts four seconds and says what to do. Tests: `tests/unit/test_oauth_flow_retention.py` and `tests/unit/test_web_js_oauth_flow_guard.py`. |
 | **0.98.0** | **`feat(prompts)`: a prompt audit of everything jacked ships, the memory vault stops begging Haiku for JSON, and `jacked install` on Windows stops piling up SessionStart hooks.** The audit (`/claude-api prompt-audit` against Claude Fable 5.1) went over all 80 shipped prompt files. Verdict: mostly clean, with three real problems. First, the two memory-vault `claude -p` passes said "Return STRICT JSON ONLY, no prose, no markdown fences" and then fished an object out of whatever came back with a widest-braces parser, while the CLI has had `--json-schema` for exactly this. Both passes now pass a JSON Schema (`TRIAGE_SCHEMA`, `MERGE_SCHEMA`) through a new `schema=` kwarg on `call_claude`, which adds `--output-format json --json-schema`; `parse_triage` reads the CLI's envelope (`structured_output`, or the JSON string in `result`, confirmed against a live run) and keeps the tolerant parse only as the schema-less fallback. Second, the "never cap successful work" backstop paragraph existed in six shouted copies whose stuck-threshold wording drifted; it now reads at normal volume in `jacked_behaviors.md` with short restatements in bhag, goal-maker, whats-next, and the two hardening skills. Third, `/learn` told every rule it wrote to lead with ALWAYS or NEVER, manufacturing the same register in every downstream CLAUDE.md; it now asks for a plain directive with its reason and reserves the absolutes for recurring hard constraints, and `/audit-rules` stops grading a rule vague for lacking the keyword. Smaller rewrites: `/redo` at normal volume, `/swarm` without the "as of v2.1.178, TeamCreate no longer exists" archaeology, chain-of-command without the "burned us 2026-07-02" story, two skill descriptions (whats-next, recover) as intent categories instead of quoted-phrase lists, and a personal-preference attribution removed from two public skills. The installer bug fell out of the audit's follow-up: `_is_jacked_managed_hook_path` matched `jacked" _hook ` case-sensitively, the Windows shim path ends in `jacked.EXE"`, so no entry on Windows ever counted as jacked's and every `jacked install` appended one more combined SessionStart hook (this machine had eight, and the chain-of-command policy was landing in context two or three times per session). The matcher is case-insensitive now and accepts the `.exe` form; uninstall used the same matcher and was leaving hooks behind too. Also in this release: `docs/future-work.md` gains the graphify-wiring and subscription-billing proposals, and the launch article draft is checked in. |
 | **0.97.1** | **`fix(auth)`: the dedicated sign-in window now actually comes to the front, and the dashboard's fallback link no longer routes you into the wrong account.** First real use of 0.97.0 on Windows: the launcher did everything right (Chrome, dedicated profile, email pre-filled) and the user saw nothing, because Windows refuses foreground activation to a window created by a background process and the tray service is one. The window opened behind the dashboard. The natural next move was the banner's "Open the authorization page" link, which opens in the dashboard's own browser, signed in to some other Claude account, and with `orgUUID` naming an org that account is not in, claude.ai answers "Can't access this organization". A dead end that looked like a jacked bug. Two fixes. New `jacked/web/window_focus.py` runs a focus pass on a daemon thread after every launch on Windows: it polls for the visible window owned by the spawned browser process (and, after three seconds, for a Claude-titled window from the same executable, since Chrome hands the URL to an already-running instance of that profile and exits), then escalates through `SetForegroundWindow`, a minimize/restore round trip, and finally a taskbar flash, and logs which one worked. Verified from a console-less detached process: the new window took the foreground on the first attempt. On macOS the launcher now goes through `open -n -a <bundle> --args ...` so Launch Services activates the app instead of leaving it behind. And the banner's primary action in profile or private-window mode is now a "Bring up the sign-in window" button backed by `POST /api/auth/flow/{id}/open`, which re-launches into the same profile (existing instance gets a tab, focus pass runs again); the raw link is demoted to "Open in this browser instead" with a plain warning that it uses whatever account that browser is already signed in to. The subtitle names the browser and says the window may be behind the dashboard or on the taskbar. Flow status now also reports `browser_name`, `purpose`, the target identity and any `reopen_error`. |
@@ -706,7 +712,7 @@ Your local database (`~/.claude/jacked.db`) stays intact - reinstall anytime wit
 | **0.94.2** | **`fix(webux)`: you can add or re-auth an account from a REMOTE dashboard again - returning from Claude's authorization tab no longer destroys the code paste box. `docs(readme)`: rewrite the README's opening and add an FAQ so coding agents can actually find this project.** The remote (manual) OAuth flow hands you an authorization link rather than popping a browser on the server: you approve in a second tab, Claude shows a code, you paste it back. Except switching back to the dashboard fired the `visibilitychange` handler in `websocket.js`, which calls `renderRoute()` - a wholesale re-render of the accounts view that takes `#oauth-flow-status` with it, destroying the authorization link and the paste box at the precise moment you returned holding the code. The flow then kept polling invisibly until it timed out, with nowhere left to paste, which made adding or re-authing an account from another machine effectively impossible. `rerenderAccountsView()` has carried that banner across re-renders since 0.85.0, but this path never went through it. The handler now bails on `_accountActionInFlight` before re-rendering, exactly as `startPolling()` already did with the same flag. The regression test is mutation-verified: pull the guard out and it fails. Separately, Firecrawl launched a Developer Index on 2026-08-20: a semantic retrieval layer over 70M+ developer artifacts (READMEs, issues, merged PRs, docs, OpenAPI specs) that coding agents increasingly use to pick tools. Our README was already indexed (confirmed via the API's `repos` echo, `readme: true`) and still ranked outside the top 50 for the query that literally describes this project, behind repos with 7 and 9 stars - so not a popularity problem. The cause was semantic: the H1 was a bare brand token that means nothing to an embedding model, and the section headings ("What You Get", "Quick Start") carried none of the vocabulary people actually search with, which matters because this index retrieves PASSAGES and the extracted passage includes the headings verbatim. The H1 now names the function, the opening is phrased as the user's problem ("when you hit a Claude Code usage limit"), the three vocabulary-free h2s were renamed (no TOC anchors broke - only the TOC links internally and none of the three were in it), and a new 10-question FAQ gives passage retrieval something to match, every answer grounded in shipped behavior rather than aspiration. Two accuracy bugs fell out of the same pass: the intro described the tray as "a macOS menu-bar app" when `select_menubar_backend()` in `jacked/service/tray.py` falls back to pystray on every non-darwin platform, so Windows and Linux support was being hidden from readers and search alike; and the command/skill counts were stale in three separate places (29 commands / 27 skills in both the intro bullet and the What's Included table, plus a third figure in the PyPI summary) against a real 30 / 28 / 10 counted off `jacked/data/`. The `pyproject.toml` description, which is the user-facing PyPI project summary, was refreshed to match and had its em-dash removed. Also investigated and rejected: moving `jacked/data/skills/` to a root-level `skills/` dir to get our 28 skills indexed individually - the repo already ships six tracked `SKILL.md` files at `.claude/skills/`, the exact path pattern the index picks up for other repos, and none are indexed, which means skill and doc ingestion is popularity-gated rather than path-gated. No code changes. |
 | **0.94.1** | **`fix(windows)`: the tray's Update button silently did nothing and left you with no tray icon at all.** Clicking Update ran for five seconds, marked every phase `ok`, and performed none of them: the package upgrade, the settings migration and the service start were all skipped, leaving the old version installed with no service and no icon. The tray-update helper is a cmd.exe batch, and 0.92.1 began spawning it with its stdout bound to an open handle on `~/.claude/jacked-update.log` so its output would be captured instead of vanishing. But cmd.exe cannot open a redirection target that another handle already holds open for writing, so every `>> "%LOGFILE%"` step failed with "The process cannot access the file because it is being used by another process" - and cmd then SKIPS the command while leaving ERRORLEVEL at 0, so every `if errorlevel 1` guard sailed straight past a step that never ran. The status file recorded `installing_package` as `ok` in 0.33 seconds, which is not a duration in which `uv tool install --force` completes. Only `verifying_service`, which actually probes the port, reported the truth, by which point there was nothing left to recover. Every `%LOGFILE%` redirection is gone from both Windows batches: cmd's stdout IS the log, so bare output both works and is strictly better than before, since steps outside a redirect previously died completely silently. Two further faults in the same batch are fixed: `timeout /t 1 /nobreak` was the poll sleep, but the helper is spawned with `stdin=DEVNULL` and `timeout` refuses a redirected stdin (`ERROR: Input redirection is not supported`), so the bounded 120-second wait for the tray to exit completed in milliseconds and raced `uv tool install --force` against a live `python.exe` - the long-standing "Access denied unless you stop the service first" upgrade folklore, which also affected `jacked upgrade`; it is now `ping -n 2 127.0.0.1`, which needs no console. And the poll loop's `tasklist`/`find`, whose exit code decides whether the parent is still alive, are pinned to `%SystemRoot%\System32` so a Git Bash, Cygwin or GnuWin32 `find` on PATH cannot make the loop conclude the tray died on its first pass. Both Windows helpers now build the wait loop from one shared `wait_for_parent_block()` instead of two hand-copied blocks that had independently regressed twice, and the tray path retries `jacked service start` once before declaring failure, because an update that ends with no tray icon is the one outcome that leaves no way back in. 15 new tests cover both batches, one of them pinning the real cmd.exe sharing-violation and ERRORLEVEL-stays-0 behaviour so the reason for the others stays visible; they were mutation-checked by reintroducing the bug and confirming the suite goes red. |
 | **0.94.0** | **`feat(tray)`: the tray/menu-bar icon is now the jacked arm - visible at 16px on Windows for the first time.** The old icon drew the letter "J" with a TrueType font onto a purple rounded rect; thin font strokes plus Windows font-resolution failures shrank it to an invisible speck in the system tray (~2% pixel coverage of a 16px cell). The new mark is a bold flexed-arm silhouette (matching the dashboard's flexed-biceps favicon), shipped as a 4.8KB grayscale mask (`jacked/data/icons/tray-mark.png`) and tinted at render time by a new shared renderer (`jacked/service/icon.py`) - ~42% coverage of a 16px cell, and the entire font-resolution failure class is deleted along with `_load_glyph_font`. Windows/Linux tray tints by service state (green running / amber starting / gray stopped; the old purple gradient is retired), macOS tints by live usage color with the update badge and provider dot intact. The macOS icon cache moves to `jacked-menubar-arm-*` names with a once-per-process sweep of the legacy PNGs (mtime-guarded so a still-running pre-upgrade process's fresh files survive). A font-free fallback mark renders if the asset is ever missing or corrupt, so the tray never goes blank. Tests pin 16px visibility with thresholds calibrated against measured reality (shipped mark 42%, old bug 2%, floor 15%), per-state tint distinctness, the fallback path, and the guarded cache sweep. |
-| **0.93.0** | **`feat(dcr)`: risk-tiered review depth — `/dcr` and `/dc` stop spending LARGE-tier tokens on every bugfix. `feat(usage)`: provider usage normalization (Claude + OpenRouter) reaches the statusline and analytics.** `/dcr` now classifies every change into a RISK TIER before spawning anything: SMALL (mechanical, nothing sensitive) runs ONE consolidated reviewer carrying all selected lenses; MEDIUM runs two; only LARGE (sensitive areas - auth, credentials, RBAC/tenancy, billing, migrations, concurrency - or >~600 lines or an architectural plan) gets the full fan-out with personas, wild cards, and the dedicated pre-mortem analyst, and selecting the Security or Access Control lens promotes the tier to LARGE even after an earlier SMALL/MEDIUM call. Re-check waves now verify fixes and their adjacent code ONLY instead of the old "FULL fresh review as if seeing the code for the first time" every wave (the single biggest token sink in the recursive loop, and structurally non-convergent since fresh eyes always dredge up one more marginal item), and the wave loop gains a default cap of 3. The findings policy flips from "report every issue including ones you are not fully sure about" to confidence-first: CRITICAL/MEDIUM only when the reviewer would stake the review on it, with the parent validation gate disproving rather than completing findings - matching how production reviewers (including Anthropic's own Code Review) filter noise. Deterministic diagnostics (lint/type/tests) move to a pre-gate that runs and gets fixed BEFORE any reviewer spawns, and the frontend design reviewer now requires a UI-meaningful diff (markup/styles/DOM/animation) instead of firing on any `.js` file. `/dc` gets the matching surgery: pre-mortem conditional on the same large/sensitive/architectural criteria and a default 3-cycle cap on the planning-phase re-verify loop. `/jacked-setup dcr` templates gain a **Sensitive Areas** key so each repo can name the paths that force LARGE. Grounded in 2026 research: same-family judge panels have correlated errors (7 same-model reviewers ≈ ~2 independent votes), marginal returns drop sharply past ~3 agents, and modern frontier models hold 5+ review lenses in one prompt without losing depth - so the median run drops from 5-8 agents times uncapped fresh-review waves to 1-3 agents times capped verify waves (~70-85% fewer tokens) while big or security-sensitive changes keep full thoroughness. 17 new content-contract tests pin the doctrine, including a verbatim-embed check that fails the moment the repo's `.claude/commands/dcr.md` wrapper drifts from the shipped engine body. Separately, the new `jacked/usage_normalizer.py` normalizes token-usage payloads across Claude and OpenRouter response shapes (input/output/cache tokens, cost, bool/NaN/negative guards) and is wired through the statusline (OpenRouter per-request cost rendering), the analytics scanner/db/anomalies pipeline, and the dashboard usage components. |
+| **0.93.0** | **`feat(dcr)`: risk-tiered review depth. `/dcr` and `/dc` stop spending LARGE-tier tokens on every bugfix. `feat(usage)`: provider usage normalization (Claude + OpenRouter) reaches the statusline and analytics.** `/dcr` now classifies every change into a RISK TIER before spawning anything: SMALL (mechanical, nothing sensitive) runs ONE consolidated reviewer carrying all selected lenses; MEDIUM runs two; only LARGE (sensitive areas - auth, credentials, RBAC/tenancy, billing, migrations, concurrency - or >~600 lines or an architectural plan) gets the full fan-out with personas, wild cards, and the dedicated pre-mortem analyst, and selecting the Security or Access Control lens promotes the tier to LARGE even after an earlier SMALL/MEDIUM call. Re-check waves now verify fixes and their adjacent code ONLY instead of the old "FULL fresh review as if seeing the code for the first time" every wave (the single biggest token sink in the recursive loop, and structurally non-convergent since fresh eyes always dredge up one more marginal item), and the wave loop gains a default cap of 3. The findings policy flips from "report every issue including ones you are not fully sure about" to confidence-first: CRITICAL/MEDIUM only when the reviewer would stake the review on it, with the parent validation gate disproving rather than completing findings - matching how production reviewers (including Anthropic's own Code Review) filter noise. Deterministic diagnostics (lint/type/tests) move to a pre-gate that runs and gets fixed BEFORE any reviewer spawns, and the frontend design reviewer now requires a UI-meaningful diff (markup/styles/DOM/animation) instead of firing on any `.js` file. `/dc` gets the matching surgery: pre-mortem conditional on the same large/sensitive/architectural criteria and a default 3-cycle cap on the planning-phase re-verify loop. `/jacked-setup dcr` templates gain a **Sensitive Areas** key so each repo can name the paths that force LARGE. Grounded in 2026 research: same-family judge panels have correlated errors (7 same-model reviewers ≈ ~2 independent votes), marginal returns drop sharply past ~3 agents, and modern frontier models hold 5+ review lenses in one prompt without losing depth - so the median run drops from 5-8 agents times uncapped fresh-review waves to 1-3 agents times capped verify waves (~70-85% fewer tokens) while big or security-sensitive changes keep full thoroughness. 17 new content-contract tests pin the doctrine, including a verbatim-embed check that fails the moment the repo's `.claude/commands/dcr.md` wrapper drifts from the shipped engine body. Separately, the new `jacked/usage_normalizer.py` normalizes token-usage payloads across Claude and OpenRouter response shapes (input/output/cache tokens, cost, bool/NaN/negative guards) and is wired through the statusline (OpenRouter per-request cost rendering), the analytics scanner/db/anomalies pipeline, and the dashboard usage components. |
 | **0.92.1** | **`fix(service)`: the Windows login autostart has been silently dead on every boot, and `jacked doctor` was covering for it.** The Startup-folder VBS launches the tray with `pythonw.exe -m jacked service start`, and `pythonw` has no console, so CPython sets `sys.stdin`, `sys.stdout` and `sys.stderr` to `None`. Two separate `isatty()` calls then killed it. First, the first-run install nag ran `sys.stdin.isatty()` straight off the top-level `main()` callback, raising `AttributeError` before any subcommand could dispatch, so every `pythonw -m jacked ...` invocation exited 1 with no console, no log line, and no tray icon, boot after boot. The guard exists precisely to bail out for non-TTY callers, and it was crashing on the most non-TTY case there is. Fixing that alone only moved the failure, because uvicorn's own log formatter does `self.use_colors = sys.stdout.isatty()`, which blows up inside `dictConfig` and takes the uvicorn thread with it, leaving the worst possible state: tray process alive, PID file written, `jacked service status` reporting running, and the port answering nothing. Rather than patch call sites (the second one is third-party, and the next dependency will do the same thing), a new `jacked/headless.py` gives the interpreter real streams once at entry. It is wired into `__main__.py` ahead of the cli import, because `cli.py` builds a rich `Console` at module scope, and again in `main()` for the `jacked.exe` console-script path that skips `__main__` entirely. The fallback sink is deliberately not a raw `os.devnull` handle: on Windows NUL is a character device and `open(os.devnull).isatty()` returns True, which would tell rich and uvicorn to paint ANSI color for a terminal that does not exist. Crash output from a console-less run now lands in `~/.claude/jacked-headless.log` (2 MB cap, rotates) instead of the void, so the next one of these takes minutes to find instead of a week. Separately, `jacked doctor` reported `HEALTHY` for eight days straight while the tray was missing: it only probed the port, so it could not tell the tray service apart from a hand-run `jacked webux` (dashboard only, no tray icon, no PID file) that was squatting 8321 and starving every `service start` of its port, all while `jacked service status` correctly said stopped. doctor now cross-checks the PID file before claiming health and reports `DASHBOARD UP, NO TRAY SERVICE` with the actual recovery steps, and its "who is holding the port" hint is no longer a hardcoded `lsof` on the one platform that has this bug. 20 new tests. |
 | **0.92.0** | **`feat(webux)`: account cards get an overflow (kebab) menu, and the color theme finally reaches the menu-bar tray. `feat(statusline)`: the model-scoped weekly limit is now on screen. `fix(statusline)`: the FALLBACK warning is no longer sticky or inverted.** The account card's action row collapses to `[Use Account] ... [kebab]`, with the rare actions behind the three-dot menu: a metadata header (account id and organization, the id being what the REST fallback needs), Copy launch command (resurrecting a dead commented-out path), Rename, Re-auth, Enable/Disable, and Delete behind a separator, with a full keyboard and ARIA contract (Escape restores focus, arrow keys navigate, one menu open at a time, and an open menu survives a background re-render). This closes a real gap: Re-auth used to render only when `validation_status` was invalid or expired, but accounts revalidate at most hourly, so a token that died inside that window left the dashboard showing "valid" with no re-auth affordance anywhere, exactly when Claude Code was demanding a relogin. Re-auth now renders for every Claude account regardless of status (never for Codex, whose re-auth is `codex login`), and an attention dot on the kebab flags the cases jacked does know about. Account cards also lose their 3px colored left border, which was redundant decoration over an already-labeled provider chip. The color theme moves from `localStorage` to the `color_theme` server setting, because the tray dropdown is a `WKWebView` inside the jacked process with its own storage, entirely separate from the browser: switching to Classic in the dashboard never reached the tray, which kept rendering America 250 forever. `localStorage` is demoted to a per-webview pre-paint cache (still no flash), an existing local choice migrates up once so nobody re-picks, the panel folds the read into its existing refresh cycle with no added polling, a user's pick always beats an in-flight reconcile, and a reconcile that changes the theme repaints the surfaces that bake theme classes into HTML. The statusline gains the model-scoped weekly bucket read read-only from jacked's own database, rendered as `Fable 96%->Sat 10:59`: Claude Code's payload carries only the aggregate `five_hour` and `seven_day` windows, and on every real account measured the model-scoped percentage sits above the aggregate one (96% vs 76%, 100% vs 90%), so `7d` alone was hiding the limit that actually stops the session. The account is resolved by email AND organization uuid (an email alone is ambiguous across organizations), stale data is marked and dropped past 24h, and stdlib-only, never-read-credentials, revision-cached (~0.2ms warm), fail-silent constraints all hold. Finally, the 0.89.0 FALLBACK warning is corrected: it compared the newest served model against the session's FIRST assistant turn, a baseline frozen for the life of the session, so every deliberate `/model` switch read as a gateway fallback and then never went away. Observed live, a session configured on Opus 5 with Opus 5 actually serving still rendered "claude-opus-5 (FALLBACK, not claude-fable-5)" because it began on Fable, and another real transcript labeled a deliberate upgrade a downgrade. The baseline is now the payload's model id, which Claude Code rewrites on every switch, so it self-clears; comparison normalizes both sides so a gateway's namespaced id is not flagged; the old first-turn baseline remains only when the payload has no model id; and skipping the head read on that path drops up to 4MB off every refresh. Across 12 real transcripts the false-warning count went from 3 to 0. |
 | **0.91.0** | **`feat(dcr)`: configurable review engine - route `/dcr` reviewers to the OpenAI Codex CLI.** New config (`~/.claude/jacked-dcr.json`) lets `/dcr`'s volume reviewers run as parallel `codex exec` jobs (default `gpt-5.6-luna` at `xhigh` effort, read-only sandbox, schema-validated JSON findings) instead of Claude Task subagents, so review fan-out spends an OpenAI subscription instead of the Anthropic plan. Judgment never moves: lens selection, per-finding validation, fixes, and the verdict stay in the parent Claude session, and `keep_on_claude` lenses (default Security + Frontend Design) always dispatch as Claude reviewers, with the carve-out applied before lens pairing so no lens is dropped or double-reviewed. Three surfaces share one contract: `jacked dcr engine` / `engine set` / `engine clear` (CLI, `--json` for the command), GET/PUT `/api/dcr-engine`, and a Review Engine card in Settings > Features (live Codex preflight with Check again, saving feedback, data-driven carve-out note). Fail-safe throughout: `resolve()` re-validates every field on the way out (shell-unsafe model ids, unknown efforts, and malformed lens lists are replaced with defaults plus a human reason), `update_config()` self-heals stale invalid stored values under a cross-process lock, and every failure shape - no config, no CLI, signed out, corrupt or permission-denied file, a failed or hung Codex job - falls back to Claude without ever silently dropping a lens. Schema live-verified against a real `codex exec --output-schema` run; 92 new tests including injection shapes, the lockout regression, and a cross-process write race. |
@@ -837,17 +843,18 @@ jacked permissions audit           # Audit permission rules for dangerous wildca
 jacked permissions audit --fix     # Interactively prune dangerous wildcards
 
 # Dashboard
-jacked webux                       # Open web dashboard
+jacked service status              # Show the background dashboard URL
+jacked webux                       # Run a foreground dashboard instead
 jacked webux --port 9000           # Custom port
 jacked webux --no-browser          # Server only, no auto-open
 
 # Background Service (tray icon ships by default)
 jacked service install             # Configure auto-start on login
-jacked service uninstall           # Remove auto-start
 jacked service start               # Start service with tray icon
 jacked service stop                # Stop running service
 jacked service restart             # Restart service
-jacked service status              # Show PID, port, uptime, autostart state
+jacked service status              # Show evidence-qualified state, build, protocol, port, autostart
+jacked service recover             # Safely reconcile a provably owned native definition
 
 # Slash Commands (29 total)
 # /dc /dcr /docs-sync /pr /learn /blindspot /redo /retry /techdebt /audit-rules /cleanup
@@ -864,11 +871,11 @@ jacked service status              # Show PID, port, uptime, autostart state
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JACKED_HOST` | 127.0.0.1 | Dashboard/service bind host |
-| `JACKED_PORT` | 8321 | Dashboard/service bind port |
 | `JACKED_ALLOWED_ORIGINS` | (unset) | Comma-separated extra origins (`scheme://host[:port]`) allowed cross-origin API/WebSocket access on a network bind (see Remote Access) |
 | `JACKED_ALLOWED_HOSTS` | (unset) | Comma-separated extra hostnames accepted in the `Host` header (DNS-rebinding guard escape hatch) |
 | `JACKED_HOME` | `~` | Redirects where jacked looks for the `.claude` home dir (used by tests and unusual setups) |
+
+`JACKED_HOST` and `JACKED_PORT` are internal runtime state set after bind resolution, not supported native-service configuration inputs. Use the dashboard's Remote access setting, `jacked service restart --host`, or `jacked webux --host/--port` instead.
 
 </details>
 
@@ -880,7 +887,7 @@ The dashboard is a local web application:
 - **Backend:** FastAPI (Python) serving a REST API
 - **Database:** SQLite at `~/.claude/jacked.db`
 - **Frontend:** Vanilla JS + Tailwind CSS (no build step, no npm)
-- **Server:** Uvicorn, runs at `localhost:8321`
+- **Server:** Uvicorn, normally at `localhost:8321`; `jacked service status` reports a quarantine port when needed
 
 All data stays on your machine. The dashboard reads Claude Code's configuration files (`~/.claude/settings.json`, `~/.claude/agents/`, etc.) and provides a visual interface for managing them.
 
@@ -945,12 +952,13 @@ PHASE 2 - INSTALL:
 - uv tool install claude-jacked && jacked install --force
 
 PHASE 3 - POST-INSTALL:
-- Launch dashboard: jacked webux
+- Confirm the running dashboard URL: jacked service status
+- Open the reported URL in my browser
 - Walk me through adding my Claude accounts from the Accounts page
 
 PHASE 4 - VERIFY:
 - jacked --help
-- jacked webux (confirm dashboard opens)
+- jacked service status (confirm the background dashboard is running)
 ```
 
 </details>

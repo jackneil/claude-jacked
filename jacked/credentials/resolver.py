@@ -1,0 +1,225 @@
+"""Canonical credential identity resolution and secret-free snapshots."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tempfile
+import time
+from dataclasses import asdict, dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Mapping, Protocol
+
+from .models import CredentialCapability, CredentialIdentity, StoreStatus
+from .store import CredentialStore
+
+SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_FILENAME = "jacked-resolver-snapshot.json"
+
+
+class ResolverState(str, Enum):
+    RESOLVED = "resolved"
+    CONFLICT = "conflict"
+    MISSING = "missing"
+    UNUSABLE = "unusable"
+    STALE = "stale"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class ResolverObservation:
+    state: ResolverState
+    identity: CredentialIdentity
+    evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ResolverSnapshot:
+    published_at: float
+    fresh_until: float
+    scope: str
+    state: ResolverState
+    evidence: tuple[str, ...]
+    credential_revision: str | None
+    desired: CredentialIdentity | None
+    observed: CredentialIdentity | None
+
+
+@dataclass(frozen=True)
+class SnapshotUpdate:
+    scope: str
+    state: ResolverState
+    evidence: tuple[str, ...]
+    credential_revision: str | None
+    desired: CredentialIdentity | None
+    observed: CredentialIdentity | None
+
+
+class ResolverSnapshotSink(Protocol):
+    def publish(self, update: SnapshotUpdate) -> None: ...
+
+
+class FileResolverSnapshotSink:
+    """Publish resolver updates with a bounded freshness lifetime."""
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        ttl_seconds: float = 30.0,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._path = path or default_snapshot_path()
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+
+    def publish(self, update: SnapshotUpdate) -> None:
+        published_at = self._clock()
+        snapshot = ResolverSnapshot(
+            published_at=published_at,
+            fresh_until=published_at + self._ttl_seconds,
+            scope=update.scope,
+            state=update.state,
+            evidence=update.evidence,
+            credential_revision=update.credential_revision,
+            desired=update.desired,
+            observed=update.observed,
+        )
+        publish_snapshot(self._path, snapshot)
+
+
+class MemoryResolverSnapshotSink:
+    def __init__(self) -> None:
+        self.updates: list[SnapshotUpdate] = []
+
+    def publish(self, update: SnapshotUpdate) -> None:
+        self.updates.append(update)
+
+
+class CanonicalCredentialResolver:
+    """Resolve authority and required-store consensus without guessing."""
+
+    def __init__(
+        self,
+        capability: CredentialCapability,
+        stores: Mapping[str, CredentialStore],
+    ) -> None:
+        self._capability = capability
+        self._stores = stores
+
+    def resolve(self) -> ResolverObservation:
+        declarations = (self._capability.authority, *self._capability.required_mirrors)
+        observations = []
+        evidence = []
+        for declaration in declarations:
+            store = self._stores.get(declaration.locator)
+            if store is None:
+                return ResolverObservation(
+                    ResolverState.UNUSABLE,
+                    CredentialIdentity(),
+                    (f"missing-adapter:{declaration.locator}",),
+                )
+            result = store.read()
+            evidence.append(
+                f"{declaration.role.value}:{declaration.name}:{result.status.value}"
+            )
+            if result.status is StoreStatus.MISSING:
+                return ResolverObservation(
+                    ResolverState.MISSING, CredentialIdentity(), tuple(evidence)
+                )
+            if result.status is not StoreStatus.OK or result.payload is None:
+                return ResolverObservation(
+                    ResolverState.UNUSABLE, CredentialIdentity(), tuple(evidence)
+                )
+            observations.append(result.payload)
+        digests = {payload.digest for payload in observations}
+        identities = {payload.identity for payload in observations}
+        if len(digests) != 1 or len(identities) != 1:
+            return ResolverObservation(
+                ResolverState.CONFLICT, CredentialIdentity(), tuple(evidence)
+            )
+        identity = observations[0].identity
+        if identity.account_id is None:
+            return ResolverObservation(
+                ResolverState.UNUSABLE, CredentialIdentity(), tuple(evidence)
+            )
+        return ResolverObservation(ResolverState.RESOLVED, identity, tuple(evidence))
+
+
+def default_snapshot_path(config_dir: Path | None = None) -> Path:
+    directory = config_dir
+    if directory is None:
+        configured = os.environ.get("CLAUDE_CONFIG_DIR")
+        directory = Path(configured) if configured else Path.home() / ".claude"
+    return directory / SNAPSHOT_FILENAME
+
+
+def _identity_dict(identity: CredentialIdentity | None) -> dict | None:
+    return asdict(identity) if identity is not None else None
+
+
+def publish_snapshot(path: Path, snapshot: ResolverSnapshot) -> None:
+    """Atomically publish the fixed, token-free resolver snapshot schema."""
+    value = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "published_at": snapshot.published_at,
+        "fresh_until": snapshot.fresh_until,
+        "scope": snapshot.scope,
+        "state": snapshot.state.value,
+        "evidence": list(snapshot.evidence),
+        "credential_revision": snapshot.credential_revision,
+        "desired": _identity_dict(snapshot.desired),
+        "observed": _identity_dict(snapshot.observed),
+    }
+    _validate_snapshot_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _validate_snapshot_path(path)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=".resolver-snapshot-", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(value, output, sort_keys=True, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _validate_snapshot_path(path: Path) -> None:
+    """Reject a link-like configured parent or snapshot target.
+
+    The configured directory is the trust boundary. Walking above it would
+    reject platform-owned aliases such as macOS ``/var -> /private/var``.
+    """
+    current = path.parent.absolute()
+    trusted_root = current
+    while True:
+        if current.is_symlink():
+            raise OSError("resolver snapshot parent contains a symlink")
+        if current.exists():
+            current_stat = current.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(current_stat.st_mode):
+                raise OSError("resolver snapshot parent is not a real directory")
+            if getattr(current_stat, "st_file_attributes", 0) & 0x400:
+                raise OSError("resolver snapshot parent is a reparse point")
+        if current == trusted_root:
+            break
+        current = current.parent
+    if path.is_symlink():
+        raise OSError("refusing resolver snapshot symlink")
+    if path.exists():
+        target_stat = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(target_stat.st_mode):
+            raise OSError("resolver snapshot target is not a regular file")
+        if getattr(target_stat, "st_file_attributes", 0) & 0x400:
+            raise OSError("resolver snapshot target is a reparse point")
+        if target_stat.st_nlink != 1:
+            raise OSError("refusing hard-linked resolver snapshot")

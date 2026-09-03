@@ -4,7 +4,7 @@ Claude Code runs the registered statusline command on every refresh and
 shows the first line of stdout. This module reads the session JSON on
 stdin and prints one ANSI-colored line:
 
-  Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | Fable 96%->Sat 10:59 | me@co.com · MyOrg · Max 5x
+  Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37 | Fable 96%->Sat 10:59 | me@co.com
 
 A "<served> (FALLBACK, not <configured>)" segment appears between the limits
 and the account when the model actually ANSWERING is not the model the
@@ -21,7 +21,8 @@ mode this design avoids).
 Data sources:
 - stdin (Claude Code): model, effort, context window, and the ONLY two
   rate-limit windows the payload carries -- five_hour and seven_day.
-- ~/.claude.json: the signed-in account (email, organization, plan tier).
+- ${CLAUDE_CONFIG_DIR:-~/.claude}/jacked-resolver-snapshot.json: an atomic,
+  secret-free account observation published by jacked's canonical resolver.
 - ~/.claude/jacked.db, READ-ONLY: jacked's cache of the Anthropic usage
   API, which is where the "Fable 96%" model-scoped weekly segment comes
   from. The stdin payload has no model-scoped limit at all, and its
@@ -46,58 +47,43 @@ Hard constraints:
   or a missing row drops its segment silently.
 - Never write to jacked.db, never create it, never migrate it. The jacked
   service owns that file and writes it concurrently.
-- Never read ~/.claude/.credentials.json. That file holds live OAuth
-  tokens; the statusline resolves the account from ~/.claude.json
-  instead. This is a deliberate security boundary, not an oversight.
+- Never read Claude credential or metadata files. A stale, conflicting, or
+  incomplete resolver snapshot renders the desired account plus runtime
+  unknown instead of inferring identity.
 """
 
-import hashlib
 import json
 import os
 import sys
-import tempfile
 import time
 
-RESET = "\033[0m"
-BOLD_CYAN = "\033[1;36m"
-YELLOW = "\033[33m"
-MAGENTA = "\033[35m"
-DIM = "\033[2m"
-GREEN = "\033[32m"
-RED = "\033[31m"
-CAVE = "\033[38;5;172m"
+from jacked.statusline_account import account_facts
+from jacked.statusline_cache import _read_cache, _write_cache
+from jacked.statusline_common import (
+    ARROW,
+    BOLD_CYAN,
+    CAVE,
+    DIM,
+    GREEN as GREEN,
+    MAGENTA,
+    MIDDOT as MIDDOT,
+    RED as RED,
+    RESET,
+    SEP,
+    YELLOW,
+    _fmt_reset,
+    _fmt_tokens,
+    _pct_color,
+    _round_pct,
+    _sum_usage,
+    _tier_label as _tier_label,
+)
+from jacked.statusline_transcript import _cost_segment, _served_segment
 
-SEP = f" {DIM}|{RESET} "
-ARROW = "→"
-MIDDOT = "·"
-
-# Plan-tier labels for the values seen in ~/.claude.json oauthAccount
-# rate-limit tiers (after stripping the "default_claude_" prefix).
-_TIER_LABELS = {
-    "max_5x": "Max 5x",
-    "max_20x": "Max 20x",
-    "pro": "Pro",
-    "free": "Free",
-}
-
-_ACCOUNT_CACHE_VERSION = 3
 _USAGE_CACHE_VERSION = 1
-
-# How far behind jacked's cached copy of the usage API may fall before the
-# model-scoped segment stops being presented as live. Fresh renders plain,
-# stale renders behind a dim "~", anything older is dropped rather than
-# shown as if it were current.
 _USAGE_FRESH_SECONDS = 2 * 3600
 _USAGE_MAX_AGE_SECONDS = 24 * 3600
-
-# The usage cache key carries a coarse wall-clock bucket as well as the
-# database revision. Without it, a segment cached while the jacked service
-# is stopped (frozen database mtime) would keep claiming to be fresh
-# forever; with it, staleness is re-evaluated at worst this many seconds
-# late while a running service still invalidates instantly on every write.
 _USAGE_CACHE_BUCKET_SECONDS = 600
-
-_EMPTY_ACCOUNT_FACTS = {"segment": "", "email": "", "org_uuid": ""}
 
 
 def _home() -> str:
@@ -105,249 +91,9 @@ def _home() -> str:
     return os.environ.get("JACKED_HOME") or os.path.expanduser("~")
 
 
-def _round_pct(value) -> "int | None":
-    """Round a raw percentage float (7.000000000000001) to an int.
-
-    >>> _round_pct(7.000000000000001)
-    7
-    >>> _round_pct(59.5)
-    60
-    >>> _round_pct(84.6)
-    85
-    >>> _round_pct(0)
-    0
-    >>> _round_pct(None) is None
-    True
-    >>> _round_pct("7") is None
-    True
-    """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return round(value)
-
-
-def _pct_color(pct: int) -> str:
-    """Pressure color: green <60, yellow 60-84, red >=85."""
-    if pct >= 85:
-        return RED
-    if pct >= 60:
-        return YELLOW
-    return GREEN
-
-
-def _fmt_tokens(n: int) -> str:
-    """512 / 80k / 1.0M -- M kicks in at >=999500 so rounding never shows 1000k.
-
-    >>> _fmt_tokens(512)
-    '512'
-    >>> _fmt_tokens(80000)
-    '80k'
-    >>> _fmt_tokens(999499)
-    '999k'
-    >>> _fmt_tokens(999500)
-    '1.0M'
-    >>> _fmt_tokens(1000000)
-    '1.0M'
-    >>> _fmt_tokens(1500000)
-    '1.5M'
-    """
-    if n >= 999500:
-        m10 = (n + 50000) // 100000
-        return f"{m10 // 10}.{m10 % 10}M"
-    if n >= 1000:
-        return f"{(n + 500) // 1000}k"
-    return str(n)
-
-
-def _fmt_reset(epoch, now: "float | None" = None) -> str:
-    """Epoch seconds -> "14:00" when under 24h away, else "Sat 02:37"."""
-    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
-        return ""
-    if now is None:
-        now = time.time()
-    fmt = "%H:%M" if (epoch - now) < 86400 else "%a %H:%M"
-    try:
-        return time.strftime(fmt, time.localtime(epoch))
-    except (OverflowError, OSError, ValueError):
-        return ""
-
-
-def _sum_usage(usage) -> "int | None":
-    """Return context tokens without double-counting provider cache details."""
-    if not isinstance(usage, dict):
-        return None
-    if "total_tokens" in usage:
-        value = usage.get("total_tokens")
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return int(value)
-    total = 0
-    for key in (
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-        "output_tokens",
-    ):
-        value = usage.get(key) or 0
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            value = 0
-        total += int(value)
-    return total
-
-
-def _tier_label(raw) -> str:
-    """Map a rate-limit tier id to its display label.
-
-    >>> _tier_label("default_claude_max_5x")
-    'Max 5x'
-    >>> _tier_label("default_claude_max_20x")
-    'Max 20x'
-    >>> _tier_label("default_claude_pro")
-    'Pro'
-    >>> _tier_label("custom_thing")
-    'custom_thing'
-    >>> _tier_label(None)
-    ''
-    """
-    if not isinstance(raw, str) or not raw:
-        return ""
-    stripped = raw[len("default_claude_"):] if raw.startswith("default_claude_") else raw
-    return _TIER_LABELS.get(stripped, stripped)
-
-
-def _account_source_signature(stat_result, content: bytes) -> dict:
-    """Revision fields plus a digest that survives file-identifier reuse."""
-    return {
-        "mtime_ns": stat_result.st_mtime_ns,
-        "ctime_ns": stat_result.st_ctime_ns,
-        "size": stat_result.st_size,
-        "device": stat_result.st_dev,
-        "inode": stat_result.st_ino,
-        "digest": hashlib.blake2b(content, digest_size=16).hexdigest(),
-    }
-
-
-def _read_cache(cache_path: str, version: int, source: dict) -> "dict | None":
-    """Return a cache record only when it belongs to this source revision."""
-    try:
-        with open(cache_path, encoding="utf-8", errors="replace") as fh:
-            cached = json.load(fh)
-    except (OSError, RecursionError, ValueError):
-        return None
-    if not isinstance(cached, dict):
-        return None
-    if cached.get("version") != version:
-        return None
-    if cached.get("source") != source:
-        return None
-    return cached
-
-
-def _write_cache(
-    cache_path: str,
-    prefix: str,
-    version: int,
-    source: dict,
-    payload: dict,
-) -> None:
-    """Atomically cache a record without ever breaking the statusline.
-
-    Every failure is swallowed: a cache that cannot be written is a
-    slower render, never a broken one.
-    """
-    record = {"version": version, "source": source}
-    record.update(payload)
-    tmp = None
-    try:
-        fd, tmp = tempfile.mkstemp(
-            dir=os.path.dirname(cache_path),
-            prefix=prefix,
-            suffix=".tmp",
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(record, fh, separators=(",", ":"))
-            fh.write("\n")
-        os.replace(tmp, cache_path)
-        tmp = None
-    except OSError:
-        pass
-    finally:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-
-
-def _read_account_cache(cache_path: str, source: dict) -> "dict | None":
-    """Cached account facts for this source revision, or None on any miss."""
-    cached = _read_cache(cache_path, _ACCOUNT_CACHE_VERSION, source)
-    if cached is None:
-        return None
-    facts = {}
-    for key in _EMPTY_ACCOUNT_FACTS:
-        value = cached.get(key)
-        if not isinstance(value, str):
-            return None
-        facts[key] = value
-    return facts
-
-
-def _write_account_cache(cache_path: str, facts: dict, source: dict) -> None:
-    """Persist the parsed ~/.claude.json facts against their revision."""
-    _write_cache(
-        cache_path,
-        ".statusline-account-",
-        _ACCOUNT_CACHE_VERSION,
-        source,
-        facts,
-    )
-
-
-def _account_facts(home: str) -> dict:
-    """Everything the statusline needs out of ~/.claude.json, parsed ONCE.
-
-    Returns {"segment", "email", "org_uuid"}: the rendered
-    "email · org · plan" segment, plus the identity the model-scoped usage
-    lookup matches on. Both come from the same parse deliberately --
-    ~/.claude.json is multi-MB and rewritten constantly, so a second reader
-    doing its own read + parse would blow the refresh budget.
-
-    The result is cached with a content-bound source signature and reused
-    only while that signature matches. Never reads
-    ~/.claude/.credentials.json (live OAuth tokens).
-    """
-    acc_path = os.path.join(home, ".claude.json")
-    cache_path = os.path.join(home, ".claude", "statusline-account.cache")
-    try:
-        with open(acc_path, "rb") as fh:
-            content = fh.read()
-            source = _account_source_signature(os.fstat(fh.fileno()), content)
-    except OSError:
-        return dict(_EMPTY_ACCOUNT_FACTS)
-    cached = _read_account_cache(cache_path, source)
-    if cached is not None:
-        return cached
-
-    facts = dict(_EMPTY_ACCOUNT_FACTS)
-    try:
-        config = json.loads(content.decode("utf-8", errors="replace")) or {}
-        account = config.get("oauthAccount") if isinstance(config, dict) else None
-        if isinstance(account, dict):
-            tier = account.get("userRateLimitTier") or account.get(
-                "organizationRateLimitTier"
-            )
-            facts["email"] = str(account.get("emailAddress") or "")
-            facts["org_uuid"] = str(account.get("organizationUuid") or "")
-            parts = [
-                facts["email"],
-                str(account.get("organizationName") or ""),
-                _tier_label(tier),
-            ]
-            facts["segment"] = f" {MIDDOT} ".join(p for p in parts if p)
-    except (OSError, RecursionError, ValueError):
-        return dict(_EMPTY_ACCOUNT_FACTS)
-    _write_account_cache(cache_path, facts, source)
-    return facts
+def _account_facts(home: str, now: float | None = None) -> dict:
+    """Resolve account facts while preserving the patchable JSON reader."""
+    return account_facts(home, time.time() if now is None else now, json_load=json.load)
 
 
 def _iso_to_epoch(value) -> "float | None":
@@ -615,222 +361,6 @@ def _model_usage_segment(home: str, facts: dict, model_name: str, now: float) ->
     return segment
 
 
-def _latest_transcript_cost(payload) -> float | None:
-    """Return the newest provider-reported transcript cost, if preserved."""
-    path = payload.get("transcript_path") if isinstance(payload, dict) else None
-    if not isinstance(path, str) or not path:
-        return None
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as fh:
-            fh.seek(max(0, size - 262144))
-            lines = fh.read().decode("utf-8", "replace").splitlines()
-    except (OSError, ValueError):
-        return None
-    from jacked.usage_normalizer import normalize_usage
-
-    for line in reversed(lines):
-        try:
-            record = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(record, dict) or record.get("type") != "assistant":
-            continue
-        message = record.get("message")
-        usage = message.get("usage") if isinstance(message, dict) else None
-        if not isinstance(usage, dict):
-            return None
-        normalized = normalize_usage(usage)
-        return normalized["cost_usd"]
-    return None
-
-
-def _cost_segment(payload) -> str:
-    """Render authoritative gateway cost preserved in the transcript."""
-    cost = _latest_transcript_cost(payload)
-    if cost is None:
-        return ""
-    return f"cost ${cost:.4f}"
-
-
-def _models_in(chunk: str) -> list:
-    """Assistant model ids from whole JSONL lines inside a text chunk.
-
-    Lines that do not parse are skipped, which is what makes a partial line
-    at a seek boundary harmless. "<synthetic>" is Claude Code's marker for
-    locally-generated messages and never names a real model.
-
-    >>> _models_in('{"type":"assistant","message":{"model":"a/b"}}')
-    ['a/b']
-    >>> _models_in('{"type":"user","message":{"model":"a/b"}}')
-    []
-    >>> _models_in('trunc{"type":"assistant"\\n{"type":"assistant","message":{"model":"x"}}')
-    ['x']
-    >>> _models_in('{"type":"assistant","message":{"model":"<synthetic>"}}')
-    []
-    """
-    out = []
-    for line in chunk.split("\n"):
-        if '"model"' not in line:
-            continue
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(entry, dict) or entry.get("type") != "assistant":
-            continue
-        message = entry.get("message")
-        if not isinstance(message, dict):
-            continue
-        model = message.get("model")
-        if isinstance(model, str) and model and model != "<synthetic>":
-            out.append(model)
-    return out
-
-
-def _configured_model(payload) -> str:
-    """The model id the session is configured with RIGHT NOW, or "".
-
-    Claude Code's stdin payload carries
-    model: {"id": "claude-opus-5", "display_name": "Opus"} and rewrites it
-    the moment the user runs /model, which is what makes it the only
-    baseline that follows a deliberate switch.
-
-    >>> _configured_model({"model": {"id": "claude-opus-5"}})
-    'claude-opus-5'
-    >>> _configured_model({"model": {"id": "  claude-opus-5  "}})
-    'claude-opus-5'
-    >>> _configured_model({"model": {"display_name": "Opus"}})
-    ''
-    >>> _configured_model({"model": {"id": ""}})
-    ''
-    >>> _configured_model({"model": {"id": 5}})
-    ''
-    >>> _configured_model({})
-    ''
-    >>> _configured_model("not-a-dict")
-    ''
-    """
-    model = payload.get("model") if isinstance(payload, dict) else None
-    raw = model.get("id") if isinstance(model, dict) else None
-    return raw.strip() if isinstance(raw, str) else ""
-
-
-def _model_key(name) -> str:
-    """Comparison key for a model id: namespace stripped, case folded.
-
-    A gateway reports the same model under its own namespace
-    ("openrouter/anthropic/claude-opus-5") that the payload names plainly
-    ("claude-opus-5"). Only the trailing segment identifies the model, so a
-    pure namespace difference must NOT read as a fallback -- otherwise every
-    gateway session would permanently warn against itself. This is the same
-    trailing-segment rule _served_segment already applies for DISPLAY, so
-    both sides of the comparison are reduced exactly the way both sides of
-    the message are.
-
-    >>> _model_key("openrouter/anthropic/claude-opus-5")
-    'claude-opus-5'
-    >>> _model_key("  Claude-Opus-5  ")
-    'claude-opus-5'
-    >>> _model_key("claude-opus-5") == _model_key("openrouter/anthropic/Claude-Opus-5")
-    True
-    >>> _model_key("claude-opus-5") == _model_key("openrouter/anthropic/claude-fable-5")
-    False
-    >>> _model_key(None)
-    ''
-    """
-    if not isinstance(name, str):
-        return ""
-    return name.strip().rsplit("/", 1)[-1].strip().casefold()
-
-
-def _served_segment(payload) -> str:
-    """Warn when the model answering is not the model configured right now.
-
-    A gateway that does fallback routing (OpenRouter presets,
-    claude-code-router, LiteLLM) can silently answer with a different model
-    -- pricier or weaker -- from the one the session asked for, with nothing
-    on screen to show it. The transcript records the serving model on every
-    assistant message, so compare the NEWEST served model against the
-    CONFIGURED one and speak up only when they differ.
-
-    This detects a SERVING mismatch, never a user's own model choice. The
-    baseline is the payload's model id, which Claude Code rewrites on every
-    /model switch, so the warning self-clears the instant the user changes
-    models. An earlier version used the session's FIRST assistant turn as
-    the baseline; that baseline is frozen for the life of the session, so it
-    misreported every deliberate switch -- it stuck on screen forever after
-    one /model, and it labelled an UPGRADE ("claude-fable-5 (FALLBACK, not
-    claude-opus-5)") as a downgrade. Across 12 real transcripts it produced
-    three warnings, all three of them deliberate switches and none of them a
-    gateway fallback.
-
-    Both sides are compared through _model_key, so a gateway's namespaced id
-    for the configured model is not reported as a fallback.
-
-    Falls back to the session's first assistant turn ONLY when the payload
-    carries no usable model id (older Claude Code, malformed payload), which
-    keeps the feature working rather than dropping it silently where the
-    payload cannot help.
-
-    Deliberately does NOT consult environment variables for the configured
-    model: a statusline subprocess is not guaranteed to inherit the
-    session's environment, and that would fail silently on exactly the
-    gateway setups this exists for.
-
-    Reads are bounded to the head and tail of the file. Transcripts reach
-    100MB+ and this runs on every refresh, so a full scan would grow
-    without limit.
-    """
-    path = payload.get("transcript_path") if isinstance(payload, dict) else None
-    if not isinstance(path, str) or not path:
-        return ""
-    expected = _configured_model(payload)
-    tail_bytes = 262144
-    # A single assistant message can be larger than the first window (a big
-    # file read, a long system prompt), and a window that lands mid-line
-    # yields nothing parseable. Grow the head read until a model turns up,
-    # with a hard cap so this stays bounded on any file.
-    head_windows = (65536, 262144, 1048576, 4194304)
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as fh:
-            first = []
-            read_bytes = 0
-            # Perf: when the payload supplies the baseline, the head is not
-            # needed at all, so skip it entirely and read only the 256KB
-            # tail. That drops up to 4MB of reads off EVERY refresh -- the
-            # growing head windows are paid only on the fallback path below.
-            if not expected:
-                for window in head_windows:
-                    if window > size and read_bytes >= size:
-                        break
-                    fh.seek(0)
-                    read_bytes = min(size, window)
-                    first = _models_in(fh.read(read_bytes).decode("utf-8", "replace"))
-                    if first or read_bytes >= size:
-                        break
-            if size > read_bytes:
-                fh.seek(max(0, size - tail_bytes))
-                last = _models_in(fh.read().decode("utf-8", "replace"))
-            else:
-                last = first
-    except (OSError, ValueError):
-        return ""
-    if not last:
-        return ""
-    if not expected:
-        if not first:
-            return ""
-        expected = first[0]
-    served = last[-1]
-    if _model_key(served) == _model_key(expected):
-        return ""
-    short_served = served.rsplit("/", 1)[-1]
-    short_expected = expected.rsplit("/", 1)[-1]
-    return f"{RED}{short_served} (FALLBACK, not {short_expected}){RESET}"
-
-
 def _caveman_segment(home: str) -> str:
     """Badge for the caveman plugin's flag file, when present."""
     flag = os.path.join(home, ".claude", ".caveman-active")
@@ -874,7 +404,11 @@ def render(payload, home: "str | None" = None, now: "float | None" = None) -> st
             seg = f"ctx {_pct_color(pct)}{pct}%{RESET}"
             used = _sum_usage(ctx.get("current_usage"))
             size = ctx.get("context_window_size")
-            if used is not None and isinstance(size, (int, float)) and not isinstance(size, bool):
+            if (
+                used is not None
+                and isinstance(size, (int, float))
+                and not isinstance(size, bool)
+            ):
                 seg += f" ({_fmt_tokens(used)}/{_fmt_tokens(int(size))})"
             segments.append(seg)
 
@@ -893,9 +427,9 @@ def render(payload, home: "str | None" = None, now: "float | None" = None) -> st
                 seg += f"{ARROW}{reset}"
             segments.append(seg)
 
-    # Parsed once here so the account segment and the model-scoped usage
-    # lookup share a single read of the multi-MB ~/.claude.json.
-    facts = _account_facts(home)
+    # Parsed once here so the account segment and model-scoped usage lookup
+    # share one read of the resolver's atomic, secret-free snapshot.
+    facts = _account_facts(home, now)
 
     scoped = _model_usage_segment(home, facts, model_name, now)
     if scoped:

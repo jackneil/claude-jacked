@@ -106,6 +106,52 @@ function renderSessionLookupResult() {
 // ---------------------------------------------------------------------------
 // Active sessions rendering (replaces old renderActiveSessions in accounts.js)
 // ---------------------------------------------------------------------------
+function _sessionIdentityLabel(value) {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object') return value.email || value.label || '';
+    return '';
+}
+
+function _sessionTruth(s) {
+    const started = _sessionIdentityLabel(s.started_as) || s.email || 'unknown';
+    const observed = _sessionIdentityLabel(s.observed_configuration);
+    const runtime = _sessionIdentityLabel(s.runtime_verified);
+    const scope = s.scope || s.credential_scope || 'unknown';
+    const evidence = s.evidence || 'unknown';
+    const state = s.state || s.observation_state || 'unknown';
+    const pending = s.pending === true || state === 'pending';
+    return { started, observed, runtime, scope, evidence, state, pending };
+}
+
+function _renderSessionTruth(s) {
+    const truth = _sessionTruth(s);
+    const items = [
+        `<span class="text-slate-500">Started as ${escapeHtml(truth.started)}</span>`,
+    ];
+
+    if (truth.state === 'conflict') {
+        items.push('<span class="text-red-300">Credential conflict</span>');
+    } else if (truth.pending) {
+        items.push('<span class="text-amber-300">Pending next activity</span>');
+    } else if (
+        truth.scope === 'scoped' &&
+        truth.evidence === 'launch_binding' &&
+        truth.observed
+    ) {
+        items.push(`<span class="text-cyan-300">Pinned target ${escapeHtml(truth.observed)}</span>`);
+    } else {
+        items.push(`<span class="text-slate-400">Observed configuration ${escapeHtml(truth.observed || 'unknown')}</span>`);
+    }
+
+    if (truth.runtime) {
+        items.push(`<span class="text-green-300">Runtime verified ${escapeHtml(truth.runtime)}</span>`);
+    } else {
+        items.push('<span class="text-violet-300">Runtime unverified</span>');
+    }
+    return `<span class="session-truth ml-1 inline-flex flex-wrap gap-x-1">${items.join('<span class="text-slate-700">\u00b7</span>')}</span>`;
+}
+
 function renderActiveSessions(acct) {
     const allSessions = (window.jackedState.activeSessions || {})[String(acct.id)];
     if (!allSessions || allSessions.length === 0) return '';
@@ -123,6 +169,28 @@ function renderActiveSessions(acct) {
     return renderFlatSessions(sessions);
 }
 
+function renderUnknownSessions() {
+    const sessions = (window.jackedState.activeSessions || {}).unknown || [];
+    if (sessions.length === 0) return '';
+    const visible = window.jackedState.sessionShowSubagents
+        ? sessions
+        : sessions.filter(s => !s.is_subagent);
+    if (visible.length === 0) return '';
+
+    return `
+        <div class="mb-4 rounded-lg border border-amber-700/50 bg-amber-950/20 px-4 py-3">
+            <div class="mb-2 flex items-center gap-2">
+                <span class="text-sm font-medium text-amber-200">Sessions with unknown account</span>
+                <span class="text-xs text-amber-400/80">${visible.length}</span>
+            </div>
+            <p class="mb-2 text-xs text-slate-400">Jacked has activity evidence, but no fresh conflict-free account observation.</p>
+            ${window.jackedState.sessionGroupByRepo
+                ? renderGroupedSessions(visible, 'unknown')
+                : renderFlatSessions(visible)}
+        </div>
+    `;
+}
+
 function renderFlatSessions(sessions) {
     const mainSessions = sessions.filter(s => !s.is_subagent);
     const subSessions = sessions.filter(s => s.is_subagent);
@@ -134,9 +202,9 @@ function renderFlatSessions(sessions) {
         const ago = s.last_activity_at ? formatTimeAgo(s.last_activity_at) : (s.detected_at ? formatTimeAgo(s.detected_at) : '');
         const sid = s.session_id || '';
         const sidTag = sid ? ` (${sid})` : '';
-        const label = ago ? `${name}${sidTag} \u2014 ${ago}` : `${name}${sidTag}`;
+        const label = ago ? `${name}${sidTag} \u00b7 ${ago}` : `${name}${sidTag}`;
         const tooltip = sid ? `${fullPath}\nSession: ...${sid}` : fullPath;
-        return `<span class="active-repo-tag" title="${escapeHtml(tooltip)}">${escapeHtml(label)}</span>`;
+        return `<span class="active-repo-tag session-evidence-pill" title="${escapeHtml(tooltip)}">${escapeHtml(label)}${_renderSessionTruth(s)}</span>`;
     }).join('');
 
     if (subSessions.length > 0) {
@@ -150,7 +218,7 @@ function renderFlatSessions(sessions) {
             const agentLabel = s.agent_type || 'agent';
             const sid = s.session_id || '';
             const tooltip = `Subagent: ${agentLabel}\n${fullPath}${sid ? '\nSession: ...' + sid : ''}`;
-            return `<span class="active-repo-tag subagent-tag" title="${escapeHtml(tooltip)}">${escapeHtml(agentLabel)} \u00b7 ${escapeHtml(name)}</span>`;
+            return `<span class="active-repo-tag session-evidence-pill subagent-tag" title="${escapeHtml(tooltip)}">${escapeHtml(agentLabel)} \u00b7 ${escapeHtml(name)}${_renderSessionTruth(s)}</span>`;
         }).join('');
 
         if (overflow > 0) {
@@ -215,12 +283,12 @@ function _renderSessionPill(s) {
         const name = fullPath.replace(/\\/g, '/').split('/').filter(Boolean).pop() || fullPath;
         const agentLabel = s.agent_type || 'agent';
         const tooltip = `Subagent: ${agentLabel}\n${fullPath}${sid ? '\nSession: ...' + sid : ''}`;
-        return `<span class="active-repo-tag subagent-tag" title="${escapeHtml(tooltip)}">${escapeHtml(agentLabel)} \u00b7 ${escapeHtml(name)}</span>`;
+        return `<span class="active-repo-tag session-evidence-pill subagent-tag" title="${escapeHtml(tooltip)}">${escapeHtml(agentLabel)} \u00b7 ${escapeHtml(name)}${_renderSessionTruth(s)}</span>`;
     }
 
-    const pill = sid ? `(${sid}) \u2014 ${ago}` : ago;
+    const pill = sid ? `(${sid}) \u00b7 ${ago}` : ago;
     const tooltip = sid ? `${fullPath}\nSession: ...${sid}` : fullPath;
-    return `<span class="active-repo-tag" title="${escapeHtml(tooltip)}">${escapeHtml(pill || 'session')}</span>`;
+    return `<span class="active-repo-tag session-evidence-pill" title="${escapeHtml(tooltip)}">${escapeHtml(pill || 'session')}${_renderSessionTruth(s)}</span>`;
 }
 
 // ---------------------------------------------------------------------------

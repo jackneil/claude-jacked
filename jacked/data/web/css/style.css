@@ -670,6 +670,17 @@ body {
     font-size: 10px;
 }
 
+.active-repo-tag.session-evidence-pill {
+    max-width: 100%;
+    flex-wrap: wrap;
+    gap: 2px 4px;
+    white-space: normal;
+}
+
+.session-truth {
+    min-width: 0;
+}
+
 /* Repo group chevron + sessions animation + lookup highlight */
 .repo-group-chevron { transition: transform 200ms ease; display: inline-block; }
 .repo-group-chevron.expanded { transform: rotate(90deg); }
@@ -894,4 +905,3 @@ html.theme-america250 .america-250-stripe {
         #ffffff 33.333% 66.666%,
         #3c3b6e 66.666% 100%);
 }
-

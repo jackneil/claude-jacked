@@ -245,5 +245,7 @@ def compute_best_account_summary(
         "best_account_cache_age_seconds": (
             cache_age_seconds(best, now) if best else None
         ),
-        "pause_until": min(constrained_resets).isoformat() if constrained_resets else None,
+        "pause_until": min(constrained_resets).isoformat()
+        if constrained_resets
+        else None,
     }

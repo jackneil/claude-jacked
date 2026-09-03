@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cross-platform account switch truth and service recovery</title>
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="reviewed">
+<meta name="jacked:branch" content="master">
+<meta name="jacked:date" content="2026-09-03">
+<meta name="jacked:project" content="claude-jacked">
+<style>
+  :root { --fg:#1a1a1a;--muted:#555;--bg:#fafaf7;--card:#fff;--accent:#2266aa;--accent-bg:#e7f0fa;--warn:#9a5c18;--warn-bg:#fcf3e7;--danger:#a92020;--danger-bg:#fbe9e7;--ok:#1f7a3f;--ok-bg:#e8f4ec;--border:#d8d4cc;--code:#f3efe8;--shadow:0 1px 3px rgba(0,0,0,.06);--radius:6px;--mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif }
+  @media(prefers-color-scheme:dark){:root{--fg:#e8e6e1;--muted:#aaa7a1;--bg:#161616;--card:#1f1f1f;--accent:#6aa8e8;--accent-bg:#1a2935;--warn:#e0a85b;--warn-bg:#3a2d18;--danger:#ea7670;--danger-bg:#3a1f1c;--ok:#6acd8e;--ok-bg:#1c3327;--border:#303030;--code:#252525;--shadow:0 1px 3px rgba(0,0,0,.3)}}
+  *{box-sizing:border-box}body{font-family:var(--sans);font-size:16px;line-height:1.6;color:var(--fg);background:var(--bg);margin:0;padding:2rem 1rem}.wrap{max-width:980px;margin:auto}h1{font-size:2rem;line-height:1.2;margin:0 0 .25rem}h2{font-size:1.4rem;margin:2.5rem 0 .75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}h3{font-size:1.08rem;margin:1.5rem 0 .5rem;color:var(--muted)}p{margin:.5rem 0 1rem}a{color:var(--accent)}code{font-family:var(--mono);font-size:.92em;background:var(--code);padding:.12em .35em;border-radius:3px}pre{font-family:var(--mono);font-size:.86rem;background:var(--code);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem;overflow:auto}.meta,.card,nav{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}.meta{display:flex;flex-wrap:wrap;gap:.5rem 1rem;padding:.75rem 1rem;margin:.5rem 0 2rem;font-size:.9rem}.k{color:var(--muted)}.v{font-family:var(--mono)}.badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.8rem}.badge.ok{background:var(--ok-bg);color:var(--ok)}.badge.warn{background:var(--warn-bg);color:var(--warn)}nav{padding:1rem 1.25rem;margin-bottom:2rem}nav h2{border:0;margin:0 0 .5rem;padding:0;font-size:.9rem;text-transform:uppercase;color:var(--muted)}nav ol{margin:0;padding-left:1.5rem}.callout{margin:1rem 0;padding:.9rem 1.1rem;border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}.callout.warn{border-color:var(--warn);background:var(--warn-bg)}.callout.danger{border-color:var(--danger);background:var(--danger-bg)}.callout.ok{border-color:var(--ok);background:var(--ok-bg)}table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--card);box-shadow:var(--shadow)}th,td{text-align:left;padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}th{background:var(--code)}.diagram{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;overflow:auto;text-align:center}.diagram .mermaid-source{display:none;text-align:left}.diagram.failed .mermaid-source{display:block}.diagram.failed svg{display:none}ul.checks{list-style:none;padding:0}ul.checks li{padding:.25rem 0 0 1.6rem;position:relative}ul.checks li:before{content:"✓";position:absolute;left:.2rem;color:var(--ok);font-weight:bold}@media print{body{background:white;color:black;padding:0}.wrap{max-width:none}h2,h3{break-after:avoid}table,.callout,.diagram{break-inside:avoid}}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Cross-platform account switch truth and service recovery</h1>
+<div class="meta"><span><span class="k">Status:</span> <span class="badge ok">reviewed</span></span><span><span class="k">Date:</span> <span class="v">2026-09-03</span></span><span><span class="k">Branch:</span> <span class="v">master @ eabbc76</span></span><span><span class="k">Type:</span> <span class="v">spec</span></span></div>
+<nav><h2>Contents</h2><ol><li><a href="#goal">User-facing goal</a></li><li><a href="#incident">Incident contract</a></li><li><a href="#criteria">Acceptance criteria</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#outcomes">Truth model</a></li><li><a href="#non-goals">Non-goals</a></li><li><a href="#interfaces">Files and interfaces</a></li></ol></nav>
+
+<h2 id="goal">User-facing goal</h2>
+<p>When a user chooses a Claude account, jacked must report exactly what changed on that operating system: the desired default, the credential store last observed by Claude, and the activation state of existing sessions. It must never claim a successful switch after a required store fails, never label historical session data as verified runtime identity, and never kill an unproven process while recovering its background service.</p>
+<aside class="callout ok"><strong>Core promise:</strong> uncertainty is a supported state. A precise <code>restart_required</code>, <code>interactive_required</code>, <code>diverged</code>, or <code>indeterminate</code> result is success of the safety contract, not an error to hide.</aside>
+
+<h2 id="incident">Incident contract</h2>
+<p>The 2026-09-03 incident produced three independent failures:</p>
+<ol>
+  <li>The Udifi account was written to SQLite, <code>~/.claude/.credentials.json</code>, and <code>~/.claude.json</code>, while macOS rejected the Keychain update. The API still returned <code>active</code>.</li>
+  <li>Two running sessions remained grouped under Raider because session identity was only detected at session start; response hooks refreshed liveness without re-observing identity.</li>
+  <li>An untracked jacked process owned port 8321 while launchd repeatedly tried and failed to start its registered replacement. PID-file absence made status report <code>stopped</code>.</li>
+</ol>
+<p>The same inspection exposed a secret-bearing environment inherited by the launch agent. Supervisor diagnostics must never emit full environments, and service processes must be created with a curated environment.</p>
+
+<h2 id="criteria">Acceptance criteria</h2>
+<ul class="checks">
+  <li><strong>AC1:</strong> A switch is reported as storage-committed only after the capability-declared runtime authority is read back and matches the intended transaction transcript, and only when the capability contract supplies an enforceable writer fence.</li>
+  <li><strong>AC2:</strong> A required-store failure preserves the previously observed local authority when that can be proven; otherwise the result is <code>indeterminate</code>. Neither path records a committed switch.</li>
+  <li><strong>AC3:</strong> Every active-account reader uses one canonical, capability-aware resolver. SQLite is desired/committed intent, not runtime authority.</li>
+  <li><strong>AC4:</strong> The result separately reports desired default, storage observation, existing-session activation, and provider-verified runtime identity.</li>
+  <li><strong>AC5:</strong> Existing sessions are never silently relabeled from a global switch. Their original binding, latest observation, evidence, scope, and freshness are visible.</li>
+  <li><strong>AC6:</strong> A session is called pinned only when the exact Claude build/config combination is certified for scoped credentials. Unsupported macOS isolation is described honestly.</li>
+  <li><strong>AC7:</strong> Manual, OAuth, launch, and certified auto-swap writes use the same transaction contract. Maintenance and 429 recovery never write Claude credential stores.</li>
+  <li><strong>AC8:</strong> Unknown Claude builds/config modes disable mutation until a shipped compatibility record or kill-switch update certifies the behavior.</li>
+  <li><strong>AC9:</strong> No new journal, manifest, response, log, supervisor artifact, or diagnostic contains raw tokens, reversible encodings, or unkeyed token hashes.</li>
+  <li><strong>AC10:</strong> The API service has one kernel-held per-user lifetime lease and a private, authenticated identity manifest; per-login-session tray clients do not own the API lease. PID, port, process name, or ordinary HTTP alone never authorizes termination.</li>
+  <li><strong>AC11:</strong> Restart/status reconcile the disk supervisor definition, loaded supervisor state, and exact live build/protocol/generation on macOS, Linux, and Windows.</li>
+  <li><strong>AC12:</strong> A foreign or ambiguous listener is never killed. Jacked starts in a discoverable quarantine mode and presents recovery instructions.</li>
+  <li><strong>AC13:</strong> Service Python starts behind a minimal pre-interpreter trust boundary. The service runtime, updater, and helpers receive only a documented allowlist; the boundary never reads, logs, or forwards other inherited values, and supervisor output is parsed rather than dumped.</li>
+  <li><strong>AC14:</strong> Remote dashboards cannot mutate credentials unless a future authenticated and encrypted remote-control design is installed. This project keeps credential mutation local.</li>
+  <li><strong>AC15:</strong> Compatibility migrations preserve existing account/session history and expose legacy evidence as unknown rather than manufacturing confidence.</li>
+  <li><strong>AC16:</strong> Linux, macOS, and Windows automated lanes plus platform smoke tests prove the failure matrix, service ownership rules, and secret-negative assertions.</li>
+</ul>
+
+<h2 id="architecture">Architecture</h2>
+<h3>Capability-driven credential topology</h3>
+<p>A versioned registry binds an exact resolved Claude executable build and configuration mode to a backend contract. Each record names the authority, required mirrors, optional metadata, every declared consumer, the writer-fence protocol, registry provenance, and capability epoch. Read-only local checks may narrow the contract but never certify write, locking, or reload behavior. Unknown or remotely changed behavior trips a runtime kill switch.</p>
+<table><thead><tr><th>Mode</th><th>Allowed behavior</th><th>Existing sessions</th><th>Auto-swap</th></tr></thead><tbody>
+<tr><td><code>SCOPED_COOPERATIVE</code></td><td>Process-scoped credential activation under the certified contract.</td><td>Only the launched scope is affected.</td><td>Allowed only through the transaction engine.</td></tr>
+<tr><td><code>GLOBAL_COOPERATIVE</code></td><td>Shared authority with certified upstream lock and reload behavior.</td><td>Reload expected, still not provider-verified.</td><td>Allowed only through the transaction engine.</td></tr>
+<tr><td><code>GLOBAL_UNCOOPERATIVE</code></td><td>Foreground observed-target operation only. It may update desired intent and last observation, but never the committed authority pointer.</td><td>Restart required; runtime unverified.</td><td>Recommendation only.</td></tr>
+<tr><td><code>UNSUPPORTED</code></td><td>No credential mutation.</td><td>Unchanged.</td><td>Disabled with remediation.</td></tr>
+</tbody></table>
+
+<div class="diagram"><pre class="mermaid">
+flowchart TD
+  U[Local user chooses account] --> G{Capability mode}
+  G -->|unsupported| X[Return unsupported]
+  G -->|shared uncooperative| Q[Foreground observed-target operation]
+  G -->|cooperative| T[Verified transaction]
+  Q --> UO[observed_target_unfenced; never committed]
+  T --> P[Commit pending SQLite row]
+  P --> W[Write and read back authority]
+  W -->|matches transcript| C[Atomic DB finalization]
+  W -->|old authority unchanged| F[failed_preserved]
+  W -->|unknown or concurrent value| I[indeterminate]
+  C --> S[Report storage and session axes separately]
+</pre><pre class="mermaid-source">flowchart TD
+  U[Local user chooses account] --&gt; G{Capability mode}
+  G --&gt;|unsupported| X[Return unsupported]
+  G --&gt;|shared uncooperative| Q[Foreground observed-target operation]
+  G --&gt;|cooperative| T[Verified transaction]
+  Q --&gt; UO[observed_target_unfenced; never committed]
+  T --&gt; P[Commit pending SQLite row]
+  P --&gt; W[Write and read back authority]
+  W --&gt;|matches transcript| C[Atomic DB finalization]
+  W --&gt;|old authority unchanged| F[failed_preserved]
+  W --&gt;|unknown or concurrent value| I[indeterminate]
+  C --&gt; S[Report storage and session axes separately]</pre></div>
+
+<h3>Durable switch state</h3>
+<p><code>credential_switches</code> is the sole durable journal. A pending row is committed before any OS store changes. It contains symbolic phases plus domain-separated <code>before_hmac</code> and <code>target_hmac</code> verifiers. Each HMAC covers the full transcript: machine-install ID, operation ID, exact backend locator, capability epoch, canonicalizer version, intended account/org identity, state role, and exact canonical credential digest. The install key is stored in machine-local user-private state. HMAC material is never exposed outside recovery code.</p>
+<p>Raw credential snapshots remain memory-only. If the process crashes after the authority write, recovery compares the authority with the before and intended transcript verifiers. A third value, a missing key, a different machine, or an unrecognized canonicalizer produces <code>indeterminate</code>. Stable account identity matching the target may be reported separately, but it never authorizes token repair.</p>
+<p>A minimum writer-protocol fence ships with the transaction engine. Mutation is disabled if an active legacy service, direct launcher, or other possible writer cannot prove protocol v2 and the same capability epoch. An arbitrary same-user copy of old code cannot be prevented from executing outside managed entry points; if it is seen or its write changes the authority, the system records an unfenced writer and subsequent state becomes indeterminate or mutation-disabled. Because arbitrary writers cannot be excluded for a shared uncooperative backend, that mode can never finalize a committed authority pointer.</p>
+
+<h3>Session truth model</h3>
+<table><thead><tr><th>Fact</th><th>Meaning</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Started as</td><td>Earliest recorded configuration span.</td><td>Launch binding or first store observation.</td></tr>
+<tr><td>Latest observed</td><td>Most recent credential configuration visible to jacked.</td><td>Scope, credential revision, store resolver, and timestamp.</td></tr>
+<tr><td>Desired global</td><td>The user-requested or committed default.</td><td>Switch transaction state, not session state.</td></tr>
+<tr><td>Runtime verified</td><td>The identity proven to have served a session request.</td><td>Nullable until Claude exposes provider/process evidence.</td></tr>
+</tbody></table>
+<p>Hooks remain fast and noninteractive. They append/coalesce nonsecret observation requests and liveness events. The service resolves stores off the event loop and atomically publishes a secret-free, evidence-qualified snapshot for stdlib-only statusline readers. The statusline never reads raw credential metadata or infers an active identity; a missing, stale, or conflicting snapshot renders desired/unknown. A global switch marks global sessions pending; only subsequent observations open a new span. Pinned launch evidence wins only in certified scoped mode.</p>
+
+<h3>Service ownership and control</h3>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+  SUP[launchd / systemd / Task Scheduler] --> CLEAN[Pre-interpreter clean environment]
+  CLEAN --> BOOT[Versioned minimal launcher]
+  BOOT --> LEASE[Kernel lifetime lease]
+  LEASE --> MAN[Private instance manifest]
+  MAN --> APP[Jacked tray and API]
+  CLI[Local CLI or tray] --> IPC[Unix socket / named pipe]
+  IPC --> APP
+  WEB[Browser] --> HTTP[Dashboard HTTP]
+  HTTP --> APP
+  APP --> HEALTH[Public non-sensitive health]
+</pre><pre class="mermaid-source">flowchart LR
+  SUP[launchd / systemd / Task Scheduler] --&gt; CLEAN[Pre-interpreter clean environment]
+  CLEAN --&gt; BOOT[Versioned minimal launcher]
+  BOOT --&gt; LEASE[Kernel lifetime lease]
+  LEASE --&gt; MAN[Private instance manifest]
+  MAN --&gt; APP[Jacked tray and API]
+  CLI[Local CLI or tray] --&gt; IPC[Unix socket / named pipe]
+  IPC --&gt; APP
+  WEB[Browser] --&gt; HTTP[Dashboard HTTP]
+  HTTP --&gt; APP
+  APP --&gt; HEALTH[Public non-sensitive health]</pre></div>
+<p>The API singleton is per OS user. Login-session tray processes are replaceable clients and never create a second API lease. The instance manifest records protocol/build/generation, per-user identity, active login-session attachments, process creation identity, resolved runtime path, bind plan, quarantine port when used, and a private control nonce. POSIX uses mode 0600 and ownership checks; Windows uses a current-user SID DACL and reparse-point protections.</p>
+<p>Lifecycle control uses a framed, versioned native IPC protocol with peer identity, transcript authentication, request nonces, expiry, timeouts, and an action allowlist. Browser HTTP never exposes lifecycle control. Account mutation remains a local same-origin endpoint protected by Host/Origin checks, CSP, no-store responses, and a server-persisted action ID that is both the atomic replay guard and idempotency key. Identical retries return the stored operation state/result; mismatched reuse is rejected.</p>
+<p>Forced termination is platform-specific and race-free: Linux retains a <code>pidfd</code>; Windows retains a process handle and verifies creation time; macOS sends no forced signal to an unmanaged process. Managed processes stop only through a supervisor artifact whose ownership and exact <code>ServiceSpec</code> generation are proven.</p>
+<p>The supervisor or a minimal non-Python launcher constructs an explicit allowlisted environment before the Python interpreter starts. POSIX supervisors invoke <code>/usr/bin/env -i</code> directly with fixed validated arguments. Windows invokes a versioned, ACL- and hash-verified PowerShell <code>-NoProfile -NonInteractive</code> script that clears a .NET <code>ProcessStartInfo</code> environment and starts Python through <code>CreateProcessW</code>. The launcher is a narrow no-log trust boundary: it may receive the supervisor environment where the OS offers no cleaner primitive, but never reads, logs, or forwards non-allowlisted values. Python runs in isolated mode from a validated runtime. Launcher artifacts are checked-in package data, installed to immutable versioned paths, verified against ServiceSpec, and retained through handoff.</p>
+
+<h2 id="outcomes">Truth model and API outcomes</h2>
+<table><thead><tr><th>Outcome</th><th>HTTP</th><th>DB active pointer</th><th>User message</th></tr></thead><tbody>
+<tr><td><code>committed</code></td><td>200</td><td>Updated atomically with audits.</td><td>Default storage verified; existing-session state shown separately.</td></tr>
+<tr><td><code>committed_degraded</code></td><td>200</td><td>Updated; counts as committed for residency only when the failed surface is declared optional for every consumer.</td><td>Authority verified; named optional metadata needs repair.</td></tr>
+<tr><td><code>observed_target_unfenced</code></td><td>202</td><td>Committed pointer unchanged; desired intent and timestamped observation may update.</td><td>Target was observed, but concurrent writers cannot be excluded. Restart required; sessions unverified.</td></tr>
+<tr><td><code>interactive_required</code></td><td>428</td><td>Unchanged.</td><td>Foreground Keychain authorization is required.</td></tr>
+<tr><td><code>interactive_operation_in_progress</code> / <code>busy</code> / <code>concurrent_write</code> / <code>diverged</code></td><td>409</td><td>Unchanged.</td><td>Show persisted operation status, observed conflict, or manual retry action.</td></tr>
+<tr><td><code>restart_required</code></td><td>409</td><td>Unchanged unless accompanied by an observed-only desired update.</td><td>Explain why live activation is unproven and provide a safe relaunch action.</td></tr>
+<tr><td><code>unusable</code> / <code>unsupported</code></td><td>422</td><td>Unchanged.</td><td>Explain credential or capability requirement.</td></tr>
+<tr><td><code>failed_preserved</code></td><td>503</td><td>Unchanged.</td><td>Previous authority was read back unchanged.</td></tr>
+<tr><td><code>indeterminate</code></td><td>503</td><td>Unchanged; pending retained.</td><td>Do not retry automatically; require recovery or re-auth.</td></tr>
+</tbody></table>
+<aside class="callout warn"><strong>macOS interaction:</strong> background Security.framework operations use a noninteractive <code>LAContext</code> and map <code>errSecInteractionNotAllowed</code> distinctly. Foreground authorization may occur during the actual mutation. It runs as one visible serialized operation with a durable status endpoint. Cancellation, caller disconnect, service restart, and lost GUI state are explicit phases; no second Keychain writer starts until readback classifies the first operation.</aside>
+
+<h2 id="non-goals">Non-goals</h2>
+<ul>
+  <li>No forced termination or relaunch of a user's Claude sessions.</li>
+  <li>No claim that observing a store proves which identity served an existing request.</li>
+  <li>No destructive deletion/recreation of an existing Keychain item or ACL reset.</li>
+  <li>No general remote-dashboard authentication system in this project; credential mutation is local-only until one exists.</li>
+  <li>No encrypted migration of the existing account-token columns in <code>jacked.db</code>.</li>
+  <li>No full package-runtime slot manager or package-manager rollback system.</li>
+  <li>No killing or overwriting ambiguous legacy/foreign processes, units, tasks, or launch agents.</li>
+</ul>
+
+<h2 id="interfaces">Files and interfaces involved</h2>
+<table><thead><tr><th>Area</th><th>Interfaces</th></tr></thead><tbody>
+<tr><td>Credential core</td><td><code>jacked/credentials/*</code>, compatibility wrappers in <code>jacked/api/credential_helpers.py</code></td></tr>
+<tr><td>Writers/readers</td><td><code>jacked/api/routes/auth.py</code>, <code>jacked/api/usage_monitor.py</code>, <code>jacked/web/auth.py</code>, <code>jacked/web/oauth.py</code>, <code>jacked/launch.py</code></td></tr>
+<tr><td>Persistence</td><td><code>jacked/web/database.py</code>: credential switches, session evidence, action nonces, machine-local identity</td></tr>
+<tr><td>Sessions/UI</td><td><code>session_account_tracker.py</code>, statusline, session/account components, WebSocket watchers</td></tr>
+<tr><td>Service</td><td><code>jacked/service/instance.py</code>, native IPC, bootstrap, supervisor adapters, CLI/updater/tray integration</td></tr>
+<tr><td>Security boundary</td><td>Local-only credential mutation, CSP/CSRF/action-nonce controls, secret-negative logging and environment contract</td></tr>
+<tr><td>Verification</td><td>Unit/state-machine tests, three-OS CI, and recorded live isolated Keychain/supervisor smoke evidence required before each platform flag is enabled</td></tr>
+</tbody></table>
+
+<hr><p style="color:var(--muted);font-size:.85rem;text-align:center">Reviewed through three swarm verification/adversarial rounds and a clean recursive design review. Generated from the jacked HTML artifact template.</p>
+</div>
+<script type="module">try{const mermaid=(await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;mermaid.initialize({startOnLoad:true,theme:matchMedia("(prefers-color-scheme: dark)").matches?"dark":"default",securityLevel:"loose"})}catch(e){document.querySelectorAll(".diagram").forEach(d=>d.classList.add("failed"))}</script>
+</body></html>

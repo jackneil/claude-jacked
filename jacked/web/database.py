@@ -315,7 +315,60 @@ CREATE TABLE IF NOT EXISTS session_accounts (
     parent_session_id TEXT,
     agent_type TEXT,
     pid INTEGER,
+    credential_scope TEXT,
+    observed_at TEXT,
+    evidence TEXT,
+    observation_state TEXT,
+    credential_revision TEXT,
+    launch_nonce TEXT,
+    event_idempotency_key TEXT,
     UNIQUE(session_id, detected_at)
+);
+
+CREATE TABLE IF NOT EXISTS session_observation_inbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    credential_revision TEXT,
+    launch_nonce TEXT,
+    repo_path TEXT,
+    requested_at TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS credential_switches (
+    operation_id TEXT PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    previous_account_id INTEGER,
+    organization_id TEXT,
+    machine_install_id TEXT,
+    context TEXT NOT NULL,
+    capability_mode TEXT NOT NULL,
+    capability_epoch TEXT NOT NULL,
+    backend_locator TEXT NOT NULL,
+    canonicalizer_version INTEGER NOT NULL,
+    before_hmac TEXT,
+    target_hmac TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    outcome TEXT,
+    observed_account_id INTEGER,
+    observed_at TEXT,
+    detail_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_action_ids (
+    action_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    action TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    result_json TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS swap_log (
@@ -361,6 +414,9 @@ CREATE INDEX IF NOT EXISTS idx_hook_executions_repo ON hook_executions(repo_path
 CREATE INDEX IF NOT EXISTS idx_sa_session ON session_accounts(session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_account ON session_accounts(account_id);
 CREATE INDEX IF NOT EXISTS idx_sa_active ON session_accounts(ended_at, last_activity_at, detected_at);
+CREATE INDEX IF NOT EXISTS idx_session_observation_requested ON session_observation_inbox(requested_at);
+CREATE INDEX IF NOT EXISTS idx_credential_switch_phase ON credential_switches(phase, updated_at);
+CREATE INDEX IF NOT EXISTS idx_auth_action_expiry ON auth_action_ids(expires_at);
 CREATE INDEX IF NOT EXISTS idx_swap_log_ts ON swap_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_decision_log_timestamp ON decision_log(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_decision_log_action ON decision_log(action);
@@ -475,6 +531,13 @@ class Database:
                 ("parent_session_id", "TEXT"),
                 ("agent_type", "TEXT"),
                 ("pid", "INTEGER"),
+                ("credential_scope", "TEXT"),
+                ("observed_at", "TEXT"),
+                ("evidence", "TEXT"),
+                ("observation_state", "TEXT"),
+                ("credential_revision", "TEXT"),
+                ("launch_nonce", "TEXT"),
+                ("event_idempotency_key", "TEXT"),
             ]:
                 if col_name not in cols:
                     try:
@@ -1807,6 +1870,13 @@ class Database:
         detection_method: Optional[str] = None,
         repo_path: Optional[str] = None,
         pid: Optional[int] = None,
+        credential_scope: Optional[str] = None,
+        observed_at: Optional[str] = None,
+        evidence: Optional[str] = None,
+        observation_state: Optional[str] = None,
+        credential_revision: Optional[str] = None,
+        launch_nonce: Optional[str] = None,
+        event_idempotency_key: Optional[str] = None,
     ) -> int:
         """Record which account a session is using.
 
@@ -1855,17 +1925,54 @@ class Database:
 
             if existing:
                 conn.execute(
-                    "UPDATE session_accounts SET last_activity_at = ? WHERE id = ?",
-                    (ts, existing[0]),
+                    """UPDATE session_accounts
+                       SET last_activity_at = ?,
+                           credential_scope = COALESCE(?, credential_scope),
+                           observed_at = COALESCE(?, observed_at),
+                           evidence = COALESCE(?, evidence),
+                           observation_state = COALESCE(?, observation_state),
+                           credential_revision = COALESCE(?, credential_revision),
+                           launch_nonce = COALESCE(?, launch_nonce),
+                           event_idempotency_key = COALESCE(?, event_idempotency_key)
+                       WHERE id = ?""",
+                    (
+                        ts,
+                        credential_scope,
+                        observed_at,
+                        evidence,
+                        observation_state,
+                        credential_revision,
+                        launch_nonce,
+                        event_idempotency_key,
+                        existing[0],
+                    ),
                 )
                 return existing[0]
 
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO session_accounts
                    (session_id, account_id, email, detected_at, last_activity_at,
-                    detection_method, repo_path, pid)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (session_id, account_id, email, ts, ts, detection_method, repo_path, pid),
+                    detection_method, repo_path, pid, credential_scope, observed_at,
+                    evidence, observation_state, credential_revision, launch_nonce,
+                    event_idempotency_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    account_id,
+                    email,
+                    ts,
+                    ts,
+                    detection_method,
+                    repo_path,
+                    pid,
+                    credential_scope,
+                    observed_at,
+                    evidence,
+                    observation_state,
+                    credential_revision,
+                    launch_nonce,
+                    event_idempotency_key,
+                ),
             )
             return cursor.lastrowid or 0
 
@@ -1928,7 +2035,10 @@ class Database:
         with self._reader() as conn:
             cursor = conn.execute(
                 """SELECT id, session_id, account_id, email, detected_at,
-                          ended_at, detection_method, repo_path, pid
+                          ended_at, detection_method, repo_path, pid,
+                          credential_scope, observed_at, evidence,
+                          observation_state, credential_revision, launch_nonce,
+                          event_idempotency_key
                    FROM session_accounts
                    WHERE session_id = ?
                    ORDER BY detected_at DESC""",
@@ -1946,7 +2056,9 @@ class Database:
         with self._reader() as conn:
             cursor = conn.execute(
                 """SELECT id, session_id, account_id, email, detected_at,
-                          ended_at, detection_method, repo_path
+                          ended_at, detection_method, repo_path,
+                          credential_scope, observed_at, evidence,
+                          observation_state, credential_revision, launch_nonce
                    FROM session_accounts
                    WHERE account_id = ?
                    ORDER BY detected_at DESC
@@ -1985,7 +2097,10 @@ class Database:
                           MIN(detected_at) AS detected_at,
                           detection_method, repo_path,
                           MAX(COALESCE(last_activity_at, detected_at)) AS last_activity_at,
-                          is_subagent, parent_session_id, agent_type
+                          is_subagent, parent_session_id, agent_type,
+                          credential_scope, MAX(observed_at) AS observed_at,
+                          evidence, observation_state, credential_revision,
+                          launch_nonce
                    FROM session_accounts
                    WHERE ended_at IS NULL
                      AND COALESCE(last_activity_at, detected_at) > ?
@@ -1994,6 +2109,295 @@ class Database:
                 (cutoff,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_active_session_states(
+        self, staleness_minutes: int = SESSION_STALENESS_MINUTES
+    ) -> list[dict]:
+        """Return one latest open span per session joined to immutable first use."""
+        clamped = max(5, min(120, staleness_minutes))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
+        with self._reader() as conn:
+            rows = conn.execute(
+                """WITH ranked_open AS (
+                       SELECT s.*,
+                              ROW_NUMBER() OVER (
+                                PARTITION BY session_id
+                                ORDER BY detected_at DESC, id DESC
+                              ) AS rn
+                       FROM session_accounts s
+                       WHERE ended_at IS NULL
+                         AND COALESCE(last_activity_at, detected_at) > ?
+                   ), first_span AS (
+                       SELECT s.session_id, s.account_id AS started_account_id,
+                              s.email AS started_email,
+                              s.detected_at AS started_at,
+                              s.detection_method AS started_method
+                       FROM session_accounts s
+                       JOIN (
+                           SELECT session_id, MIN(id) AS first_id
+                           FROM session_accounts GROUP BY session_id
+                       ) first ON first.first_id = s.id
+                   )
+                   SELECT latest.session_id, latest.account_id, latest.email,
+                          latest.detected_at, latest.last_activity_at,
+                          latest.detection_method, latest.repo_path,
+                          latest.is_subagent, latest.parent_session_id,
+                          latest.agent_type, latest.credential_scope,
+                          latest.observed_at, latest.evidence,
+                          latest.observation_state, latest.credential_revision,
+                          latest.launch_nonce, first.started_account_id,
+                          first.started_email, first.started_at,
+                          first.started_method
+                   FROM ranked_open latest
+                   JOIN first_span first ON first.session_id = latest.session_id
+                   WHERE latest.rn = 1
+                   ORDER BY latest.last_activity_at DESC""",
+                (cutoff,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def enqueue_session_observation(
+        self,
+        session_id: str,
+        event_kind: str,
+        *,
+        credential_revision: Optional[str] = None,
+        launch_nonce: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        idempotency_key: str,
+        max_rows: int = 1000,
+    ) -> None:
+        """Coalesce a non-secret session observation request and bound the inbox."""
+        ts = datetime.now(timezone.utc).isoformat()
+        max_rows = max(10, min(10_000, int(max_rows)))
+        with self._writer() as conn:
+            conn.execute(
+                """INSERT INTO session_observation_inbox
+                   (session_id, event_kind, credential_revision, launch_nonce,
+                    repo_path, requested_at, idempotency_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(idempotency_key) DO UPDATE SET
+                     repo_path=excluded.repo_path,
+                     requested_at=excluded.requested_at""",
+                (
+                    session_id,
+                    event_kind,
+                    credential_revision,
+                    launch_nonce,
+                    repo_path,
+                    ts,
+                    idempotency_key,
+                ),
+            )
+            conn.execute(
+                """DELETE FROM session_observation_inbox
+                   WHERE id NOT IN (
+                     SELECT id FROM session_observation_inbox
+                     ORDER BY requested_at DESC, id DESC LIMIT ?
+                   )""",
+                (max_rows,),
+            )
+
+    def drain_session_observations(self, limit: int = 100) -> list[dict]:
+        """Atomically return and remove the oldest observation requests."""
+        limit = max(1, min(1000, int(limit)))
+        with self._writer() as conn:
+            rows = conn.execute(
+                """SELECT id, session_id, event_kind, credential_revision,
+                          launch_nonce, repo_path, requested_at, idempotency_key
+                   FROM session_observation_inbox
+                   ORDER BY requested_at, id LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            if rows:
+                conn.executemany(
+                    "DELETE FROM session_observation_inbox WHERE id = ?",
+                    [(row["id"],) for row in rows],
+                )
+            return [dict(row) for row in rows]
+
+    def mark_global_sessions_pending(self) -> int:
+        """Mark only known-global open sessions pending after a default switch."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE session_accounts
+                   SET observation_state = 'pending'
+                   WHERE ended_at IS NULL AND credential_scope = 'global'"""
+            )
+            return cursor.rowcount
+
+    def create_credential_switch(self, values: dict) -> None:
+        """Create the durable pending row before any credential-store mutation."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            conn.execute(
+                """INSERT INTO credential_switches
+                   (operation_id, account_id, previous_account_id, organization_id,
+                    machine_install_id, context, capability_mode, capability_epoch, backend_locator,
+                    canonicalizer_version, before_hmac, target_hmac, phase,
+                    outcome, observed_account_id, observed_at, detail_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    values["operation_id"],
+                    values["account_id"],
+                    values.get("previous_account_id"),
+                    values.get("organization_id"),
+                    values.get("machine_install_id"),
+                    values.get("context", "manual"),
+                    values["capability_mode"],
+                    values["capability_epoch"],
+                    values["backend_locator"],
+                    values.get("canonicalizer_version", 1),
+                    values.get("before_hmac"),
+                    values["target_hmac"],
+                    values.get("phase", "pending"),
+                    values.get("outcome"),
+                    values.get("observed_account_id"),
+                    values.get("observed_at"),
+                    json.dumps(values.get("detail", {}), sort_keys=True),
+                    values.get("created_at", now),
+                    now,
+                ),
+            )
+
+    def update_credential_switch(self, operation_id: str, **values) -> None:
+        """Update a journal row without accepting arbitrary SQL column names."""
+        allowed = {
+            "phase",
+            "outcome",
+            "observed_account_id",
+            "observed_at",
+            "detail_json",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE credential_switches SET {assignments} WHERE operation_id = ?",
+                (*updates.values(), operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown credential switch operation: {operation_id}")
+
+    def get_credential_switch(self, operation_id: str) -> Optional[dict]:
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT * FROM credential_switches WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_pending_credential_switches(self) -> list[dict]:
+        with self._reader() as conn:
+            rows = conn.execute(
+                """SELECT * FROM credential_switches
+                   WHERE phase NOT IN ('committed', 'failed', 'observed_only', 'abandoned')
+                   ORDER BY created_at"""
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def claim_auth_action(
+        self,
+        action_id: str,
+        *,
+        session_key: str,
+        action: str,
+        request_digest: str,
+        operation_id: str,
+        expires_at: str,
+    ) -> tuple[str, Optional[dict]]:
+        """Atomically claim an action id, or return its idempotent stored result."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth_action_ids WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if row:
+                existing = dict(row)
+                if existing["expires_at"] <= now:
+                    return "expired", None
+                matches = (
+                    existing["session_key"] == session_key
+                    and existing["action"] == action
+                    and existing["request_digest"] == request_digest
+                    and existing["operation_id"] == operation_id
+                )
+                if not matches:
+                    return "mismatch", None
+                result = json.loads(existing["result_json"]) if existing["result_json"] else None
+                return existing["state"], result
+            operation_row = conn.execute(
+                "SELECT * FROM auth_action_ids WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if operation_row:
+                existing = dict(operation_row)
+                if existing["expires_at"] <= now:
+                    return "expired", None
+                matches = (
+                    existing["session_key"] == session_key
+                    and existing["action"] == action
+                    and existing["request_digest"] == request_digest
+                )
+                return ("claimed" if matches else "mismatch"), None
+            conn.execute(
+                """INSERT INTO auth_action_ids
+                   (action_id, session_key, action, request_digest, operation_id,
+                    state, expires_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
+                (
+                    action_id,
+                    session_key,
+                    action,
+                    request_digest,
+                    operation_id,
+                    expires_at,
+                    now,
+                    now,
+                ),
+            )
+            return "new", None
+
+    def finish_auth_action(self, action_id: str, result: dict) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE auth_action_ids
+                   SET state = 'complete', result_json = ?, updated_at = ?
+                   WHERE action_id = ?""",
+                (json.dumps(result, sort_keys=True), now, action_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown auth action: {action_id}")
+
+    def get_auth_action(self, identifier: str) -> Optional[dict]:
+        """Read action state by action ID or operation ID without claiming it."""
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth_action_ids WHERE action_id = ?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    """SELECT * FROM auth_action_ids WHERE operation_id = ?
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (identifier,),
+                ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["result"] = (
+                json.loads(result["result_json"])
+                if result.get("result_json")
+                else None
+            )
+            result.pop("result_json", None)
+            return result
 
     def get_stale_open_sessions(
         self, staleness_minutes: int = SESSION_STALENESS_MINUTES

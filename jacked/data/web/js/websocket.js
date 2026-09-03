@@ -537,7 +537,7 @@ jackedWS.on('auto_swap_triggered', (msg) => {
     banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-teal-900/95 border border-teal-600 rounded-lg px-5 py-3 shadow-lg max-w-lg flex items-center gap-3';
     const text = document.createElement('span');
     text.className = 'text-sm text-teal-100';
-    text.textContent = 'Auto-swapped to ' + toLabel + (reason ? ' \u2014 ' + reason : '');
+    text.textContent = 'Auto-swapped to ' + toLabel + (reason ? ': ' + reason : '');
     const close = document.createElement('button');
     close.className = 'text-teal-400 hover:text-white text-lg leading-none ml-auto';
     close.textContent = '\u00d7';
@@ -548,6 +548,15 @@ jackedWS.on('auto_swap_triggered', (msg) => {
     setTimeout(function() { if (banner.parentNode) banner.remove(); }, 300000);
     if (typeof loadActiveCredential === 'function') loadActiveCredential();
     if (typeof refreshAndRender === 'function') refreshAndRender();
+});
+
+jackedWS.on('auto_swap_recommended', (msg) => {
+    const data = msg.payload || msg;
+    if (typeof showAutoSwapRecommendation === 'function') {
+        showAutoSwapRecommendation(data);
+    } else if (typeof showToast === 'function') {
+        showToast('Account switch recommended. Open Accounts to review it.', 'warning', 8000);
+    }
 });
 
 jackedWS.on('all_accounts_exhausted', (msg) => {

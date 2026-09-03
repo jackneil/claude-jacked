@@ -19,10 +19,37 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import click
 
 from jacked.api.credential_helpers import build_oauth_data
+from jacked.credentials.models import (
+    IdentityAxis,
+    ProviderVerificationState,
+    SessionActivationState,
+    SwitchOutcome,
+    SwitchResult,
+)
 from jacked.web.auth import refresh_cc_token, should_refresh_cc
 from jacked.web.database import Database
+
+
+def _activation_result(outcome: SwitchOutcome = SwitchOutcome.COMMITTED):
+    committed = outcome in {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.COMMITTED_DEGRADED,
+    }
+    return SwitchResult(
+        operation_id="oauth-test",
+        outcome=outcome,
+        desired_default=IdentityAxis(1, "desired"),
+        storage=IdentityAxis(1 if committed else None, outcome.value),
+        committed_authority=IdentityAxis(
+            1 if committed else None, "committed" if committed else "unchanged"
+        ),
+        existing_session_activation=SessionActivationState.PENDING_NEXT_ACTIVITY,
+        provider_verification=ProviderVerificationState.UNVERIFIED,
+        message="test activation",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -380,39 +407,27 @@ class TestSyncTokensCAS:
 
 class TestResolveAccountCCMatch:
     @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
-    @patch("jacked.launch.read_platform_credentials")
-    @patch("jacked.launch.Path.home")
-    def test_layer4_matches_cc_access_token(self, mock_home, mock_kc, mock_which, tmp_path):
-        """resolve_account Layer 4 matches cc_access_token from Keychain."""
-        mock_home.return_value = tmp_path  # isolate from real credential files
+    @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
+    def test_resolver_consensus_selects_account(self, mock_active, mock_which, tmp_path):
         db = _make_db(tmp_path)
         db.update_account(1, cc_access_token="alice_cc_at")
-
-        mock_kc.return_value = {
-            "claudeAiOauth": {"accessToken": "alice_cc_at"}
-        }
 
         from jacked.launch import resolve_account
         result = resolve_account(None, db)
         assert result["id"] == 1
 
     @patch("jacked.launch.find_bin", return_value="/usr/bin/claude")
-    @patch("jacked.launch.read_platform_credentials")
-    @patch("jacked.launch.Path.home")
-    def test_layer4_cc_takes_precedence_over_primary(self, mock_home, mock_kc, mock_which, tmp_path):
-        """CC token match takes precedence over primary token match."""
-        mock_home.return_value = tmp_path  # isolate from real credential files
+    @patch("jacked.api.credential_helpers.read_active_account_id", return_value=None)
+    def test_token_collision_cannot_guess_active_account(
+        self, mock_active, mock_which, tmp_path
+    ):
         db = _make_db(tmp_path)
         db.update_account(1, cc_access_token="shared_token")
         db.update_account(2, access_token="shared_token")
 
-        mock_kc.return_value = {
-            "claudeAiOauth": {"accessToken": "shared_token"}
-        }
-
         from jacked.launch import resolve_account
-        result = resolve_account(None, db)
-        assert result["id"] == 1
+        with pytest.raises(click.ClickException, match="No active account detected"):
+            resolve_account(None, db)
 
 
 # ---------------------------------------------------------------------------
@@ -682,13 +697,14 @@ class TestCCInvalidGrantHandling:
 class TestCompleteAuthPurposeGuard:
     """Verify _complete_auth skips _create_api_key for CC flows (bug fix)."""
 
-    @patch("jacked.api.credential_helpers.sync_credential_to_all_stores")
-    def test_cc_flow_preserves_refresh_token(self, mock_sync, tmp_path):
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_cc_flow_preserves_refresh_token(self, mock_activation, tmp_path):
         """CC flow does NOT call _create_api_key — refresh_token preserved."""
         from jacked.web.oauth import OAuthFlow
 
         db = _make_db(tmp_path)
         flow = OAuthFlow(db, purpose="claude_code", target_account_id=1)
+        mock_activation.return_value = _activation_result()
 
         tokens = {
             "access_token": "cc_at",
@@ -710,13 +726,14 @@ class TestCompleteAuthPurposeGuard:
         acct = db.get_account(1)
         assert acct["cc_refresh_token"] == "cc_rt"
 
-    @patch("jacked.api.credential_helpers.sync_credential_to_all_stores")
-    def test_primary_flow_calls_create_api_key(self, mock_sync, tmp_path):
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_primary_flow_calls_create_api_key(self, mock_activation, tmp_path):
         """Primary flow calls _create_api_key when scope includes org:create_api_key."""
         from jacked.web.oauth import OAuthFlow
 
         db = _make_db(tmp_path)
         flow = OAuthFlow(db, purpose="primary")
+        mock_activation.return_value = _activation_result()
 
         tokens = {
             "access_token": "primary_at",
@@ -741,6 +758,12 @@ class TestCompleteAuthPurposeGuard:
             ) as mock_api_key,
             patch.object(flow, "_fetch_profile", new_callable=AsyncMock, return_value=profile),
             patch.object(flow, "_fetch_usage", new_callable=AsyncMock, return_value=usage),
+            patch.object(
+                OAuthFlow,
+                "start",
+                new_callable=AsyncMock,
+                return_value={"flow_id": "cc"},
+            ),
         ):
             asyncio.run(flow._complete_auth("test_code"))
 
@@ -768,6 +791,15 @@ class TestAddAccountActivation:
         assert flow._should_become_active(alice) is True
         assert flow._should_become_active(bob) is False
 
+        # Observed-only activation advances desired truth without fabricating a
+        # committed pointer. Re-authentication follows that desired identity.
+        db.set_setting("desired_account_id", "2")
+        assert flow._should_become_active(bob) is True
+        assert flow._should_become_active(alice) is False
+        db.set_setting("desired_account_id", "999")
+        assert flow._should_become_active(alice) is True
+        assert flow._should_become_active(bob) is False
+
         # Active points at a deleted/missing account → next becomes active.
         db.set_setting("active_account_id", "999")
         assert flow._should_become_active(bob) is True
@@ -776,8 +808,8 @@ class TestAddAccountActivation:
         db.set_setting("active_account_id", "not-an-int")
         assert flow._should_become_active(bob) is True
 
-    @patch("jacked.api.credential_helpers.sync_credential_to_all_stores")
-    def test_second_account_does_not_switch(self, mock_sync, tmp_path):
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_second_account_does_not_switch(self, mock_activation, tmp_path):
         """Adding a new primary account while one is active must NOT switch:
         no live-store write, active_account_id unchanged."""
         from jacked.web.oauth import OAuthFlow
@@ -803,15 +835,20 @@ class TestAddAccountActivation:
         carol = db.get_account_by_email("carol@test.com")
         assert carol is not None  # stored...
         assert db.get_setting("active_account_id") == "1"  # ...but alice still active
-        mock_sync.assert_not_called()  # live credential store untouched
+        mock_activation.assert_not_called()  # live credential store untouched
 
-    @patch("jacked.api.credential_helpers.sync_credential_to_all_stores")
-    def test_first_account_becomes_active(self, mock_sync, tmp_path):
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_first_account_becomes_active(self, mock_activation, tmp_path):
         """The very first account added becomes active (live-store + setting)."""
         from jacked.web.oauth import OAuthFlow
         from jacked.web.database import Database
         db = Database(str(tmp_path / "empty.db"))  # no accounts, no active setting
         flow = OAuthFlow(db, purpose="primary")
+        def commit(db_arg, account, operation_id):
+            db_arg.set_setting("active_account_id", str(account["id"]))
+            return _activation_result()
+
+        mock_activation.side_effect = commit
 
         tokens = {
             "access_token": "first_at", "refresh_token": "first_rt",
@@ -831,7 +868,48 @@ class TestAddAccountActivation:
         acct = db.get_account_by_email("first@test.com")
         assert acct is not None
         assert db.get_setting("active_account_id") == str(acct["id"])
-        mock_sync.assert_called()  # live store written for the first account
+        mock_activation.assert_called_once()
+
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_failed_activation_never_sets_active_pointer(
+        self, mock_activation, tmp_path
+    ):
+        from jacked.web.oauth import OAuthFlow
+        from jacked.web.database import Database
+
+        db = Database(str(tmp_path / "failed.db"))
+        flow = OAuthFlow(db, purpose="primary")
+        mock_activation.return_value = _activation_result(SwitchOutcome.UNSUPPORTED)
+        tokens = {
+            "access_token": "first_at",
+            "refresh_token": "first_rt",
+            "expires_in": 3600,
+            "scope": "user:profile",
+            "email": "first@test.com",
+        }
+        profile = {"account": {"email_address": "first@test.com"}}
+
+        with (
+            patch.object(
+                flow, "_exchange_code", new_callable=AsyncMock, return_value=tokens
+            ),
+            patch.object(
+                flow, "_fetch_profile", new_callable=AsyncMock, return_value=profile
+            ),
+            patch.object(
+                flow, "_fetch_usage", new_callable=AsyncMock, return_value={}
+            ),
+            patch.object(
+                OAuthFlow,
+                "start",
+                new_callable=AsyncMock,
+                return_value={"flow_id": "cc"},
+            ),
+        ):
+            result = asyncio.run(flow._complete_auth("test_code"))
+
+        assert result["activation_status"] == "unsupported"
+        assert db.get_setting("active_account_id") is None
 
 
 class TestCCIdentityValidation:
@@ -920,7 +998,15 @@ class TestHandleCallback:
     def test_success_returns_success_html(self, tmp_path):
         """Valid code + _complete_auth succeeds → 'Success!' in response."""
         flow = self._make_flow(tmp_path)
-        flow._complete_auth = AsyncMock(return_value={"account_id": 1, "email": "alice@test.com"})
+        flow._complete_auth = AsyncMock(
+            return_value={
+                "account_id": 1,
+                "email": "alice@test.com",
+                "activation_status": "committed",
+                "activation_operation_id": "oauth-callback-operation",
+                "activation_message": "verified",
+            }
+        )
         req = self._make_request({"code": "valid-code", "state": "test-state"})
 
         resp = asyncio.run(flow._handle_callback(req))
@@ -928,6 +1014,9 @@ class TestHandleCallback:
         assert flow._status == "completed"
         assert "Success!" in resp.text
         assert "window.close()" in resp.text
+        status = flow.get_status()
+        assert status["activation_status"] == "committed"
+        assert status["activation_operation_id"] == "oauth-callback-operation"
 
     def test_exception_returns_error_html(self, tmp_path):
         """Valid code + _complete_auth raises → 'Authorization Failed' (NOT 'Success!')."""

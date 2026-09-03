@@ -9,7 +9,6 @@ migrates settings.json via `jacked install`, then spawns a fresh
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -30,15 +29,15 @@ RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
 # batch stops waiting for the tray to die and races `uv tool install --force`
 # against a live python.exe (the classic Windows "Access denied" upgrade).
 # `ping -n 2 127.0.0.1` needs no console and sleeps ~1s between its two pings.
-_SLEEP_1S = 'ping -n 2 127.0.0.1 >NUL\r\n'
+_SLEEP_1S = "ping -n 2 127.0.0.1 >NUL\r\n"
 
 # Absolute paths for the two tools whose EXIT CODE steers the wait loop. Git
 # Bash, Cygwin and GnuWin32 all put a `find` on PATH that takes different flags
 # and returns different codes; if one shadows System32's, `if errorlevel 1`
 # reads as "parent is gone" on the very first pass and the batch stops waiting
 # for the tray to die. Same failure the `timeout` bug caused, different cause.
-_TASKLIST = '%SystemRoot%\\System32\\tasklist.exe'
-_FIND = '%SystemRoot%\\System32\\find.exe'
+_TASKLIST = "%SystemRoot%\\System32\\tasklist.exe"
+_FIND = "%SystemRoot%\\System32\\find.exe"
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +46,9 @@ def _verify_service_block(port: int) -> str:
     """Batch line that polls ``/api/version`` for up to 20s. Exit 0 = healthy."""
     return (
         'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++)'
-        '{try{$r=Invoke-WebRequest -UseBasicParsing '
-        f'http://127.0.0.1:{port}/api/version'
-        ' -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}'
+        "{try{$r=Invoke-WebRequest -UseBasicParsing "
+        f"http://127.0.0.1:{port}/api/version"
+        " -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}"
         'Start-Sleep -Milliseconds 500} exit 1"\r\n'
     )
 
@@ -69,18 +68,16 @@ def wait_for_parent_block(pid: int) -> str:
     (see the warning in ``_spawn_windows_tray_updater``).
     """
     return (
-        'set /a JACKED_WAITED=0\r\n'
-        ':wait\r\n'
+        "set /a JACKED_WAITED=0\r\n"
+        ":wait\r\n"
         f'{_TASKLIST} /FI "PID eq {pid}" 2>NUL | {_FIND} "{pid}" >NUL\r\n'
-        'if errorlevel 1 goto waitdone\r\n'
-        'set /a JACKED_WAITED+=1\r\n'
-        'if %JACKED_WAITED% GEQ 120 (\r\n'
-        f'    echo [%date% %time%] WARNING: parent {pid} still listed after 120s; proceeding (PID may be reused)\r\n'
-        '    goto waitdone\r\n'
-        ')\r\n'
-        + _SLEEP_1S +
-        'goto wait\r\n'
-        ':waitdone\r\n'
+        "if errorlevel 1 goto waitdone\r\n"
+        "set /a JACKED_WAITED+=1\r\n"
+        "if %JACKED_WAITED% GEQ 120 (\r\n"
+        f"    echo [%date% %time%] WARNING: parent {pid} still listed after 120s; proceeding (PID may be reused)\r\n"
+        "    goto waitdone\r\n"
+        ")\r\n" + _SLEEP_1S + "goto wait\r\n"
+        ":waitdone\r\n"
     )
 
 
@@ -95,63 +92,16 @@ def wait_for_exit(pid: int, timeout: float = 30.0) -> bool:
 
 
 def _force_kill_pid(pid: int) -> None:
-    """SIGKILL the PID if it's still alive. No exceptions leak out.
-
-    pystray's AppKit runloop on macOS can swallow Python signals, so the
-    tray's own `icon.stop()` call may not actually end the process. Without
-    this we'd waste 30+ seconds of wait_for_exit and still hit "port in use"
-    on the detached start.
-    """
-    if pid <= 0 or not is_process_alive(pid):
-        return
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/F", "/T"],
-                capture_output=True, check=False,
-                creationflags=NO_WINDOW,
-            )
-        else:
-            import signal as _signal
-            os.kill(pid, _signal.SIGKILL)
-    except Exception:
-        logger.exception("force-kill of PID %d failed", pid)
+    """Compatibility no-op: integer PIDs never authorize force termination."""
+    logger.warning(
+        "Refused force-kill of PID %d without a v2 creation-identity handle", pid
+    )
 
 
 def _pids_bound_to_port(port: int) -> list[int]:
-    """Return PIDs holding a LISTEN socket on *port*. Uses lsof on POSIX,
-    netstat on Windows. Best-effort — returns [] on any failure."""
-    try:
-        if sys.platform == "win32":
-            out = subprocess.run(
-                ["netstat", "-ano"],
-                capture_output=True, text=True, check=False,
-                creationflags=NO_WINDOW,
-            ).stdout
-            pids: set[int] = set()
-            for line in out.splitlines():
-                if f":{port}" in line and "LISTENING" in line.upper():
-                    parts = line.split()
-                    try:
-                        pids.add(int(parts[-1]))
-                    except (ValueError, IndexError):
-                        pass
-            return list(pids)
-        out = subprocess.run(
-            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", f"-iTCP:{port}"],
-            capture_output=True, text=True, check=False,
-        ).stdout
-        pids = set()
-        for line in out.splitlines()[1:]:  # skip header
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    pids.add(int(parts[1]))
-                except ValueError:
-                    pass
-        return list(pids)
-    except Exception:
-        return []
+    """Compatibility shim: port ownership is deliberately not enumerated."""
+    logger.warning("Refused PID discovery from port %d; ownership is ambiguous", port)
+    return []
 
 
 def _spawn_detached(cmd: list, log_fh=None) -> "subprocess.Popen":
@@ -237,9 +187,20 @@ def run_update(
         except Exception:
             logger.exception("begin_phase failed: %s", phase)
 
-    def _end(phase: str, status: str, error: "str | None" = None, recovery: "str | None" = None) -> None:
+    def _end(
+        phase: str,
+        status: str,
+        error: "str | None" = None,
+        recovery: "str | None" = None,
+    ) -> None:
         try:
-            _us.end_phase(_us.UPDATE_STATUS_FILE, phase, status=status, error=error, recovery=recovery)
+            _us.end_phase(
+                _us.UPDATE_STATUS_FILE,
+                phase,
+                status=status,
+                error=error,
+                recovery=recovery,
+            )
         except Exception:
             logger.exception("end_phase failed: %s", phase)
 
@@ -252,15 +213,20 @@ def run_update(
         _begin("waiting_for_parent")
         log(f"Waiting for parent PID {parent_pid} to exit")
         if not wait_for_exit(parent_pid, timeout=15.0):
-            log(f"Parent {parent_pid} still alive after 15s — SIGKILL")
-            _force_kill_pid(parent_pid)
-            if not wait_for_exit(parent_pid, timeout=5.0):
-                log(f"Parent {parent_pid} still alive after SIGKILL — continuing anyway")
-                _end("waiting_for_parent", "failed",
-                     error="parent PID did not exit; upgrade may collide",
-                     recovery="kill -9 the parent PID manually then: jacked service start")
-            else:
-                _end("waiting_for_parent", "ok")
+            log(
+                f"Parent {parent_pid} still alive after 15s; refusing PID-only termination"
+            )
+            _end(
+                "waiting_for_parent",
+                "failed",
+                error="parent process did not exit; ownership cannot be revalidated",
+                recovery="stop the owned service normally, then retry the update",
+            )
+            _write_recovery(
+                "Jacked auto-update stopped safely because the old service did not exit.\n"
+                "No process was killed from PID-only evidence. Stop jacked normally, then retry.\n"
+            )
+            return
         else:
             _end("waiting_for_parent", "ok")
 
@@ -316,14 +282,21 @@ def run_update(
         log(f"Install method: {method}")
         log(f"Running: {label}")
         result = subprocess.run(
-            cmd, stdout=log_fh, stderr=log_fh, check=False,
+            cmd,
+            stdout=log_fh,
+            stderr=log_fh,
+            check=False,
             creationflags=NO_WINDOW,
         )
         log(f"upgrade command returncode: {result.returncode}")
 
         if result.returncode != 0:
-            _end("installing_package", "failed",
-                 error=f"upgrade command exit {result.returncode}", recovery=label)
+            _end(
+                "installing_package",
+                "failed",
+                error=f"upgrade command exit {result.returncode}",
+                recovery=label,
+            )
             _write_recovery(
                 f"Jacked auto-update failed: upgrade command returned {result.returncode}.\n"
                 f"See {UPDATE_LOG} for details.\n\n"
@@ -359,15 +332,20 @@ def run_update(
         log(f"Running: {jacked} install --force")
         migrate_result = subprocess.run(
             [jacked, "install", "--force"],
-            stdout=log_fh, stderr=log_fh, check=False,
+            stdout=log_fh,
+            stderr=log_fh,
+            check=False,
             creationflags=NO_WINDOW,
         )
         log(f"jacked install returncode: {migrate_result.returncode}")
 
         if migrate_result.returncode != 0:
-            _end("migrating_settings", "failed",
-                 error=f"jacked install exit {migrate_result.returncode}",
-                 recovery="jacked install --force")
+            _end(
+                "migrating_settings",
+                "failed",
+                error=f"jacked install exit {migrate_result.returncode}",
+                recovery="jacked install --force",
+            )
             _write_recovery(
                 f"Jacked auto-update: package upgrade succeeded but "
                 f"`jacked install --force` returned {migrate_result.returncode}.\n"
@@ -391,31 +369,19 @@ def run_update(
                 break
             time.sleep(0.5)
         if not is_port_available("127.0.0.1", port):
-            squatters = _pids_bound_to_port(port)
-            if squatters:
-                log(f"Port {port} still bound by PIDs {squatters} — SIGKILL")
-                for pid in squatters:
-                    _force_kill_pid(pid)
-                kill_deadline = time.monotonic() + 3.0
-                while time.monotonic() < kill_deadline:
-                    if is_port_available("127.0.0.1", port):
-                        break
-                    time.sleep(0.2)
-            if not is_port_available("127.0.0.1", port):
-                _end("waiting_port_free", "failed",
-                     error=f"port {port} still bound",
-                     recovery=f"kill the process holding :{port} manually then jacked service start")
-                _write_recovery(
-                    f"Jacked auto-update: port {port} could not be freed after "
-                    "the update. Some other process is holding it.\n\n"
-                    f"Check with: lsof -iTCP:{port} -sTCP:LISTEN   (macOS/Linux)\n"
-                    f"            netstat -ano | findstr :{port}   (Windows)\n\n"
-                    "Recovery:\n"
-                    "  kill -9 <PID>  (or taskkill /PID <PID> /F on Windows)\n"
-                    "  jacked service start\n"
-                )
-                log(f"ABORT: port {port} could not be freed — see recovery file")
-                return
+            _end(
+                "waiting_port_free",
+                "failed",
+                error=f"port {port} remains occupied by an unverified listener",
+                recovery="run `jacked service status`; v2 services use discoverable quarantine",
+            )
+            _write_recovery(
+                f"Jacked auto-update stopped safely because port {port} is occupied by an "
+                "unverified listener. No port owner was killed. Run `jacked service status` "
+                "for ownership and quarantine guidance.\n"
+            )
+            log(f"ABORT: port {port} is ambiguous; no process was signalled")
+            return
         _end("waiting_port_free", "ok")
 
         # Phase: starting_service
@@ -427,10 +393,13 @@ def run_update(
         # --user on Linux if user-installed). Fall back to detached Popen
         # when no manager is present (Windows or unmanaged Linux).
         from jacked.service.platform import ensure_native_lifecycle, native_restart
+
         ens_ok, ens_state, ens_reason = ensure_native_lifecycle()
         if ens_ok:
             if ens_state == "just_installed":
-                log(f"Native lifecycle freshly installed (RunAtLoad booted service): {ens_reason}")
+                log(
+                    f"Native lifecycle freshly installed (RunAtLoad booted service): {ens_reason}"
+                )
                 _restart_attempted[0] = True
             else:
                 # already_installed → atomic kickstart
@@ -439,7 +408,9 @@ def run_update(
                 if native_ok:
                     log(f"Native lifecycle restart: {native_reason}")
                 else:
-                    log(f"Native kickstart failed ({native_reason}); fallback to manual spawn")
+                    log(
+                        f"Native kickstart failed ({native_reason}); fallback to manual spawn"
+                    )
                     _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
         else:
             log(f"Native lifecycle unavailable ({ens_reason}); manual spawn")
@@ -481,9 +452,12 @@ def run_update(
                     logger.exception("mark_failed fallback also raised")
                     log("ERROR: mark_failed fallback also raised — disk likely full")
         else:
-            _end("verifying_service", "failed",
-                 error=f"new service did not bind :{port} within 20s",
-                 recovery="jacked service start")
+            _end(
+                "verifying_service",
+                "failed",
+                error=f"new service did not bind :{port} within 20s",
+                recovery="jacked service start",
+            )
             log(f"WARNING: new service did not bind :{port} within 20s")
             _write_recovery(
                 "Jacked auto-update: package install + migrate succeeded, but "
@@ -506,9 +480,12 @@ def run_update(
         if not _restart_attempted[0]:
             try:
                 from jacked.service.platform import native_restart
+
                 log("Final guard: no restart attempted by upgrade flow — kickstart")
                 ok, reason = native_restart()
-                log(f"Final guard: native_restart {'OK' if ok else 'FAILED'} ({reason})")
+                log(
+                    f"Final guard: native_restart {'OK' if ok else 'FAILED'} ({reason})"
+                )
             except Exception:
                 logger.exception("Final-guard native_restart raised")
         log_fh.close()
@@ -558,7 +535,9 @@ def spawn_updater_from_tray(
     does to the jacked venv. Same trick as `jacked upgrade` on Windows.
     """
     if sys.platform == "win32":
-        _spawn_windows_tray_updater(parent_pid, extras, target_version=target_version, port=port)
+        _spawn_windows_tray_updater(
+            parent_pid, extras, target_version=target_version, port=port
+        )
         return
 
     py = _find_updater_python()
@@ -567,9 +546,15 @@ def spawn_updater_from_tray(
 
     _spawn_detached(
         [
-            py, "-m", "jacked.service.updater", str(parent_pid), extras,
-            "--target-version", target_version or "",
-            "--port", str(port),
+            py,
+            "-m",
+            "jacked.service.updater",
+            str(parent_pid),
+            extras,
+            "--target-version",
+            target_version or "",
+            "--port",
+            str(port),
         ],
         log_fh=None,
     )
@@ -658,66 +643,88 @@ def _spawn_windows_tray_updater(
     # %LOGFILE% survives only as text inside the recovery-file messages, and the
     # recovery file itself is a DIFFERENT path that nothing else holds open.
     DRIFT_GUARD = (
-        'if errorlevel 1 (\r\n'
-        '    echo [%date% %time%] WARN: _update_status shim returned non-zero (continuing)\r\n'
-        ')\r\n'
+        "if errorlevel 1 (\r\n"
+        "    echo [%date% %time%] WARN: _update_status shim returned non-zero (continuing)\r\n"
+        ")\r\n"
     )
     batch_body = (
-        '@echo off\r\n'
-        'set LOGFILE=' + log_path + '\r\n'
-        'echo [%date% %time%] tray update helper starting (parent PID ' + str(parent_pid) + ', method ' + method + ')\r\n'
-        'echo [%date% %time%] upgrade command: ' + label + '\r\n'
-        'jacked _update_status_init "' + current_version + '" "' + to_version + '" ' + method + ' --log-path "' + log_path + '"\r\n'
-        'if errorlevel 2 (\r\n'
+        "@echo off\r\n"
+        "set LOGFILE=" + log_path + "\r\n"
+        "echo [%date% %time%] tray update helper starting (parent PID "
+        + str(parent_pid)
+        + ", method "
+        + method
+        + ")\r\n"
+        "echo [%date% %time%] upgrade command: " + label + "\r\n"
+        'jacked _update_status_init "'
+        + current_version
+        + '" "'
+        + to_version
+        + '" '
+        + method
+        + ' --log-path "'
+        + log_path
+        + '"\r\n'
+        "if errorlevel 2 (\r\n"
         '    echo Another jacked updater is already in progress. Aborting. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        '    exit /b 2\r\n'
-        ')\r\n'
+        "    exit /b 2\r\n"
+        ")\r\n"
         # Phase: waiting_for_parent
-        'jacked _update_status waiting_for_parent in_progress\r\n'
+        "jacked _update_status waiting_for_parent in_progress\r\n"
         + DRIFT_GUARD
-        + wait_for_parent_block(parent_pid) +
-        'jacked _update_status waiting_for_parent ok\r\n'
-        + DRIFT_GUARD +
-        'echo [%date% %time%] parent exited\r\n'
+        + wait_for_parent_block(parent_pid)
+        + "jacked _update_status waiting_for_parent ok\r\n"
+        + DRIFT_GUARD
+        + "echo [%date% %time%] parent exited\r\n"
         # Phase: installing_package
-        'jacked _update_status installing_package in_progress\r\n'
+        "jacked _update_status installing_package in_progress\r\n"
         + DRIFT_GUARD
-        + upgrade_line + ' 2>&1\r\n'
-        'if errorlevel 1 (\r\n'
-        '    jacked _update_status installing_package failed --error "upgrade command failed" --recovery "' + label_for_batch + '"\r\n'
-        '    echo [%date% %time%] ERROR: upgrade command failed\r\n'
+        + upgrade_line
+        + " 2>&1\r\n"
+        "if errorlevel 1 (\r\n"
+        '    jacked _update_status installing_package failed --error "upgrade command failed" --recovery "'
+        + label_for_batch
+        + '"\r\n'
+        "    echo [%date% %time%] ERROR: upgrade command failed\r\n"
         '    echo Jacked tray update failed. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        '    exit /b 1\r\n'
-        ')\r\n'
-        'jacked _update_status installing_package ok\r\n'
-        + DRIFT_GUARD +
-        # Phase: migrating_settings
-        'jacked _update_status migrating_settings in_progress\r\n'
-        + DRIFT_GUARD +
-        'jacked install --force 2>&1\r\n'
-        'if errorlevel 1 (\r\n'
-        '    jacked _update_status migrating_settings failed --error "jacked install --force failed" --recovery "jacked install --force"\r\n'
-        '    exit /b 1\r\n'
-        ')\r\n'
-        'jacked _update_status migrating_settings ok\r\n'
-        + DRIFT_GUARD +
-        # Phase: waiting_port_free
-        'jacked _update_status waiting_port_free in_progress\r\n'
+        "    echo Recovery: "
+        + label
+        + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        "    exit /b 1\r\n"
+        ")\r\n"
+        "jacked _update_status installing_package ok\r\n"
         + DRIFT_GUARD
-        + _SLEEP_1S +
-        'jacked _update_status waiting_port_free ok\r\n'
-        + DRIFT_GUARD +
+        +
+        # Phase: migrating_settings
+        "jacked _update_status migrating_settings in_progress\r\n"
+        + DRIFT_GUARD
+        + "jacked install --force 2>&1\r\n"
+        "if errorlevel 1 (\r\n"
+        '    jacked _update_status migrating_settings failed --error "jacked install --force failed" --recovery "jacked install --force"\r\n'
+        "    exit /b 1\r\n"
+        ")\r\n"
+        "jacked _update_status migrating_settings ok\r\n"
+        + DRIFT_GUARD
+        +
+        # Phase: waiting_port_free
+        "jacked _update_status waiting_port_free in_progress\r\n"
+        + DRIFT_GUARD
+        + _SLEEP_1S
+        + "jacked _update_status waiting_port_free ok\r\n"
+        + DRIFT_GUARD
+        +
         # Phase: starting_service
-        'jacked _update_status starting_service in_progress\r\n'
-        + DRIFT_GUARD +
-        'start "" /B jacked service start\r\n'
-        'jacked _update_status starting_service ok\r\n'
-        + DRIFT_GUARD +
+        "jacked _update_status starting_service in_progress\r\n"
+        + DRIFT_GUARD
+        + 'start "" /B jacked service start\r\n'
+        "jacked _update_status starting_service ok\r\n"
+        + DRIFT_GUARD
+        +
         # Phase: verifying_service
-        'jacked _update_status verifying_service in_progress\r\n'
-        + DRIFT_GUARD +
-        _verify_service_block(port) +
+        "jacked _update_status verifying_service in_progress\r\n"
+        + DRIFT_GUARD
+        + _verify_service_block(port)
+        +
         # One retry before declaring defeat. A tray update that ends with NO
         # service is the worst possible outcome — the user loses the icon and
         # every entry point to fix it. Re-issuing `service start` is safe: the
@@ -726,20 +733,22 @@ def _spawn_windows_tray_updater(
         # powershell one-liner stuffed with parentheses, and burying it inside a
         # parenthesised block is exactly the kind of cmd.exe parsing trap that
         # produced this bug in the first place.
-        'if not errorlevel 1 goto verifyok\r\n'
-        'echo [%date% %time%] verify failed; retrying service start once\r\n'
+        "if not errorlevel 1 goto verifyok\r\n"
+        "echo [%date% %time%] verify failed; retrying service start once\r\n"
         'start "" /B jacked service start\r\n'
-        + _verify_service_block(port) +
-        ':verifyok\r\n'
-        'if errorlevel 1 (\r\n'
-        '    jacked _update_status verifying_service failed --error "service did not bind :' + str(port) + ' in 20s" --recovery "jacked service start"\r\n'
+        + _verify_service_block(port)
+        + ":verifyok\r\n"
+        "if errorlevel 1 (\r\n"
+        '    jacked _update_status verifying_service failed --error "service did not bind :'
+        + str(port)
+        + ' in 20s" --recovery "jacked service start"\r\n'
         '    echo Jacked tray update: service did not come up. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        '    exit /b 1\r\n'
-        ')\r\n'
-        'jacked _update_status verifying_service ok\r\n'
-        + DRIFT_GUARD +
-        'jacked _update_status_succeed\r\n'
-        'echo [%date% %time%] tray update complete\r\n'
+        "    exit /b 1\r\n"
+        ")\r\n"
+        "jacked _update_status verifying_service ok\r\n"
+        + DRIFT_GUARD
+        + "jacked _update_status_succeed\r\n"
+        "echo [%date% %time%] tray update complete\r\n"
         '(goto) 2>nul & del "%~f0"\r\n'
     )
 
@@ -809,6 +818,7 @@ def _spawn_windows_tray_updater(
 def _cli() -> None:
     """Entry point for `python -m jacked.service.updater <pid> [extras] [--target-version V] [--port P]`."""
     import argparse
+
     ap = argparse.ArgumentParser(prog="python -m jacked.service.updater")
     ap.add_argument("parent_pid", type=int)
     ap.add_argument("extras", nargs="?", default="tray")

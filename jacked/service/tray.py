@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import webbrowser
+from dataclasses import replace
 
 from jacked import __version__
 from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
@@ -185,24 +186,28 @@ def build_menu(
     if started_at_text_fn is not None:
         items.append(
             pystray.MenuItem(
-                lambda _: started_at_text_fn(), None, enabled=False,
+                lambda _: started_at_text_fn(),
+                None,
+                enabled=False,
             )
         )
-    items.extend([
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Open Dashboard", on_open_dashboard),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Restart", on_restart),
-        pystray.MenuItem("Stop", on_stop),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(
-            "Start on Login",
-            on_toggle_autostart,
-            checked=lambda _: autostart_check(),
-        ),
-        pystray.Menu.SEPARATOR,
-        version_item,
-    ])
+    items.extend(
+        [
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open Dashboard", on_open_dashboard),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Restart", on_restart),
+            pystray.MenuItem("Stop", on_stop),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Start on Login",
+                on_toggle_autostart,
+                checked=lambda _: autostart_check(),
+            ),
+            pystray.Menu.SEPARATOR,
+            version_item,
+        ]
+    )
     if last_check_text_fn is not None:
         items.append(
             pystray.MenuItem(lambda _: last_check_text_fn(), None, enabled=False)
@@ -217,9 +222,7 @@ def build_menu(
                 )
             )
         else:
-            items.append(
-                pystray.MenuItem("Check for updates...", on_check_for_updates)
-            )
+            items.append(pystray.MenuItem("Check for updates...", on_check_for_updates))
 
     return pystray.Menu(*items)
 
@@ -240,7 +243,9 @@ class ServiceRunner:
         # start, so readiness/port-free probes fall back to loopback.
         self.bind_plan = None
         self._stop_event = threading.Event()
-        self._lifecycle_lock = threading.RLock()  # reentrant: update click holds through _on_stop
+        self._lifecycle_lock = (
+            threading.RLock()
+        )  # reentrant: update click holds through _on_stop
         self._uvicorn_thread: threading.Thread | None = None
         self._uvicorn_server = None
         self._icon: "pystray.Icon | None" = None
@@ -264,6 +269,13 @@ class ServiceRunner:
         # a Restart click actually took effect — the timestamp shifts on
         # every successful start/restart.
         self._started_at: float | None = None
+        # v2 process ownership. Initialized at run() before any bind attempt;
+        # kept optional so low-level unit tests can exercise _start_uvicorn in
+        # isolation without touching user state.
+        self._ownership = None
+        self._service_spec = None
+        self._service_environment: dict[str, str] | None = None
+        self._control_server = None
 
     def _start_uvicorn(self, cold_start: bool = False) -> threading.Thread:
         """Resolve the bind plan, pre-bind its sockets, and serve in a daemon
@@ -294,17 +306,35 @@ class ServiceRunner:
         plan = resolve_bind(self.cli_host, self.port)
         self.bind_plan = plan
         self.host = plan.primary_host
-        # Publish the live plan so the settings API's effective-state view
-        # reflects what we actually bound (re-published on every restart).
-        set_active_plan(plan)
-
-        os.environ["JACKED_HOST"] = plan.primary_host
-        os.environ["JACKED_PORT"] = str(self.port)
-
         try:
             socks = create_sockets(plan)
         except OSError as exc:
-            if cold_start:
+            if cold_start and self._ownership is not None:
+                # The fixed listener is ambiguous. Never kill its owner and
+                # never race it. Bind a loopback-only dynamic port and publish
+                # that endpoint in the private manifest for CLI/tray discovery.
+                from jacked.service.bind import BindPlan
+
+                quarantine = BindPlan(
+                    mode="quarantine",
+                    addresses=("127.0.0.1",),
+                    port=0,
+                    primary_host="127.0.0.1",
+                    fallback_reason=(
+                        f"Port {self.port} is occupied without v2 ownership proof"
+                    ),
+                )
+                socks = create_sockets(quarantine)
+                actual_port = socks[0].getsockname()[1]
+                plan = replace(quarantine, port=actual_port)
+                self.port = actual_port
+                self.bind_plan = plan
+                self.host = plan.primary_host
+                logger.warning(
+                    "Port conflict: started owned service in quarantine on 127.0.0.1:%d",
+                    actual_port,
+                )
+            elif cold_start:
                 raise SystemExit(
                     f"Port {self.port} is already in use.\n"
                     "Is another jacked instance running? Check with: jacked service status\n"
@@ -313,7 +343,42 @@ class ServiceRunner:
             # Restart path: propagate as OSError so _on_restart's retry loop
             # (except Exception) can catch it, retry, and show the "stopped"
             # state instead of a BaseException escaping the loop.
-            raise
+            else:
+                raise
+
+        # Publish only after sockets are successfully reserved. The manifest
+        # therefore never advertises a port this process failed to bind.
+        set_active_plan(plan)
+        os.environ["JACKED_HOST"] = plan.primary_host
+        os.environ["JACKED_PORT"] = str(self.port)
+        if self._ownership is not None:
+            from jacked.service.instance import BindIdentity
+
+            self._ownership.publish(
+                BindIdentity(
+                    host="127.0.0.1",
+                    port=self.port,
+                    quarantine=plan.mode == "quarantine",
+                )
+            )
+            if self._control_server is None:
+                from jacked.service.ipc import create_control_server
+
+                self._control_server = create_control_server(
+                    self._ownership.manifest.control_address,
+                    manifest_provider=lambda: self._ownership.manifest,
+                    handler=self._handle_control_action,
+                )
+                try:
+                    self._control_server.start()
+                except BaseException:
+                    for sock in socks:
+                        sock.close()
+                    self._control_server = None
+                    raise
+        # Legacy PID file remains diagnostic-only for two releases. It never
+        # authorizes v2 control or termination.
+        write_pid(PID_FILE, self.port)
 
         config = uvicorn.Config(
             "jacked.api.main:app",
@@ -439,7 +504,8 @@ class ServiceRunner:
             logger.info(
                 "Uvicorn graceful shutdown timed out after %.1fs (ws_clients=%d) "
                 "— forcing exit",
-                graceful_elapsed, ws_client_count,
+                graceful_elapsed,
+                ws_client_count,
             )
             self._uvicorn_server.force_exit = True
             self._uvicorn_thread.join(timeout=5)
@@ -448,7 +514,8 @@ class ServiceRunner:
                     "Uvicorn thread still alive after force_exit "
                     "(total elapsed %.1fs, ws_clients=%d) — proceeding "
                     "anyway; OS will reap the daemon thread",
-                    time.monotonic() - graceful_start, ws_client_count,
+                    time.monotonic() - graceful_start,
+                    ws_client_count,
                 )
 
     def _on_open_dashboard(self):
@@ -517,9 +584,10 @@ class ServiceRunner:
                     if self._wait_for_ready(timeout=15):
                         self._started_at = time.time()
                         logger.info(
-                            "Service ready after restart "
-                            "(pid=%d, port=%d, attempt=%d)",
-                            os.getpid(), self.port, attempt + 1,
+                            "Service ready after restart (pid=%d, port=%d, attempt=%d)",
+                            os.getpid(),
+                            self.port,
+                            attempt + 1,
                         )
                         if self._icon:
                             self._apply_icon("running")
@@ -527,14 +595,16 @@ class ServiceRunner:
                         return
                     logger.warning(
                         "Restart attempt %d: server did not become ready "
-                        "within timeout", attempt + 1,
+                        "within timeout",
+                        attempt + 1,
                     )
                     self._shutdown_uvicorn()
                     self._wait_for_port_free(timeout=5)
                 except Exception as exc:
                     last_err = exc
                     logger.exception(
-                        "Restart attempt %d raised; will retry", attempt + 1,
+                        "Restart attempt %d raised; will retry",
+                        attempt + 1,
                     )
                     self._shutdown_uvicorn()
                     self._wait_for_port_free(timeout=5)
@@ -661,12 +731,15 @@ class ServiceRunner:
         item with `force=True`, does a single forced PyPI hit and returns.
         """
         import time as _time
+
         first = True
         while not self._stop_event.is_set():
             try:
                 # First iteration honors the `force` arg from the caller.
                 # Subsequent loops are always cache-respecting.
-                info = check_version_cached(__version__, force=force if first else False)
+                info = check_version_cached(
+                    __version__, force=force if first else False
+                )
                 if info is not None:
                     self._version_info = info
                 # Always stamp the last-checked time (even on PyPI failure) so
@@ -709,6 +782,7 @@ class ServiceRunner:
         # Fire a one-shot thread so we don't block the menu callback.
         def _once():
             import time as _time
+
             try:
                 info = check_version_cached(__version__, force=True)
             except Exception:
@@ -737,11 +811,13 @@ class ServiceRunner:
                     elif info.get("outdated"):
                         latest = info.get("latest", "?")
                         self._icon.notify(
-                            f"Update available: v{latest}", "Jacked",
+                            f"Update available: v{latest}",
+                            "Jacked",
                         )
                     else:
                         self._icon.notify(
-                            f"You're up to date (v{__version__})", "Jacked",
+                            f"You're up to date (v{__version__})",
+                            "Jacked",
                         )
                 except Exception:
                     pass
@@ -762,6 +838,7 @@ class ServiceRunner:
             return "Last checked: never"
 
         import time as _time
+
         delta = max(0, int(_time.time() - self._last_check_at))
         if delta < 60:
             return "Last checked: just now"
@@ -796,6 +873,7 @@ class ServiceRunner:
         # ModuleNotFoundError on editable dev-clone venvs that don't ship pip)
         # and the user would be left with a dead tray and no tray to retry from.
         from jacked.install_method import can_auto_upgrade as _can_upgrade
+
         _ok, _reason = _can_upgrade()
         if not _ok:
             if self._icon:
@@ -805,12 +883,14 @@ class ServiceRunner:
                     logger.exception("Failed to notify on update refusal")
             try:
                 from jacked.service.updater import RECOVERY_FILE
+
                 RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
                 RECOVERY_FILE.write_text(_reason + "\n")
             except Exception:
                 logger.exception("Could not write recovery file on refusal")
             try:
                 from jacked.service import update_status as _us
+
                 _us.clear_status(_us.UPDATE_STATUS_FILE)
             except Exception:
                 logger.exception("Could not clear stale status file on refusal")
@@ -827,6 +907,7 @@ class ServiceRunner:
         try:
             import time as _time_mod
             from jacked.service.updater import UPDATE_LOG as _bc_log
+
             _bc_log.parent.mkdir(parents=True, exist_ok=True)
             with open(_bc_log, "a", encoding="utf-8") as _lf:
                 _lf.write(
@@ -857,6 +938,7 @@ class ServiceRunner:
             try:
                 from jacked.api.main import WEB_DIR
                 from jacked.service import CLAUDE_DIR
+
                 template = (WEB_DIR / "update_bootstrap.html").read_text(
                     encoding="utf-8"
                 )
@@ -886,6 +968,7 @@ class ServiceRunner:
                 from jacked.service.updater import UPDATE_LOG as _upd_log
                 from jacked.install_method import detect_install_method as _det
                 from jacked import __version__ as _cv
+
                 _us.init_status(
                     _us.UPDATE_STATUS_FILE,
                     from_version=_cv,
@@ -900,6 +983,7 @@ class ServiceRunner:
 
             try:
                 from jacked.service.updater import spawn_updater_from_tray
+
                 spawn_updater_from_tray(
                     parent_pid=os.getpid(),
                     extras="tray",
@@ -937,6 +1021,7 @@ class ServiceRunner:
         # Surface a prior failed update if recovery file exists.
         try:
             from jacked.service.updater import RECOVERY_FILE
+
             if RECOVERY_FILE.exists():
                 icon.notify(
                     "Previous update failed. See "
@@ -958,7 +1043,9 @@ class ServiceRunner:
             self._started_at = time.time()
             logger.info(
                 "Service ready (pid=%d, port=%d, autostart=%s)",
-                os.getpid(), self.port, self._autostart_enabled,
+                os.getpid(),
+                self.port,
+                self._autostart_enabled,
             )
             self._apply_icon("running")
             # Force a menu rebuild so the dynamic "Started ..." item
@@ -985,6 +1072,7 @@ class ServiceRunner:
         try:
             import logging as _logging
             from jacked.service import CLAUDE_DIR
+
             CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
             tray_log_path = CLAUDE_DIR / "jacked-tray.log"
             handler = _logging.FileHandler(tray_log_path, encoding="utf-8")
@@ -1021,7 +1109,7 @@ class ServiceRunner:
         # resolve_bind, and every plan except a cli-pinned specific IP includes
         # or covers loopback. A cli specific-IP run still conflict-checks cleanly
         # at create_sockets time (which raises SystemExit with this same message).
-        if not is_port_available("127.0.0.1", self.port):
+        if self._ownership is None and not is_port_available("127.0.0.1", self.port):
             raise SystemExit(
                 f"Port {self.port} is already in use.\n"
                 "Is another jacked instance running? Check with: jacked service status\n"
@@ -1046,10 +1134,13 @@ class ServiceRunner:
             self._started_at = time.time()
             logger.info(
                 "Service ready — macOS menu-bar agent (pid=%d, port=%d)",
-                os.getpid(), self.port,
+                os.getpid(),
+                self.port,
             )
         else:
-            logger.error("Service did not become ready; menu-bar pill will show degraded")
+            logger.error(
+                "Service did not become ready; menu-bar pill will show degraded"
+            )
 
         try:
             MacMenuBarApp(self).run()
@@ -1059,6 +1150,33 @@ class ServiceRunner:
     def run(self) -> None:
         """Start the service: tray icon on main thread, uvicorn in background."""
         self._install_tray_file_logger()
+
+        from jacked.service.lifecycle import (
+            claim_service_ownership,
+            provision_service_contract,
+        )
+
+        candidate, environment = provision_service_contract()
+        if os.environ.get("JACKED_SERVICE_GENERATION") == candidate.generation:
+            self._service_spec, self._service_environment = candidate, environment
+        else:
+            # A direct CLI/manual start has no exact supervisor generation
+            # marker and must never claim native-manager provenance.
+            from jacked.service.spec import SupervisorKind
+
+            self._service_spec, self._service_environment = provision_service_contract(
+                supervisor=SupervisorKind.MANUAL
+            )
+        try:
+            self._ownership = claim_service_ownership(self._service_spec)
+        except RuntimeError as exc:
+            if (
+                os.environ.get("JACKED_SERVICE_GENERATION")
+                == self._service_spec.generation
+            ):
+                logger.error("Managed starter lost the service lease: %s", exc)
+                raise SystemExit(0) from exc
+            raise SystemExit(f"Cannot start jacked service safely: {exc}") from exc
 
         # Register the in-process restart handler for the WHOLE run lifetime,
         # so the settings API's POST /remote-access/restart can apply a bind
@@ -1074,6 +1192,37 @@ class ServiceRunner:
             return self._run()
         finally:
             set_restart_handler(None)
+            if self._control_server is not None:
+                self._control_server.close()
+                self._control_server = None
+            if self._ownership is not None:
+                self._ownership.close()
+                self._ownership = None
+
+    def _handle_control_action(self, action):
+        """Dispatch an authenticated native-control action."""
+        from jacked.service.ipc import ControlAction
+
+        if action is ControlAction.STATUS:
+            manifest = self._ownership.manifest if self._ownership else None
+            return {
+                "state": "running" if manifest is not None else "stopping",
+                "instance_id": manifest.instance_id if manifest else None,
+                "generation": manifest.generation if manifest else None,
+                "build_version": manifest.build_version if manifest else None,
+                "protocol_version": manifest.protocol_version if manifest else None,
+                "port": manifest.bind.port if manifest else None,
+                "quarantine": manifest.bind.quarantine if manifest else None,
+            }
+        if action is ControlAction.SHUTDOWN:
+            self._request_stop()
+            return {"accepted": True}
+        if action is ControlAction.RESTART_HANDOFF:
+            # A handoff must exit this interpreter so an upgraded package can
+            # actually load. Tray/menu restart remains the in-process path.
+            self._request_stop()
+            return {"accepted": True}
+        raise ValueError("unsupported control action")
 
     def _run(self) -> None:
         """Backend dispatch for :meth:`run` (wrapped there for handler setup)."""
@@ -1094,7 +1243,7 @@ class ServiceRunner:
         # resolve_bind, and every plan except a cli-pinned specific IP includes
         # or covers loopback. A cli specific-IP run still conflict-checks cleanly
         # at create_sockets time (which raises SystemExit with this same message).
-        if not is_port_available("127.0.0.1", self.port):
+        if self._ownership is None and not is_port_available("127.0.0.1", self.port):
             raise SystemExit(
                 f"Port {self.port} is already in use.\n"
                 "Is another jacked instance running? Check with: jacked service status\n"

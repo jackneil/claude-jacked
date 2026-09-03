@@ -45,9 +45,7 @@ def _fallback_mark(size: int) -> "Image.Image":
     m = max(1, size // 16)
     d.rounded_rectangle([m, m, size - 1 - m, size - 1 - m], radius=size // 5, fill=255)
     r = size // 5
-    d.ellipse(
-        [size // 2 - r, size // 2 - r, size // 2 + r, size // 2 + r], fill=0
-    )
+    d.ellipse([size // 2 - r, size // 2 - r, size // 2 + r, size // 2 + r], fill=0)
     return img
 
 

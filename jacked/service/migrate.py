@@ -63,8 +63,6 @@ def extract_baked_host(artifact_text: str, kind: str) -> str | None:
     return host or None
 
 
-
-
 def strip_baked_host(artifact_text: str, kind: str) -> str:
     """Return the artifact text with its ``--host X`` removed, all else intact.
 
@@ -138,10 +136,7 @@ def migrate_baked_host_to_db(host: str, db=None) -> str:
 
             db = Database()
         if db.get_setting("remote_access_enabled") is not None:
-            msg = (
-                "remote access setting already present; "
-                f"baked host {host} left alone"
-            )
+            msg = f"remote access setting already present; baked host {host} left alone"
             logger.info(msg)
             return msg
         # Write scope FIRST, then the guard key `remote_access_enabled` LAST.
@@ -179,6 +174,7 @@ def remote_access_configured(db=None) -> bool:
             db = Database()
         return db.get_setting("remote_access_enabled") is not None
     except Exception as exc:  # a broken DB must not crash boot resolution
-        logger.warning("Could not read remote-access setting (%s); "
-                       "treating as unconfigured", exc)
+        logger.warning(
+            "Could not read remote-access setting (%s); treating as unconfigured", exc
+        )
         return False

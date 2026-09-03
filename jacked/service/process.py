@@ -5,10 +5,129 @@ import signal
 import socket
 import sys
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from jacked.service import DEFAULT_PORT
 from jacked.winproc import NO_WINDOW
+
+
+@dataclass(frozen=True)
+class OwnedProcess:
+    """Process evidence copied from a validated private instance manifest."""
+
+    pid: int
+    creation_id: str
+    executable: str
+    managed: bool
+
+
+class TerminationResult(str, Enum):
+    SIGNALLED = "signalled"
+    REFUSED_IDENTITY = "refused_identity"
+    REFUSED_UNMANAGED = "refused_unmanaged"
+    REFUSED_SUPERVISOR_REQUIRED = "refused_supervisor_required"
+    UNSUPPORTED = "unsupported"
+
+
+def verify_owned_process(process: OwnedProcess) -> bool:
+    """Re-read creation identity and executable immediately before control."""
+
+    try:
+        from jacked.service.instance import process_identity
+
+        observed = process_identity(process.pid)
+    except (OSError, ProcessLookupError, ValueError):
+        return False
+    return observed.creation_id == process.creation_id and os.path.realpath(
+        observed.executable
+    ) == os.path.realpath(process.executable)
+
+
+def _linux_pidfd_signal(pid: int, sig: int) -> bool:
+    """Signal the exact Linux process object, not a reusable integer PID."""
+
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
+    descriptor = os.pidfd_open(pid, 0)
+    try:
+        signal.pidfd_send_signal(descriptor, sig)
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _windows_handle_terminate(process: OwnedProcess, *, force: bool) -> bool:
+    """Retain a Win32 process handle and verify creation time before control."""
+
+    if not force:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    query = 0x1000
+    terminate = 0x0001
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(query | terminate, False, process.pid)
+    if not handle:
+        return False
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return False
+        creation_id = f"windows-filetime:{(creation.dwHighDateTime << 32) | creation.dwLowDateTime}"
+        if creation_id != process.creation_id:
+            return False
+        return bool(kernel32.TerminateProcess(handle, 1))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def terminate_owned_process(
+    process: OwnedProcess,
+    *,
+    force: bool = False,
+) -> TerminationResult:
+    """Apply the fail-closed platform termination policy.
+
+    Managed services must be stopped through a separately verified supervisor
+    artifact.  macOS unmanaged processes have no race-free force primitive and
+    must use authenticated IPC for graceful shutdown.
+    """
+
+    if process.managed:
+        return TerminationResult.REFUSED_SUPERVISOR_REQUIRED
+    if not verify_owned_process(process):
+        return TerminationResult.REFUSED_IDENTITY
+    requested_signal = signal.SIGKILL if force else signal.SIGTERM
+    if sys.platform.startswith("linux"):
+        try:
+            if _linux_pidfd_signal(process.pid, requested_signal):
+                return TerminationResult.SIGNALLED
+        except OSError:
+            return TerminationResult.REFUSED_IDENTITY
+        return TerminationResult.UNSUPPORTED
+    if sys.platform == "win32":
+        return (
+            TerminationResult.SIGNALLED
+            if _windows_handle_terminate(process, force=force)
+            else TerminationResult.REFUSED_UNMANAGED
+        )
+    if sys.platform == "darwin":
+        return TerminationResult.REFUSED_UNMANAGED
+    return TerminationResult.UNSUPPORTED
 
 
 def write_pid(pid_file: Path, port: int = DEFAULT_PORT) -> None:
@@ -118,6 +237,7 @@ def stop_process(pid_file: Path) -> bool:
 
     if sys.platform == "win32":
         import subprocess
+
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/F"],
             capture_output=True,
@@ -174,6 +294,7 @@ def stop_process_graceful(
 
     if sys.platform == "win32":
         import subprocess
+
         # Graceful first — no /F. Sends WM_CLOSE to GUI procs / CTRL_BREAK to consoles.
         subprocess.run(
             ["taskkill", "/PID", str(pid)],
@@ -194,6 +315,7 @@ def stop_process_graceful(
     # Escalate.
     if sys.platform == "win32":
         import subprocess
+
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/F", "/T"],
             capture_output=True,

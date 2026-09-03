@@ -36,12 +36,12 @@ window.jackedState = {
 const API_DEFAULT_TIMEOUT_MS = 60000;
 
 const api = {
-    async _request(method, path, body, { timeout = API_DEFAULT_TIMEOUT_MS } = {}) {
+    async _request(method, path, body, { timeout = API_DEFAULT_TIMEOUT_MS, headers = {} } = {}) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
         const opts = {
             method,
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...headers },
             // Bypass browser cache — stale responses after OAuth flows cause UI desync
             cache: 'no-store',
             signal: controller.signal,
@@ -53,7 +53,13 @@ const api = {
             const res = await fetch(path, opts);
             if (!res.ok) {
                 const err = await res.json().catch(() => ({ error: { message: res.statusText } }));
-                throw new ApiError(err.error?.message || res.statusText, res.status, err.error?.code);
+                const apiError = new ApiError(
+                    err.error?.message || err.message || res.statusText,
+                    res.status,
+                    err.error?.code,
+                );
+                apiError.payload = err;
+                throw apiError;
             }
             // 204 No Content
             if (res.status === 204) return null;
@@ -220,8 +226,19 @@ async function loadVersion() {
 async function loadActiveSessions() {
     try {
         const mins = Math.round(window.jackedState.sessionStalenessMs / 60000) || 60;
-        const data = await api.get(`/api/auth/active-sessions?staleness=${mins}`);
-        window.jackedState.activeSessions = data.sessions || {};
+        const data = await api.get(`/api/auth/session-states?staleness=${mins}`);
+        const rows = Array.isArray(data.sessions) ? data.sessions : [];
+        const grouped = {};
+        for (const row of rows) {
+            const accountId = row.observed_configuration?.account_id
+                ?? row.started_as?.account_id
+                ?? 'unknown';
+            const key = String(accountId);
+            if (!grouped[key]) grouped[key] = [];
+            grouped[key].push(row);
+        }
+        window.jackedState.activeSessions = grouped;
+        window.jackedState.desiredGlobalAccount = data.desired_global || null;
     } catch (e) {
         console.error('Failed to load active sessions:', e);
     }

@@ -3,21 +3,45 @@
 import pytest
 from unittest.mock import patch
 
+from jacked.credentials.models import (
+    CredentialIdentity,
+    IdentityAxis,
+    ProviderVerificationState,
+    SessionActivationState,
+    SwitchOutcome,
+    SwitchResult,
+)
+
 
 
 @pytest.fixture(autouse=True)
 def _block_keychain_writes():
-    """Prevent any test from writing to the real macOS Keychain.
+    """Prevent tests from mutating the real credential authority."""
+    def launch_result(account, _db):
+        account_id = int(account["id"])
+        identity = CredentialIdentity(
+            account_id=account_id,
+            email=account.get("email"),
+            organization_id=account.get("organization_uuid") or None,
+        )
+        return SwitchResult(
+            operation_id="launch-test-operation",
+            outcome=SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+            desired_default=IdentityAxis(account_id, "desired"),
+            storage=IdentityAxis(account_id, "observed"),
+            committed_authority=IdentityAxis(None, "uncommitted"),
+            existing_session_activation=SessionActivationState.RESTART_REQUIRED,
+            provider_verification=ProviderVerificationState.UNVERIFIED,
+            observed_identity=identity,
+            message="test credential observation",
+        )
 
-    write_platform_credentials is imported by name in jacked.launch,
-    so we must patch both the definition and the import site.
-    """
     with patch(
         "jacked.api.credential_helpers.write_platform_credentials",
         return_value=True,
     ), patch(
-        "jacked.launch.write_platform_credentials",
-        return_value=True,
+        "jacked.launch._activate_launch_credentials",
+        side_effect=launch_result,
     ):
         yield
 

@@ -155,8 +155,7 @@ def resolve_bind(cli_host: str | None, port: int, db=None) -> BindPlan:
         scope = db.get_setting("remote_access_scope")
     except Exception as exc:  # sqlite errors, corrupt DB, unreadable path ...
         logger.warning(
-            "Could not read remote-access settings (%s: %s); "
-            "binding loopback only.",
+            "Could not read remote-access settings (%s: %s); binding loopback only.",
             type(exc).__name__,
             exc,
         )
@@ -237,7 +236,8 @@ def _detect_via_udp() -> str | None:
         return local_ip
     logger.debug(
         "Tailscale UDP route detection returned %s, outside 100.64.0.0/10; "
-        "not a tailnet address", local_ip,
+        "not a tailnet address",
+        local_ip,
     )
     return None
 
@@ -261,19 +261,24 @@ def _detect_via_cli() -> str | None:
         # FileNotFoundError (⊂ OSError), TimeoutExpired (⊂ SubprocessError), ...
         # debug-level so an on-call can distinguish "binary missing" from "CLI
         # hung/timed out" when triaging a loopback fallback.
-        logger.debug("`tailscale ip -4` could not run (%s: %s)",
-                     type(exc).__name__, exc)
+        logger.debug(
+            "`tailscale ip -4` could not run (%s: %s)", type(exc).__name__, exc
+        )
         return None
     if result.returncode != 0:
-        logger.debug("`tailscale ip -4` exit %d: %s", result.returncode,
-                     (result.stderr or result.stdout or "").strip())
+        logger.debug(
+            "`tailscale ip -4` exit %d: %s",
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
         return None
     lines = (result.stdout or "").splitlines()
     first_line = lines[0].strip() if lines else ""
     if _in_cgnat_range(first_line):
         return first_line
-    logger.debug("`tailscale ip -4` returned %r, not a 100.64.0.0/10 address",
-                 first_line)
+    logger.debug(
+        "`tailscale ip -4` returned %r, not a 100.64.0.0/10 address", first_line
+    )
     return None
 
 
@@ -322,8 +327,6 @@ def create_sockets(plan: BindPlan) -> list[socket.socket]:
             sock.close()
             for opened in sockets:
                 opened.close()
-            raise OSError(
-                f"Failed to bind {addr}:{plan.port} ({exc})"
-            ) from exc
+            raise OSError(f"Failed to bind {addr}:{plan.port} ({exc})") from exc
         sockets.append(sock)
     return sockets

@@ -24,6 +24,8 @@ from jacked.api.credential_helpers import (
     update_claude_config_email,
     write_platform_credentials,
 )
+from jacked.credentials.canonical import CredentialPayload
+from jacked.credentials.models import StoreReadResult, StoreStatus, StoreWriteResult
 from jacked.web.database import Database
 
 # Windows holds SQLite file locks — use ignore_cleanup_errors
@@ -162,6 +164,36 @@ def test_sync_writes_global_credential_file():
         assert data["claudeAiOauth"]["expiresAt"] == 1800000000000
 
 
+def test_sync_authority_failure_does_not_publish_file_target():
+    """The compatibility path cannot recreate the original split-store bug."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        cred_dir = tmp_path / ".claude"
+        cred_dir.mkdir()
+        cred_path = cred_dir / ".credentials.json"
+        cred_path.write_text(
+            json.dumps({"_jackedAccountId": 1, "claudeAiOauth": {"accessToken": "old"}}),
+            encoding="utf-8",
+        )
+        account = {
+            "email": "new@test.com",
+            "access_token": "new",
+            "expires_at": 1800000000,
+        }
+
+        with (
+            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
+            mock.patch(
+                "jacked.api.credential_helpers.write_platform_credentials",
+                return_value=False,
+            ),
+        ):
+            result = sync_credential_to_all_stores(2, account)
+
+        assert result is False
+        assert json.loads(cred_path.read_text(encoding="utf-8"))["_jackedAccountId"] == 1
+
+
 @pytest.mark.parametrize("rate_limit_tier", ["t1", None])
 def test_sync_writes_initial_claude_json_metadata(rate_limit_tier):
     """First activation writes coherent metadata even without a known tier."""
@@ -205,7 +237,7 @@ def test_sync_writes_initial_claude_json_metadata(rate_limit_tier):
 
 
 def _prime_cached_statusline_account(tmp_path: Path) -> Path:
-    """Create the outgoing account and prime its rendered cache."""
+    """Create outgoing metadata plus a resolver snapshot."""
     (tmp_path / ".claude").mkdir()
     config_path = tmp_path / ".claude.json"
     config_path.write_text(
@@ -220,7 +252,27 @@ def _prime_cached_statusline_account(tmp_path: Path) -> Path:
         }),
         encoding="utf-8",
     )
-    assert statusline.render({}, home=str(tmp_path)).endswith("Max 5x")
+    from jacked.credentials.models import CredentialIdentity
+    from jacked.credentials.resolver import (
+        FileResolverSnapshotSink,
+        ResolverState,
+        SnapshotUpdate,
+    )
+
+    old_identity = CredentialIdentity(1, "old@test.com", "org-old")
+    FileResolverSnapshotSink(
+        tmp_path / ".claude" / "jacked-resolver-snapshot.json"
+    ).publish(
+        SnapshotUpdate(
+            scope="global",
+            state=ResolverState.RESOLVED,
+            evidence=("test",),
+            credential_revision="old-revision",
+            desired=old_identity,
+            observed=old_identity,
+        )
+    )
+    assert statusline.render({}, home=str(tmp_path)) == "old@test.com"
     return config_path
 
 
@@ -268,25 +320,22 @@ def test_sync_switches_cached_statusline_identity_and_tier_coherently():
         config = json.loads(config_path.read_text(encoding="utf-8"))
         oauth = config["oauthAccount"]
         config_text = config_path.read_text(encoding="utf-8")
-        cache_text = (tmp_path / ".claude" / "statusline-account.cache").read_text(
-            encoding="utf-8"
-        )
+        snapshot_text = (
+            tmp_path / ".claude" / "jacked-resolver-snapshot.json"
+        ).read_text(encoding="utf-8")
         credential_text = (
             tmp_path / ".claude" / ".credentials.json"
         ).read_text(encoding="utf-8")
 
         assert "new@test.com" in line
-        assert "New Org" in line
-        assert "Max 20x" in line
         assert "old@test.com" not in line
-        assert "Max 5x" not in line
         assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
         assert "userRateLimitTier" not in oauth
         assert config["topLevelSetting"] == {"preserve": True}
         assert oauth["unrelatedAccountSetting"] == ["keep", 7]
         assert access_canary in credential_text
         assert refresh_canary in credential_text
-        for public_text in (config_text, cache_text, line):
+        for public_text in (config_text, snapshot_text, line):
             assert access_canary not in public_text
             assert refresh_canary not in public_text
 
@@ -315,6 +364,7 @@ def test_sync_with_unknown_tier_clears_both_outgoing_tier_fields():
             "scopes": None,
             "subscription_type": "max",
             "rate_limit_tier": None,
+            "organization_uuid": "org-unknown",
         }
 
         with (
@@ -421,24 +471,23 @@ def test_sync_preserves_existing_keys():
 # ------------------------------------------------------------------
 
 
-def test_read_platform_credentials_uses_user_account():
-    """Reads keychain with -a $USER to match Claude Code's entry.
-
-    >>> test_read_platform_credentials_uses_user_account()
-    """
-    keychain_json = json.dumps({
+def test_read_platform_credentials_uses_security_framework_store():
+    """Reads the native adapter without putting secrets in process arguments."""
+    payload = CredentialPayload.from_mapping({
         "claudeAiOauth": {
             "accessToken": "keychain_token",
             "refreshToken": "keychain_refresh",
         }
     })
-    mock_result = mock.MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = keychain_json
+    store = mock.MagicMock()
+    store.read.return_value = StoreReadResult(StoreStatus.OK, payload)
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
-        mock.patch("jacked.api.credential_helpers.subprocess.run", return_value=mock_result) as mock_run,
+        mock.patch(
+            "jacked.credentials.macos_store.MacOSCredentialStore",
+            return_value=store,
+        ) as store_class,
         mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
@@ -446,11 +495,7 @@ def test_read_platform_credentials_uses_user_account():
 
     assert result is not None
     assert result["claudeAiOauth"]["accessToken"] == "keychain_token"
-    # Verify the command uses -a with $USER
-    call_args = mock_run.call_args[0][0]
-    assert "-a" in call_args
-    a_idx = call_args.index("-a")
-    assert call_args[a_idx + 1] == "testuser"
+    store_class.assert_called_once_with("testuser")
 
 
 def test_read_platform_credentials_linux():
@@ -470,14 +515,15 @@ def test_read_platform_credentials_keychain_not_found():
 
     >>> test_read_platform_credentials_keychain_not_found()
     """
-    mock_result = mock.MagicMock()
-    mock_result.returncode = 44
-    mock_result.stdout = ""
-    mock_result.stderr = "The specified item could not be found in the keychain."
+    store = mock.MagicMock()
+    store.read.return_value = StoreReadResult(StoreStatus.MISSING)
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
-        mock.patch("jacked.api.credential_helpers.subprocess.run", return_value=mock_result),
+        mock.patch(
+            "jacked.credentials.macos_store.MacOSCredentialStore",
+            return_value=store,
+        ),
         mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
@@ -491,13 +537,17 @@ def test_read_platform_credentials_malformed_json():
 
     >>> test_read_platform_credentials_malformed_json()
     """
-    mock_result = mock.MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "not valid json{"
+    store = mock.MagicMock()
+    store.read.return_value = StoreReadResult(
+        StoreStatus.UNUSABLE, reason="invalid credential JSON"
+    )
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
-        mock.patch("jacked.api.credential_helpers.subprocess.run", return_value=mock_result),
+        mock.patch(
+            "jacked.credentials.macos_store.MacOSCredentialStore",
+            return_value=store,
+        ),
         mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
@@ -511,50 +561,30 @@ def test_read_platform_credentials_malformed_json():
 # ------------------------------------------------------------------
 
 
-def test_write_platform_credentials_uses_hex_and_user():
-    """Writes keychain with -X hex encoding and -a $USER to match Claude Code.
-
-    >>> test_write_platform_credentials_uses_hex_and_user()
-    """
+def test_write_platform_credentials_uses_native_store():
+    """Writes through Security.framework without a credential subprocess."""
     cred_data = {
         "_jackedAccountId": 1,
         "claudeAiOauth": {"accessToken": "test_token"},
     }
-    mock_result = mock.MagicMock()
-    mock_result.returncode = 0
+    store = mock.MagicMock()
+    store.write.return_value = StoreWriteResult(StoreStatus.OK)
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
         mock.patch(
-            "jacked.api.credential_helpers.subprocess.run",
-            return_value=mock_result,
-        ) as mock_run,
+            "jacked.credentials.macos_store.MacOSCredentialStore",
+            return_value=store,
+        ) as store_class,
         mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = write_platform_credentials(cred_data)
 
     assert result is True
-    # 2 calls: add-generic-password THEN orphan cleanup (delete old -a "Claude Code")
-    # Orphan cleanup runs AFTER successful write so user is never left with no entry.
-    assert mock_run.call_count == 2
-    # First call: the actual add
-    call_args = mock_run.call_args_list[0][0][0]
-    assert "add-generic-password" in call_args
-    # Second call: cleanup of orphan entry
-    cleanup_args = mock_run.call_args_list[1][0][0]
-    assert "delete-generic-password" in cleanup_args
-    assert "Claude Code" in cleanup_args
-    assert "-U" in call_args
-    a_idx = call_args.index("-a")
-    assert call_args[a_idx + 1] == "testuser"
-    assert "-X" in call_args
-    assert "-w" not in call_args
-    x_idx = call_args.index("-X")
-    hex_value = call_args[x_idx + 1]
-    decoded = bytes.fromhex(hex_value).decode("utf-8")
-    decoded_data = json.loads(decoded)
-    assert decoded_data["_jackedAccountId"] == 1
+    store_class.assert_called_once_with("testuser")
+    payload = store.write.call_args.args[0]
+    assert payload.identity.account_id == 1
 
 
 def test_write_platform_credentials_linux_noop():
@@ -574,25 +604,21 @@ def test_write_platform_credentials_keychain_error():
 
     >>> test_write_platform_credentials_keychain_error()
     """
-    # The add call fails — orphan cleanup never runs (it's after the add)
-    mock_add_fail = mock.MagicMock()
-    mock_add_fail.returncode = 1
-    mock_add_fail.stderr = "errSecAuthFailed"
+    store = mock.MagicMock()
+    store.write.return_value = StoreWriteResult(StoreStatus.DENIED, "authorization denied")
 
     with (
         mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
         mock.patch(
-            "jacked.api.credential_helpers.subprocess.run",
-            return_value=mock_add_fail,
-        ) as mock_run,
+            "jacked.credentials.macos_store.MacOSCredentialStore",
+            return_value=store,
+        ),
         mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
     ):
         mock_sys.platform = "darwin"
         result = write_platform_credentials({"claudeAiOauth": {"accessToken": "x"}})
 
     assert result is False
-    # Only 1 call (the add) — cleanup is skipped because add failed
-    assert mock_run.call_count == 1
 
 
 # ------------------------------------------------------------------
@@ -600,40 +626,18 @@ def test_write_platform_credentials_keychain_error():
 # ------------------------------------------------------------------
 
 
-def test_get_keychain_username_from_user():
-    """Returns $USER when set.
-
-    >>> test_get_keychain_username_from_user()
-    """
-    with mock.patch.dict(os.environ, {"USER": "alice"}, clear=False):
+def test_get_keychain_username_uses_os_identity_not_environment():
+    """Environment spoofing cannot change the Keychain locator account."""
+    with (
+        mock.patch.dict(os.environ, {"USER": "spoofed"}, clear=False),
+        mock.patch(
+            "jacked.credentials.macos_store.system_account_name",
+            return_value="os-user",
+        ),
+    ):
         from jacked.api.credential_helpers import _get_keychain_username
-        assert _get_keychain_username() == "alice"
 
-
-def test_get_keychain_username_falls_back_to_username():
-    """Returns $USERNAME when $USER is unset (Windows).
-
-    >>> test_get_keychain_username_falls_back_to_username()
-    """
-    env = dict(os.environ)
-    env.pop("USER", None)
-    env["USERNAME"] = "bob"
-    with mock.patch.dict(os.environ, env, clear=True):
-        from jacked.api.credential_helpers import _get_keychain_username
-        assert _get_keychain_username() == "bob"
-
-
-def test_get_keychain_username_fallback_to_claude_code():
-    """Returns 'Claude Code' when both vars are unset.
-
-    >>> test_get_keychain_username_fallback_to_claude_code()
-    """
-    env = dict(os.environ)
-    env.pop("USER", None)
-    env.pop("USERNAME", None)
-    with mock.patch.dict(os.environ, env, clear=True):
-        from jacked.api.credential_helpers import _get_keychain_username
-        assert _get_keychain_username() == "Claude Code"
+        assert _get_keychain_username() == "os-user"
 
 
 # ------------------------------------------------------------------
@@ -919,6 +923,10 @@ def test_read_fresh_active_token_from_file():
         }))
 
         with (
+            mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id",
+                return_value=1,
+            ),
             mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
             mock.patch(
                 "jacked.api.credential_helpers.read_platform_credentials",
@@ -930,8 +938,8 @@ def test_read_fresh_active_token_from_file():
     assert result == "fresh_token_from_file"
 
 
-def test_read_fresh_active_token_from_keychain():
-    """Prefers keychain over file when both have tokens."""
+def test_read_fresh_active_token_from_keychain_after_consensus():
+    """Reads raw Keychain token only after canonical identity consensus."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
         tmp_path = Path(tmp)
         cred_dir = tmp_path / ".claude"
@@ -943,6 +951,10 @@ def test_read_fresh_active_token_from_keychain():
         }))
 
         with (
+            mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id",
+                return_value=1,
+            ),
             mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
             mock.patch(
                 "jacked.api.credential_helpers.read_platform_credentials",
@@ -970,6 +982,10 @@ def test_read_fresh_active_token_wrong_account():
         }))
 
         with (
+            mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id",
+                return_value=2,
+            ),
             mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
             mock.patch(
                 "jacked.api.credential_helpers.read_platform_credentials",
@@ -989,10 +1005,47 @@ def test_read_fresh_active_token_no_credentials():
         cred_dir.mkdir()
 
         with (
+            mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id",
+                return_value=None,
+            ),
             mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
             mock.patch(
                 "jacked.api.credential_helpers.read_platform_credentials",
                 return_value=None,
+            ),
+        ):
+            result = read_fresh_active_token(1)
+
+    assert result is None
+
+
+def test_read_fresh_active_token_rejects_matching_file_when_stores_conflict():
+    """A matching fallback store cannot override canonical resolver conflict."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        cred_dir = tmp_path / ".claude"
+        cred_dir.mkdir()
+        (cred_dir / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "_jackedAccountId": 1,
+                    "claudeAiOauth": {"accessToken": "must-not-return"},
+                }
+            )
+        )
+        with (
+            mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id",
+                return_value=None,
+            ),
+            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
+            mock.patch(
+                "jacked.api.credential_helpers.read_platform_credentials",
+                return_value={
+                    "_jackedAccountId": 2,
+                    "claudeAiOauth": {"accessToken": "other-account"},
+                },
             ),
         ):
             result = read_fresh_active_token(1)

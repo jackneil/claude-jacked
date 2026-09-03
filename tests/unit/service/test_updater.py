@@ -214,7 +214,7 @@ class TestPortWaitBeforeServiceStart:
 
 
 class TestParentKillEscalation:
-    """Updater must force-kill the parent tray if pystray ignores icon.stop()."""
+    """A reusable integer PID is never enough evidence to kill a process."""
 
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.is_port_available", return_value=True)
@@ -222,7 +222,7 @@ class TestParentKillEscalation:
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
-    def test_sigkill_parent_when_it_wont_exit(
+    def test_refuses_pid_only_parent_kill_when_it_wont_exit(
         self, mock_popen, mock_run, mock_find, mock_force_kill, mock_port_avail, mock_gate,
     ):
         from jacked.service import updater
@@ -232,11 +232,12 @@ class TestParentKillEscalation:
         with patch.object(updater, "wait_for_exit", side_effect=[False, True]):
             updater.run_update(parent_pid=99999, extras="tray")
 
-        mock_force_kill.assert_called_once_with(99999)
+        mock_force_kill.assert_not_called()
+        mock_popen.assert_not_called()
 
 
 class TestPortStuckRecovery:
-    """If port is still bound after the wait loop, force-kill the squatter."""
+    """An occupied port is never process-ownership evidence."""
 
     @patch("jacked.service.platform.ensure_native_lifecycle",
            return_value=(False, "unavailable", "test"))
@@ -249,7 +250,7 @@ class TestPortStuckRecovery:
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
-    def test_force_kills_port_squatter(
+    def test_refuses_to_kill_port_squatter(
         self, mock_popen, mock_run, mock_find, mock_port_avail,
         mock_force_kill, mock_port_pids, mock_gate,
         mock_method, mock_ensure,
@@ -257,20 +258,14 @@ class TestPortStuckRecovery:
         from jacked.service import updater
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = MagicMock(returncode=0)
-        # Port-wait loop sees "stuck" (False). After the force-kill grace
-        # loop, port becomes free (True), and verification also sees True.
-        call_state = {"kill_done": False}
-        def port_result(*_args, **_kw):
-            if mock_force_kill.called:
-                call_state["kill_done"] = True
-            return call_state["kill_done"]
-        mock_port_avail.side_effect = port_result
+        mock_port_avail.return_value = False
 
         with patch.object(updater, "wait_for_exit", return_value=True):
             updater.run_update(parent_pid=12345, extras="tray")
 
-        mock_force_kill.assert_called_with(54321)
-        mock_popen.assert_called_once()
+        mock_port_pids.assert_not_called()
+        mock_force_kill.assert_not_called()
+        mock_popen.assert_not_called()
 
     @patch("jacked.service.platform.ensure_native_lifecycle",
            return_value=(False, "unavailable", "test"))

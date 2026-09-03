@@ -480,7 +480,13 @@ def test_submit_code_completes_the_flow_on_a_valid_paste():
     async def _body():
         flow = _pending_flow(state="the-right-state")
         flow._complete_auth = AsyncMock(
-            return_value={"account_id": 7, "email": "jack@example.com"}
+            return_value={
+                "account_id": 7,
+                "email": "jack@example.com",
+                "activation_status": "observed_target_unfenced",
+                "activation_operation_id": "oauth-operation-123",
+                "activation_message": "target observed",
+            }
         )
         return flow, await flow.submit_code("auth-code-abc#the-right-state")
 
@@ -497,6 +503,26 @@ def test_submit_code_completes_the_flow_on_a_valid_paste():
     assert status["status"] == "completed"
     assert status["account_id"] == 7
     assert status["email"] == "jack@example.com"
+    assert status["activation_status"] == "observed_target_unfenced"
+    assert status["activation_operation_id"] == "oauth-operation-123"
+    assert status["activation_message"] == "target observed"
+
+
+def test_completed_remote_flow_keeps_local_only_activation_truth():
+    flow = OAuthFlow(MagicMock(), manual=True, allow_credential_activation=False)
+    flow._status = "completed"
+    flow._result = {
+        "account_id": 7,
+        "email": "jack@example.com",
+        "activation_status": "local_only",
+        "activation_message": "Account saved; credential activation is local-only.",
+    }
+
+    status = flow.get_status()
+
+    assert status["activation_status"] == "local_only"
+    assert status["activation_message"].endswith("local-only.")
+    assert "activation_operation_id" not in status
 
 
 def test_submit_code_marks_the_flow_errored_when_the_exchange_fails():

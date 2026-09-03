@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "claude-jacked"
 dynamic = ["version"]
-description = "Multi-account manager and skills suite for Claude Code and Codex: live 5h/7d usage tracking, auto account-switching when you hit a usage limit, menu-bar and system-tray app, 30 slash commands, 28 skills, web dashboard"
+description = "Multi-account manager and skills suite for Claude Code and Codex: live usage tracking, evidence-safe account switching, swap recommendations, tray app, and web dashboard"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -49,6 +49,11 @@ dependencies = [
     "rumps>=0.4,<1; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10,<13; sys_platform == 'darwin'",
     "pyobjc-framework-WebKit>=10,<13; sys_platform == 'darwin'",
+    # Credential switching uses Security.framework directly so failures are
+    # typed and secrets never appear in shell process arguments. Background
+    # reads use an interaction-disabled LAContext.
+    "pyobjc-framework-Security>=10,<13; sys_platform == 'darwin'",
+    "pyobjc-framework-LocalAuthentication>=10,<13; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

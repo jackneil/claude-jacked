@@ -1,162 +1,58 @@
 #!/usr/bin/env python3
-"""Session-account tracker hook for Claude Code.
-
-Handles four hook events:
-  - SessionStart: Record which account this session is using
-  - Notification(auth_success): User re-authenticated — close old, record new
-  - SessionEnd: Mark the session-account record as ended
-  - Stop: Heartbeat — update last_activity_at (throttled to every 5 min)
-
-Reads ~/.claude/.credentials.json to identify the active token, then
-matches it against jacked's accounts DB to find the account.
-
-Fire-and-forget: writes happen in a daemon thread so the hook returns
-quickly and never blocks Claude Code.
-"""
+"""Fast session hook consuming only the canonical secret-free snapshot."""
 
 import json
 import os
 import sqlite3
 import sys
 import threading
-import time
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 
+from jacked.resolver_snapshot import SNAPSHOT_FILENAME, read_resolver_snapshot
+from jacked.session_tracking_store import (
+    end_session,
+    heartbeat_session,
+    match_snapshot_account,
+    record_session,
+    tag_subagent,
+)
+
 DB_PATH = Path.home() / ".claude" / "jacked.db"
-CRED_PATH = Path.home() / ".claude" / ".credentials.json"
-ACCOUNTS_DIR = Path.home() / ".claude" / "accounts"
+OBSERVATION_INBOX_LIMIT = 512
 
 
-def _get_cred_data() -> tuple[str | None, dict | None]:
-    """Read the credential file, return (access_token, full_data).
-
-    Checks CLAUDE_CONFIG_DIR first (per-account dirs), then global.
-
-    >>> token, data = _get_cred_data()
-    >>> token is None or isinstance(token, str)
-    True
-    """
-    # Per-account dir: CLAUDE_CONFIG_DIR is set by jacked claude <id>
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    if config_dir:
-        config_cred = Path(config_dir) / ".credentials.json"
-        try:
-            if config_cred.exists() and not config_cred.is_symlink():
-                data = json.loads(config_cred.read_text(encoding="utf-8"))
-                token = data.get("claudeAiOauth", {}).get("accessToken")
-                if token:
-                    # Derive account_id from directory path
-                    try:
-                        acct_id = int(Path(config_dir).name)
-                        data["_jackedAccountId"] = acct_id
-                    except (ValueError, TypeError):
-                        pass
-                    return token, data
-        except (json.JSONDecodeError, OSError, AttributeError):
-            pass
-
-    # Global credential file
-    try:
-        if not CRED_PATH.exists():
-            return None, None
-        data = json.loads(CRED_PATH.read_text(encoding="utf-8"))
-        token = data.get("claudeAiOauth", {}).get("accessToken")
-        return token, data
-    except (json.JSONDecodeError, OSError, AttributeError):
-        return None, None
+def _config_dir() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured) if configured else Path.home() / ".claude"
 
 
-CLAUDE_CONFIG = Path.home() / ".claude.json"
+def _read_resolver_snapshot(now: float | None = None) -> dict | None:
+    return read_resolver_snapshot(
+        _config_dir() / SNAPSHOT_FILENAME, now=now, require_fresh=True
+    )
+
+
+def _get_cred_data() -> tuple[None, dict | None]:
+    """Compatibility wrapper returning only the secret-free snapshot."""
+    return None, _read_resolver_snapshot()
 
 
 def _match_token_to_account(
-    token: str | None,
-    cred_data: dict | None = None,
+    token: str | None, cred_data: dict | None = None
 ) -> tuple[int | None, str | None]:
-    """Match the active account using layered matching.
-
-    Layer 1: Read ~/.claude.json email, case-insensitive match against DB.
-    Layer 2: Check _jackedAccountId in credential data (passed from caller).
-    Layer 3: Exact access_token match (fallback).
-
-    Returns (account_id, email) or (None, None) if no match.
-
-    >>> _match_token_to_account("nonexistent-token")
-    (None, None)
-    """
-    if not DB_PATH.exists():
-        return None, None
-
-    try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout = 5000")
-
-            # Layer 1: Read ~/.claude.json for email identity
-            if CLAUDE_CONFIG.exists() and not CLAUDE_CONFIG.is_symlink():
-                try:
-                    config = json.loads(CLAUDE_CONFIG.read_text(encoding="utf-8"))
-                    email = config.get("oauthAccount", {}).get("emailAddress")
-                    if email:
-                        # This is a Claude Code session hook — only ever resolve
-                        # a CLAUDE account, never a same-email Codex row.
-                        row = conn.execute(
-                            "SELECT id, email FROM accounts "
-                            "WHERE LOWER(email) = LOWER(?) AND is_deleted = 0 "
-                            "AND COALESCE(provider, 'claude') = 'claude' "
-                            "ORDER BY priority ASC, id ASC LIMIT 1",
-                            (email,),
-                        ).fetchone()
-                        if row:
-                            return row[0], row[1]
-                except (json.JSONDecodeError, OSError):
-                    pass
-
-            # Layer 2: Check _jackedAccountId (reuses cred_data from caller)
-            if cred_data is not None:
-                jacked_id = cred_data.get("_jackedAccountId")
-                if jacked_id is not None:
-                    row = conn.execute(
-                        "SELECT id, email FROM accounts WHERE id = ? AND is_deleted = 0",
-                        (jacked_id,),
-                    ).fetchone()
-                    if row:
-                        return row[0], row[1]
-
-            # Layer 3: Exact access_token match (fallback)
-            if token:
-                row = conn.execute(
-                    "SELECT id, email FROM accounts WHERE access_token = ? AND is_deleted = 0",
-                    (token,),
-                ).fetchone()
-                if row:
-                    return row[0], row[1]
-        finally:
-            conn.close()
-    except Exception:
-        pass
-    return None, None
+    """Match account id, email, organization and provider evidence exactly."""
+    del token
+    return match_snapshot_account(DB_PATH, cred_data)
 
 
 def _detect_subagent() -> tuple[bool, str | None, str | None]:
-    """Check env vars to determine if this is a subagent session.
-
-    Returns (is_subagent, parent_session_id, agent_type).
-
-    >>> import os
-    >>> # Clear any test env vars
-    >>> for k in ['CLAUDE_CODE_PARENT_SESSION_ID', 'CLAUDE_CODE_AGENT_TYPE', 'CLAUDE_CODE_AGENT_NAME']:
-    ...     os.environ.pop(k, None)
-    >>> _detect_subagent()
-    (False, None, None)
-    """
-    parent_sid = os.environ.get("CLAUDE_CODE_PARENT_SESSION_ID")
-    agent_type = os.environ.get("CLAUDE_CODE_AGENT_TYPE")
-    agent_name = os.environ.get("CLAUDE_CODE_AGENT_NAME")
-    is_sub = bool(parent_sid or agent_type or agent_name)
-    return is_sub, parent_sid, (agent_type or agent_name)
+    parent = os.environ.get("CLAUDE_CODE_PARENT_SESSION_ID")
+    agent_type = os.environ.get("CLAUDE_CODE_AGENT_TYPE") or os.environ.get(
+        "CLAUDE_CODE_AGENT_NAME"
+    )
+    return bool(parent or agent_type), parent, agent_type
 
 
 def _record_session(
@@ -166,179 +62,224 @@ def _record_session(
     method: str,
     repo_path: str | None,
     pid: int | None = None,
+    *,
+    credential_scope: str | None = None,
+    observed_at: str | None = None,
+    evidence: str | None = None,
+    observation_state: str | None = None,
+    credential_revision: str | None = None,
+    launch_nonce: str | None = None,
+    event_idempotency_key: str | None = None,
+    force_new_span: bool = False,
 ) -> str | None:
-    """Insert or refresh a session-account record via raw sqlite3.
+    return record_session(
+        DB_PATH,
+        session_id,
+        account_id,
+        email,
+        method,
+        repo_path,
+        pid,
+        credential_scope=credential_scope,
+        observed_at=observed_at,
+        evidence=evidence,
+        observation_state=observation_state,
+        credential_revision=credential_revision,
+        launch_nonce=launch_nonce,
+        event_idempotency_key=event_idempotency_key,
+        force_new_span=force_new_span,
+    )
 
-    Closes stale records for different accounts on the same session and
-    prevents duplicate rows for the same session+account combo.
 
-    Returns the detected_at timestamp used, or None on failure.
+def _tag_subagent(session_id: str, detected_at: str | None) -> None:
+    is_subagent, parent, agent_type = _detect_subagent()
+    if is_subagent:
+        tag_subagent(DB_PATH, session_id, detected_at, parent, agent_type)
 
-    >>> # Smoke test — doesn't crash on missing DB
-    >>> _record_session("test", None, None, "test", None) is None
-    True
-    """
-    if not DB_PATH.exists():
+
+def _end_session(session_id: str) -> None:
+    end_session(DB_PATH, session_id)
+
+
+def _heartbeat_session(session_id: str) -> None:
+    heartbeat_session(DB_PATH, session_id)
+
+
+def _iso_from_epoch(value) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
-        ts = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(str(DB_PATH), timeout=2.0, isolation_level=None)
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _observation_context(snapshot: dict | None) -> dict:
+    """Build nonsecret, evidence-qualified fields for a hook event."""
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    scope = os.environ.get("JACKED_CREDENTIAL_SCOPE") or snapshot.get("scope")
+    certified_scoped = os.environ.get("JACKED_SCOPED_CREDENTIAL_CERTIFIED") == "1"
+    if scope == "scoped" and not certified_scoped:
+        scope = "unknown"
+    if scope not in {"global", "scoped", "unknown"}:
+        scope = "unknown"
+
+    state = snapshot.get("state")
+    observation_state = (
+        "observed"
+        if state == "resolved"
+        else "conflict"
+        if state == "conflict"
+        else "unknown"
+    )
+    evidence = snapshot.get("evidence")
+    if scope == "scoped" and certified_scoped:
+        evidence = "launch_binding"
+    elif isinstance(evidence, list) and all(
+        isinstance(item, str) and item for item in evidence
+    ):
+        evidence = ",".join(evidence)
+    elif not isinstance(evidence, str) or not evidence:
+        evidence = "unknown"
+
+    revision = os.environ.get("JACKED_CREDENTIAL_REVISION") or snapshot.get(
+        "credential_revision"
+    )
+    launch_nonce = os.environ.get("JACKED_LAUNCH_NONCE")
+    return {
+        "credential_scope": scope,
+        "observed_at": _iso_from_epoch(snapshot.get("published_at")),
+        "evidence": evidence,
+        "observation_state": observation_state,
+        "credential_revision": revision if isinstance(revision, str) else None,
+        "launch_nonce": launch_nonce if launch_nonce else None,
+    }
+
+
+def _event_idempotency_key(
+    session_id: str,
+    event: str,
+    credential_revision: str | None,
+    launch_nonce: str | None,
+) -> str:
+    material = "\x00".join(
+        (session_id, event, credential_revision or "unknown", launch_nonce or "")
+    )
+    return sha256(material.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _enqueue_observation(
+    session_id: str, event: str, repo_path: str | None, context: dict
+) -> str | None:
+    """Coalesce one nonsecret request for off-thread resolver processing."""
+    if not DB_PATH.exists():
+        return None
+    key = _event_idempotency_key(
+        session_id,
+        event,
+        context.get("credential_revision"),
+        context.get("launch_nonce"),
+    )
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout = 5000")
-            conn.execute("BEGIN IMMEDIATE")
-
-            # End any open records for this session under a DIFFERENT account
-            # (account_id != ? doesn't match NULLs, so OR account_id IS NULL)
-            if account_id is not None:
-                conn.execute(
-                    """UPDATE session_accounts SET ended_at = ?
-                       WHERE session_id = ? AND ended_at IS NULL
-                         AND (account_id != ? OR account_id IS NULL)""",
-                    (ts, session_id, account_id),
-                )
-
-            # Check if open record already exists for same session+account
-            # (IS used instead of = for NULL-safe comparison)
-            existing = conn.execute(
-                """SELECT id FROM session_accounts
-                   WHERE session_id = ? AND account_id IS ? AND ended_at IS NULL
-                   LIMIT 1""",
-                (session_id, account_id),
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'session_observation_inbox'"
             ).fetchone()
-
-            if existing:
-                conn.execute(
-                    "UPDATE session_accounts SET last_activity_at = ? WHERE id = ?",
-                    (ts, existing[0]),
-                )
-            else:
-                conn.execute(
-                    """INSERT OR IGNORE INTO session_accounts
-                       (session_id, account_id, email, detected_at, last_activity_at,
-                        detection_method, repo_path, pid)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (session_id, account_id, email, ts, ts, method, repo_path, pid),
-                )
+            if not table:
+                return None
+            conn.execute(
+                """INSERT INTO session_observation_inbox
+                   (session_id, event_kind, credential_revision, launch_nonce,
+                    repo_path, requested_at, idempotency_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(idempotency_key) DO UPDATE SET
+                       repo_path = excluded.repo_path,
+                       requested_at = excluded.requested_at""",
+                (
+                    session_id,
+                    event,
+                    context.get("credential_revision"),
+                    context.get("launch_nonce"),
+                    repo_path,
+                    datetime.now(timezone.utc).isoformat(),
+                    key,
+                ),
+            )
+            conn.execute(
+                """DELETE FROM session_observation_inbox
+                   WHERE id IN (
+                       SELECT id FROM session_observation_inbox
+                       ORDER BY requested_at DESC, id DESC LIMIT -1 OFFSET ?
+                   )""",
+                (OBSERVATION_INBOX_LIMIT,),
+            )
             conn.commit()
-            return ts
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            return None
+            return key
         finally:
             conn.close()
     except Exception:
         return None
 
 
-def _tag_subagent(session_id: str, detected_at: str | None):
-    """Best-effort UPDATE to tag a session as a subagent.
-
-    Fails silently if columns don't exist yet (migration not run).
-    Zero impact on the core session record created by _record_session().
-
-    >>> _tag_subagent("nonexistent", "2025-01-01T00:00:00Z")
-    """
-    if not detected_at:
-        return
-    is_sub, parent_sid, agent_type = _detect_subagent()
-    if not is_sub:
-        return
+def _latest_session_revision(session_id: str) -> tuple[bool, str | None]:
     if not DB_PATH.exists():
-        return
+        return False, None
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
         try:
-            conn.execute("PRAGMA busy_timeout = 5000")
-            conn.execute(
-                """UPDATE session_accounts
-                   SET is_subagent = 1, parent_session_id = ?, agent_type = ?
-                   WHERE session_id = ? AND detected_at = ?""",
-                (parent_sid, agent_type, session_id, detected_at),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception:
-        pass
-
-
-def _end_session(session_id: str):
-    """Set ended_at on the latest open record for this session.
-
-    >>> _end_session("nonexistent")
-    """
-    if not DB_PATH.exists():
-        return
-    try:
-        ts = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout = 5000")
-            conn.execute(
-                """UPDATE session_accounts SET ended_at = ?
-                   WHERE session_id = ? AND ended_at IS NULL""",
-                (ts, session_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception:
-        pass
-
-
-HEARTBEAT_THROTTLE_SECONDS = (
-    300  # 5 min — must stay well under SESSION_STALENESS_MINUTES (see web/database.py)
-)
-
-
-def _heartbeat_session(session_id: str):
-    """Update last_activity_at for an active session, throttled.
-
-    Only writes if last_activity_at is > 5 minutes old to avoid
-    excessive DB writes (Stop fires every Claude response).
-
-    >>> _heartbeat_session("nonexistent")
-    """
-    if not DB_PATH.exists():
-        return
-    try:
-        now = datetime.now(timezone.utc)
-        ts = now.isoformat()
-        conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout = 5000")
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(session_accounts)")
+            }
+            if "credential_revision" not in columns:
+                return False, None
             row = conn.execute(
-                "SELECT last_activity_at FROM session_accounts "
-                "WHERE session_id = ? AND ended_at IS NULL "
-                "ORDER BY detected_at DESC LIMIT 1",
+                """SELECT credential_revision FROM session_accounts
+                   WHERE session_id = ? AND ended_at IS NULL
+                   ORDER BY detected_at DESC LIMIT 1""",
                 (session_id,),
             ).fetchone()
-            if not row:
+            revision = row[0] if row and isinstance(row[0], str) else None
+            return True, revision
+        finally:
+            conn.close()
+    except Exception:
+        return False, None
+
+
+def _mark_session_observation_state(session_id: str, context: dict) -> None:
+    """Update evidence on the open span without changing its account label."""
+    if not DB_PATH.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
+        try:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(session_accounts)")
+            }
+            if "observation_state" not in columns:
                 return
-            last = row[0]
-            if last:
-                try:
-                    last_dt = datetime.fromisoformat(last)
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-                    if (now - last_dt).total_seconds() < HEARTBEAT_THROTTLE_SECONDS:
-                        return  # throttled — skip write
-                except (ValueError, TypeError):
-                    pass  # unparseable — update it
             conn.execute(
-                """UPDATE session_accounts SET last_activity_at = ?
+                """UPDATE session_accounts
+                   SET last_activity_at = ?, observation_state = ?,
+                       credential_scope = COALESCE(?, credential_scope),
+                       evidence = COALESCE(?, evidence),
+                       observed_at = COALESCE(?, observed_at)
                    WHERE id = (
                        SELECT id FROM session_accounts
                        WHERE session_id = ? AND ended_at IS NULL
                        ORDER BY detected_at DESC LIMIT 1
                    )""",
-                (ts, session_id),
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    context.get("observation_state"),
+                    context.get("credential_scope"),
+                    context.get("evidence"),
+                    context.get("observed_at"),
+                    session_id,
+                ),
             )
             conn.commit()
         finally:
@@ -347,105 +288,93 @@ def _heartbeat_session(session_id: str):
         pass
 
 
-def _clear_account_error(account_id: int):
-    """Clear stale error on account when a live session proves creds work.
-
-    Only fires when validation_status='invalid' — no-op for healthy accounts.
-    Safe because credential_helpers.py handles token updates separately.
-
-    >>> _clear_account_error(99999)
-    """
-    if not DB_PATH.exists() or account_id is None:
-        return
-    try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout = 5000")
-            ts = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                """UPDATE accounts SET
-                    validation_status = 'valid',
-                    last_error = NULL, last_error_at = NULL,
-                    consecutive_failures = 0,
-                    last_validated_at = ?,
-                    updated_at = ?
-                   WHERE id = ? AND validation_status = 'invalid'""",
-                (int(time.time()), ts, account_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception:
-        pass
-
-
-def _handle_event(event: str, session_id: str, repo_path: str | None):
-    """Route the hook event to the appropriate handler.
-
-    >>> _handle_event("SessionEnd", "test-sess", None)
-    >>> _handle_event("Stop", "test-sess", None)
-    """
+def _handle_event(event: str, session_id: str, repo_path: str | None) -> None:
     if event == "SessionEnd":
         _end_session(session_id)
         return
+    token, snapshot = _get_cred_data()
+    context = _observation_context(snapshot)
+    context["event_idempotency_key"] = _enqueue_observation(
+        session_id, event, repo_path, context
+    )
 
-    if event == "Stop":
-        _heartbeat_session(session_id)
+    if event in {"Stop", "UserPromptSubmit"}:
+        if context["observation_state"] != "observed":
+            _mark_session_observation_state(session_id, context)
+            return
+        account_id, email = _match_token_to_account(token, snapshot)
+        supported, previous = _latest_session_revision(session_id)
+        revision = context.get("credential_revision")
+        if not supported:
+            _heartbeat_session(session_id)
+        elif account_id is None:
+            context.update(
+                observation_state="unknown", evidence="resolver_identity_unmatched"
+            )
+            _mark_session_observation_state(session_id, context)
+        elif not revision or revision == previous:
+            _mark_session_observation_state(session_id, context)
+        else:
+            _record_session(
+                session_id,
+                account_id,
+                email,
+                "resolver_observation",
+                repo_path,
+                os.getppid(),
+                **context,
+                force_new_span=True,
+            )
         return
 
-    # SessionStart or Notification(auth_success) — detect account
-    token, cred_data = _get_cred_data()
-    account_id, email = _match_token_to_account(token, cred_data)
-    pid = os.getppid()
-
+    account_id, email = _match_token_to_account(token, snapshot)
     if event == "Notification":
-        # auth_success — close previous record first
         _end_session(session_id)
-        _record_session(session_id, account_id, email, "auth_success", repo_path, pid)
-    else:
-        # SessionStart
-        ts = _record_session(
-            session_id, account_id, email, "session_start", repo_path, pid
+        _record_session(
+            session_id,
+            account_id,
+            email,
+            "auth_success",
+            repo_path,
+            os.getppid(),
+            **context,
         )
-        _tag_subagent(session_id, ts)
+    else:
+        detected_at = _record_session(
+            session_id,
+            account_id,
+            email,
+            "session_start",
+            repo_path,
+            os.getppid(),
+            **context,
+        )
+        _tag_subagent(session_id, detected_at)
 
-    if account_id is not None:
-        _clear_account_error(account_id)
 
-
-def main():
-    """Read hook input from stdin, dispatch in fire-and-forget thread.
-
-    >>> # main() reads stdin — can't easily doctest, but structure is tested above
-    """
+def main() -> None:
     try:
         raw = sys.stdin.read()
-        if not raw.strip():
-            return
-        data = json.loads(raw)
+        data = json.loads(raw) if raw.strip() else {}
     except (json.JSONDecodeError, OSError):
         return
-
     event = data.get("hook_event_name", "")
     session_id = data.get("session_id", "")
-    repo_path = data.get("cwd")
-
-    if not session_id:
+    if not session_id or event not in {
+        "SessionStart",
+        "Notification",
+        "UserPromptSubmit",
+        "SessionEnd",
+        "Stop",
+    }:
         return
-
-    # Only handle our events
-    if event not in ("SessionStart", "Notification", "SessionEnd", "Stop"):
-        return
-
-    # Fire-and-forget: daemon thread so we don't block Claude Code
-    t = threading.Thread(
+    thread = threading.Thread(
         target=_handle_event,
-        args=(event, session_id, repo_path),
+        args=(event, session_id, data.get("cwd")),
         daemon=True,
     )
-    t.start()
-    t.join(timeout=2.0)
+    thread.start()
+    thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":

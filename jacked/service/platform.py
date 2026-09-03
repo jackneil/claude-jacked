@@ -22,118 +22,36 @@ def _get_systemd_user_unit_path() -> Path:
 
 
 def native_restart() -> tuple[bool, str]:
-    """Restart jacked via the platform's native lifecycle manager, if any.
+    """Compatibility adapter for exact-generation native restart."""
+    from jacked.service.lifecycle import (
+        native_artifact_path,
+        provision_service_contract,
+        restart_native_owned,
+    )
 
-    Returns (ok, reason):
-      - (True, "...")  native restart initiated successfully; caller should
-                       stop its own stop+start dance and let the manager
-                       handle respawn.
-      - (False, "...") no native manager available OR manager command failed;
-                       caller should fall back to manual stop+start.
-
-    Per-platform behavior:
-      - macOS:   if ai.hank.jacked.plist is installed, `launchctl kickstart -k`.
-      - Linux:   if user-installed systemd unit exists, `systemctl --user restart`.
-      - Windows: always returns (False, ...) — the Startup-folder VBS doesn't
-                 supervise lifecycle.
-
-    Rationale: on macOS, launchd's `KeepAlive: SuccessfulExit=false` racing
-    against a manual `service stop && service start` causes the "Port 8321
-    is already in use" error users keep hitting. Delegation to kickstart is
-    atomic.
-    """
-    if sys.platform == "darwin":
-        plist_path = _get_launchd_plist_path()
-        if not plist_path.exists():
-            return (False, "launchd plist not installed")
-        uid = os.getuid()
-        try:
-            result = subprocess.run(
-                ["launchctl", "kickstart", "-k", f"gui/{uid}/{LAUNCHD_LABEL}"],
-                capture_output=True, text=True, timeout=15,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            return (False, f"launchctl kickstart failed: {exc}")
-        if result.returncode == 0:
-            return (True, f"launchctl kickstart gui/{uid}/{LAUNCHD_LABEL}")
-        return (
-            False,
-            f"launchctl exit {result.returncode}: {result.stderr.strip() or result.stdout.strip()}",
+    try:
+        spec, environment = provision_service_contract()
+        result = restart_native_owned(
+            spec, native_artifact_path(spec), environment=environment
         )
-
-    if sys.platform.startswith("linux"):
-        unit_path = _get_systemd_user_unit_path()
-        if not unit_path.exists():
-            return (False, "no user systemd unit installed")
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "restart", "jacked"],
-                capture_output=True, text=True, timeout=15,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            return (False, f"systemctl restart failed: {exc}")
-        if result.returncode == 0:
-            return (True, "systemctl --user restart jacked")
-        return (
-            False,
-            f"systemctl exit {result.returncode}: {result.stderr.strip() or result.stdout.strip()}",
-        )
-
-    # Windows: no supervising manager — VBS only fires on login.
-    return (False, "no native lifecycle manager on this platform")
+    except (OSError, ValueError) as exc:
+        return False, type(exc).__name__
+    return result.ok, result.reason
 
 
 def ensure_native_lifecycle() -> tuple[bool, str, str]:
-    """Ensure the platform's native lifecycle manager is configured.
+    """Compatibility adapter for exact ServiceSpec reconciliation/activation."""
+    from jacked.service.lifecycle import (
+        install_native_owned,
+        provision_service_contract,
+    )
 
-    Returns a 3-tuple: (ok, state, reason).
-
-    - (True, "already_installed", "..."):  plist/unit was present; caller
-      should run native_restart() to atomically restart the job.
-    - (True, "just_installed", "..."):     we just wrote the plist and
-      launchd already started the service via RunAtLoad=true.  Caller
-      should SKIP native_restart (the job is already fresh and running).
-    - (False, "unavailable", reason):      no plist/unit and we can't
-      create one (Linux systemd: user DIYs; Windows: no manager).
-      Caller falls through to manual stop+start.
-
-    macOS: auto-creates the plist via in-process call to install_autostart()
-    — no subprocess shell-out.  Eliminates the class of bugs that bit us
-    when 0.41.17 detection mis-classified and the ad-hoc "jacked install
-    --tray" command didn't exist.
-
-    Before creating the plist, if an ad-hoc jacked service is running on
-    DEFAULT_PORT (held by some other user-initiated `jacked service start`),
-    stop it first so the RunAtLoad fired by install_autostart's launchctl
-    bootstrap can bind the port cleanly.
-    """
-    if sys.platform == "darwin":
-        plist_path = _get_launchd_plist_path()
-        if plist_path.exists():
-            return (True, "already_installed", "launchd plist already installed")
-
-        # Ad-hoc service may be holding :DEFAULT_PORT.  Stop it so the
-        # RunAtLoad inside install_autostart can bind cleanly.
-        from jacked.service import PID_FILE
-        from jacked.service.process import stop_process_graceful
-        stop_process_graceful(PID_FILE)
-
-        status = install_autostart()
-        if plist_path.exists():
-            return (True, "just_installed", status)
-        return (False, "unavailable", f"install_autostart did not produce plist: {status}")
-
-    if sys.platform.startswith("linux"):
-        unit_path = _get_systemd_user_unit_path()
-        if unit_path.exists():
-            return (True, "already_installed", "systemd user unit already installed")
-        return (
-            False, "unavailable",
-            "no systemd user unit installed — create one manually to enable "
-            "native restart.  See docs.",
-        )
-
-    return (False, "unavailable", "no native lifecycle manager on this platform")
+    try:
+        spec, environment = provision_service_contract()
+        result = install_native_owned(spec, environment=environment)
+    except (OSError, ValueError) as exc:
+        return False, "unavailable", type(exc).__name__
+    return result.ok, ("just_installed" if result.ok else "unavailable"), result.reason
 
 
 def _get_windows_startup_path() -> Path:
@@ -325,7 +243,8 @@ def install_autostart(
         uid = os.getuid()
         bootout = subprocess.run(
             ["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if bootout.returncode != 0:
             # "Boot-out failed: ... not loaded" is the normal case when the
@@ -337,7 +256,8 @@ def install_autostart(
             )
         bootstrap = subprocess.run(
             ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if bootstrap.returncode != 0:
             err = (bootstrap.stderr or bootstrap.stdout or "").strip()

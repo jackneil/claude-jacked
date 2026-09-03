@@ -10,7 +10,6 @@ import logging
 import os
 import random
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -114,21 +113,10 @@ def acquire_claude_lock(timeout_retries: int = _LOCK_MAX_RETRIES):
 
 
 def _get_keychain_username() -> str:
-    """Get the system username for keychain account name.
+    """Get the Keychain account name from the operating-system identity."""
+    from jacked.credentials.macos_store import system_account_name
 
-    Claude Code uses process.env.USER || userInfo().username as the
-    keychain account name (-a parameter). We must match this exactly
-    or we write to a different keychain entry.
-    """
-    username = os.environ.get("USER") or os.environ.get("USERNAME") or ""
-    if not username:
-        logger.warning(
-            "Neither $USER nor $USERNAME is set — keychain operations will use "
-            "fallback account name 'Claude Code' which may not match Claude Code's "
-            "entry (it uses the system username)"
-        )
-        return "Claude Code"
-    return username
+    return system_account_name()
 
 
 def _safe_replace(src: str, dst: str, *, retries: int = 3, delay: float = 0.1):
@@ -273,23 +261,18 @@ def read_platform_credentials() -> dict | None:
     """
     if sys.platform != "darwin":
         return None
+    from jacked.credentials.macos_store import MacOSCredentialStore
+    from jacked.credentials.models import StoreStatus
+
     try:
-        username = _get_keychain_username()
-        result = subprocess.run(
-            ["security", "find-generic-password",
-             "-a", username,
-             "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
-        if result.returncode != 0:
-            logger.debug("Keychain read failed: %s", result.stderr.strip())
-    except json.JSONDecodeError as exc:
-        logger.warning("Keychain data is not valid JSON (corrupted?): %s", exc)
-    except (subprocess.SubprocessError, OSError) as exc:
+        result = MacOSCredentialStore(_get_keychain_username()).read()
+    except (OSError, RuntimeError) as exc:
         logger.debug("Keychain read error: %s", exc)
-    return None
+        return None
+    if result.status is not StoreStatus.OK or result.payload is None:
+        logger.debug("Keychain read unavailable: %s", result.reason)
+        return None
+    return result.payload.to_mapping()
 
 
 def read_fresh_active_token(account_id: int) -> str | None:
@@ -302,7 +285,14 @@ def read_fresh_active_token(account_id: int) -> str | None:
     Returns the access token string, or None if the stores don't belong
     to this account or are unreadable.
     """
-    # Try keychain first (same precedence as Claude Code on macOS)
+    # Identity must reach resolver consensus before any raw store can supply an
+    # "active" token. This prevents a matching file from winning while the
+    # Keychain authority belongs to another account.
+    if read_active_account_id() != account_id:
+        return None
+
+    # Consensus guarantees required stores describe the same payload. Read raw
+    # bytes only now, because this caller genuinely needs the access token.
     kc_data = read_platform_credentials()
     if kc_data and kc_data.get("_jackedAccountId") == account_id:
         token = kc_data.get("claudeAiOauth", {}).get("accessToken")
@@ -330,39 +320,20 @@ def read_active_account_id() -> int | None:
     Consulted by all paths that must NOT rotate the active account's CC
     refresh token (architecture doc §7.1, §7.2, §7.3 + invariant I2).
 
-    Reads `_jackedAccountId` stamp from Keychain first, then from
-    `~/.claude/.credentials.json`. Returns an `int` for easy `==` comparison
-    against `account["id"]`. Never raises — all errors resolved to None so
-    callers can safely `if read_active_account_id() == account_id: skip`.
-
-    Coerces string values (e.g. hand-edited JSON with "1" instead of 1) to
-    int. Rejects zero and negative values as invalid account ids.
+    Returns an ID only when the exact-build canonical resolver reports store
+    consensus. Never raises; unsupported, missing, and conflicting states all
+    resolve to None.
     """
-    stamp = None
     try:
-        live = read_platform_credentials()
-        if not live:
-            cred_path = Path.home() / ".claude" / ".credentials.json"
-            if cred_path.exists() and not cred_path.is_symlink():
-                try:
-                    live = json.loads(cred_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    live = None
-        if isinstance(live, dict):
-            stamp = live.get("_jackedAccountId")
+        from jacked.credentials.resolver import ResolverState
+        from jacked.credentials.runtime import resolve_active_identity
+
+        observation = resolve_active_identity()
+        if observation.state is ResolverState.RESOLVED:
+            return observation.identity.account_id
     except Exception:
         logger.debug("read_active_account_id failed", exc_info=True)
-        return None
-
-    if stamp is None:
-        return None
-    try:
-        account_id = int(stamp)
-    except (TypeError, ValueError):
-        return None
-    if account_id <= 0:
-        return None
-    return account_id
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -501,10 +472,8 @@ reconcile_outgoing_credentials = reconcile_credentials_from_live_store
 def write_platform_credentials(data: dict) -> bool:
     """Write credentials to the platform's native credential store.
 
-    macOS: Keychain entry with service "Claude Code-credentials" and
-    account name matching the system username.  Uses -X hex encoding
-    to match Claude Code's format (avoids plaintext in process args,
-    prevents CrowdStrike/process monitor exposure).
+    macOS: Security.framework Keychain entry with the full service/account
+    locator. Credential bytes never appear in a subprocess argument.
 
     Linux/Windows: no-op (they use .credentials.json)
 
@@ -515,43 +484,21 @@ def write_platform_credentials(data: dict) -> bool:
     """
     if sys.platform != "darwin":
         return True  # no-op on non-macOS (file write is sufficient)
+    from jacked.credentials.canonical import CredentialFormatError, CredentialPayload
+    from jacked.credentials.macos_store import MacOSCredentialStore
+    from jacked.credentials.models import InteractionMode, StoreStatus
+
     try:
-        username = _get_keychain_username()
-        json_data = json.dumps(data, separators=(",", ":"))
-        hex_value = json_data.encode("utf-8").hex()
-
-        # Use -U (update-or-insert) with -X (hex value) to match CC's format.
-        result = subprocess.run(
-            ["security", "add-generic-password",
-             "-U",
-             "-a", username,
-             "-s", "Claude Code-credentials",
-             "-X", hex_value],
-            capture_output=True, text=True, timeout=5,
+        payload = CredentialPayload.from_mapping(data)
+        result = MacOSCredentialStore(_get_keychain_username()).write(
+            payload, InteractionMode.BACKGROUND
         )
-        if result.returncode != 0:
-            logger.warning(
-                "Keychain write failed (user=%s, service=Claude Code-credentials): %s",
-                username, result.stderr.strip(),
-            )
-            return False
-
-        # Clean up orphan keychain entry from old jacked versions that used
-        # -a "Claude Code" instead of -a $USER.  Runs AFTER successful write
-        # so the user is never left with no entry.  Ignore errors (may not exist).
-        if username != "Claude Code":
-            cleanup = subprocess.run(
-                ["security", "delete-generic-password",
-                 "-a", "Claude Code",
-                 "-s", "Claude Code-credentials"],
-                capture_output=True, timeout=5,
-            )
-            if cleanup.returncode == 0:
-                logger.info("Cleaned up orphan keychain entry (-a 'Claude Code')")
-
-        return True
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning("Keychain write error (user=%s): %s", username, exc)
+        if result.status is StoreStatus.OK:
+            return True
+        logger.warning("Keychain write did not commit: %s", result.reason)
+        return False
+    except (CredentialFormatError, OSError, RuntimeError) as exc:
+        logger.warning("Keychain write error: %s", exc)
         return False
 
 
@@ -629,7 +576,7 @@ def sync_credential_to_all_stores(
     account: dict,
     email: str = None,
     display_name: str = None,
-) -> None:
+) -> bool:
     """Write credential tokens to all stores atomically.
 
     This is the ONLY function that writes credentials.  Called from:
@@ -637,9 +584,9 @@ def sync_credential_to_all_stores(
     - "Set Active" / use_account endpoint
     - Per-account dir preparation (launch.py)
 
-    Writes to: global .credentials.json, macOS Keychain, ~/.claude.json,
-    and per-account dir if it exists.  Each step is independent — failures
-    are logged but don't prevent subsequent writes.
+    This compatibility wrapper now returns an honest boolean and stops before
+    file publication when the macOS authority cannot be updated. New callers
+    should use ``CredentialTransactionEngine`` for durable outcomes.
 
     Args:
         account_id: The account DB id
@@ -652,6 +599,13 @@ def sync_credential_to_all_stores(
     oauth_data = build_oauth_data(account)
 
     cred_path = Path.home() / ".claude" / ".credentials.json"
+
+    # On macOS the Keychain is the runtime authority. Never publish the file
+    # target first and then claim success when the authority rejects it.
+    kc_data = {"claudeAiOauth": oauth_data, "_jackedAccountId": account_id}
+    if not write_platform_credentials(kc_data):
+        logger.warning("Credential authority did not accept account %d", account_id)
+        return False
 
     # 1. Write global .credentials.json
     try:
@@ -670,13 +624,32 @@ def sync_credential_to_all_stores(
         logger.info("Wrote global .credentials.json for account %d", account_id)
     except Exception as exc:
         logger.warning("Failed to write global .credentials.json: %s", exc)
+        return False
 
-    # 2. Write to macOS Keychain (no-op on Linux/Windows)
-    try:
-        kc_data = {"claudeAiOauth": oauth_data, "_jackedAccountId": account_id}
-        write_platform_credentials(kc_data)
-    except Exception as exc:
-        logger.warning("Failed to write keychain credentials: %s", exc)
+    # Read back every declared compatibility surface before reporting success.
+    from jacked.credentials.canonical import CredentialPayload
+    from jacked.credentials.file_store import FileCredentialStore
+    from jacked.credentials.models import CredentialIdentity, StoreStatus
+    from jacked.credentials.resolver import (
+        FileResolverSnapshotSink,
+        ResolverState,
+        SnapshotUpdate,
+    )
+
+    file_target = CredentialPayload.from_mapping(existing)
+    file_observation = FileCredentialStore(
+        cred_path, trusted_root=Path.home()
+    ).read()
+    if (
+        file_observation.status is not StoreStatus.OK
+        or file_observation.payload is None
+        or file_observation.payload.digest != file_target.digest
+    ):
+        logger.warning("Credential file readback did not match account %d", account_id)
+        return False
+    evidence = ["authority:file:readback"]
+    if sys.platform == "darwin":
+        evidence.insert(0, "authority:keychain:readback")
 
     # 3. Update ~/.claude.json with email + org identity
     try:
@@ -726,4 +699,23 @@ def sync_credential_to_all_stores(
     # wake same-process watchers so the pill re-resolves immediately.
     from jacked import usage_events
 
+    try:
+        identity = CredentialIdentity(
+            account_id=account_id,
+            email=email,
+            organization_id=account.get("organization_uuid") or None,
+        )
+        FileResolverSnapshotSink(cred_path.parent / "jacked-resolver-snapshot.json").publish(
+            SnapshotUpdate(
+                scope="global",
+                state=ResolverState.RESOLVED,
+                evidence=tuple(evidence) + ("compatibility:observed-target-unfenced",),
+                credential_revision=None,
+                desired=identity,
+                observed=identity,
+            )
+        )
+    except OSError as exc:
+        logger.warning("Failed to publish credential resolver snapshot: %s", exc)
     usage_events.bump()
+    return True

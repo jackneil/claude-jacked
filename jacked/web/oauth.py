@@ -31,6 +31,14 @@ from jacked.web.database import Database
 
 logger = logging.getLogger("jacked.oauth")
 
+
+def _activate_oauth_account(db: Database, account: dict, operation_id: str):
+    """Run OAuth-triggered activation through the shared transaction engine."""
+    from jacked.credentials.models import SwitchContext
+    from jacked.credentials.runtime import activate_account
+
+    return activate_account(db, account, SwitchContext.OAUTH, operation_id)
+
 # ---------------------------------------------------------------------------
 # Constants — from design doc section 5
 # ---------------------------------------------------------------------------
@@ -197,6 +205,7 @@ class OAuthFlow:
         purpose: str = "primary",
         target_account_id: Optional[int] = None,
         manual: bool = False,
+        allow_credential_activation: bool = True,
     ):
         self.db = db
         self.purpose = purpose  # "primary" | "claude_code"
@@ -219,6 +228,7 @@ class OAuthFlow:
         # browser. The user opens the auth link themselves and pastes the code
         # that Anthropic's code page shows.
         self.manual = manual
+        self._allow_credential_activation = allow_credential_activation
         self.flow_id = secrets.token_urlsafe(16)
         self._verifier: Optional[str] = None
         self._state: Optional[str] = None
@@ -278,6 +288,13 @@ class OAuthFlow:
             result["account_id"] = self._result.get("account_id") or self._result.get("id")
             result["email"] = self._result.get("email")
             result["organization_name"] = self._result.get("organization_name")
+            for field in (
+                "activation_status",
+                "activation_operation_id",
+                "activation_message",
+            ):
+                if field in self._result:
+                    result[field] = self._result[field]
             if self._result.get("_redirected_from"):
                 result["redirected_from_account_id"] = self._result["_redirected_from"]
         if self._error:
@@ -599,16 +616,17 @@ class OAuthFlow:
         user stays on whoever they were on. First account (or one added when
         the prior active account is gone) still becomes active.
         """
-        cur = self.db.get_setting("active_account_id")
-        if not cur:
-            return True  # no active account chosen yet → first one wins
-        try:
-            existing = self.db.get_account(int(cur))
-        except (TypeError, ValueError):
-            return True  # corrupt setting → treat as no active account
-        if existing is None:
-            return True  # active points to a deleted/missing account
-        return int(cur) == account.get("id")  # only when it already IS active
+        for setting_key in ("desired_account_id", "active_account_id"):
+            current = self.db.get_setting(setting_key)
+            if not current:
+                continue
+            try:
+                existing = self.db.get_account(int(current))
+            except (TypeError, ValueError):
+                continue
+            if existing is not None:
+                return existing["id"] == account.get("id")
+        return True
 
     async def _complete_auth(self, code: str) -> dict:
         """Complete the OAuth flow: token exchange, API key, profile, usage, DB store."""
@@ -648,16 +666,17 @@ class OAuthFlow:
             # active account's live credentials and silently switch Claude Code
             # to the new one. Non-active accounts live in the DB until the user
             # explicitly switches (use_account) or launches them.
-            if activate:
-                from jacked.api.credential_helpers import sync_credential_to_all_stores
-
-                sync_credential_to_all_stores(account["id"], account)
+            activation_result = None
+            if activate and self._allow_credential_activation:
+                activation_result = await asyncio.to_thread(
+                    _activate_oauth_account,
+                    self.db,
+                    account,
+                    f"oauth-{self.flow_id}",
+                )
 
             # Step 7: For primary flows, persist active account + auto-start CC flow
             if self.purpose == "primary":
-                if activate:
-                    self.db.set_setting("active_account_id", str(account["id"]))
-
                 # Auto-start CC flow so the account gets independent CC tokens.
                 # Wrapped in try/except: CC failure is non-fatal — primary account
                 # is already saved. Without this guard, a CC failure (e.g., no
@@ -668,6 +687,7 @@ class OAuthFlow:
                         self.db,
                         purpose="claude_code",
                         target_account_id=account["id"],
+                        allow_credential_activation=self._allow_credential_activation,
                     )
                     cc_result = await cc_flow.start()
                     self._cc_flow_id = cc_result.get("flow_id")
@@ -675,10 +695,28 @@ class OAuthFlow:
                     logger.warning(f"CC auto-flow failed (non-fatal): {e}")
                     self._cc_flow_id = None
 
-            return {
+            response = {
                 "account_id": account.get("id"),
                 "email": account.get("email"),
             }
+            if activation_result is not None:
+                response.update(
+                    {
+                        "activation_status": activation_result.outcome.value,
+                        "activation_operation_id": activation_result.operation_id,
+                        "activation_message": activation_result.message,
+                    }
+                )
+            elif activate and not self._allow_credential_activation:
+                response.update(
+                    {
+                        "activation_status": "local_only",
+                        "activation_message": (
+                            "Account saved; credential activation is local-only."
+                        ),
+                    }
+                )
+            return response
 
     async def _exchange_code(self, client: httpx.AsyncClient, code: str) -> dict:
         """Exchange authorization code for tokens (design doc section 4b)."""

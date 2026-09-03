@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Implementation plan: cross-platform account switch truth</title>
+<meta name="jacked:type" content="plan"><meta name="jacked:status" content="reviewed"><meta name="jacked:branch" content="master"><meta name="jacked:date" content="2026-09-03"><meta name="jacked:project" content="claude-jacked">
+<style>
+  :root{--fg:#1a1a1a;--muted:#555;--bg:#fafaf7;--card:#fff;--accent:#2266aa;--accent-bg:#e7f0fa;--warn:#9a5c18;--warn-bg:#fcf3e7;--danger:#a92020;--danger-bg:#fbe9e7;--ok:#1f7a3f;--ok-bg:#e8f4ec;--border:#d8d4cc;--code:#f3efe8;--shadow:0 1px 3px rgba(0,0,0,.06);--radius:6px;--mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif}@media(prefers-color-scheme:dark){:root{--fg:#e8e6e1;--muted:#aaa7a1;--bg:#161616;--card:#1f1f1f;--accent:#6aa8e8;--accent-bg:#1a2935;--warn:#e0a85b;--warn-bg:#3a2d18;--danger:#ea7670;--danger-bg:#3a1f1c;--ok:#6acd8e;--ok-bg:#1c3327;--border:#303030;--code:#252525;--shadow:0 1px 3px rgba(0,0,0,.3)}}*{box-sizing:border-box}body{font-family:var(--sans);font-size:16px;line-height:1.6;color:var(--fg);background:var(--bg);margin:0;padding:2rem 1rem}.wrap{max-width:1040px;margin:auto}h1{font-size:2rem;line-height:1.2;margin:0 0 .25rem}h2{font-size:1.4rem;margin:2.5rem 0 .75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}h3{font-size:1.12rem;margin:1.7rem 0 .5rem;color:var(--muted)}h4{margin:1.1rem 0 .35rem}p{margin:.5rem 0 1rem}a{color:var(--accent)}code{font-family:var(--mono);font-size:.91em;background:var(--code);padding:.12em .35em;border-radius:3px}pre{font-family:var(--mono);font-size:.85rem;background:var(--code);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem;overflow:auto}.meta,nav{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}.meta{display:flex;flex-wrap:wrap;gap:.5rem 1rem;padding:.75rem 1rem;margin:.5rem 0 2rem;font-size:.9rem}.k{color:var(--muted)}.v{font-family:var(--mono)}.badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.8rem}.badge.ok{background:var(--ok-bg);color:var(--ok)}.badge.warn{background:var(--warn-bg);color:var(--warn)}.badge.info{background:var(--accent-bg);color:var(--accent)}nav{padding:1rem 1.25rem;margin-bottom:2rem}nav h2{border:0;margin:0 0 .5rem;padding:0;font-size:.9rem;text-transform:uppercase;color:var(--muted)}nav ol{margin:0;padding-left:1.5rem}.callout{margin:1rem 0;padding:.9rem 1.1rem;border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:0 var(--radius) var(--radius) 0}.callout.warn{border-color:var(--warn);background:var(--warn-bg)}.callout.danger{border-color:var(--danger);background:var(--danger-bg)}.callout.ok{border-color:var(--ok);background:var(--ok-bg)}table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--card);box-shadow:var(--shadow)}th,td{text-align:left;padding:.55rem .75rem;border-bottom:1px solid var(--border);vertical-align:top}th{background:var(--code)}ul.tasks{list-style:none;padding:0}ul.tasks li{padding:.28rem 0;display:flex;align-items:flex-start;gap:.55rem}ul.tasks input{margin-top:.4rem;flex:0 0 auto}.trace{font-size:.86rem;color:var(--muted)}.diagram{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;overflow:auto;text-align:center}.diagram .mermaid-source{display:none;text-align:left}.diagram.failed .mermaid-source{display:block}.diagram.failed svg{display:none}.gate{border-left:4px solid var(--ok);padding-left:1rem;margin:1rem 0}@media print{body{background:#fff;color:#000;padding:0}.wrap{max-width:none}h2,h3{break-after:avoid}table,.callout,.diagram,.gate{break-inside:avoid}}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Implementation plan: cross-platform account switch truth</h1>
+<div class="meta"><span><span class="k">Status:</span> <span class="badge ok">reviewed</span></span><span><span class="k">Date:</span> <span class="v">2026-09-03</span></span><span><span class="k">Base:</span> <span class="v">master @ eabbc76</span></span><span><span class="k">Risk:</span> <span class="badge warn">large / credentials + lifecycle</span></span></div>
+<nav><h2>Contents</h2><ol><li><a href="#contract">Contract</a></li><li><a href="#sequence">Delivery sequence</a></li><li><a href="#files">File structure</a></li><li><a href="#tasks">Tasks</a></li><li><a href="#verification">Verification</a></li><li><a href="#rollout">Rollout and rollback</a></li></ol></nav>
+
+<h2 id="contract">Contract</h2>
+<p>This plan implements the reviewed <a href="../specs/2026-09-03-cross-platform-account-switch-truth-design.html">cross-platform account switch truth specification</a>. Every task cites its acceptance criteria. Work is split into four reviewable pull requests; each leaves the product internally consistent and independently testable.</p>
+<aside class="callout danger"><strong>Hard safety rule:</strong> never test against the user's live credentials or kill the current orphan service while implementing. Use temporary homes, fake stores, isolated Keychains, disposable processes, and platform CI. Live repair is a separate, explicitly authorized operation after the fix ships.</aside>
+
+<h3>Invariant summary</h3>
+<ul>
+  <li>Storage observation, desired default, existing-session activation, and provider verification are different facts.</li>
+  <li>Only the canonical resolver answers active identity. Direct Keychain/file/DB inference is removed from callers.</li>
+  <li>Only a capability-certified mode may claim scoped or live switching.</li>
+  <li>An uncooperative store can produce a timestamped observation, never a committed activation.</li>
+  <li>A service may control a process only after exact ownership proof.</li>
+  <li>Credential mutation remains disabled whenever a legacy or otherwise unfenced writer cannot be excluded.</li>
+  <li>Every new state surface is secret-negative by construction.</li>
+</ul>
+
+<h2 id="sequence">Delivery sequence</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+  P1[PR 1: truthful credential transaction] --> P2[PR 2: session evidence model]
+  P2 --> P3[PR 3: service identity and native control]
+  P3 --> P4[PR 4: supervisors, environment, rollout]
+  P4 --> SEC[Security audit]
+  SEC --> E2E[Three-OS evidence]
+</pre><pre class="mermaid-source">flowchart LR
+  P1[PR 1: truthful credential transaction] --&gt; P2[PR 2: session evidence model]
+  P2 --&gt; P3[PR 3: service identity and native control]
+  P3 --&gt; P4[PR 4: supervisors, environment, rollout]
+  P4 --&gt; SEC[Security audit]
+  SEC --&gt; E2E[Three-OS evidence]</pre></div>
+<table><thead><tr><th>PR</th><th>End-to-end user value</th><th>Release posture</th></tr></thead><tbody>
+<tr><td>1</td><td>Use Account stops lying, detects split stores, fences legacy writers, and gives precise repair/restart outcomes.</td><td>Can ship alone only with the fail-closed writer fence enabled; old session labels remain historical.</td></tr>
+<tr><td>2</td><td>Session dashboard/statusline distinguish started, observed, pending, pinned, and unverified.</td><td>Can ship after PR 1.</td></tr>
+<tr><td>3</td><td>Status/restart find the real jacked instance and never kill a foreign listener.</td><td>Protocol lands before supervisor migration.</td></tr>
+<tr><td>4</td><td>All three OSes use reconciled supervisors and sanitized process environments.</td><td>Migration release with explicit upgrade notes.</td></tr>
+</tbody></table>
+
+<h2 id="files">Planned file structure</h2>
+<table><thead><tr><th>File</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>jacked/credentials/models.py</code></td><td>Enums and typed results for capabilities, observations, stores, transactions, and activation axes.</td></tr>
+<tr><td><code>jacked/credentials/capabilities.py</code></td><td>Exact-build/config registry, authority/required/optional consumer roles, read-only checks, writer protocol epoch and mutation kill switch.</td></tr>
+<tr><td><code>jacked/credentials/file_store.py</code></td><td>Safe file reads, secret temp staging, durable POSIX replace, Windows ReplaceFile/write-through and link checks.</td></tr>
+<tr><td><code>jacked/credentials/macos_store.py</code></td><td>Security.framework Keychain read/update/add, full item locator, duplicate handling, typed noninteractive/interactive failures.</td></tr>
+<tr><td><code>jacked/credentials/resolver.py</code></td><td>The only active-identity resolution path; store consensus, freshness, evidence, conflict, confidence, and atomic secret-free status snapshots.</td></tr>
+<tr><td><code>jacked/credentials/transaction.py</code></td><td>Lock order, pending journal, transcript HMAC, store phases, result axes, final DB commit and events.</td></tr>
+<tr><td><code>jacked/credentials/recovery.py</code></td><td>Pending-operation classification, explicit abandon-after-reauth, cleanup and startup gating.</td></tr>
+<tr><td><code>jacked/credentials/writer_fence.py</code></td><td>Minimum writer-protocol discovery and fail-closed legacy mutation gate delivered in PR 1.</td></tr>
+<tr><td><code>jacked/service/instance.py</code></td><td>Kernel lifetime lease, machine/session identity, private manifest, ownership inspection and quarantine discovery.</td></tr>
+<tr><td><code>jacked/service/ipc.py</code></td><td>Versioned UDS/named-pipe protocol, peer identity, nonce/generation validation and command allowlist.</td></tr>
+<tr><td><code>jacked/service/spec.py</code></td><td>Canonical ServiceSpec, artifact ownership and generation contract delivered before supervisor-mediated control.</td></tr>
+<tr><td><code>jacked/service/environment.py</code></td><td>Curated cross-platform environment construction and typed structured redaction.</td></tr>
+<tr><td><code>jacked/service/launcher/</code></td><td>Minimal pre-Python OS launchers in immutable versioned paths; create an explicit clean environment and validate the runtime entry point.</td></tr>
+<tr><td><code>jacked/service/supervisors/*.py</code></td><td>launchd, systemd-user, Task Scheduler and manual adapters rendered from ServiceSpec.</td></tr>
+<tr><td><code>jacked/web/database.py</code></td><td>Additive schemas and atomic methods for credential switches, action nonces, observation inbox and session evidence.</td></tr>
+<tr><td><code>jacked/api/routes/auth.py</code></td><td>Local mutation gateway, structured outcomes, active resolver and v1/v2 session APIs.</td></tr>
+<tr><td><code>jacked/data/web/js/components/account-actions.js</code></td><td>Precise switch states, local-only guard, repair and restart guidance.</td></tr>
+<tr><td><code>jacked/data/web/js/components/sessions.js</code></td><td>Evidence-qualified session labels and pending/conflict states.</td></tr>
+</tbody></table>
+
+<h2 id="tasks">Tasks</h2>
+
+<h3>PR 1: Truthful credential activation</h3>
+
+<h4>Task 1.1: Freeze the capability and outcome contracts</h4>
+<p class="trace">Traces to AC1, AC3, AC4, AC6, AC8, AC9.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Add failing tests for all capability modes and result axes before production code, including <code>observed_target_unfenced</code>, <code>restart_required</code>, and <code>interactive_operation_in_progress</code>.</li>
+  <li><input type="checkbox" disabled> Resolve executable identity through wrappers/symlinks to an exact build digest; bind config mode and registry provenance/version.</li>
+  <li><input type="checkbox" disabled> Ship a conservative registry: enumerate authority, required mirrors, optional metadata, every consumer, and writer-fence protocol. Scoped/cooperative flags remain false until isolated certification passes.</li>
+  <li><input type="checkbox" disabled> Implement the runtime mutation kill switch and hysteresis: any contract mismatch disables writes; re-enable only after a fresh capability resolution.</li>
+  <li><input type="checkbox" disabled> Define response enums and exact HTTP mapping from the spec, including storage, desired-default, committed-authority, session-activation and provider-verification axes. An observed-only result never updates the committed pointer.</li>
+  <li><input type="checkbox" disabled> Commit: <code>feat(auth): define credential capability and outcome contracts</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/test_credential_capabilities.py tests/unit/test_use_account.py -q
+uv run ruff check jacked/credentials tests/unit/test_credential_capabilities.py</code></pre>
+
+<h4>Task 1.2: Build safe store adapters and canonical resolution</h4>
+<p class="trace">Traces to AC1, AC2, AC3, AC6, AC8, AC9.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Implement file-store contract with strict JSON parsing, user-private staging, symlink/hardlink/reparse rejection, durable replace, readback and abandoned-stage cleanup under the switch lease.</li>
+  <li><input type="checkbox" disabled> Add matching Darwin-only <code>pyobjc-framework-Security&gt;=10,&lt;13</code> and <code>pyobjc-framework-LocalAuthentication&gt;=10,&lt;13</code> dependencies; test imports across supported macOS/Python versions; implement full-locator <code>SecItemCopyMatching</code>, <code>SecItemUpdate</code>, and foreground-only <code>SecItemAdd</code>.</li>
+  <li><input type="checkbox" disabled> Keep Keychain reads/writes off the FastAPI loop. Use a noninteractive <code>LAContext</code> for background work and map <code>errSecInteractionNotAllowed</code>; model a visible serialized operation when foreground mutation prompts.</li>
+  <li><input type="checkbox" disabled> Implement canonical exact-byte transcript digesting with a versioned strict parser. Reject duplicate/ambiguous JSON keys and unknown canonicalizer versions.</li>
+  <li><input type="checkbox" disabled> Implement the canonical resolver and replace Keychain-first/file-only/file-first drift in credential helpers, usage monitor, auth routes, launch, web auth and OAuth.</li>
+  <li><input type="checkbox" disabled> Atomically publish a per-scope, nonsecret, evidence-qualified resolver snapshot for the stdlib-only statusline. Missing, stale, or conflicting snapshots render desired/unknown; statusline never reads raw credential metadata.</li>
+  <li><input type="checkbox" disabled> Add a static contract test that fails when credential-store paths or Keychain APIs are read outside the approved adapters.</li>
+  <li><input type="checkbox" disabled> Commit: <code>refactor(auth): centralize credential stores and active identity</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/test_credential_sync.py tests/unit/test_active_account_cc_skip.py tests/unit/test_credential_resolver.py -q
+uv run ruff check jacked/credentials jacked/api/credential_helpers.py jacked/api/usage_monitor.py jacked/web/auth.py jacked/web/oauth.py jacked/launch.py</code></pre>
+
+<h4>Task 1.3: Implement the durable switch state machine</h4>
+<p class="trace">Traces to AC1, AC2, AC4, AC7, AC8, AC9.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Add <code>credential_switches</code> and machine-local recovery-key metadata migrations. Put the random recovery key outside roaming project state with mode 0600 or a current-user SID DACL.</li>
+  <li><input type="checkbox" disabled> Persist domain-separated <code>before_hmac</code> and <code>target_hmac</code> verifiers over the full transcript: machine/install ID, operation ID, state role, backend locator, capability epoch, canonicalizer, exact canonical digest and intended account/org. Never serialize raw credential snapshots.</li>
+  <li><input type="checkbox" disabled> Deliver the minimum writer-protocol fence in PR 1. Discover active old services/direct launchers conservatively, persist a writer epoch, and disable mutation whenever every possible writer cannot prove protocol v2 and the same capability epoch. Never infer absence from PID/session rows alone.</li>
+  <li><input type="checkbox" disabled> Implement lock order: writer-protocol fence, switch lease, certified upstream credential lock, SQLite writer. Hooks never enter this chain.</li>
+  <li><input type="checkbox" disabled> Commit <code>pending</code> with SQLite FULL durability before OS mutation. Interaction may occupy the serialized operation, but other callers receive <code>interactive_operation_in_progress</code> rather than starting a second writer.</li>
+  <li><input type="checkbox" disabled> Validate target structure/expiry without rotating tokens. Stage subordinate files, revalidate capability epoch, observe authority, write/read back authority, then publish mirrors.</li>
+  <li><input type="checkbox" disabled> Atomically finalize the active pointer, transaction outcome, swap audit and decision audit in one SQLite transaction.</li>
+  <li><input type="checkbox" disabled> Implement pending recovery: classify before/target/third-value HMACs; third value or stable-target/different-revision remains indeterminate while reporting observed stable identity separately.</li>
+  <li><input type="checkbox" disabled> Add explicit abandon only after foreground re-auth; expire requested targets and require manual retry.</li>
+  <li><input type="checkbox" disabled> Commit: <code>feat(auth): add crash-safe credential switch transactions</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/test_credential_transactions.py tests/unit/test_credential_recovery.py tests/unit/test_credential_writer_fence.py tests/unit/test_multi_org.py -q
+uv run ruff check jacked/credentials jacked/web/database.py</code></pre>
+
+<h4>Task 1.4: Wire manual, OAuth, launch and auto-swap behavior end to end</h4>
+<p class="trace">Traces to AC1, AC2, AC4, AC7, AC8, AC14.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Route Use Account, OAuth activation/re-auth and launch preparation through declared transaction contexts. Remove global-switch writes to per-account directories. In <code>GLOBAL_UNCOOPERATIVE</code>, update only desired intent and timestamped observation, never committed authority, committed audits, residency, or activation broadcasts.</li>
+  <li><input type="checkbox" disabled> Convert 429 recovery to DB-only/recommendation behavior. Permit auto-swap writes only in certified cooperative modes; otherwise emit a durable recommendation and one-click safe local launch action.</li>
+  <li><input type="checkbox" disabled> Gate credential mutation to loopback clients. Remote clients get a read-only explanation; do not add incomplete authentication.</li>
+  <li><input type="checkbox" disabled> Use a server-persisted action ID as both replay guard and idempotency key, bound to page session, exact request digest, action and expiry. Identical retries return persisted status/result; mismatched reuse fails. Send <code>Cache-Control: no-store</code>; add strict CSP and disable production API docs.</li>
+  <li><input type="checkbox" disabled> Add an operation-status endpoint for interactive/lost-response recovery. Do not launch a second Keychain writer until readback classifies the prior operation.</li>
+  <li><input type="checkbox" disabled> Move DB/audit/broadcast/residency side effects behind committed outcomes. Count <code>committed_degraded</code> as committed only if the failed surface is declared optional for every consumer.</li>
+  <li><input type="checkbox" disabled> Test two installed Claude builds with reversed store precedence, response loss before/after DB finalization, identical retry, and altered action-ID reuse.</li>
+  <li><input type="checkbox" disabled> Replace generic success toasts with exact storage/session axes and repair/restart actions.</li>
+  <li><input type="checkbox" disabled> Preserve compatibility wrappers until every caller/test patch is migrated; add a removal warning for the next major release.</li>
+  <li><input type="checkbox" disabled> Update README, troubleshooting, architecture notes and release notes in this PR for fail-closed, recommendation-only and observed-but-unfenced behavior.</li>
+  <li><input type="checkbox" disabled> Commit: <code>fix(auth): make account activation verified and truthful</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/test_use_account.py tests/unit/test_dual_token.py tests/unit/test_oauth_manual_flow.py tests/unit/test_web_js_swap_ui.py tests/unit/test_web_js_account_menu.py tests/unit/test_auth_action_nonce.py -q
+uv run ruff check jacked/api/routes/auth.py jacked/web/auth.py jacked/web/oauth.py jacked/launch.py</code></pre>
+
+<div class="gate"><strong>PR 1 exit gate:</strong> fault-inject the exact incident (global file staging succeeds, Keychain returns ACL denial), plus an old writer between readback and DB finalization and an external overwrite immediately after an uncooperative readback. The first response is not success; the second is refused or indeterminate; the third is <code>observed_target_unfenced</code>, never committed. DB/audits remain truthful and no secret appears in logs/API/process arguments.</div>
+
+<h3>PR 2: Evidence-based session identity</h3>
+
+<h4>Task 2.1: Add additive session observation storage</h4>
+<p class="trace">Traces to AC4, AC5, AC6, AC15.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Add nullable scope, observed-at, evidence, state, credential revision, launch nonce and event idempotency fields to session spans.</li>
+  <li><input type="checkbox" disabled> Add a bounded/coalescing nonsecret <code>session_observation_inbox</code>. Service-offline behavior records pinned launch evidence but leaves global observation unknown.</li>
+  <li><input type="checkbox" disabled> Migrate old rows as <code>legacy/unknown</code>; never infer historical scope.</li>
+  <li><input type="checkbox" disabled> Preserve immutable historical spans. Earliest span is started-as; latest open span is observed configuration.</li>
+  <li><input type="checkbox" disabled> Commit: <code>feat(sessions): store scoped identity evidence</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/test_session_accounts.py tests/unit/test_active_sessions.py tests/unit/test_session_identity_migration.py -q
+uv run ruff check jacked/web/database.py</code></pre>
+
+<h4>Task 2.2: Make hooks and statusline scope-aware</h4>
+<p class="trace">Traces to AC4, AC5, AC6, AC9.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Explicitly accept SessionStart, Notification(auth_success), UserPromptSubmit, Stop and SessionEnd. Coalesce idempotently by session, event kind, credential revision and launch nonce; do not claim replay-proof ordering without an upstream event sequence.</li>
+  <li><input type="checkbox" disabled> Keep hook work to scope/revision/activity writes. Debounce store observation in the service and bypass caches for transaction-critical reads.</li>
+  <li><input type="checkbox" disabled> Supply nonsecret launch scope/nonce/revision env from <code>jacked claude</code>. Emit pinned only in certified scoped mode.</li>
+  <li><input type="checkbox" disabled> Require email plus organization for metadata fallback; conflict becomes unknown rather than a convenient match.</li>
+  <li><input type="checkbox" disabled> Make statusline consume only the resolver's atomic, secret-free per-scope snapshot. Validate freshness/evidence and show desired/unknown for missing, stale or conflicting state; never interpret <code>.claude.json</code> as active identity.</li>
+  <li><input type="checkbox" disabled> Commit: <code>fix(sessions): observe credential scope on session activity</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/test_session_start_hook.py tests/unit/test_launch.py tests/unit/test_statusline.py -q
+uv run ruff check jacked/data/hooks/session_account_tracker.py jacked/statusline.py jacked/launch.py</code></pre>
+
+<h4>Task 2.3: Ship truthful session API and UI</h4>
+<p class="trace">Traces to AC4, AC5, AC6, AC14, AC15.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Add <code>/api/auth/session-states</code> with started, observed, desired-global, pending, scope, evidence/freshness and nullable runtime-verified fields.</li>
+  <li><input type="checkbox" disabled> Preserve <code>/api/auth/active-sessions</code> for one release through a conservative adapter. Add no-store headers and never compress unknown into a confident active account.</li>
+  <li><input type="checkbox" disabled> Update account/session cards to render <em>Started as</em>, <em>Observed configuration</em>, <em>Pending next activity</em>, <em>Pinned target</em>, <em>Credential conflict</em>, and <em>Runtime unverified</em>.</li>
+  <li><input type="checkbox" disabled> Update watchers so observation state/revision changes repaint immediately.</li>
+  <li><input type="checkbox" disabled> Update README, UI copy, API/reference docs, troubleshooting, release notes and the v1-route deprecation timeline for the evidence-qualified session model. Remove claims that one click verifiably switches all running sessions.</li>
+  <li><input type="checkbox" disabled> Commit: <code>fix(sessions): distinguish configuration from runtime identity</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/test_active_sessions.py tests/unit/test_web_js_sessions.py tests/unit/test_websocket.py tests/unit/test_statusline.py -q
+uv run ruff check jacked/api/routes/auth.py jacked/api/watchers.py</code></pre>
+
+<div class="gate"><strong>PR 2 exit gate:</strong> in a mixed global/scoped fixture, changing desired global account leaves pinned spans unchanged, marks global spans pending, and never populates runtime-verified identity. A metadata-target/Keychain-old conflict renders desired target plus runtime unknown in the UI and statusline. Legacy rows render unknown, not active.</div>
+
+<h3>PR 3: Provable service ownership</h3>
+
+<h4>Task 3.1: Add the lease, manifest and inspection state machine</h4>
+<p class="trace">Traces to AC9, AC10, AC11, AC12, AC15.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Define the canonical <code>ServiceSpec</code> ownership/generation contract before any supervisor-mediated control. Hash/sign the expected artifact identity and reject name/label collisions.</li>
+  <li><input type="checkbox" disabled> Implement one per-OS-user API lifetime lease held until process exit. Treat each login-session tray as a replaceable client that discovers the same API and never owns a second API lease. Use POSIX advisory locking and a retained Windows file handle with SID ACL.</li>
+  <li><input type="checkbox" disabled> Atomically publish the private instance manifest after acquiring the lease; bind instance/machine/session nonce, process creation identity, UID/SID, executable/build/protocol/version/generation and bind plan.</li>
+  <li><input type="checkbox" disabled> Validate ownership, file type, parent, link/reparse state and process creation identity. Cleanup only when instance ID still matches.</li>
+  <li><input type="checkbox" disabled> Implement inspect states: managed healthy/degraded, verified unmanaged, stale manifest, legacy jacked, foreign listener, supervisor crash loop, quarantined and stopped.</li>
+  <li><input type="checkbox" disabled> Self-repair a missing/corrupt manifest only while the same in-memory instance still holds the lease.</li>
+  <li><input type="checkbox" disabled> Keep the legacy PID file inspect-only during compatibility; remove PID/port-only kill paths, including updater port-owner sweeps.</li>
+  <li><input type="checkbox" disabled> Commit: <code>feat(service): add verifiable instance ownership</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/service/test_instance.py tests/unit/service/test_process.py tests/unit/service/test_updater.py -q
+uv run ruff check jacked/service/instance.py jacked/service/process.py jacked/service/updater.py</code></pre>
+
+<h4>Task 3.2: Add private native control and discoverable quarantine</h4>
+<p class="trace">Traces to AC10, AC11, AC12, AC14.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Implement framed/versioned/nonced/time-bounded UDS control with peer UID on macOS/Linux and <code>FILE_FLAG_FIRST_PIPE_INSTANCE</code> named pipe with current-user/session SID DACL and remote-client rejection on Windows.</li>
+  <li><input type="checkbox" disabled> Expose only status, graceful shutdown and restart-handoff actions. Authenticate the complete request transcript with private control nonce, peer identity, action, instance ID, creation identity, generation, request nonce and expiry; reject replay.</li>
+  <li><input type="checkbox" disabled> Keep HTTP health public but non-sensitive. No bearer/control token, PID-control endpoint, or destructive action exists over HTTP.</li>
+  <li><input type="checkbox" disabled> When an ambiguous fixed-port listener exists, bind the owned service to a dynamic quarantine port, store it in the manifest and make CLI/tray/browser-launch/updater/status discover it. When a manifest exists or 8321 is ambiguous, clients never fall back to 8321.</li>
+  <li><input type="checkbox" disabled> Make supervisors treat one healthy quarantined instance as success, not a reason to spawn competitors.</li>
+  <li><input type="checkbox" disabled> Test IPC replay/manifest copy and enforce the no-fallback rule with a foreign listener on 8321 plus an owned quarantined instance.</li>
+  <li><input type="checkbox" disabled> Commit: <code>feat(service): control owned instances over native IPC</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/service/test_ipc.py tests/unit/service/test_quarantine.py tests/unit/service/test_bind.py tests/unit/service/test_cli.py -q
+uv run ruff check jacked/service/ipc.py jacked/service/bind.py jacked/cli.py</code></pre>
+
+<h4>Task 3.3: Make status/restart health-verifying</h4>
+<p class="trace">Traces to AC10, AC11, AC12.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Replace generic HTTP/port readiness with exact instance/build/protocol/generation and internal-watchdog health.</li>
+  <li><input type="checkbox" disabled> Route managed restart only through a verified ServiceSpec supervisor artifact and verified unmanaged shutdown through IPC. Linux forced fallback retains and signals through <code>pidfd</code>; Windows retains a process handle and rechecks creation time; macOS never force-signals an unmanaged process.</li>
+  <li><input type="checkbox" disabled> Fail closed on incomplete evidence and print structured remediation without raw process/supervisor output.</li>
+  <li><input type="checkbox" disabled> Add <code>jacked service recover</code> for crash-loop reset, quarantine discovery and guided legacy exit.</li>
+  <li><input type="checkbox" disabled> Commit: <code>fix(service): verify identity across status and restart</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/service/test_cli.py tests/unit/service/test_restart.py tests/unit/service/test_update_phases.py -q
+uv run ruff check jacked/cli.py jacked/service</code></pre>
+
+<div class="gate"><strong>PR 3 exit gate:</strong> PID reuse between final inspection and signal, missing/altered manifest, wrong UID/SID, wrong executable, foreign supervisor artifact, foreign HTTP server and foreign port owner all result in zero signals or supervisor actions against the foreign process. The current orphan scenario becomes either verified recovery or quarantine with explicit guidance.</div>
+
+<h3>PR 4: Native supervision, environment hygiene and rollout</h3>
+
+<h4>Task 4.1: Install a pre-interpreter sanitized launcher</h4>
+<p class="trace">Traces to AC9, AC11, AC13.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Implement the launcher concretely: POSIX supervisor artifacts invoke <code>/usr/bin/env -i</code> directly with fixed arguments; Windows uses a checked-in PowerShell <code>-NoProfile -NonInteractive</code> script whose .NET <code>ProcessStartInfo</code> clears and rebuilds the child environment before <code>CreateProcessW</code>. The boundary never reads, logs, or forwards non-allowlisted inherited values.</li>
+  <li><input type="checkbox" disabled> Package the Windows script and POSIX specification as deterministic package data; verify source hash/provenance, signer when releases are signed, OS ownership/DACL, architecture-neutral PowerShell behavior, and installed-wheel inclusion. Install to an immutable versioned path, atomically switch ServiceSpec, and retain the prior launcher through rollback.</li>
+  <li><input type="checkbox" disabled> Start Python in isolated mode and load only the validated runtime path. Test installed wheels on Windows x64/ARM64 and supported macOS/Linux architectures; fail closed on unsupported architecture or missing system launcher.</li>
+  <li><input type="checkbox" disabled> Derive home, user identity, PATH, temp and application directories from OS APIs or fixed validated values, not inherited variables. Allowlist locale and required Linux GUI/session-bus values; review CA/proxy values and reject proxy userinfo.</li>
+  <li><input type="checkbox" disabled> Resolve Keychain account identity from OS UID APIs, never optional USER variables.</li>
+  <li><input type="checkbox" disabled> Validate the candidate runtime import, build/protocol and entry point before supervisor activation; expose local repair state if invalid. Do not promise package rollback.</li>
+  <li><input type="checkbox" disabled> Apply the same pre-interpreter boundary/environment builder to manual starts, updater helpers, browser helpers and exec paths. Add structured redaction at logging/API boundaries.</li>
+  <li><input type="checkbox" disabled> Inject hostile <code>PYTHONHOME</code>, <code>PYTHONPATH</code>, <code>sitecustomize</code>, loader variables and secret canaries into the parent/supervisor. Prove they neither execute nor reach Python, its children, diagnostics, runtime process snapshots or APIs; the narrow launcher itself never emits inherited environment data.</li>
+  <li><input type="checkbox" disabled> Commit: <code>security(service): sanitize every background process environment</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/service/test_environment.py tests/unit/service/test_launcher.py tests/unit/service/test_updater.py -q
+uv run ruff check jacked/service/environment.py jacked/service/updater.py jacked/cli.py</code></pre>
+
+<h4>Task 4.2: Reconcile native supervisors on all three OSes</h4>
+<p class="trace">Traces to AC10, AC11, AC12, AC13, AC15.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Render every native artifact from the PR 3 <code>ServiceSpec</code>; reconcile schema/generation hash and foreign-artifact ownership without weakening it.</li>
+  <li><input type="checkbox" disabled> macOS: validate ownership, atomically replace plist, bootout/bootstrap/kickstart the exact per-user LaunchAgent, and verify the loaded generation.</li>
+  <li><input type="checkbox" disabled> Linux: install a user systemd unit only when the user bus works and no foreign unit exists; daemon-reload and enable-now; use bounded restart and watchdog only with implemented <code>sd_notify</code>. Retain manual mode for WSL/headless/non-systemd.</li>
+  <li><input type="checkbox" disabled> Windows: register one current-user API Task Scheduler task with IgnoreNew, bounded restart, unlimited execution and explicit battery settings; attach per-login-session tray clients separately. Validate task ownership before use.</li>
+  <li><input type="checkbox" disabled> Ensure the losing starter exits without triggering supervisor crash loops; persist terminal reasons and recovery command.</li>
+  <li><input type="checkbox" disabled> Make service status show disk spec, loaded supervisor, live runtime and drift independently.</li>
+  <li><input type="checkbox" disabled> Commit: <code>feat(service): reconcile native supervisors cross-platform</code></li>
+</ul>
+<pre><code>uv run python -m pytest tests/unit/service/test_platform.py tests/unit/service/test_native_restart.py tests/unit/service/test_supervisors.py tests/unit/test_windows_update_batch.py -q
+uv run ruff check jacked/service/supervisors jacked/service/platform.py</code></pre>
+
+<h4>Task 4.3: Migrate safely and expand CI</h4>
+<p class="trace">Traces to AC11, AC12, AC13, AC15, AC16.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Preserve and extend the PR 1 writer-protocol fence throughout migration. An ambiguous legacy process keeps the new service quarantined and credential mutation disabled.</li>
+  <li><input type="checkbox" disabled> Preserve the old PID reader for two releases as diagnostic evidence; never control through it. Do not overwrite foreign launchd labels, systemd units or scheduled tasks.</li>
+  <li><input type="checkbox" disabled> Retire Windows VBS or another old launcher only after the new instance proves lease, manifest, IPC, build, protocol and generation, and survives at least one supervisor-driven restart/logon cycle. Keep the old artifact inert but recoverable until then.</li>
+  <li><input type="checkbox" disabled> Enforce a durable minimum-writer protocol epoch across managed service and manual entry points that re-exec through the launcher. Pre-v2 managed downgrade is unsupported until an explicit migration removes v2 journals/artifacts. Arbitrary direct execution of an old same-user binary cannot be prevented; detect its writes as unfenced and force subsequent state to indeterminate or mutation-disabled.</li>
+  <li><input type="checkbox" disabled> Add Ubuntu, macOS and Windows CI lanes with platform-specific unit selections and a common full suite. Real isolated Keychain, launchd, systemd-user and Task Scheduler smoke workflows may be manually dispatched, but a recorded pass is a release gate before enabling each platform migration flag.</li>
+  <li><input type="checkbox" disabled> Add token/environment canaries across journals, manifests, responses, logs, artifacts, diagnostics and subprocess argv.</li>
+  <li><input type="checkbox" disabled> Update README, troubleshooting/reference docs, architecture docs and release notes for supervisor/environment migration and rollback. Behavior-changing documentation was already updated in PRs 1 and 2.</li>
+  <li><input type="checkbox" disabled> Commit: <code>test: verify account and service recovery on every OS</code></li>
+</ul>
+<pre><code>uv run python -m pytest -q
+uv run ruff check .
+uv run ruff format --check .</code></pre>
+
+<div class="gate"><strong>PR 4 exit gate:</strong> all three OS lanes pass and recorded real-OS smoke evidence exists before each platform flag is enabled; hostile startup and secret canaries remain absent; supervisor definitions reconcile idempotently; old launchers retire only after a verified handoff cycle; an invalid candidate runtime reports repair-required without port-based false health; docs make no unsupported live-switch or pinned-session claim.</div>
+
+<h2 id="verification">Final verification</h2>
+<ol>
+  <li>Run the full suite with <code>uv run python -m pytest</code>, then ruff check/format.</li>
+  <li>Run <code>$dcr</code> because credentials, local control, process termination, CSRF and cross-platform service installation are security-sensitive.</li>
+  <li>Run <code>$cso</code>; no high/critical finding may remain.</li>
+  <li>Run <code>$qa</code> against the local account/session UI. Cover committed, ACL denied, interactive pending, diverged, indeterminate, remote read-only, session pending, scoped and legacy unknown states.</li>
+  <li>Use disposable homes and processes for CLI/service end-to-end tests. Never use the maintainer's real Keychain, accounts, port 8321 listener or live Claude sessions.</li>
+  <li>Capture exact evidence for AC1-AC16 in the PR description: command, platform, result and artifact/log location.</li>
+  <li>After dependency and workflow changes, run <code>$lockdown --workspace=/Users/jackneil/Github</code> before release.</li>
+</ol>
+
+<h3>Required model-based failure points</h3>
+<p>Terminate or fault the credential engine before/after pending commit, staging, authority call, authority readback, mirror publication, DB finalization and broadcast. Combine each with concurrent switch request, same-account token rotation, two Claude builds with reversed precedence, capability/writer epoch change, old-writer race, recovery-key loss, SQLite busy/read-only, response loss, service restart and abandoned interactive operation. Also inject PID reuse after final inspection, foreign supervisor artifacts, IPC replay/manifest copy, 8321 plus quarantine, broken candidate launch, locked Windows launcher, reboot/logon, missing systemd user bus, managed pre-v2 downgrade, and direct execution of an old binary followed by a credential write. Every state must resolve to a documented outcome without automatic secret rewrite, foreign control, or secret exposure.</p>
+
+<h2 id="rollout">Rollout and rollback</h2>
+<ol>
+  <li><strong>Release PR 1 first.</strong> It prevents false success, centralizes identity, and includes the minimum writer-protocol fence. If a legacy/direct writer cannot be excluded, mutation is disabled.</li>
+  <li><strong>Release PR 2 second.</strong> Keep the v1 active-sessions route for one release and mark it deprecated in response metadata.</li>
+  <li><strong>Release PR 3 before enabling supervisor migration.</strong> New ownership proof must exist before any artifact tries to adopt or stop legacy processes.</li>
+  <li><strong>Release PR 4 behind a migration feature flag.</strong> Enable per platform after its real-OS smoke lane passes. Keep manual service mode as the safe fallback.</li>
+  <li><strong>Rollback behavior:</strong> schema changes are additive; old account/session reads continue. Managed service/manual entry points enforce the minimum writer epoch, so disabling transaction v2 fails closed and managed pre-v2 downgrade requires explicit migration. Direct old same-user binaries are outside that prevention boundary; detected writes make state indeterminate or disable mutation. If supervisor v2 is disabled, the owned new service can run manual/quarantined without deleting native artifacts. The previous versioned launcher is retained until candidate handoff proves healthy.</li>
+  <li><strong>Live maintainer repair:</strong> only after the release is installed, explicitly inspect and repair the current Keychain/service state. That operation is not part of implementation testing.</li>
+</ol>
+
+<h3>Resolved decisions</h3>
+<ul>
+  <li>Remote credential mutation is read-only until real remote authentication and TLS are designed.</li>
+  <li>Full runtime package slots and encrypted migration of existing DB token columns are separate projects.</li>
+  <li>Security.framework is the macOS backend; the shell <code>security -X</code> secret-in-argv path is removed.</li>
+  <li>HMAC recovery evidence covers the complete transaction transcript and is machine-local/internal.</li>
+  <li>Uncooperative shared stores never receive an atomic/live-switch claim.</li>
+  <li>The API service is one per OS user; tray presentation may be one per graphical login session.</li>
+  <li>Forced unmanaged termination is unavailable on macOS; ambiguity always fails closed.</li>
+</ul>
+
+<hr><p style="color:var(--muted);font-size:.85rem;text-align:center">Plan reviewed through three independent verification/adversarial rounds and a clean recursive design review. Generated from the jacked HTML artifact template.</p>
+</div><script type="module">try{const mermaid=(await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;mermaid.initialize({startOnLoad:true,theme:matchMedia("(prefers-color-scheme: dark)").matches?"dark":"default",securityLevel:"loose"})}catch(e){document.querySelectorAll(".diagram").forEach(d=>d.classList.add("failed"))}</script></body></html>

@@ -31,22 +31,22 @@ def _make_db(tmp_path: Path) -> Database:
     with db._writer() as conn:
         conn.execute(
             """INSERT INTO accounts
-               (id, email, access_token, refresh_token, expires_at,
+               (id, email, organization_uuid, access_token, refresh_token, expires_at,
                 cc_access_token, cc_refresh_token, cc_expires_at,
                 is_active, is_deleted, validation_status,
                 consecutive_failures, subscription_type, rate_limit_tier)
-               VALUES (1, 'alice@test.com', 'alice_access', 'alice_refresh',
+               VALUES (1, 'alice@test.com', 'org-alice', 'alice_access', 'alice_refresh',
                        ?, 'alice_cc_access', 'alice_cc_refresh', ?,
                        1, 0, 'valid', 0, 'max', 't1')""",
             (future, future),
         )
         conn.execute(
             """INSERT INTO accounts
-               (id, email, access_token, refresh_token, expires_at,
+               (id, email, organization_uuid, access_token, refresh_token, expires_at,
                 cc_access_token, cc_refresh_token, cc_expires_at,
                 is_active, is_deleted, validation_status,
                 consecutive_failures, subscription_type, rate_limit_tier)
-               VALUES (2, 'bob@test.com', 'bob_access', 'bob_refresh',
+               VALUES (2, 'bob@test.com', 'org-bob', 'bob_access', 'bob_refresh',
                        ?, 'bob_cc_access', 'bob_cc_refresh', ?,
                        1, 0, 'valid', 0, 'pro', 't2')""",
             (future, future),
@@ -541,6 +541,16 @@ class TestPrepareAccountDir:
         assert oauth["subscriptionType"] == "max"
         assert oauth["rateLimitTier"] == "t1"
 
+        snapshot = json.loads(
+            (result / "jacked-resolver-snapshot.json").read_text()
+        )
+        assert snapshot["scope"] == "global"
+        assert snapshot["state"] == "resolved"
+        assert snapshot["observed"]["account_id"] == 1
+        assert snapshot["credential_revision"] == "switch:launch-test-operation"
+        assert "launch:global-authority:observed_target_unfenced" in snapshot["evidence"]
+        assert "alice_cc_access" not in json.dumps(snapshot)
+
         # Check permissions (skip on Windows)
         if os.name != "nt":
             dir_mode = stat.S_IMODE(result.stat().st_mode)
@@ -616,25 +626,46 @@ class TestPrepareAccountDir:
                 with pytest.raises(click.ClickException, match="symlink"):
                     prepare_account_dir(account, db)
 
-    def test_warns_on_keychain_write_failure(self, tmp_path):
-        """Logs warning when macOS Keychain write fails."""
+    def test_fails_closed_when_global_authority_cannot_be_observed(self, tmp_path):
+        """Never launch or publish resolved state from a failed native write."""
         db = _make_db(tmp_path)
         account = db.get_account(1)
 
+        from jacked.credentials.models import (
+            CredentialIdentity,
+            IdentityAxis,
+            ProviderVerificationState,
+            SessionActivationState,
+            SwitchOutcome,
+            SwitchResult,
+        )
+
+        failed = SwitchResult(
+            operation_id="launch-failed-operation",
+            outcome=SwitchOutcome.UNSUPPORTED,
+            desired_default=IdentityAxis(1, "desired"),
+            storage=IdentityAxis(None, "unchanged"),
+            committed_authority=IdentityAxis(None, "unchanged"),
+            existing_session_activation=SessionActivationState.UNCHANGED,
+            provider_verification=ProviderVerificationState.UNVERIFIED,
+            observed_identity=CredentialIdentity(),
+            message="exact Claude build is not certified",
+        )
+
         with mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"):
             with mock.patch("jacked.launch.should_refresh", return_value=False):
-                with mock.patch("jacked.launch.write_platform_credentials", return_value=False):
-                    with mock.patch("jacked.launch.logger") as mock_logger:
-                        from jacked.launch import prepare_account_dir
+                with mock.patch(
+                    "jacked.launch._activate_launch_credentials", return_value=failed
+                ):
+                    from jacked.launch import prepare_account_dir
 
-                        result = prepare_account_dir(account, db)
+                    with pytest.raises(click.ClickException, match="not certified"):
+                        prepare_account_dir(account, db)
 
-                        # Should still return successfully (non-fatal)
-                        assert result == tmp_path / "accounts" / "1"
-                        # But should log a warning
-                        mock_logger.warning.assert_any_call(
-                            mock.ANY, account["id"]
-                        )
+        snapshot = (
+            tmp_path / "accounts" / "1" / "jacked-resolver-snapshot.json"
+        )
+        assert not snapshot.exists()
 
     def test_preserves_existing_keys(self, tmp_path):
         """Preserves non-OAuth keys Claude Code may have added."""
@@ -711,18 +742,14 @@ class TestResolveAccount:
             prepare_account_dir(codex, db)
 
     def test_without_id_uses_active(self, tmp_path):
-        """resolve_account(None) reads _jackedAccountId stamp from credential file."""
+        """resolve_account(None) accepts an evidence-qualified active ID."""
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        # Create credential file with stamp pointing to account 1
-        claude_dir = tmp_path / ".claude"
-        claude_dir.mkdir()
-        cred_file = claude_dir / ".credentials.json"
-        cred_file.write_text(json.dumps({"_jackedAccountId": 1}))
-
         with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
-            with mock.patch.object(Path, "home", return_value=tmp_path):
+            with mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id", return_value=1
+            ):
                 result = resolve_account(None, db)
         assert result["email"] == "alice@test.com"
 
@@ -857,49 +884,41 @@ class TestResolveAccount:
             with pytest.raises(click.ClickException, match="claude not found"):
                 resolve_account(1, db)
 
-    def test_without_id_db_fallback(self, tmp_path):
-        """resolve_account(None) falls back to DB setting when file is missing."""
+    def test_without_id_uses_canonical_resolver(self, tmp_path):
+        """resolve_account(None) uses resolver consensus, never DB precedence."""
         db = _make_db(tmp_path)
         db.set_setting("active_account_id", "1")
         from jacked.launch import resolve_account
 
-        # No credential file exists — should fall through to DB setting
         with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
-            with mock.patch.object(Path, "home", return_value=tmp_path):
-                with mock.patch(
-                    "jacked.launch.read_platform_credentials", return_value=None
-                ):
-                    result = resolve_account(None, db)
+            with mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id", return_value=1
+            ):
+                result = resolve_account(None, db)
         assert result["email"] == "alice@test.com"
 
-    def test_without_id_keychain_stamp_fallback(self, tmp_path):
-        """resolve_account(None) falls back to Keychain stamp."""
+    def test_without_id_canonical_resolver_can_select_second_account(self, tmp_path):
         db = _make_db(tmp_path)
         from jacked.launch import resolve_account
 
-        kc_data = {"_jackedAccountId": 2, "claudeAiOauth": {"accessToken": "x"}}
         with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
-            with mock.patch.object(Path, "home", return_value=tmp_path):
-                with mock.patch(
-                    "jacked.launch.read_platform_credentials", return_value=kc_data
-                ):
-                    result = resolve_account(None, db)
+            with mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id", return_value=2
+            ):
+                result = resolve_account(None, db)
         assert result["email"] == "bob@test.com"
 
-    def test_without_id_keychain_token_match(self, tmp_path):
-        """resolve_account(None) matches Keychain token against DB as last resort."""
+    def test_without_id_never_uses_db_pointer_without_consensus(self, tmp_path):
         db = _make_db(tmp_path)
+        db.set_setting("active_account_id", "2")
         from jacked.launch import resolve_account
 
-        # Keychain has token but no stamp
-        kc_data = {"claudeAiOauth": {"accessToken": "bob_access"}}
         with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
-            with mock.patch.object(Path, "home", return_value=tmp_path):
-                with mock.patch(
-                    "jacked.launch.read_platform_credentials", return_value=kc_data
-                ):
-                    result = resolve_account(None, db)
-        assert result["email"] == "bob@test.com"
+            with mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id", return_value=None
+            ):
+                with pytest.raises(click.ClickException, match="No active account detected"):
+                    resolve_account(None, db)
 
     def test_without_id_all_layers_fail(self, tmp_path):
         """resolve_account(None) raises when no file, no DB setting, no Keychain."""
@@ -907,14 +926,13 @@ class TestResolveAccount:
         from jacked.launch import resolve_account
 
         with mock.patch("jacked.launch.find_bin", return_value="/usr/local/bin/claude"):
-            with mock.patch.object(Path, "home", return_value=tmp_path):
-                with mock.patch(
-                    "jacked.launch.read_platform_credentials", return_value=None
+            with mock.patch(
+                "jacked.api.credential_helpers.read_active_account_id", return_value=None
+            ):
+                with pytest.raises(
+                    click.ClickException, match="No active account detected"
                 ):
-                    with pytest.raises(
-                        click.ClickException, match="No active account detected"
-                    ):
-                        resolve_account(None, db)
+                    resolve_account(None, db)
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +962,74 @@ class TestLaunchClaude:
         assert args[0][0] == ["claude", "--resume", "abc123"]
         env = args[1]["env"]
         assert env["CLAUDE_CONFIG_DIR"] == str(config_dir)
+        assert env["JACKED_CREDENTIAL_SCOPE"] == "unknown"
+        assert "JACKED_LAUNCH_NONCE" not in env
+        assert "JACKED_SCOPED_CREDENTIAL_CERTIFIED" not in env
+
+    def test_launch_passes_token_free_revision_without_claiming_certification(
+        self, tmp_path
+    ):
+        from jacked.launch import launch_claude
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        now = time.time()
+        (config_dir / "jacked-resolver-snapshot.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "published_at": now,
+                    "fresh_until": now + 30,
+                    "scope": "global",
+                    "state": "resolved",
+                    "credential_revision": "revision-123",
+                    "observed": {"account_id": 1},
+                }
+            )
+        )
+        mock_proc = mock.MagicMock(pid=42, returncode=0)
+        mock_proc.wait.return_value = 0
+
+        with mock.patch(
+            "jacked.launch.subprocess.Popen", return_value=mock_proc
+        ) as mock_popen:
+            with pytest.raises(SystemExit):
+                launch_claude(config_dir, ())
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert env["JACKED_CREDENTIAL_SCOPE"] == "global"
+        assert env["JACKED_CREDENTIAL_REVISION"] == "revision-123"
+        assert "JACKED_LAUNCH_NONCE" not in env
+        assert "JACKED_SCOPED_CREDENTIAL_CERTIFIED" not in env
+
+    def test_launch_does_not_inherit_false_scoped_certification(self, tmp_path):
+        from jacked.launch import launch_claude
+
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        mock_proc = mock.MagicMock(pid=42, returncode=0)
+        mock_proc.wait.return_value = 0
+        inherited = {
+            "JACKED_CREDENTIAL_SCOPE": "scoped",
+            "JACKED_SCOPED_CREDENTIAL_CERTIFIED": "1",
+            "JACKED_LAUNCH_NONCE": "stale-nonce",
+            "JACKED_CREDENTIAL_REVISION": "stale-revision",
+        }
+
+        with (
+            mock.patch.dict(os.environ, inherited, clear=False),
+            mock.patch(
+                "jacked.launch.subprocess.Popen", return_value=mock_proc
+            ) as mock_popen,
+            pytest.raises(SystemExit),
+        ):
+            launch_claude(config_dir, ())
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert env["JACKED_CREDENTIAL_SCOPE"] == "unknown"
+        assert "JACKED_SCOPED_CREDENTIAL_CERTIFIED" not in env
+        assert "JACKED_LAUNCH_NONCE" not in env
+        assert "JACKED_CREDENTIAL_REVISION" not in env
 
     def test_launches_with_db_path(self, tmp_path):
         """launch_claude with db_path starts token sync and closes sessions on exit."""
@@ -1092,7 +1178,10 @@ class TestTokenSync:
         }))
         # Email matches DB — this is a legitimate token refresh
         (config_dir / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "alice@test.com"}
+            "oauthAccount": {
+                "emailAddress": "alice@test.com",
+                "organizationUuid": "org-alice",
+            }
         }))
 
         from jacked.launch import _sync_tokens_from_file
@@ -1119,7 +1208,10 @@ class TestTokenSync:
         }))
         # Same email, different case — should sync normally
         (config_dir / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "Alice@Test.Com"}
+            "oauthAccount": {
+                "emailAddress": "Alice@Test.Com",
+                "organizationUuid": "org-alice",
+            }
         }))
 
         from jacked.launch import _sync_tokens_from_file
@@ -1271,36 +1363,53 @@ class TestSeedOauthAccountEmailUpdate:
 
 class TestHookConfigDir:
     def test_get_cred_data_reads_config_dir(self, tmp_path):
-        """_get_cred_data reads from CLAUDE_CONFIG_DIR when set."""
-        cred_file = tmp_path / ".credentials.json"
-        cred_file.write_text(
-            json.dumps(
-                {"claudeAiOauth": {"accessToken": "per_acct_token"}}
-            )
-        )
+        """_get_cred_data reads the scoped resolver snapshot, never tokens."""
+        snapshot_file = tmp_path / "jacked-resolver-snapshot.json"
+        snapshot_file.write_text(json.dumps({
+            "schema_version": 1,
+            "published_at": time.time() - 1,
+            "fresh_until": time.time() + 60,
+            "scope": "scoped",
+            "state": "resolved",
+            "evidence": ["launch_binding"],
+            "credential_revision": "rev-1",
+            "desired": {
+                "account_id": 1,
+                "email": "alice@test.com",
+                "organization_id": "org-alice",
+            },
+            "observed": {
+                "account_id": 1,
+                "email": "alice@test.com",
+                "organization_id": "org-alice",
+            },
+        }))
+        snapshot_file.chmod(0o600)
 
         from jacked.data.hooks.session_account_tracker import _get_cred_data
 
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(tmp_path)}):
             token, data = _get_cred_data()
 
-        assert token == "per_acct_token"
-        assert data["claudeAiOauth"]["accessToken"] == "per_acct_token"
+        assert token is None
+        assert data["observed"]["account_id"] == 1
 
     def test_match_uses_path_based_account_id(self, tmp_path):
-        """_match_token_to_account resolves via _jackedAccountId in cred_data.
-
-        _get_cred_data derives _jackedAccountId from the CLAUDE_CONFIG_DIR path;
-        _match_token_to_account then uses it as Layer 2.
-        """
+        """_match_token_to_account resolves canonical snapshot identity."""
         _make_db(tmp_path)
 
         from jacked.data.hooks.session_account_tracker import (
             _match_token_to_account,
         )
 
-        # Simulate what _get_cred_data produces for a per-account dir
-        cred_data = {"_jackedAccountId": 1}
+        cred_data = {
+            "state": "resolved",
+            "observed": {
+                "account_id": 1,
+                "email": "alice@test.com",
+                "organization_id": "org-alice",
+            },
+        }
 
         with mock.patch(
             "jacked.data.hooks.session_account_tracker.DB_PATH",
@@ -1341,11 +1450,18 @@ class TestHookConfigDir:
 
 class TestSessionHookEarlyReturn:
     def test_match_works_without_token(self, tmp_path):
-        """_match_token_to_account succeeds via Layer 2 even when token is None."""
+        """_match_token_to_account needs no token for resolver evidence."""
         _make_db(tmp_path)
         from jacked.data.hooks.session_account_tracker import _match_token_to_account
 
-        cred_data = {"_jackedAccountId": 1}
+        cred_data = {
+            "state": "resolved",
+            "observed": {
+                "account_id": 1,
+                "email": "alice@test.com",
+                "organization_id": "org-alice",
+            },
+        }
         with mock.patch(
             "jacked.data.hooks.session_account_tracker.DB_PATH",
             Path(str(tmp_path / "test.db")),
@@ -1356,12 +1472,22 @@ class TestSessionHookEarlyReturn:
         assert email == "alice@test.com"
 
     def test_handle_event_matches_without_token(self, tmp_path):
-        """_handle_event matches account via Layer 2 even when credential file has no token."""
+        """_handle_event matches a secret-free resolver observation."""
         db = _make_db(tmp_path)
         from jacked.data.hooks.session_account_tracker import _handle_event
 
-        # _get_cred_data returns no token but cred_data has _jackedAccountId
-        cred_data = {"_jackedAccountId": 1}
+        cred_data = {
+            "state": "resolved",
+            "scope": "global",
+            "published_at": time.time(),
+            "credential_revision": "rev-1",
+            "evidence": "store_consensus",
+            "observed": {
+                "account_id": 1,
+                "email": "alice@test.com",
+                "organization_id": "org-alice",
+            },
+        }
         with mock.patch(
             "jacked.data.hooks.session_account_tracker.DB_PATH",
             Path(str(tmp_path / "test.db")),
@@ -1370,11 +1496,7 @@ class TestSessionHookEarlyReturn:
                 "jacked.data.hooks.session_account_tracker._get_cred_data",
                 return_value=(None, cred_data),
             ):
-                with mock.patch(
-                    "jacked.data.hooks.session_account_tracker.CLAUDE_CONFIG",
-                    tmp_path / "nonexistent.json",
-                ):
-                    _handle_event("SessionStart", "sess-notoken", "/tmp")
+                _handle_event("SessionStart", "sess-notoken", "/tmp")
 
         rows = db.get_session_accounts("sess-notoken")
         assert len(rows) == 1

@@ -507,8 +507,8 @@ function renderAccounts(accounts) {
             <div id="session-tip-banner" class="bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 mb-4 text-sm text-slate-300">
                 <div class="flex items-start justify-between">
                     <div>
-                        <strong class="text-slate-200">Per-account sessions</strong> &mdash;
-                        Click <strong>Use Account</strong> to switch all sessions, or use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch with isolated credentials.
+                        <strong class="text-slate-200">Per-account sessions:</strong>
+                        <strong>Use Account</strong> changes the desired global account. Existing sessions update only when fresh evidence confirms it. Use <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude &lt;id&gt;</code> to launch with per-account credentials.
                         Supports pass-through args: <code class="bg-slate-800 px-1.5 py-0.5 rounded text-teal-400 text-xs">jacked claude 2 --resume</code>
                     </div>
                     <button id="btn-dismiss-tip" class="text-slate-500 hover:text-slate-300 ml-3 shrink-0 text-lg leading-none" title="Dismiss">&times;</button>
@@ -547,6 +547,7 @@ function renderAccounts(accounts) {
             <div id="oauth-flow-status"></div>
             ${typeof renderSessionControls === 'function' ? renderSessionControls() : ''}
             ${typeof renderSessionLookupResult === 'function' ? renderSessionLookupResult() : ''}
+            ${typeof renderUnknownSessions === 'function' ? renderUnknownSessions() : ''}
             <!-- Responsive card grid — see .accounts-grid in style.css.
                  Reflows to 2 columns only when each card can be a comfortable
                  width; the wrapper's max-width caps the flow at 2. -->

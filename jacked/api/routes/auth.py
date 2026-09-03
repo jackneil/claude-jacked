@@ -6,10 +6,13 @@ session-account queries.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import shutil
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -38,7 +41,9 @@ _bulk_refresh_acquired_at: float = 0.0
 # 0.41.23: track the task holding the lock so the stale-lock guard can
 # cancel it before swapping in a fresh lock.
 _bulk_refresh_task: "asyncio.Task | None" = None
-_BULK_REFRESH_STALE_AFTER = 180.0  # generous: a concurrent pass worst-cases at ~_BULK_PER_ACCOUNT_TIMEOUT
+_BULK_REFRESH_STALE_AFTER = (
+    180.0  # generous: a concurrent pass worst-cases at ~_BULK_PER_ACCOUNT_TIMEOUT
+)
 # 0.41.25: max seconds per account in bulk refresh before declaring it hung.
 # Happy path is 1-2s; 10s is plenty of slack for a slow Anthropic refresh.
 # If refresh takes >10s something's wrong upstream — waiting longer doesn't help.
@@ -219,6 +224,9 @@ class FlowStatusResponse(BaseModel):
     browser_mode: Optional[str] = None
     browser_name: Optional[str] = None
     reopen_error: Optional[str] = None
+    activation_status: Optional[str] = None
+    activation_operation_id: Optional[str] = None
+    activation_message: Optional[str] = None
 
 
 def _flow_status_response(status_data: dict) -> FlowStatusResponse:
@@ -242,6 +250,9 @@ def _flow_status_response(status_data: dict) -> FlowStatusResponse:
         browser_mode=status_data.get("browser_mode"),
         browser_name=status_data.get("browser_name"),
         reopen_error=status_data.get("reopen_error"),
+        activation_status=status_data.get("activation_status"),
+        activation_operation_id=status_data.get("activation_operation_id"),
+        activation_message=status_data.get("activation_message"),
     )
 
 
@@ -265,6 +276,13 @@ def _manual_oauth(request: Request, remote: bool) -> bool:
     client = request.client
     host = client.host if client else ""
     return host not in _LOOPBACK_HOSTS
+
+
+def _local_mutation_allowed(request: Request) -> bool:
+    """Credential mutation is local-only until remote auth and TLS exist."""
+    client = request.client
+    host = client.host.lower() if client and client.host else ""
+    return host in _LOOPBACK_HOSTS
 
 
 class RefreshResponse(BaseModel):
@@ -297,11 +315,89 @@ class BulkUsageRefreshResponse(BaseModel):
 class UseAccountResponse(BaseModel):
     status: str
     email: str
+    operation_id: Optional[str] = None
+    storage: Optional[dict] = None
+    committed_authority: Optional[dict] = None
+    existing_sessions: Optional[str] = None
+    provider_verification: Optional[str] = None
+    message: Optional[str] = None
 
 
 class ActiveCredentialResponse(BaseModel):
     account_id: Optional[int] = None
     email: Optional[str] = None
+    state: str = "unknown"
+    evidence: list[str] = Field(default_factory=list)
+
+
+_ACTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+def _switch_http_status(outcome) -> int:
+    from jacked.credentials.models import SwitchOutcome
+
+    if outcome in {SwitchOutcome.COMMITTED, SwitchOutcome.COMMITTED_DEGRADED}:
+        return status.HTTP_200_OK
+    if outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED:
+        return status.HTTP_202_ACCEPTED
+    if outcome is SwitchOutcome.INTERACTIVE_REQUIRED:
+        return status.HTTP_428_PRECONDITION_REQUIRED
+    if outcome in {
+        SwitchOutcome.INTERACTIVE_OPERATION_IN_PROGRESS,
+        SwitchOutcome.BUSY,
+        SwitchOutcome.CONCURRENT_WRITE,
+        SwitchOutcome.DIVERGED,
+        SwitchOutcome.RESTART_REQUIRED,
+    }:
+        return status.HTTP_409_CONFLICT
+    if outcome in {SwitchOutcome.UNUSABLE, SwitchOutcome.UNSUPPORTED}:
+        return status.HTTP_422_UNPROCESSABLE_CONTENT
+    return status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+def _switch_content(result, email: str) -> dict:
+    return {
+        "status": result.outcome.value,
+        "email": email,
+        "operation_id": result.operation_id,
+        "storage": {
+            "account_id": result.storage.account_id,
+            "state": result.storage.state,
+        },
+        "committed_authority": {
+            "account_id": result.committed_authority.account_id,
+            "state": result.committed_authority.state,
+        },
+        "existing_sessions": result.existing_session_activation.value,
+        "provider_verification": result.provider_verification.value,
+        "message": result.message,
+    }
+
+
+def _claim_switch_action(db, request: Request, account_id: int):
+    supplied = request.headers.get("X-Jacked-Action-Id")
+    action_id = supplied or str(uuid.uuid4())
+    operation_id = request.headers.get("X-Jacked-Operation-Id") or action_id
+    if not _ACTION_ID_PATTERN.fullmatch(action_id) or not _ACTION_ID_PATTERN.fullmatch(
+        operation_id
+    ):
+        return action_id, operation_id, "invalid", None
+    session_key = request.headers.get("X-Jacked-Page-Session") or ""
+    if not _ACTION_ID_PATTERN.fullmatch(session_key):
+        return action_id, operation_id, "invalid_session", None
+    request_digest = hashlib.sha256(
+        f"use-account-v2:{account_id}".encode("utf-8")
+    ).hexdigest()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    state, stored = db.claim_auth_action(
+        action_id,
+        session_key=session_key,
+        action="use_account",
+        request_digest=request_digest,
+        operation_id=operation_id,
+        expires_at=expires_at,
+    )
+    return action_id, operation_id, state, stored
 
 
 # --- Helpers ---
@@ -364,12 +460,18 @@ def _parse_usage_details(
             raw_used = extra_raw.get("used_credits")
             extra = ExtraUsage(
                 is_enabled=extra_raw.get("is_enabled", False),
-                monthly_limit=raw_limit / 100 if isinstance(raw_limit, (int, float)) else None,
-                used_credits=raw_used / 100 if isinstance(raw_used, (int, float)) else None,
+                monthly_limit=raw_limit / 100
+                if isinstance(raw_limit, (int, float))
+                else None,
+                used_credits=raw_used / 100
+                if isinstance(raw_used, (int, float))
+                else None,
                 utilization=extra_raw.get("utilization"),
             )
     except (TypeError, ValueError, AttributeError, KeyError):
-        logger.warning("Malformed cached_usage_raw — dropping per-model details", exc_info=True)
+        logger.warning(
+            "Malformed cached_usage_raw — dropping per-model details", exc_info=True
+        )
         return None, None, None
 
     return (per_model or None), binding_key, extra
@@ -386,7 +488,9 @@ def _build_account_usage(row: dict) -> Optional[AccountUsage]:
     """
     if row.get("cached_usage_5h") is None and row.get("cached_usage_7d") is None:
         return None
-    per_model, binding_key, extra_usage = _parse_usage_details(row.get("cached_usage_raw"))
+    per_model, binding_key, extra_usage = _parse_usage_details(
+        row.get("cached_usage_raw")
+    )
     binding = per_model.get(binding_key) if (per_model and binding_key) else None
     return AccountUsage(
         five_hour=row.get("cached_usage_5h", 0) or 0,
@@ -430,19 +534,24 @@ _active_account_cache: dict = {"id": None, "expires_at": 0.0}
 
 
 def _get_active_account_id_cached() -> int | None:
-    """Get active account ID from credential file, cached 30s."""
+    """Get the canonical observed account ID, cached for 30 seconds."""
     if time.time() < _active_account_cache["expires_at"]:
         return _active_account_cache["id"]
     try:
-        cred_path = Path.home() / ".claude" / ".credentials.json"
-        if cred_path.exists():
-            data = json.loads(cred_path.read_text(encoding="utf-8"))
-            _active_account_cache["id"] = data.get("_jackedAccountId")
-            _active_account_cache["expires_at"] = time.time() + 30.0
-            return _active_account_cache["id"]
-    except (json.JSONDecodeError, OSError):
-        pass
-    return None
+        from jacked.credentials.resolver import ResolverState
+        from jacked.credentials.runtime import resolve_active_identity
+
+        observation = resolve_active_identity()
+        account_id = (
+            observation.identity.account_id
+            if observation.state is ResolverState.RESOLVED
+            else None
+        )
+    except (OSError, RuntimeError):
+        account_id = None
+    _active_account_cache["id"] = account_id
+    _active_account_cache["expires_at"] = time.time() + 30.0
+    return account_id
 
 
 def _account_to_response(row: dict, db=None) -> AccountResponse:
@@ -454,11 +563,13 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
     if db is not None:
         _active_id = _get_active_account_id_cached()
         if row["id"] == _active_id and (
-            row.get("cc_refresh_token") is None
-            or (row.get("cc_expires_at") or 0) < now
+            row.get("cc_refresh_token") is None or (row.get("cc_expires_at") or 0) < now
         ):
             try:
-                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                from jacked.api.credential_helpers import (
+                    reconcile_credentials_from_live_store,
+                )
+
                 reconcile_credentials_from_live_store(row["id"], db)
                 row = db.get_account(row["id"]) or row  # Re-read after reconciliation
             except Exception:
@@ -553,7 +664,11 @@ async def start_add_account(
             "plan": acct.get("subscription_type"),
         }
 
-    flow = OAuthFlow(db, manual=_manual_oauth(request, remote))
+    flow = OAuthFlow(
+        db,
+        manual=_manual_oauth(request, remote),
+        allow_credential_activation=_local_mutation_allowed(request),
+    )
     result = await flow.start()
 
     if "error" in result:
@@ -590,10 +705,12 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
     if (account.get("provider") or "claude") == "codex":
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": {
-                "message": "Codex accounts re-authenticate with `codex login`, then Add Account → Codex.",
-                "code": "CODEX_NOT_OAUTH",
-            }},
+            content={
+                "error": {
+                    "message": "Codex accounts re-authenticate with `codex login`, then Add Account → Codex.",
+                    "code": "CODEX_NOT_OAUTH",
+                }
+            },
         )
 
     flow = OAuthFlow(
@@ -601,6 +718,7 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
         purpose="primary",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
+        allow_credential_activation=_local_mutation_allowed(request),
     )
     result = await flow.start()
 
@@ -713,7 +831,8 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
         label = raw if raw else None
         logger.info(
             "PATCH label for account %d: %r (User-Agent: %s, Origin: %s)",
-            account_id, label,
+            account_id,
+            label,
             request.headers.get("user-agent", "unknown"),
             request.headers.get("origin", "unknown"),
         )
@@ -832,7 +951,8 @@ async def refresh_token(account_id: int, request: Request):
     except asyncio.TimeoutError:
         logger.warning(
             "refresh_token: account %d refresh_account_token exceeded %.0fs — returning 504",
-            account_id, _TOKEN_REFRESH_TIMEOUT,
+            account_id,
+            _TOKEN_REFRESH_TIMEOUT,
         )
         return _gateway_timeout(
             "Token refresh timed out — server may be recovering a wedged refresh",
@@ -880,7 +1000,8 @@ async def refresh_usage(account_id: int, request: Request):
         logger.warning(
             "refresh_usage: account %d fetch_usage exceeded %.0fs — "
             "returning 504 and resetting validation_status",
-            account_id, _SINGLE_USAGE_TIMEOUT,
+            account_id,
+            _SINGLE_USAGE_TIMEOUT,
         )
         # Mirror the bulk route's timeout handling: record the error and
         # reset validation_status in the same call so the row doesn't sit
@@ -888,9 +1009,7 @@ async def refresh_usage(account_id: int, request: Request):
         db.update_account(
             account_id,
             validation_status="unknown",
-            last_error=(
-                f"Usage fetch timed out after {int(_SINGLE_USAGE_TIMEOUT)}s"
-            ),
+            last_error=(f"Usage fetch timed out after {int(_SINGLE_USAGE_TIMEOUT)}s"),
             last_error_at=datetime.now(timezone.utc).isoformat(),
         )
         return _gateway_timeout(
@@ -901,7 +1020,12 @@ async def refresh_usage(account_id: int, request: Request):
     if isinstance(usage_data, dict) and usage_data.get("_backed_off"):
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"error": {"message": "Usage API rate limited — try again shortly", "code": "RATE_LIMITED"}},
+            content={
+                "error": {
+                    "message": "Usage API rate limited. Try again shortly.",
+                    "code": "RATE_LIMITED",
+                }
+            },
         )
 
     if usage_data is None:
@@ -988,7 +1112,9 @@ async def refresh_all_usage(
         logger.info(
             "Bulk usage refresh throttled: previous pass completed %.1fs ago "
             "(< %.0fs) — returning DB values for %d account(s)",
-            since_last, _BULK_PASS_MIN_INTERVAL, len(results),
+            since_last,
+            _BULK_PASS_MIN_INTERVAL,
+            len(results),
         )
         return BulkUsageRefreshResponse(
             refreshed=len(results),
@@ -998,11 +1124,14 @@ async def refresh_all_usage(
         )
 
     if _bulk_refresh_lock.locked():
-        held_for = time.time() - _bulk_refresh_acquired_at if _bulk_refresh_acquired_at else 0
+        held_for = (
+            time.time() - _bulk_refresh_acquired_at if _bulk_refresh_acquired_at else 0
+        )
         if held_for > _BULK_REFRESH_STALE_AFTER:
             logger.warning(
                 "Bulk refresh lock held %ds (> %ds) — forcing reset",
-                int(held_for), int(_BULK_REFRESH_STALE_AFTER),
+                int(held_for),
+                int(_BULK_REFRESH_STALE_AFTER),
             )
             orphan = _bulk_refresh_task
             if orphan is not None and not orphan.done():
@@ -1038,19 +1167,10 @@ async def refresh_all_usage(
             ws_registry = getattr(request.app.state, "ws_registry", None)
             total = len(accounts)
 
-            # Read active account ID once from file — avoids per-iteration keychain
-            # subprocess calls.  File-only is acceptable because
-            # sync_credential_to_all_stores() writes both file and keychain
-            # atomically, so they should always agree on _jackedAccountId.
+            # Resolve active identity once through the certified store topology.
             from jacked.api.credential_helpers import read_fresh_active_token
-            active_acct_id = None
-            cred_path = Path.home() / ".claude" / ".credentials.json"
-            if cred_path.exists() and not cred_path.is_symlink():
-                try:
-                    cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
-                    active_acct_id = cred_data.get("_jackedAccountId")
-                except (json.JSONDecodeError, OSError):
-                    pass
+
+            active_acct_id = await asyncio.to_thread(_get_active_account_id_cached)
 
             if active_acct_id is not None:
                 logger.debug(
@@ -1059,7 +1179,7 @@ async def refresh_all_usage(
                 )
             else:
                 logger.debug(
-                    "Bulk refresh: no _jackedAccountId in credential file — "
+                    "Bulk refresh: no canonical active credential identity; "
                     "all accounts will use DB tokens"
                 )
 
@@ -1071,11 +1191,14 @@ async def refresh_all_usage(
                 )
 
             targets = [
-                acct for acct in accounts
+                acct
+                for acct in accounts
                 if not (skip_account is not None and acct["id"] == skip_account)
             ]
             sem = asyncio.Semaphore(_BULK_MAX_CONCURRENCY)
-            completed = {"n": 0}  # mutable closure counter; event loop is single-threaded
+            completed = {
+                "n": 0
+            }  # mutable closure counter; event loop is single-threaded
 
             async def _refresh_one(acct: dict) -> dict:
                 async with sem:
@@ -1098,15 +1221,20 @@ async def refresh_all_usage(
                             effective_token = fresh_token
                     try:
                         usage_data = await asyncio.wait_for(
-                            fetch_usage(acct["id"], db, access_token=effective_token,
-                                        manual=user_initiated),
+                            fetch_usage(
+                                acct["id"],
+                                db,
+                                access_token=effective_token,
+                                manual=user_initiated,
+                            ),
                             timeout=_BULK_PER_ACCOUNT_TIMEOUT,
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
                             "Bulk refresh: account %d fetch_usage exceeded %.0fs — "
                             "marking failed and resetting validation_status",
-                            acct["id"], _BULK_PER_ACCOUNT_TIMEOUT,
+                            acct["id"],
+                            _BULK_PER_ACCOUNT_TIMEOUT,
                         )
                         timeout_error = (
                             f"Usage fetch timed out after {int(_BULK_PER_ACCOUNT_TIMEOUT)}s "
@@ -1124,11 +1252,15 @@ async def refresh_all_usage(
                         usage_data = None
 
                     # Cache hits return {"_cached": True} — read stored values from DB
-                    is_cached = isinstance(usage_data, dict) and usage_data.get("_cached")
+                    is_cached = isinstance(usage_data, dict) and usage_data.get(
+                        "_cached"
+                    )
                     if is_cached:
                         usage_data = None  # Treat as skip — use DB values below
 
-                    is_backed_off = isinstance(usage_data, dict) and usage_data.get("_backed_off")
+                    is_backed_off = isinstance(usage_data, dict) and usage_data.get(
+                        "_backed_off"
+                    )
                     if is_backed_off:
                         usage_data = None
 
@@ -1157,24 +1289,32 @@ async def refresh_all_usage(
                             "account_id": acct["id"],
                             "email": acct["email"],
                             "success": False,
-                            "error": updated_acct.get("last_error") if updated_acct else None,
+                            "error": updated_acct.get("last_error")
+                            if updated_acct
+                            else None,
                         }
 
                     completed["n"] += 1
                     # Notify frontend: done or failed (include account data for immediate UI update)
-                    progress_status = "failed" if (not is_cached and usage_data is None) else "done"
+                    progress_status = (
+                        "failed" if (not is_cached and usage_data is None) else "done"
+                    )
                     if ws_registry:
                         updated_row = db.get_account(acct["id"])
                         acct_payload = (
                             _account_to_response(updated_row).model_dump()
-                            if updated_row else None
+                            if updated_row
+                            else None
                         )
                         await ws_registry.broadcast(
                             "usage_refresh_progress",
-                            {"account_id": acct["id"],
-                             "status": progress_status,
-                             "progress": completed["n"], "total": total,
-                             "account_data": acct_payload},
+                            {
+                                "account_id": acct["id"],
+                                "status": progress_status,
+                                "progress": completed["n"],
+                                "total": total,
+                                "account_data": acct_payload,
+                            },
                         )
                     return row
 
@@ -1187,7 +1327,8 @@ async def refresh_all_usage(
                     return await _refresh_one(acct)
                 except Exception as exc:
                     logger.exception(
-                        "Bulk refresh: unexpected error for account %d", acct["id"],
+                        "Bulk refresh: unexpected error for account %d",
+                        acct["id"],
                     )
                     completed["n"] += 1
                     return {
@@ -1197,9 +1338,9 @@ async def refresh_all_usage(
                         "error": f"internal error during refresh: {exc}",
                     }
 
-            results = list(await asyncio.gather(
-                *(_refresh_one_guarded(a) for a in targets)
-            ))
+            results = list(
+                await asyncio.gather(*(_refresh_one_guarded(a) for a in targets))
+            )
             refreshed = sum(1 for r in results if r["success"])
             failed = sum(1 for r in results if not r["success"])
 
@@ -1242,7 +1383,8 @@ async def validate_token(account_id: int, request: Request):
     except asyncio.TimeoutError:
         logger.warning(
             "validate_token: account %d validate_account exceeded %.0fs — returning 504",
-            account_id, _VALIDATE_TIMEOUT,
+            account_id,
+            _VALIDATE_TIMEOUT,
         )
         return _gateway_timeout(
             "Validation timed out — server may be recovering a wedged refresh",
@@ -1274,10 +1416,12 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
     if (account.get("provider") or "claude") == "codex":
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": {
-                "message": "Codex accounts have no Claude Code token to authorize.",
-                "code": "CODEX_NO_CC",
-            }},
+            content={
+                "error": {
+                    "message": "Codex accounts have no Claude Code token to authorize.",
+                    "code": "CODEX_NO_CC",
+                }
+            },
         )
 
     from jacked.web.oauth import OAuthFlow
@@ -1289,6 +1433,7 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
         purpose="claude_code",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
+        allow_credential_activation=_local_mutation_allowed(request),
     )
     result = await flow.start()
     return result
@@ -1299,16 +1444,29 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
 
 @router.post("/accounts/{account_id}/use", response_model=UseAccountResponse)
 async def use_account(account_id: int, request: Request):
-    """Switch all Claude Code sessions to this account's credentials.
+    """Request a local default-credential activation for one account.
 
-    Writes the account's tokens to all credential stores (global
-    .credentials.json, macOS Keychain, ~/.claude.json).  Claude Code
-    v2.1.81+ dynamically re-reads credentials, so running sessions
-    pick up the new account without logging out.
+    The response reports separately what was stored, what was committed, and
+    what can be claimed about existing sessions.
 
     Rejects disabled accounts, accounts with invalid validation status,
     and accounts without CC tokens (which would be un-refreshable).
     """
+    if not _local_mutation_allowed(request):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={
+                "error": {
+                    "message": (
+                        "Account switching is available only from this computer. "
+                        "Remote dashboards are read-only for credentials."
+                    ),
+                    "code": "CREDENTIAL_MUTATION_LOCAL_ONLY",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
@@ -1348,8 +1506,6 @@ async def use_account(account_id: int, request: Request):
     # writing the Claude credential stores — and Codex has no CC tokens, so this
     # branches before the Claude-only checks below.
     if account.get("provider") == "codex":
-        import asyncio
-
         from jacked.codex.switching import CodexSwapError, swap_codex_account
 
         try:
@@ -1393,42 +1549,90 @@ async def use_account(account_id: int, request: Request):
             },
         )
 
-    # Reconcile outgoing account's credentials before writing new ones —
-    # captures any token rotation by Claude Code during the outgoing session.
+    action_id, operation_id, action_state, stored_result = _claim_switch_action(
+        db, request, account_id
+    )
+    if action_state == "complete" and stored_result is not None:
+        stored_result = dict(stored_result)
+        http_status = int(stored_result.pop("_http_status", status.HTTP_200_OK))
+        return JSONResponse(
+            status_code=http_status,
+            content=stored_result,
+            headers={"Cache-Control": "no-store"},
+        )
+    if action_state in {"invalid", "mismatch", "expired"}:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "error": {
+                    "message": f"Credential action id is {action_state}",
+                    "code": f"CREDENTIAL_ACTION_{action_state.upper()}",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    if action_state == "invalid_session":
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": "A valid page-session identifier is required.",
+                    "code": "CREDENTIAL_PAGE_SESSION_INVALID",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    if action_state == "claimed":
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "error": {
+                    "message": "Credential operation is already in progress",
+                    "code": "CREDENTIAL_OPERATION_IN_PROGRESS",
+                    "operation_id": operation_id,
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # Reconcile outgoing account's credentials before writing new ones.
     from jacked.api.credential_helpers import reconcile_credentials_from_live_store
     from jacked.api.usage_monitor import _read_active_account_id
-    outgoing_id = _read_active_account_id()
+
+    outgoing_id = await asyncio.to_thread(_read_active_account_id)
     if outgoing_id and outgoing_id != account_id:
-        reconcile_credentials_from_live_store(outgoing_id, db)
+        await asyncio.to_thread(
+            reconcile_credentials_from_live_store, outgoing_id, db
+        )
 
-    # SAFETY: This is a user-initiated, one-shot credential write — NOT a
-    # background loop.  The design spec (2026-03-24-kill-background-credential-
-    # writes-design.md) prohibits credential file writes from background loops
-    # (_token_refresh_loop, _heal_sweep_loop) because they caused session
-    # logouts.  This endpoint is safe because: (1) it is user-initiated,
-    # (2) it runs once per click, and (3) Claude Code v2.1.81+ handles
-    # credential file changes gracefully.  Do NOT copy this pattern into
-    # refresh_account_token() or any background loop.
-    from jacked.api.credential_helpers import sync_credential_to_all_stores
+    from jacked.credentials.models import SwitchContext, SwitchOutcome
+    from jacked.credentials.runtime import activate_account
 
-    sync_credential_to_all_stores(
-        account_id,
-        account,
-        email=account.get("email"),
-        display_name=account.get("display_name"),
+    switcher = getattr(request.app.state, "credential_switcher", activate_account)
+    result = await asyncio.to_thread(
+        switcher, db, account, SwitchContext.MANUAL, operation_id
     )
+    content = _switch_content(result, account.get("email", ""))
+    http_status = _switch_http_status(result.outcome)
+    db.finish_auth_action(action_id, {**content, "_http_status": http_status})
 
-    # Sync DB active_account_id setting — keeps the launch-time Layer-2
-    # fallback (jacked/launch.py) consistent with the credential file.
-    # Without this, every manual switch leaves the DB stale, so a
-    # cred-file recovery picks the wrong account.
-    try:
-        db.set_setting("active_account_id", account_id)
-    except Exception:
-        logger.exception(
-            "Failed to sync active_account_id setting after manual "
-            "switch (account=%d) — credential file is authoritative",
-            account_id,
+    truthful_target = result.outcome in {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.COMMITTED_DEGRADED,
+        SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+    }
+    if truthful_target:
+        db.mark_global_sessions_pending()
+
+    committed = result.outcome in {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.COMMITTED_DEGRADED,
+    }
+    if not committed:
+        return JSONResponse(
+            status_code=http_status,
+            content=content,
+            headers={"Cache-Control": "no-store"},
         )
 
     # Give the manual choice residency: without this, the auto-swap loop
@@ -1466,67 +1670,9 @@ async def use_account(account_id: int, request: Request):
 
     try:
         from jacked.web.auto_swap import format_account_label
+
         prev_acct = db.get_account(outgoing_id) if outgoing_id else None
         reason = f"user switched to {format_account_label(account)}"
-
-        # Record in swap_log so it appears in swap history
-        db.record_swap(
-            from_account_id=outgoing_id,
-            to_account_id=account_id,
-            reason=reason,
-            trigger="manual",
-            from_5h=prev_acct.get("cached_usage_5h") if prev_acct else None,
-            from_7d=prev_acct.get("cached_usage_7d") if prev_acct else None,
-            to_5h=account.get("cached_usage_5h"),
-            to_7d=account.get("cached_usage_7d"),
-        )
-
-        # Record in decision_log with full detail
-        _manual_detail = {
-            "source": "dashboard",
-            "previous_account_id": outgoing_id,
-            "active": {
-                "id": account_id,
-                "email": account.get("email", ""),
-                "label": format_account_label(account),
-            },
-            "previous": {
-                "id": outgoing_id,
-                "email": prev_acct.get("email", "") if prev_acct else "",
-                "label": format_account_label(prev_acct) if prev_acct else "",
-            } if outgoing_id else None,
-        }
-        decision_id = db.record_decision(
-            account_id=account_id,
-            action="manual_switch",
-            trigger="manual",
-            target_id=account_id,
-            reason=reason,
-            detail=_manual_detail,
-        )
-
-        # Broadcast decision log entry
-        ws_registry = getattr(request.app.state, "ws_registry", None)
-        if ws_registry and decision_id:
-            try:
-                await ws_registry.broadcast(
-                    "decision_log_entry",
-                    {
-                        "id": decision_id,
-                        "account_id": account_id,
-                        "email": account.get("email", ""),
-                        "label": format_account_label(account),
-                        "action": "manual_switch",
-                        "trigger": "manual",
-                        "reason": reason,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "detail": _manual_detail,
-                    },
-                )
-            except Exception:
-                logger.debug("Decision log WS broadcast failed", exc_info=True)
-
-        # Broadcast via WebSocket so dashboard updates live
         ws_registry = getattr(request.app.state, "ws_registry", None)
         if ws_registry:
             await ws_registry.broadcast(
@@ -1542,128 +1688,133 @@ async def use_account(account_id: int, request: Request):
                 },
             )
     except Exception:
-        pass
+        logger.debug("Committed switch broadcast failed", exc_info=True)
 
-    return UseAccountResponse(
-        status="active",
-        email=account.get("email", ""),
+    return JSONResponse(
+        status_code=http_status,
+        content=content,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/credential-operations/{identifier}")
+async def get_credential_operation(identifier: str, request: Request):
+    """Return local, secret-free status for a credential action/operation."""
+    if not _local_mutation_allowed(request):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={
+                "error": {
+                    "message": "Credential operation status is local-only.",
+                    "code": "CREDENTIAL_STATUS_LOCAL_ONLY",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    if not _ACTION_ID_PATTERN.fullmatch(identifier):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": "Credential operation identifier is invalid.",
+                    "code": "CREDENTIAL_OPERATION_ID_INVALID",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    session_key = request.headers.get("X-Jacked-Page-Session") or ""
+    if not _ACTION_ID_PATTERN.fullmatch(session_key):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": "A valid page-session identifier is required.",
+                    "code": "CREDENTIAL_PAGE_SESSION_INVALID",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    db = _get_db(request)
+    if db is None:
+        return _db_unavailable()
+    action = db.get_auth_action(identifier)
+    if action is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "error": {
+                    "message": "Credential operation was not found.",
+                    "code": "CREDENTIAL_OPERATION_NOT_FOUND",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    if action["session_key"] != session_key:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={
+                "error": {
+                    "message": "Credential operation belongs to another page session.",
+                    "code": "CREDENTIAL_PAGE_SESSION_MISMATCH",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    action_state = action["state"]
+    if action["expires_at"] <= datetime.now(timezone.utc).isoformat():
+        action_state = "expired"
+    return JSONResponse(
+        status_code=(
+            status.HTTP_200_OK
+            if action_state == "complete"
+            else status.HTTP_202_ACCEPTED
+        ),
+        content={
+            "action_id": action["action_id"],
+            "operation_id": action["operation_id"],
+            "state": action_state,
+            "result": action["result"] if action_state == "complete" else None,
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 
 @router.get("/active-credential", response_model=ActiveCredentialResponse)
 async def get_active_credential(request: Request):
-    """Read credential file/keychain and match to a jacked account.
-
-    3-layer matching: (1) _jackedAccountId stamp, (2) refresh/access
-    token match, (3) email+org from ~/.claude.json.
-    """
+    """Return the canonical evidence-qualified credential observation."""
     db = _get_db(request)
     if db is None:
         return ActiveCredentialResponse()
+    from jacked.credentials.resolver import ResolverState
+    from jacked.credentials.runtime import resolve_active_identity
 
-    from jacked.api.credential_helpers import read_platform_credentials
-
-    # Read credential file
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    cred_data = None
-    if cred_path.exists() and not cred_path.is_symlink():
-        try:
-            cred_data = json.loads(cred_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, AttributeError):
-            pass
-
-    # Fallback: macOS Keychain
-    if cred_data is None or not cred_data.get("claudeAiOauth", {}).get("accessToken"):
-        platform_data = read_platform_credentials()
-        if platform_data:
-            cred_data = platform_data
-
-    if cred_data:
-        # Layer 1: _jackedAccountId stamp
-        jacked_id = cred_data.get("_jackedAccountId")
-        if jacked_id is not None:
-            account = db.get_account(jacked_id)
-            if account and not account.get("is_deleted"):
-                return ActiveCredentialResponse(
-                    account_id=account["id"], email=account["email"]
-                )
-
-        # Layer 2: Token match — try refresh token first (more stable than
-        # access token because it only rotates on explicit refresh, not every
-        # API call), then fall back to access token match.
-        oauth_data = cred_data.get("claudeAiOauth", {})
-        refresh_token = oauth_data.get("refreshToken")
-        access_token = oauth_data.get("accessToken")
-
-        if refresh_token or access_token:
-            accounts = db.list_accounts(include_inactive=True)
-            # Pass 1: refresh token match (most stable after dashboard switch)
-            if refresh_token:
-                for acct in accounts:
-                    if acct.get("is_deleted"):
-                        continue
-                    if acct.get("cc_refresh_token") == refresh_token:
-                        return ActiveCredentialResponse(
-                            account_id=acct["id"], email=acct["email"]
-                        )
-            # Pass 2: access token match (works briefly before CC refreshes)
-            if access_token:
-                for acct in accounts:
-                    if acct.get("is_deleted"):
-                        continue
-                    if acct.get("cc_access_token") == access_token:
-                        return ActiveCredentialResponse(
-                            account_id=acct["id"], email=acct["email"]
-                        )
-                    if acct.get("access_token") == access_token:
-                        return ActiveCredentialResponse(
-                            account_id=acct["id"], email=acct["email"]
-                        )
-
-    # Layer 3: Email + org match from ~/.claude.json
-    #
-    # On macOS, .credentials.json may not exist (Claude Code uses keychain
-    # exclusively).  The keychain may lack the _jackedAccountId stamp
-    # (accounts predating the dashboard-switching feature).  Token match
-    # fails because Claude Code refreshes tokens independently.
-    #
-    # ~/.claude.json is maintained by Claude Code on ALL platforms and
-    # always has oauthAccount.emailAddress + organizationUuid after login.
-    # It is NOT overwritten during token refresh — only during login/logout.
-    claude_config = Path.home() / ".claude.json"
-    if claude_config.exists() and not claude_config.is_symlink():
-        try:
-            config = json.loads(claude_config.read_text(encoding="utf-8"))
-            oauth_acct = config.get("oauthAccount", {})
-            config_email = oauth_acct.get("emailAddress")
-            config_org = oauth_acct.get("organizationUuid") or ""
-            if config_email:
-                accounts = db.list_accounts(include_inactive=True)
-                # Prefer email+org match (disambiguates same-email multi-org).
-                # Normalize org to "" because DB uses "" for personal accounts
-                # while ~/.claude.json uses null (Python None).
-                for acct in accounts:
-                    if acct.get("is_deleted"):
-                        continue
-                    if (
-                        acct.get("email", "").lower() == config_email.lower()
-                        and (acct.get("organization_uuid") or "") == config_org
-                    ):
-                        return ActiveCredentialResponse(
-                            account_id=acct["id"], email=acct["email"]
-                        )
-                # Fall back to email-only match (org may be None for personal accounts)
-                for acct in accounts:
-                    if acct.get("is_deleted"):
-                        continue
-                    if acct.get("email", "").lower() == config_email.lower():
-                        return ActiveCredentialResponse(
-                            account_id=acct["id"], email=acct["email"]
-                        )
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    return ActiveCredentialResponse()
+    resolver = getattr(request.app.state, "credential_resolver", None)
+    observation = await asyncio.to_thread(resolver or resolve_active_identity)
+    evidence = list(observation.evidence)
+    if observation.state is not ResolverState.RESOLVED:
+        return ActiveCredentialResponse(
+            state=observation.state.value, evidence=evidence
+        )
+    identity = observation.identity
+    account = db.get_account(identity.account_id) if identity.account_id else None
+    if not account or account.get("is_deleted"):
+        return ActiveCredentialResponse(
+            state=ResolverState.UNUSABLE.value,
+            evidence=[*evidence, "account-stamp-not-found"],
+        )
+    observed_org = identity.organization_id or ""
+    account_org = account.get("organization_uuid") or ""
+    if observed_org and observed_org != account_org:
+        return ActiveCredentialResponse(
+            state=ResolverState.CONFLICT.value,
+            evidence=[*evidence, "account-organization-conflict"],
+        )
+    return ActiveCredentialResponse(
+        account_id=account["id"],
+        email=account["email"],
+        state=ResolverState.RESOLVED.value,
+        evidence=evidence,
+    )
 
 
 # --- Session queries ---
@@ -1691,7 +1842,12 @@ async def get_account_sessions(request: Request, account_id: int, limit: int = 5
 
 @router.get("/active-sessions")
 async def get_active_sessions(request: Request, staleness: int = 60):
-    """Get all currently active sessions, grouped by account_id."""
+    """Compatibility view of recent session observations grouped by account.
+
+    The grouping is historical/configuration evidence, not proof of which
+    provider identity served the session's latest request. New clients should
+    use ``/session-states``.
+    """
     db = _get_db(request)
     if db is None:
         return {"sessions": {}}
@@ -1719,7 +1875,92 @@ async def get_active_sessions(request: Request, staleness: int = 60):
             }
         )
 
-    return {"sessions": grouped}
+    return JSONResponse(
+        content={
+            "sessions": grouped,
+            "identity_semantics": "historical_observation",
+            "deprecated": True,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/session-states")
+async def get_session_states(request: Request, staleness: int = 60):
+    """Return evidence-qualified configuration state for recent sessions."""
+    db = _get_db(request)
+    if db is None:
+        return JSONResponse(
+            content={"sessions": [], "desired_global": None},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    desired = None
+    for setting_key in ("desired_account_id", "active_account_id"):
+        raw_id = db.get_setting(setting_key)
+        try:
+            candidate_id = int(raw_id) if raw_id else None
+        except (TypeError, ValueError):
+            candidate_id = None
+        if candidate_id:
+            desired = db.get_account(candidate_id)
+            if desired is not None:
+                break
+    desired_public = (
+        {
+            "account_id": desired["id"],
+            "email": desired.get("email"),
+            "organization_uuid": desired.get("organization_uuid"),
+            "organization_name": desired.get("organization_name"),
+        }
+        if desired
+        else None
+    )
+
+    sessions = []
+    for row in db.get_active_session_states(staleness_minutes=staleness):
+        scope = row.get("credential_scope") or "legacy"
+        evidence = row.get("evidence") or "legacy"
+        state = row.get("observation_state") or "unknown"
+        observed_at = row.get("observed_at")
+        observed = None
+        if state == "observed" and evidence not in {"legacy", "unknown"}:
+            observed = {
+                "account_id": row.get("account_id"),
+                "email": row.get("email"),
+                "credential_revision": row.get("credential_revision"),
+                "observed_at": observed_at,
+            }
+        sessions.append(
+            {
+                "session_id": row.get("session_id", "")[-8:],
+                "repo_path": row.get("repo_path"),
+                "detected_at": row.get("detected_at"),
+                "last_activity_at": row.get("last_activity_at"),
+                "started_as": {
+                    "account_id": row.get("started_account_id"),
+                    "email": row.get("started_email"),
+                    "observed_at": row.get("started_at"),
+                    "evidence": row.get("started_method") or "legacy",
+                },
+                "observed_configuration": observed,
+                "desired_global": desired_public,
+                "pending": state == "pending",
+                "scope": scope,
+                "evidence": evidence,
+                "freshness": observed_at,
+                "runtime_verified": None,
+                "state": state,
+                "is_subagent": bool(row.get("is_subagent")),
+                "parent_session_id": row.get("parent_session_id", ""),
+                "agent_type": row.get("agent_type", ""),
+            }
+        )
+
+    return JSONResponse(
+        content={"sessions": sessions, "desired_global": desired_public},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/display-name-audit")

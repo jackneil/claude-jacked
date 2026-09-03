@@ -3459,41 +3459,74 @@ def _ensure_autostart_and_running(
     unmapped ``--host`` that is deliberately not persisted; the launchd path
     always boots host-free.
     """
-    from jacked.service import PID_FILE
-    from jacked.service.platform import install_autostart
-    from jacked.service.process import is_process_alive, read_pid
+    from jacked.service.lifecycle import (
+        default_service_paths,
+        discover_service,
+        install_native_owned,
+        native_artifact_path,
+        provision_service_contract,
+        reconcile_native_artifact,
+        spawn_exact_service,
+    )
+    from jacked.service.instance import read_manifest
+    from jacked.service.ipc import ControlAction, send_native_control
+    from jacked.service.spec import SupervisorKind
+    from jacked.service.supervisors import ArtifactDisposition
 
-    result = install_autostart(port)
-    if result.startswith("Could not find"):
-        console.print(f"[red]Error:[/red] {result}")
-        return
-    console.print("[green][OK][/green] Autostart registered (starts on login)")
-
-    info = read_pid(PID_FILE)
-    if info and is_process_alive(info["pid"]):
-        console.print(
-            f"[dim][-][/dim] {label} already running "
-            f"(pid {info['pid']} -> http://127.0.0.1:{info['port']})"
-        )
-        return
-    if sys.platform == "darwin":
-        # launchd just started it via install_autostart's bootstrap; the
-        # PID file can lag a beat, so don't race it with a second spawn.
-        console.print(
-            f"[green][OK][/green] {label} started via launchd -> "
-            f"http://127.0.0.1:{port}"
-        )
-        return
+    paths = default_service_paths()
     try:
-        _spawn_service_detached(one_shot_host, port)
-        console.print(
-            f"[green][OK][/green] {label} started -> http://127.0.0.1:{port}"
+        spec, environment = provision_service_contract(paths=paths)
+        endpoint = discover_service(paths)
+        if endpoint.source == "manifest":
+            existing = read_manifest(paths.manifest)
+            if existing.supervisor == SupervisorKind.MANUAL.value:
+                reconciled = reconcile_native_artifact(
+                    spec,
+                    native_artifact_path(spec, paths=paths),
+                    environment=environment,
+                )
+                if reconciled.artifact.disposition is ArtifactDisposition.FOREIGN:
+                    console.print(
+                        "[red]Error:[/red] supervisor artifact is foreign; "
+                        "run `jacked service recover`"
+                    )
+                    return
+                response = send_native_control(paths.manifest, ControlAction.SHUTDOWN)
+                if not response.get("ok"):
+                    console.print("[red]Error:[/red] manual service refused handoff")
+                    return
+                import time
+
+                deadline = time.monotonic() + 10
+                while paths.manifest.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if paths.manifest.exists():
+                    console.print(
+                        "[red]Error:[/red] manual service did not release ownership"
+                    )
+                    return
+        result = (
+            spawn_exact_service(spec, environment=environment)
+            if spec.supervisor is SupervisorKind.MANUAL
+            else install_native_owned(spec, environment=environment, paths=paths)
         )
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         console.print(
-            f"[yellow][WARN][/yellow] Could not start {label.lower()}: {exc} "
-            "-- run `jacked start`"
+            f"[red]Error:[/red] safe service install failed ({type(exc).__name__})"
         )
+        return
+    if not result.ok:
+        console.print(
+            f"[red]Error:[/red] safe service install refused: {result.reason}"
+        )
+        return
+    endpoint = discover_service(paths)
+    port_label = endpoint.port or port
+    console.print("[green][OK][/green] Autostart registered from exact ServiceSpec")
+    console.print(
+        f"[green][OK][/green] {label} activation requested -> "
+        f"http://127.0.0.1:{port_label}"
+    )
 
 
 def _setup_tray_autostart() -> None:
@@ -5257,7 +5290,7 @@ def menubar(host: str | None, port: int | None):
     ServiceRunner(host=host, port=port or DEFAULT_PORT).run()
 
 
-def _persist_remote_access_from_host(host: str) -> bool:
+def _persist_remote_access_from_host(host: str, *, allow_one_shot: bool = True) -> bool:
     """Map an explicit ``service install/restart --host`` onto the dashboard
     Remote access setting.
 
@@ -5272,11 +5305,18 @@ def _persist_remote_access_from_host(host: str) -> bool:
 
     mapping = map_host_to_setting(host)
     if mapping is None:
-        console.print(
-            f"[yellow]Host {host} is a one-shot override for this start only "
-            "and is not persisted. Use the dashboard Remote access setting "
-            "(Settings > Advanced) for a persistent mode.[/yellow]"
-        )
+        if allow_one_shot:
+            console.print(
+                f"[yellow]Host {host} is a one-shot override for this start only "
+                "and is not persisted. Use the dashboard Remote access setting "
+                "(Settings > Advanced) for a persistent mode.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[yellow]Host {host} is not a supported persistent mode and was "
+                "not applied. The exact supervisor remains host-free. Choose "
+                "0.0.0.0, a Tailscale 100.x address, or 127.0.0.1.[/yellow]"
+            )
         return False
     enabled, scope = mapping
     try:
@@ -5416,28 +5456,34 @@ def service_start(host: str | None, port: int | None):
 
 @service.command(name="stop")
 def service_stop():
-    """Stop the running jacked service.
+    """Stop only an instance proven by its private v2 control channel."""
+    from jacked.service.lifecycle import default_service_paths
 
-    Uses stop_process_graceful which waits for actual PID death and
-    escalates to SIGKILL if SIGTERM is ignored — pystray's AppKit
-    runloop on macOS can silently swallow Python signals.
-    """
-    from jacked.service import PID_FILE
-    from jacked.service.process import stop_process_graceful
-
-    result = stop_process_graceful(PID_FILE)
-    if not result["was_running"]:
+    paths = default_service_paths()
+    if not paths.manifest.exists():
+        if paths.legacy_pid.exists():
+            console.print(
+                "[red]Refusing PID-only stop:[/red] legacy service evidence exists, "
+                "but its process identity is unproven. Stop it from its tray menu, "
+                "then start the upgraded service."
+            )
+            sys.exit(1)
         console.print("[yellow]Service is not running[/yellow]")
         return
+    from jacked.service.ipc import ControlAction, send_native_control
 
-    if not result["died"]:
-        console.print("[red]Could not stop service — still alive after SIGKILL[/red]")
+    try:
+        response = send_native_control(paths.manifest, ControlAction.SHUTDOWN)
+    except (OSError, ValueError) as exc:
+        console.print(
+            f"[red]Could not authenticate the service control channel:[/red] "
+            f"{type(exc).__name__}. No process was signalled."
+        )
         sys.exit(1)
-
-    if result["killed"]:
-        console.print("[yellow][OK][/yellow] Service ignored SIGTERM — force-killed")
-    else:
-        console.print("[green][OK][/green] Stopped jacked service")
+    if not response.get("ok"):
+        console.print("[red]Service rejected the authenticated stop request[/red]")
+        sys.exit(1)
+    console.print("[green][OK][/green] Graceful stop accepted by owned service")
 
 
 @service.command(name="restart")
@@ -5458,12 +5504,8 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
 
     Use --foreground to run interactively (tray logs to your terminal).
     """
-    from jacked.service import DEFAULT_PORT, PID_FILE
-    from jacked.service.platform import ensure_native_lifecycle, native_restart
-    from jacked.service.process import (
-        stop_process_graceful,
-        wait_for_port_free,
-    )
+    from jacked.service import DEFAULT_PORT
+    from jacked.service.lifecycle import default_service_paths
 
     the_port = port or DEFAULT_PORT
 
@@ -5476,43 +5518,20 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     if host is not None and _persist_remote_access_from_host(host):
         host = None
 
-    # Preferred path: make sure native lifecycle (launchd plist / systemd
-    # unit) is configured, then delegate.  Skip kickstart when the plist
-    # was just installed — RunAtLoad already started the service fresh
-    # and kickstart would race the boot.
-    # `--foreground` is an explicit debug path — skip native handoff.
-    if not foreground:
-        ok_ens, state, reason_ens = ensure_native_lifecycle()
-        if ok_ens:
-            if state == "just_installed":
-                console.print(f"[green][OK][/green] {reason_ens}")
-                return
-            # already_installed → run native_restart for atomic kickstart
-            ok, reason = native_restart()
-            if ok:
-                console.print(f"[green][OK][/green] {reason}")
-                return
-            console.print(f"[yellow]native_restart failed: {reason}[/yellow]")
-        else:
-            console.print(f"[dim]native lifecycle unavailable: {reason_ens}[/dim]")
+    paths = default_service_paths()
+    if not foreground and paths.manifest.exists():
+        from jacked.service.lifecycle import (
+            handoff_owned_service,
+            provision_service_contract,
+        )
 
-    # 1. Stop any running service. stop_process_graceful waits for actual PID
-    # death and escalates to SIGKILL if SIGTERM is ignored (pystray's AppKit
-    # runloop can swallow signals until it yields to Python).
-    result = stop_process_graceful(PID_FILE)
-    if result["was_running"]:
-        if result["killed"]:
-            console.print("[yellow]Tray ignored SIGTERM — force-killed[/yellow]")
-        elif result["died"]:
-            console.print("[dim]Stopped existing service[/dim]")
-        if not result["died"]:
-            console.print("[red]Could not stop existing service — aborting restart[/red]")
-            sys.exit(1)
-        # Port can linger a beat after the PID dies. Probe loopback: the bind
-        # host is resolved by the child from the DB, and every plan covers it.
-        if not wait_for_port_free("127.0.0.1", the_port, timeout=10.0):
-            console.print(f"[red]Port {the_port} still in use — aborting start[/red]")
-            sys.exit(1)
+        spec, environment = provision_service_contract(paths=paths)
+        result = handoff_owned_service(spec, environment=environment, paths=paths)
+        if result.ok:
+            console.print(f"[green][OK][/green] Owned service handoff: {result.reason}")
+            return
+        console.print(f"[red]Owned service handoff failed:[/red] {result.reason}")
+        sys.exit(1)
 
     # 2. Start the new service.
     if foreground:
@@ -5531,39 +5550,55 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
 
 @service.command(name="status")
 def service_status():
-    """Show whether the jacked service is running."""
-    from jacked.service import PID_FILE
-    from jacked.service.process import read_pid, is_process_alive
+    """Show evidence-qualified service state and discovered endpoint."""
+    from jacked.service.lifecycle import default_service_paths, discover_service
     from jacked.service.platform import detect_autostart
 
-    info = read_pid(PID_FILE)
+    paths = default_service_paths()
+    endpoint = discover_service(paths)
     autostart = detect_autostart()
     autostart_label = "[green]enabled[/green]" if autostart else "[dim]disabled[/dim]"
+    if endpoint.source == "manifest":
+        from jacked.service.ipc import ControlAction, send_native_control
 
-    if info and is_process_alive(info["pid"]):
-        import time
-        pid_mtime = PID_FILE.stat().st_mtime
-        uptime_secs = time.time() - pid_mtime
-        hours, remainder = divmod(int(uptime_secs), 3600)
-        minutes, _ = divmod(remainder, 60)
-        uptime = f"{hours}h {minutes}m" if hours else f"{minutes}m"
-
-        console.print("[bold green]Jacked Service: running[/bold green]")
-        console.print(f"  PID:       {info['pid']}")
-        console.print(f"  Port:      {info['port']}")
-        console.print(f"  Uptime:    {uptime}")
-        console.print(f"  Autostart: {autostart_label}")
-        console.print(f"  Dashboard: http://127.0.0.1:{info['port']}")
+        try:
+            response = send_native_control(paths.manifest, ControlAction.STATUS)
+        except (OSError, ValueError) as exc:
+            console.print(
+                "[bold yellow]Jacked Service: ownership indeterminate[/bold yellow]"
+            )
+            console.print(
+                f"  Evidence:  manifest + failed control ({type(exc).__name__})"
+            )
+            console.print(f"  Autostart: {autostart_label}")
+            return
+        if response.get("ok"):
+            state = response["result"]
+            label = "quarantined" if state.get("quarantine") else "running"
+            console.print(f"[bold green]Jacked Service: {label}[/bold green]")
+            console.print(f"  Build:     {state.get('build_version')}")
+            console.print(f"  Protocol:  {state.get('protocol_version')}")
+            console.print(f"  Generation:{state.get('generation')}")
+            console.print(f"  Port:      {state.get('port')}")
+            console.print(f"  Autostart: {autostart_label}")
+            console.print(f"  Dashboard: http://127.0.0.1:{state.get('port')}")
+            return
+    if endpoint.source in {"manifest-invalid", "legacy-ambiguous"}:
+        console.print(
+            "[bold yellow]Jacked Service: ownership indeterminate[/bold yellow]"
+        )
+        console.print(f"  Evidence:  {endpoint.source} ({endpoint.reason})")
     else:
         console.print("[bold yellow]Jacked Service: stopped[/bold yellow]")
-        console.print(f"  Autostart: {autostart_label}")
-        if info:
-            from jacked.service.process import remove_pid
-            remove_pid(PID_FILE)
+    console.print(f"  Autostart: {autostart_label}")
 
 
 @service.command(name="install")
-@click.option("--host", default=None, help="Sets the dashboard Remote access setting: 0.0.0.0 enables all interfaces, a Tailscale 100.x IP enables Tailscale only, 127.0.0.1 disables remote access. Any other IP applies to this start only and is not persisted. The GUI toggle (Settings > Advanced) is the primary interface.")
+@click.option(
+    "--host",
+    default=None,
+    help="Sets the dashboard Remote access setting: 0.0.0.0 enables all interfaces, a Tailscale 100.x IP enables Tailscale only, 127.0.0.1 disables remote access. Other IPs are not applied to the host-free supervisor. The GUI toggle (Settings > Advanced) is the primary interface.",
+)
 @click.option("--port", default=None, type=int, help="Port to bind to (default: 8321)")
 def service_install(host: str | None, port: int | None):
     """Configure jacked to start automatically on login, and start it now."""
@@ -5572,25 +5607,89 @@ def service_install(host: str | None, port: int | None):
     # An explicit --host expresses intent about the persistent Remote access
     # mode: map it into the settings DB (overwriting existing keys), then
     # install host-free so every boot resolves the bind from the DB. An
-    # unmapped specific IP stays a one-shot for the immediate start only.
-    one_shot = None
-    if host is not None and not _persist_remote_access_from_host(host):
-        one_shot = host
-    _ensure_autostart_and_running(
-        port or DEFAULT_PORT, one_shot_host=one_shot, label="Service"
+    # unmapped IP cannot safely become an extra process beside the supervisor.
+    if host is not None:
+        _persist_remote_access_from_host(host, allow_one_shot=False)
+    _ensure_autostart_and_running(port or DEFAULT_PORT, label="Service")
+
+
+@service.command(name="recover")
+def service_recover():
+    """Safely reconcile owned service state without PID/port-based control."""
+    from jacked.service.lifecycle import (
+        default_service_paths,
+        discover_service,
+        install_native_owned,
+        native_artifact_path,
+        provision_service_contract,
+        reconcile_native_artifact,
+    )
+    from jacked.service.supervisors import ArtifactDisposition
+
+    paths = default_service_paths()
+    try:
+        spec, environment = provision_service_contract(paths=paths)
+        artifact_path = native_artifact_path(spec, paths=paths)
+        reconciliation = reconcile_native_artifact(
+            spec, artifact_path, environment=environment
+        )
+    except (OSError, ValueError) as exc:
+        console.print(
+            f"[red]Recovery could not establish ownership:[/red] {type(exc).__name__}. "
+            "No process or supervisor was changed."
+        )
+        raise SystemExit(1) from exc
+
+    if reconciliation.artifact.disposition is ArtifactDisposition.FOREIGN:
+        console.print(
+            "[red]Recovery refused a foreign or legacy supervisor artifact.[/red]"
+        )
+        console.print(f"  Artifact: {artifact_path}")
+        console.print(
+            "  Stop the legacy service from its tray, inspect and move this artifact "
+            "to a backup path, then run `jacked service recover` again. No PID or "
+            "port owner was signalled."
+        )
+        endpoint = discover_service(paths)
+        if endpoint.source == "manifest" and endpoint.port:
+            console.print(
+                f"  Owned service remains discoverable at http://127.0.0.1:{endpoint.port}"
+            )
+        raise SystemExit(1)
+
+    result = install_native_owned(spec, environment=environment, paths=paths)
+    if not result.ok:
+        console.print(f"[red]Recovery activation refused:[/red] {result.reason}")
+        raise SystemExit(1)
+    console.print(
+        f"[green][OK][/green] Recovered exact service generation {spec.generation[:12]}"
     )
 
 
 @service.command(name="uninstall")
 def service_uninstall():
-    """Remove jacked auto-start configuration."""
-    from jacked.service.platform import uninstall_autostart
+    """Remove the exact owned jacked auto-start configuration."""
+    from jacked.service.lifecycle import (
+        default_service_paths,
+        provision_service_contract,
+        uninstall_native_owned,
+    )
 
-    result = uninstall_autostart()
-    if "not supported" in result.lower() or "not found" in result.lower():
-        console.print(f"[yellow]{result}[/yellow]")
-    else:
-        console.print(f"[green][OK][/green] {result}")
+    paths = default_service_paths()
+    try:
+        spec, environment = provision_service_contract(paths=paths)
+        result = uninstall_native_owned(spec, environment=environment, paths=paths)
+    except (OSError, ValueError) as exc:
+        console.print(
+            f"[red]Safe service uninstall failed:[/red] {type(exc).__name__}. "
+            "No PID or port owner was signalled."
+        )
+        raise SystemExit(1) from exc
+    if not result.ok:
+        console.print(f"[red]Service uninstall refused:[/red] {result.reason}")
+        console.print("No PID or port owner was signalled.")
+        raise SystemExit(1)
+    console.print(f"[green][OK][/green] {result.reason}")
 
 
 HIGH_RISK_PREFIXES = {

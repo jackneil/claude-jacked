@@ -106,7 +106,9 @@ def _http_get_json(url: str, timeout: float = 2.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_send_json(url: str, method: str, payload: dict | None, timeout: float = 3.0) -> dict:
+def _http_send_json(
+    url: str, method: str, payload: dict | None, timeout: float = 3.0
+) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else b""
     req = urllib.request.Request(
         url,
@@ -193,21 +195,29 @@ def _render_status_icon(
             # Update-available badge: blue dot + white ring, top-right corner.
             # Sized to stay legible when macOS scales the icon to ~18px tall.
             cx, cy, r = size - 11, 11, 8
-            draw.ellipse([cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2], fill=(255, 255, 255, 255))
+            draw.ellipse(
+                [cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2],
+                fill=(255, 255, 255, 255),
+            )
             draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(59, 130, 246, 255))
         dot = _PROVIDER_DOT.get(provider)
         if dot:
             # Provider badge: brand dot + white ring, bottom-left (opposite the
             # update badge so they never overlap).
             cx, cy, r = 11, size - 11, 8
-            draw.ellipse([cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2], fill=(255, 255, 255, 255))
+            draw.ellipse(
+                [cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2],
+                fill=(255, 255, 255, 255),
+            )
             draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=dot)
         img.save(str(path))
         return str(path)
     except Exception:
         logger.exception(
             "Could not render menu-bar status icon (color=%s, update=%s, provider=%s)",
-            color, update, provider,
+            color,
+            update,
+            provider,
         )
         return None
 
@@ -268,7 +278,9 @@ if RUMPS_AVAILABLE:
             self._popover_web = None
             self._screen_observer = None
             self._auto_swap_enabled = False
-            self._current_icon_key = None  # (color, update) — avoid redundant icon writes
+            self._current_icon_key = (
+                None  # (color, update) — avoid redundant icon writes
+            )
             self._click_handler = None
             self._appkit_menu = None
             self._click_wired = False
@@ -305,13 +317,11 @@ if RUMPS_AVAILABLE:
             ]
 
             # Re-pin the panel when displays change (add/remove/resolution).
-            self._screen_observer = (
-                NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
-                    NSApplicationDidChangeScreenParametersNotification,
-                    None,
-                    NSOperationQueue.mainQueue(),
-                    lambda _note: self._reposition_panel(),
-                )
+            self._screen_observer = NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+                NSApplicationDidChangeScreenParametersNotification,
+                None,
+                NSOperationQueue.mainQueue(),
+                lambda _note: self._reposition_panel(),
             )
 
             # Immediate pill, then refresh + stop-watch + click-wiring timers.
@@ -724,7 +734,9 @@ if RUMPS_AVAILABLE:
                     script += f" subtitle {self._osa_quote(subtitle)}"
                 subprocess.run(
                     ["osascript", "-e", script],
-                    timeout=5, capture_output=True, check=False,
+                    timeout=5,
+                    capture_output=True,
+                    check=False,
                 )
             except Exception:
                 logger.debug("osascript notification failed", exc_info=True)
@@ -749,7 +761,10 @@ if RUMPS_AVAILABLE:
             outcome as a banner and refresh the menu text."""
             r = self._runner
             self._check_poll_count = getattr(self, "_check_poll_count", 0) + 1
-            if getattr(r, "_version_check_in_progress", False) and self._check_poll_count < 24:
+            if (
+                getattr(r, "_version_check_in_progress", False)
+                and self._check_poll_count < 24
+            ):
                 return
             timer.stop()
             self._refresh_version_menu()
@@ -757,7 +772,8 @@ if RUMPS_AVAILABLE:
                 self._mac_notify("Still checking PyPI — try again in a moment.")
             elif getattr(r, "_last_check_failed", False):
                 self._mac_notify(
-                    "Couldn't reach PyPI.", subtitle="Check your connection and try again."
+                    "Couldn't reach PyPI.",
+                    subtitle="Check your connection and try again.",
                 )
             else:
                 info = getattr(r, "_version_info", None) or {}

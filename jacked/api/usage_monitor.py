@@ -13,7 +13,6 @@ import logging
 import random
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -165,18 +164,17 @@ def _swap_backoff_remaining(now: float | None = None) -> float:
 
 
 def _read_active_account_id() -> int | None:
-    """Read the active account ID from the credential file stamp.
-
-    Returns the _jackedAccountId integer, or None if unreadable.
-    """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if not cred_path.exists() or cred_path.is_symlink():
-        return None
+    """Return only a consensus-resolved active credential identity."""
     try:
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
-        return data.get("_jackedAccountId")
-    except (json.JSONDecodeError, OSError):
+        from jacked.credentials.resolver import ResolverState
+        from jacked.credentials.runtime import resolve_active_identity
+
+        observation = resolve_active_identity()
+        if observation.state is ResolverState.RESOLVED:
+            return observation.identity.account_id
+    except (OSError, RuntimeError):
         return None
+    return None
 
 
 def _setting_bool(db, key: str, default: bool = False) -> bool:
@@ -350,6 +348,7 @@ def _trigger_for_reason(reason: str | None) -> str:
         REASON_PREFIX_FIVE_H,
         REASON_PREFIX_BURN_RATE,
     )
+
     if reason is None:
         return "tick"
     if reason.startswith(REASON_PREFIX_HIGHER_TIER):
@@ -383,7 +382,12 @@ def _compute_poll_interval(
     if active_id is None or db is None:
         return 60.0, "unknown"
     try:
-        from jacked.web.auth import compute_urgency_tier, _get_usage_state, _TIER_INTERVALS
+        from jacked.web.auth import (
+            compute_urgency_tier,
+            _get_usage_state,
+            _TIER_INTERVALS,
+        )
+
         acct = db.get_account(active_id)
         br = burn_rates.get(active_id)
         state = _get_usage_state(active_id)
@@ -514,7 +518,8 @@ def _candidate_staleness_override(acct: dict) -> bool:
             except (ValueError, TypeError):
                 pass
     return needs_7d_ping(
-        acct.get("cached_7d_resets_at"), acct.get("usage_cached_at"),
+        acct.get("cached_7d_resets_at"),
+        acct.get("usage_cached_at"),
     )
 
 
@@ -554,7 +559,8 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
         except Exception:
             logger.warning(
                 "Candidate usage: fetch for account %d failed or timed "
-                "out — skipping this tick", acct["id"],
+                "out — skipping this tick",
+                acct["id"],
             )
         await asyncio.sleep(1)
 
@@ -595,7 +601,10 @@ async def _drain_advisor_tick(
         if tier != TIER_T0:
             continue
         stranding = stranding_estimate(
-            acct, now_utc, active_start, active_end,
+            acct,
+            now_utc,
+            active_start,
+            active_end,
         )
         if stranding is None or stranding <= _DRAIN_ADVISOR_STRANDING_THRESHOLD:
             continue
@@ -604,16 +613,25 @@ async def _drain_advisor_tick(
             continue
         _drain_advisor_last_sent[acct["id"]] = now_ts
         deficit = deficit_vs_target(
-            acct, now=now_utc, active_start=active_start, active_end=active_end,
+            acct,
+            now=now_utc,
+            active_start=active_start,
+            active_end=active_end,
         )
         achievable = achievable_burn(
-            acct, now_utc, active_start, active_end,
+            acct,
+            now_utc,
+            active_start,
+            active_end,
         )
         logger.info(
             "Drain advisor: account %d (%s) expires with ~%.1f%% stranded "
             "capacity (deficit=%.1f%%, achievable=%.1f%%, resets_at=%s)",
-            acct["id"], acct.get("email", "?"), stranding,
-            deficit or 0.0, achievable or 0.0,
+            acct["id"],
+            acct.get("email", "?"),
+            stranding,
+            deficit or 0.0,
+            achievable or 0.0,
             acct.get("cached_7d_resets_at"),
         )
         if ws_registry:
@@ -647,6 +665,7 @@ def _build_tick_detail(
 ) -> dict:
     """Build the detail JSON for a decision log entry."""
     from jacked.web.auto_swap import format_account_label
+
     detail = {
         "active": {
             "id": active_acct.get("id"),
@@ -669,34 +688,45 @@ def _build_tick_detail(
     return detail
 
 
-def _write_swap_credentials(active_acct_id: int, target: dict, db) -> bool:
-    """Reconcile outgoing + write incoming credentials. Returns True when
-    the credential write committed.
+def _certified_auto_swap_engine(db):
+    """Return an explicitly installed transaction engine, never a guess.
 
-    SYNC by design — must run via ``asyncio.to_thread``:
-    ``acquire_claude_lock`` does time.sleep retries (~7.5s worst case) and
-    the credential stores shell out to keychain subprocesses; running this
-    on the event loop freezes every other coroutine for the duration.
+    The production Database intentionally has no such attribute today. A
+    capability bootstrap may install one only after exact-build capability
+    resolution. ``CredentialTransactionEngine.activate`` then rechecks the
+    writer fence before and after the write. Until that exists, auto-swap is
+    recommendation-only.
     """
-    from jacked.api.credential_helpers import (
-        acquire_claude_lock,
-        reconcile_credentials_from_live_store,
-        sync_credential_to_all_stores,
-    )
+    from jacked.credentials.transaction import CredentialTransactionEngine
 
-    reconcile_credentials_from_live_store(active_acct_id, db)
-    with acquire_claude_lock() as locked:
-        if not locked:
-            logger.warning(
-                "Swap: could not acquire lock for credential write "
-                "(account %d -> %d)", active_acct_id, target["id"],
-            )
-            return False
-        sync_credential_to_all_stores(
-            target["id"], target,
-            email=target.get("email"),
-        )
-        return True
+    engine = getattr(db, "_certified_auto_swap_engine", None)
+    return engine if isinstance(engine, CredentialTransactionEngine) else None
+
+
+def _auto_swap_request(target: dict):
+    """Build a background transaction request from one database account."""
+    import uuid
+
+    from jacked.api.credential_helpers import build_oauth_data
+    from jacked.credentials.canonical import CredentialPayload
+    from jacked.credentials.models import InteractionMode, SwitchContext
+    from jacked.credentials.transaction import SwitchRequest
+
+    payload = CredentialPayload.from_mapping(
+        {
+            "_jackedAccountId": target["id"],
+            "claudeAiOauth": build_oauth_data(target),
+        }
+    )
+    return SwitchRequest(
+        operation_id=f"auto-{uuid.uuid4().hex}",
+        account_id=target["id"],
+        email=target.get("email") or "",
+        organization_id=target.get("organization_uuid") or None,
+        payload=payload,
+        context=SwitchContext.AUTO_SWAP,
+        interaction=InteractionMode.BACKGROUND,
+    )
 
 
 async def _execute_swap(
@@ -709,19 +739,13 @@ async def _execute_swap(
     usage_5h: float | None,
     usage_7d: float | None,
     ws_registry=None,
+    transaction_engine=None,
 ) -> bool:
     """Execute a swap. Returns True if credential write succeeded.
 
-    Canonical ordering:
-    1. TOCTOU guard
-    2. Record swap as 'pending' + arm cooldown (audit trail survives
-       credential failure)
-    3. Credential write off the event loop (reconcile outgoing + write
-       incoming under cross-process lock, via asyncio.to_thread)
-    4. Resolve the pending row to 'committed'/'failed'; on success clean
-       up burn-rate state, reset failure backoff, record residency; on
-       failure arm the exponential failure backoff
-    5. Broadcast via WebSocket
+    The transaction repository owns pending/final journal state, committed
+    pointers, and swap audit publication. This wrapper owns only scheduling,
+    recommendation-only audits, runtime backoff, cache cleanup, and broadcasts.
     """
     global _last_swap_time, _last_committed_swap_time
     global _swap_failure_count, _last_swap_failure_at
@@ -730,57 +754,72 @@ async def _execute_swap(
     from jacked.web.auto_swap import format_account_label
 
     # 1. TOCTOU guard
-    current_active = _read_active_account_id()
+    current_active = await asyncio.to_thread(_read_active_account_id)
     if current_active != active_acct_id:
         logger.info(
             "Swap aborted: active account changed from %d to %s during evaluation",
-            active_acct_id, current_active,
+            active_acct_id,
+            current_active,
         )
         return False
 
-    # 2. Record swap (pending) + arm cooldown BEFORE credential write.
-    # residency_seconds = how long the outgoing account held the active
-    # slot — known at record time, immutable across the status update.
+    # No exact-build cooperative capability is registered in current
+    # production builds. Persist the recommendation, but do not fall back to
+    # the legacy unfenced writer. Global-uncooperative outcomes are likewise
+    # not safe for a background mutation.
+    transaction_engine = transaction_engine or _certified_auto_swap_engine(db)
+    if transaction_engine is None:
+        db.record_swap(
+            from_account_id=active_acct_id,
+            to_account_id=target["id"],
+            reason=reason,
+            trigger=trigger,
+            from_5h=usage_5h,
+            from_7d=usage_7d,
+            to_5h=target.get("cached_usage_5h"),
+            to_7d=target.get("cached_usage_7d"),
+            status="recommendation_only",
+        )
+        logger.info(
+            "Auto-swap recommendation only: account %d -> %d; no certified "
+            "cooperative credential capability/writer fence is installed",
+            active_acct_id,
+            target["id"],
+        )
+        if ws_registry:
+            await ws_registry.broadcast(
+                "auto_swap_recommended",
+                {
+                    "from_account_id": active_acct_id,
+                    "to_account_id": target["id"],
+                    "reason": reason,
+                },
+            )
+        return False
+
+    # Arm the in-memory attempt cooldown before invoking the transactional
+    # authority. The repository creates its durable pending row before writes.
     _last_swap_time = time.time()
-    residency_seconds = (
-        int(time.time() - _last_committed_swap_time)
-        if _last_committed_swap_time > 0 else None
-    )
-    swap_id = db.record_swap(
-        from_account_id=active_acct_id,
-        to_account_id=target["id"],
-        reason=reason,
-        trigger=trigger,
-        from_5h=usage_5h,
-        from_7d=usage_7d,
-        to_5h=target.get("cached_usage_5h"),
-        to_7d=target.get("cached_usage_7d"),
-        status="pending",
-        residency_seconds=residency_seconds,
-    )
 
-    # 3. Credential write OFF the event loop — acquire_claude_lock sleeps
-    # and the stores spawn keychain subprocesses (~7.5s worst case).
-    credential_ok = await asyncio.to_thread(
-        _write_swap_credentials, active_acct_id, target, db,
-    )
+    # Credential mutation runs off the event loop. The engine serializes
+    # writers and atomically finalizes journal + active/desired pointers.
+    from jacked.credentials.models import SwitchOutcome
 
-    # 4. Resolve pending row + sync DB active_account_id setting +
-    # broadcast WS event ONLY when credentials actually committed. The DB
-    # setting is the launch-time Layer-2 fallback (see jacked/launch.py);
-    # leaving it stale across auto-swaps means a credential-file recovery
-    # uses an out-of-date account. Without gating the broadcast on
-    # credential_ok, dashboards would display "swap completed" even when
-    # the filesystem still belongs to the old account — a misleading
-    # audit signal.
+    result = await asyncio.to_thread(
+        transaction_engine.activate, _auto_swap_request(target)
+    )
+    credential_ok = result.outcome in {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.COMMITTED_DEGRADED,
+    }
     if credential_ok:
         try:
-            db.update_swap_status(swap_id, "committed")
+            db.mark_global_sessions_pending()
         except Exception:
-            logger.exception(
-                "Failed to mark swap %s committed — credentials are "
-                "written; the row stays 'pending'", swap_id,
-            )
+            logger.exception("Failed to mark global sessions pending after auto-swap")
+
+    # Broadcast and runtime cleanup only after the repository committed.
+    if credential_ok:
         _last_committed_swap_time = time.time()
         _swap_failure_count = 0
         # Invalidate live credential cache (new account is active now) and
@@ -791,15 +830,6 @@ async def _execute_swap(
         _burn_rate_unchanged_ticks.pop(active_acct_id, None)
         _burn_rates.pop(target["id"], None)
         _burn_rate_unchanged_ticks.pop(target["id"], None)
-        try:
-            db.set_setting("active_account_id", target["id"])
-        except Exception:
-            logger.exception(
-                "Failed to sync active_account_id setting after swap "
-                "(target=%d) — credential file is authoritative; setting "
-                "may stay stale until next manual switch",
-                target["id"],
-            )
         if ws_registry:
             await ws_registry.broadcast(
                 "auto_swap_triggered",
@@ -814,13 +844,6 @@ async def _execute_swap(
                 },
             )
     else:
-        try:
-            db.update_swap_status(swap_id, "failed")
-        except Exception:
-            logger.exception(
-                "Failed to mark swap %s failed — row stays 'pending'",
-                swap_id,
-            )
         # Arm the exponential failure backoff; retry pacing for failed
         # attempts is governed by _swap_backoff_remaining, so un-arm the
         # committed-swap cooldown (it would mask the 60/120/240s windows).
@@ -828,9 +851,11 @@ async def _execute_swap(
         _last_swap_failure_at = time.time()
         _last_swap_time = 0.0
         logger.warning(
-            "Swap recorded but credential write failed — retry gated by "
+            "Credential transaction failed — retry gated by "
             "failure backoff, attempt %d (account %d -> %d)",
-            _swap_failure_count, active_acct_id, target["id"],
+            _swap_failure_count,
+            active_acct_id,
+            target["id"],
         )
         if ws_registry:
             await ws_registry.broadcast(
@@ -944,7 +969,7 @@ async def active_account_poll_loop(app):
             )
 
             # -- Active account ID ---------------------------------------
-            active_acct_id = _read_active_account_id()
+            active_acct_id = await asyncio.to_thread(_read_active_account_id)
             if active_acct_id is None:
                 logger.debug("Active poll: no active account in credential file")
                 await asyncio.sleep(60)
@@ -954,6 +979,7 @@ async def active_account_poll_loop(app):
             global _ticks_since_prune
             if not _initial_fetch_done:
                 from jacked.web.auth import fetch_usage as _prime_fetch
+
                 logger.info("Auto-swap: priming usage data for all accounts")
                 all_accts = db.list_accounts(include_inactive=False)
                 primed = 0
@@ -963,7 +989,8 @@ async def active_account_poll_loop(app):
                         attempted += 1
                         try:
                             await asyncio.wait_for(
-                                _prime_fetch(a["id"], db), timeout=30,
+                                _prime_fetch(a["id"], db),
+                                timeout=30,
                             )
                             primed += 1
                         except Exception:
@@ -974,7 +1001,9 @@ async def active_account_poll_loop(app):
                 if attempted == 0 or primed > 0:
                     _initial_fetch_done = True
                     logger.info(
-                        "Auto-swap: primed %d/%d accounts", primed, attempted,
+                        "Auto-swap: primed %d/%d accounts",
+                        primed,
+                        attempted,
                     )
 
             # -- Fetch usage (fresh token, bypasses cache) ---------------
@@ -982,14 +1011,17 @@ async def active_account_poll_loop(app):
             try:
                 await asyncio.wait_for(
                     fetch_usage(
-                        active_acct_id, db, access_token=effective_token,
+                        active_acct_id,
+                        db,
+                        access_token=effective_token,
                     ),
                     timeout=50,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Active poll: fetch_usage for account %d exceeded 50s "
-                    "— continuing tick with cached data", active_acct_id,
+                    "— continuing tick with cached data",
+                    active_acct_id,
                 )
 
             # -- Read active account data from DB ------------------------
@@ -1012,11 +1044,17 @@ async def active_account_poll_loop(app):
             # frontend receives _poll_interval / _poll_tier / _last_poll_at
             # and can count down accurately instead of guessing.
             _poll_interval, _poll_tier = _compute_poll_interval(
-                active_acct_id, db, _burn_rates,
+                active_acct_id,
+                db,
+                _burn_rates,
             )
             _poll_interval = _clamp_poll_interval(
-                _poll_interval, accounts, active_acct_id,
-                datetime.now(timezone.utc), active_start, active_end,
+                _poll_interval,
+                accounts,
+                active_acct_id,
+                datetime.now(timezone.utc),
+                active_start,
+                active_end,
                 _last_observed_tiers,
             )
 
@@ -1036,21 +1074,38 @@ async def active_account_poll_loop(app):
                 # Whitelist safe fields — new DB columns won't leak by default.
                 # Mirrors _account_to_response in routes/auth.py.
                 _WS_SAFE_FIELDS = {
-                    "id", "provider", "email", "organization_uuid",
+                    "id",
+                    "provider",
+                    "email",
+                    "organization_uuid",
                     "organization_name",
-                    "display_name", "expires_at", "scopes",
-                    "subscription_type", "rate_limit_tier", "has_extra_usage",
-                    "priority", "is_active", "is_deleted",
-                    "last_used_at", "cached_usage_5h", "cached_usage_7d",
-                    "cached_5h_resets_at", "cached_7d_resets_at",
-                    "usage_cached_at", "last_error", "last_error_at",
-                    "consecutive_failures", "last_validated_at",
-                    "validation_status", "created_at", "updated_at",
-                    "cc_expires_at", "auto_swap_enabled",
+                    "display_name",
+                    "expires_at",
+                    "scopes",
+                    "subscription_type",
+                    "rate_limit_tier",
+                    "has_extra_usage",
+                    "priority",
+                    "is_active",
+                    "is_deleted",
+                    "last_used_at",
+                    "cached_usage_5h",
+                    "cached_usage_7d",
+                    "cached_5h_resets_at",
+                    "cached_7d_resets_at",
+                    "usage_cached_at",
+                    "last_error",
+                    "last_error_at",
+                    "consecutive_failures",
+                    "last_validated_at",
+                    "validation_status",
+                    "created_at",
+                    "updated_at",
+                    "cc_expires_at",
+                    "auto_swap_enabled",
                 }
                 safe_acct = {
-                    k: v for k, v in active_acct.items()
-                    if k in _WS_SAFE_FIELDS
+                    k: v for k, v in active_acct.items() if k in _WS_SAFE_FIELDS
                 }
                 safe_acct["_poll_interval"] = int(_poll_interval)
                 safe_acct["_poll_tier"] = _poll_tier
@@ -1060,11 +1115,17 @@ async def active_account_poll_loop(app):
                 # fields, not the full AccountResponse the bulk path sends).
                 try:
                     from jacked.service.menubar_summary import binding_model_compact
+
                     _raw = active_acct.get("cached_usage_raw")
                     safe_acct["_binding_model"] = binding_model_compact(
                         json.loads(_raw) if _raw else None
                     )
-                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as _bm_err:
+                except (
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                    KeyError,
+                ) as _bm_err:
                     # WARNING, not DEBUG: the service runs at effective INFO, so a
                     # DEBUG line here would be invisible and a recurring parse
                     # failure of our own cached payload (schema drift / corruption)
@@ -1072,7 +1133,8 @@ async def active_account_poll_loop(app):
                     # is minutes, so this can't spam.
                     logger.warning(
                         "binding_model_compact failed for account %d: %s",
-                        active_acct_id, _bm_err,
+                        active_acct_id,
+                        _bm_err,
                     )
                     safe_acct["_binding_model"] = None
                 await _ws.broadcast(
@@ -1110,7 +1172,8 @@ async def active_account_poll_loop(app):
                 # Usage changed — update burn rate and reset tick counter
                 _burn_rate_unchanged_ticks[active_acct_id] = 0
                 br = update_burn_rate(
-                    _burn_rates, active_acct_id,
+                    _burn_rates,
+                    active_acct_id,
                     current_5h=current_5h_val,
                     current_7d=usage_7d or 0,
                 )
@@ -1133,7 +1196,9 @@ async def active_account_poll_loop(app):
             # same for stable data — only candidates we haven't fetched
             # in 10+ minutes get re-fetched.
             accounts = await _fetch_candidate_usage(
-                accounts, active_acct_id, db,
+                accounts,
+                active_acct_id,
+                db,
             )
 
             # Hysteresis: pass last-observed tier per non-active account
@@ -1165,20 +1230,26 @@ async def active_account_poll_loop(app):
             # evaluated (see TestActiveTierHysteresis in test_auto_swap).
             best_tier_damped = (
                 tier_for(
-                    best, now=now_utc,
+                    best,
+                    now=now_utc,
                     prev_tier=_last_observed_tiers.get(best["id"]),
                 )
-                if best is not None else None
+                if best is not None
+                else None
             )
             active_tier_damped = tier_for(
-                active_acct, now=now_utc,
+                active_acct,
+                now=now_utc,
                 prev_tier=_last_observed_tiers.get(active_acct_id),
             )
             _is_emerge_reason = reason is not None and reason.startswith(
                 (REASON_PREFIX_HIGHER_TIER, REASON_PREFIX_INTRA_TIER),
             )
-            if (_is_emerge_reason and best_tier_damped == TIER_T0
-                    and active_tier_damped >= TIER_T2):
+            if (
+                _is_emerge_reason
+                and best_tier_damped == TIER_T0
+                and active_tier_damped >= TIER_T2
+            ):
                 # Fast path: a >=2-tier gap (T0 best vs T2+/unclassified
                 # active) cannot be boundary jitter — skip the persistence
                 # requirement entirely.
@@ -1199,11 +1270,16 @@ async def active_account_poll_loop(app):
                 if cand["id"] == active_acct_id:
                     continue
                 cand_tier = tier_for(
-                    cand, now=now_utc,
+                    cand,
+                    now=now_utc,
                     prev_tier=_last_observed_tiers.get(cand["id"]),
                 )
                 cand_target = target_for_tier(
-                    cand_tier, cand, now_utc, active_start, active_end,
+                    cand_tier,
+                    cand,
+                    now_utc,
+                    active_start,
+                    active_end,
                 )
                 cand_usage_7d = cand.get("cached_usage_7d")
                 cand_deficit = (
@@ -1212,29 +1288,33 @@ async def active_account_poll_loop(app):
                     else None
                 )
                 cand_stranding = stranding_estimate(
-                    cand, now_utc, active_start, active_end,
+                    cand,
+                    now_utc,
+                    active_start,
+                    active_end,
                 )
-                _candidate_summaries.append({
-                    "id": cand["id"],
-                    "email": cand.get("email", ""),
-                    "label": format_account_label(cand),
-                    "5h": cand.get("cached_usage_5h"),
-                    "7d": cand.get("cached_usage_7d"),
-                    "tier": cand_tier,
-                    "target_7d": (
-                        round(cand_target, 1)
-                        if cand_target is not None else None
-                    ),
-                    "deficit": (
-                        round(cand_deficit, 1)
-                        if cand_deficit is not None else None
-                    ),
-                    "stranding": (
-                        round(cand_stranding, 1)
-                        if cand_stranding is not None else None
-                    ),
-                    "is_best": (best is not None and cand["id"] == best["id"]),
-                })
+                _candidate_summaries.append(
+                    {
+                        "id": cand["id"],
+                        "email": cand.get("email", ""),
+                        "label": format_account_label(cand),
+                        "5h": cand.get("cached_usage_5h"),
+                        "7d": cand.get("cached_usage_7d"),
+                        "tier": cand_tier,
+                        "target_7d": (
+                            round(cand_target, 1) if cand_target is not None else None
+                        ),
+                        "deficit": (
+                            round(cand_deficit, 1) if cand_deficit is not None else None
+                        ),
+                        "stranding": (
+                            round(cand_stranding, 1)
+                            if cand_stranding is not None
+                            else None
+                        ),
+                        "is_best": (best is not None and cand["id"] == best["id"]),
+                    }
+                )
 
             # Refresh hysteresis state + prune dead account ids.
             # The ACTIVE account is included in _last_observed_tiers so
@@ -1253,7 +1333,8 @@ async def active_account_poll_loop(app):
                     _drain_advisor_last_sent.pop(stale_id, None)
             for cand in accounts:
                 cand_tier = tier_for(
-                    cand, now=now_utc,
+                    cand,
+                    now=now_utc,
                     prev_tier=_last_observed_tiers.get(cand["id"]),
                 )
                 if cand_tier == TIER_EXCLUDED:
@@ -1271,18 +1352,24 @@ async def active_account_poll_loop(app):
             # decision below, so a failure must not abort the tick.
             try:
                 await _drain_advisor_tick(
-                    accounts, now_utc, active_start, active_end,
-                    ws_registry, _last_observed_tiers,
+                    accounts,
+                    now_utc,
+                    active_start,
+                    active_end,
+                    ws_registry,
+                    _last_observed_tiers,
                 )
             except Exception:
                 logger.debug("Drain advisor failed", exc_info=True)
 
             _residency_elapsed = time.time() - _last_committed_swap_time
-            _residency_gated = reason is not None and reason.startswith((
-                REASON_PREFIX_HIGHER_TIER,
-                REASON_PREFIX_INTRA_TIER,
-                REASON_PREFIX_BURN_RATE,
-            ))
+            _residency_gated = reason is not None and reason.startswith(
+                (
+                    REASON_PREFIX_HIGHER_TIER,
+                    REASON_PREFIX_INTRA_TIER,
+                    REASON_PREFIX_BURN_RATE,
+                )
+            )
 
             if reason is None:
                 _decision_action = "stay"
@@ -1303,8 +1390,7 @@ async def active_account_poll_loop(app):
                         if _emerged_tier_streak["tier"] == best_tier_damped
                         else 0
                     )
-                    if (best_tier_damped != TIER_EXCLUDED
-                            and streak_count > 0):
+                    if best_tier_damped != TIER_EXCLUDED and streak_count > 0:
                         _decision_trigger = "emergence_pending"
                         _decision_reason = (
                             f"stay: emergence streak "
@@ -1344,16 +1430,15 @@ async def active_account_poll_loop(app):
             elif best is None:
                 _decision_action = "stay"
                 _decision_trigger = "no_target"
-                _decision_reason = (
-                    f"swap warranted ({reason}) but no eligible target"
-                )
+                _decision_reason = f"swap warranted ({reason}) but no eligible target"
 
                 now_ts = time.time()
                 if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
                     logger.warning(
                         "Auto-swap needed but no eligible target "
                         "(active account %d at 5h=%.1f%%)",
-                        active_acct_id, usage_5h or 0,
+                        active_acct_id,
+                        usage_5h or 0,
                     )
                     _last_exhaustion_warning = now_ts
 
@@ -1380,7 +1465,8 @@ async def active_account_poll_loop(app):
                             "usage_7d": usage_7d,
                             "next_recovery_at": (
                                 next_recovery_at.isoformat()
-                                if next_recovery_at else None
+                                if next_recovery_at
+                                else None
                             ),
                         },
                     )
@@ -1399,15 +1485,25 @@ async def active_account_poll_loop(app):
                 logger.info(
                     "Auto-swap: switching from account %d (5h=%.1f%%) to "
                     "account %d (5h=%.1f%%) — %s [%s]",
-                    active_acct_id, usage_5h or 0,
-                    best["id"], best.get("cached_usage_5h") or 0,
-                    reason, trigger,
+                    active_acct_id,
+                    usage_5h or 0,
+                    best["id"],
+                    best.get("cached_usage_5h") or 0,
+                    reason,
+                    trigger,
                 )
+                transaction_engine = _certified_auto_swap_engine(db)
                 swap_committed = await _execute_swap(
-                    db, active_acct_id, active_acct, best,
-                    reason=reason, trigger=trigger,
-                    usage_5h=usage_5h, usage_7d=usage_7d,
+                    db,
+                    active_acct_id,
+                    active_acct,
+                    best,
+                    reason=reason,
+                    trigger=trigger,
+                    usage_5h=usage_5h,
+                    usage_7d=usage_7d,
                     ws_registry=ws_registry,
+                    transaction_engine=transaction_engine,
                 )
                 if swap_committed:
                     _emerged_tier_streak["tier"] = None
@@ -1423,6 +1519,14 @@ async def active_account_poll_loop(app):
                     _decision_trigger = trigger
                     _decision_target_id = best["id"]
                     _decision_reason = reason
+                elif transaction_engine is None:
+                    _decision_action = "recommend"
+                    _decision_trigger = "recommendation_only"
+                    _decision_target_id = best["id"]
+                    _decision_reason = (
+                        "swap recommended but automatic credential mutation "
+                        f"is not certified: {reason}"
+                    )
                 else:
                     # TOCTOU mismatch or credential lock failure. Don't
                     # clear streak/hysteresis — retry pacing is governed
@@ -1443,19 +1547,22 @@ async def active_account_poll_loop(app):
             # Cooldown does NOT mutate reason — only persistence does.
             cached_at = active_acct.get("usage_cached_at") or 0
             age_seconds = int(time.time()) - int(cached_at)
-            has_other_accounts = sum(
-                1 for a in accounts if a["id"] != active_acct_id
-            ) > 0
+            has_other_accounts = (
+                sum(1 for a in accounts if a["id"] != active_acct_id) > 0
+            )
             best_deficit_val = None
             if best is not None:
                 _bd = deficit_vs_target(
-                    best, now=now_utc,
-                    active_start=active_start, active_end=active_end,
+                    best,
+                    now=now_utc,
+                    active_start=active_start,
+                    active_end=active_end,
                 )
                 if _bd is not None:
                     best_deficit_val = _bd
             stalled_this_tick = _evaluate_stall(
-                decision_action=_decision_action, best=best,
+                decision_action=_decision_action,
+                best=best,
                 usage_cached_at_age_seconds=age_seconds,
                 has_other_accounts=has_other_accounts,
                 reason=reason,
@@ -1466,20 +1573,26 @@ async def active_account_poll_loop(app):
             # intended-behavior stays must not page at ERROR. T0/T1
             # candidates only — those are harvestable drain-to targets.
             if _same_tier_advisory_applies(
-                decision_action=_decision_action, best=best,
-                reason=reason, best_deficit=best_deficit_val,
+                decision_action=_decision_action,
+                best=best,
+                reason=reason,
+                best_deficit=best_deficit_val,
                 best_tier=best_tier_damped,
             ):
                 now_ts = time.time()
-                if (now_ts - _same_tier_advisory_last
-                        > _SAME_TIER_ADVISORY_COOLDOWN_SECONDS):
+                if (
+                    now_ts - _same_tier_advisory_last
+                    > _SAME_TIER_ADVISORY_COOLDOWN_SECONDS
+                ):
                     _same_tier_advisory_last = now_ts
                     logger.info(
                         "Same-tier deficit advisory: best id=%s "
                         "(tier=%s) is %.1f%% behind its tier target but "
                         "same-tier-never-overrides keeps the loop on "
                         "stay (active=%d)",
-                        best["id"], best_tier_damped, best_deficit_val,
+                        best["id"],
+                        best_tier_damped,
+                        best_deficit_val,
                         active_acct_id,
                     )
                     if ws_registry:
@@ -1504,7 +1617,8 @@ async def active_account_poll_loop(app):
             now_stalled = _consecutive_no_best_ticks >= _STALL_TICK_THRESHOLD
             if was_stalled and not now_stalled:
                 logger.info(
-                    "Auto-swap stall cleared (active=%d)", active_acct_id,
+                    "Auto-swap stall cleared (active=%d)",
+                    active_acct_id,
                 )
                 if ws_registry:
                     await ws_registry.broadcast(
@@ -1520,7 +1634,8 @@ async def active_account_poll_loop(app):
                         "Auto-swap stalled: %d consecutive ticks "
                         "(active=%d, last_fetch=%ss ago, best=%s, "
                         "best_deficit=%s)",
-                        _consecutive_no_best_ticks, active_acct_id,
+                        _consecutive_no_best_ticks,
+                        active_acct_id,
                         last_fetch_age,
                         best["id"] if best else None,
                         f"{best_deficit_val:.1f}%" if best_deficit_val else "n/a",
@@ -1550,7 +1665,8 @@ async def active_account_poll_loop(app):
                         escape_override=False,
                         candidates=_candidate_summaries,
                         proactive_target_id=None,
-                        cooldown_active=(time.time() - _last_swap_time) < _SWAP_COOLDOWN_SECONDS,
+                        cooldown_active=(time.time() - _last_swap_time)
+                        < _SWAP_COOLDOWN_SECONDS,
                         decision=_decision_action,
                     )
                     decision_id = db.record_decision(
@@ -1578,7 +1694,9 @@ async def active_account_poll_loop(app):
                                 },
                             )
                         except Exception:
-                            logger.debug("Decision log WS broadcast failed", exc_info=True)
+                            logger.debug(
+                                "Decision log WS broadcast failed", exc_info=True
+                            )
                 except Exception:
                     logger.debug("Failed to record decision", exc_info=True)
 
@@ -1599,10 +1717,15 @@ async def active_account_poll_loop(app):
 
         # Watchdog: detect if the event loop was blocked or suspended
         now_tick = time.time()
-        if _last_tick_at > 0 and _poll_interval > 0 and (now_tick - _last_tick_at) > 2 * _poll_interval:
+        if (
+            _last_tick_at > 0
+            and _poll_interval > 0
+            and (now_tick - _last_tick_at) > 2 * _poll_interval
+        ):
             logger.warning(
                 "Active poll loop delayed — last tick %ds ago, expected interval %ds",
-                int(now_tick - _last_tick_at), int(_poll_interval),
+                int(now_tick - _last_tick_at),
+                int(_poll_interval),
             )
         _last_tick_at = now_tick
 
@@ -1764,7 +1887,8 @@ async def all_accounts_refresh_loop(app):
                 except Exception:
                     logger.warning(
                         "All-accounts refresh: fetch_usage failed for account %s",
-                        acct.get("id"), exc_info=True,
+                        acct.get("id"),
+                        exc_info=True,
                     )
                 await asyncio.sleep(2)  # pace between accounts
             if refreshed:
@@ -1781,6 +1905,7 @@ async def all_accounts_refresh_loop(app):
 # -----------------------------------------------------------------------
 # Loop 2 — Full sweep (configurable interval, default 5min)
 # -----------------------------------------------------------------------
+
 
 async def full_sweep_loop(app):
     """Fetch usage for all non-active accounts and run window keeper.
@@ -1833,12 +1958,12 @@ async def full_sweep_loop(app):
             # Local time intentional: users configure active hours in
             # their local timezone (e.g. "06:00" means local 6am).
             now = datetime.now()
-            should_ping = (
-                is_active_hours(now, start=wk_start, end=wk_end)
-                or is_prewake_time(
-                    now, prewake=wk_prewake,
-                    check_interval_min=check_interval / 60,
-                )
+            should_ping = is_active_hours(
+                now, start=wk_start, end=wk_end
+            ) or is_prewake_time(
+                now,
+                prewake=wk_prewake,
+                check_interval_min=check_interval / 60,
             )
 
             if should_ping:
@@ -1868,7 +1993,8 @@ async def full_sweep_loop(app):
 
                     logger.info(
                         "Window keeper: pinging account %d (%s)%s%s",
-                        acct["id"], acct.get("email", "?"),
+                        acct["id"],
+                        acct.get("email", "?"),
                         " [5h expired]" if needs_5h else "",
                         " [7d reset]" if needs_7d else "",
                     )
@@ -1881,6 +2007,7 @@ async def full_sweep_loop(app):
                         # For the active account, reconcile from live creds
                         # instead (Claude Code keeps its own token fresh).
                         from jacked.api.credential_helpers import read_active_account_id
+
                         active_id_now = read_active_account_id()
                         if active_id_now == acct["id"]:
                             logger.info(
@@ -1889,20 +2016,35 @@ async def full_sweep_loop(app):
                                 acct["id"],
                             )
                             try:
-                                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+                                from jacked.api.credential_helpers import (
+                                    reconcile_credentials_from_live_store,
+                                )
+
                                 reconcile_credentials_from_live_store(acct["id"], db)
                                 fresh_acct = db.get_account(acct["id"])
-                                fresh_cc = fresh_acct.get("cc_access_token") if fresh_acct else None
+                                fresh_cc = (
+                                    fresh_acct.get("cc_access_token")
+                                    if fresh_acct
+                                    else None
+                                )
                                 if fresh_cc and fresh_cc != cc_at:
                                     success = await ping_account(fresh_cc)
                             except Exception:
-                                logger.exception("Window keeper reconcile failed for active account %d", acct["id"])
+                                logger.exception(
+                                    "Window keeper reconcile failed for active account %d",
+                                    acct["id"],
+                                )
                         else:
                             from jacked.web.auth import refresh_cc_token
+
                             refreshed = await refresh_cc_token(acct["id"], db)
                             if refreshed:
                                 fresh_acct = db.get_account(acct["id"])
-                                fresh_cc = fresh_acct.get("cc_access_token") if fresh_acct else None
+                                fresh_cc = (
+                                    fresh_acct.get("cc_access_token")
+                                    if fresh_acct
+                                    else None
+                                )
                                 if fresh_cc and fresh_cc != cc_at:
                                     success = await ping_account(fresh_cc)
                     if success:
@@ -1927,7 +2069,8 @@ async def full_sweep_loop(app):
                         # above — arm exponential backoff so the next sweeps
                         # skip this account instead of hammering it.
                         _backoff = _ping_backoff.setdefault(
-                            acct["id"], {"fails": 0, "skip_until": 0.0},
+                            acct["id"],
+                            {"fails": 0, "skip_until": 0.0},
                         )
                         _backoff["fails"] += 1
                         _delay = min(
@@ -1938,7 +2081,9 @@ async def full_sweep_loop(app):
                         logger.info(
                             "Window keeper: ping failed for account %d — "
                             "backing off %.0fs (%d consecutive failures)",
-                            acct["id"], _delay, _backoff["fails"],
+                            acct["id"],
+                            _delay,
+                            _backoff["fails"],
                         )
                     await asyncio.sleep(2)  # pacing
 

@@ -129,46 +129,33 @@ class TestBackgroundLoopSkipsActiveCC:
 class TestReadActiveAccountId:
     """The shared helper used by every skip site."""
 
-    @patch("jacked.api.credential_helpers.read_platform_credentials")
-    def test_returns_int_from_keychain_int(self, mock_read):
+    @patch("jacked.credentials.runtime.resolve_active_identity")
+    def test_returns_int_from_resolver_consensus(self, mock_resolve):
+        from jacked.credentials.models import CredentialIdentity
+        from jacked.credentials.resolver import ResolverObservation, ResolverState
         from jacked.api.credential_helpers import read_active_account_id
-        mock_read.return_value = {"_jackedAccountId": 7, "claudeAiOauth": {}}
+
+        mock_resolve.return_value = ResolverObservation(
+            ResolverState.RESOLVED,
+            CredentialIdentity(account_id=7),
+            ("authority:ok", "required_mirror:ok"),
+        )
         assert read_active_account_id() == 7
 
-    @patch("jacked.api.credential_helpers.read_platform_credentials")
-    def test_coerces_string_to_int(self, mock_read):
-        """Hand-edited JSON with '1' instead of 1 must still match."""
+    @patch("jacked.credentials.runtime.resolve_active_identity")
+    def test_conflict_returns_none(self, mock_resolve):
+        from jacked.credentials.models import CredentialIdentity
+        from jacked.credentials.resolver import ResolverObservation, ResolverState
         from jacked.api.credential_helpers import read_active_account_id
-        mock_read.return_value = {"_jackedAccountId": "5", "claudeAiOauth": {}}
-        assert read_active_account_id() == 5
 
-    @patch("jacked.api.credential_helpers.read_platform_credentials")
-    def test_rejects_zero(self, mock_read):
-        from jacked.api.credential_helpers import read_active_account_id
-        mock_read.return_value = {"_jackedAccountId": 0}
+        mock_resolve.return_value = ResolverObservation(
+            ResolverState.CONFLICT, CredentialIdentity(), ("stores-disagree",)
+        )
         assert read_active_account_id() is None
 
-    @patch("jacked.api.credential_helpers.read_platform_credentials")
-    def test_rejects_negative(self, mock_read):
-        from jacked.api.credential_helpers import read_active_account_id
-        mock_read.return_value = {"_jackedAccountId": -1}
-        assert read_active_account_id() is None
-
-    @patch("jacked.api.credential_helpers.read_platform_credentials")
-    def test_missing_stamp_returns_none(self, mock_read):
-        from jacked.api.credential_helpers import read_active_account_id
-        mock_read.return_value = {"claudeAiOauth": {}}  # no stamp key
-        assert read_active_account_id() is None
-
-    @patch("jacked.api.credential_helpers.read_platform_credentials")
-    def test_non_dict_returns_none(self, mock_read):
-        from jacked.api.credential_helpers import read_active_account_id
-        mock_read.return_value = "not a dict"
-        assert read_active_account_id() is None
-
-    @patch("jacked.api.credential_helpers.read_platform_credentials",
+    @patch("jacked.credentials.runtime.resolve_active_identity",
            side_effect=RuntimeError("keychain exploded"))
-    def test_exception_returns_none_no_raise(self, mock_read):
+    def test_exception_returns_none_no_raise(self, mock_resolve):
         from jacked.api.credential_helpers import read_active_account_id
         # Must NOT raise — callers depend on this being safe.
         assert read_active_account_id() is None

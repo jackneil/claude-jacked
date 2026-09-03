@@ -362,6 +362,157 @@ function initAccountMenuHandlers() {
     });
 }
 
+function showCredentialActivationResult(result, email) {
+    if (result && result.restart_required) {
+        showToast(
+            result.message || 'Switched the active Codex account. Restart Codex to pick it up.',
+            'info',
+            7000,
+        );
+    } else if (result.status === 'committed') {
+        showToast(result.message || `Default credentials verified for ${email}. Existing sessions update on next activity.`, 'success', 6000);
+    } else if (result.status === 'committed_degraded') {
+        showToast(result.message || `Default credentials verified for ${email}, but optional metadata is degraded.`, 'warning', 7000);
+    } else if (result.status === 'observed_target_unfenced') {
+        showToast(result.message || `Credentials observed for ${email}, but concurrent writers cannot be excluded. Restart Claude Code; existing sessions are unverified.`, 'warning', 8000);
+    } else {
+        showToast(result.message || `Credential activation returned ${result.status}.`, 'warning', 7000);
+    }
+}
+
+async function pollCredentialOperation(actionId, operationId, pageSessionId, email) {
+    const deadline = Date.now() + 120000;
+    let announcedRunning = false;
+    while (Date.now() < deadline) {
+        try {
+            const operation = await api.get(
+                `/api/auth/credential-operations/${actionId}`,
+                {
+                    timeout: 10000,
+                    headers: { 'X-Jacked-Page-Session': pageSessionId },
+                },
+            );
+            if (operation.state === 'complete' && operation.result) {
+                showCredentialActivationResult(operation.result, email);
+                return;
+            }
+            if (operation.state === 'expired') {
+                showToast(`Credential operation ${operation.operation_id} expired before a result was recorded.`, 'warning', 8000);
+                return;
+            }
+            if (!announcedRunning) {
+                showToast(`Credential operation ${operation.operation_id} is still running.`, 'info', 10000);
+                announcedRunning = true;
+            }
+        } catch (statusError) {
+            if (statusError.status === 404) {
+                showToast(`Credential operation ${operationId} was not found.`, 'warning', 8000);
+                return;
+            }
+            if (statusError.code !== 'TIMEOUT' && statusError.code !== 'NETWORK_ERROR') {
+                showToast(statusError.message, 'error', 8000);
+                return;
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+    showToast(`Credential operation ${operationId} is still running. Check again before starting another switch.`, 'warning', 10000);
+}
+
+async function activateAccountFromDashboard(id, email, sourceButton) {
+    if (window.jackedState._accountActionInFlight) {
+        showToast('Another action is still running. Finish it, or cancel the sign-in banner above, then try again.', 'warning', 4000);
+        return;
+    }
+    window.jackedState._accountActionInFlight = true;
+    if (sourceButton) {
+        sourceButton.disabled = true;
+        sourceButton.textContent = 'Switching\u2026';
+    }
+    const actionId = crypto.randomUUID();
+    const operationId = crypto.randomUUID();
+    let pageSessionId = sessionStorage.getItem('jacked-page-session-id');
+    if (!pageSessionId) {
+        pageSessionId = crypto.randomUUID();
+        sessionStorage.setItem('jacked-page-session-id', pageSessionId);
+    }
+    try {
+        const result = await api.post(
+            `/api/auth/accounts/${id}/use`,
+            undefined,
+            {
+                headers: {
+                    'X-Jacked-Action-Id': actionId,
+                    'X-Jacked-Operation-Id': operationId,
+                    'X-Jacked-Page-Session': pageSessionId,
+                },
+            },
+        );
+        showCredentialActivationResult(result, email);
+        await loadActiveCredential();
+    } catch (e) {
+        const outcome = e.payload || {};
+        if (e.code === 'TIMEOUT') {
+            await pollCredentialOperation(
+                actionId, operationId, pageSessionId, email
+            );
+        } else if (outcome.status === 'interactive_required') {
+            showToast(outcome.message || 'Credential access needs foreground confirmation. Try again and approve the prompt.', 'warning', 8000);
+        } else if (outcome.status === 'unsupported') {
+            showToast(outcome.message || 'This Claude build is not certified for credential switching.', 'error', 8000);
+        } else if (outcome.status === 'observed_target_unfenced') {
+            showToast(outcome.message || `Credentials observed for ${email}, but existing sessions are unverified.`, 'warning', 8000);
+        } else {
+            showToast(outcome.message || e.message, 'error');
+        }
+    } finally {
+        window.jackedState._accountActionInFlight = false;
+        await refreshAndRender();
+    }
+}
+
+function showAutoSwapRecommendation(data) {
+    const targetId = data.to_account_id;
+    if (!targetId) return;
+    const accounts = window.jackedState.accounts || [];
+    const target = accounts.find(account => account.id === targetId);
+    const targetLabel = data.to_label || (target && (target.display_name || target.email)) || `account ${targetId}`;
+    const reason = data.reason ? `: ${data.reason}` : '';
+    const existing = document.getElementById('swap-recommendation-banner');
+    if (existing) existing.remove();
+
+    const banner = document.createElement('div');
+    banner.id = 'swap-recommendation-banner';
+    banner.setAttribute('role', 'region');
+    banner.setAttribute('aria-label', 'Account switch recommendation');
+    banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-amber-950/95 border border-amber-600 rounded-lg px-5 py-3 shadow-lg max-w-xl flex items-center gap-3';
+    const text = document.createElement('span');
+    text.setAttribute('role', 'status');
+    text.setAttribute('aria-live', 'polite');
+    text.className = 'text-sm text-amber-100';
+    text.textContent = `Account switch recommended: ${targetLabel}${reason}`;
+    const useButton = document.createElement('button');
+    useButton.className = 'text-xs px-3 py-1.5 rounded bg-amber-500 text-slate-950 font-semibold hover:bg-amber-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200';
+    useButton.textContent = 'Use Account';
+    useButton.onclick = async function() {
+        await activateAccountFromDashboard(
+            String(targetId),
+            (target && target.email) || targetLabel,
+            useButton,
+        );
+        if (banner.parentNode) banner.remove();
+    };
+    const close = document.createElement('button');
+    close.className = 'text-amber-300 hover:text-white text-lg leading-none ml-auto rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200';
+    close.textContent = '\u00d7';
+    close.setAttribute('aria-label', 'Dismiss account switch recommendation');
+    close.onclick = function() { banner.remove(); };
+    banner.appendChild(text);
+    banner.appendChild(useButton);
+    banner.appendChild(close);
+    document.body.appendChild(banner);
+}
+
 function bindAccountEvents() {
     initAccountMenuHandlers();
     initPillHandlers();
@@ -474,42 +625,13 @@ function bindAccountEvents() {
         });
     });
 
-    // "Use Account" button — switches all Claude Code sessions to this account
+    // "Use Account" requests a default-credential activation. The server's
+    // evidence-qualified outcome determines what the UI may claim.
     document.querySelectorAll('.btn-use-account').forEach(btn => {
         btn.addEventListener('click', async () => {
-            if (window.jackedState._accountActionInFlight) {
-                // Long enough to read, and it names the way out: a two-second
-                // "in progress" toast was easy to miss, and a Use click that
-                // seemed to do nothing sent people to the reload button.
-                showToast('Another action is still running. Finish it, or cancel the sign-in banner above, then try again.', 'warning', 4000);
-                return;
-            }
             const id = btn.dataset.id;
             const email = btn.dataset.email || '';
-            window.jackedState._accountActionInFlight = true;
-            btn.disabled = true;
-            btn.textContent = 'Switching\u2026';
-            try {
-                const result = await api.post(`/api/auth/accounts/${id}/use`);
-                // Codex caches auth at startup, so the swap only takes effect
-                // after a restart — surface the server's instruction instead of
-                // a plain "switched" toast that looks like nothing happened.
-                if (result && result.restart_required) {
-                    showToast(
-                        result.message || 'Switched the active Codex account — restart Codex to pick it up.',
-                        'info',
-                        7000,
-                    );
-                } else {
-                    showToast(`Switched to ${email}`, 'success');
-                }
-                await loadActiveCredential();
-            } catch (e) {
-                showToast(e.message, 'error');
-            } finally {
-                window.jackedState._accountActionInFlight = false;
-                await refreshAndRender();
-            }
+            await activateAccountFromDashboard(id, email, btn);
         });
     });
 
