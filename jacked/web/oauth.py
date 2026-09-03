@@ -51,6 +51,14 @@ CALLBACK_PORT_RANGE = range(45100, 45200)
 MANUAL_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 BROWSER_TIMEOUT_SECONDS = 120  # localhost-callback flow
 MANUAL_TIMEOUT_SECONDS = 600  # a human copies a code across machines
+# How long a FINISHED flow stays pollable. The dashboard learns the verdict by
+# polling once a second, but the sign-in window takes the foreground and a
+# hidden tab's timers get throttled (Chrome: once a minute after five minutes
+# hidden, or frozen outright). Dropping the flow 30s after the callback meant a
+# late poll came back not_found: the tokens were stored, the banner said
+# "expired", and until the next reload the account-action guard stayed up and
+# every Use Account click was silently refused.
+FLOW_RETENTION_SECONDS = 300
 # Each code submission costs an outbound token-exchange call, and the dashboard
 # API is network-trusted (no per-request auth) — bound the attempts per flow.
 MAX_SUBMIT_ATTEMPTS = 10
@@ -424,8 +432,8 @@ class OAuthFlow:
                 self._status = "not_found"
                 self._error = "OAuth flow timed out (10 minutes)"
         finally:
-            # Clean up from global registry after a delay
-            await asyncio.sleep(30)
+            # Keep the verdict pollable for a while before forgetting the flow
+            await asyncio.sleep(FLOW_RETENTION_SECONDS)
             _active_flows.pop(self.flow_id, None)
 
     async def _wait_for_callback(self, runner: web.AppRunner) -> None:
@@ -437,8 +445,8 @@ class OAuthFlow:
             self._error = "OAuth flow timed out (2 minutes)"
         finally:
             await runner.cleanup()
-            # Clean up from global registry after a delay
-            await asyncio.sleep(30)
+            # Keep the verdict pollable for a while before forgetting the flow
+            await asyncio.sleep(FLOW_RETENTION_SECONDS)
             _active_flows.pop(self.flow_id, None)
 
     async def _handle_callback(self, request: web.Request) -> web.Response:

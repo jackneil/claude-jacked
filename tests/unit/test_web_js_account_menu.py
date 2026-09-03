@@ -635,6 +635,50 @@ out({ aOpen: isOpen(a), bOpen: isOpen(b),
         # The account-actions .btn-toggle handler ran untouched
         assert result["toasts"] == ["Account disabled"]
 
+    def test_reauth_row_starts_the_targeted_reauth_flow(self, tmp_path):
+        """The kebab Re-auth row must re-auth THIS account, like the token pill does.
+
+        Regression: the row called startAddAccountFlow(), the untargeted
+        add-account flow. With no account identity the browser launcher falls
+        back to an incognito window (no login hint, no per-account profile)
+        and the OAuth callback can create a duplicate row instead of updating
+        the one the user clicked. The pill handler already routed through
+        startReauthFlow(id, email); the menu row must do the same.
+        """
+        result = _run_behavior(tmp_path, _TWO_CARDS + r"""
+(async () => {
+    const calls = { reauth: [], add: [] };
+    global.startReauthFlow = (id, email) => { calls.reauth.push([id, email]); };
+    global.startAddAccountFlow = () => { calls.add.push(true); };
+    global.Swal = { fire: async () => ({ isConfirmed: true }) };
+    a.items['btn-reauth'].setAttribute('data-email', 'one@x.com');
+    __click(list, a.kebab);
+    __click(list, a.items['btn-reauth']);
+    await new Promise(r => setTimeout(r, 10));
+    out({ calls, open: isOpen(a) });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["calls"]["reauth"] == [["1", "one@x.com"]]
+        assert result["calls"]["add"] == []
+        assert result["open"] is False
+
+    def test_reauth_row_cancel_starts_nothing(self, tmp_path):
+        result = _run_behavior(tmp_path, _TWO_CARDS + r"""
+(async () => {
+    const calls = { reauth: [], add: [] };
+    global.startReauthFlow = (id, email) => { calls.reauth.push([id, email]); };
+    global.startAddAccountFlow = () => { calls.add.push(true); };
+    global.Swal = { fire: async () => ({ isConfirmed: false }) };
+    __click(list, a.kebab);
+    __click(list, a.items['btn-reauth']);
+    await new Promise(r => setTimeout(r, 10));
+    out({ calls });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["calls"] == {"reauth": [], "add": []}
+
     def test_item_handler_stop_propagation_cannot_strand_the_menu(self, tmp_path):
         # .btn-edit-label calls e.stopPropagation(); the close listener runs in
         # the capture phase precisely so that cannot leave the menu open.

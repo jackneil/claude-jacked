@@ -239,9 +239,11 @@ async function runOAuthFlow(opts) {
         // have claimed it while a submit was in flight.
         if (window.jackedState.flowPolling === pollTimer) window.jackedState.flowPolling = null;
         pollTimer = null;
+        document.removeEventListener('visibilitychange', pollOnVisible);
+        window.removeEventListener('focus', pollOnVisible);
     }
 
-    // End the flow on a local verdict: timeout, expiry, or a dead poll loop.
+    // End the flow on a local verdict: timeout, expiry, cancel, or a dead poll loop.
     function endWith(className, text) {
         if (terminal) return;
         terminal = true;
@@ -253,6 +255,29 @@ async function runOAuthFlow(opts) {
     // Spinner and title go up immediately; the mode-dependent parts wait for
     // the start response to say which mode we got.
     const textDiv = buildOAuthBanner(statusEl, opts.accent, opts.title);
+
+    // A way out that is not "reload the page". While a flow is pending, the
+    // shared guard refuses every other account action (Use Account included)
+    // with nothing but a short toast, so a sign-in window that was closed, or
+    // a verdict that never shows up, used to leave the dashboard looking dead
+    // until the flow timed out or the page was reloaded. Cancelling settles
+    // the banner locally; a sign-in the browser already finished is stored
+    // server-side regardless, and the refresh right after picks it up.
+    const bannerEl = textDiv.parentNode;
+    if (bannerEl) {
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'shrink-0 self-start text-xs text-slate-400 hover:text-white underline';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.setAttribute('data-oauth-cancel', 'true');
+        cancelBtn.addEventListener('click', () => {
+            endWith(OAUTH_WARN_CLASS, 'Sign-in cancelled. If you already approved it in the browser, the account updates on the next refresh.');
+            if (typeof loadAllData === 'function' && typeof rerenderAccountsView === 'function') {
+                loadAllData().then(() => rerenderAccountsView()).catch(() => {});
+            }
+        });
+        bannerEl.appendChild(cancelBtn);
+    }
 
     let start;
     try {
@@ -293,15 +318,17 @@ async function runOAuthFlow(opts) {
         if (poll.status === 'completed') {
             terminal = true;
             stopPolling();
+            // The server's verdict is what the guard was waiting on, so drop
+            // it now, not after the refresh: refreshAndRender fetches every
+            // account (and, on macOS, reconciles the active one through the
+            // Keychain), and a Use Account click during that window used to
+            // be refused as "another action in progress".
+            window.jackedState._accountActionInFlight = false;
             const success = msgs.success(poll);
             // Refresh FIRST: refreshAndRender re-renders the route wholesale,
             // which would wipe a banner drawn before it. Render the success
             // message into the fresh slot afterwards.
-            try {
-                await refreshAndRender();
-            } finally {
-                window.jackedState._accountActionInFlight = false;
-            }
+            await refreshAndRender();
             renderBanner(OAUTH_SUCCESS_CLASS, success.text, success.duration);
         } else if (poll.status === 'error') {
             endWith(OAUTH_ERROR_CLASS, msgs.failPrefix + (poll.error || 'Unknown error'));
@@ -340,15 +367,13 @@ async function runOAuthFlow(opts) {
         }
     });
 
-    let elapsed = 0;
+    // One poll of the server verdict. Shared by the interval and the
+    // visibility hook; overlapping calls collapse into the one in flight.
     let consecutiveErrors = 0;
-    pollTimer = setInterval(async () => {
-        elapsed++;
-        if (elapsed > maxWait) {
-            endWith(OAUTH_WARN_CLASS, msgs.timedOut(waitLabel));
-            return;
-        }
-
+    let pollInFlight = false;
+    async function pollOnce() {
+        if (terminal || pollInFlight) return;
+        pollInFlight = true;
         try {
             const poll = await api.get(`/api/auth/flow/${flowId}`);
             consecutiveErrors = 0;
@@ -362,10 +387,33 @@ async function runOAuthFlow(opts) {
                     endWith(OAUTH_ERROR_CLASS, msgs.checkFailed);
                 }
             }
+        } finally {
+            pollInFlight = false;
         }
+    }
+
+    // The sign-in window takes the foreground, and a hidden tab's timers are
+    // throttled or frozen, so the interval alone can leave the verdict unread
+    // for minutes after the callback landed. Coming back to the tab polls
+    // straight away instead.
+    function pollOnVisible() {
+        if (document.hidden) return;
+        pollOnce();
+    }
+
+    let elapsed = 0;
+    pollTimer = setInterval(() => {
+        elapsed++;
+        if (elapsed > maxWait) {
+            endWith(OAUTH_WARN_CLASS, msgs.timedOut(waitLabel));
+            return;
+        }
+        pollOnce();
     }, 1000);
 
     window.jackedState.flowPolling = pollTimer;
+    document.addEventListener('visibilitychange', pollOnVisible);
+    window.addEventListener('focus', pollOnVisible);
 }
 
 // ---------------------------------------------------------------------------
