@@ -368,36 +368,58 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
     server.run(sockets=socks)
 
 
-def _service_http_ok(port: int, timeout: float = 1.0) -> bool:
-    """True if the dashboard answers HTTP on 127.0.0.1:port.
-
-    Always probes loopback, never the bind host — the service may bind
-    0.0.0.0 (unroutable as a client target), but it's always reachable on
-    127.0.0.1 once up. Any HTTP response, including a 4xx/5xx, means the
-    server process is alive; only connection/timeout errors count as down.
-    """
-    import urllib.error as _ue
-    import urllib.request as _ur
-
-    try:
-        with _ur.urlopen(f"http://127.0.0.1:{port}/", timeout=timeout):
-            return True
-    except _ue.HTTPError:
-        return True  # server responded — it's up
-    except Exception:
-        return False
-
-
-def _wait_service_ready(port: int, timeout: float = 15.0) -> bool:
-    """Poll _service_http_ok until the dashboard answers or timeout elapses."""
+def _wait_owned_service_ready(
+    paths,
+    timeout: float = 15.0,
+    *,
+    expected_generation: str | None = None,
+    expected_build: str | None = None,
+    previous_instance: str | None = None,
+) -> dict | None:
+    """Wait for a manifest-authenticated running service and return its status."""
     import time as _time
+
+    from jacked.service.ipc import ControlAction, send_native_control
 
     deadline = _time.monotonic() + timeout
     while _time.monotonic() < deadline:
-        if _service_http_ok(port):
-            return True
-        _time.sleep(0.4)
-    return _service_http_ok(port)
+        try:
+            response = send_native_control(paths.manifest, ControlAction.STATUS)
+            status = response.get("result", {})
+            if (
+                response.get("ok")
+                and isinstance(status, dict)
+                and status.get("state") == "running"
+                and (
+                    expected_generation is None
+                    or status.get("generation") == expected_generation
+                )
+                and (
+                    expected_build is None
+                    or status.get("build_version") == expected_build
+                )
+                and (
+                    previous_instance is None
+                    or status.get("instance_id") != previous_instance
+                )
+            ):
+                return status
+        except (OSError, ValueError):
+            pass
+        _time.sleep(0.25)
+    return None
+
+
+def _manifest_is_proven_stale(path: Path) -> bool:
+    """True only when a valid manifest names a dead or identity-mismatched PID."""
+    from jacked.service.instance import process_identity, read_manifest
+
+    manifest = read_manifest(path)
+    try:
+        observed = process_identity(manifest.process.pid)
+    except (OSError, ProcessLookupError, ValueError):
+        return True
+    return observed != manifest.process
 
 
 def _spawn_service_detached(host: str | None, port: int):
@@ -495,49 +517,122 @@ def start(host: str | None, port: int | None, restart: bool):
     the tray disappears or the dashboard stops responding — you don't have
     to know whether it's down, just run `jacked start`.
     """
-    from jacked.service import DEFAULT_PORT, PID_FILE
+    from jacked.service import DEFAULT_PORT
+    from jacked.service.ipc import ControlAction, send_native_control
+    from jacked.service.lifecycle import (
+        default_service_paths,
+        handoff_owned_service,
+        provision_service_contract,
+    )
     from jacked.service.process import (
         is_port_available,
-        is_process_alive,
-        read_pid,
-        remove_pid,
-        stop_process_graceful,
-        wait_for_port_free,
     )
 
     the_port = port or DEFAULT_PORT
+    paths = default_service_paths()
 
-    info = read_pid(PID_FILE)
-    pid_alive = bool(info) and is_process_alive(info["pid"])
-    responding = _service_http_ok(the_port)
+    # A v2 manifest is the only authority for service control. Its native
+    # control channel proves possession of the manifest nonce and the restart
+    # handoff additionally waits for the owned lease to transfer.
+    if paths.manifest.exists():
+        if restart:
+            try:
+                stale = _manifest_is_proven_stale(paths.manifest)
+            except (OSError, ValueError):
+                console.print(
+                    "[red]The service manifest is invalid.[/red] No process was "
+                    "signalled. Run `jacked service recover`."
+                )
+                sys.exit(1)
+            if not stale:
+                spec, environment = provision_service_contract(paths=paths)
+                handoff = handoff_owned_service(
+                    spec, environment=environment, paths=paths
+                )
+                if handoff.ok:
+                    console.print(
+                        f"[green][OK][/green] Owned service handoff: {handoff.reason}"
+                    )
+                    return
+                console.print(
+                    "[red]Could not authenticate and restart the owned service.[/red] "
+                    f"{handoff.reason}. No process was signalled."
+                )
+                console.print(
+                    "[dim]Run `jacked service recover` to inspect ownership.[/dim]"
+                )
+                sys.exit(1)
+            console.print(
+                "[yellow]The prior owned service is stale; starting a new "
+                "instance.[/yellow]"
+            )
+        try:
+            response = send_native_control(paths.manifest, ControlAction.STATUS)
+        except (OSError, ValueError) as exc:
+            try:
+                stale = _manifest_is_proven_stale(paths.manifest)
+            except (OSError, ValueError):
+                console.print(
+                    "[red]The service manifest is invalid.[/red] No process was "
+                    "signalled. Run `jacked service recover`."
+                )
+                sys.exit(1)
+            if stale:
+                console.print(
+                    "[yellow]The prior owned service is stale; starting a new "
+                    "instance.[/yellow]"
+                )
+            else:
+                console.print(
+                    "[red]Could not authenticate the existing service.[/red] "
+                    f"{type(exc).__name__}. No process was signalled."
+                )
+                console.print(
+                    "[dim]Run `jacked service recover` to inspect ownership.[/dim]"
+                )
+                sys.exit(1)
+        else:
+            status = response.get("result", {})
+            if not response.get("ok") or status.get("state") != "running":
+                console.print(
+                    "[red]The owned service is present but degraded.[/red] "
+                    "No process was signalled."
+                )
+                console.print(
+                    "[dim]Run `jacked service recover` to inspect ownership.[/dim]"
+                )
+                sys.exit(1)
+            running_port = status.get("port") or the_port
+            console.print(
+                "[green][OK][/green] jacked already running "
+                f"(authenticated v2 service on :{running_port})"
+            )
+            console.print(f"[dim]http://127.0.0.1:{running_port}[/dim]")
+            return
 
-    # Already healthy → nothing to do (unless forced).
-    if pid_alive and responding and not restart:
+    # The old PID file is refusal-only evidence. PID reuse means it can never
+    # authorize signalling or file removal, even when the recorded PID exists.
+    from jacked.service.legacy import resolve_active_legacy_service
+
+    legacy = resolve_active_legacy_service(paths.legacy_pid)
+    if legacy is not None:
+        if not restart:
+            console.print(
+                "[yellow]A legacy jacked service is already running "
+                f"(PID {legacy.pid}, dashboard on :{legacy.port}).[/yellow]"
+            )
+            console.print(f"[dim]http://127.0.0.1:{legacy.port}[/dim]")
+            return
         console.print(
-            f"[green][OK][/green] jacked already running "
-            f"(PID {info['pid']}, tray + dashboard on :{info['port']})"
+            "[red]Refusing to control a legacy PID-only service.[/red] "
+            "No process was signalled."
         )
-        console.print(f"[dim]http://127.0.0.1:{info['port']}[/dim]")
-        return
-
-    # Tear down whatever's there if it's stuck, or if a restart was forced.
-    if pid_alive and (restart or not responding):
-        why = (
-            "restart requested"
-            if restart
-            else "process alive but dashboard not answering — restarting"
+        console.print(
+            "[dim]Quit the old tray, then retry `jacked start"
+            + (" --restart" if restart else "")
+            + "`.[/dim]"
         )
-        console.print(f"[dim]{why}...[/dim]")
-        result = stop_process_graceful(PID_FILE)
-        if result["was_running"] and not result["died"]:
-            console.print("[red]Couldn't stop the stuck service. Aborting.[/red]")
-            sys.exit(1)
-        # Probe loopback: the actual bind host is resolved in the detached
-        # child from the DB, and every plan covers loopback on this port.
-        wait_for_port_free("127.0.0.1", the_port, timeout=10.0)
-    elif info and not pid_alive:
-        remove_pid(PID_FILE)
-        console.print("[dim]Cleared a stale PID file left by a previous crash[/dim]")
+        sys.exit(1)
 
     # Port held by something that isn't us?
     if not is_port_available("127.0.0.1", the_port):
@@ -552,10 +647,16 @@ def start(host: str | None, port: int | None, restart: bool):
     # detached service resolves its bind from the DB / loopback default.
     log_path = _spawn_service_detached(host, the_port)
 
-    if _wait_service_ready(the_port, timeout=15.0):
+    from jacked import __version__ as current_build
+
+    status = _wait_owned_service_ready(
+        paths, timeout=15.0, expected_build=current_build
+    )
+    if status is not None:
+        running_port = status.get("port") or the_port
         console.print(
-            f"[green][OK][/green] jacked running — tray icon up, "
-            f"dashboard at http://127.0.0.1:{the_port}"
+            f"[green][OK][/green] jacked running - tray icon up, "
+            f"dashboard at http://127.0.0.1:{running_port}"
         )
     else:
         console.print(
@@ -674,12 +775,7 @@ def _run_upgrade_inline(
     """Inline upgrade for POSIX. Running binary gets replaced safely via inode."""
     import subprocess
     from jacked.findbin import find_bin
-    from jacked.service.process import (
-        is_process_alive,
-        read_pid,
-        stop_process_graceful,
-        wait_for_port_free,
-    )
+    from jacked.service.lifecycle import default_service_paths
 
     # Step 1: package upgrade (uv / pipx / pip, auto-detected).
     console.print(f"[dim]$ {label}[/dim]")
@@ -708,64 +804,34 @@ def _run_upgrade_inline(
             "Your settings.json may be in a partial state — check ~/.claude/settings.json.bak-*"
         )
 
-    # Step 3: stop the tray if it's running, then start fresh detached.
-    #
-    # We call stop_process_graceful() directly — not `jacked service stop` —
-    # because the subprocess version sends SIGTERM and returns without
-    # waiting, and pystray's AppKit runloop on macOS can swallow SIGTERM.
-    # The upgrade must not move on until the old PID is actually dead,
-    # otherwise the detached `service start` below hits "port in use" and
-    # the user is left with the pre-upgrade tray still running.
+    # Step 3: delegate restart to the newly installed CLI. Only its v2
+    # manifest + authenticated control channel may authorize a handoff.
     if skip_service:
         console.print("\n[dim]Skipping service restart (--skip-service)[/dim]")
     else:
-        info = read_pid(pid_file)
-        was_running = bool(info) and is_process_alive(info["pid"])
-        if was_running:
-            console.print(f"\n[dim]$ stopping service (PID {info['pid']})[/dim]")
-            result = stop_process_graceful(pid_file)
-            if not result["died"]:
-                console.print(
-                    f"[red]Could not stop PID {info['pid']} — port {port} may still be in use.[/red]"
-                )
-                console.print(
-                    "[dim]Run manually: "
-                    f"kill -9 {info['pid']}   then:   {jacked} service start[/dim]"
-                )
-                sys.exit(1)
-            if result["killed"]:
-                console.print(
-                    "[yellow]Tray ignored SIGTERM — force-killed.[/yellow]"
-                )
-            # Port can linger a beat after the PID dies (TIME_WAIT-ish).
-            if not wait_for_port_free(host, port, timeout=10.0):
-                console.print(
-                    f"[red]Port {port} still in use after stop — aborting start.[/red]"
-                )
-                console.print(
-                    f"[dim]Investigate with: lsof -iTCP:{port} -sTCP:LISTEN[/dim]"
-                )
-                sys.exit(1)
+        paths = default_service_paths()
+        from jacked.service.legacy import resolve_active_legacy_service
 
-        # Start detached — the tray must survive this upgrade process exiting.
-        console.print(f"\n[dim]$ {jacked} service start  (detached)[/dim]")
-        from jacked.service import CLAUDE_DIR
-        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = CLAUDE_DIR / "jacked-service.log"
-        try:
-            log_fh = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
-            subprocess.Popen(
-                [jacked, "service", "start"],
-                stdin=subprocess.DEVNULL,
-                stdout=log_fh,
-                stderr=log_fh,
-                start_new_session=True,
-                close_fds=True,
+        legacy = resolve_active_legacy_service(pid_file)
+        legacy_only = not paths.manifest.exists() and legacy is not None
+        if legacy_only:
+            console.print(
+                "\n[yellow]Package upgraded, but the running legacy tray cannot "
+                "be authenticated safely.[/yellow] No process was signalled."
             )
-            console.print(f"[dim]Logs: {log_path}[/dim]")
-        except Exception as exc:
-            console.print(f"[yellow]Could not spawn detached service: {exc}[/yellow]")
-            console.print(f"[dim]Run manually: {jacked} service start[/dim]")
+            console.print(
+                f"[dim]Quit the old tray, then run `{jacked} service start`.[/dim]"
+            )
+        else:
+            console.print(f"\n[dim]$ {jacked} service restart[/dim]")
+            result = subprocess.run([jacked, "service", "restart"])
+            if result.returncode != 0:
+                console.print(
+                    "[yellow]Package upgraded, but the owned service restart "
+                    f"failed (exit {result.returncode}).[/yellow]"
+                )
+                console.print(f"[dim]Run manually: {jacked} service restart[/dim]")
+                sys.exit(result.returncode or 1)
 
     console.print("\n[green][OK][/green] Upgrade complete.")
 
@@ -3462,10 +3528,10 @@ def _ensure_autostart_and_running(
     from jacked.service.lifecycle import (
         default_service_paths,
         discover_service,
+        inspect_native_artifact,
         install_native_owned,
         native_artifact_path,
         provision_service_contract,
-        reconcile_native_artifact,
         spawn_exact_service,
     )
     from jacked.service.instance import read_manifest
@@ -3480,12 +3546,12 @@ def _ensure_autostart_and_running(
         if endpoint.source == "manifest":
             existing = read_manifest(paths.manifest)
             if existing.supervisor == SupervisorKind.MANUAL.value:
-                reconciled = reconcile_native_artifact(
+                inspected = inspect_native_artifact(
                     spec,
                     native_artifact_path(spec, paths=paths),
                     environment=environment,
                 )
-                if reconciled.artifact.disposition is ArtifactDisposition.FOREIGN:
+                if inspected.artifact.disposition is ArtifactDisposition.FOREIGN:
                     console.print(
                         "[red]Error:[/red] supervisor artifact is foreign; "
                         "run `jacked service recover`"
@@ -3520,8 +3586,18 @@ def _ensure_autostart_and_running(
             f"[red]Error:[/red] safe service install refused: {result.reason}"
         )
         return
-    endpoint = discover_service(paths)
-    port_label = endpoint.port or port
+    ready = _wait_owned_service_ready(
+        paths,
+        timeout=15.0,
+        expected_generation=spec.generation,
+    )
+    if ready is None:
+        console.print(
+            "[red]Error:[/red] native manager accepted the definition, but the "
+            "exact service generation did not become ready"
+        )
+        return
+    port_label = ready.get("port") or port
     console.print("[green][OK][/green] Autostart registered from exact ServiceSpec")
     console.print(
         f"[green][OK][/green] {label} activation requested -> "
@@ -5461,7 +5537,9 @@ def service_stop():
 
     paths = default_service_paths()
     if not paths.manifest.exists():
-        if paths.legacy_pid.exists():
+        from jacked.service.legacy import resolve_active_legacy_service
+
+        if resolve_active_legacy_service(paths.legacy_pid) is not None:
             console.print(
                 "[red]Refusing PID-only stop:[/red] legacy service evidence exists, "
                 "but its process identity is unproven. Stop it from its tray menu, "
@@ -5525,13 +5603,29 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
             provision_service_contract,
         )
 
-        spec, environment = provision_service_contract(paths=paths)
-        result = handoff_owned_service(spec, environment=environment, paths=paths)
-        if result.ok:
-            console.print(f"[green][OK][/green] Owned service handoff: {result.reason}")
-            return
-        console.print(f"[red]Owned service handoff failed:[/red] {result.reason}")
-        sys.exit(1)
+        try:
+            stale = _manifest_is_proven_stale(paths.manifest)
+        except (OSError, ValueError):
+            console.print(
+                "[red]The service manifest is invalid.[/red] Run "
+                "`jacked service recover`."
+            )
+            sys.exit(1)
+        if not stale:
+            spec, environment = provision_service_contract(paths=paths)
+            result = handoff_owned_service(
+                spec, environment=environment, paths=paths
+            )
+            if result.ok:
+                console.print(
+                    f"[green][OK][/green] Owned service handoff: {result.reason}"
+                )
+                return
+            console.print(f"[red]Owned service handoff failed:[/red] {result.reason}")
+            sys.exit(1)
+        console.print(
+            "[yellow]The prior owned service is stale; starting a replacement.[/yellow]"
+        )
 
     # 2. Start the new service.
     if foreground:
@@ -5543,21 +5637,38 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     # Detached - the tray must survive this command returning. Raw host stays
     # out of argv when None so the child re-resolves the bind from the DB.
     log_path = _spawn_service_detached(host, the_port)
+    from jacked import __version__ as current_build
 
-    console.print(f"[green][OK][/green] Started jacked service (detached) on :{the_port}")
-    console.print(f"[dim]Logs: {log_path}[/dim]")
+    status = _wait_owned_service_ready(
+        paths, timeout=15.0, expected_build=current_build
+    )
+    if status is None:
+        console.print("[red]Replacement service did not become ready.[/red]")
+        console.print(f"[dim]Logs: {log_path}[/dim]")
+        sys.exit(1)
+    running_port = status.get("port") or the_port
+    console.print(
+        f"[green][OK][/green] Started authenticated service on :{running_port}"
+    )
 
 
 @service.command(name="status")
 def service_status():
     """Show evidence-qualified service state and discovered endpoint."""
     from jacked.service.lifecycle import default_service_paths, discover_service
-    from jacked.service.platform import detect_autostart
+    from jacked.service.autostart import AutostartState
+    from jacked.service.platform import inspect_autostart
 
     paths = default_service_paths()
     endpoint = discover_service(paths)
-    autostart = detect_autostart()
-    autostart_label = "[green]enabled[/green]" if autostart else "[dim]disabled[/dim]"
+    autostart = inspect_autostart()
+    if autostart.state is AutostartState.OWNED_ENABLED:
+        autostart_label = "[green]enabled[/green]"
+    elif autostart.state in {AutostartState.ABSENT, AutostartState.OWNED_DISABLED}:
+        autostart_label = "[dim]disabled[/dim]"
+    else:
+        detail = f" ({autostart.reason})" if autostart.reason else ""
+        autostart_label = f"[yellow]{autostart.state.value}{detail}[/yellow]"
     if endpoint.source == "manifest":
         from jacked.service.ipc import ControlAction, send_native_control
 
@@ -5574,16 +5685,35 @@ def service_status():
             return
         if response.get("ok"):
             state = response["result"]
-            label = "quarantined" if state.get("quarantine") else "running"
-            console.print(f"[bold green]Jacked Service: {label}[/bold green]")
+            reported = state.get("state", "unknown")
+            label = (
+                "quarantined"
+                if reported == "running" and state.get("quarantine")
+                else reported
+            )
+            color = "green" if reported == "running" else "yellow"
+            console.print(f"[bold {color}]Jacked Service: {label}[/bold {color}]")
             console.print(f"  Build:     {state.get('build_version')}")
             console.print(f"  Protocol:  {state.get('protocol_version')}")
             console.print(f"  Generation:{state.get('generation')}")
             console.print(f"  Port:      {state.get('port')}")
             console.print(f"  Autostart: {autostart_label}")
-            console.print(f"  Dashboard: http://127.0.0.1:{state.get('port')}")
+            if reported == "degraded":
+                console.print(f"  Failure:   {state.get('failure') or 'unknown'}")
+                console.print(
+                    "  Recovery:  run `jacked service recover`; inspect "
+                    "~/.claude/jacked-tray.log"
+                )
+            if reported == "running":
+                console.print(f"  Dashboard: http://127.0.0.1:{state.get('port')}")
             return
-    if endpoint.source in {"manifest-invalid", "legacy-ambiguous"}:
+    if endpoint.source == "legacy":
+        console.print("[bold yellow]Jacked Service: legacy service running[/bold yellow]")
+        console.print(
+            f"  Evidence:  health fingerprint on 127.0.0.1:{endpoint.port}; "
+            "control unavailable"
+        )
+    elif endpoint.source in {"manifest-invalid", "legacy-ambiguous"}:
         console.print(
             "[bold yellow]Jacked Service: ownership indeterminate[/bold yellow]"
         )
@@ -5622,44 +5752,47 @@ def service_recover():
         install_native_owned,
         native_artifact_path,
         provision_service_contract,
-        reconcile_native_artifact,
+        quarantine_invalid_ownership,
     )
-    from jacked.service.supervisors import ArtifactDisposition
+    from jacked.service.instance import ServiceLeaseBusy
 
     paths = default_service_paths()
     try:
+        quarantined = quarantine_invalid_ownership(paths)
         spec, environment = provision_service_contract(paths=paths)
         artifact_path = native_artifact_path(spec, paths=paths)
-        reconciliation = reconcile_native_artifact(
-            spec, artifact_path, environment=environment
-        )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, ServiceLeaseBusy) as exc:
         console.print(
             f"[red]Recovery could not establish ownership:[/red] {type(exc).__name__}. "
             "No process or supervisor was changed."
         )
         raise SystemExit(1) from exc
-
-    if reconciliation.artifact.disposition is ArtifactDisposition.FOREIGN:
+    if quarantined is not None:
         console.print(
-            "[red]Recovery refused a foreign or legacy supervisor artifact.[/red]"
+            "[yellow]Quarantined invalid ownership evidence:[/yellow] "
+            f"{quarantined}"
         )
-        console.print(f"  Artifact: {artifact_path}")
-        console.print(
-            "  Stop the legacy service from its tray, inspect and move this artifact "
-            "to a backup path, then run `jacked service recover` again. No PID or "
-            "port owner was signalled."
-        )
-        endpoint = discover_service(paths)
-        if endpoint.source == "manifest" and endpoint.port:
-            console.print(
-                f"  Owned service remains discoverable at http://127.0.0.1:{endpoint.port}"
-            )
-        raise SystemExit(1)
 
     result = install_native_owned(spec, environment=environment, paths=paths)
     if not result.ok:
         console.print(f"[red]Recovery activation refused:[/red] {result.reason}")
+        console.print(f"  Artifact: {artifact_path}")
+        endpoint = discover_service(paths)
+        if endpoint.source == "manifest" and endpoint.port:
+            console.print(
+                f"  Owned service remains at http://127.0.0.1:{endpoint.port}"
+            )
+        raise SystemExit(1)
+    ready = _wait_owned_service_ready(
+        paths,
+        timeout=15.0,
+        expected_generation=spec.generation,
+    )
+    if ready is None:
+        console.print(
+            "[red]Recovery activation failed:[/red] the exact service generation "
+            "did not become ready."
+        )
         raise SystemExit(1)
     console.print(
         f"[green][OK][/green] Recovered exact service generation {spec.generation[:12]}"

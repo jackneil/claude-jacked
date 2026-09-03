@@ -47,6 +47,7 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
         # can't delete or overwrite the user's real PID file.
         ("jacked.service.tray", "PID_FILE", fake / "jacked-service.pid"),
         ("jacked.service.lifecycle", "CLAUDE_DIR", fake),
+        ("jacked.service.platform", "CLAUDE_DIR", fake),
     ]
 
     import importlib

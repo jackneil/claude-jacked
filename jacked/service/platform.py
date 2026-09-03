@@ -147,12 +147,21 @@ def _generate_windows_vbs(
 
 
 def detect_autostart() -> bool:
-    """Check if auto-start is currently configured."""
-    if sys.platform == "darwin":
-        return _get_launchd_plist_path().exists()
-    elif sys.platform == "win32":
-        return _get_windows_startup_path().exists()
-    return False
+    """Compatibility boolean backed by native-manager inspection."""
+    return inspect_autostart().enabled
+
+
+def inspect_autostart():
+    """Return typed native autostart state for safe UI and CLI decisions."""
+    from jacked.service.autostart import inspect_autostart as inspect
+
+    task = CLAUDE_DIR / "jacked-service-v2" / "supervisors" / "jacked-task.xml"
+    return inspect(
+        launchd_path=_get_launchd_plist_path(),
+        task_path=task,
+        legacy_vbs_path=_get_windows_startup_path(),
+        systemd_path=_get_systemd_user_unit_path(),
+    )
 
 
 def _service_is_running() -> bool:

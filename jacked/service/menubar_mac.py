@@ -815,17 +815,10 @@ if RUMPS_AVAILABLE:
                 rumps.quit_application()
 
         def _shutdown(self):
-            from jacked.service import PID_FILE
-            from jacked.service.process import remove_pid
-
             try:
                 self._runner._shutdown_uvicorn()
             except Exception:
                 logger.exception("uvicorn shutdown during quit failed")
-            try:
-                remove_pid(PID_FILE)
-            except Exception:
-                logger.exception("PID cleanup during quit failed")
             if self._screen_observer is not None:
                 try:
                     NSNotificationCenter.defaultCenter().removeObserver_(

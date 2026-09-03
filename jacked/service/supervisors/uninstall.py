@@ -11,13 +11,14 @@ from typing import Any
 
 from jacked.service.spec import ServiceSpec, SupervisorKind
 
-from . import (
+from ._artifacts import (
     ArtifactDisposition,
     SupervisorAction,
-    _extract_marker,
+    extract_marker,
     inspect_artifact,
-    render_for_spec,
 )
+from ._transition import SupervisorTransitionLease, TransitionBusy
+from . import render_for_spec
 
 
 def uninstall_owned_supervisor(
@@ -28,9 +29,25 @@ def uninstall_owned_supervisor(
     run: Any = subprocess.run,
     uid: int | None = None,
 ) -> SupervisorAction:
-    """Unregister a native definition only after proving its exact identity."""
+    """Unregister under the same service-scoped lease used by install/restart."""
 
     expected = render_for_spec(spec, environment=environment)
+    try:
+        with SupervisorTransitionLease(artifact_path, spec.service_id):
+            return _uninstall_locked(spec, artifact_path, expected, run, uid)
+    except TransitionBusy:
+        return _refused(artifact_path, "another native transition is active")
+    except OSError as exc:
+        return _refused(artifact_path, f"transition failed: {type(exc).__name__}")
+
+
+def _uninstall_locked(
+    spec: ServiceSpec,
+    artifact_path: Path,
+    expected,
+    run: Any,
+    uid: int | None,
+) -> SupervisorAction:
     inspection = inspect_artifact(artifact_path, expected)
     if inspection.disposition not in {
         ArtifactDisposition.MATCHING,
@@ -50,7 +67,7 @@ def uninstall_owned_supervisor(
     marker = (
         expected.marker
         if original is None
-        else _extract_marker(original, spec.supervisor)
+        else extract_marker(original, spec.supervisor)
     )
     if marker is None:
         return _refused(artifact_path, "supervisor ownership marker is invalid")
@@ -150,7 +167,7 @@ def _uninstall_task(spec, path, marker, run, common) -> SupervisorAction:
         return SupervisorAction(True, "uninstall", "Task Scheduler task was absent")
     if queried.returncode != 0:
         return _refused(path, f"Task Scheduler inspection exit {queried.returncode}")
-    registered = _extract_marker(queried.stdout.encode("utf-8"), spec.supervisor)
+    registered = extract_marker(queried.stdout.encode("utf-8"), spec.supervisor)
     if registered != marker:
         return _refused(path, "registered task identity is foreign")
     # /End returns 1 when no instance is running. Deletion is still required

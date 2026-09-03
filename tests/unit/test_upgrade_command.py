@@ -39,14 +39,13 @@ class TestUpgradeCommand:
     @patch("sys.platform", "darwin")
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
-    @patch("jacked.service.process.is_process_alive", return_value=False)
     @patch("jacked.service.process.read_pid", return_value=None)
     @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_upgrade_starts_detached_service_even_when_not_running(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find, mock_method,
+    def test_upgrade_delegates_restart_to_new_cli_when_not_running(
+        self, mock_run, mock_popen, mock_read_pid, mock_find, mock_method,
     ):
-        """Service wasn't running → still start it detached (user ran `upgrade` expecting it)."""
+        """The newly installed CLI owns all service restart decisions."""
         from jacked.cli import main
 
         mock_find.side_effect = lambda name: {
@@ -59,8 +58,8 @@ class TestUpgradeCommand:
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # Two blocking subprocess.run calls: uv install + jacked install
-        assert mock_run.call_count == 2
+        # Three blocking calls: package install, settings migration, v2 restart.
+        assert mock_run.call_count == 3
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
         assert "claude-jacked[tray]" in uv_args
@@ -68,15 +67,9 @@ class TestUpgradeCommand:
         assert "/fake/jacked" in install_args
         assert "install" in install_args
 
-        # One Popen call: detached `jacked service start`
-        assert mock_popen.call_count == 1
-        popen_args = mock_popen.call_args[0][0]
-        assert "/fake/jacked" in popen_args
-        assert "service" in popen_args and "start" in popen_args
-        # Must be detached
-        kwargs = mock_popen.call_args[1]
-        assert kwargs.get("start_new_session") is True
-        assert kwargs.get("stdin") is __import__("subprocess").DEVNULL
+        restart_args = mock_run.call_args_list[2][0][0]
+        assert restart_args == ["/fake/jacked", "service", "restart"]
+        mock_popen.assert_not_called()
 
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
@@ -125,68 +118,80 @@ class TestUpgradeCommand:
     @patch("sys.platform", "darwin")
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
-    @patch("jacked.service.process.wait_for_port_free", return_value=True)
-    @patch(
-        "jacked.service.process.stop_process_graceful",
-        return_value={"was_running": True, "died": True, "killed": False},
-    )
-    @patch("jacked.service.process.is_process_alive", return_value=True)
     @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
     @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_upgrade_stops_then_starts_detached_when_running(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_stop_graceful,
-        mock_wait_port, mock_find, mock_method,
+    def test_upgrade_v2_service_uses_new_cli_restart(
+        self, mock_run, mock_popen, mock_read_pid, mock_find, mock_method, tmp_path,
     ):
-        """When service is running: stop gracefully (in-process), wait for port, start detached."""
+        """A v2 manifest delegates the authenticated handoff to the new CLI."""
         from jacked.cli import main
+
+        manifest = tmp_path / "instance.json"
+        manifest.write_text("{}", encoding="utf-8")
+        paths = MagicMock(manifest=manifest)
         mock_find.side_effect = lambda name: {
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
 
-        runner = CliRunner()
-        result = runner.invoke(main, ["upgrade"])
+        with (
+            patch(
+                "jacked.service.lifecycle.default_service_paths",
+                return_value=paths,
+            ),
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
 
-        assert result.exit_code == 0
-        # 2 blocking runs: uv install + jacked install. stop is now in-process
-        # via stop_process_graceful (no subprocess shell-out).
-        assert mock_run.call_count == 2
-        mock_stop_graceful.assert_called_once()
-        mock_wait_port.assert_called_once()
-        # 1 detached Popen: jacked service start
-        assert mock_popen.call_count == 1
-        start_args = mock_popen.call_args[0][0]
-        assert "start" in start_args
-        assert mock_popen.call_args[1].get("start_new_session") is True
+        assert result.exit_code == 0, result.output
+        assert mock_run.call_args_list[2][0][0] == [
+            "/fake/jacked", "service", "restart"
+        ]
+        stop.assert_not_called()
+        remove.assert_not_called()
+        mock_popen.assert_not_called()
 
     @patch("sys.platform", "darwin")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
-    @patch(
-        "jacked.service.process.stop_process_graceful",
-        return_value={"was_running": True, "died": False, "killed": True},
-    )
     @patch("jacked.service.process.is_process_alive", return_value=True)
     @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
     @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_upgrade_aborts_when_stop_fails(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_stop_graceful,
-        mock_find,
+    def test_upgrade_live_legacy_pid_reports_manual_handoff_without_signal(
+        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
+        mock_method, tmp_path,
     ):
-        """If graceful stop (even with SIGKILL) can't kill the tray, abort before spawning start."""
+        """Legacy evidence never authorizes a signal or a competing tray."""
         from jacked.cli import main
+
+        paths = MagicMock(manifest=tmp_path / "missing-instance.json")
         mock_find.side_effect = lambda name: {
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
 
-        runner = CliRunner()
-        result = runner.invoke(main, ["upgrade"])
+        with (
+            patch(
+                "jacked.service.lifecycle.default_service_paths",
+                return_value=paths,
+            ),
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
 
-        assert result.exit_code != 0
+        assert result.exit_code == 0, result.output
+        assert "package upgraded" in result.output.lower()
+        assert "quit the old tray" in result.output.lower()
+        assert "service start" in result.output.lower()
+        assert mock_run.call_count == 2
+        stop.assert_not_called()
+        remove.assert_not_called()
         mock_popen.assert_not_called()
 
     @patch("sys.platform", "darwin")
@@ -234,15 +239,19 @@ class TestUpgradeCommand:
         mock_run.side_effect = [
             MagicMock(returncode=0),
             MagicMock(returncode=1),
+            MagicMock(returncode=0),
         ]
 
         runner = CliRunner()
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # 2 blocking runs (uv + failing jacked install), still attempts detached start
-        assert mock_run.call_count == 2
-        assert mock_popen.call_count == 1
+        # Migration remains non-fatal; the new CLI still owns the v2 restart.
+        assert mock_run.call_count == 3
+        assert mock_run.call_args_list[2][0][0] == [
+            "/fake/jacked", "service", "restart"
+        ]
+        mock_popen.assert_not_called()
 
 
 class TestUpgradeWindows:

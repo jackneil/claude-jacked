@@ -161,6 +161,297 @@ class TestServiceRunner:
         assert hasattr(runner, "_uvicorn_server")
         assert runner._uvicorn_server is None
 
+    def test_resolve_active_legacy_service_pid_ignores_stale_entry(self, monkeypatch):
+        from jacked.service.tray import ServiceRunner
+
+        monkeypatch.setattr(
+            "jacked.service.process.read_pid",
+            lambda *args, **kwargs: {"pid": 4242, "port": 8321},
+        )
+        monkeypatch.setattr(
+            "jacked.service.process.is_process_alive", lambda _pid: False
+        )
+
+        assert ServiceRunner._resolve_active_legacy_service_pid() is None
+
+    def test_guard_legacy_pid_or_exit_raises_when_live(self, monkeypatch):
+        from jacked.service.tray import ServiceRunner
+
+        monkeypatch.setattr(
+            "jacked.service.process.read_pid",
+            lambda *args, **kwargs: {"pid": 4242, "port": 8321},
+        )
+        monkeypatch.setattr(
+            "jacked.service.process.is_process_alive", lambda _pid: True
+        )
+        monkeypatch.setattr(
+            "jacked.service.legacy.probe_legacy_health", lambda *_args: True
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            ServiceRunner()._guard_legacy_pid_or_exit()
+        assert exc_info.value.code == 0
+
+    def test_run_claims_lease_then_yields_to_live_legacy_pid(self):
+        from jacked.service.tray import ServiceRunner
+
+        ownership = MagicMock()
+        with (
+            patch("jacked.service.lifecycle.provision_service_contract", return_value=(MagicMock(), {})),
+            patch("jacked.service.process.read_pid", return_value={"pid": 4242, "port": 8321}),
+            patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("jacked.service.legacy.probe_legacy_health", return_value=True),
+            patch(
+                "jacked.service.lifecycle.claim_service_ownership",
+                return_value=ownership,
+            ) as mock_claim,
+            patch.object(ServiceRunner, "_run") as mock_run,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                ServiceRunner().run()
+            assert exc_info.value.code == 0
+            mock_claim.assert_called_once()
+            ownership.close.assert_called_once_with()
+            mock_run.assert_not_called()
+
+    def test_run_lease_contention_is_clean_noop_for_every_starter(self):
+        from jacked.service.instance import ServiceLeaseBusy
+        from jacked.service.tray import ServiceRunner
+
+        with (
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(MagicMock(), {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.claim_service_ownership",
+                side_effect=ServiceLeaseBusy(
+                    "another process holds the service lease"
+                ),
+            ),
+            patch.object(ServiceRunner, "_run") as mock_run,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                ServiceRunner().run()
+            assert exc_info.value.code == 0
+            mock_run.assert_not_called()
+
+    def test_invalid_ownership_is_nonzero_for_manual_starter(self):
+        from jacked.service.instance import ServiceOwnershipInvalid
+        from jacked.service.spec import SupervisorKind
+        from jacked.service.tray import ServiceRunner
+
+        spec = MagicMock(supervisor=SupervisorKind.MANUAL)
+        with (
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.claim_service_ownership",
+                side_effect=ServiceOwnershipInvalid("invalid manifest"),
+            ),
+            patch.object(ServiceRunner, "_run") as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ServiceRunner().run()
+        assert exc_info.value.code != 0
+        assert "service recover" in str(exc_info.value)
+        mock_run.assert_not_called()
+
+    def test_cold_start_rechecks_legacy_pid_before_binding(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._ownership = MagicMock()
+        with (
+            patch.object(
+                runner, "_guard_legacy_pid_or_exit", side_effect=SystemExit(0)
+            ) as guard,
+            patch("jacked.service.bind.create_sockets") as create_sockets,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner._start_uvicorn(cold_start=True)
+        assert exc_info.value.code == 0
+        guard.assert_called_once_with()
+        create_sockets.assert_not_called()
+
+    def test_bind_race_with_legacy_jacked_listener_yields_instead_of_quarantine(self):
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._ownership = MagicMock()
+        plan = BindPlan(
+            mode="loopback",
+            addresses=("127.0.0.1",),
+            port=8321,
+            primary_host="127.0.0.1",
+        )
+        with (
+            patch.object(runner, "_guard_legacy_pid_or_exit"),
+            patch.object(
+                runner, "_legacy_jacked_listener_detected", return_value=True
+            ) as detected,
+            patch("jacked.service.bind.resolve_bind", return_value=plan),
+            patch(
+                "jacked.service.bind.create_sockets",
+                side_effect=OSError("address in use"),
+            ) as create_sockets,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner._start_uvicorn(cold_start=True)
+        assert exc_info.value.code == 0
+        detected.assert_called_once_with("127.0.0.1", 8321)
+        assert create_sockets.call_count == 1
+        runner._ownership.publish.assert_not_called()
+
+    def test_health_probe_requires_stale_private_pid_evidence(self):
+        from jacked.service.legacy import LegacyPidEvidence
+        from jacked.service.tray import ServiceRunner
+
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b'{"status":"ok","db":true}'
+        response.__enter__.return_value = response
+        stale = LegacyPidEvidence(pid=4242, port=8321, alive=False)
+        with (
+            patch("jacked.service.legacy.inspect_legacy_pid", return_value=stale),
+            patch("urllib.request.urlopen", return_value=response),
+        ):
+            assert ServiceRunner._legacy_jacked_listener_detected(
+                "127.0.0.1", 8321
+            ) is True
+
+        with patch("jacked.service.legacy.inspect_legacy_pid", return_value=None):
+            assert ServiceRunner._legacy_jacked_listener_detected(
+                "127.0.0.1", 8321
+            ) is False
+
+    def test_pystray_icon_is_not_created_until_bind_preflight_succeeds(self):
+        import jacked.service.tray as tray_module
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._ownership = MagicMock()
+        fake_pystray = MagicMock()
+        with (
+            patch.object(tray_module, "pystray", fake_pystray, create=True),
+            patch.object(tray_module, "_TRAY_AVAILABLE", True),
+            patch.object(tray_module, "_UVICORN_AVAILABLE", True),
+            patch.object(tray_module, "_mac_menubar_available", return_value=False),
+            patch.object(runner, "_start_uvicorn", side_effect=SystemExit(0)),
+            patch("jacked.service.platform.detect_autostart", return_value=True),
+            patch("signal.signal"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner._run()
+        assert exc_info.value.code == 0
+        fake_pystray.Icon.assert_not_called()
+
+    def test_pystray_icon_is_not_created_when_server_never_becomes_ready(self):
+        import jacked.service.tray as tray_module
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        fake_thread = MagicMock()
+        fake_pystray = MagicMock()
+        with (
+            patch.object(tray_module, "pystray", fake_pystray, create=True),
+            patch.object(tray_module, "_TRAY_AVAILABLE", True),
+            patch.object(tray_module, "_UVICORN_AVAILABLE", True),
+            patch.object(tray_module, "_mac_menubar_available", return_value=False),
+            patch.object(tray_module, "is_port_available", return_value=True),
+            patch.object(runner, "_start_uvicorn", return_value=fake_thread),
+            patch.object(runner, "_wait_for_ready", return_value=False),
+            patch("jacked.service.platform.detect_autostart", return_value=True),
+            patch("signal.signal"),
+            pytest.raises(SystemExit),
+        ):
+            runner._run()
+        fake_pystray.Icon.assert_not_called()
+        fake_thread.join.assert_called_once_with(timeout=5)
+
+    def test_autostart_toggle_uses_v2_lifecycle_not_legacy_writer(self):
+        from jacked.service.autostart import AutostartInspection, AutostartState
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        result = MagicMock(ok=True)
+        with (
+            patch("jacked.service.lifecycle.default_service_paths") as paths,
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(MagicMock(), {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.install_native_owned",
+                return_value=result,
+            ) as install_owned,
+            patch("jacked.service.lifecycle.uninstall_native_owned") as uninstall_owned,
+            patch(
+                "jacked.service.platform.inspect_autostart",
+                side_effect=[
+                    AutostartInspection(AutostartState.ABSENT),
+                    AutostartInspection(AutostartState.OWNED_ENABLED),
+                ],
+            ),
+            patch("jacked.service.platform.install_autostart") as legacy_install,
+        ):
+            runner._on_toggle_autostart()
+        install_owned.assert_called_once()
+        uninstall_owned.assert_not_called()
+        legacy_install.assert_not_called()
+        assert install_owned.call_args.kwargs["paths"] is paths.return_value
+        assert runner._autostart_enabled is True
+
+    def test_autostart_toggle_refuses_legacy_definition(self):
+        from jacked.service.autostart import AutostartInspection, AutostartState
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        before = AutostartInspection(AutostartState.LEGACY, "old plist")
+        with (
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(MagicMock(), {}),
+            ),
+            patch("jacked.service.lifecycle.install_native_owned") as install_owned,
+            patch("jacked.service.lifecycle.uninstall_native_owned") as uninstall_owned,
+            patch("jacked.service.platform.inspect_autostart", return_value=before),
+        ):
+            runner._on_toggle_autostart()
+        install_owned.assert_not_called()
+        uninstall_owned.assert_not_called()
+
+    def test_autostart_toggle_notifies_when_post_state_is_unknown(self):
+        from jacked.service.autostart import AutostartInspection, AutostartState
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._icon = MagicMock()
+        with (
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(MagicMock(), {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.uninstall_native_owned",
+                return_value=MagicMock(ok=True),
+            ),
+            patch(
+                "jacked.service.platform.inspect_autostart",
+                side_effect=[
+                    AutostartInspection(AutostartState.OWNED_ENABLED),
+                    AutostartInspection(AutostartState.UNKNOWN, "manager unavailable"),
+                ],
+            ),
+        ):
+            runner._on_toggle_autostart()
+
+        runner._icon.notify.assert_called_once()
+        assert "recover" in runner._icon.notify.call_args.args[0]
+
     # create=True: headless boxes never bind tray.pystray (backend resolution
     # fails without a display), and @patch resolves the target BEFORE the
     # in-body _skip_if_no_tray() can skip.
@@ -303,6 +594,8 @@ class TestServiceRunner:
             runner._on_restart()  # should not raise
         # Icon should show stopped state on failure
         assert runner._icon.icon is not None
+        assert runner._service_state == "degraded"
+        assert runner._lifecycle_failure == "restart failed after 3 attempts"
 
     def test_on_restart_aborts_when_port_does_not_free(self):
         """If the old uvicorn won't release the port, abort cleanly
@@ -319,6 +612,8 @@ class TestServiceRunner:
             runner._on_restart()
         start.assert_not_called()  # never even tried to bind
         assert runner._icon.icon is not None  # stopped icon shown
+        assert runner._service_state == "degraded"
+        assert runner._lifecycle_failure == "port did not become available"
 
     def test_on_restart_retries_on_transient_failure(self):
         """A first-attempt OSError should not give up — try again up to
@@ -1018,10 +1313,13 @@ class TestRestartHandlerRegistration:
             "jacked.service.tray.is_port_available", lambda *a, **k: True
         )
         monkeypatch.setattr("jacked.service.tray.write_pid", lambda *a, **k: None)
-        monkeypatch.setattr("jacked.service.tray.remove_pid", lambda *a, **k: None)
         monkeypatch.setattr(
             "jacked.service.platform.detect_autostart", lambda: False
         )
+        monkeypatch.setattr(
+            runner, "_start_uvicorn", lambda cold_start=False: MagicMock()
+        )
+        monkeypatch.setattr(runner, "_wait_for_ready", lambda timeout=15: True)
 
         import jacked.service.tray as tray_mod
         monkeypatch.setattr(tray_mod.signal, "signal", lambda *a, **k: None)

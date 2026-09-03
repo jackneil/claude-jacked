@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -31,7 +32,7 @@ from jacked.service.spec import ServiceSpec, SupervisorKind
 from jacked.service.supervisors import (
     ArtifactInspection,
     SupervisorAction,
-    reconcile_artifact,
+    inspect_artifact,
     render_for_spec,
     restart_owned_supervisor,
     install_owned_supervisor,
@@ -225,10 +226,71 @@ def discover_service(paths: ServicePaths | None = None) -> Discovery:
     return discover_endpoint(paths or default_service_paths())
 
 
+def quarantine_invalid_ownership(paths: ServicePaths) -> Path | None:
+    """Move a safely-owned invalid manifest aside while holding the v2 lease."""
+    from jacked.service.instance import ServiceLease, read_manifest
+
+    lease = ServiceLease(paths.lease)
+    lease.acquire()
+    try:
+        try:
+            read_manifest(paths.manifest)
+            return None
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            pass
+
+        status = paths.manifest.lstat()
+        unsafe = (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or bool(getattr(status, "st_file_attributes", 0) & 0x400)
+            or (
+                os.name == "posix"
+                and (status.st_uid != os.getuid() or status.st_mode & 0o077)
+            )
+        )
+        if unsafe:
+            raise ValueError(f"unsafe manifest requires manual backup: {paths.manifest}")
+
+        control_exists = paths.control.exists() or paths.control.is_symlink()
+        if control_exists:
+            control_status = paths.control.lstat()
+            if os.name == "posix" and (
+                not stat.S_ISSOCK(control_status.st_mode)
+                or control_status.st_uid != os.getuid()
+            ):
+                raise ValueError(
+                    f"unsafe control path requires manual backup: {paths.control}"
+                )
+
+        backup = paths.manifest.with_name(
+            f"{paths.manifest.name}.invalid-{time.time_ns()}"
+        )
+        os.replace(paths.manifest, backup)
+        if control_exists:
+            paths.control.unlink()
+        return backup
+    finally:
+        lease.release()
+
+
 @dataclass(frozen=True)
 class Reconciliation:
     artifact: ArtifactInspection
     path: Path
+
+
+def inspect_native_artifact(
+    spec: ServiceSpec,
+    path: Path,
+    *,
+    environment: dict[str, str],
+) -> Reconciliation:
+    """Inspect an artifact without mutating outside a supervisor transition."""
+    expected = render_for_spec(spec, environment=environment)
+    return Reconciliation(inspect_artifact(path, expected), path)
 
 
 def reconcile_native_artifact(
@@ -237,8 +299,13 @@ def reconcile_native_artifact(
     *,
     environment: dict[str, str],
 ) -> Reconciliation:
-    expected = render_for_spec(spec, environment=environment)
-    return Reconciliation(reconcile_artifact(path, expected), path)
+    """Compatibility name for the now read-only artifact inspection.
+
+    Native mutation must remain inside ``install_native_owned`` so every
+    artifact and manager change shares the cross-process transition lease.
+    """
+
+    return inspect_native_artifact(spec, path, environment=environment)
 
 
 def restart_native_owned(
@@ -351,16 +418,30 @@ def handoff_owned_service(
             return SupervisorAction(False, "handoff", "ownership became indeterminate")
         if current.instance_id != old.instance_id:
             if current.generation == spec.generation:
-                return SupervisorAction(True, "handoff", "supervisor started new build")
+                return _await_ready_generation(
+                    selected_paths,
+                    spec.generation,
+                    previous_instance=old.instance_id,
+                    timeout=timeout,
+                )
             return SupervisorAction(False, "handoff", "supervisor started stale build")
         time.sleep(0.05)
     else:
         return SupervisorAction(False, "handoff", "old ownership did not exit")
 
     artifact = native_artifact_path(spec, paths=selected_paths)
-    native = restart_native_owned(spec, artifact, environment=environment)
+    native = install_owned_supervisor(
+        spec,
+        artifact,
+        environment=environment,
+    )
     if native.ok:
-        return native
+        return _await_ready_generation(
+            selected_paths,
+            spec.generation,
+            previous_instance=old.instance_id,
+            timeout=timeout,
+        )
     if old.supervisor != SupervisorKind.MANUAL.value:
         return SupervisorAction(
             False,
@@ -370,7 +451,45 @@ def handoff_owned_service(
     manual = ServiceSpec(
         **{**spec.constructor_fields(), "supervisor": SupervisorKind.MANUAL}
     )
-    return spawn_exact_service(manual, environment=environment)
+    spawned = spawn_exact_service(manual, environment=environment)
+    if not spawned.ok:
+        return spawned
+    return _await_ready_generation(
+        selected_paths,
+        manual.generation,
+        previous_instance=old.instance_id,
+        timeout=timeout,
+    )
+
+
+def _await_ready_generation(
+    paths: ServicePaths,
+    generation: str,
+    *,
+    previous_instance: str,
+    timeout: float,
+) -> SupervisorAction:
+    """Require authenticated ready state from a new exact generation."""
+    from jacked.service.ipc import ControlAction, send_native_control
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = send_native_control(paths.manifest, ControlAction.STATUS)
+            status = response.get("result", {})
+        except (OSError, ValueError):
+            time.sleep(0.05)
+            continue
+        if (
+            response.get("ok")
+            and isinstance(status, dict)
+            and status.get("state") == "running"
+            and status.get("generation") == generation
+            and status.get("instance_id") != previous_instance
+        ):
+            return SupervisorAction(True, "handoff", "new generation is ready")
+        time.sleep(0.05)
+    return SupervisorAction(False, "handoff", "new generation did not become ready")
 
 
 __all__ = [
@@ -383,9 +502,11 @@ __all__ = [
     "discover_service",
     "inspect_service",
     "handoff_owned_service",
+    "quarantine_invalid_ownership",
     "install_native_owned",
     "native_artifact_path",
     "provision_service_contract",
+    "inspect_native_artifact",
     "reconcile_native_artifact",
     "restart_native_owned",
     "spawn_exact_service",

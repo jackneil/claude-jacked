@@ -28,6 +28,14 @@ from jacked.service.instance_storage import (
 from jacked.service.spec import ServiceSpec
 
 
+class ServiceLeaseBusy(RuntimeError):
+    """The singleton lease is already held by another live starter."""
+
+
+class ServiceOwnershipInvalid(RuntimeError):
+    """Persistent ownership evidence is unsafe to recover automatically."""
+
+
 class ServiceLease:
     """A non-blocking lock retained for the entire API process lifetime."""
 
@@ -46,7 +54,7 @@ class ServiceLease:
         key = os.path.realpath(self.path)
         with self._held_lock:
             if key in self._held_paths:
-                raise RuntimeError("this process already holds the service lease")
+                raise ServiceLeaseBusy("this process already holds the service lease")
             _ensure_private_directory(self.path.parent)
             handle = open(self.path, "a+b")
             try:
@@ -67,7 +75,9 @@ class ServiceLease:
                     os.fchmod(handle.fileno(), 0o600)
             except (OSError, BlockingIOError) as exc:
                 handle.close()
-                raise RuntimeError("another process holds the service lease") from exc
+                raise ServiceLeaseBusy(
+                    "another process holds the service lease"
+                ) from exc
             self._file = handle
             self._held_paths.add(key)
 
@@ -116,9 +126,23 @@ class ServiceOwnership:
         cls, *, spec: ServiceSpec, paths: ServicePaths, machine_id: str
     ) -> "ServiceOwnership":
         lease = ServiceLease(paths.lease)
-        lease.acquire()
+        try:
+            lease.acquire()
+        except ServiceLeaseBusy:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ServiceOwnershipInvalid(
+                "the private service lease is unsafe or unavailable"
+            ) from exc
         try:
             _clear_proven_stale_manifest(paths)
+        except Exception as exc:
+            lease.release()
+            if isinstance(exc, ServiceOwnershipInvalid):
+                raise
+            raise ServiceOwnershipInvalid(
+                "stale ownership state could not be recovered safely"
+            ) from exc
         except BaseException:
             lease.release()
             raise
@@ -167,7 +191,7 @@ def _clear_proven_stale_manifest(paths: ServicePaths) -> None:
     try:
         stale = read_manifest(paths.manifest)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
+        raise ServiceOwnershipInvalid(
             "an invalid instance manifest requires explicit recovery"
         ) from exc
     try:
@@ -175,14 +199,16 @@ def _clear_proven_stale_manifest(paths: ServicePaths) -> None:
     except (OSError, ProcessLookupError, ValueError):
         _remove_owned_stale_control(paths.control)
         if not remove_manifest_if_current(paths.manifest, stale.instance_id):
-            raise RuntimeError("stale manifest changed during recovery")
+            raise ServiceOwnershipInvalid("stale manifest changed during recovery")
         return
     if observed != stale.process:
         _remove_owned_stale_control(paths.control)
         if not remove_manifest_if_current(paths.manifest, stale.instance_id):
-            raise RuntimeError("stale manifest changed during recovery")
+            raise ServiceOwnershipInvalid("stale manifest changed during recovery")
         return
-    raise RuntimeError("an existing instance manifest still names a live process")
+    raise ServiceOwnershipInvalid(
+        "an existing instance manifest still names a live process"
+    )
 
 
 def _remove_owned_stale_control(path: Path) -> None:
@@ -191,9 +217,9 @@ def _remove_owned_stale_control(path: Path) -> None:
     except FileNotFoundError:
         return
     if not stat.S_ISSOCK(status.st_mode):
-        raise RuntimeError("stale control path is not a socket")
+        raise ServiceOwnershipInvalid("stale control path is not a socket")
     if os.name == "posix" and status.st_uid != os.getuid():
-        raise RuntimeError("stale control socket has the wrong owner")
+        raise ServiceOwnershipInvalid("stale control socket has the wrong owner")
     path.unlink()
 
 

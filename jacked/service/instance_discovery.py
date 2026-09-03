@@ -39,6 +39,10 @@ def inspect_instance(
                 reason="native supervisor is crash-looping",
             )
         if paths.legacy_pid.exists():
+            from jacked.service.legacy import resolve_active_legacy_service
+
+            if resolve_active_legacy_service(paths.legacy_pid) is None:
+                return Inspection(InspectState.STOPPED)
             return Inspection(
                 InspectState.LEGACY_JACKED,
                 reason="legacy PID evidence exists but is not controllable",
@@ -121,12 +125,11 @@ def discover_endpoint(
             return Discovery(None, None, "manifest-invalid", type(exc).__name__)
         return Discovery(manifest.bind.host, manifest.bind.port, "manifest")
     if paths.legacy_pid.exists():
-        return Discovery(
-            None,
-            None,
-            "legacy-ambiguous",
-            "legacy PID evidence suppresses fixed-port fallback",
-        )
+        from jacked.service.legacy import resolve_active_legacy_service
+
+        evidence = resolve_active_legacy_service(paths.legacy_pid, default_host)
+        if evidence is not None:
+            return Discovery(default_host, evidence.port, "legacy")
     return Discovery(default_host, default_port, "default")
 
 

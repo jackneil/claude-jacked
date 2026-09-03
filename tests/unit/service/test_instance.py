@@ -160,6 +160,30 @@ def test_manifest_presence_suppresses_legacy_port_fallback(tmp_path):
     assert endpoint.source == "manifest-invalid"
 
 
+def test_v2_compatibility_pid_is_not_legacy_instance_evidence(tmp_path):
+    paths = ServicePaths.in_directory(tmp_path)
+    paths.legacy_pid.write_text("123\n8321\njacked-v2\n")
+
+    assert inspect_instance(paths, _spec()).state is InspectState.STOPPED
+    endpoint = discover_endpoint(paths)
+    assert endpoint.source == "default"
+
+
+def test_reused_legacy_pid_without_jacked_health_is_not_legacy_evidence(
+    tmp_path, monkeypatch
+):
+    paths = ServicePaths.in_directory(tmp_path)
+    paths.legacy_pid.write_text("4242\n8321\n")
+    monkeypatch.setattr("jacked.service.process.is_process_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        "jacked.service.legacy.probe_legacy_health", lambda *_args: False
+    )
+
+    assert inspect_instance(paths, _spec()).state is InspectState.STOPPED
+    endpoint = discover_endpoint(paths)
+    assert endpoint.source == "default"
+
+
 def test_occupied_8321_reserves_dynamic_quarantine_port(monkeypatch):
     class FakeSocket:
         count = 0

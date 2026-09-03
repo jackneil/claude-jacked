@@ -1,7 +1,9 @@
-import os
 import hashlib
+import os
+import plistlib
+import subprocess
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
 import pytest
@@ -18,6 +20,7 @@ from jacked.service.supervisors import (
     restart_owned_supervisor,
 )
 from jacked.service.supervisors.uninstall import uninstall_owned_supervisor
+from jacked.service.supervisors._transition import SupervisorTransitionLease
 
 
 def _spec(kind, *, launcher_path="/opt/jacked/launcher-v2", launcher_hash="c" * 64):
@@ -114,9 +117,36 @@ def test_restart_never_invokes_supervisor_for_foreign_artifact(tmp_path):
     runner.assert_not_called()
 
 
+@pytest.mark.parametrize("operation", ["install", "restart", "uninstall"])
+def test_all_native_mutators_share_one_transition_lease(tmp_path, operation):
+    spec, environment, _, path = _installed_artifact(
+        tmp_path, SupervisorKind.SYSTEMD_USER
+    )
+    runner = Mock()
+
+    with SupervisorTransitionLease(path, spec.service_id):
+        if operation == "install":
+            result = install_owned_supervisor(
+                spec, path, environment=environment, run=runner
+            )
+        elif operation == "restart":
+            result = restart_owned_supervisor(
+                spec, path, environment=environment, run=runner
+            )
+        else:
+            result = uninstall_owned_supervisor(
+                spec, path, environment=environment, run=runner
+            )
+
+    assert result.ok is False
+    assert result.action == "refused"
+    assert "transition" in result.reason
+    runner.assert_not_called()
+
+
 def test_restart_invokes_exact_owned_supervisor(tmp_path):
     import hashlib
-    from unittest.mock import MagicMock, Mock
+    from unittest.mock import Mock
 
     launcher = tmp_path / "launcher"
     launcher.write_bytes(b"launcher")
@@ -131,7 +161,18 @@ def test_restart_invokes_exact_owned_supervisor(tmp_path):
     )
     path = tmp_path / "jacked.service"
     reconcile_artifact(path, artifact)
-    runner = Mock(return_value=MagicMock(returncode=0))
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"LoadState=loaded\nFragmentPath={path}\n"
+                    "NeedDaemonReload=no\n"
+                ),
+            ),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
     result = restart_owned_supervisor(
         spec,
         path,
@@ -139,7 +180,7 @@ def test_restart_invokes_exact_owned_supervisor(tmp_path):
         run=runner,
     )
     assert result.ok is True
-    assert runner.call_args.args[0] == [
+    assert runner.call_args_list[1].args[0] == [
         "systemctl",
         "--user",
         "restart",
@@ -161,7 +202,20 @@ def test_install_reconciles_before_systemd_activation(tmp_path):
         launcher_hash=hashlib.sha256(b"launcher").hexdigest(),
     )
     artifact = tmp_path / "jacked.service"
-    runner = Mock(return_value=SimpleNamespace(returncode=0, stdout=""))
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "LoadState=not-found\nFragmentPath=\n"
+                    "ActiveState=inactive\nUnitFileState=disabled\n"
+                ),
+            ),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
 
     result = install_owned_supervisor(
         spec,
@@ -172,18 +226,605 @@ def test_install_reconciles_before_systemd_activation(tmp_path):
 
     assert result.ok is True
     assert artifact.exists()
-    assert runner.call_args_list[0].args[0] == [
+    assert runner.call_args_list[1].args[0] == [
         "systemctl",
         "--user",
         "daemon-reload",
     ]
-    assert runner.call_args_list[1].args[0] == [
+    assert runner.call_args_list[2].args[0] == [
         "systemctl",
         "--user",
         "enable",
-        "--now",
         "jacked.service",
     ]
+    assert runner.call_args_list[3].args[0] == [
+        "systemctl",
+        "--user",
+        "restart",
+        "jacked.service",
+    ]
+
+
+def test_install_systemd_refuses_foreign_loaded_fragment_before_write(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.SYSTEMD_USER
+    )
+    previous = rendered.content.replace(
+        spec.generation.encode(), b"0" * len(spec.generation)
+    )
+    path.write_bytes(previous)
+    runner = Mock(
+        return_value=SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "LoadState=loaded\nFragmentPath=/tmp/foreign.service\n"
+                "ActiveState=active\nUnitFileState=enabled\n"
+            ),
+        )
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    assert result.ok is False
+    assert "identity differs" in result.reason
+    assert path.read_bytes() == previous
+    assert runner.call_count == 1
+
+
+def test_install_systemd_restores_old_generation_after_restart_failure(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.SYSTEMD_USER
+    )
+    previous = rendered.content.replace(
+        spec.generation.encode(), b"0" * len(spec.generation)
+    )
+    path.write_bytes(previous)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"LoadState=loaded\nFragmentPath={path}\n"
+                    "ActiveState=active\nUnitFileState=enabled\n"
+                ),
+            ),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    assert result.ok is False
+    assert "previous systemd state restored" in result.reason
+    assert path.read_bytes() == previous
+    assert runner.call_args_list[4].args[0][-1] == "daemon-reload"
+    assert runner.call_args_list[5].args[0][-2:] == ["enable", "jacked.service"]
+    assert runner.call_args_list[6].args[0][-2:] == ["restart", "jacked.service"]
+
+
+def test_install_task_refuses_while_legacy_startup_vbs_exists(tmp_path, monkeypatch):
+    spec, environment, _, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    appdata = tmp_path / "AppData" / "Roaming"
+    startup = (
+        appdata
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+    )
+    startup.mkdir(parents=True)
+    legacy = startup / "jacked.vbs"
+    legacy.write_text("legacy", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+    runner = Mock()
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    assert result.ok is False
+    assert "Startup VBS identity is foreign" in result.reason
+    runner.assert_not_called()
+
+
+def test_install_task_retires_known_legacy_vbs_and_runs_task(tmp_path, monkeypatch):
+    spec, environment, _, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    appdata = tmp_path / "AppData" / "Roaming"
+    legacy = (
+        appdata
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+        / "jacked.vbs"
+    )
+    legacy.parent.mkdir(parents=True)
+    legacy_content = (
+        'Set WshShell = CreateObject("WScript.Shell")\n'
+        'WshShell.Run """C:\\bin\\jacked.exe"" service start'
+        ' --port 8321", 0, False\n'
+    )
+    legacy.write_text(legacy_content, encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=1, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    assert result.ok is True
+    assert not legacy.exists()
+    assert legacy.with_name("jacked.vbs.pre-v2").read_text() == legacy_content
+    assert runner.call_args_list[1].args[0][:2] == ["schtasks.exe", "/Create"]
+    assert runner.call_args_list[2].args[0] == [
+        "schtasks.exe",
+        "/Run",
+        "/TN",
+        "ai.hank.jacked",
+    ]
+
+
+def test_install_task_foreign_registered_definition_never_changes_disk(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    previous = rendered.content.replace(
+        spec.generation.encode(), b"0" * len(spec.generation)
+    )
+    path.write_bytes(previous)
+    runner = Mock(return_value=SimpleNamespace(returncode=0, stdout="<Task />"))
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    assert result.ok is False
+    assert "registered task is foreign" in result.reason
+    assert path.read_bytes() == previous
+    assert runner.call_count == 1
+
+
+def test_install_task_run_failure_restores_stopped_task_and_artifact(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    previous = rendered.content.replace(
+        spec.generation.encode(), b"0" * len(spec.generation)
+    )
+    path.write_bytes(previous)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=0, stdout=previous.decode()),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=1, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    assert result.ok is False
+    assert "previous Task Scheduler state restored" in result.reason
+    assert path.read_bytes() == previous
+    assert runner.call_count == 5
+    assert not path.with_name(f".{path.name}.transition-backup").exists()
+
+
+def test_install_task_reports_and_retains_failed_rollback_evidence(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    previous = rendered.content.replace(
+        spec.generation.encode(), b"0" * len(spec.generation)
+    )
+    path.write_bytes(previous)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=0, stdout=previous.decode()),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    backup = path.with_name(f".{path.name}.transition-backup")
+    assert result.ok is False
+    assert "rollback failed" in result.reason
+    assert str(backup) in result.reason
+    assert backup.read_bytes() == previous
+    assert path.read_bytes() == previous
+
+
+def test_ambiguous_task_create_is_deleted_before_legacy_vbs_returns(
+    tmp_path, monkeypatch
+):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    appdata = tmp_path / "AppData" / "Roaming"
+    legacy = (
+        appdata
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+        / "jacked.vbs"
+    )
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        'Set WshShell = CreateObject("WScript.Shell")\n'
+        'WshShell.Run """C:\\bin\\jacked.exe"" service start'
+        ' --port 8321", 0, False\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("APPDATA", str(appdata))
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        if command[1:3] == ["/Query", "/TN"] and len(calls) == 1:
+            return SimpleNamespace(returncode=1, stdout="")
+        if command[1] == "/Create":
+            raise subprocess.TimeoutExpired("schtasks", 15)
+        if command[1] == "/Query":
+            return SimpleNamespace(returncode=0, stdout=rendered.content.decode())
+        if command[1] == "/Delete":
+            assert not legacy.exists()
+            return SimpleNamespace(returncode=0, stdout="")
+        raise AssertionError(command)
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=run
+    )
+
+    assert result.ok is False
+    assert "previous Task Scheduler state restored" in result.reason
+    assert legacy.exists()
+    assert [call[1] for call in calls] == ["/Query", "/Create", "/Query", "/Delete"]
+
+
+def test_restart_refuses_loaded_systemd_definition_from_other_path(tmp_path):
+    spec, environment, _, path = _installed_artifact(
+        tmp_path, SupervisorKind.SYSTEMD_USER
+    )
+    runner = Mock(
+        return_value=SimpleNamespace(
+            returncode=0,
+            stdout="LoadState=loaded\nFragmentPath=/tmp/foreign\nNeedDaemonReload=no\n",
+        )
+    )
+
+    result = restart_owned_supervisor(
+        spec, path, environment=environment, run=runner
+    )
+
+    assert result.ok is False
+    assert result.action == "refused"
+    assert runner.call_count == 1
+
+
+def test_install_launchd_kickstarts_matching_loaded_generation(tmp_path):
+    spec, environment, _, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(
+                returncode=0, stdout=f"{spec.generation} {spec.launcher_path}"
+            ),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is True
+    assert runner.call_args_list[1].args[0] == [
+        "launchctl",
+        "enable",
+        "gui/501/ai.hank.jacked",
+    ]
+    assert runner.call_args_list[2].args[0] == [
+        "launchctl",
+        "kickstart",
+        "-k",
+        "gui/501/ai.hank.jacked",
+    ]
+
+
+def test_install_launchd_creates_missing_launchagents_directory(tmp_path):
+    spec, environment, _, _ = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    path = tmp_path / "fresh" / "LaunchAgents" / "ai.hank.jacked.plist"
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=113, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is True
+    assert path.exists()
+
+
+def test_install_launchd_migrates_exact_known_legacy_definition(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    legacy_args = ["/Users/test/.local/bin/jacked", "service", "start", "--port", "8321"]
+    legacy = plistlib.dumps(
+        {"Label": spec.service_id, "ProgramArguments": legacy_args, "RunAtLoad": True}
+    )
+    path.write_bytes(legacy)
+    path.chmod(0o600)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=0, stdout=" ".join(legacy_args)),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is True
+    assert path.read_bytes() == rendered.content
+    assert path.with_name(f"{path.name}.pre-v2").read_bytes() == legacy
+    assert runner.call_args_list[1].args[0][:2] == ["launchctl", "bootout"]
+    assert runner.call_args_list[2].args[0][:2] == ["launchctl", "enable"]
+    assert runner.call_args_list[3].args[0][:2] == ["launchctl", "bootstrap"]
+
+
+def test_install_launchd_resolves_bootstrap_timeout_from_loaded_identity(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    path.unlink()
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=113, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            subprocess.TimeoutExpired("launchctl", 15),
+            SimpleNamespace(
+                returncode=0, stdout=f"{spec.generation} {spec.launcher_path}"
+            ),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is True
+    assert path.read_bytes() == rendered.content
+
+
+def test_install_launchd_boots_out_proven_old_generation_before_replacing_it(
+    tmp_path,
+):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    previous_generation = "0" * len(spec.generation)
+    previous = rendered.content.replace(
+        spec.generation.encode(), previous_generation.encode()
+    )
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(
+                returncode=0,
+                stdout=f"{previous_generation} {spec.launcher_path}",
+            ),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is True
+    assert path.read_bytes() == rendered.content
+    assert runner.call_args_list[2].args[0] == [
+        "launchctl",
+        "bootout",
+        "gui/501/ai.hank.jacked",
+    ]
+    assert runner.call_args_list[3].args[0] == [
+        "launchctl",
+        "bootstrap",
+        "gui/501",
+        str(path),
+    ]
+
+
+def test_install_launchd_restores_old_generation_when_new_bootstrap_fails(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    previous_generation = "0" * len(spec.generation)
+    previous = rendered.content.replace(
+        spec.generation.encode(), previous_generation.encode()
+    )
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(
+                returncode=0,
+                stdout=f"{previous_generation} {spec.launcher_path}",
+            ),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is False
+    assert "previous supervisor restored" in result.reason
+    assert path.read_bytes() == previous
+    assert runner.call_args_list[4].args[0] == [
+        "launchctl",
+        "bootstrap",
+        "gui/501",
+        str(path),
+    ]
+
+
+def test_install_launchd_removes_new_artifact_when_first_bootstrap_fails(tmp_path):
+    spec, environment, _, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    path.unlink()
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=113, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is False
+    assert "previous unloaded state restored" in result.reason
+    assert not path.exists()
+
+
+def test_install_launchd_restores_unloaded_owned_drift_on_failure(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    previous = rendered.content.replace(
+        spec.generation.encode(), b"0" * len(spec.generation)
+    )
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(returncode=113, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),
+        ]
+    )
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is False
+    assert path.read_bytes() == previous
+
+
+def test_install_launchd_reloads_old_job_when_reconcile_raises(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    previous_generation = "0" * len(spec.generation)
+    previous = rendered.content.replace(
+        spec.generation.encode(), previous_generation.encode()
+    )
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    runner = Mock(
+        side_effect=[
+            SimpleNamespace(
+                returncode=0,
+                stdout=f"{previous_generation} {spec.launcher_path}",
+            ),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout=""),
+        ]
+    )
+
+    with patch(
+        "jacked.service.supervisors.launchd.reconcile_artifact",
+        side_effect=OSError("disk full"),
+    ):
+        result = install_owned_supervisor(
+            spec, path, environment=environment, run=runner, uid=501
+        )
+
+    assert result.ok is False
+    assert "previous supervisor restored" in result.reason
+    assert path.read_bytes() == previous
+    assert runner.call_args_list[3].args[0][:2] == ["launchctl", "bootstrap"]
+
+
+def test_install_launchd_refuses_drift_when_loaded_identity_is_not_the_old_artifact(
+    tmp_path,
+):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    previous = rendered.content.replace(
+        spec.generation.encode(), b"0" * len(spec.generation)
+    )
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    runner = Mock(return_value=SimpleNamespace(returncode=0, stdout="foreign"))
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is False
+    assert path.read_bytes() == previous
+    assert runner.call_count == 1
 
 
 def _installed_artifact(tmp_path, kind):

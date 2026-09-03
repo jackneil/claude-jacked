@@ -2,6 +2,11 @@
 
 from unittest.mock import MagicMock, patch
 from click.testing import CliRunner
+import pytest
+
+
+def _ready_status(*_args, **_kwargs):
+    return {"state": "running", "port": 8321}
 
 
 def _legacy_plist(host: str, port: int = 8321) -> str:
@@ -157,6 +162,7 @@ class TestServiceStatus:
                 return_value={
                     "ok": True,
                     "result": {
+                        "state": "running",
                         "quarantine": False,
                         "build_version": "test",
                         "protocol_version": 2,
@@ -170,6 +176,76 @@ class TestServiceStatus:
         assert result.exit_code == 0
         assert "running" in result.output.lower()
         assert "8321" in result.output
+
+    def test_status_reports_starting_without_dashboard_claim(self):
+        from types import SimpleNamespace
+
+        from jacked.cli import main
+
+        with (
+            patch(
+                "jacked.service.lifecycle.discover_service",
+                return_value=SimpleNamespace(source="manifest", reason=""),
+            ),
+            patch(
+                "jacked.service.ipc.send_native_control",
+                return_value={
+                    "ok": True,
+                    "result": {
+                        "state": "starting",
+                        "build_version": "test",
+                        "protocol_version": 2,
+                        "generation": "abc",
+                        "port": 8321,
+                    },
+                },
+            ),
+        ):
+            result = CliRunner().invoke(main, ["service", "status"])
+
+        assert result.exit_code == 0
+        assert "starting" in result.output.lower()
+        assert "Dashboard:" not in result.output
+
+    def test_status_preserves_unknown_autostart_truth(self):
+        from types import SimpleNamespace
+
+        from jacked.cli import main
+        from jacked.service.autostart import AutostartInspection, AutostartState
+
+        with (
+            patch(
+                "jacked.service.lifecycle.discover_service",
+                return_value=SimpleNamespace(source="default", reason="", port=None),
+            ),
+            patch(
+                "jacked.service.platform.inspect_autostart",
+                return_value=AutostartInspection(
+                    AutostartState.UNKNOWN, "launchd unavailable"
+                ),
+            ),
+        ):
+            result = CliRunner().invoke(main, ["service", "status"])
+
+        assert "Autostart: unknown" in result.output
+        assert "Autostart: disabled" not in result.output
+
+    def test_status_reports_healthy_legacy_without_claiming_control(self):
+        from types import SimpleNamespace
+
+        from jacked.cli import main
+
+        with patch(
+            "jacked.service.lifecycle.discover_service",
+            return_value=SimpleNamespace(
+                source="legacy", reason="", host="127.0.0.1", port=8321
+            ),
+        ):
+            result = CliRunner().invoke(main, ["service", "status"])
+
+        assert result.exit_code == 0, result.output
+        assert "legacy service running" in result.output.lower()
+        assert "control unavailable" in result.output.lower()
 
 
 class TestServiceStop:
@@ -208,9 +284,44 @@ class TestServiceStop:
         paths.root.mkdir(parents=True, exist_ok=True)
         paths.legacy_pid.write_text("123\n8321")
         runner = CliRunner()
-        result = runner.invoke(main, ["service", "stop"])
+        with patch(
+            "jacked.service.legacy.resolve_active_legacy_service",
+            return_value=MagicMock(pid=123, port=8321),
+        ):
+            result = runner.invoke(main, ["service", "stop"])
         assert result.exit_code != 0
         assert "refusing pid-only" in result.output.lower()
+
+    def test_stop_ignores_stale_v2_compatibility_pid(self):
+        from jacked.cli import main
+        from jacked.service.lifecycle import default_service_paths
+
+        paths = default_service_paths()
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.legacy_pid.write_text("123\n8321\njacked-v2\n")
+
+        result = CliRunner().invoke(main, ["service", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "not running" in result.output.lower()
+
+    def test_stop_ignores_reused_unhealthy_legacy_pid_without_signal(self):
+        from jacked.cli import main
+        from jacked.service.lifecycle import default_service_paths
+
+        paths = default_service_paths()
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.legacy_pid.write_text("4242\n8321\n")
+        with (
+            patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("jacked.service.legacy.probe_legacy_health", return_value=False),
+            patch("jacked.service.ipc.send_native_control") as control,
+        ):
+            result = CliRunner().invoke(main, ["service", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "not running" in result.output.lower()
+        control.assert_not_called()
 
     @patch(
         "jacked.service.ipc.send_native_control",
@@ -231,6 +342,10 @@ class TestServiceStop:
 
 
 class TestServiceInstall:
+    @pytest.fixture(autouse=True)
+    def _service_becomes_ready(self, monkeypatch):
+        monkeypatch.setattr("jacked.cli._wait_owned_service_ready", _ready_status)
+
     @patch("jacked.service.lifecycle.provision_service_contract")
     @patch("jacked.service.lifecycle.install_native_owned")
     def test_install_calls_platform(self, mock_install, mock_provision):
@@ -283,6 +398,10 @@ class TestServiceUninstall:
 
 
 class TestServiceInstallError:
+    @pytest.fixture(autouse=True)
+    def _service_becomes_ready(self, monkeypatch):
+        monkeypatch.setattr("jacked.cli._wait_owned_service_ready", _ready_status)
+
     @patch(
         "jacked.service.lifecycle.provision_service_contract",
         side_effect=ValueError("bad"),
@@ -310,13 +429,51 @@ class TestServiceInstallError:
 
 
 class TestServiceRecover:
+    def test_private_invalid_manifest_is_quarantined_then_recovered(self):
+        from jacked.cli import main
+        from jacked.service.lifecycle import default_service_paths
+
+        paths = default_service_paths()
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.manifest.write_text("not-json", encoding="utf-8")
+        paths.manifest.chmod(0o600)
+        spec = MagicMock(generation="a" * 64)
+        with (
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.native_artifact_path",
+                return_value=paths.root / "supervisor",
+            ),
+            patch(
+                "jacked.service.lifecycle.install_native_owned",
+                return_value=MagicMock(ok=True, reason="installed"),
+            ),
+            patch("jacked.cli._wait_owned_service_ready", return_value={"state": "running"}),
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code == 0, result.output
+        assert "Quarantined invalid ownership evidence" in result.output
+        assert not paths.manifest.exists()
+        assert list(paths.root.glob("api-v2.instance.json.invalid-*"))
+
+    def test_active_v2_lease_is_reported_as_recovery_refusal(self):
+        from jacked.cli import main
+        from jacked.service.instance import ServiceLeaseBusy
+
+        with patch(
+            "jacked.service.lifecycle.quarantine_invalid_ownership",
+            side_effect=ServiceLeaseBusy("already owned"),
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code != 0
+        assert "could not establish ownership" in result.output.lower()
     def test_foreign_artifact_is_left_untouched_with_actionable_guidance(self):
         from jacked.cli import main
-        from jacked.service.supervisors import (
-            ArtifactDisposition,
-            ArtifactInspection,
-        )
-
         with (
             patch(
                 "jacked.service.lifecycle.provision_service_contract",
@@ -327,20 +484,19 @@ class TestServiceRecover:
                 return_value="/owned/path/jacked.plist",
             ),
             patch(
-                "jacked.service.lifecycle.reconcile_native_artifact",
+                "jacked.service.lifecycle.install_native_owned",
                 return_value=MagicMock(
-                    artifact=ArtifactInspection(ArtifactDisposition.FOREIGN)
+                    ok=False,
+                    reason="foreign artifact. Inspect and back up the path.",
                 ),
-            ),
-            patch("jacked.service.lifecycle.install_native_owned") as install,
+            ) as install,
         ):
             result = CliRunner().invoke(main, ["service", "recover"])
 
         assert result.exit_code != 0
-        assert "move this artifact" in result.output
-        assert "No PID or port owner was" in result.output
-        assert "signalled" in result.output
-        install.assert_not_called()
+        assert "foreign artifact" in result.output
+        assert "/owned/path/jacked.plist" in result.output
+        install.assert_called_once()
 
 
 class TestServiceRestart:
@@ -348,6 +504,10 @@ class TestServiceRestart:
 
     Unavailable-native path → exercises the manual stop+start fallback
     (used on Windows, bare POSIX, and --foreground)."""
+
+    @pytest.fixture(autouse=True)
+    def _service_becomes_ready(self, monkeypatch):
+        monkeypatch.setattr("jacked.cli._wait_owned_service_ready", _ready_status)
 
     @patch(
         "jacked.service.platform.ensure_native_lifecycle",
@@ -469,6 +629,10 @@ class TestServiceRestart:
 class TestServiceRestartAutoInstall:
     """Restart no longer trusts legacy native artifacts without ServiceSpec."""
 
+    @pytest.fixture(autouse=True)
+    def _service_becomes_ready(self, monkeypatch):
+        monkeypatch.setattr("jacked.cli._wait_owned_service_ready", _ready_status)
+
     @patch("jacked.findbin.find_bin", return_value="/fake/jacked")
     @patch("subprocess.Popen")
     @patch(
@@ -526,30 +690,120 @@ class TestServiceRestartAutoInstall:
 
 
 class TestStartCommand:
-    """`jacked start` — idempotent "make sure it's running" command.
+    """`jacked start` uses authenticated v2 control and refusal-only legacy evidence."""
 
-    If the service is healthy it no-ops; if it's dead/stale/hung it
-    (re)starts it detached and verifies it came up. This is the command a
-    user runs when the tray disappears, without needing to know whether
-    the service is actually down.
-    """
-
-    def test_noop_when_already_healthy(self):
+    def test_noop_when_authenticated_v2_service_is_running(self):
         from jacked.cli import main
+        from jacked.service.lifecycle import default_service_paths
 
+        paths = default_service_paths()
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.manifest.write_text("{}", encoding="utf-8")
         with (
             patch(
-                "jacked.service.process.read_pid",
-                return_value={"pid": 4242, "port": 8321},
-            ),
-            patch("jacked.service.process.is_process_alive", return_value=True),
-            patch("jacked.cli._service_http_ok", return_value=True),
+                "jacked.service.ipc.send_native_control",
+                return_value={
+                    "ok": True,
+                    "result": {"state": "running", "port": 8421},
+                },
+            ) as control,
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
             patch("jacked.cli._spawn_service_detached") as spawn,
         ):
             result = CliRunner().invoke(main, ["start"])
-        assert result.exit_code == 0
-        assert "already running" in result.output.lower()
+        assert result.exit_code == 0, result.output
+        assert "authenticated v2 service" in result.output.lower()
+        assert "8421" in result.output
+        control.assert_called_once()
+        stop.assert_not_called()
+        remove.assert_not_called()
         spawn.assert_not_called()
+
+    def test_restart_uses_authenticated_owned_handoff(self):
+        from jacked.cli import main
+        from jacked.service.lifecycle import default_service_paths
+
+        paths = default_service_paths()
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.manifest.write_text("{}", encoding="utf-8")
+        spec = MagicMock()
+        environment = {"PATH": "/safe"}
+        with (
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, environment),
+            ),
+            patch(
+                "jacked.service.lifecycle.handoff_owned_service",
+                return_value=MagicMock(ok=True, reason="new build started"),
+            ) as handoff,
+            patch("jacked.cli._manifest_is_proven_stale", return_value=False),
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
+            patch("jacked.cli._spawn_service_detached") as spawn,
+        ):
+            result = CliRunner().invoke(main, ["start", "--restart"])
+        assert result.exit_code == 0, result.output
+        handoff.assert_called_once_with(spec, environment=environment, paths=paths)
+        stop.assert_not_called()
+        remove.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_degraded_v2_control_refuses_without_legacy_signal(self):
+        from jacked.cli import main
+        from jacked.service.lifecycle import default_service_paths
+
+        paths = default_service_paths()
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.manifest.write_text("{}", encoding="utf-8")
+        with (
+            patch(
+                "jacked.service.ipc.send_native_control",
+                side_effect=OSError("unreachable"),
+            ),
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
+            patch("jacked.cli._spawn_service_detached") as spawn,
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code != 0
+        assert "service manifest is invalid" in result.output.lower()
+        assert "jacked service" in result.output.lower()
+        assert "recover" in result.output.lower()
+        assert "no process was signalled" in result.output.lower()
+        stop.assert_not_called()
+        remove.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_proven_stale_v2_manifest_self_heals_without_signalling(self, tmp_path):
+        from jacked.cli import main
+        from jacked.service.lifecycle import default_service_paths
+
+        paths = default_service_paths()
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.manifest.write_text("{}", encoding="utf-8")
+        with (
+            patch(
+                "jacked.service.ipc.send_native_control",
+                side_effect=OSError("stale endpoint"),
+            ),
+            patch("jacked.cli._manifest_is_proven_stale", return_value=True),
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch(
+                "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
+            ) as spawn,
+            patch(
+                "jacked.cli._wait_owned_service_ready",
+                return_value={"state": "running", "port": 8432},
+            ),
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code == 0, result.output
+        assert "stale" in result.output.lower()
+        assert "8432" in result.output
+        spawn.assert_called_once()
 
     def test_cold_start_when_down(self, tmp_path):
         from jacked.cli import main
@@ -558,19 +812,22 @@ class TestStartCommand:
             patch("jacked.service.process.read_pid", return_value=None),
             patch("jacked.service.process.is_process_alive", return_value=False),
             patch("jacked.service.process.is_port_available", return_value=True),
-            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.service.legacy.probe_legacy_health", return_value=False),
             patch(
                 "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
             ) as spawn,
-            patch("jacked.cli._wait_service_ready", return_value=True),
+            patch(
+                "jacked.cli._wait_owned_service_ready",
+                return_value={"state": "running", "port": 8321},
+            ),
         ):
             result = CliRunner().invoke(main, ["start"])
         assert result.exit_code == 0
         assert "running" in result.output.lower()
         spawn.assert_called_once()
 
-    def test_clears_stale_pid_then_starts(self, tmp_path):
-        """A dead PID from a crash must be cleared, then a fresh start spawned."""
+    def test_ignores_stale_pid_without_unlinking_then_starts(self, tmp_path):
+        """A dead PID is non-authoritative and remains untouched."""
         from jacked.cli import main
 
         with (
@@ -581,19 +838,24 @@ class TestStartCommand:
             patch("jacked.service.process.is_process_alive", return_value=False),
             patch("jacked.service.process.is_port_available", return_value=True),
             patch("jacked.service.process.remove_pid") as remove,
-            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.service.legacy.probe_legacy_health", return_value=False),
             patch(
                 "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
             ) as spawn,
-            patch("jacked.cli._wait_service_ready", return_value=True),
+            patch(
+                "jacked.cli._wait_owned_service_ready",
+                return_value={"state": "running", "port": 8321},
+            ),
         ):
             result = CliRunner().invoke(main, ["start"])
         assert result.exit_code == 0
-        remove.assert_called_once()
+        remove.assert_not_called()
         spawn.assert_called_once()
 
-    def test_restarts_when_alive_but_not_responding(self, tmp_path):
-        """Process alive but dashboard hung → stop it and restart."""
+    def test_reused_live_pid_without_jacked_health_does_not_block_start(
+        self, tmp_path
+    ):
+        """An unrelated process that reused a stale legacy PID is ignored."""
         from jacked.cli import main
 
         with (
@@ -602,25 +864,26 @@ class TestStartCommand:
                 return_value={"pid": 77, "port": 8321},
             ),
             patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
+            patch("jacked.service.legacy.probe_legacy_health", return_value=False),
             patch("jacked.service.process.is_port_available", return_value=True),
-            patch(
-                "jacked.service.process.stop_process_graceful",
-                return_value={"was_running": True, "died": True, "killed": False},
-            ) as stop,
-            patch("jacked.service.process.wait_for_port_free", return_value=True),
-            patch("jacked.cli._service_http_ok", return_value=False),
             patch(
                 "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
             ) as spawn,
-            patch("jacked.cli._wait_service_ready", return_value=True),
+            patch(
+                "jacked.cli._wait_owned_service_ready",
+                return_value={"state": "running", "port": 8321},
+            ),
         ):
             result = CliRunner().invoke(main, ["start"])
-        assert result.exit_code == 0
-        stop.assert_called_once()
+        assert result.exit_code == 0, result.output
+        stop.assert_not_called()
+        remove.assert_not_called()
         spawn.assert_called_once()
 
-    def test_force_restart_when_healthy(self, tmp_path):
-        """--restart tears down a healthy service and starts fresh."""
+    def test_restart_refuses_healthy_legacy_pid_without_signal(self):
+        """Even a healthy legacy PID cannot authorize --restart."""
         from jacked.cli import main
 
         with (
@@ -629,22 +892,38 @@ class TestStartCommand:
                 return_value={"pid": 77, "port": 8321},
             ),
             patch("jacked.service.process.is_process_alive", return_value=True),
-            patch("jacked.service.process.is_port_available", return_value=True),
-            patch(
-                "jacked.service.process.stop_process_graceful",
-                return_value={"was_running": True, "died": True, "killed": False},
-            ) as stop,
-            patch("jacked.service.process.wait_for_port_free", return_value=True),
-            patch("jacked.cli._service_http_ok", return_value=True),
-            patch(
-                "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
-            ) as spawn,
-            patch("jacked.cli._wait_service_ready", return_value=True),
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
+            patch("jacked.service.legacy.probe_legacy_health", return_value=True),
+            patch("jacked.cli._spawn_service_detached") as spawn,
         ):
             result = CliRunner().invoke(main, ["start", "--restart"])
-        assert result.exit_code == 0
-        stop.assert_called_once()
-        spawn.assert_called_once()
+        assert result.exit_code != 0
+        assert "quit the old tray" in result.output.lower()
+        stop.assert_not_called()
+        remove.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_healthy_legacy_service_is_reported_without_control(self):
+        from jacked.cli import main
+
+        with (
+            patch(
+                "jacked.service.process.read_pid",
+                return_value={"pid": 77, "port": 8321},
+            ),
+            patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("jacked.service.legacy.probe_legacy_health", return_value=True),
+            patch("jacked.service.process.stop_process_graceful") as stop,
+            patch("jacked.service.process.remove_pid") as remove,
+            patch("jacked.cli._spawn_service_detached") as spawn,
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code == 0, result.output
+        assert "legacy jacked service" in result.output.lower()
+        stop.assert_not_called()
+        remove.assert_not_called()
+        spawn.assert_not_called()
 
     def test_aborts_when_port_held_by_other(self):
         """Cold start but the port is squatted by a non-jacked process → abort."""
@@ -654,7 +933,6 @@ class TestStartCommand:
             patch("jacked.service.process.read_pid", return_value=None),
             patch("jacked.service.process.is_process_alive", return_value=False),
             patch("jacked.service.process.is_port_available", return_value=False),
-            patch("jacked.cli._service_http_ok", return_value=False),
             patch("jacked.cli._spawn_service_detached") as spawn,
         ):
             result = CliRunner().invoke(main, ["start"])
@@ -669,15 +947,30 @@ class TestStartCommand:
             patch("jacked.service.process.read_pid", return_value=None),
             patch("jacked.service.process.is_process_alive", return_value=False),
             patch("jacked.service.process.is_port_available", return_value=True),
-            patch("jacked.cli._service_http_ok", return_value=False),
+            patch("jacked.service.legacy.probe_legacy_health", return_value=False),
             patch(
                 "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
             ),
-            patch("jacked.cli._wait_service_ready", return_value=False),
+            patch("jacked.cli._wait_owned_service_ready", return_value=None),
         ):
             result = CliRunner().invoke(main, ["start"])
         assert result.exit_code != 0
         assert "didn't answer" in result.output.lower()
+
+    def test_foreign_http_listener_never_satisfies_owned_readiness(self, tmp_path):
+        from jacked.cli import main
+
+        with (
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch(
+                "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
+            ) as spawn,
+            patch("jacked.cli._wait_owned_service_ready", return_value=None),
+        ):
+            result = CliRunner().invoke(main, ["start"])
+        assert result.exit_code != 0
+        spawn.assert_called_once()
 
 
 class TestServiceStartBootMigration:
@@ -890,6 +1183,10 @@ class TestServiceInstallRemoteAccessParity:
     setting (OVERWRITING existing keys — the command expresses intent), then
     installs host-free. Unmapped IPs stay a one-shot for the immediate spawn."""
 
+    @pytest.fixture(autouse=True)
+    def _service_becomes_ready(self, monkeypatch):
+        monkeypatch.setattr("jacked.cli._wait_owned_service_ready", _ready_status)
+
     def _invoke(self, monkeypatch, host, platform="win32"):
         import jacked.cli as cli
 
@@ -981,6 +1278,10 @@ class TestServiceRestartRemoteAccessParity:
     restarting, so the restarted service (native kickstart or detached spawn)
     resolves the new mode from the DB — this is what makes the command finally
     work reliably on macOS, where kickstart reuses launchd's in-memory argv."""
+
+    @pytest.fixture(autouse=True)
+    def _service_becomes_ready(self, monkeypatch):
+        monkeypatch.setattr("jacked.cli._wait_owned_service_ready", _ready_status)
 
     def test_all_interfaces_writes_db_then_safe_detached_start(self, monkeypatch):
         import jacked.cli as cli

@@ -4,6 +4,7 @@ import os
 import signal
 import socket
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -130,10 +131,61 @@ def terminate_owned_process(
     return TerminationResult.UNSUPPORTED
 
 
-def write_pid(pid_file: Path, port: int = DEFAULT_PORT) -> None:
-    """Write current PID and port to the PID file."""
+def write_pid(pid_file: Path, port: int = DEFAULT_PORT) -> bool:
+    """Publish compatibility evidence unless another live process is named.
+
+    This file is refusal-only. It never authorizes process control or cleanup.
+    The v2 lease is the actual singleton authority.
+    """
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(f"{os.getpid()}\n{port}")
+    current_pid = os.getpid()
+    existing = read_pid(pid_file)
+    if existing is not None:
+        if is_v2_pid_evidence(pid_file):
+            return True
+        if existing["pid"] != current_pid and is_process_alive(existing["pid"]):
+            return False
+        # Compatibility evidence is refusal-only. Never replace an existing
+        # pathname, even when it is stale or belongs to this process: a legacy
+        # writer could claim it between inspection and replacement.
+        return True
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{pid_file.name}.", dir=pid_file.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(f"{current_pid}\n{port}\njacked-v2\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # link(2) is an atomic create-if-absent publication. os.replace()
+            # would let a racing legacy process lose its live PID evidence.
+            os.link(temporary, pid_file)
+        except FileExistsError:
+            winner = read_pid(pid_file)
+            if (
+                winner is not None
+                and winner["pid"] != current_pid
+                and is_process_alive(winner["pid"])
+            ):
+                return False
+            return True
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def is_v2_pid_evidence(pid_file: Path) -> bool:
+    """Identify compatibility evidence emitted by a lease-owning v2 service."""
+    try:
+        with pid_file.open("r", encoding="utf-8") as handle:
+            return handle.read(256).splitlines()[2:3] == ["jacked-v2"]
+    except (OSError, UnicodeError):
+        return False
 
 
 def read_pid(pid_file: Path) -> dict | None:
@@ -150,9 +202,17 @@ def read_pid(pid_file: Path) -> dict | None:
         return None
 
 
-def remove_pid(pid_file: Path) -> None:
-    """Remove PID file if it exists."""
-    pid_file.unlink(missing_ok=True)
+def remove_pid(pid_file: Path, *, expected_pid: int | None = None) -> bool:
+    """Legacy helper retained for old callers; v2 ownership never uses it."""
+    if expected_pid is not None:
+        existing = read_pid(pid_file)
+        if existing is None or existing["pid"] != expected_pid:
+            return False
+    try:
+        pid_file.unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def is_process_alive(pid: int) -> bool:
