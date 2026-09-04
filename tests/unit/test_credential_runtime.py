@@ -155,6 +155,32 @@ def test_resolve_active_identity_on_linux_reads_credential_file(tmp_path: Path) 
     assert f"build:{INSPECTED_CLAUDE_BUILD}" in observation.evidence
 
 
+def test_resolve_active_identity_reports_a_divergent_darwin_mirror_as_evidence(tmp_path: Path) -> None:
+    """Keychain says account 4, the file mirror says 5: the runtime uses the Keychain."""
+    from jacked.credentials.canonical import CredentialPayload
+    from jacked.credentials.store import MemoryCredentialStore
+
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / ".credentials.json").write_text(
+        '{"_jackedAccountId": 5, "claudeAiOauth": {"accessToken": "five"}}', encoding="utf-8"
+    )
+    keychain = MemoryCredentialStore(
+        "keychain",
+        CredentialPayload.from_mapping({"_jackedAccountId": 4, "claudeAiOauth": {"accessToken": "four"}}),
+    )
+    with (
+        mock.patch("jacked.credentials.runtime.detect_claude_identity", return_value=_identity()),
+        mock.patch("jacked.credentials.runtime.Path.home", return_value=home),
+        mock.patch("jacked.credentials.runtime.MacOSCredentialStore", return_value=keychain),
+    ):
+        observation = resolve_active_identity()
+
+    assert observation.state.value == "resolved"
+    assert observation.identity.account_id == 4
+    assert "required_mirror:global credential file:divergent" in observation.evidence
+
+
 def test_unstamped_credential_file_is_unusable_with_named_evidence(tmp_path: Path) -> None:
     """A first-run Linux install has a Claude-written file with no jacked stamp."""
     home = tmp_path

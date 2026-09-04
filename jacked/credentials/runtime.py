@@ -318,7 +318,9 @@ def resolve_active_identity() -> ResolverObservation:
         return ResolverObservation(
             ResolverState.UNSUPPORTED, CredentialIdentity(), (str(exc),)
         )
-    observation = CanonicalCredentialResolver(resolution.capability, stores).resolve()
+    observation = CanonicalCredentialResolver(
+        resolution.capability, stores, require_mirror_consensus=False
+    ).resolve()
     return ResolverObservation(
         observation.state,
         observation.identity,

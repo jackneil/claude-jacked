@@ -10,10 +10,13 @@ import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol
 
 from .models import CredentialCapability, CredentialIdentity, StoreStatus
 from .store import CredentialStore
+
+if TYPE_CHECKING:
+    from .canonical import CredentialPayload
 
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_FILENAME = "jacked-resolver-snapshot.json"
@@ -105,11 +108,66 @@ class CanonicalCredentialResolver:
         self,
         capability: CredentialCapability,
         stores: Mapping[str, CredentialStore],
+        *,
+        require_mirror_consensus: bool = True,
     ) -> None:
         self._capability = capability
         self._stores = stores
+        self._require_mirror_consensus = require_mirror_consensus
 
     def resolve(self) -> ResolverObservation:
+        if self._require_mirror_consensus:
+            return self._resolve_by_consensus()
+        return self._resolve_from_authority()
+
+    def _resolve_from_authority(self) -> ResolverObservation:
+        """Report what the runtime will use: the authority decides, mirrors are evidence.
+
+        Claude Code refreshes the authority alone, so a required mirror can lag
+        it between jacked writes. Hiding the identity behind CONFLICT on every
+        lag blanked the menu bar. Write verification keeps demanding consensus
+        in the transaction engine; only observation takes this path.
+        """
+        authority = self._capability.authority
+        store = self._stores.get(authority.locator)
+        if store is None:
+            return ResolverObservation(
+                ResolverState.UNUSABLE, CredentialIdentity(), (f"missing-adapter:{authority.locator}",)
+            )
+        result = store.read()
+        evidence = [f"{authority.role.value}:{authority.name}:{result.status.value}"]
+        if result.status is StoreStatus.MISSING:
+            return ResolverObservation(ResolverState.MISSING, CredentialIdentity(), tuple(evidence))
+        if result.status is not StoreStatus.OK or result.payload is None:
+            return ResolverObservation(ResolverState.UNUSABLE, CredentialIdentity(), tuple(evidence))
+        evidence.extend(self._mirror_evidence(result.payload))
+        identity = result.payload.identity
+        if identity.account_id is None:
+            return ResolverObservation(
+                ResolverState.UNUSABLE, CredentialIdentity(), (*evidence, "identity:stamp-absent")
+            )
+        return ResolverObservation(ResolverState.RESOLVED, identity, tuple(evidence))
+
+    def _mirror_evidence(self, authority_payload: CredentialPayload) -> list[str]:
+        evidence = []
+        for declaration in self._capability.required_mirrors:
+            store = self._stores.get(declaration.locator)
+            if store is None:
+                evidence.append(f"{declaration.role.value}:{declaration.name}:missing-adapter")
+                continue
+            result = store.read()
+            if result.status is StoreStatus.OK and result.payload is not None:
+                same = (
+                    result.payload.digest == authority_payload.digest
+                    and result.payload.identity == authority_payload.identity
+                )
+                verdict = "ok" if same else "divergent"
+            else:
+                verdict = result.status.value
+            evidence.append(f"{declaration.role.value}:{declaration.name}:{verdict}")
+        return evidence
+
+    def _resolve_by_consensus(self) -> ResolverObservation:
         declarations = (self._capability.authority, *self._capability.required_mirrors)
         observations = []
         evidence = []
