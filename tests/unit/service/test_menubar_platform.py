@@ -50,14 +50,13 @@ def test_run_dispatches_to_mac_on_darwin():
 
 
 def test_run_uses_pystray_off_darwin():
-    """On non-darwin, run() must NOT take the mac branch — it falls into the
-    pystray precondition path (proven here by the port guard firing)."""
+    """On non-darwin, run() takes the pystray dependency path."""
     runner = ServiceRunner()
     with mock.patch.object(tray.sys, "platform", "linux"), \
          mock.patch.object(tray, "_mac_menubar_available", return_value=False), \
          mock.patch.object(ServiceRunner, "_install_tray_file_logger"), \
          mock.patch.object(ServiceRunner, "_run_mac_menubar") as mac_run, \
-         mock.patch.object(tray, "is_port_available", return_value=False):
+         mock.patch.object(tray, "check_tray_deps", side_effect=SystemExit):
         with pytest.raises(SystemExit):
             runner.run()
     mac_run.assert_not_called()
@@ -70,7 +69,7 @@ def test_run_uses_pystray_when_mac_deps_missing_on_darwin():
          mock.patch.object(tray, "_mac_menubar_available", return_value=False), \
          mock.patch.object(ServiceRunner, "_install_tray_file_logger"), \
          mock.patch.object(ServiceRunner, "_run_mac_menubar") as mac_run, \
-         mock.patch.object(tray, "is_port_available", return_value=False):
+         mock.patch.object(tray, "check_tray_deps", side_effect=SystemExit):
         with pytest.raises(SystemExit):
             runner.run()
     mac_run.assert_not_called()

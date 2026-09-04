@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="jacked:type" content="lockdown">
+  <meta name="jacked:status" content="audit-complete">
+  <meta name="jacked:branch" content="master">
+  <meta name="jacked:date" content="2026-09-03">
+  <title>Supply-Chain Lockdown - claude-jacked</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#fafaf7; --card:#fff; --fg:#1b1b1b; --muted:#5d5d5d; --border:#d9d5cc; --ok:#19733b; --warn:#a55b0a; --danger:#b42318; --info:#2463a3; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#151515; --card:#202020; --fg:#ece9e3; --muted:#b4b0aa; --border:#383838; --ok:#69cc8c; --warn:#efad55; --danger:#f47b70; --info:#79afe8; } }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:2rem 1rem; background:var(--bg); color:var(--fg); font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:960px; margin:auto; }
+    h1 { margin:.25rem 0; font-size:2rem; }
+    h2 { margin-top:2.2rem; padding-bottom:.3rem; border-bottom:1px solid var(--border); }
+    h3 { margin-bottom:.4rem; }
+    .meta,.score,.finding,aside { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; margin:1rem 0; }
+    .meta { display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; color:var(--muted); }
+    .score { display:flex; align-items:center; gap:1.5rem; }
+    .score strong { color:var(--warn); font:700 4rem/1 ui-monospace,monospace; }
+    .badge { display:inline-block; padding:.15rem .55rem; border-radius:999px; font-size:.78rem; font-weight:700; }
+    .ok { color:var(--ok); } .warn { color:var(--warn); } .danger { color:var(--danger); } .info { color:var(--info); }
+    table { width:100%; border-collapse:collapse; background:var(--card); }
+    caption { text-align:left; font-weight:700; margin-bottom:.5rem; }
+    th,td { text-align:left; vertical-align:top; border:1px solid var(--border); padding:.55rem .7rem; }
+    code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:color-mix(in srgb,var(--card),var(--muted) 12%); padding:.1rem .3rem; border-radius:3px; }
+    ul.tasks { list-style:none; padding:0; } ul.tasks li { margin:.55rem 0; } input { margin-right:.5rem; }
+    @media print { body { background:#fff; color:#000; padding:0; } .finding,table,aside { break-inside:avoid; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Supply-Chain Lockdown</h1>
+  <p>claude-jacked release audit</p>
+  <div class="meta">
+    <span>Date: <strong>2026-09-03</strong></span>
+    <span>Mode: <strong>baseline audit</strong></span>
+    <span>Branch: <strong>master</strong></span>
+    <span>Worktree: <strong>primary checkout</strong></span>
+  </div>
+
+  <section aria-labelledby="score-title">
+    <h2 id="score-title">Score and posture</h2>
+    <div class="score">
+      <strong>67</strong>
+      <div><span class="badge warn">Critical gaps remain</span><p>Measured coverage: 6 of 11 applicable categories (55%). Missing scanners cap confidence below Hardened.</p></div>
+    </div>
+    <aside><strong>Release focus:</strong> the runtime lock and GitHub Actions controls are strong. The existing publish build still resolves its build tools outside <code>uv.lock</code>, so a fresh registry compromise could enter the artifact-building job without a lockfile diff.</aside>
+  </section>
+
+  <section aria-labelledby="categories-title">
+    <h2 id="categories-title">Category breakdown</h2>
+    <table>
+      <caption>Supply-chain control status</caption>
+      <thead><tr><th>Category</th><th>Status</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>Lockfile integrity</td><td class="danger">danger</td><td><code>uv.lock</code> is current and all 61 registry packages are hashed, but publish build tools are installed outside the lock.</td></tr>
+        <tr><td>Dependency CVEs</td><td class="info">unknown</td><td><code>pip-audit</code> and <code>osv-scanner</code> are unavailable.</td></tr>
+        <tr><td>Malware / typosquat</td><td class="info">unknown</td><td>Socket is unavailable; registry provenance for the full closure was not independently checked.</td></tr>
+        <tr><td>CI / Actions hardening</td><td class="ok">ok</td><td>All third-party Actions use 40-character SHAs with version comments. Permissions are explicit, checkout credentials are not persisted, and Harden Runner is present.</td></tr>
+        <tr><td>Secrets hygiene</td><td class="info">unknown</td><td>Redacted heuristic scan found no production secret literal and <code>.gitignore</code> covers common secret files. Gitleaks is unavailable.</td></tr>
+        <tr><td>Provenance and signing</td><td class="ok">ok</td><td>PyPI Trusted Publishing uses job-scoped OIDC; the pinned publisher produces attestations. The build uploads a CycloneDX SBOM.</td></tr>
+        <tr><td>Container hardening</td><td>n/a</td><td>No container build is present.</td></tr>
+        <tr><td>Pre-commit and Scorecard</td><td class="warn">warn</td><td>Pre-commit includes Gitleaks, actionlint, and zizmor. Scorecard is unavailable and CVE scanning is not a required CI job.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="inventory-title">
+    <h2 id="inventory-title">Ecosystem inventory</h2>
+    <table>
+      <caption>Detected ecosystems and checks</caption>
+      <thead><tr><th>Ecosystem</th><th>Inputs</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Python / uv</td><td><code>pyproject.toml</code>, <code>uv.lock</code></td><td><code>uv lock --check</code> passed; 1,457 SHA-256 entries; zero unhashed registry packages.</td></tr>
+        <tr><td>GitHub Actions</td><td><code>tests.yml</code>, <code>publish.yml</code></td><td>SHA-pinned actions, least-privilege permissions, Harden Runner, frozen test execution, Trusted Publishing.</td></tr>
+        <tr><td>Dependency automation</td><td><code>dependabot.yml</code></td><td>Weekly updates with a 7-day default cooldown.</td></tr>
+        <tr><td>Local gates</td><td><code>.pre-commit-config.yaml</code></td><td>Secret and workflow checks configured; local tool availability not assumed.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="findings-title">
+    <h2 id="findings-title">Findings</h2>
+    <article class="finding">
+      <h3><span class="badge danger">CRITICAL</span> SCSC-2026-001: publish build dependencies bypass the committed lock</h3>
+      <p><strong>Evidence:</strong> <code>.github/workflows/publish.yml:32-33</code> upgrades pip and installs <code>build hatchling cyclonedx-bom twine</code> from the live registry without exact versions or a frozen, hashed requirements set.</p>
+      <p><strong>Risk:</strong> an attacker who compromises any selected build-tool release can execute code in the artifact-building job and alter the wheel that the separate OIDC job publishes.</p>
+      <p><strong>Remediation:</strong> declare the release toolchain in a locked dependency group, run it with <code>uv run --frozen</code>, and keep the build and OIDC publish jobs separated. This audit did not change the publish workflow.</p>
+    </article>
+    <article class="finding">
+      <h3><span class="badge warn">HIGH</span> SCSC-2026-002: Starlette has no upper bound</h3>
+      <p><strong>Evidence:</strong> <code>pyproject.toml:35</code> declares <code>starlette&gt;=0.48</code>, while the other production dependencies use upper bounds.</p>
+      <p><strong>Risk:</strong> an attacker who publishes a malicious or incompatible future major release could be selected by downstream fresh resolution even though this repository's current lock is safe.</p>
+      <p><strong>Remediation:</strong> choose and test an upper bound in a dedicated dependency update. Lockdown never changes dependency manifests automatically.</p>
+    </article>
+    <article class="finding">
+      <h3><span class="badge warn">MEDIUM</span> SCSC-2026-003: no required CVE scanner runs in CI</h3>
+      <p><strong>Evidence:</strong> the two workflows run tests and publish, but neither runs <code>pip-audit</code> or <code>osv-scanner</code>. The local pre-commit configuration covers secrets and workflow lint only.</p>
+      <p><strong>Risk:</strong> a known vulnerable transitive dependency can remain in the release lock until a human notices it.</p>
+      <p><strong>Remediation:</strong> add a locked, blocking CVE scan over <code>uv.lock</code> on pull requests and a scheduled cadence.</p>
+    </article>
+  </section>
+
+  <section aria-labelledby="remediation-title">
+    <h2 id="remediation-title">Remediation plan</h2>
+    <ul class="tasks">
+      <li><label><input type="checkbox" disabled>Lock the publish toolchain and switch the build job to frozen uv execution.</label></li>
+      <li><label><input type="checkbox" disabled>Test and add a compatible Starlette upper bound in a separate dependency change.</label></li>
+      <li><label><input type="checkbox" disabled>Add blocking pip-audit or OSV scanning to CI.</label></li>
+      <li><label><input type="checkbox" disabled>Install missing local scanners and rerun for higher coverage.</label></li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="manual-title">
+    <h2 id="manual-title">Manual verification</h2>
+    <ul>
+      <li>Confirm the PyPI Trusted Publisher is restricted to this repository, <code>publish.yml</code>, and the <code>pypi</code> environment.</li>
+      <li>Confirm secret scanning and push protection are enabled.</li>
+      <li>Confirm master branch rules block force-push and require the repository's test checks.</li>
+      <li>Confirm maintainer accounts use phishing-resistant MFA.</li>
+    </ul>
+    <p><strong>Not evaluated:</strong> AI model deserialization and IDE extension supply chains.</p>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,77 @@
+"""Recoverable Windows state-path validation and hardening."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from jacked.service.windows_security import inspect_windows_path, secure_windows_path
+
+
+def _repair_private_windows_directory(path: Path) -> None:
+    inspected = inspect_windows_path(path)
+    if (
+        not inspected.is_directory
+        or inspected.is_reparse_point
+        or not inspected.owner_matches
+    ):
+        raise ValueError("private directory has unsafe Windows ownership or type")
+    if not inspected.dacl_private:
+        secure_windows_path(path)
+
+
+def reject_windows_reparse_ancestors(path: Path) -> None:
+    """Reject any existing reparse point in a Windows path chain."""
+    current = path
+    while True:
+        if current.exists() or current.is_symlink():
+            if inspect_windows_path(current).is_reparse_point:
+                raise ValueError("private Windows path has a reparse ancestor")
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def ensure_private_windows_file(path: Path) -> None:
+    """Validate ownership/type and repair a current-user file's private DACL."""
+
+    reject_windows_reparse_ancestors(path.parent)
+    inspected = inspect_windows_path(path)
+    if (
+        inspected.is_directory
+        or inspected.is_reparse_point
+        or inspected.link_count != 1
+    ):
+        raise ValueError("private file has unsafe Windows ownership or type")
+    if not inspected.owner_matches and not inspect_windows_path(
+        path.parent
+    ).private_for(directory=True):
+        raise ValueError("private file has unsafe Windows ownership or type")
+    if not inspected.owner_matches or not inspected.dacl_private:
+        secure_windows_path(path)
+
+
+def ensure_private_windows_directory(path: Path) -> None:
+    """Create or validate a non-reparse, current-user-owned private directory."""
+
+    reject_windows_reparse_ancestors(path.parent)
+    missing = []
+    current = path
+    while not (current.exists() or current.is_symlink()):
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            _repair_private_windows_directory(directory)
+        else:
+            secure_windows_path(directory)
+
+    reject_windows_reparse_ancestors(path)
+    for directory in reversed(missing):
+        _repair_private_windows_directory(directory)
+    if not missing:
+        _repair_private_windows_directory(path)

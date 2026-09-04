@@ -3,7 +3,21 @@ import os
 
 import pytest
 
-from jacked.service.launcher import install_versioned_launcher, verify_launcher
+from jacked.service.launcher import (
+    LauncherInstall,
+    install_versioned_launcher,
+    verify_launcher,
+)
+
+
+def _request(content, digest, *, executable=False):
+    return LauncherInstall(
+        version="v2",
+        name="jacked-launch" if executable else "launcher",
+        content=content,
+        expected_sha256=digest,
+        executable=executable,
+    )
 
 
 def test_launcher_install_is_content_addressed_and_idempotent(tmp_path):
@@ -11,21 +25,13 @@ def test_launcher_install_is_content_addressed_and_idempotent(tmp_path):
     digest = hashlib.sha256(content).hexdigest()
     path = install_versioned_launcher(
         tmp_path,
-        version="v2",
-        name="jacked-launch",
-        content=content,
-        expected_sha256=digest,
-        executable=True,
+        _request(content, digest, executable=True),
     )
     assert verify_launcher(path, digest)
     assert (
         install_versioned_launcher(
             tmp_path,
-            version="v2",
-            name="jacked-launch",
-            content=content,
-            expected_sha256=digest,
-            executable=True,
+            _request(content, digest, executable=True),
         )
         == path
     )
@@ -33,24 +39,32 @@ def test_launcher_install_is_content_addressed_and_idempotent(tmp_path):
         assert path.stat().st_mode & 0o777 == 0o700
 
 
+def test_launcher_recovers_interrupted_hardlink_publication(tmp_path):
+    content = b"fixed-launcher"
+    digest = hashlib.sha256(content).hexdigest()
+    request = _request(content, digest)
+    path = install_versioned_launcher(tmp_path, request)
+    temporary = path.with_name(".launcher.interrupted")
+    os.link(path, temporary)
+    assert path.stat().st_nlink == 2
+
+    assert install_versioned_launcher(tmp_path, request) == path
+    assert path.stat().st_nlink == 1
+    assert not temporary.exists()
+
+
 def test_launcher_never_overwrites_changed_version_slot(tmp_path):
     good = b"fixed-launcher"
     digest = hashlib.sha256(good).hexdigest()
     path = install_versioned_launcher(
         tmp_path,
-        version="v2",
-        name="launcher",
-        content=good,
-        expected_sha256=digest,
+        _request(good, digest),
     )
     path.write_bytes(b"changed")
     with pytest.raises(ValueError, match="foreign or altered"):
         install_versioned_launcher(
             tmp_path,
-            version="v2",
-            name="launcher",
-            content=good,
-            expected_sha256=digest,
+            _request(good, digest),
         )
 
 
@@ -58,8 +72,5 @@ def test_launcher_rejects_source_hash_mismatch(tmp_path):
     with pytest.raises(ValueError, match="source hash"):
         install_versioned_launcher(
             tmp_path,
-            version="v2",
-            name="launcher",
-            content=b"content",
-            expected_sha256="0" * 64,
+            _request(b"content", "0" * 64),
         )

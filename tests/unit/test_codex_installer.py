@@ -1244,7 +1244,14 @@ def test_claude_install_copies_skill_sidecars(tmp_path, monkeypatch):
     monkeypatch.setenv("JACKED_HOME", str(tmp_path))
     result = CliRunner().invoke(
         main,
-        ["install", "--no-tray", "--no-rules", "--no-codex", "--force"],
+        [
+            "install",
+            "--no-tray",
+            "--no-rules",
+            "--no-codex",
+            "--no-packs",
+            "--force",
+        ],
     )
     assert result.exit_code == 0, result.output
     sidecar = tmp_path / ".claude" / "skills" / "aesthetic-dogfood-audit" / "measure.js"
@@ -1261,7 +1268,14 @@ def test_claude_install_includes_chain_of_command(tmp_path, monkeypatch):
     monkeypatch.setenv("JACKED_HOME", str(tmp_path))
     result = CliRunner().invoke(
         main,
-        ["install", "--no-tray", "--no-rules", "--no-codex", "--force"],
+        [
+            "install",
+            "--no-tray",
+            "--no-rules",
+            "--no-codex",
+            "--no-packs",
+            "--force",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert (tmp_path / ".claude" / "skills" / "chain-of-command" / "SKILL.md").exists(), \

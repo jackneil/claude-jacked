@@ -62,7 +62,7 @@ class TestWritePathsBump:
         from jacked.api import credential_helpers
 
         monkeypatch.setattr(
-            credential_helpers, "write_platform_credentials", lambda data: None
+            credential_helpers, "write_platform_credentials", lambda data: True
         )
         monkeypatch.setattr(
             credential_helpers,
@@ -77,5 +77,5 @@ class TestWritePathsBump:
             "cc_expires_at": 9999999999,
         }
         before = usage_events.version()
-        credential_helpers.sync_credential_to_all_stores(1, account)
+        assert credential_helpers.sync_credential_to_all_stores(1, account)
         assert usage_events.version() == before + 1

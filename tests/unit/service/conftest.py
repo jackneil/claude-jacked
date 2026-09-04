@@ -15,6 +15,8 @@ tests may still monkeypatch their own path; this autouse default only covers
 the ones that forget.
 """
 
+import os
+
 import pytest
 
 
@@ -28,8 +30,19 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
     tray captured at import. Module imports are guarded so a missing optional
     dep (e.g. pystray) can't break the whole service test suite.
     """
+    if os.name == "nt":
+        # GitHub's elevated Windows runner creates pytest temp directories with
+        # BUILTIN\\Administrators as the owner. Production state creation
+        # immediately hardens its directory; make the test root model that
+        # same precondition before exercising fail-closed ownership checks.
+        from jacked.service.windows_security import secure_windows_path
+
+        secure_windows_path(tmp_path)
+
     fake = tmp_path / ".claude"
     fake.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        secure_windows_path(fake)
 
     # (module path, attribute, value) — set raising=False so a constant that
     # doesn't exist in a given module is silently skipped.
@@ -47,6 +60,7 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
         # can't delete or overwrite the user's real PID file.
         ("jacked.service.tray", "PID_FILE", fake / "jacked-service.pid"),
         ("jacked.service.lifecycle", "CLAUDE_DIR", fake),
+        ("jacked.service.platform", "CLAUDE_DIR", fake),
     ]
 
     import importlib

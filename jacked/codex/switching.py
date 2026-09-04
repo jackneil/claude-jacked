@@ -37,6 +37,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
+from jacked.service.process import process_liveness
+
 from .credentials import codex_home, ensure_file_storage, extract_identity
 
 logger = logging.getLogger(__name__)
@@ -161,13 +163,9 @@ def _codex_swap_lock(base: Path, retries: int = 340) -> Iterator[bool]:
             stale = holder is None
             if holder is not None:
                 try:
-                    os.kill(holder, 0)
-                except ProcessLookupError:
-                    stale = True
-                except PermissionError:
+                    stale = process_liveness(holder) is False
+                except (OSError, SystemError):
                     stale = False
-                except OSError:
-                    stale = True
             if stale:
                 shutil.rmtree(lock_dir, ignore_errors=True)
                 continue

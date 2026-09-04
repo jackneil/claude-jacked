@@ -13,7 +13,6 @@ from jacked import __version__
 from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
 from jacked.service.process import (
     is_port_available,
-    remove_pid,
     write_pid,
 )
 from jacked.version_check import check_version_cached
@@ -89,6 +88,10 @@ _ICON_COLORS = {
     "starting": (245, 158, 11, 255),
     "stopped": (130, 130, 130, 255),
 }
+
+# If Win32 refuses to unregister a console callback, Windows still owns its
+# raw address. Root it for the rest of the process so GC can never free it.
+_FAILED_WIN_CTRL_HANDLERS: list[object] = []
 
 
 def check_tray_deps() -> None:
@@ -276,6 +279,51 @@ class ServiceRunner:
         self._service_spec = None
         self._service_environment: dict[str, str] | None = None
         self._control_server = None
+        self._server_ready = False
+        self._service_state = "starting"
+        self._lifecycle_failure: str | None = None
+        self._win_ctrl_handler = None
+
+    @staticmethod
+    def _resolve_active_legacy_service_pid() -> int | None:
+        """Return a live PID only when legacy jacked health corroborates it."""
+        from jacked.service.legacy import resolve_active_legacy_service
+
+        evidence = resolve_active_legacy_service(PID_FILE)
+        if evidence is None or evidence.pid == os.getpid():
+            return None
+        return evidence.pid
+
+    def _guard_legacy_pid_or_exit(self) -> None:
+        """Stop duplicate launch when a live legacy tray process is already running."""
+        pid = self._resolve_active_legacy_service_pid()
+        if pid is None:
+            return
+        logger.info(
+            "Another live jacked tray owns the compatibility PID file (pid=%d); "
+            "yielding before UI startup",
+            pid,
+        )
+        # A clean exit is essential for launchd/systemd restart-on-failure
+        # policies. Treat singleton contention as an idempotent no-op for both
+        # managed and direct starters instead of creating a supervisor loop.
+        raise SystemExit(0)
+
+    @staticmethod
+    def _legacy_jacked_listener_detected(host: str, port: int) -> bool:
+        """Recognize old jacked only when private stale PID evidence points here."""
+
+        from jacked.service.legacy import inspect_legacy_pid, probe_legacy_health
+        from jacked.service.process import is_v2_pid_evidence
+
+        evidence = inspect_legacy_pid(PID_FILE)
+        return bool(
+            evidence
+            and not is_v2_pid_evidence(PID_FILE)
+            and not evidence.alive
+            and evidence.port == port
+            and probe_legacy_health(host, port)
+        )
 
     def _start_uvicorn(self, cold_start: bool = False) -> threading.Thread:
         """Resolve the bind plan, pre-bind its sockets, and serve in a daemon
@@ -297,6 +345,12 @@ class ServiceRunner:
         ``BaseException`` — can catch it, retry, and fall back to the "stopped"
         icon instead of the exception escaping and stranding a dead dashboard.
         """
+        # Close the gap between the run-level admission check and socket bind.
+        # An older jacked process can appear during that window and does not
+        # know about the v2 lease, so re-check before reserving any endpoint.
+        if cold_start and self._ownership is not None:
+            self._guard_legacy_pid_or_exit()
+
         from jacked.service.bind import (
             create_sockets,
             resolve_bind,
@@ -310,6 +364,19 @@ class ServiceRunner:
             socks = create_sockets(plan)
         except OSError as exc:
             if cold_start and self._ownership is not None:
+                # A pre-v2 service may have started between the admission check
+                # and bind. Prefer its one existing tray over a second v2 tray.
+                # The HTTP probe is refusal-only and never controls the listener.
+                self._guard_legacy_pid_or_exit()
+                if self._legacy_jacked_listener_detected(
+                    "127.0.0.1", self.port
+                ):
+                    logger.info(
+                        "A legacy jacked listener already owns port %d; yielding "
+                        "before quarantine UI startup",
+                        self.port,
+                    )
+                    raise SystemExit(0) from exc
                 # The fixed listener is ambiguous. Never kill its owner and
                 # never race it. Bind a loopback-only dynamic port and publish
                 # that endpoint in the private manifest for CLI/tray discovery.
@@ -351,6 +418,25 @@ class ServiceRunner:
         set_active_plan(plan)
         os.environ["JACKED_HOST"] = plan.primary_host
         os.environ["JACKED_PORT"] = str(self.port)
+        # Keep the two-release legacy diagnostic file from clobbering a live
+        # pre-v2 owner that started during our admission window. If another
+        # live PID won, release the sockets and yield before publishing v2 state.
+        if not write_pid(PID_FILE, self.port):
+            if self._resolve_active_legacy_service_pid() is not None:
+                for sock in socks:
+                    sock.close()
+                logger.info(
+                    "Compatibility PID publication found a healthy legacy jacked "
+                    "process; yielding before UI startup"
+                )
+                if cold_start:
+                    raise SystemExit(0)
+                raise OSError("another live jacked process owns the compatibility PID")
+            logger.warning(
+                "Ignoring uncorroborated compatibility PID evidence; v2 ownership "
+                "and reserved sockets remain authoritative"
+            )
+
         if self._ownership is not None:
             from jacked.service.instance import BindIdentity
 
@@ -376,10 +462,6 @@ class ServiceRunner:
                         sock.close()
                     self._control_server = None
                     raise
-        # Legacy PID file remains diagnostic-only for two releases. It never
-        # authorizes v2 control or termination.
-        write_pid(PID_FILE, self.port)
-
         config = uvicorn.Config(
             "jacked.api.main:app",
             host=plan.primary_host,
@@ -414,6 +496,26 @@ class ServiceRunner:
             except OSError:
                 time.sleep(0.3)
         return False
+
+    def _abort_unready_start(self) -> None:
+        """Stop before any tray UI exists when startup never became ready."""
+
+        logger.error("Service did not become ready; aborting before UI startup")
+        self._service_state = "degraded"
+        self._lifecycle_failure = "initial service start did not become ready"
+        self._request_stop()
+        if self._uvicorn_thread is not None:
+            self._uvicorn_thread.join(timeout=5)
+        from jacked.service.spec import SupervisorKind
+
+        if (
+            self._service_spec is not None
+            and self._service_spec.supervisor is not SupervisorKind.MANUAL
+        ):
+            raise SystemExit(0)
+        raise SystemExit(
+            "Jacked did not become ready. Check ~/.claude/jacked-tray.log."
+        )
 
     def _wait_for_port_free(self, timeout: float = 10.0) -> bool:
         """Poll until EVERY plan address is free to bind (old server released).
@@ -560,6 +662,9 @@ class ServiceRunner:
         if not self._lifecycle_lock.acquire(blocking=False):
             return  # Already restarting or stopping
         try:
+            self._server_ready = False
+            self._service_state = "starting"
+            self._lifecycle_failure = None
             if self._icon:
                 self._apply_icon("starting")
 
@@ -573,6 +678,8 @@ class ServiceRunner:
                 )
                 if self._icon:
                     self._apply_icon("stopped")
+                self._service_state = "degraded"
+                self._lifecycle_failure = "port did not become available"
                 return
 
             # Retry the bind+ready cycle in case of transient failures
@@ -582,6 +689,9 @@ class ServiceRunner:
                 try:
                     self._uvicorn_thread = self._start_uvicorn()
                     if self._wait_for_ready(timeout=15):
+                        self._server_ready = True
+                        self._service_state = "running"
+                        self._lifecycle_failure = None
                         self._started_at = time.time()
                         logger.info(
                             "Service ready after restart (pid=%d, port=%d, attempt=%d)",
@@ -609,6 +719,8 @@ class ServiceRunner:
                     self._shutdown_uvicorn()
                     self._wait_for_port_free(timeout=5)
             logger.error("Restart failed after 3 attempts: %s", last_err)
+            self._service_state = "degraded"
+            self._lifecycle_failure = "restart failed after 3 attempts"
             if self._icon:
                 self._apply_icon("stopped")
         finally:
@@ -646,6 +758,8 @@ class ServiceRunner:
 
     def _request_stop(self):
         """Signal-safe stop request — only sets flags, no locks or I/O."""
+        self._server_ready = False
+        self._service_state = "stopping"
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
         self._stop_event.set()
@@ -663,6 +777,8 @@ class ServiceRunner:
         the main thread is doing.
         """
         if sys.platform != "win32":
+            return
+        if self._win_ctrl_handler is not None:
             return
         try:
             import ctypes
@@ -683,14 +799,39 @@ class ServiceRunner:
                     pass
                 return True  # we handled it — don't chain to default handler
 
-            # Keep a strong reference so the callback isn't GC'd.
-            self._win_ctrl_handler = HandlerRoutine(_handler)
+            callback = HandlerRoutine(_handler)
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleCtrlHandler.argtypes = [HandlerRoutine, wintypes.BOOL]
             kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
-            kernel32.SetConsoleCtrlHandler(self._win_ctrl_handler, True)
+            if not kernel32.SetConsoleCtrlHandler(callback, True):
+                logger.error("Could not install Windows console Ctrl handler")
+                return
+            # Keep a strong reference for exactly as long as Windows retains it.
+            self._win_ctrl_handler = callback
         except Exception:
             logger.exception("Could not install Windows console Ctrl handler")
+
+    def _uninstall_windows_console_handler(self) -> None:
+        """Unregister the Win32 callback before releasing its ctypes object."""
+        handler = self._win_ctrl_handler
+        if sys.platform != "win32" or handler is None:
+            return
+        try:
+            import ctypes
+
+            if not ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, False):
+                if not any(root is handler for root in _FAILED_WIN_CTRL_HANDLERS):
+                    _FAILED_WIN_CTRL_HANDLERS.append(handler)
+                logger.error("Could not uninstall Windows console Ctrl handler")
+                return
+            _FAILED_WIN_CTRL_HANDLERS[:] = [
+                root for root in _FAILED_WIN_CTRL_HANDLERS if root is not handler
+            ]
+            self._win_ctrl_handler = None
+        except Exception:
+            if not any(root is handler for root in _FAILED_WIN_CTRL_HANDLERS):
+                _FAILED_WIN_CTRL_HANDLERS.append(handler)
+            logger.exception("Could not uninstall Windows console Ctrl handler")
 
     def _on_stop(self):
         """Full stop — called from menu or atexit, not from signal handler."""
@@ -700,28 +841,72 @@ class ServiceRunner:
             self._request_stop()
             if self._uvicorn_thread:
                 self._uvicorn_thread.join(timeout=5)
-            remove_pid(PID_FILE)
             if self._icon:
                 self._icon.stop()
         finally:
             self._lifecycle_lock.release()
 
     def _on_toggle_autostart(self):
-        from jacked.service.platform import (
-            detect_autostart,
-            install_autostart,
-            uninstall_autostart,
+        from jacked.service.lifecycle import (
+            default_service_paths,
+            install_native_owned,
+            provision_service_contract,
+            uninstall_native_owned,
         )
+        from jacked.service.autostart import AutostartState
+        from jacked.service.platform import inspect_autostart
 
-        if detect_autostart():
-            uninstall_autostart()
-            self._autostart_enabled = False
-        else:
-            # Artifacts are host-free: the bind host is resolved from the
-            # settings DB at every boot, so autostart honors the GUI Remote
-            # access toggle instead of pinning a host in the plist/VBS.
-            install_autostart(self.port)
-            self._autostart_enabled = True
+        paths = default_service_paths()
+        try:
+            spec, environment = provision_service_contract(paths=paths)
+            before = inspect_autostart()
+            if not before.toggle_safe:
+                message = (
+                    f"Start-on-Login is {before.state.value}: {before.reason}. "
+                    "Run `jacked service recover`."
+                )
+                logger.warning(message)
+                if self._icon is not None:
+                    self._icon.notify(message, "Jacked")
+                return
+            was_enabled = before.state is AutostartState.OWNED_ENABLED
+            if was_enabled:
+                result = uninstall_native_owned(
+                    spec, environment=environment, paths=paths
+                )
+            else:
+                result = install_native_owned(
+                    spec, environment=environment, paths=paths
+                )
+        except (OSError, ValueError) as exc:
+            message = (
+                f"Start-on-Login failed safely: {type(exc).__name__}. "
+                "Run `jacked service recover`."
+            )
+            logger.warning(message)
+            if self._icon is not None:
+                self._icon.notify(message, "Jacked")
+            return
+        if not result.ok:
+            logger.warning("Start-on-Login toggle refused: %s", result.reason)
+            if self._icon is not None:
+                self._icon.notify(result.reason, "Jacked")
+            return
+        after = inspect_autostart()
+        self._autostart_enabled = after.enabled
+        expected_state = (
+            AutostartState.ABSENT
+            if was_enabled
+            else AutostartState.OWNED_ENABLED
+        )
+        if after.state is not expected_state:
+            message = (
+                "Start-on-Login did not reach the expected manager state: "
+                f"{after.state.value}. Run `jacked service recover`."
+            )
+            logger.warning(message)
+            if self._icon is not None:
+                self._icon.notify(message, "Jacked")
 
     def _check_version(self, force: bool = False) -> None:
         """Poll PyPI for latest version and refresh the menu.
@@ -1038,15 +1223,7 @@ class ServiceRunner:
         threading.Thread(
             target=self._check_version, name="jacked-version-check", daemon=True
         ).start()
-        self._uvicorn_thread = self._start_uvicorn(cold_start=True)
-        if self._wait_for_ready():
-            self._started_at = time.time()
-            logger.info(
-                "Service ready (pid=%d, port=%d, autostart=%s)",
-                os.getpid(),
-                self.port,
-                self._autostart_enabled,
-            )
+        if self._started_at is not None:
             self._apply_icon("running")
             # Force a menu rebuild so the dynamic "Started ..." item
             # picks up the just-set timestamp on first open. Without
@@ -1059,7 +1236,6 @@ class ServiceRunner:
                 logger.debug("update_menu after start failed", exc_info=True)
         else:
             self._apply_icon("stopped")
-            remove_pid(PID_FILE)
             icon.notify("Jacked failed to start", "Jacked Service")
 
     def _install_tray_file_logger(self) -> None:
@@ -1116,8 +1292,6 @@ class ServiceRunner:
                 "Use --port to run on a different port."
             )
 
-        write_pid(PID_FILE, self.port)
-
         # Signal-safe: just set the stop event; the agent's stop-watch timer
         # bridges that to a clean uvicorn shutdown + quit on the main thread.
         signal.signal(signal.SIGTERM, lambda *_: self._request_stop())
@@ -1131,6 +1305,9 @@ class ServiceRunner:
         # status item appears, so the first pill reflects real data.
         self._uvicorn_thread = self._start_uvicorn(cold_start=True)
         if self._wait_for_ready():
+            self._server_ready = True
+            self._service_state = "running"
+            self._lifecycle_failure = None
             self._started_at = time.time()
             logger.info(
                 "Service ready — macOS menu-bar agent (pid=%d, port=%d)",
@@ -1138,14 +1315,9 @@ class ServiceRunner:
                 self.port,
             )
         else:
-            logger.error(
-                "Service did not become ready; menu-bar pill will show degraded"
-            )
+            self._abort_unready_start()
 
-        try:
-            MacMenuBarApp(self).run()
-        finally:
-            remove_pid(PID_FILE)
+        MacMenuBarApp(self).run()
 
     def run(self) -> None:
         """Start the service: tray icon on main thread, uvicorn in background."""
@@ -1167,31 +1339,45 @@ class ServiceRunner:
             self._service_spec, self._service_environment = provision_service_contract(
                 supervisor=SupervisorKind.MANUAL
             )
+        from jacked.service.instance import ServiceLeaseBusy, ServiceOwnershipInvalid
+
         try:
             self._ownership = claim_service_ownership(self._service_spec)
-        except RuntimeError as exc:
-            if (
-                os.environ.get("JACKED_SERVICE_GENERATION")
-                == self._service_spec.generation
-            ):
-                logger.error("Managed starter lost the service lease: %s", exc)
+        except ServiceLeaseBusy as exc:
+            logger.info("Service starter lost the singleton lease; yielding: %s", exc)
+            raise SystemExit(0) from exc
+        except ServiceOwnershipInvalid as exc:
+            logger.error("Service ownership recovery is required: %s", exc)
+            from jacked.service.spec import SupervisorKind
+
+            if self._service_spec.supervisor is not SupervisorKind.MANUAL:
                 raise SystemExit(0) from exc
-            raise SystemExit(f"Cannot start jacked service safely: {exc}") from exc
+            raise SystemExit(
+                "Jacked ownership is invalid. Run `jacked service recover`, then retry."
+            ) from exc
 
-        # Register the in-process restart handler for the WHOLE run lifetime,
-        # so the settings API's POST /remote-access/restart can apply a bind
-        # change (same PID, tray survives) instead of execv. Registered as
-        # _on_settings_restart, NOT _on_restart: a settings apply must clear
-        # any launch-time --host pin (stale launchd in-memory argv) so the DB
-        # actually wins — see _on_settings_restart's docstring.
-        # Shared across both backends below; the finally unregisters on exit.
-        from jacked.service.restart import set_restart_handler
-
-        set_restart_handler(self._on_settings_restart)
         try:
-            return self._run()
+            # The v2 lease is acquired first so v2-v2 contention never consults
+            # a mutable compatibility file. Legacy admission follows while the
+            # lease is held, preventing any new v2 tray from racing us to UI.
+            self._guard_legacy_pid_or_exit()
+
+            # Register the in-process restart handler for the WHOLE run lifetime,
+            # so the settings API's POST /remote-access/restart can apply a bind
+            # change (same PID, tray survives) instead of execv. Registered as
+            # _on_settings_restart, NOT _on_restart: a settings apply must clear
+            # any launch-time --host pin (stale launchd in-memory argv) so the DB
+            # actually wins — see _on_settings_restart's docstring.
+            # Shared across both backends below; the finally unregisters on exit.
+            from jacked.service.restart import set_restart_handler
+
+            set_restart_handler(self._on_settings_restart)
+            try:
+                return self._run()
+            finally:
+                set_restart_handler(None)
         finally:
-            set_restart_handler(None)
+            self._uninstall_windows_console_handler()
             if self._control_server is not None:
                 self._control_server.close()
                 self._control_server = None
@@ -1206,7 +1392,8 @@ class ServiceRunner:
         if action is ControlAction.STATUS:
             manifest = self._ownership.manifest if self._ownership else None
             return {
-                "state": "running" if manifest is not None else "stopping",
+                "state": self._service_state if manifest is not None else "stopping",
+                "failure": self._lifecycle_failure,
                 "instance_id": manifest.instance_id if manifest else None,
                 "generation": manifest.generation if manifest else None,
                 "build_version": manifest.build_version if manifest else None,
@@ -1250,8 +1437,6 @@ class ServiceRunner:
                 "Use --port to run on a different port."
             )
 
-        write_pid(PID_FILE, self.port)
-
         # Signal handlers are signal-safe — they just set the stop event.
         # The stop-monitor thread bridges that to the full _on_stop() cleanup.
         if sys.platform == "win32":
@@ -1281,6 +1466,24 @@ class ServiceRunner:
 
         self._autostart_enabled = detect_autostart()
 
+        # Complete admission, socket reservation, manifest publication, and
+        # health verification before constructing any tray object. A losing
+        # mixed-version starter therefore cannot flash or strand a second icon.
+        self._uvicorn_thread = self._start_uvicorn(cold_start=True)
+        if self._wait_for_ready():
+            self._server_ready = True
+            self._service_state = "running"
+            self._lifecycle_failure = None
+            self._started_at = time.time()
+            logger.info(
+                "Service ready (pid=%d, port=%d, autostart=%s)",
+                os.getpid(),
+                self.port,
+                self._autostart_enabled,
+            )
+        else:
+            self._abort_unready_start()
+
         menu = build_menu(
             port=self.port,
             version=__version__,
@@ -1304,8 +1507,4 @@ class ServiceRunner:
             title="Jacked",
             menu=menu,
         )
-        try:
-            self._icon.run(setup=self._setup)
-        finally:
-            # Ensure PID file is cleaned up even if pystray crashes
-            remove_pid(PID_FILE)
+        self._icon.run(setup=self._setup)

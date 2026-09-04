@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -60,7 +60,7 @@ def build_service_environment(
         "PATH": _SAFE_PATHS.get(platform, _SAFE_PATHS["linux"]),
         "JACKED_SERVICE_USER": _validate_plain(inputs.user_id, "user identity"),
     }
-    home = _validate_plain(str(Path(inputs.home)), "home")
+    home = _validate_plain(inputs.home, "home")
     if platform == "win32":
         env["USERPROFILE"] = home
         if inputs.temp_dir:
@@ -102,7 +102,11 @@ def posix_preinterpreter_command(
 ) -> tuple[str, ...]:
     """Return argv that clears the environment before Python is executed."""
 
-    if not Path(runtime).is_absolute() or not argv or argv[0] != "-I":
+    # ServiceSpec already validates the runtime using the host platform's path
+    # rules. Keep this boundary independently defensive without interpreting
+    # a Windows drive path as POSIX when cross-platform serializer tests render
+    # every supervisor on every CI host.
+    if not os.path.isabs(runtime) or not argv or argv[0] != "-I":
         raise ValueError("an absolute runtime and isolated Python argv are required")
     assignments = tuple(
         f"{key}={_validate_plain(value, key)}"

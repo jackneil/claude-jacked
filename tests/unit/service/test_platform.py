@@ -108,8 +108,9 @@ class TestDetectAutostart:
     @patch("sys.platform", "darwin")
     def test_darwin_detects_plist(self, tmp_path):
         plist = tmp_path / "ai.hank.jacked.plist"
-        plist.write_text("<plist>test</plist>")
-        from jacked.service.platform import detect_autostart
+        from jacked.service.platform import _generate_launchd_plist, detect_autostart
+
+        plist.write_text(_generate_launchd_plist("/usr/local/bin/jacked"))
         with patch("jacked.service.platform._get_launchd_plist_path", return_value=plist):
             assert detect_autostart() is True
 
@@ -125,15 +126,69 @@ class TestDetectAutostart:
         vbs = tmp_path / "jacked.vbs"
         vbs.write_text("test")
         from jacked.service.platform import detect_autostart
-        with patch("jacked.service.platform._get_windows_startup_path", return_value=vbs):
+        with (
+            patch("jacked.service.platform._get_windows_startup_path", return_value=vbs),
+            patch(
+                "jacked.service.autostart.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout=""),
+            ),
+        ):
             assert detect_autostart() is True
 
     @patch("sys.platform", "win32")
     def test_win32_no_vbs(self, tmp_path):
         vbs = tmp_path / "jacked.vbs"
         from jacked.service.platform import detect_autostart
-        with patch("jacked.service.platform._get_windows_startup_path", return_value=vbs):
+        with (
+            patch("jacked.service.platform._get_windows_startup_path", return_value=vbs),
+            patch(
+                "jacked.service.autostart.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout=""),
+            ),
+        ):
             assert detect_autostart() is False
+
+    @patch("sys.platform", "win32")
+    def test_win32_staged_task_definition_is_not_reported_as_registered(
+        self, tmp_path, monkeypatch
+    ):
+        import jacked.service.platform as platform_module
+        from jacked.service.platform import detect_autostart
+
+        monkeypatch.setattr(platform_module, "CLAUDE_DIR", tmp_path)
+        task = (
+            tmp_path
+            / "jacked-service-v2"
+            / "supervisors"
+            / "jacked-task.xml"
+        )
+        task.parent.mkdir(parents=True)
+        task.write_text("owned task")
+        with patch(
+            "jacked.service.platform._get_windows_startup_path",
+            return_value=tmp_path / "missing.vbs",
+        ):
+            with patch(
+                "jacked.service.autostart.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout=""),
+            ):
+                assert detect_autostart() is False
+
+    @patch("sys.platform", "linux")
+    def test_linux_requires_systemd_to_report_unit_enabled(self, tmp_path):
+        from jacked.service.platform import detect_autostart
+
+        unit = tmp_path / "jacked.service"
+        unit.write_text("owned unit")
+        with patch(
+            "jacked.service.platform._get_systemd_user_unit_path",
+            return_value=unit,
+        ):
+            with patch(
+                "jacked.service.autostart.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout="disabled"),
+            ):
+                assert detect_autostart() is False
 
 
 # Realistic pre-M5 artifacts with a baked --host, for migration tests.

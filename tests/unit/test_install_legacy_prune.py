@@ -65,7 +65,15 @@ def test_install_prunes_retired_hooks_but_keeps_user_hooks(tmp_path, monkeypatch
     from jacked.cli import main
 
     result = CliRunner().invoke(
-        main, ["install", "--force", "--no-tray", "--no-codex", "--no-rules"]
+        main,
+        [
+            "install",
+            "--force",
+            "--no-tray",
+            "--no-codex",
+            "--no-rules",
+            "--no-packs",
+        ],
     )
     assert result.exit_code == 0, result.output
 

@@ -22,7 +22,9 @@ from jacked.service.instance_models import (
 from jacked.service.instance_ownership import (
     ServiceInstance,
     ServiceLease,
+    ServiceLeaseBusy,
     ServiceOwnership,
+    ServiceOwnershipInvalid,
 )
 from jacked.service.instance_storage import (
     current_process_identity,
@@ -44,7 +46,9 @@ __all__ = [
     "ProcessIdentity",
     "ServiceInstance",
     "ServiceLease",
+    "ServiceLeaseBusy",
     "ServiceOwnership",
+    "ServiceOwnershipInvalid",
     "ServicePaths",
     "choose_quarantine_port",
     "current_process_identity",

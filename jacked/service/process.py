@@ -4,6 +4,7 @@ import os
 import signal
 import socket
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -65,13 +66,14 @@ def _windows_handle_terminate(process: OwnedProcess, *, force: bool) -> bool:
         return False
     import ctypes
     from ctypes import wintypes
+    from jacked.service.windows_security import windows_libraries
 
     query = 0x1000
     terminate = 0x0001
-    kernel32 = ctypes.windll.kernel32
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    handle = kernel32.OpenProcess(query | terminate, False, process.pid)
+    api = windows_libraries()
+    api.kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    api.kernel32.TerminateProcess.restype = wintypes.BOOL
+    handle = api.kernel32.OpenProcess(query | terminate, False, process.pid)
     if not handle:
         return False
     try:
@@ -79,7 +81,7 @@ def _windows_handle_terminate(process: OwnedProcess, *, force: bool) -> bool:
         exit_time = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
         user = wintypes.FILETIME()
-        if not kernel32.GetProcessTimes(
+        if not api.kernel32.GetProcessTimes(
             handle,
             ctypes.byref(creation),
             ctypes.byref(exit_time),
@@ -90,9 +92,9 @@ def _windows_handle_terminate(process: OwnedProcess, *, force: bool) -> bool:
         creation_id = f"windows-filetime:{(creation.dwHighDateTime << 32) | creation.dwLowDateTime}"
         if creation_id != process.creation_id:
             return False
-        return bool(kernel32.TerminateProcess(handle, 1))
+        return bool(api.kernel32.TerminateProcess(handle, 1))
     finally:
-        kernel32.CloseHandle(handle)
+        api.kernel32.CloseHandle(handle)
 
 
 def terminate_owned_process(
@@ -111,8 +113,8 @@ def terminate_owned_process(
         return TerminationResult.REFUSED_SUPERVISOR_REQUIRED
     if not verify_owned_process(process):
         return TerminationResult.REFUSED_IDENTITY
-    requested_signal = signal.SIGKILL if force else signal.SIGTERM
     if sys.platform.startswith("linux"):
+        requested_signal = signal.SIGKILL if force else signal.SIGTERM
         try:
             if _linux_pidfd_signal(process.pid, requested_signal):
                 return TerminationResult.SIGNALLED
@@ -130,10 +132,61 @@ def terminate_owned_process(
     return TerminationResult.UNSUPPORTED
 
 
-def write_pid(pid_file: Path, port: int = DEFAULT_PORT) -> None:
-    """Write current PID and port to the PID file."""
+def write_pid(pid_file: Path, port: int = DEFAULT_PORT) -> bool:
+    """Publish compatibility evidence unless another live process is named.
+
+    This file is refusal-only. It never authorizes process control or cleanup.
+    The v2 lease is the actual singleton authority.
+    """
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(f"{os.getpid()}\n{port}")
+    current_pid = os.getpid()
+    existing = read_pid(pid_file)
+    if existing is not None:
+        if is_v2_pid_evidence(pid_file):
+            return True
+        if existing["pid"] != current_pid and is_process_alive(existing["pid"]):
+            return False
+        # Compatibility evidence is refusal-only. Never replace an existing
+        # pathname, even when it is stale or belongs to this process: a legacy
+        # writer could claim it between inspection and replacement.
+        return True
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{pid_file.name}.", dir=pid_file.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(f"{current_pid}\n{port}\njacked-v2\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # link(2) is an atomic create-if-absent publication. os.replace()
+            # would let a racing legacy process lose its live PID evidence.
+            os.link(temporary, pid_file)
+        except FileExistsError:
+            winner = read_pid(pid_file)
+            if (
+                winner is not None
+                and winner["pid"] != current_pid
+                and is_process_alive(winner["pid"])
+            ):
+                return False
+            return True
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def is_v2_pid_evidence(pid_file: Path) -> bool:
+    """Identify compatibility evidence emitted by a lease-owning v2 service."""
+    try:
+        with pid_file.open("r", encoding="utf-8") as handle:
+            return handle.read(256).splitlines()[2:3] == ["jacked-v2"]
+    except (OSError, UnicodeError):
+        return False
 
 
 def read_pid(pid_file: Path) -> dict | None:
@@ -150,52 +203,81 @@ def read_pid(pid_file: Path) -> dict | None:
         return None
 
 
-def remove_pid(pid_file: Path) -> None:
-    """Remove PID file if it exists."""
-    pid_file.unlink(missing_ok=True)
-
-
-def is_process_alive(pid: int) -> bool:
-    """Cross-platform check if a PID is running.
-
-    POSIX: `os.kill(pid, 0)` probes process existence.
-    Windows: `os.kill(pid, 0)` is not a valid probe — use the Win32 API
-    via ctypes. WaitForSingleObject with 0 timeout avoids the
-    STILL_ACTIVE==259 false-positive that bites GetExitCodeProcess.
-    """
-    if pid <= 0:
-        return False
-
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        SYNCHRONIZE = 0x00100000
-        WAIT_TIMEOUT = 0x00000102
-
-        kernel32 = ctypes.windll.kernel32
-        # Explicit argtypes/restype — default int marshalling truncates
-        # 64-bit HANDLE values and yields false results.
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        kernel32.WaitForSingleObject.restype = wintypes.DWORD
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-        if not handle:
+def remove_pid(pid_file: Path, *, expected_pid: int | None = None) -> bool:
+    """Legacy helper retained for old callers; v2 ownership never uses it."""
+    if expected_pid is not None:
+        existing = read_pid(pid_file)
+        if existing is None or existing["pid"] != expected_pid:
             return False
-        try:
-            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
-        finally:
-            kernel32.CloseHandle(handle)
+    try:
+        pid_file.unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
+
+def _windows_process_liveness(pid: int) -> bool | None:
+    """Probe a Windows PID without generating a console control event."""
+    import ctypes
+    from ctypes import wintypes
+
+    SYNCHRONIZE = 0x00100000
+    ERROR_INVALID_PARAMETER = 87
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+
+    kernel32 = ctypes.windll.kernel32
+    # Explicit argtypes/restype — default int marshalling truncates
+    # 64-bit HANDLE values and yields false results.
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetLastError.argtypes = []
+    kernel32.GetLastError.restype = wintypes.DWORD
+
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if not handle:
+        error = kernel32.GetLastError()
+        return False if error == ERROR_INVALID_PARAMETER else None
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == WAIT_TIMEOUT:
+            return True
+        if result == WAIT_OBJECT_0:
+            return False
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _posix_process_liveness(pid: int) -> bool | None:
+    """Probe a POSIX PID without conflating access denial with absence."""
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, ProcessLookupError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def process_liveness(pid: int) -> bool | None:
+    """Return True for alive, False for dead, and None when indeterminate."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return _windows_process_liveness(pid)
+    return _posix_process_liveness(pid)
+
+
+def is_process_alive(pid: int) -> bool:
+    """Return whether a PID is confirmed alive; unknown remains non-authority."""
+    return process_liveness(pid) is True
 
 
 def is_port_available(host: str, port: int) -> bool:

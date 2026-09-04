@@ -284,19 +284,31 @@ async def read_codex_rate_limits(
 
 
 async def _terminate(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
+    """Close stdin, stop the app server if needed, and drain its pipes."""
+
+    if proc.stdin is not None:
+        proc.stdin.close()
+    cleanup = asyncio.create_task(proc.communicate())
     try:
-        proc.terminate()
-    except ProcessLookupError:
+        await asyncio.wait_for(asyncio.shield(cleanup), timeout=3)
         return
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=3)
-    except (asyncio.TimeoutError, ProcessLookupError):
+    except asyncio.TimeoutError:
+        pass
+
+    if proc.returncode is None:
         try:
-            proc.kill()
+            proc.terminate()
         except ProcessLookupError:
             pass
+    try:
+        await asyncio.wait_for(asyncio.shield(cleanup), timeout=3)
+    except asyncio.TimeoutError:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await cleanup
 
 
 def live_codex_account_id(db, env: Optional[Mapping[str, str]] = None) -> Optional[int]:

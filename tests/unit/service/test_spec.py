@@ -1,3 +1,6 @@
+import os
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -10,8 +13,10 @@ def _spec(**overrides):
         "service_id": "ai.hank.jacked",
         "protocol_version": 2,
         "build_version": "0.99.0",
-        "runtime_path": "/opt/jacked/python",
-        "launcher_path": "/opt/jacked/launcher-v2",
+        "runtime_path": os.path.realpath(sys.executable),
+        "launcher_path": os.path.join(
+            tempfile.gettempdir(), "jacked", "launcher-v2"
+        ),
         "launcher_sha256": "a" * 64,
         "supervisor": SupervisorKind.LAUNCHD,
         "arguments": ("-I", "-m", "jacked", "service", "start"),
@@ -24,7 +29,10 @@ def test_generation_is_deterministic_and_covers_runtime_identity():
     first = _spec()
     assert first.generation == _spec().generation
     assert first.generation != _spec(build_version="0.99.1").generation
-    assert first.generation != _spec(runtime_path="/other/python").generation
+    other_runtime = os.path.realpath(
+        os.path.join(tempfile.gettempdir(), "jacked", "other-python")
+    )
+    assert first.generation != _spec(runtime_path=other_runtime).generation
 
 
 def test_rejects_relative_or_unresolved_runtime_paths(tmp_path):

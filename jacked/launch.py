@@ -447,11 +447,26 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
 
     config_dir = ACCOUNTS_DIR / str(account_id)
 
-    # Refuse symlinks on the directory itself (defense-in-depth)
-    if config_dir.exists() and config_dir.is_symlink():
+    # Refuse redirects in the credential path (defense-in-depth).
+    # is_symlink() uses lstat and also catches a broken link. Checking
+    # exists() first misses broken Windows links and lets mkdir fail outside
+    # the intended, user-facing refusal path.
+    if config_dir.is_symlink():
         raise click.ClickException(
-            f"Account dir is a symlink — refusing to use: {config_dir}"
+            f"Account dir is a symlink; refusing to use: {config_dir}"
         )
+    if os.name == "nt":
+        from jacked.service.windows_state import (
+            reject_windows_reparse_ancestors,
+        )
+
+        try:
+            reject_windows_reparse_ancestors(config_dir)
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(
+                "Account dir path contains an unsafe Windows reparse point; "
+                f"refusing to use: {config_dir}"
+            ) from exc
 
     # Create dir with user-only permissions
     config_dir.mkdir(parents=True, exist_ok=True)

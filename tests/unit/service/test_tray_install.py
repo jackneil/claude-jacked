@@ -102,6 +102,11 @@ def _patch_autostart(monkeypatch, *, result, pid=None, alive=True, platform="win
         ),
     )
     monkeypatch.setattr(cli.sys, "platform", platform)
+    monkeypatch.setattr(
+        cli,
+        "_wait_owned_service_ready",
+        lambda *_a, **_k: {"state": "running", "port": 8321},
+    )
     spawned = []
     monkeypatch.setattr(
         cli, "_spawn_service_detached", lambda h, p: spawned.append((h, p))
@@ -138,9 +143,9 @@ class TestEnsureAutostartAndRunning:
             lambda _p: mock.MagicMock(supervisor="manual"),
         )
         monkeypatch.setattr(
-            "jacked.service.lifecycle.reconcile_native_artifact",
+            "jacked.service.lifecycle.inspect_native_artifact",
             lambda *a, **k: (
-                order.append("reconcile")
+                order.append("inspect")
                 or mock.MagicMock(
                     artifact=ArtifactInspection(ArtifactDisposition.MATCHING)
                 )
@@ -163,9 +168,14 @@ class TestEnsureAutostartAndRunning:
                 order.append("activate") or mock.MagicMock(ok=True, reason="ok")
             ),
         )
+        monkeypatch.setattr(
+            cli,
+            "_wait_owned_service_ready",
+            lambda *_a, **_k: {"state": "running", "port": 8321},
+        )
 
         cli._ensure_autostart_and_running(8321)
-        assert order == ["reconcile", "shutdown", "activate"]
+        assert order == ["inspect", "shutdown", "activate"]
 
     def test_never_starts_if_autostart_registration_failed(self, monkeypatch):
         cli, spawned = _patch_autostart(

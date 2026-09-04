@@ -7,6 +7,7 @@ hook CLAUDE_CONFIG_DIR support, and account deletion cleanup.
 import json
 import os
 import stat
+import subprocess
 import time
 from pathlib import Path
 from unittest import mock
@@ -596,9 +597,11 @@ class TestPrepareAccountDir:
 
         accounts_dir = tmp_path / "accounts"
         accounts_dir.mkdir(parents=True)
-        # Create symlink at accounts/1 -> /tmp
+        # Use a guaranteed-missing target so this covers dangling links too.
         symlink_dir = accounts_dir / "1"
-        symlink_dir.symlink_to("/tmp")
+        symlink_dir.symlink_to(
+            tmp_path / "missing-account-target", target_is_directory=True
+        )
 
         with mock.patch("jacked.launch.ACCOUNTS_DIR", accounts_dir):
             with mock.patch("jacked.launch.should_refresh", return_value=False):
@@ -606,6 +609,35 @@ class TestPrepareAccountDir:
 
                 with pytest.raises(click.ClickException, match="symlink"):
                     prepare_account_dir(account, db)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+    def test_rejects_junction_dir(self, tmp_path):
+        """Refuses to write account credentials through a Windows junction."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+        accounts_dir = tmp_path / "accounts"
+        accounts_dir.mkdir(parents=True)
+        target = tmp_path / "junction-target"
+        target.mkdir()
+        junction = accounts_dir / "1"
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if created.returncode != 0:
+            pytest.skip(created.stderr or created.stdout)
+
+        with mock.patch("jacked.launch.ACCOUNTS_DIR", accounts_dir):
+            with mock.patch("jacked.launch.should_refresh", return_value=False):
+                from jacked.launch import prepare_account_dir
+
+                with pytest.raises(click.ClickException, match="reparse point"):
+                    prepare_account_dir(account, db)
+
+        assert list(target.iterdir()) == []
 
     @requires_symlinks
     def test_rejects_symlink_cred_file(self, tmp_path):

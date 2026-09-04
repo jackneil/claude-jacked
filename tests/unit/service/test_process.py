@@ -5,7 +5,8 @@ import signal
 import subprocess
 import sys
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -14,7 +15,7 @@ class TestWritePid:
     def test_writes_pid_to_file(self, tmp_path):
         pid_file = tmp_path / "test.pid"
         from jacked.service.process import write_pid
-        write_pid(pid_file, port=8321)
+        assert write_pid(pid_file, port=8321) is True
         content = pid_file.read_text().strip()
         lines = content.split("\n")
         assert lines[0] == str(os.getpid())
@@ -23,17 +24,62 @@ class TestWritePid:
     def test_creates_parent_dirs(self, tmp_path):
         pid_file = tmp_path / "sub" / "dir" / "test.pid"
         from jacked.service.process import write_pid
-        write_pid(pid_file, port=8321)
+        assert write_pid(pid_file, port=8321) is True
         assert pid_file.exists()
 
-    def test_overwrites_existing(self, tmp_path):
+    def test_preserves_stale_existing_pid(self, tmp_path):
         pid_file = tmp_path / "test.pid"
-        pid_file.write_text("99999\n1234")
+        pid_file.write_text("12345\n1234")
         from jacked.service.process import write_pid
-        write_pid(pid_file, port=5555)
-        lines = pid_file.read_text().strip().split("\n")
-        assert lines[0] == str(os.getpid())
-        assert lines[1] == "5555"
+        with patch("jacked.service.process.is_process_alive", return_value=False):
+            assert write_pid(pid_file, port=5555) is True
+        assert pid_file.read_text() == "12345\n1234"
+
+    def test_refuses_to_overwrite_different_live_pid(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        other_pid = os.getpid() + 1
+        original = f"{other_pid}\n1234"
+        pid_file.write_text(original)
+        from jacked.service.process import write_pid
+        with patch("jacked.service.process.is_process_alive", return_value=True):
+            assert write_pid(pid_file, port=5555) is False
+        assert pid_file.read_text() == original
+
+    def test_preserves_same_process_without_liveness_probe(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text(f"{os.getpid()}\n1234")
+        from jacked.service.process import write_pid
+        with patch("jacked.service.process.is_process_alive") as is_alive:
+            assert write_pid(pid_file, port=5555) is True
+        is_alive.assert_not_called()
+        assert pid_file.read_text() == f"{os.getpid()}\n1234"
+
+    def test_atomic_publish_refuses_live_race_winner(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        other_pid = os.getpid() + 1
+
+        def racing_link(_source, target):
+            target.write_text(f"{other_pid}\n4321")
+            raise FileExistsError
+
+        from jacked.service.process import write_pid
+
+        with (
+            patch("jacked.service.process.os.link", side_effect=racing_link),
+            patch("jacked.service.process.is_process_alive", return_value=True),
+        ):
+            assert write_pid(pid_file, port=5555) is False
+        assert pid_file.read_text() == f"{other_pid}\n4321"
+
+    def test_v2_marker_never_treats_reused_pid_as_legacy_authority(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("12345\n8321\njacked-v2\n")
+        from jacked.service.process import write_pid
+
+        with patch("jacked.service.process.is_process_alive") as alive:
+            assert write_pid(pid_file, port=5555) is True
+        alive.assert_not_called()
+        assert pid_file.read_text() == "12345\n8321\njacked-v2\n"
 
 
 class TestReadPid:
@@ -74,13 +120,35 @@ class TestRemovePid:
         pid_file = tmp_path / "test.pid"
         pid_file.write_text("12345\n8321")
         from jacked.service.process import remove_pid
-        remove_pid(pid_file)
+        assert remove_pid(pid_file) is True
         assert not pid_file.exists()
 
     def test_no_error_on_missing_file(self, tmp_path):
         pid_file = tmp_path / "nope.pid"
         from jacked.service.process import remove_pid
-        remove_pid(pid_file)
+        assert remove_pid(pid_file) is False
+
+    def test_expected_pid_removes_matching_file(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("12345\n8321")
+        from jacked.service.process import remove_pid
+        assert remove_pid(pid_file, expected_pid=12345) is True
+        assert not pid_file.exists()
+
+    def test_expected_pid_preserves_mismatched_file(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        original = "12345\n8321"
+        pid_file.write_text(original)
+        from jacked.service.process import remove_pid
+        assert remove_pid(pid_file, expected_pid=54321) is False
+        assert pid_file.read_text() == original
+
+    def test_expected_pid_preserves_corrupt_file(self, tmp_path):
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("not a pid")
+        from jacked.service.process import remove_pid
+        assert remove_pid(pid_file, expected_pid=12345) is False
+        assert pid_file.read_text() == "not a pid"
 
 
 class TestIsProcessAlive:
@@ -114,6 +182,31 @@ class TestIsProcessAlive:
         finally:
             p.terminate()
             p.wait(timeout=5)
+
+    def test_indeterminate_probe_is_not_reported_alive(self):
+        from jacked.service import process
+
+        with patch.object(process, "process_liveness", return_value=None):
+            assert process.is_process_alive(12345) is False
+
+    def test_windows_access_denied_probe_is_indeterminate(self, monkeypatch):
+        import ctypes
+        from jacked.service.process import _windows_process_liveness
+
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 0
+        kernel32.GetLastError.return_value = 5
+        monkeypatch.setattr(
+            ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False
+        )
+
+        assert _windows_process_liveness(12345) is None
+
+    def test_posix_permission_error_means_process_exists(self):
+        from jacked.service.process import _posix_process_liveness
+
+        with patch("os.kill", side_effect=PermissionError):
+            assert _posix_process_liveness(12345) is True
 
 
 class TestCheckPort:

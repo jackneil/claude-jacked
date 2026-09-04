@@ -11,6 +11,7 @@ account live in the shared root is polled; non-active ones keep their cache).
 import asyncio
 import base64
 import json
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -551,7 +552,7 @@ def test_fetch_codex_usage_skips_when_swap_locked(db, tmp_path, monkeypatch):
 # Real subprocess round-trip through a fake app-server
 # --------------------------------------------------------------------------
 
-_FAKE_CODEX = """import sys, json
+_FAKE_CODEX = """import sys, json, os
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -569,6 +570,10 @@ for line in sys.stdin:
             "secondary": {"usedPercent": 33, "windowDurationMins": 10080, "resetsAt": 1783199300},
             "planType": "pro"}}}), flush=True)
     # 'initialized' notification: no response
+exit_file = os.environ.get("JACKED_TEST_CHILD_EXIT_FILE")
+if exit_file:
+    with open(exit_file, "w", encoding="utf-8") as marker:
+        marker.write(str(os.getpid()))
 """
 
 
@@ -584,10 +589,16 @@ def test_read_rate_limits_real_subprocess_roundtrip(tmp_path):
     fake = _write_fake_codex(tmp_path)
     home = tmp_path / ".codex"
     home.mkdir()
-    result = asyncio.run(cu.read_codex_rate_limits(home=home, codex_bin=fake))
+    exit_file = tmp_path / "fake-exited"
+    run_env = dict(os.environ)
+    run_env["JACKED_TEST_CHILD_EXIT_FILE"] = str(exit_file)
+    result = asyncio.run(
+        cu.read_codex_rate_limits(home=home, codex_bin=fake, env=run_env)
+    )
     norm = cu.normalize_rate_limits(result)
     assert norm["five_hour"]["utilization"] == 7
     assert norm["seven_day"]["utilization"] == 33
+    assert exit_file.read_text(encoding="utf-8").isdigit()
 
 
 def test_read_rate_limits_missing_binary_raises(tmp_path):
