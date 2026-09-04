@@ -41,13 +41,4 @@ jobs:
           python -m pip install --only-binary=:all: uv
 
       - name: Run tests
-        if: runner.os != 'Windows'
         run: uv run --frozen python -m pytest
-
-      - name: Isolate Windows native-state interaction
-        if: runner.os == 'Windows'
-        run: >-
-          uv run --frozen python -m pytest -vv
-          tests/unit/service/test_tray.py
-          tests/unit/service/test_windows_security.py
-          tests/unit/test_codex_usage.py::test_read_rate_limits_real_subprocess_roundtrip
