@@ -1440,12 +1440,31 @@ class ServiceRunner:
                 set_restart_handler(None)
         finally:
             self._uninstall_windows_console_handler()
-            if self._control_server is not None:
-                self._control_server.close()
-                self._control_server = None
-            if self._ownership is not None:
-                self._ownership.close()
-                self._ownership = None
+            self.release_ownership()
+
+    def release_ownership(self) -> None:
+        """Close the control channel and retire this instance's manifest.
+
+        Idempotent. ``run()`` calls it in its ``finally`` on every platform.
+        macOS also calls it explicitly before ``NSApp.terminate_`` because
+        that call ends the process without unwinding Python, so the
+        ``finally`` never runs there and the manifest would outlive the pid.
+        The attributes are cleared only after both closes so the control
+        server's manifest provider stays valid while its handler joins.
+        """
+        control, ownership = self._control_server, self._ownership
+        if control is not None:
+            try:
+                control.close()
+            except OSError:
+                logger.exception("Control server close failed during shutdown")
+        if ownership is not None:
+            try:
+                ownership.close()
+            except OSError:
+                logger.exception("Ownership release failed during shutdown")
+        self._control_server = None
+        self._ownership = None
 
     def _handle_control_action(self, action):
         """Dispatch an authenticated native-control action."""

@@ -5,7 +5,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 
 
 def _skip_if_no_tray():
@@ -1556,3 +1556,33 @@ class TestReadinessBudget:
         with patch.object(runner, "_start_failure_path", return_value=path):
             runner._note_ready(0.5)
         assert not path.exists()
+
+
+class TestReleaseOwnership:
+    def test_release_closes_control_then_ownership_once(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        parent = MagicMock()
+        runner._control_server = parent.control
+        runner._ownership = parent.ownership
+
+        runner.release_ownership()
+        runner.release_ownership()  # idempotent
+
+        assert parent.mock_calls == [call.control.close(), call.ownership.close()]
+        assert runner._control_server is None
+        assert runner._ownership is None
+
+    def test_release_still_retires_manifest_when_control_close_raises(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._control_server = MagicMock(close=MagicMock(side_effect=OSError("boom")))
+        ownership = MagicMock()
+        runner._ownership = ownership
+
+        runner.release_ownership()
+
+        ownership.close.assert_called_once()
+        assert runner._ownership is None
