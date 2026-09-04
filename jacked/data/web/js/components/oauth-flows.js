@@ -217,6 +217,12 @@ async function runOAuthFlow(opts) {
     // The poller and a code submission race to finish the flow. First one to
     // reach a terminal state wins; the loser must not re-render or double-refresh.
     let terminal = false;
+    // Set once this flow has followed a primary sign-in into the chained
+    // Claude Code token flow; the copy at the end depends on it.
+    let chainedFlowId = null;
+    // The interval's second counter. Declared here so chainTo can restart the
+    // clock when the poller switches to the chained flow.
+    let elapsed = 0;
 
     // Every banner is built node by node — no innerHTML with interpolated data.
     // Always re-look-up the slot: the accounts view re-renders wholesale
@@ -231,6 +237,19 @@ async function runOAuthFlow(opts) {
         slot.appendChild(div);
         // Clear only our own node — a newer flow may own the slot by then.
         if (clearAfterMs) setTimeout(() => { if (div.isConnected) div.remove(); }, clearAfterMs);
+    }
+
+    // A primary sign-in that completes may hand back a second flow: the server
+    // opened another browser window for the Claude Code token. Follow it so
+    // the account card updates when that token lands, not on the next click.
+    function chainTo(ccFlowId) {
+        chainedFlowId = ccFlowId;
+        flowId = ccFlowId;
+        elapsed = 0;
+        const slot = document.getElementById('oauth-flow-status') || statusEl;
+        slot.textContent = '';
+        buildOAuthBanner(slot, OAUTH_ACCENT_ORANGE,
+            'Account re-authenticated. Authorizing the Claude Code token in the browser...');
     }
 
     function stopPolling() {
@@ -288,7 +307,7 @@ async function runOAuthFlow(opts) {
         return;
     }
 
-    const flowId = start.flow_id;
+    let flowId = start.flow_id;
     if (!flowId) {
         endWith(OAUTH_ERROR_CLASS, 'No flow ID returned from server');
         return;
@@ -316,22 +335,45 @@ async function runOAuthFlow(opts) {
         if (terminal) return true;
 
         if (poll.status === 'completed') {
-            terminal = true;
-            stopPolling();
             // The server's verdict is what the guard was waiting on, so drop
             // it now, not after the refresh: refreshAndRender fetches every
             // account (and, on macOS, reconciles the active one through the
             // Keychain), and a Use Account click during that window used to
             // be refused as "another action in progress".
             window.jackedState._accountActionInFlight = false;
-            const success = msgs.success(poll);
+            const ccFlowId = typeof poll.cc_flow_id === 'string' ? poll.cc_flow_id : '';
+            if (ccFlowId && !chainedFlowId) {
+                // Refresh so the re-authenticated account shows now, then keep
+                // polling the chained flow; this call is not terminal.
+                await refreshAndRender();
+                chainTo(ccFlowId);
+                return false;
+            }
+            terminal = true;
+            stopPolling();
+            const success = chainedFlowId
+                ? { text: 'Account re-authenticated and Claude Code token authorized!', duration: 3000 }
+                : msgs.success(poll);
             // Refresh FIRST: refreshAndRender re-renders the route wholesale,
             // which would wipe a banner drawn before it. Render the success
             // message into the fresh slot afterwards.
             await refreshAndRender();
             renderBanner(OAUTH_SUCCESS_CLASS, success.text, success.duration);
         } else if (poll.status === 'error') {
-            endWith(OAUTH_ERROR_CLASS, msgs.failPrefix + (poll.error || 'Unknown error'));
+            if (chainedFlowId) {
+                // The account itself is stored; only the token step failed.
+                // Refresh so the card shows exactly what the server holds.
+                terminal = true;
+                stopPolling();
+                await refreshAndRender();
+                renderBanner(OAUTH_ERROR_CLASS,
+                    'Account re-authenticated, but the Claude Code token authorization failed: '
+                    + (poll.error || 'Unknown error')
+                    + '. Use the account menu to authorize the Claude Code token again.');
+                window.jackedState._accountActionInFlight = false;
+            } else {
+                endWith(OAUTH_ERROR_CLASS, msgs.failPrefix + (poll.error || 'Unknown error'));
+            }
         } else {
             endWith(OAUTH_WARN_CLASS, msgs.notFound);
         }
@@ -401,7 +443,6 @@ async function runOAuthFlow(opts) {
         pollOnce();
     }
 
-    let elapsed = 0;
     pollTimer = setInterval(() => {
         elapsed++;
         if (elapsed > maxWait) {
