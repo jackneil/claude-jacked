@@ -36,6 +36,11 @@ const OAUTH_CODE_BUTTON_CLASS = 'px-3 py-1 bg-blue-600 hover:bg-blue-500 text-wh
 const OAUTH_SUBTITLE_MANUAL = 'Click the link and approve. Claude then shows a code. Copy the code and paste it below.';
 const OAUTH_SUBTITLE_BROWSER = 'A browser window should open on this machine. If it does not open, use the link.';
 
+// Every chained-step failure ends the same way: the sign-in is stored, only
+// the token is missing, and there is a way to get it. Reasons are written
+// without trailing punctuation so this reads as one sentence after them.
+const OAUTH_CHAINED_RETRY_HINT = '. You can authorize the Claude Code token from the account menu.';
+
 // Poll every 1s. Manual flows get the longer window because a human is copying
 // a code between machines (mirrors MANUAL_TIMEOUT_SECONDS server-side).
 const OAUTH_MANUAL_MAX_WAIT = 600;
@@ -220,6 +225,9 @@ async function runOAuthFlow(opts) {
     // Set once this flow has followed a primary sign-in into the chained
     // Claude Code token flow; the copy at the end depends on it.
     let chainedFlowId = null;
+    // The primary flow's own success message, kept because every chained
+    // banner hangs off it: the sign-in it describes has already happened.
+    let primaryResult = null;
     // The interval's second counter. Declared here so chainTo can restart the
     // clock when the poller switches to the chained flow.
     let elapsed = 0;
@@ -242,14 +250,42 @@ async function runOAuthFlow(opts) {
     // A primary sign-in that completes may hand back a second flow: the server
     // opened another browser window for the Claude Code token. Follow it so
     // the account card updates when that token lands, not on the next click.
-    function chainTo(ccFlowId) {
+    function chainTo(ccFlowId, primary) {
         chainedFlowId = ccFlowId;
+        primaryResult = primary;
         flowId = ccFlowId;
         elapsed = 0;
         const slot = document.getElementById('oauth-flow-status') || statusEl;
-        slot.textContent = '';
-        buildOAuthBanner(slot, OAUTH_ACCENT_ORANGE,
-            'Account re-authenticated. Authorizing the Claude Code token in the browser...');
+        const chainedTextDiv = buildOAuthBanner(slot, OAUTH_ACCENT_ORANGE,
+            primary.text + ' Authorizing the Claude Code token in the browser...');
+        // The refresh that just ran re-rendered the route, taking the primary
+        // banner's Cancel button with it, so the chained wait needs its own.
+        addCancelButton(chainedTextDiv,
+            primary.text + ' The Claude Code token step was cancelled' + OAUTH_CHAINED_RETRY_HINT);
+    }
+
+    // Copy for the chained step, built from the flow's own success line so an
+    // added account is never told it was re-authenticated and the add flow's
+    // org-redirect notice survives the chain.
+    function chainedSuccess(poll) {
+        if (msgs.chainedSuccess) return msgs.chainedSuccess(primaryResult, poll);
+        return {
+            text: primaryResult.text + ' Claude Code token authorized!',
+            duration: primaryResult.duration || 3000,
+        };
+    }
+
+    function chainedFailPrefix() {
+        if (msgs.chainedFailPrefix) return msgs.chainedFailPrefix(primaryResult);
+        return primaryResult.text + ' The Claude Code token step failed: ';
+    }
+
+    // Every verdict reads differently once the sign-in itself has landed: the
+    // account is stored and only the token step is unfinished, so the primary
+    // flow's "it failed, try again" copy would be a lie.
+    function terminalCopy(primaryText, chainedReason) {
+        if (!chainedFlowId) return primaryText;
+        return chainedFailPrefix() + chainedReason + OAUTH_CHAINED_RETRY_HINT;
     }
 
     function stopPolling() {
@@ -263,17 +299,18 @@ async function runOAuthFlow(opts) {
     }
 
     // End the flow on a local verdict: timeout, expiry, cancel, or a dead poll loop.
-    function endWith(className, text) {
+    async function endWith(className, text) {
         if (terminal) return;
         terminal = true;
         stopPolling();
+        // While chained, the sign-in is stored whatever became of the token,
+        // so the card has to show what the server holds. Refresh FIRST:
+        // refreshAndRender re-renders the route wholesale and would wipe a
+        // banner drawn before it.
+        if (chainedFlowId) await refreshAndRender();
         renderBanner(className, text);
         window.jackedState._accountActionInFlight = false;
     }
-
-    // Spinner and title go up immediately; the mode-dependent parts wait for
-    // the start response to say which mode we got.
-    const textDiv = buildOAuthBanner(statusEl, opts.accent, opts.title);
 
     // A way out that is not "reload the page". While a flow is pending, the
     // shared guard refuses every other account action (Use Account included)
@@ -282,21 +319,29 @@ async function runOAuthFlow(opts) {
     // until the flow timed out or the page was reloaded. Cancelling settles
     // the banner locally; a sign-in the browser already finished is stored
     // server-side regardless, and the refresh right after picks it up.
-    const bannerEl = textDiv.parentNode;
-    if (bannerEl) {
+    function addCancelButton(textDiv, cancelledText) {
+        const bannerEl = textDiv.parentNode;
+        if (!bannerEl) return;
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button';
         cancelBtn.className = 'shrink-0 self-start text-xs text-slate-400 hover:text-white underline';
         cancelBtn.textContent = 'Cancel';
         cancelBtn.setAttribute('data-oauth-cancel', 'true');
         cancelBtn.addEventListener('click', () => {
-            endWith(OAUTH_WARN_CLASS, 'Sign-in cancelled. If you already approved it in the browser, the account updates on the next refresh.');
+            endWith(OAUTH_WARN_CLASS, cancelledText);
             if (typeof loadAllData === 'function' && typeof rerenderAccountsView === 'function') {
                 loadAllData().then(() => rerenderAccountsView()).catch(() => {});
             }
         });
         bannerEl.appendChild(cancelBtn);
     }
+
+    // Spinner and title go up immediately; the mode-dependent parts wait for
+    // the start response to say which mode we got.
+    const textDiv = buildOAuthBanner(statusEl, opts.accent, opts.title);
+
+    addCancelButton(textDiv,
+        'Sign-in cancelled. If you already approved it in the browser, the account updates on the next refresh.');
 
     let start;
     try {
@@ -343,39 +388,30 @@ async function runOAuthFlow(opts) {
             window.jackedState._accountActionInFlight = false;
             const ccFlowId = typeof poll.cc_flow_id === 'string' ? poll.cc_flow_id : '';
             if (ccFlowId && !chainedFlowId) {
-                // Refresh so the re-authenticated account shows now, then keep
+                // Read the flow's own success copy now: this poll is the only
+                // one carrying the sign-in's details (the email, and the
+                // add flow's org-redirect notice), and the chained poll won't.
+                const primary = msgs.success(poll);
+                // Refresh so the signed-in account shows now, then keep
                 // polling the chained flow; this call is not terminal.
                 await refreshAndRender();
-                chainTo(ccFlowId);
+                chainTo(ccFlowId, primary);
                 return false;
             }
             terminal = true;
             stopPolling();
-            const success = chainedFlowId
-                ? { text: 'Account re-authenticated and Claude Code token authorized!', duration: 3000 }
-                : msgs.success(poll);
+            const success = chainedFlowId ? chainedSuccess(poll) : msgs.success(poll);
             // Refresh FIRST: refreshAndRender re-renders the route wholesale,
             // which would wipe a banner drawn before it. Render the success
             // message into the fresh slot afterwards.
             await refreshAndRender();
             renderBanner(OAUTH_SUCCESS_CLASS, success.text, success.duration);
         } else if (poll.status === 'error') {
-            if (chainedFlowId) {
-                // The account itself is stored; only the token step failed.
-                // Refresh so the card shows exactly what the server holds.
-                terminal = true;
-                stopPolling();
-                await refreshAndRender();
-                renderBanner(OAUTH_ERROR_CLASS,
-                    'Account re-authenticated, but the Claude Code token authorization failed: '
-                    + (poll.error || 'Unknown error')
-                    + '. Use the account menu to authorize the Claude Code token again.');
-                window.jackedState._accountActionInFlight = false;
-            } else {
-                endWith(OAUTH_ERROR_CLASS, msgs.failPrefix + (poll.error || 'Unknown error'));
-            }
+            const reason = poll.error || 'Unknown error';
+            await endWith(OAUTH_ERROR_CLASS, terminalCopy(msgs.failPrefix + reason, reason));
         } else {
-            endWith(OAUTH_WARN_CLASS, msgs.notFound);
+            await endWith(OAUTH_WARN_CLASS,
+                terminalCopy(msgs.notFound, 'the token authorization flow was not found and may have expired'));
         }
         return true;
     }
@@ -391,7 +427,8 @@ async function runOAuthFlow(opts) {
             submitError.hidden = false;
         } catch (e) {
             if (e.status === 404) {
-                endWith(OAUTH_WARN_CLASS, msgs.expired);
+                await endWith(OAUTH_WARN_CLASS,
+                    terminalCopy(msgs.expired, 'the token authorization flow expired'));
                 return;
             }
             submitError.textContent = e.message || 'Could not submit the code.';
@@ -422,11 +459,13 @@ async function runOAuthFlow(opts) {
             await handleFlowResult(poll);
         } catch (e) {
             if (e.status === 404) {
-                endWith(OAUTH_WARN_CLASS, msgs.expired);
+                await endWith(OAUTH_WARN_CLASS,
+                    terminalCopy(msgs.expired, 'the token authorization flow expired'));
             } else {
                 consecutiveErrors++;
                 if (consecutiveErrors >= OAUTH_MAX_POLL_ERRORS) {
-                    endWith(OAUTH_ERROR_CLASS, msgs.checkFailed);
+                    await endWith(OAUTH_ERROR_CLASS,
+                        terminalCopy(msgs.checkFailed, 'the token status check failed repeatedly'));
                 }
             }
         } finally {
@@ -446,7 +485,8 @@ async function runOAuthFlow(opts) {
     pollTimer = setInterval(() => {
         elapsed++;
         if (elapsed > maxWait) {
-            endWith(OAUTH_WARN_CLASS, msgs.timedOut(waitLabel));
+            endWith(OAUTH_WARN_CLASS,
+                terminalCopy(msgs.timedOut(waitLabel), 'it was not finished within ' + waitLabel));
             return;
         }
         pollOnce();
@@ -480,7 +520,7 @@ async function startAddAccountFlow() {
                 if (poll.redirected_from_account_id) {
                     return {
                         text: 'Updated ' + acctEmail + (orgName ? ' (' + orgName + ')' : '')
-                            + ' - you authorized a different org than selected',
+                            + ' - you authorized a different org than selected.',
                         duration: 10000,
                     };
                 }
