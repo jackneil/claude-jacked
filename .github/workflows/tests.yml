@@ -12,11 +12,70 @@ concurrency:
 
 jobs:
   tests:
-    name: Python 3.11 / ${{ matrix.os }}
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        include:
+          - name: Python 3.11 / ubuntu-latest
+            os: ubuntu-latest
+            command: uv run --frozen python -m pytest
+          - name: Python 3.11 / macos-14
+            os: macos-14
+            command: uv run --frozen python -m pytest
+          - name: Windows diagnostic / native core
+            os: windows-latest
+            command: >-
+              uv run --frozen python -m pytest -vv
+              tests/integration
+              tests/unit/service/test_instance.py
+              tests/unit/service/test_platform.py
+              tests/unit/service/test_process.py
+              tests/unit/service/test_windows_security.py
+              tests/unit/test_codex_usage.py::test_read_rate_limits_real_subprocess_roundtrip
+          - name: Windows diagnostic / supervisors
+            os: windows-latest
+            command: >-
+              uv run --frozen python -m pytest -vv
+              tests/unit/service/test_autostart.py
+              tests/unit/service/test_spec.py
+              tests/unit/service/test_supervisor_core.py
+              tests/unit/service/test_supervisor_launchd.py
+              tests/unit/service/test_supervisor_task_scheduler.py
+              tests/unit/service/test_supervisor_uninstall.py
+              tests/unit/test_codex_usage.py::test_read_rate_limits_real_subprocess_roundtrip
+          - name: Windows diagnostic / lifecycle tray
+            os: windows-latest
+            command: >-
+              uv run --frozen python -m pytest -vv
+              tests/unit/service/test_cli.py
+              tests/unit/service/test_launcher.py
+              tests/unit/service/test_lifecycle.py
+              tests/unit/service/test_menubar_platform.py
+              tests/unit/service/test_tray.py
+              tests/unit/service/test_tray_install.py
+              tests/unit/test_codex_usage.py::test_read_rate_limits_real_subprocess_roundtrip
+          - name: Windows diagnostic / baseline service
+            os: windows-latest
+            command: >-
+              uv run --frozen python -m pytest -vv
+              tests/unit/service/test_bind.py
+              tests/unit/service/test_ensure_native_lifecycle.py
+              tests/unit/service/test_environment.py
+              tests/unit/service/test_icon.py
+              tests/unit/service/test_ipc.py
+              tests/unit/service/test_menubar_summary.py
+              tests/unit/service/test_menubar_usage_watch.py
+              tests/unit/service/test_migrate.py
+              tests/unit/service/test_multi_socket_serving.py
+              tests/unit/service/test_native_restart.py
+              tests/unit/service/test_phase_drift.py
+              tests/unit/service/test_restart.py
+              tests/unit/service/test_termination.py
+              tests/unit/service/test_update_phases.py
+              tests/unit/service/test_update_status.py
+              tests/unit/service/test_updater.py
+              tests/unit/test_codex_usage.py::test_read_rate_limits_real_subprocess_roundtrip
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -41,13 +100,4 @@ jobs:
           python -m pip install --only-binary=:all: uv
 
       - name: Run tests
-        if: runner.os != 'Windows'
-        run: uv run --frozen python -m pytest
-
-      - name: Isolate Windows service state
-        if: runner.os == 'Windows'
-        run: >-
-          uv run --frozen python -m pytest -vv
-          tests/integration
-          tests/unit/service
-          tests/unit/test_codex_usage.py::test_read_rate_limits_real_subprocess_roundtrip
+        run: ${{ matrix.command }}
