@@ -325,6 +325,32 @@ def process_identity(pid: int) -> ProcessIdentity:
     raise OSError(f"unsupported platform: {sys.platform}")
 
 
+def process_is_stale(process: ProcessIdentity | None) -> bool:
+    """True only when a recorded process is proven dead or replaced.
+
+    A probe that times out (macOS shells out to ``ps``) proves nothing and
+    returns False so callers never treat a busy machine as a dead owner.
+    """
+    if process is None:
+        return False
+    try:
+        observed = process_identity(process.pid)
+    except subprocess.SubprocessError:
+        return False
+    except (OSError, ProcessLookupError, ValueError):
+        return True
+    return observed != process
+
+
+def manifest_is_proven_stale(path: Path) -> bool:
+    """True only when a valid manifest names a dead or identity-mismatched PID.
+
+    Unreadable or invalid manifests raise (OSError/ValueError) so callers can
+    route them to explicit recovery instead of guessing.
+    """
+    return process_is_stale(read_manifest(path).process)
+
+
 def process_user_identity(pid: int) -> str:
     if sys.platform.startswith("linux"):
         return f"uid:{Path(f'/proc/{pid}').stat().st_uid}"

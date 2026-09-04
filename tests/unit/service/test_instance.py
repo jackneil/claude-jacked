@@ -246,3 +246,49 @@ def test_occupied_8321_reserves_dynamic_quarantine_port(monkeypatch):
     assert bind.quarantine is True
     assert bind.port == 49152
     reserved.close()
+
+
+def test_process_is_stale_rules(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    from jacked.service import instance_storage
+    from jacked.service.instance import process_is_stale
+
+    process = SimpleNamespace(pid=4242, creation_id="c1", executable="/x")
+
+    assert process_is_stale(None) is False
+
+    monkeypatch.setattr(instance_storage, "process_identity", lambda pid: process)
+    assert process_is_stale(process) is False
+
+    other = SimpleNamespace(pid=4242, creation_id="c2", executable="/x")
+    monkeypatch.setattr(instance_storage, "process_identity", lambda pid: other)
+    assert process_is_stale(process) is True
+
+    def dead(pid):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(instance_storage, "process_identity", dead)
+    assert process_is_stale(process) is True
+
+    def slow(pid):
+        raise subprocess.TimeoutExpired(["ps"], 2)
+
+    monkeypatch.setattr(instance_storage, "process_identity", slow)
+    assert process_is_stale(process) is False  # not proven; fail closed
+
+
+def test_manifest_is_proven_stale_reads_then_applies_rule(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from jacked.service import instance_storage
+    from jacked.service.instance import manifest_is_proven_stale
+
+    process = SimpleNamespace(pid=1, creation_id="c", executable="/x")
+    monkeypatch.setattr(
+        instance_storage, "read_manifest", lambda _path: SimpleNamespace(process=process)
+    )
+    monkeypatch.setattr(instance_storage, "process_is_stale", lambda p: p is process)
+
+    assert manifest_is_proven_stale(tmp_path / "m") is True

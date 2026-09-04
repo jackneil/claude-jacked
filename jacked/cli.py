@@ -16,11 +16,14 @@ import click
 from rich.console import Console
 from rich.panel import Panel
 
-# The only eager jacked import in this file: click.Choice needs these values at
-# decoration time (see the `jacked dcr engine set` command). jacked.dcr_settings
-# is stdlib-only at import time, so this costs nothing at startup.
+# The only eager jacked imports in this file: click.Choice needs these values at
+# decoration time (see the `jacked dcr engine set` command), and
+# _wait_owned_service_ready's default budget is evaluated at import time.
+# jacked.dcr_settings is stdlib-only at import time, and jacked.service is
+# stdlib-only at import time too, so this costs nothing at startup.
 from jacked.dcr_settings import EFFORT_CHOICES as _DCR_EFFORT_CHOICES
 from jacked.dcr_settings import ENGINE_CHOICES as _DCR_ENGINE_CHOICES
+from jacked.service import REPLACEMENT_READY_TIMEOUT
 
 
 # Windows legacy consoles (cp1252 / cp437 OEM) can't encode glyphs like → or −;
@@ -370,7 +373,7 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
 
 def _wait_owned_service_ready(
     paths,
-    timeout: float = 15.0,
+    timeout: float = REPLACEMENT_READY_TIMEOUT,
     *,
     expected_generation: str | None = None,
     expected_build: str | None = None,
@@ -410,16 +413,25 @@ def _wait_owned_service_ready(
     return None
 
 
+def _clear_start_failure_breaker(paths) -> None:
+    """Let an explicit start or restart retry after the give-up breaker fired.
+
+    A supervised service exits cleanly once repeated starts fail inside the
+    window, and only an operator gesture is allowed to re-arm it.
+    """
+    from jacked.service.start_failures import clear_start_failures
+
+    try:
+        clear_start_failures(paths.root / "start-failures.json")
+    except OSError:
+        logger.warning("Could not clear the start-failure breaker", exc_info=True)
+
+
 def _manifest_is_proven_stale(path: Path) -> bool:
     """True only when a valid manifest names a dead or identity-mismatched PID."""
-    from jacked.service.instance import process_identity, read_manifest
+    from jacked.service.instance import manifest_is_proven_stale
 
-    manifest = read_manifest(path)
-    try:
-        observed = process_identity(manifest.process.pid)
-    except (OSError, ProcessLookupError, ValueError):
-        return True
-    return observed != manifest.process
+    return manifest_is_proven_stale(path)
 
 
 def _spawn_service_detached(host: str | None, port: int):
@@ -555,11 +567,14 @@ def start(host: str | None, port: int | None, restart: bool):
                     )
                     return
                 console.print(
-                    "[red]Could not authenticate and restart the owned service.[/red] "
-                    f"{handoff.reason}. No process was signalled."
+                    "[red]Owned service restart did not complete.[/red] "
+                    f"{handoff.reason}."
                 )
                 console.print(
-                    "[dim]Run `jacked service recover` to inspect ownership.[/dim]"
+                    "[dim]The shutdown request may already have been accepted. "
+                    "Check `jacked service status` in a minute; if the service "
+                    "is still down, run `jacked service restart`, then "
+                    "`jacked service recover` to inspect ownership.[/dim]"
                 )
                 sys.exit(1)
             console.print(
@@ -643,15 +658,14 @@ def start(host: str | None, port: int | None, restart: bool):
         sys.exit(1)
 
     console.print(f"[dim]Starting jacked service (detached) on :{the_port}...[/dim]")
+    _clear_start_failure_breaker(paths)
     # Pass the raw host (possibly None): None means "no --host in argv", so the
     # detached service resolves its bind from the DB / loopback default.
     log_path = _spawn_service_detached(host, the_port)
 
     from jacked import __version__ as current_build
 
-    status = _wait_owned_service_ready(
-        paths, timeout=15.0, expected_build=current_build
-    )
+    status = _wait_owned_service_ready(paths, expected_build=current_build)
     if status is not None:
         running_port = status.get("port") or the_port
         console.print(
@@ -660,7 +674,8 @@ def start(host: str | None, port: int | None, restart: bool):
         )
     else:
         console.print(
-            f"[yellow]Started, but :{the_port} didn't answer within 15s.[/yellow]"
+            f"[yellow]Started, but :{the_port} didn't answer within "
+            f"{int(REPLACEMENT_READY_TIMEOUT)}s.[/yellow]"
         )
         console.print(f"[dim]Check {log_path}[/dim]")
         sys.exit(1)
@@ -3588,7 +3603,6 @@ def _ensure_autostart_and_running(
         return
     ready = _wait_owned_service_ready(
         paths,
-        timeout=15.0,
         expected_generation=spec.generation,
     )
     if ready is None:
@@ -5585,6 +5599,7 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     from jacked.service import DEFAULT_PORT
     from jacked.service.lifecycle import default_service_paths
 
+    _clear_start_failure_breaker(default_service_paths())
     the_port = port or DEFAULT_PORT
 
     # An explicit --host expresses intent about the persistent Remote access
@@ -5639,9 +5654,7 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     log_path = _spawn_service_detached(host, the_port)
     from jacked import __version__ as current_build
 
-    status = _wait_owned_service_ready(
-        paths, timeout=15.0, expected_build=current_build
-    )
+    status = _wait_owned_service_ready(paths, expected_build=current_build)
     if status is None:
         console.print("[red]Replacement service did not become ready.[/red]")
         console.print(f"[dim]Logs: {log_path}[/dim]")
@@ -5785,7 +5798,6 @@ def service_recover():
         raise SystemExit(1)
     ready = _wait_owned_service_ready(
         paths,
-        timeout=15.0,
         expected_generation=spec.generation,
     )
     if ready is None:

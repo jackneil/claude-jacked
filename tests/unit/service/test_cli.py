@@ -1374,3 +1374,68 @@ class TestServiceRestartRemoteAccessParity:
         args = mock_popen.call_args[0][0]
         assert "--host" in args
         assert args[args.index("--host") + 1] == "192.168.1.5"
+
+
+def test_cli_ready_waits_share_the_replacement_budget():
+    import inspect
+
+    from jacked import cli
+    from jacked.service import REPLACEMENT_READY_TIMEOUT
+
+    assert inspect.signature(cli._wait_owned_service_ready).parameters["timeout"].default == REPLACEMENT_READY_TIMEOUT
+    assert "timeout=15.0" not in inspect.getsource(cli)
+    assert "within 15s" not in inspect.getsource(cli)
+
+
+def test_service_restart_clears_the_start_failure_breaker():
+    from jacked.cli import main
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = default_service_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    paths.manifest.write_text("{}", encoding="utf-8")
+    breaker = paths.root / "start-failures.json"
+    breaker.write_text("[1.0, 2.0]", encoding="utf-8")
+    with (
+        patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(MagicMock(), {"PATH": "/safe"}),
+        ),
+        patch(
+            "jacked.service.lifecycle.handoff_owned_service",
+            return_value=MagicMock(ok=True, reason="new build started"),
+        ),
+        patch("jacked.cli._manifest_is_proven_stale", return_value=False),
+    ):
+        result = CliRunner().invoke(main, ["service", "restart"])
+
+    assert result.exit_code == 0, result.output
+    assert not breaker.exists()
+
+
+def test_start_clears_the_start_failure_breaker_before_spawning(tmp_path):
+    from jacked.cli import main
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = default_service_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    breaker = paths.root / "start-failures.json"
+    breaker.write_text("[1.0, 2.0]", encoding="utf-8")
+    with (
+        patch("jacked.service.process.read_pid", return_value=None),
+        patch("jacked.service.process.is_process_alive", return_value=False),
+        patch("jacked.service.process.is_port_available", return_value=True),
+        patch("jacked.service.legacy.probe_legacy_health", return_value=False),
+        patch(
+            "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
+        ) as spawn,
+        patch(
+            "jacked.cli._wait_owned_service_ready",
+            return_value={"state": "running", "port": 8321},
+        ),
+    ):
+        result = CliRunner().invoke(main, ["start"])
+
+    assert result.exit_code == 0, result.output
+    spawn.assert_called_once()
+    assert not breaker.exists()
