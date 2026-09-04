@@ -58,6 +58,26 @@ def test_posix_command_clears_environment_before_python():
     )
 
 
+def test_posix_launcher_command_binds_runtime_target():
+    command = posix_preinterpreter_command(
+        runtime="/opt/jacked/venv/bin/python",
+        runtime_target="/opt/jacked/python-build/bin/python3.14",
+        argv=("-I", "-m", "jacked", "service", "start"),
+        environment={"HOME": "/home/alice"},
+        launcher="/home/alice/.claude/jacked-launch",
+    )
+    assert command[-8:] == (
+        "/home/alice/.claude/jacked-launch",
+        "/opt/jacked/venv/bin/python",
+        "/opt/jacked/python-build/bin/python3.14",
+        "-I",
+        "-m",
+        "jacked",
+        "service",
+        "start",
+    )
+
+
 def test_windows_launcher_clears_environment_and_never_embeds_inherited_secret():
     script = render_windows_launcher(
         runtime=r"C:\\jacked\\python.exe",

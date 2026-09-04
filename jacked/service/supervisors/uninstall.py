@@ -231,9 +231,9 @@ def _remove_exact_artifact(
 def _launchd_launcher(content: bytes, argument_count: int) -> str | None:
     try:
         arguments = plistlib.loads(content)["ProgramArguments"]
-        # The immutable launcher is followed by the exact runtime and Python
-        # argument vector in posix_preinterpreter_command.
-        return arguments[-argument_count - 2]
+        # The immutable launcher is followed by the exact runtime, its bound
+        # target, and the Python argument vector.
+        return arguments[-argument_count - 3]
     except (
         KeyError,
         IndexError,

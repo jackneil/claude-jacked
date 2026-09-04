@@ -180,3 +180,18 @@ def test_invalid_manifest_recovery_refuses_while_lease_is_active(tmp_path):
     finally:
         lease.release()
     assert paths.manifest.exists()
+
+
+def test_manual_spawn_refuses_a_changed_runtime_target(monkeypatch):
+    from jacked.service import lifecycle
+
+    spec = MagicMock()
+    spec.runtime_target_matches.return_value = False
+    popen = MagicMock()
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", popen)
+
+    result = lifecycle.spawn_exact_service(spec, environment={})
+
+    assert result.ok is False
+    assert result.reason == "runtime target changed"
+    popen.assert_not_called()

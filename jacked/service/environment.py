@@ -99,6 +99,7 @@ def posix_preinterpreter_command(
     argv: tuple[str, ...],
     environment: dict[str, str],
     launcher: str | None = None,
+    runtime_target: str | None = None,
 ) -> tuple[str, ...]:
     """Return argv that clears the environment before Python is executed."""
 
@@ -112,7 +113,12 @@ def posix_preinterpreter_command(
         f"{key}={_validate_plain(value, key)}"
         for key, value in sorted(environment.items())
     )
-    launch = (runtime, *argv) if launcher is None else (launcher, runtime, *argv)
+    if launcher is None:
+        launch = (runtime, *argv)
+    else:
+        if runtime_target is None or not os.path.isabs(runtime_target):
+            raise ValueError("launcher commands require an absolute runtime target")
+        launch = (launcher, runtime, runtime_target, *argv)
     return ("/usr/bin/env", "-i", *assignments, *launch)
 
 

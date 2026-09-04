@@ -58,6 +58,16 @@ def default_service_paths() -> ServicePaths:
     )
 
 
+def _service_runtime_path(executable: str) -> str:
+    """Resolve ancestors while preserving a virtualenv's Python entrypoint."""
+
+    absolute = Path(os.path.normpath(os.path.abspath(executable)))
+    venv_config = absolute.parent.parent / "pyvenv.cfg"
+    if os.name == "posix" and absolute.is_symlink() and venv_config.is_file():
+        return str(Path(os.path.realpath(absolute.parent)) / absolute.name)
+    return os.path.realpath(absolute)
+
+
 def supervisor_for_platform(platform: str | None = None) -> SupervisorKind:
     current = sys.platform if platform is None else platform
     if current == "darwin":
@@ -84,7 +94,7 @@ def build_service_spec(
         service_id=LAUNCHD_LABEL,
         protocol_version=PROTOCOL_VERSION,
         build_version=build_version,
-        runtime_path=os.path.realpath(runtime_path),
+        runtime_path=runtime_path,
         launcher_path=os.path.normpath(launcher_path),
         launcher_sha256=hashlib.sha256(launcher_content).hexdigest(),
         supervisor=supervisor or supervisor_for_platform(),
@@ -166,7 +176,9 @@ def provision_service_contract(
         inherited_allowlisted=inherited,
         platform=selected_platform,
     )
-    runtime = os.path.realpath(sys.executable)
+    # Preserve the virtualenv entrypoint. Resolving this symlink selects the
+    # base interpreter, which cannot import the tool environment under -I.
+    runtime = _service_runtime_path(sys.executable)
     arguments = ("-I", "-m", "jacked", "service", "start")
     install = _launcher_install(
         selected_platform, runtime, arguments, environment
@@ -336,6 +348,8 @@ def spawn_exact_service(
         **environment,
         "JACKED_SERVICE_GENERATION": spec.generation,
     }
+    if not spec.runtime_target_matches():
+        return SupervisorAction(False, "spawn", "runtime target changed")
     kwargs: dict[str, object] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,

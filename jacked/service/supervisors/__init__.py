@@ -39,6 +39,7 @@ def render_launchd(
         argv=spec.arguments,
         environment={**environment, "JACKED_SERVICE_GENERATION": spec.generation},
         launcher=spec.launcher_path,
+        runtime_target=spec.runtime_target_path,
     )
     payload: dict[str, Any] = {
         "Label": spec.service_id,
@@ -70,6 +71,7 @@ def render_systemd_user(
         argv=spec.arguments,
         environment={**environment, "JACKED_SERVICE_GENERATION": spec.generation},
         launcher=spec.launcher_path,
+        runtime_target=spec.runtime_target_path,
     )
     escaped = (
         " ".join(command[:2])
