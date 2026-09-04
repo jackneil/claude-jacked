@@ -284,21 +284,30 @@ async def read_codex_rate_limits(
 
 
 async def _terminate(proc: asyncio.subprocess.Process) -> None:
-    """Stop the app server and drain its pipes before the event loop closes."""
+    """Close stdin, stop the app server if needed, and drain its pipes."""
+
+    if proc.stdin is not None:
+        proc.stdin.close()
+    cleanup = asyncio.create_task(proc.communicate())
+    try:
+        await asyncio.wait_for(asyncio.shield(cleanup), timeout=3)
+        return
+    except asyncio.TimeoutError:
+        pass
 
     if proc.returncode is None:
         try:
             proc.terminate()
         except ProcessLookupError:
             pass
-    cleanup = asyncio.create_task(proc.communicate())
     try:
         await asyncio.wait_for(asyncio.shield(cleanup), timeout=3)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         await cleanup
 
 
