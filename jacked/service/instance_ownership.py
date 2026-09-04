@@ -56,12 +56,23 @@ class ServiceLease:
             if key in self._held_paths:
                 raise ServiceLeaseBusy("this process already holds the service lease")
             _ensure_private_directory(self.path.parent)
+            existed = self.path.exists() or self.path.is_symlink()
+            if os.name == "nt" and existed:
+                from jacked.service.windows_state import ensure_private_windows_file
+
+                try:
+                    ensure_private_windows_file(self.path)
+                except (OSError, ValueError) as exc:
+                    raise ServiceLeaseBusy(
+                        "the existing service lease is unsafe"
+                    ) from exc
             handle = open(self.path, "a+b")
             try:
                 if os.name == "nt":
                     import msvcrt
 
-                    _secure_windows_path(self.path)
+                    if not existed:
+                        _secure_windows_path(self.path)
                     handle.seek(0)
                     if handle.tell() == 0:
                         handle.write(b"\0")

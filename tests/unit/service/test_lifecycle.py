@@ -151,6 +151,9 @@ def test_invalid_private_manifest_is_quarantined_under_lease(tmp_path):
     paths = ServicePaths.in_directory(tmp_path)
     paths.manifest.write_text("not-json", encoding="utf-8")
     paths.manifest.chmod(0o600)
+    from tests.unit.service.supervisor_test_support import _secure_test_path
+
+    _secure_test_path(paths.manifest)
 
     backup = quarantine_invalid_ownership(paths)
 
@@ -166,6 +169,9 @@ def test_invalid_manifest_recovery_refuses_while_lease_is_active(tmp_path):
     paths = ServicePaths.in_directory(tmp_path)
     paths.manifest.write_text("not-json", encoding="utf-8")
     paths.manifest.chmod(0o600)
+    from tests.unit.service.supervisor_test_support import _secure_test_path
+
+    _secure_test_path(paths.manifest)
     lease = ServiceLease(paths.lease)
     lease.acquire()
     try:

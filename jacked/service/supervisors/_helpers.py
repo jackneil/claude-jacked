@@ -12,7 +12,12 @@ def atomic_write(path: Path, content: bytes) -> None:
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
     try:
-        os.fchmod(descriptor, 0o600)
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        elif os.name == "nt":
+            from jacked.service.instance_storage import _secure_windows_path
+
+            _secure_windows_path(temporary)
         with os.fdopen(descriptor, "wb", closefd=True) as file:
             descriptor = -1
             file.write(content)
@@ -21,6 +26,8 @@ def atomic_write(path: Path, content: bytes) -> None:
         os.replace(temporary, path)
         if os.name == "posix":
             path.chmod(0o600)
+        elif os.name == "nt":
+            _secure_windows_path(path)
     finally:
         if descriptor >= 0:
             os.close(descriptor)

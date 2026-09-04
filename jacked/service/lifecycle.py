@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -16,6 +14,7 @@ from jacked import __version__
 from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, LAUNCHD_LABEL
 from jacked.service.environment import EnvironmentInputs, build_service_environment
 from jacked.service.environment import render_windows_launcher
+from jacked.service.handoff import handoff_owned_service
 from jacked.service.instance import (
     Discovery,
     Inspection,
@@ -27,7 +26,12 @@ from jacked.service.instance import (
     inspect_instance,
     load_or_create_machine_id,
 )
-from jacked.service.launcher import POSIX_LAUNCHER_SOURCE, install_versioned_launcher
+from jacked.service.launcher import (
+    POSIX_LAUNCHER_SOURCE,
+    LauncherInstall,
+    install_versioned_launcher,
+)
+from jacked.service.recovery import quarantine_invalid_ownership
 from jacked.service.spec import ServiceSpec, SupervisorKind
 from jacked.service.supervisors import (
     ArtifactInspection,
@@ -106,6 +110,32 @@ def default_environment(
     )
 
 
+def _launcher_install(
+    platform: str,
+    runtime: str,
+    arguments: tuple[str, ...],
+    environment: dict[str, str],
+) -> LauncherInstall:
+    if platform == "win32":
+        content = render_windows_launcher(
+            runtime=runtime, argv=arguments, environment=environment
+        ).encode("utf-8")
+        name = "jacked-service.ps1"
+        executable = False
+    else:
+        content = POSIX_LAUNCHER_SOURCE
+        name = "jacked-service-launch"
+        executable = True
+    digest = hashlib.sha256(content).hexdigest()
+    return LauncherInstall(
+        version=f"v2-{digest[:16]}",
+        name=name,
+        content=content,
+        expected_sha256=digest,
+        executable=executable,
+    )
+
+
 def provision_service_contract(
     *,
     paths: ServicePaths | None = None,
@@ -138,29 +168,17 @@ def provision_service_contract(
     )
     runtime = os.path.realpath(sys.executable)
     arguments = ("-I", "-m", "jacked", "service", "start")
-    if selected_platform == "win32":
-        launcher_content = render_windows_launcher(
-            runtime=runtime, argv=arguments, environment=environment
-        ).encode("utf-8")
-        launcher_name = "jacked-service.ps1"
-        executable = False
-    else:
-        launcher_content = POSIX_LAUNCHER_SOURCE
-        launcher_name = "jacked-service-launch"
-        executable = True
-    digest = hashlib.sha256(launcher_content).hexdigest()
+    install = _launcher_install(
+        selected_platform, runtime, arguments, environment
+    )
     launcher = install_versioned_launcher(
         selected_paths.root / "launchers",
-        version=f"v2-{digest[:16]}",
-        name=launcher_name,
-        content=launcher_content,
-        expected_sha256=digest,
-        executable=executable,
+        install,
     )
     spec = build_service_spec(
         runtime_path=runtime,
         launcher_path=str(launcher),
-        launcher_content=launcher_content,
+        launcher_content=install.content,
         supervisor=supervisor or supervisor_for_platform(selected_platform),
         arguments=arguments,
     )
@@ -224,56 +242,6 @@ def inspect_service(
 
 def discover_service(paths: ServicePaths | None = None) -> Discovery:
     return discover_endpoint(paths or default_service_paths())
-
-
-def quarantine_invalid_ownership(paths: ServicePaths) -> Path | None:
-    """Move a safely-owned invalid manifest aside while holding the v2 lease."""
-    from jacked.service.instance import ServiceLease, read_manifest
-
-    lease = ServiceLease(paths.lease)
-    lease.acquire()
-    try:
-        try:
-            read_manifest(paths.manifest)
-            return None
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError):
-            pass
-
-        status = paths.manifest.lstat()
-        unsafe = (
-            not stat.S_ISREG(status.st_mode)
-            or status.st_nlink != 1
-            or bool(getattr(status, "st_file_attributes", 0) & 0x400)
-            or (
-                os.name == "posix"
-                and (status.st_uid != os.getuid() or status.st_mode & 0o077)
-            )
-        )
-        if unsafe:
-            raise ValueError(f"unsafe manifest requires manual backup: {paths.manifest}")
-
-        control_exists = paths.control.exists() or paths.control.is_symlink()
-        if control_exists:
-            control_status = paths.control.lstat()
-            if os.name == "posix" and (
-                not stat.S_ISSOCK(control_status.st_mode)
-                or control_status.st_uid != os.getuid()
-            ):
-                raise ValueError(
-                    f"unsafe control path requires manual backup: {paths.control}"
-                )
-
-        backup = paths.manifest.with_name(
-            f"{paths.manifest.name}.invalid-{time.time_ns()}"
-        )
-        os.replace(paths.manifest, backup)
-        if control_exists:
-            paths.control.unlink()
-        return backup
-    finally:
-        lease.release()
 
 
 @dataclass(frozen=True)
@@ -384,112 +352,6 @@ def spawn_exact_service(
     except OSError as exc:
         return SupervisorAction(False, "spawn", type(exc).__name__)
     return SupervisorAction(True, "spawn", f"started {spec.generation[:12]}")
-
-
-def handoff_owned_service(
-    spec: ServiceSpec,
-    *,
-    environment: dict[str, str],
-    paths: ServicePaths | None = None,
-    timeout: float = 10,
-) -> SupervisorAction:
-    """Authenticate shutdown, await lease release, then start the new build."""
-
-    from jacked.service.instance import read_manifest
-    from jacked.service.ipc import ControlAction, send_native_control
-
-    selected_paths = paths or default_service_paths()
-    try:
-        old = read_manifest(selected_paths.manifest)
-        response = send_native_control(
-            selected_paths.manifest, ControlAction.RESTART_HANDOFF
-        )
-    except (OSError, ValueError) as exc:
-        return SupervisorAction(False, "handoff", type(exc).__name__)
-    if not response.get("ok"):
-        return SupervisorAction(False, "handoff", "service rejected shutdown")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            current = read_manifest(selected_paths.manifest)
-        except FileNotFoundError:
-            break
-        except (OSError, ValueError):
-            return SupervisorAction(False, "handoff", "ownership became indeterminate")
-        if current.instance_id != old.instance_id:
-            if current.generation == spec.generation:
-                return _await_ready_generation(
-                    selected_paths,
-                    spec.generation,
-                    previous_instance=old.instance_id,
-                    timeout=timeout,
-                )
-            return SupervisorAction(False, "handoff", "supervisor started stale build")
-        time.sleep(0.05)
-    else:
-        return SupervisorAction(False, "handoff", "old ownership did not exit")
-
-    artifact = native_artifact_path(spec, paths=selected_paths)
-    native = install_owned_supervisor(
-        spec,
-        artifact,
-        environment=environment,
-    )
-    if native.ok:
-        return _await_ready_generation(
-            selected_paths,
-            spec.generation,
-            previous_instance=old.instance_id,
-            timeout=timeout,
-        )
-    if old.supervisor != SupervisorKind.MANUAL.value:
-        return SupervisorAction(
-            False,
-            "refused",
-            f"managed supervisor restart refused: {native.reason}",
-        )
-    manual = ServiceSpec(
-        **{**spec.constructor_fields(), "supervisor": SupervisorKind.MANUAL}
-    )
-    spawned = spawn_exact_service(manual, environment=environment)
-    if not spawned.ok:
-        return spawned
-    return _await_ready_generation(
-        selected_paths,
-        manual.generation,
-        previous_instance=old.instance_id,
-        timeout=timeout,
-    )
-
-
-def _await_ready_generation(
-    paths: ServicePaths,
-    generation: str,
-    *,
-    previous_instance: str,
-    timeout: float,
-) -> SupervisorAction:
-    """Require authenticated ready state from a new exact generation."""
-    from jacked.service.ipc import ControlAction, send_native_control
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            response = send_native_control(paths.manifest, ControlAction.STATUS)
-            status = response.get("result", {})
-        except (OSError, ValueError):
-            time.sleep(0.05)
-            continue
-        if (
-            response.get("ok")
-            and isinstance(status, dict)
-            and status.get("state") == "running"
-            and status.get("generation") == generation
-            and status.get("instance_id") != previous_instance
-        ):
-            return SupervisorAction(True, "handoff", "new generation is ready")
-        time.sleep(0.05)
-    return SupervisorAction(False, "handoff", "new generation did not become ready")
 
 
 __all__ = [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import stat
@@ -22,6 +23,8 @@ from jacked.service.supervisors._artifacts import (
     snapshot_artifact,
 )
 from jacked.service.supervisors._helpers import atomic_write
+
+logger = logging.getLogger(__name__)
 
 _RUN_OPTIONS = {
     "capture_output": True,
@@ -251,7 +254,28 @@ def _known_legacy_vbs(path: Path) -> bytes | None:
         r'(?: --(?:host|port) [^\s"&|;]+)*", 0, False\r?\n?$',
         re.MULTILINE | re.IGNORECASE,
     )
-    return content if pattern.fullmatch(text) else None
+    if not pattern.fullmatch(text):
+        return None
+    return _harden_legacy_windows_file(path, content)
+
+
+def _harden_legacy_windows_file(path: Path, content: bytes) -> bytes | None:
+    """Privatize one current-user-owned legacy artifact before trusting it."""
+
+    if os.name != "nt":
+        return content
+    from jacked.service.windows_state import ensure_private_windows_file
+
+    try:
+        ensure_private_windows_file(path)
+        return content if path.read_bytes() == content else None
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Legacy Windows artifact hardening failed for %s: %s",
+            path,
+            type(exc).__name__,
+        )
+        return None
 
 
 def _retire_legacy_vbs(path: Path, content: bytes) -> Path | None:

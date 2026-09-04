@@ -62,6 +62,14 @@ def inspect_artifact(path: Path, expected: SupervisorArtifact) -> ArtifactInspec
                 ArtifactDisposition.FOREIGN,
                 "artifact is not privately controlled by the current user",
             )
+        if os.name == "nt":
+            from jacked.service.windows_security import inspect_windows_path
+
+            if not inspect_windows_path(path).private_for(directory=False):
+                return ArtifactInspection(
+                    ArtifactDisposition.FOREIGN,
+                    "artifact is not a private current-user Windows file",
+                )
         current = path.read_bytes()
     except OSError as exc:
         return ArtifactInspection(

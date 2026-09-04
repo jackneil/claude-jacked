@@ -55,6 +55,11 @@ class SupervisorTransitionLease:
 
 
 def _ensure_safe_parent(path: Path) -> None:
+    if os.name == "nt":
+        from jacked.service.windows_state import ensure_private_windows_directory
+
+        ensure_private_windows_directory(path)
+        return
     path.mkdir(parents=True, exist_ok=True)
     status = path.lstat()
     if not stat.S_ISDIR(status.st_mode):
@@ -67,10 +72,19 @@ def _ensure_safe_parent(path: Path) -> None:
 
 def _open_lock(path: Path):
     if os.name == "nt":
+        from jacked.service.windows_state import ensure_private_windows_file
+
+        existed = path.exists() or path.is_symlink()
+        if existed:
+            try:
+                ensure_private_windows_file(path)
+            except (OSError, ValueError) as exc:
+                raise OSError("unsafe Windows transition lease") from exc
         handle = open(path, "a+b")
         from jacked.service.instance_storage import _secure_windows_path
 
-        _secure_windows_path(path)
+        if not existed:
+            _secure_windows_path(path)
         return handle
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)

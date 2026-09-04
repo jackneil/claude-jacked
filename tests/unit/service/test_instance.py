@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 
 import pytest
 
@@ -26,7 +27,9 @@ def _spec():
         protocol_version=2,
         build_version="test",
         runtime_path=os.path.realpath(os.sys.executable),
-        launcher_path="/opt/jacked/launcher-v2",
+        launcher_path=os.path.join(
+            tempfile.gettempdir(), "jacked", "launcher-v2"
+        ),
         launcher_sha256="b" * 64,
         supervisor=SupervisorKind.MANUAL,
         arguments=("-I", "-m", "jacked"),
@@ -81,6 +84,36 @@ def test_private_manifest_roundtrip_and_instance_guarded_cleanup(tmp_path):
     assert not remove_manifest_if_current(paths.manifest, "another-instance")
     assert paths.manifest.exists()
     assert remove_manifest_if_current(paths.manifest, manifest.instance_id)
+
+
+def test_machine_id_recovers_interrupted_hardlink_publication(tmp_path):
+    from jacked.service.instance_storage import load_or_create_machine_id
+
+    path = tmp_path / "machine-id"
+    value = load_or_create_machine_id(path)
+    temporary = tmp_path / ".machine-id.interrupted"
+    os.link(path, temporary)
+    assert path.stat().st_nlink == 2
+
+    assert load_or_create_machine_id(path) == value
+    assert path.stat().st_nlink == 1
+    assert not temporary.exists()
+
+
+def test_interrupted_hardlink_recovery_logs_operational_failure(
+    tmp_path, monkeypatch, caplog
+):
+    from jacked.service.instance_storage import _recover_interrupted_hardlink
+
+    path = tmp_path / "machine-id"
+
+    def fail_lstat(_path):
+        raise OSError("denied")
+
+    monkeypatch.setattr(type(path), "lstat", fail_lstat)
+
+    assert not _recover_interrupted_hardlink(path, ".machine-id.")
+    assert "Interrupted hardlink recovery failed" in caplog.text
 
 
 def test_manifest_tamper_is_rejected(tmp_path):

@@ -66,13 +66,14 @@ def _windows_handle_terminate(process: OwnedProcess, *, force: bool) -> bool:
         return False
     import ctypes
     from ctypes import wintypes
+    from jacked.service.windows_security import windows_libraries
 
     query = 0x1000
     terminate = 0x0001
-    kernel32 = ctypes.windll.kernel32
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    handle = kernel32.OpenProcess(query | terminate, False, process.pid)
+    api = windows_libraries()
+    api.kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    api.kernel32.TerminateProcess.restype = wintypes.BOOL
+    handle = api.kernel32.OpenProcess(query | terminate, False, process.pid)
     if not handle:
         return False
     try:
@@ -80,7 +81,7 @@ def _windows_handle_terminate(process: OwnedProcess, *, force: bool) -> bool:
         exit_time = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
         user = wintypes.FILETIME()
-        if not kernel32.GetProcessTimes(
+        if not api.kernel32.GetProcessTimes(
             handle,
             ctypes.byref(creation),
             ctypes.byref(exit_time),
@@ -91,9 +92,9 @@ def _windows_handle_terminate(process: OwnedProcess, *, force: bool) -> bool:
         creation_id = f"windows-filetime:{(creation.dwHighDateTime << 32) | creation.dwLowDateTime}"
         if creation_id != process.creation_id:
             return False
-        return bool(kernel32.TerminateProcess(handle, 1))
+        return bool(api.kernel32.TerminateProcess(handle, 1))
     finally:
-        kernel32.CloseHandle(handle)
+        api.kernel32.CloseHandle(handle)
 
 
 def terminate_owned_process(
@@ -112,8 +113,8 @@ def terminate_owned_process(
         return TerminationResult.REFUSED_SUPERVISOR_REQUIRED
     if not verify_owned_process(process):
         return TerminationResult.REFUSED_IDENTITY
-    requested_signal = signal.SIGKILL if force else signal.SIGTERM
     if sys.platform.startswith("linux"):
+        requested_signal = signal.SIGKILL if force else signal.SIGTERM
         try:
             if _linux_pidfd_signal(process.pid, requested_signal):
                 return TerminationResult.SIGNALLED

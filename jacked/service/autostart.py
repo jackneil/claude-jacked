@@ -81,8 +81,9 @@ def _inspect_launchd(path: Path, run: Any) -> AutostartInspection:
     marker = extract_marker(content, SupervisorKind.LAUNCHD)
     if _owned(marker):
         try:
+            uid = os.getuid() if hasattr(os, "getuid") else 0
             result = run(
-                ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
+                ["launchctl", "print-disabled", f"gui/{uid}"],
                 capture_output=True,
                 text=True,
                 timeout=5,

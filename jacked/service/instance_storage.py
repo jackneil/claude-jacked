@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import logging
 import os
 import secrets
 import stat
@@ -15,8 +16,15 @@ from typing import Any
 
 from jacked.service.instance_models import InstanceManifest, ProcessIdentity
 
+logger = logging.getLogger(__name__)
+
 
 def _ensure_private_directory(path: Path) -> None:
+    if os.name == "nt":
+        from jacked.service.windows_state import ensure_private_windows_directory
+
+        ensure_private_windows_directory(path)
+        return
     if path.exists() and path.is_symlink():
         raise ValueError("service state directory cannot be a symlink")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -25,8 +33,6 @@ def _ensure_private_directory(path: Path) -> None:
         if status.st_uid != os.getuid():
             raise ValueError("service state directory has the wrong owner")
         path.chmod(0o700)
-    elif os.name == "nt":
-        _secure_windows_path(path)
 
 
 def _validate_private_file(path: Path) -> os.stat_result:
@@ -38,7 +44,63 @@ def _validate_private_file(path: Path) -> os.stat_result:
     if os.name == "posix":
         if status.st_uid != os.getuid() or status.st_mode & 0o077:
             raise ValueError("manifest must be owned by this user with mode 0600")
+    elif os.name == "nt":
+        from jacked.service.windows_security import inspect_windows_path
+
+        if not inspect_windows_path(path).private_for(directory=False):
+            raise ValueError("manifest must be a private current-user Windows file")
     return status
+
+
+def _recover_interrupted_hardlink(path: Path, temp_prefix: str) -> bool:
+    """Remove one validated temp alias left after atomic hard-link publication."""
+
+    try:
+        target = path.lstat()
+        if (
+            not stat.S_ISREG(target.st_mode)
+            or target.st_nlink != 2
+            or bool(getattr(target, "st_file_attributes", 0) & 0x400)
+        ):
+            return False
+        if os.name == "posix" and (
+            target.st_uid != os.getuid() or target.st_mode & 0o077
+        ):
+            return False
+        if os.name == "nt":
+            from jacked.service.windows_security import inspect_windows_path
+
+            inspected = inspect_windows_path(path)
+            if (
+                inspected.is_directory
+                or inspected.is_reparse_point
+                or not inspected.owner_matches
+                or not inspected.dacl_private
+            ):
+                return False
+        matches = []
+        for candidate in path.parent.iterdir():
+            if candidate.name == path.name or not candidate.name.startswith(
+                temp_prefix
+            ):
+                continue
+            status = candidate.lstat()
+            if stat.S_ISREG(status.st_mode) and (
+                status.st_dev,
+                status.st_ino,
+            ) == (target.st_dev, target.st_ino):
+                matches.append(candidate)
+        if len(matches) != 1:
+            return False
+        matches[0].unlink()
+        return path.lstat().st_nlink == 1
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning(
+            "Interrupted hardlink recovery failed for %s: %s",
+            path,
+            type(exc).__name__,
+        )
+        return False
 
 
 def publish_manifest(path: Path, manifest: InstanceManifest) -> None:
@@ -51,7 +113,10 @@ def publish_manifest(path: Path, manifest: InstanceManifest) -> None:
     descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp_path = Path(temp_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        elif os.name == "nt":
+            _secure_windows_path(temp_path)
         with os.fdopen(descriptor, "wb", closefd=True) as file:
             descriptor = -1
             file.write(encoded)
@@ -78,6 +143,7 @@ def load_or_create_machine_id(path: Path) -> str:
 
     _ensure_private_directory(path.parent)
     if path.exists() or path.is_symlink():
+        _recover_interrupted_hardlink(path, f".{path.name}.")
         _validate_private_file(path)
         value = path.read_text(encoding="ascii").strip()
         if len(value) < 32 or any(
@@ -93,7 +159,10 @@ def load_or_create_machine_id(path: Path) -> str:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        elif os.name == "nt":
+            _secure_windows_path(temporary)
         with os.fdopen(descriptor, "w", encoding="ascii", closefd=True) as file:
             descriptor = -1
             file.write(value + "\n")
@@ -162,73 +231,15 @@ def current_user_identity() -> str:
 
 
 def _windows_current_sid() -> str:
-    import ctypes
-    from ctypes import wintypes
+    from jacked.service.windows_security import current_user_sid
 
-    token_query = 0x0008
-    token_user = 1
-    token = wintypes.HANDLE()
-    if not ctypes.windll.advapi32.OpenProcessToken(
-        ctypes.windll.kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
-    ):
-        raise OSError("OpenProcessToken failed")
-    try:
-        needed = wintypes.DWORD()
-        ctypes.windll.advapi32.GetTokenInformation(
-            token, token_user, None, 0, ctypes.byref(needed)
-        )
-        buffer = ctypes.create_string_buffer(needed.value)
-        if not ctypes.windll.advapi32.GetTokenInformation(
-            token, token_user, buffer, needed, ctypes.byref(needed)
-        ):
-            raise OSError("GetTokenInformation failed")
-        sid_pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
-        sid_string = wintypes.LPWSTR()
-        if not ctypes.windll.advapi32.ConvertSidToStringSidW(
-            sid_pointer, ctypes.byref(sid_string)
-        ):
-            raise OSError("ConvertSidToStringSidW failed")
-        try:
-            return sid_string.value
-        finally:
-            ctypes.windll.kernel32.LocalFree(sid_string)
-    finally:
-        ctypes.windll.kernel32.CloseHandle(token)
+    return current_user_sid()
 
 
 def _secure_windows_path(path: Path) -> None:
-    """Apply a protected current-user-only DACL to a state path."""
+    from jacked.service.windows_security import secure_windows_path
 
-    import ctypes
-    from ctypes import wintypes
-
-    sid = _windows_current_sid()
-    descriptor = ctypes.c_void_p()
-    if not ctypes.windll.advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        f"D:P(A;;FA;;;{sid})", 1, ctypes.byref(descriptor), None
-    ):
-        raise OSError("could not construct the service-state DACL")
-    try:
-        present = wintypes.BOOL()
-        defaulted = wintypes.BOOL()
-        dacl = ctypes.c_void_p()
-        if (
-            not ctypes.windll.advapi32.GetSecurityDescriptorDacl(
-                descriptor,
-                ctypes.byref(present),
-                ctypes.byref(dacl),
-                ctypes.byref(defaulted),
-            )
-            or not present
-        ):
-            raise OSError("could not read the service-state DACL")
-        result = ctypes.windll.advapi32.SetNamedSecurityInfoW(
-            str(path), 1, 0x80000004, None, None, dacl, None
-        )
-        if result:
-            raise OSError(result, "could not apply the service-state DACL")
-    finally:
-        ctypes.windll.kernel32.LocalFree(descriptor)
+    secure_windows_path(path)
 
 
 def _linux_process_identity(pid: int) -> ProcessIdentity:
@@ -268,9 +279,11 @@ def _darwin_process_identity(pid: int) -> ProcessIdentity:
 def _windows_process_identity(pid: int) -> ProcessIdentity:
     import ctypes
     from ctypes import wintypes
+    from jacked.service.windows_security import windows_libraries
 
+    api = windows_libraries()
     query = 0x1000
-    handle = ctypes.windll.kernel32.OpenProcess(query, False, pid)
+    handle = api.kernel32.OpenProcess(query, False, pid)
     if not handle:
         raise ProcessLookupError(pid)
     try:
@@ -278,7 +291,7 @@ def _windows_process_identity(pid: int) -> ProcessIdentity:
         exit_time = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
         user = wintypes.FILETIME()
-        if not ctypes.windll.kernel32.GetProcessTimes(
+        if not api.kernel32.GetProcessTimes(
             handle,
             ctypes.byref(creation),
             ctypes.byref(exit_time),
@@ -288,7 +301,7 @@ def _windows_process_identity(pid: int) -> ProcessIdentity:
             raise ProcessLookupError(pid)
         buffer = ctypes.create_unicode_buffer(32768)
         size = wintypes.DWORD(len(buffer))
-        if not ctypes.windll.kernel32.QueryFullProcessImageNameW(
+        if not api.kernel32.QueryFullProcessImageNameW(
             handle, 0, buffer, ctypes.byref(size)
         ):
             raise ProcessLookupError(pid)
@@ -299,7 +312,7 @@ def _windows_process_identity(pid: int) -> ProcessIdentity:
             executable=os.path.realpath(buffer.value),
         )
     finally:
-        ctypes.windll.kernel32.CloseHandle(handle)
+        api.kernel32.CloseHandle(handle)
 
 
 def process_identity(pid: int) -> ProcessIdentity:
@@ -331,42 +344,32 @@ def process_user_identity(pid: int) -> str:
         # insufficient ownership evidence and therefore fails closed.
         import ctypes
         from ctypes import wintypes
+        from jacked.service.windows_security import (
+            windows_libraries,
+            windows_token_sid,
+        )
 
         query = 0x1000
         token_query = 0x0008
-        process = ctypes.windll.kernel32.OpenProcess(query, False, pid)
+        api = windows_libraries()
+        process = api.kernel32.OpenProcess(query, False, pid)
         if not process:
             raise ProcessLookupError(pid)
         token = wintypes.HANDLE()
         try:
-            if not ctypes.windll.advapi32.OpenProcessToken(
+            if not api.advapi32.OpenProcessToken(
                 process, token_query, ctypes.byref(token)
             ):
                 raise ProcessLookupError(pid)
-            # Reuse the SID conversion with an explicitly selected token.
-            needed = wintypes.DWORD()
-            ctypes.windll.advapi32.GetTokenInformation(
-                token, 1, None, 0, ctypes.byref(needed)
-            )
-            buffer = ctypes.create_string_buffer(needed.value)
-            if not ctypes.windll.advapi32.GetTokenInformation(
-                token, 1, buffer, needed, ctypes.byref(needed)
-            ):
-                raise ProcessLookupError(pid)
-            sid_pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
-            sid_string = wintypes.LPWSTR()
-            if not ctypes.windll.advapi32.ConvertSidToStringSidW(
-                sid_pointer, ctypes.byref(sid_string)
-            ):
-                raise ProcessLookupError(pid)
             try:
-                return f"sid:{sid_string.value}"
-            finally:
-                ctypes.windll.kernel32.LocalFree(sid_string)
+                sid = windows_token_sid(token, api)
+            except OSError:
+                raise ProcessLookupError(pid)
+            return f"sid:{sid}"
         finally:
             if token:
-                ctypes.windll.kernel32.CloseHandle(token)
-            ctypes.windll.kernel32.CloseHandle(process)
+                api.kernel32.CloseHandle(token)
+            api.kernel32.CloseHandle(process)
     raise OSError(f"unsupported platform: {sys.platform}")
 
 

@@ -437,6 +437,9 @@ class TestServiceRecover:
         paths.root.mkdir(parents=True, exist_ok=True)
         paths.manifest.write_text("not-json", encoding="utf-8")
         paths.manifest.chmod(0o600)
+        from tests.unit.service.supervisor_test_support import _secure_test_path
+
+        _secure_test_path(paths.manifest)
         spec = MagicMock(generation="a" * 64)
         with (
             patch(

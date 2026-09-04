@@ -31,6 +31,13 @@ def _spec(kind, launcher, *, build):
     )
 
 
+def _secure_windows_test_path(path):
+    if os.name == "nt":
+        from jacked.service.windows_security import secure_windows_path
+
+        secure_windows_path(path)
+
+
 class StatefulManager:
     """Small native-manager model with one process/listener/UI invariant."""
 
@@ -155,6 +162,7 @@ def test_old_generation_and_repeated_installs_converge_to_one_native_service(
     launcher = tmp_path / "launcher"
     launcher.write_bytes(b"launcher")
     launcher.chmod(0o700)
+    _secure_windows_test_path(launcher)
     old_spec = _spec(kind, launcher, build="0.98.1")
     new_spec = _spec(kind, launcher, build="0.99.1")
     environment = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
@@ -171,6 +179,7 @@ def test_old_generation_and_repeated_installs_converge_to_one_native_service(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(old.content)
     path.chmod(0o600)
+    _secure_windows_test_path(path)
     manager = StatefulManager(kind, path, old.content)
 
     for _attempt in range(3):
