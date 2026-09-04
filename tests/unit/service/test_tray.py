@@ -1320,6 +1320,11 @@ class TestRestartHandlerRegistration:
             runner, "_start_uvicorn", lambda cold_start=False: MagicMock()
         )
         monkeypatch.setattr(runner, "_wait_for_ready", lambda timeout=15: True)
+        ownership = MagicMock()
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.claim_service_ownership",
+            lambda *_args, **_kwargs: ownership,
+        )
 
         import jacked.service.tray as tray_mod
         monkeypatch.setattr(tray_mod.signal, "signal", lambda *a, **k: None)
@@ -1337,6 +1342,7 @@ class TestRestartHandlerRegistration:
         assert captured.get("during") != runner._on_restart
         # Unregistered on exit (run()'s finally).
         assert restart_mod.get_restart_handler() is None
+        ownership.close.assert_called_once()
 
 
 class TestOnSettingsRestart:
