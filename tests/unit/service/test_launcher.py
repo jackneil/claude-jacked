@@ -1,7 +1,6 @@
 import hashlib
 import os
 import subprocess
-import sys
 
 import pytest
 
@@ -85,8 +84,11 @@ def test_launcher_refuses_retargeted_runtime_without_running_replacement(tmp_pat
     venv = tmp_path / "venv"
     venv.joinpath("bin").mkdir(parents=True)
     venv.joinpath("pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    original = tmp_path / "python3.11"
+    original.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    original.chmod(0o700)
     runtime = venv / "bin" / "python"
-    runtime.symlink_to(sys.executable)
+    runtime.symlink_to(original)
     spec = ServiceSpec(
         service_id="ai.hank.jacked",
         protocol_version=2,

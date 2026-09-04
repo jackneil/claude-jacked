@@ -52,11 +52,14 @@ def test_runtime_path_accepts_virtualenv_symlink(tmp_path):
     venv = tmp_path / "venv"
     venv.joinpath("bin").mkdir(parents=True)
     venv.joinpath("pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    target = tmp_path / "python3.99"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o700)
     link = venv / "bin" / "python"
-    link.symlink_to(Path(sys.executable))
+    link.symlink_to(target)
     spec = _spec(runtime_path=str(link))
     assert spec.runtime_path == str(link)
-    assert spec.runtime_target_path == os.path.realpath(sys.executable)
+    assert spec.runtime_target_path == str(target)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
@@ -118,8 +121,11 @@ def test_runtime_target_is_bound_and_retargeting_changes_fresh_generation(tmp_pa
     venv = tmp_path / "venv"
     venv.joinpath("bin").mkdir(parents=True)
     venv.joinpath("pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    original_target = tmp_path / "python3.11"
+    original_target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    original_target.chmod(0o700)
     link = venv / "bin" / "python"
-    link.symlink_to(Path(sys.executable))
+    link.symlink_to(original_target)
     original = _spec(runtime_path=str(link))
     original_generation = original.generation
 
@@ -157,6 +163,22 @@ def test_virtualenv_runtime_rejects_mutating_darwin_acls(
     subprocess.run(["/bin/chmod", "+a", acl_rule, str(path)], check=True)
 
     with pytest.raises(ValueError, match="mutating extended ACL"):
+        _spec(runtime_path=str(link))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
+def test_group_writable_runtime_directory_is_always_rejected(tmp_path):
+    venv = tmp_path / "venv"
+    venv.joinpath("bin").mkdir(parents=True)
+    venv.joinpath("bin").chmod(0o770)
+    venv.joinpath("pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    target = tmp_path / "python3.99"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o700)
+    link = venv / "bin" / "python"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="untrusted writable directory"):
         _spec(runtime_path=str(link))
 
 

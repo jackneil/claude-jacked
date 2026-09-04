@@ -34,6 +34,7 @@ _PYTHON_ENTRYPOINT_RE = re.compile(
 _DARWIN_ACL_TYPE_EXTENDED = 0x100
 _DARWIN_ACL_EXTENDED_ALLOW = 1
 _DARWIN_MUTATING_ACL_MASK = sum(1 << bit for bit in (2, 4, 5, 6, 8, 10, 12, 13))
+_HOST_IS_DARWIN = sys.platform == "darwin"
 
 
 @lru_cache(maxsize=1)
@@ -117,7 +118,7 @@ def _darwin_secure_status(path: Path, *, directory: bool) -> os.stat_result:
 
 
 def _validate_darwin_link_acl(path: Path) -> None:
-    if sys.platform != "darwin":
+    if not _HOST_IS_DARWIN:
         return
     library = _darwin_acl_api()
     ctypes.set_errno(0)
@@ -132,6 +133,13 @@ def _trusted_posix_owner(owner: int) -> bool:
     return owner in {0, os.getuid()}
 
 
+def _writable_by_untrusted_principal(
+    status: os.stat_result, *, directory: bool
+) -> bool:
+    sticky = directory and bool(status.st_mode & stat.S_ISVTX)
+    return bool(status.st_mode & 0o022) and not sticky
+
+
 def _validate_posix_directory_chain(path: Path) -> None:
     """Require every directory to resist replacement by another local user."""
 
@@ -140,18 +148,15 @@ def _validate_posix_directory_chain(path: Path) -> None:
         try:
             status = (
                 _darwin_secure_status(current, directory=True)
-                if sys.platform == "darwin"
+                if _HOST_IS_DARWIN
                 else current.lstat()
             )
         except OSError as exc:
             raise ValueError("runtime_path directory chain is incomplete") from exc
-        sticky_shared = bool(status.st_mode & stat.S_ISVTX) and _trusted_posix_owner(
-            status.st_uid
-        )
         if (
             not stat.S_ISDIR(status.st_mode)
             or not _trusted_posix_owner(status.st_uid)
-            or (status.st_mode & 0o022 and not sticky_shared)
+            or _writable_by_untrusted_principal(status, directory=True)
         ):
             raise ValueError("runtime_path has an untrusted writable directory")
         if current.parent == current:
@@ -163,7 +168,7 @@ def _validate_posix_file(path: Path, name: str, *, executable: bool = False) -> 
     try:
         status = (
             _darwin_secure_status(path, directory=False)
-            if sys.platform == "darwin"
+            if _HOST_IS_DARWIN
             else path.lstat()
         )
     except OSError as exc:
@@ -171,7 +176,7 @@ def _validate_posix_file(path: Path, name: str, *, executable: bool = False) -> 
     if (
         not stat.S_ISREG(status.st_mode)
         or not _trusted_posix_owner(status.st_uid)
-        or status.st_mode & 0o022
+        or _writable_by_untrusted_principal(status, directory=False)
     ):
         raise ValueError(f"{name} must be a trusted regular file")
     if executable and not status.st_mode & 0o111:
