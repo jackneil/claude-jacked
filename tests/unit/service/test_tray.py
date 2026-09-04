@@ -1370,6 +1370,12 @@ class TestRestartHandlerRegistration:
         )
         monkeypatch.setattr(runner, "_wait_for_ready", lambda timeout=15: True)
         ownership = MagicMock()
+        candidate = MagicMock(generation="test-generation")
+        monkeypatch.setenv("JACKED_SERVICE_GENERATION", candidate.generation)
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.provision_service_contract",
+            lambda **_kwargs: (candidate, {}),
+        )
         monkeypatch.setattr(
             "jacked.service.lifecycle.claim_service_ownership",
             lambda *_args, **_kwargs: ownership,
