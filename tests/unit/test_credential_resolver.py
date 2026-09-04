@@ -116,3 +116,106 @@ def test_snapshot_rejects_hard_link_target(tmp_path: Path) -> None:
 
     with pytest.raises(OSError, match="hard-linked"):
         publish_snapshot(link, snapshot)
+
+
+def test_unstamped_payload_is_unusable_with_named_evidence() -> None:
+    payload = CredentialPayload.from_mapping({"claudeAiOauth": {"accessToken": "a"}})
+    resolver = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", payload),
+            "file": MemoryCredentialStore("file", payload),
+        },
+    )
+
+    observation = resolver.resolve()
+
+    assert observation.state is ResolverState.UNUSABLE
+    assert "identity:stamp-absent" in observation.evidence
+
+
+def test_observation_resolves_from_the_authority_when_the_mirror_diverges() -> None:
+    resolver = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", _payload(1)),
+            "file": MemoryCredentialStore("file", _payload(2)),
+        },
+        require_mirror_consensus=False,
+    )
+
+    observation = resolver.resolve()
+
+    assert observation.state is ResolverState.RESOLVED
+    assert observation.identity.account_id == 1
+    assert "authority:keychain:ok" in observation.evidence
+    assert "required_mirror:file:divergent" in observation.evidence
+
+
+def test_observation_names_a_missing_mirror_but_still_resolves() -> None:
+    resolver = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", _payload(1)),
+            "file": MemoryCredentialStore("file", None),
+        },
+        require_mirror_consensus=False,
+    )
+
+    observation = resolver.resolve()
+
+    assert observation.state is ResolverState.RESOLVED
+    assert observation.identity.account_id == 1
+    assert "required_mirror:file:missing" in observation.evidence
+
+
+def test_observation_agreeing_mirror_is_marked_ok() -> None:
+    resolver = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", _payload(1)),
+            "file": MemoryCredentialStore("file", _payload(1)),
+        },
+        require_mirror_consensus=False,
+    )
+
+    observation = resolver.resolve()
+
+    assert observation.state is ResolverState.RESOLVED
+    assert "required_mirror:file:ok" in observation.evidence
+
+
+def test_observation_still_fails_closed_on_the_authority() -> None:
+    missing = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", None),
+            "file": MemoryCredentialStore("file", _payload(2)),
+        },
+        require_mirror_consensus=False,
+    ).resolve()
+    assert missing.state is ResolverState.MISSING
+
+    unstamped = CredentialPayload.from_mapping({"claudeAiOauth": {"accessToken": "secret"}})
+    unusable = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", unstamped),
+            "file": MemoryCredentialStore("file", _payload(2)),
+        },
+        require_mirror_consensus=False,
+    ).resolve()
+    assert unusable.state is ResolverState.UNUSABLE
+    assert "identity:stamp-absent" in unusable.evidence
+
+
+def test_consensus_default_is_unchanged() -> None:
+    resolver = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", _payload(1)),
+            "file": MemoryCredentialStore("file", _payload(2)),
+        },
+    )
+
+    assert resolver.resolve().state is ResolverState.CONFLICT

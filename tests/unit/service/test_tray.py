@@ -1,7 +1,11 @@
 """Tests for jacked.service.tray module."""
 
+import socket
+import time
+from types import SimpleNamespace
+
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 
 
 def _skip_if_no_tray():
@@ -1442,3 +1446,143 @@ class TestOnSettingsRestart:
         runner._on_restart()
 
         assert runner.cli_host == "192.168.1.5"
+
+
+class TestReadinessBudget:
+    """Cold-start readiness: long budget, fail fast on a dead server, retryable exit."""
+
+    def test_timing_constants(self):
+        from jacked import service as service_pkg
+
+        assert service_pkg.COLD_START_READY_TIMEOUT == 90.0
+        assert service_pkg.REPLACEMENT_READY_TIMEOUT == 105.0
+        assert service_pkg.EX_TEMPFAIL == 75
+
+    def test_wait_for_ready_returns_true_once_port_answers_and_records_elapsed(self):
+        from jacked.service.tray import ServiceRunner
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            runner = ServiceRunner(port=port)
+            runner._uvicorn_thread = SimpleNamespace(is_alive=lambda: True)
+            assert runner._wait_for_ready(timeout=5) is True
+            assert runner._ready_elapsed is not None and runner._ready_elapsed < 5
+        finally:
+            listener.close()
+
+    def test_wait_for_ready_fails_fast_when_server_thread_died(self):
+        from jacked.service.tray import ServiceRunner
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens here now
+        runner = ServiceRunner(port=port)
+        runner._uvicorn_thread = SimpleNamespace(is_alive=lambda: False)
+        started = time.monotonic()
+        assert runner._wait_for_ready(timeout=30) is False
+        assert time.monotonic() - started < 3
+
+    @pytest.mark.parametrize("kind", ["LAUNCHD", "SYSTEMD_USER", "TASK_SCHEDULER"])
+    def test_unready_start_under_native_supervisor_exits_tempfail(self, kind, tmp_path):
+        from jacked.service.spec import SupervisorKind
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._service_spec = SimpleNamespace(supervisor=SupervisorKind[kind])
+        runner._uvicorn_thread = None
+        with (
+            patch.object(runner, "_request_stop"),
+            patch.object(runner, "_start_failure_path", return_value=tmp_path / "f.json"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner._abort_unready_start()
+        assert exc_info.value.code == 75
+        assert runner._service_state == "degraded"
+
+    def test_unready_start_gives_up_cleanly_after_limit(self, tmp_path, caplog):
+        from jacked.service import START_FAILURE_LIMIT
+        from jacked.service.spec import SupervisorKind
+        from jacked.service.start_failures import record_start_failure
+        from jacked.service.tray import ServiceRunner
+
+        path = tmp_path / "f.json"
+        for _ in range(START_FAILURE_LIMIT - 1):
+            record_start_failure(path, time.time())
+        runner = ServiceRunner()
+        runner._service_spec = SimpleNamespace(supervisor=SupervisorKind.LAUNCHD)
+        runner._uvicorn_thread = None
+        with (
+            patch.object(runner, "_request_stop"),
+            patch.object(runner, "_start_failure_path", return_value=path),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner._abort_unready_start()
+        assert exc_info.value.code == 0
+        assert "giving up" in caplog.text
+
+    def test_unready_start_under_manual_supervisor_keeps_message(self):
+        from jacked.service.spec import SupervisorKind
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._service_spec = SimpleNamespace(supervisor=SupervisorKind.MANUAL)
+        runner._uvicorn_thread = None
+        with patch.object(runner, "_request_stop"), pytest.raises(SystemExit) as exc_info:
+            runner._abort_unready_start()
+        assert "did not become ready" in str(exc_info.value.code)
+
+    def test_both_ready_sites_record_success_and_elapsed(self):
+        """_note_ready is the only thing that clears the breaker; both platform
+        ready sites (macOS menu bar and pystray) must call it and log timing."""
+        import inspect
+
+        from jacked.service import tray as tray_module
+
+        source = inspect.getsource(tray_module)
+        assert source.count("self._note_ready(self._ready_elapsed or 0.0)") == 2
+        assert source.count("ready_in=%.1fs") == 2
+
+    def test_successful_start_clears_failure_memory(self, tmp_path):
+        from jacked.service.start_failures import record_start_failure
+        from jacked.service.tray import ServiceRunner
+
+        path = tmp_path / "f.json"
+        record_start_failure(path, time.time())
+        runner = ServiceRunner()
+        with patch.object(runner, "_start_failure_path", return_value=path):
+            runner._note_ready(0.5)
+        assert not path.exists()
+
+
+class TestReleaseOwnership:
+    def test_release_closes_control_then_ownership_once(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        parent = MagicMock()
+        runner._control_server = parent.control
+        runner._ownership = parent.ownership
+
+        runner.release_ownership()
+        runner.release_ownership()  # idempotent
+
+        assert parent.mock_calls == [call.control.close(), call.ownership.close()]
+        assert runner._control_server is None
+        assert runner._ownership is None
+
+    def test_release_still_retires_manifest_when_control_close_raises(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._control_server = MagicMock(close=MagicMock(side_effect=OSError("boom")))
+        ownership = MagicMock()
+        runner._ownership = ownership
+
+        runner.release_ownership()
+
+        ownership.close.assert_called_once()
+        assert runner._ownership is None

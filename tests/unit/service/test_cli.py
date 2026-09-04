@@ -1374,3 +1374,133 @@ class TestServiceRestartRemoteAccessParity:
         args = mock_popen.call_args[0][0]
         assert "--host" in args
         assert args[args.index("--host") + 1] == "192.168.1.5"
+
+
+def test_cli_ready_waits_share_the_replacement_budget():
+    import inspect
+
+    from jacked import cli
+    from jacked.service import REPLACEMENT_READY_TIMEOUT
+
+    assert inspect.signature(cli._wait_owned_service_ready).parameters["timeout"].default == REPLACEMENT_READY_TIMEOUT
+    assert "timeout=15.0" not in inspect.getsource(cli)
+    assert "within 15s" not in inspect.getsource(cli)
+
+
+def test_service_restart_clears_the_start_failure_breaker():
+    from jacked.cli import main
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = default_service_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    paths.manifest.write_text("{}", encoding="utf-8")
+    breaker = paths.root / "start-failures.json"
+    breaker.write_text("[1.0, 2.0]", encoding="utf-8")
+    with (
+        patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(MagicMock(), {"PATH": "/safe"}),
+        ),
+        patch(
+            "jacked.service.lifecycle.handoff_owned_service",
+            return_value=MagicMock(ok=True, reason="new build started"),
+        ),
+        patch("jacked.cli._manifest_is_proven_stale", return_value=False),
+    ):
+        result = CliRunner().invoke(main, ["service", "restart"])
+
+    assert result.exit_code == 0, result.output
+    assert not breaker.exists()
+
+
+def test_service_start_never_clears_the_start_failure_breaker():
+    """`jacked service start` is what supervisors relaunch on every retry.
+
+    Clearing the give-up breaker there would let a supervised relaunch reset
+    its own counter, so a permanently broken environment would loop forever
+    instead of exiting cleanly after START_FAILURE_LIMIT. Only an operator
+    gesture (`jacked start` / `jacked service restart`) may re-arm it.
+    """
+    import inspect
+
+    from jacked import cli
+
+    # `service_start` is a click Command; its .callback is the function.
+    source = inspect.getsource(cli.service_start.callback)
+    assert "_clear_start_failure_breaker" not in source
+    assert "clear_start_failures" not in source
+
+
+def _write_breaker(count: int, age_seconds: float = 1.0):
+    """Seed the give-up breaker with `count` stamps `age_seconds` old."""
+    import json
+    import time
+
+    from jacked.service import START_FAILURE_FILENAME
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = default_service_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    breaker = paths.root / START_FAILURE_FILENAME
+    now = time.time()
+    breaker.write_text(
+        json.dumps([now - age_seconds] * count), encoding="utf-8"
+    )
+    return breaker
+
+
+def test_service_status_reports_the_start_failure_give_up():
+    from jacked.cli import main
+    from jacked.service import START_FAILURE_LIMIT
+
+    _write_breaker(START_FAILURE_LIMIT)
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert str(START_FAILURE_LIMIT) in result.output
+    assert "failed start" in result.output
+    assert "jacked service restart" in result.output
+
+
+def test_service_status_is_silent_when_the_breaker_has_not_tripped():
+    from jacked.cli import main
+    from jacked.service import START_FAILURE_LIMIT, START_FAILURE_WINDOW_SECONDS
+
+    # Enough failures, but all of them older than the window.
+    _write_breaker(
+        START_FAILURE_LIMIT, age_seconds=START_FAILURE_WINDOW_SECONDS + 60
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "failed start" not in result.output
+
+
+def test_start_clears_the_start_failure_breaker_before_spawning(tmp_path):
+    from jacked.cli import main
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = default_service_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    breaker = paths.root / "start-failures.json"
+    breaker.write_text("[1.0, 2.0]", encoding="utf-8")
+    with (
+        patch("jacked.service.process.read_pid", return_value=None),
+        patch("jacked.service.process.is_process_alive", return_value=False),
+        patch("jacked.service.process.is_port_available", return_value=True),
+        patch("jacked.service.legacy.probe_legacy_health", return_value=False),
+        patch(
+            "jacked.cli._spawn_service_detached", return_value=tmp_path / "svc.log"
+        ) as spawn,
+        patch(
+            "jacked.cli._wait_owned_service_ready",
+            return_value={"state": "running", "port": 8321},
+        ),
+    ):
+        result = CliRunner().invoke(main, ["start"])
+
+    assert result.exit_code == 0, result.output
+    spawn.assert_called_once()
+    assert not breaker.exists()

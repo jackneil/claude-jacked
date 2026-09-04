@@ -819,6 +819,10 @@ if RUMPS_AVAILABLE:
                 self._runner._shutdown_uvicorn()
             except Exception:
                 logger.exception("uvicorn shutdown during quit failed")
+            # NSApp.terminate_ exits without unwinding Python, so the runner's
+            # finally never runs on this path. Retire the manifest now so a
+            # restart handoff sees a real exit instead of a dead pid.
+            self._runner.release_ownership()
             if self._screen_observer is not None:
                 try:
                     NSNotificationCenter.defaultCenter().removeObserver_(

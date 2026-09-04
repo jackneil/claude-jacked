@@ -36,6 +36,11 @@ const OAUTH_CODE_BUTTON_CLASS = 'px-3 py-1 bg-blue-600 hover:bg-blue-500 text-wh
 const OAUTH_SUBTITLE_MANUAL = 'Click the link and approve. Claude then shows a code. Copy the code and paste it below.';
 const OAUTH_SUBTITLE_BROWSER = 'A browser window should open on this machine. If it does not open, use the link.';
 
+// Every chained-step failure ends the same way: the sign-in is stored, only
+// the token is missing, and there is a way to get it. Reasons are written
+// without trailing punctuation so this reads as one sentence after them.
+const OAUTH_CHAINED_RETRY_HINT = '. You can authorize the Claude Code token from the account menu.';
+
 // Poll every 1s. Manual flows get the longer window because a human is copying
 // a code between machines (mirrors MANUAL_TIMEOUT_SECONDS server-side).
 const OAUTH_MANUAL_MAX_WAIT = 600;
@@ -214,9 +219,21 @@ async function runOAuthFlow(opts) {
 
     const msgs = opts.messages;
     let pollTimer = null;
+    // The two "user came back to the tab" hooks are registered once for the
+    // life of the flow, even though the interval is re-armed after chaining.
+    let hooked = false;
     // The poller and a code submission race to finish the flow. First one to
     // reach a terminal state wins; the loser must not re-render or double-refresh.
     let terminal = false;
+    // Set once this flow has followed a primary sign-in into the chained
+    // Claude Code token flow; the copy at the end depends on it.
+    let chainedFlowId = null;
+    // The primary flow's own success message, kept because every chained
+    // banner hangs off it: the sign-in it describes has already happened.
+    let primaryResult = null;
+    // The interval's second counter. Declared here so chainTo can restart the
+    // clock when the poller switches to the chained flow.
+    let elapsed = 0;
 
     // Every banner is built node by node — no innerHTML with interpolated data.
     // Always re-look-up the slot: the accounts view re-renders wholesale
@@ -233,6 +250,73 @@ async function runOAuthFlow(opts) {
         if (clearAfterMs) setTimeout(() => { if (div.isConnected) div.remove(); }, clearAfterMs);
     }
 
+    // A primary sign-in that completes may hand back a second flow: the server
+    // opened another browser window for the Claude Code token. Follow it so
+    // the account card updates when that token lands, not on the next click.
+    function chainTo(ccFlowId, primary) {
+        chainedFlowId = ccFlowId;
+        primaryResult = primary;
+        flowId = ccFlowId;
+        const slot = document.getElementById('oauth-flow-status') || statusEl;
+        const chainedTextDiv = buildOAuthBanner(slot, OAUTH_ACCENT_ORANGE,
+            primary.text + ' Authorizing the Claude Code token in the browser...');
+        // The refresh that just ran re-rendered the route, taking the primary
+        // banner's Cancel button with it, so the chained wait needs its own.
+        addCancelButton(chainedTextDiv,
+            primary.text + ' The Claude Code token step was cancelled' + OAUTH_CHAINED_RETRY_HINT);
+        // The refresh went through renderRoute, which clears
+        // window.jackedState.flowPolling and with it our interval, so the
+        // chained flow would be polled only when the tab regains focus.
+        startPolling();
+    }
+
+    // Copy for the chained step, built from the flow's own success line so an
+    // added account is never told it was re-authenticated and the add flow's
+    // org-redirect notice survives the chain.
+    function chainedSuccess(poll) {
+        if (msgs.chainedSuccess) return msgs.chainedSuccess(primaryResult, poll);
+        return {
+            text: primaryResult.text + ' Claude Code token authorized!',
+            duration: primaryResult.duration || 3000,
+        };
+    }
+
+    function chainedFailPrefix() {
+        if (msgs.chainedFailPrefix) return msgs.chainedFailPrefix(primaryResult);
+        return primaryResult.text + ' The Claude Code token step failed: ';
+    }
+
+    // Every verdict reads differently once the sign-in itself has landed: the
+    // account is stored and only the token step is unfinished, so the primary
+    // flow's "it failed, try again" copy would be a lie.
+    function terminalCopy(primaryText, chainedReason) {
+        if (!chainedFlowId) return primaryText;
+        return chainedFailPrefix() + chainedReason + OAUTH_CHAINED_RETRY_HINT;
+    }
+
+    // The 1s poll plus the hooks that re-poll when the tab comes back. Safe to
+    // call twice: it takes over from any interval still running and registers
+    // the listeners only the first time.
+    function startPolling() {
+        elapsed = 0;
+        if (pollTimer !== null) clearInterval(pollTimer);
+        pollTimer = setInterval(() => {
+            elapsed++;
+            if (elapsed > maxWait) {
+                endWith(OAUTH_WARN_CLASS,
+                    terminalCopy(msgs.timedOut(waitLabel), 'it was not finished within ' + waitLabel));
+                return;
+            }
+            pollOnce();
+        }, 1000);
+        window.jackedState.flowPolling = pollTimer;
+        if (!hooked) {
+            document.addEventListener('visibilitychange', pollOnVisible);
+            window.addEventListener('focus', pollOnVisible);
+            hooked = true;
+        }
+    }
+
     function stopPolling() {
         if (pollTimer !== null) clearInterval(pollTimer);
         // Only release the shared slot if it's still ours — a newer flow may
@@ -241,20 +325,31 @@ async function runOAuthFlow(opts) {
         pollTimer = null;
         document.removeEventListener('visibilitychange', pollOnVisible);
         window.removeEventListener('focus', pollOnVisible);
+        hooked = false;
     }
 
     // End the flow on a local verdict: timeout, expiry, cancel, or a dead poll loop.
-    function endWith(className, text) {
+    async function endWith(className, text) {
         if (terminal) return;
         terminal = true;
         stopPolling();
-        renderBanner(className, text);
-        window.jackedState._accountActionInFlight = false;
+        let bannerText = text;
+        try {
+            // While chained, the sign-in is stored whatever became of the
+            // token, so the card has to show what the server holds. Refresh
+            // FIRST: refreshAndRender re-renders the route wholesale and would
+            // wipe a banner drawn before it.
+            if (chainedFlowId) await refreshAndRender();
+        } catch (e) {
+            // A refresh that fails must not cost the user the verdict or leave
+            // the guard up, which would refuse every other account action.
+            console.warn('Could not refresh the accounts view: ' + ((e && e.message) || e));
+            bannerText = text + ' The accounts view could not be refreshed, so reload the page to see the stored state.';
+        } finally {
+            renderBanner(className, bannerText);
+            window.jackedState._accountActionInFlight = false;
+        }
     }
-
-    // Spinner and title go up immediately; the mode-dependent parts wait for
-    // the start response to say which mode we got.
-    const textDiv = buildOAuthBanner(statusEl, opts.accent, opts.title);
 
     // A way out that is not "reload the page". While a flow is pending, the
     // shared guard refuses every other account action (Use Account included)
@@ -263,21 +358,32 @@ async function runOAuthFlow(opts) {
     // until the flow timed out or the page was reloaded. Cancelling settles
     // the banner locally; a sign-in the browser already finished is stored
     // server-side regardless, and the refresh right after picks it up.
-    const bannerEl = textDiv.parentNode;
-    if (bannerEl) {
+    function addCancelButton(textDiv, cancelledText) {
+        const bannerEl = textDiv.parentNode;
+        if (!bannerEl) return;
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button';
         cancelBtn.className = 'shrink-0 self-start text-xs text-slate-400 hover:text-white underline';
         cancelBtn.textContent = 'Cancel';
         cancelBtn.setAttribute('data-oauth-cancel', 'true');
         cancelBtn.addEventListener('click', () => {
-            endWith(OAUTH_WARN_CLASS, 'Sign-in cancelled. If you already approved it in the browser, the account updates on the next refresh.');
+            // endWith is async, and a throw from renderBanner inside its
+            // finally would surface as an unhandled rejection from a DOM
+            // event handler. The verdict is already settled either way.
+            endWith(OAUTH_WARN_CLASS, cancelledText).catch(() => {});
             if (typeof loadAllData === 'function' && typeof rerenderAccountsView === 'function') {
                 loadAllData().then(() => rerenderAccountsView()).catch(() => {});
             }
         });
         bannerEl.appendChild(cancelBtn);
     }
+
+    // Spinner and title go up immediately; the mode-dependent parts wait for
+    // the start response to say which mode we got.
+    const textDiv = buildOAuthBanner(statusEl, opts.accent, opts.title);
+
+    addCancelButton(textDiv,
+        'Sign-in cancelled. If you already approved it in the browser, the account updates on the next refresh.');
 
     let start;
     try {
@@ -288,7 +394,7 @@ async function runOAuthFlow(opts) {
         return;
     }
 
-    const flowId = start.flow_id;
+    let flowId = start.flow_id;
     if (!flowId) {
         endWith(OAUTH_ERROR_CLASS, 'No flow ID returned from server');
         return;
@@ -316,24 +422,38 @@ async function runOAuthFlow(opts) {
         if (terminal) return true;
 
         if (poll.status === 'completed') {
-            terminal = true;
-            stopPolling();
             // The server's verdict is what the guard was waiting on, so drop
             // it now, not after the refresh: refreshAndRender fetches every
             // account (and, on macOS, reconciles the active one through the
             // Keychain), and a Use Account click during that window used to
             // be refused as "another action in progress".
             window.jackedState._accountActionInFlight = false;
-            const success = msgs.success(poll);
+            const ccFlowId = typeof poll.cc_flow_id === 'string' ? poll.cc_flow_id : '';
+            if (ccFlowId && !chainedFlowId) {
+                // Read the flow's own success copy now: this poll is the only
+                // one carrying the sign-in's details (the email, and the
+                // add flow's org-redirect notice), and the chained poll won't.
+                const primary = msgs.success(poll);
+                // Refresh so the signed-in account shows now, then keep
+                // polling the chained flow; this call is not terminal.
+                await refreshAndRender();
+                chainTo(ccFlowId, primary);
+                return false;
+            }
+            terminal = true;
+            stopPolling();
+            const success = chainedFlowId ? chainedSuccess(poll) : msgs.success(poll);
             // Refresh FIRST: refreshAndRender re-renders the route wholesale,
             // which would wipe a banner drawn before it. Render the success
             // message into the fresh slot afterwards.
             await refreshAndRender();
             renderBanner(OAUTH_SUCCESS_CLASS, success.text, success.duration);
         } else if (poll.status === 'error') {
-            endWith(OAUTH_ERROR_CLASS, msgs.failPrefix + (poll.error || 'Unknown error'));
+            const reason = poll.error || 'Unknown error';
+            await endWith(OAUTH_ERROR_CLASS, terminalCopy(msgs.failPrefix + reason, reason));
         } else {
-            endWith(OAUTH_WARN_CLASS, msgs.notFound);
+            await endWith(OAUTH_WARN_CLASS,
+                terminalCopy(msgs.notFound, 'the token authorization flow was not found and may have expired'));
         }
         return true;
     }
@@ -349,7 +469,8 @@ async function runOAuthFlow(opts) {
             submitError.hidden = false;
         } catch (e) {
             if (e.status === 404) {
-                endWith(OAUTH_WARN_CLASS, msgs.expired);
+                await endWith(OAUTH_WARN_CLASS,
+                    terminalCopy(msgs.expired, 'the token authorization flow expired'));
                 return;
             }
             submitError.textContent = e.message || 'Could not submit the code.';
@@ -380,11 +501,13 @@ async function runOAuthFlow(opts) {
             await handleFlowResult(poll);
         } catch (e) {
             if (e.status === 404) {
-                endWith(OAUTH_WARN_CLASS, msgs.expired);
+                await endWith(OAUTH_WARN_CLASS,
+                    terminalCopy(msgs.expired, 'the token authorization flow expired'));
             } else {
                 consecutiveErrors++;
                 if (consecutiveErrors >= OAUTH_MAX_POLL_ERRORS) {
-                    endWith(OAUTH_ERROR_CLASS, msgs.checkFailed);
+                    await endWith(OAUTH_ERROR_CLASS,
+                        terminalCopy(msgs.checkFailed, 'the token status check failed repeatedly'));
                 }
             }
         } finally {
@@ -401,19 +524,7 @@ async function runOAuthFlow(opts) {
         pollOnce();
     }
 
-    let elapsed = 0;
-    pollTimer = setInterval(() => {
-        elapsed++;
-        if (elapsed > maxWait) {
-            endWith(OAUTH_WARN_CLASS, msgs.timedOut(waitLabel));
-            return;
-        }
-        pollOnce();
-    }, 1000);
-
-    window.jackedState.flowPolling = pollTimer;
-    document.addEventListener('visibilitychange', pollOnVisible);
-    window.addEventListener('focus', pollOnVisible);
+    startPolling();
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +550,7 @@ async function startAddAccountFlow() {
                 if (poll.redirected_from_account_id) {
                     return {
                         text: 'Updated ' + acctEmail + (orgName ? ' (' + orgName + ')' : '')
-                            + ' - you authorized a different org than selected',
+                            + ' - you authorized a different org than selected.',
                         duration: 10000,
                     };
                 }

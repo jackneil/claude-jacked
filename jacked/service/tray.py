@@ -10,7 +10,14 @@ import webbrowser
 from dataclasses import replace
 
 from jacked import __version__
-from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+from jacked.service import (
+    COLD_START_READY_TIMEOUT,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    EX_TEMPFAIL,
+    PID_FILE,
+    START_FAILURE_LIMIT,
+)
 from jacked.service.process import (
     is_port_available,
     write_pid,
@@ -280,6 +287,10 @@ class ServiceRunner:
         self._service_environment: dict[str, str] | None = None
         self._control_server = None
         self._server_ready = False
+        # Seconds the most recent _wait_for_ready spent before the port
+        # answered. None until a start becomes ready; logged so a slow cold
+        # boot is visible in ~/.claude/jacked-tray.log.
+        self._ready_elapsed: float | None = None
         self._service_state = "starting"
         self._lifecycle_failure: str | None = None
         self._win_ctrl_handler = None
@@ -479,26 +490,59 @@ class ServiceRunner:
         thread.start()
         return thread
 
-    def _wait_for_ready(self, timeout: float = 10.0) -> bool:
-        """Poll until the server is accepting connections."""
+    def _wait_for_ready(self, timeout: float | None = None) -> bool:
+        """Poll until the server accepts connections.
+
+        Returns False early when the uvicorn thread has already died: there is
+        nothing left to wait for. ``timeout=None`` uses the cold-start budget.
+        """
         import socket
         import time
 
+        if timeout is None:
+            timeout = COLD_START_READY_TIMEOUT
         probe_host = (
             self.bind_plan.probe_host if self.bind_plan is not None else "127.0.0.1"
         )
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         while time.monotonic() < deadline:
             try:
                 sock = socket.create_connection((probe_host, self.port), timeout=0.5)
                 sock.close()
+                self._ready_elapsed = time.monotonic() - started
                 return True
             except OSError:
+                thread = self._uvicorn_thread
+                if thread is not None and not thread.is_alive():
+                    logger.error(
+                        "Server thread exited before becoming ready (%.1fs)",
+                        time.monotonic() - started,
+                    )
+                    return False
                 time.sleep(0.3)
+        logger.error("Server did not become ready within %.0fs", timeout)
         return False
+
+    def _start_failure_path(self):
+        from jacked.service import START_FAILURE_FILENAME
+        from jacked.service.lifecycle import default_service_paths
+
+        return default_service_paths().root / START_FAILURE_FILENAME
+
+    def _note_ready(self, elapsed: float) -> None:
+        """Record a successful start: reset the retry breaker, remember timing."""
+        from jacked.service.start_failures import clear_start_failures
+
+        self._ready_elapsed = elapsed
+        try:
+            clear_start_failures(self._start_failure_path())
+        except OSError:
+            logger.exception("Could not clear start-failure memory")
 
     def _abort_unready_start(self) -> None:
         """Stop before any tray UI exists when startup never became ready."""
+        import time
 
         logger.error("Service did not become ready; aborting before UI startup")
         self._service_state = "degraded"
@@ -507,15 +551,32 @@ class ServiceRunner:
         if self._uvicorn_thread is not None:
             self._uvicorn_thread.join(timeout=5)
         from jacked.service.spec import SupervisorKind
+        from jacked.service.start_failures import record_start_failure
 
         if (
-            self._service_spec is not None
-            and self._service_spec.supervisor is not SupervisorKind.MANUAL
+            self._service_spec is None
+            or self._service_spec.supervisor is SupervisorKind.MANUAL
         ):
+            raise SystemExit(
+                "Jacked did not become ready. Check ~/.claude/jacked-tray.log."
+            )
+        try:
+            failures = record_start_failure(self._start_failure_path(), time.time())
+        except OSError:
+            logger.exception("Could not record start failure")
+            failures = 1
+        if failures >= START_FAILURE_LIMIT:
+            # A clean exit stops every supervisor from relaunching. The log
+            # line is the operator's signal; `jacked service restart` resets.
+            logger.error(
+                "Service failed to start %d times in a row; giving up until "
+                "`jacked service restart` is run",
+                failures,
+            )
             raise SystemExit(0)
-        raise SystemExit(
-            "Jacked did not become ready. Check ~/.claude/jacked-tray.log."
-        )
+        # A non-zero exit is what makes launchd, systemd and Task Scheduler
+        # retry; a clean exit would be treated as final.
+        raise SystemExit(EX_TEMPFAIL)
 
     def _wait_for_port_free(self, timeout: float = 10.0) -> bool:
         """Poll until EVERY plan address is free to bind (old server released).
@@ -1309,10 +1370,12 @@ class ServiceRunner:
             self._service_state = "running"
             self._lifecycle_failure = None
             self._started_at = time.time()
+            self._note_ready(self._ready_elapsed or 0.0)
             logger.info(
-                "Service ready — macOS menu-bar agent (pid=%d, port=%d)",
+                "Service ready — macOS menu-bar agent (pid=%d, port=%d, ready_in=%.1fs)",
                 os.getpid(),
                 self.port,
+                self._ready_elapsed or 0.0,
             )
         else:
             self._abort_unready_start()
@@ -1378,12 +1441,31 @@ class ServiceRunner:
                 set_restart_handler(None)
         finally:
             self._uninstall_windows_console_handler()
-            if self._control_server is not None:
-                self._control_server.close()
-                self._control_server = None
-            if self._ownership is not None:
-                self._ownership.close()
-                self._ownership = None
+            self.release_ownership()
+
+    def release_ownership(self) -> None:
+        """Close the control channel and retire this instance's manifest.
+
+        Idempotent. ``run()`` calls it in its ``finally`` on every platform.
+        macOS also calls it explicitly before ``NSApp.terminate_`` because
+        that call ends the process without unwinding Python, so the
+        ``finally`` never runs there and the manifest would outlive the pid.
+        The attributes are cleared only after both closes so the control
+        server's manifest provider stays valid while its handler joins.
+        """
+        control, ownership = self._control_server, self._ownership
+        if control is not None:
+            try:
+                control.close()
+            except OSError:
+                logger.exception("Control server close failed during shutdown")
+        if ownership is not None:
+            try:
+                ownership.close()
+            except OSError:
+                logger.exception("Ownership release failed during shutdown")
+        self._control_server = None
+        self._ownership = None
 
     def _handle_control_action(self, action):
         """Dispatch an authenticated native-control action."""
@@ -1475,11 +1557,13 @@ class ServiceRunner:
             self._service_state = "running"
             self._lifecycle_failure = None
             self._started_at = time.time()
+            self._note_ready(self._ready_elapsed or 0.0)
             logger.info(
-                "Service ready (pid=%d, port=%d, autostart=%s)",
+                "Service ready (pid=%d, port=%d, autostart=%s, ready_in=%.1fs)",
                 os.getpid(),
                 self.port,
                 self._autostart_enabled,
+                self._ready_elapsed or 0.0,
             )
         else:
             self._abort_unready_start()

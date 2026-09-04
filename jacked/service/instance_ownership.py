@@ -20,10 +20,10 @@ from jacked.service.instance_storage import (
     _secure_windows_path,
     current_process_identity,
     current_user_identity,
+    process_is_stale,
     publish_manifest,
     read_manifest,
     remove_manifest_if_current,
-    process_identity,
 )
 from jacked.service.spec import ServiceSpec
 
@@ -205,14 +205,7 @@ def _clear_proven_stale_manifest(paths: ServicePaths) -> None:
         raise ServiceOwnershipInvalid(
             "an invalid instance manifest requires explicit recovery"
         ) from exc
-    try:
-        observed = process_identity(stale.process.pid)
-    except (OSError, ProcessLookupError, ValueError):
-        _remove_owned_stale_control(paths.control)
-        if not remove_manifest_if_current(paths.manifest, stale.instance_id):
-            raise ServiceOwnershipInvalid("stale manifest changed during recovery")
-        return
-    if observed != stale.process:
+    if process_is_stale(stale.process):
         _remove_owned_stale_control(paths.control)
         if not remove_manifest_if_current(paths.manifest, stale.instance_id):
             raise ServiceOwnershipInvalid("stale manifest changed during recovery")

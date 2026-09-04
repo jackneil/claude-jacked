@@ -195,3 +195,71 @@ def test_manual_spawn_refuses_a_changed_runtime_target(monkeypatch):
     assert result.ok is False
     assert result.reason == "runtime target changed"
     popen.assert_not_called()
+
+
+def test_handoff_treats_dead_owner_pid_as_exit(monkeypatch, tmp_path):
+    process = SimpleNamespace(pid=999_999, creation_id="gone", executable="/x")
+    old = SimpleNamespace(
+        instance_id="old",
+        generation="old-generation",
+        supervisor=SupervisorKind.LAUNCHD.value,
+        process=process,
+    )
+    spec = MagicMock(generation="a" * 64, supervisor=SupervisorKind.LAUNCHD)
+    paths = SimpleNamespace(manifest=tmp_path / "manifest", root=tmp_path)
+    control = MagicMock(
+        side_effect=[
+            {"ok": True, "result": {"accepted": True}},
+            {
+                "ok": True,
+                "result": {
+                    "state": "running",
+                    "generation": spec.generation,
+                    "instance_id": "new",
+                },
+            },
+        ]
+    )
+    install = MagicMock(return_value=SupervisorAction(True, "install", "exact"))
+    monkeypatch.setattr("jacked.service.instance.read_manifest", lambda _path: old)
+    monkeypatch.setattr("jacked.service.instance.process_is_stale", lambda p: True)
+    monkeypatch.setattr("jacked.service.ipc.send_native_control", control)
+    monkeypatch.setattr("jacked.service.lifecycle.install_owned_supervisor", install)
+    monkeypatch.setattr("jacked.service.lifecycle.spawn_exact_service", MagicMock())
+
+    result = handoff_owned_service(spec, environment={}, paths=paths, timeout=2)
+
+    assert result.ok is True
+    install.assert_called_once()
+
+
+def test_handoff_keeps_waiting_while_owner_pid_is_alive(monkeypatch, tmp_path):
+    process = SimpleNamespace(pid=4242, creation_id="live", executable="/x")
+    old = SimpleNamespace(instance_id="old", generation="old-generation", process=process)
+    spec = MagicMock(generation="a" * 64, supervisor=SupervisorKind.MANUAL)
+    paths = SimpleNamespace(manifest=tmp_path / "manifest", root=tmp_path)
+    monkeypatch.setattr("jacked.service.instance.read_manifest", lambda _path: old)
+    monkeypatch.setattr("jacked.service.instance.process_is_stale", lambda p: False)
+    monkeypatch.setattr(
+        "jacked.service.ipc.send_native_control",
+        lambda *_args, **_kwargs: {"ok": True, "result": {"accepted": True}},
+    )
+    spawn = MagicMock()
+    monkeypatch.setattr("jacked.service.lifecycle.spawn_exact_service", spawn)
+
+    result = handoff_owned_service(spec, environment={}, paths=paths, timeout=0.3)
+
+    assert result.ok is False
+    assert "did not exit" in result.reason
+    spawn.assert_not_called()
+
+
+def test_handoff_budgets_come_from_service_constants():
+    import inspect
+
+    from jacked.service import HANDOFF_EXIT_TIMEOUT, REPLACEMENT_READY_TIMEOUT
+
+    params = inspect.signature(handoff_owned_service).parameters
+    assert params["timeout"].default == HANDOFF_EXIT_TIMEOUT
+    assert params["ready_timeout"].default == REPLACEMENT_READY_TIMEOUT
+    assert REPLACEMENT_READY_TIMEOUT > 90

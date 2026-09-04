@@ -33,6 +33,7 @@ from jacked.credentials.resolver import (
     ResolverState,
     SnapshotUpdate,
 )
+from jacked.credentials.runtime import GLOBAL_FILE_LOCATOR, KEYCHAIN_LOCATOR
 
 logger = logging.getLogger(__name__)
 
@@ -82,17 +83,20 @@ def _build_resolver(config_root: Path, scope: str) -> CanonicalCredentialResolve
 
         authority = MacOSCredentialStore()
         declaration = StoreDeclaration(
-            "macos-keychain", authority.locator, StoreRole.AUTHORITY
+            "macOS Keychain", KEYCHAIN_LOCATOR, StoreRole.AUTHORITY
         )
-        stores = {authority.locator: authority}
+        stores = {KEYCHAIN_LOCATOR: authority}
     else:
+        # The path still comes from config_root so scoped mode keeps working;
+        # only the declaration locator is canonical, because that is the key
+        # the resolver looks the adapter up by.
         authority = FileCredentialStore(
             config_root / ".credentials.json", trusted_root=config_root
         )
         declaration = StoreDeclaration(
-            "configured-credential-file", authority.locator, StoreRole.AUTHORITY
+            "configured credential file", GLOBAL_FILE_LOCATOR, StoreRole.AUTHORITY
         )
-        stores = {authority.locator: authority}
+        stores = {GLOBAL_FILE_LOCATOR: authority}
 
     capability = CredentialCapability(
         executable=executable,

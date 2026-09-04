@@ -164,7 +164,11 @@ def _swap_backoff_remaining(now: float | None = None) -> float:
 
 
 def _read_active_account_id() -> int | None:
-    """Return only a consensus-resolved active credential identity."""
+    """Return the active identity the authority store resolves, else None.
+
+    Required-mirror drift is evidence on the observation, not a veto, so this
+    reports what the runtime will actually use.
+    """
     try:
         from jacked.credentials.resolver import ResolverState
         from jacked.credentials.runtime import resolve_active_identity

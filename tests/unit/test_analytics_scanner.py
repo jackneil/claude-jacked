@@ -280,6 +280,12 @@ class TestScanProjectDir:
         # Rewrite with a smaller file (Claude Code resumes)
         small_msgs = [_assistant_msg("new_m1"), _assistant_msg("new_m2")]
         _write_jsonl(session_file, small_msgs)
+        # The scanner skips a file whose mtime is unchanged, so the rewrite has
+        # to land on a later tick or the offset-reset branch is never reached.
+        # Windows updates the clock about every 15 ms, which is coarse enough
+        # for both writes to share an mtime. Same guard as the append test.
+        time.sleep(0.05)
+        os.utime(session_file, None)
 
         count2 = scan_project_dir(project_dir, "proj_hash", db)
         assert count2 == 2  # Should have reset and re-read

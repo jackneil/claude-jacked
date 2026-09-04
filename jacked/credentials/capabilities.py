@@ -1,9 +1,11 @@
-"""Exact-build credential capability registry."""
+"""Topology-keyed credential capability registry."""
 
 from __future__ import annotations
 
 import hashlib
 import platform
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import (
@@ -52,12 +54,44 @@ def _unsupported(identity: ExecutableIdentity, reason: str) -> CapabilityResolut
     return CapabilityResolution(capability, False, reason)
 
 
-class CapabilityRegistry:
-    """Conservative registry keyed by artifact, platform, and config mode."""
+_BUILD_RE = re.compile(r"^(\d+(?:\.\d+)*)")
 
-    def __init__(self, capabilities: tuple[CredentialCapability, ...] = ()) -> None:
+
+def parse_build(version: str) -> tuple[int, ...]:
+    """Parse the leading dotted integers of a build version ("2.1.260" -> (2, 1, 260))."""
+    match = _BUILD_RE.match(version or "")
+    if match is None:
+        raise ValueError(f"unparseable build version: {version!r}")
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+@dataclass(frozen=True)
+class CapabilityRecord:
+    """One certified credential-store topology for a platform and config mode.
+
+    Certification is keyed by where Claude Code keeps its credentials, which
+    is stable across builds, rather than by executable bytes, which change on
+    every release. ``min_build`` is the oldest build the topology was verified
+    against and ``inspected_through`` the newest; a newer build still resolves
+    and is flagged in the evidence so mutation can be more conservative.
+    """
+
+    platform_system: str
+    config_mode: str
+    min_build: str
+    inspected_through: str
+    capability: CredentialCapability
+
+
+NEWER_THAN_INSPECTED = "build-newer-than-inspected"
+
+
+class CapabilityRegistry:
+    """Conservative registry keyed by platform and config mode."""
+
+    def __init__(self, records: tuple[CapabilityRecord, ...] = ()) -> None:
         self._records = {
-            self._key(record.executable): record for record in capabilities
+            (record.platform_system, record.config_mode): record for record in records
         }
         self._disabled_reason: str | None = None
         self._fresh_generation = 0
@@ -79,24 +113,34 @@ class CapabilityRegistry:
             return _unsupported(
                 identity, f"mutation kill switch: {self._disabled_reason}"
             )
-        capability = self._records.get(self._key(identity))
-        if capability is None:
+        record = self._records.get((identity.platform_system, identity.config_mode))
+        if record is None:
             return _unsupported(
-                identity, "exact build/config capability is not certified"
+                identity,
+                "no certified credential-store topology for "
+                f"{identity.platform_system or 'unknown'}/{identity.config_mode}",
             )
+        try:
+            build = parse_build(identity.build_version)
+        except ValueError:
+            return _unsupported(identity, "Claude build version is not parseable")
+        if build < parse_build(record.min_build):
+            return _unsupported(
+                identity,
+                f"Claude build {identity.build_version} predates the certified "
+                f"floor {record.min_build}",
+            )
+        evidence = [
+            f"build:{identity.build_version}",
+            f"inspected-through:{record.inspected_through}",
+        ]
+        if build > parse_build(record.inspected_through):
+            evidence.append(NEWER_THAN_INSPECTED)
         capability = CredentialCapability(
-            **{**capability.__dict__, "executable": identity}
+            **{**record.capability.__dict__, "executable": identity}
         )
-        return CapabilityResolution(capability, True, "exact capability record matched")
-
-    @staticmethod
-    def _key(identity: ExecutableIdentity) -> tuple[str, str, str, str, str]:
-        return (
-            identity.sha256,
-            identity.build_version,
-            identity.config_mode,
-            identity.platform_system,
-            identity.platform_machine,
+        return CapabilityResolution(
+            capability, True, "certified topology matched", tuple(evidence)
         )
 
 

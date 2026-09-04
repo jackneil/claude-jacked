@@ -6,7 +6,9 @@ agent module's importability + degraded stub, and the `jacked menubar` CLI
 guard. The pill-title-from-summary wiring is covered in test_menubar_summary.
 """
 import sys
+from types import SimpleNamespace
 from unittest import mock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -198,3 +200,15 @@ def test_cli_menubar_rejects_non_darwin():
         result = CliRunner().invoke(main, ["menubar"])
     assert result.exit_code == 1
     assert "macOS-only" in result.output
+
+
+def test_mac_shutdown_releases_ownership_before_quit():
+    pytest.importorskip("rumps")
+    from jacked.service import menubar_mac
+
+    runner = MagicMock()
+    app = SimpleNamespace(_runner=runner, _screen_observer=None)
+
+    menubar_mac.MacMenuBarApp._shutdown(app)
+
+    assert runner.mock_calls == [call._shutdown_uvicorn(), call.release_ownership()]
