@@ -89,29 +89,32 @@ The installed path is evidence but is not part of the registry key. Relocating
 identical certified bytes therefore does not invalidate an otherwise exact
 match.
 
-An unknown digest, version, config mode, platform, or architecture resolves to
-`unsupported` with `can_mutate=False`. A registry kill switch also disables
-mutation until a caller explicitly begins a fresh resolution generation. There
-is no "closest known version" or platform fallback.
+An unknown platform or config mode, or a build below the certified floor,
+resolves to `unsupported` with `can_mutate=False`; digest and architecture are
+evidence, not gates. A registry kill switch also disables mutation until a
+caller explicitly begins a fresh resolution generation. There is no "closest
+known version" or platform fallback.
 
-### Shipped capability
+### Shipped capability records
 
-The production registry currently contains one record:
+Certification is keyed by credential-store topology per platform and config
+mode, not by executable bytes. The observed build and SHA-256 are recorded as
+evidence on every resolution.
 
-| Property | Certified value |
-| --- | --- |
-| Claude version | `2.1.259` |
-| Executable SHA-256 | `884baa38fe1a624be25c4a91568bf5a08b5cf4e7d7acf29b7760e3525d964898` |
-| Config mode | `global` |
-| Platform | `darwin` / `arm64` |
-| Capability mode | `global_uncooperative` |
-| Authority | macOS Keychain |
-| Required mirror | `~/.claude/.credentials.json` |
+| Platform | Config mode | Build floor | Inspected through | Authority | Required mirror | Mode |
+| --- | --- | --- | --- | --- | --- | --- |
+| `darwin` | `global` | `2.1.0` | `2.1.260` | macOS Keychain (`Claude Code-credentials`) | `~/.claude/.credentials.json` | `global_uncooperative` |
+| `linux` | `global` | `2.1.0` | `2.1.260` | `~/.claude/.credentials.json` | none | `global_uncooperative` |
+| `windows` | `global` | `2.1.0` | `2.1.260` | `%USERPROFILE%\.claude\.credentials.json` | none | `global_uncooperative` |
 
-No Linux, Windows, Intel macOS, other Claude build, or scoped-consumption
-capability is shipped. The file-store and transaction abstractions are
-cross-platform, but the production activation surface is not certified on
-those other combinations yet.
+A build newer than "inspected through" still resolves and carries the
+`build-newer-than-inspected` evidence marker; on such a build jacked refuses
+to create a missing authority (a moved store looks identical to a missing
+one) and logs any `claudeAiOauth` keys it would drop. Scoped config mode
+(`CLAUDE_CONFIG_DIR`) has no shipped record. On Linux and Windows a scoped
+launch does not touch the global file. `~/.claude` must be a real directory
+(a symlinked dotfiles setup is refused with a clear reason); on Windows the
+file's privacy is the profile directory's ACL, the same as Claude Code's own.
 
 ## 5. Store topology
 
@@ -128,17 +131,29 @@ before and target canonical digests, plus capability and machine metadata.
 
 ### 5.2 macOS Keychain is authority for the shipped capability
 
-For the certified macOS build, `MacOSCredentialStore` accesses the generic
+For a certified macOS build, `MacOSCredentialStore` accesses the generic
 password item whose service is `Claude Code-credentials` and whose account is
-the username returned by the operating-system identity API. It uses
-Security.framework through PyObjC, not the `security` subprocess and not
-`USER` or `USERNAME` environment variables.
+the username returned by the operating-system identity API, not the `USER` or
+`USERNAME` environment variables.
 
-Noninteractive reads are bounded. After a read timeout, further noninteractive
-reads for that locator are disabled for the process. Creating a missing
-Keychain item requires `InteractionMode.FOREGROUND`; a background request gets
-`interactive_required`. Every successful update or add is read back and must
-match the requested canonical digest.
+#### Keychain access
+
+All Keychain reads and writes go through `/usr/bin/security`, the same
+Apple-signed tool Claude Code uses, so its access-list entry is shared and no
+password prompt ever names a Python binary. Writes run `security -i` with the
+command on stdin, so tokens never appear in process arguments. A write is sent
+as hex when that command line fits the tool's 4095-byte stdin limit, then as
+escaped JSON with `-w` when that form fits; otherwise the write fails closed
+unless `JACKED_KEYCHAIN_ARGV_FALLBACK=1` is set, which passes the hex payload
+as a process argument and warns once per process. Reads decode the tool's hex
+output. Background calls are guarded by a prompt-free lock-status probe, a 2 s
+subprocess timeout (the child is killed on expiry), and a 10 minute cooling
+latch that also blocks background writes; a successful foreground call clears
+the latch.
+
+Creating a missing Keychain item requires `InteractionMode.FOREGROUND`; a
+background request gets `interactive_required`. Every successful update or add
+is read back and must match the requested canonical digest.
 
 ### 5.3 Global credential file is a required mirror
 
@@ -379,7 +394,7 @@ credential file.
 | `jacked/credentials/canonical.py` | Strict JSON parsing, canonical bytes, identity, digest |
 | `jacked/credentials/capabilities.py` | Exact-build and platform capability registry |
 | `jacked/credentials/runtime.py` | Production capability assembly and activation entry points |
-| `jacked/credentials/macos_store.py` | Security.framework Keychain authority adapter |
+| `jacked/credentials/macos_store.py` | Keychain authority adapter driven by the signed security tool |
 | `jacked/credentials/file_store.py` | Cross-platform durable JSON file adapter |
 | `jacked/credentials/resolver.py` | Authority/mirror consensus and snapshot publication |
 | `jacked/credentials/transaction.py` | Switch state machine and outcome axes |

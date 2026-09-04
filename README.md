@@ -203,7 +203,7 @@ Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bo
 
 **Use Account** requests a change to the default Claude credential stores. The result is evidence-qualified: the dashboard says whether the target was committed, merely observed without a complete writer fence, needs interaction, or is unsupported. It never turns a database selection into a false claim that running sessions changed. Credential mutation is local-only, so a remotely opened dashboard can manage and inspect accounts but cannot switch credentials.
 
-Current support is deliberately conservative. The exact Claude Code 2.1.259 macOS arm64 build can report `observed_target_unfenced`: the requested credentials were read back, but another writer cannot be ruled out, so existing sessions remain unverified and a restart is recommended. An unknown executable, build, platform, architecture, or configuration mode fails closed instead of guessing how that Claude Code version stores credentials.
+Current support is deliberately conservative. Certification is keyed to the credential-store topology per platform and config mode, with a certified build floor: macOS (Keychain plus a required `~/.claude/.credentials.json` mirror), Linux and Windows (the credentials file is the authority), for Claude Code builds from 2.1.0, inspected through 2.1.260. A certified switch can report `observed_target_unfenced`: the requested credentials were read back, but another writer cannot be ruled out, so existing sessions remain unverified and a restart is recommended. An unknown platform or configuration mode, or a build below the floor, fails closed instead of guessing how that Claude Code version stores credentials.
 
 For a specific account, launch Claude Code through jacked:
 

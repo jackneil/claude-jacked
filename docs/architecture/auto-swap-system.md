@@ -119,9 +119,11 @@ The decision log records the action as `recommend`, the trigger as
 
 ## 6. Why background mutation is not certified
 
-Credential capabilities are keyed to exact executable bytes, version, config
-mode, platform, and architecture. The only shipped production record is Claude
-`2.1.259` with a specific SHA-256 on macOS arm64 in global mode.
+Credential capabilities are keyed to the credential-store topology per
+platform and config mode, with a certified build floor; the executable hash
+and build travel as evidence. The shipped production records certify the
+topology on macOS (Keychain plus file mirror), Linux and Windows (file
+authority) for Claude builds from `2.1.0`, inspected through `2.1.260`.
 
 That record is `global_uncooperative`: macOS Keychain is authority,
 `~/.claude/.credentials.json` is a required mirror, and all possible competing
@@ -132,9 +134,9 @@ Auto-swap requests use `InteractionMode.BACKGROUND`. Even if the shipped
 global-uncooperative engine were incorrectly attached to the database, it
 would not be a certified automatic switch path.
 
-Linux, Windows, Intel macOS, other Claude builds, and scoped modes also have no
-shipped mutation capability. The portable file-store code does not itself
-certify Claude's consumption behavior on those platforms.
+Scoped config modes have no shipped mutation capability. Linux and Windows are
+certified for the file topology; a switch there is unfenced and foreground-only,
+exactly as on macOS.
 
 ## 7. Requirements for a future automatic switch
 
