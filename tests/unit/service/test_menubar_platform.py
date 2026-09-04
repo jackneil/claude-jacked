@@ -45,7 +45,7 @@ def test_run_dispatches_to_mac_on_darwin():
          mock.patch.object(tray, "_mac_menubar_available", return_value=True), \
          mock.patch.object(ServiceRunner, "_install_tray_file_logger"), \
          mock.patch.object(ServiceRunner, "_run_mac_menubar") as mac_run:
-        runner.run()
+        runner._run()
     mac_run.assert_called_once()
 
 
@@ -58,7 +58,7 @@ def test_run_uses_pystray_off_darwin():
          mock.patch.object(ServiceRunner, "_run_mac_menubar") as mac_run, \
          mock.patch.object(tray, "check_tray_deps", side_effect=SystemExit):
         with pytest.raises(SystemExit):
-            runner.run()
+            runner._run()
     mac_run.assert_not_called()
 
 
@@ -71,7 +71,7 @@ def test_run_uses_pystray_when_mac_deps_missing_on_darwin():
          mock.patch.object(ServiceRunner, "_run_mac_menubar") as mac_run, \
          mock.patch.object(tray, "check_tray_deps", side_effect=SystemExit):
         with pytest.raises(SystemExit):
-            runner.run()
+            runner._run()
     mac_run.assert_not_called()
 
 

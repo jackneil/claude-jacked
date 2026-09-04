@@ -310,7 +310,8 @@ def _artifact_identity(content: bytes, argument_count: int) -> tuple[str, str] |
         return None
     try:
         arguments = plistlib.loads(content)["ProgramArguments"]
-        launcher = arguments[-argument_count - 2]
+        # launcher, runtime, bound runtime target, then Python arguments
+        launcher = arguments[-argument_count - 3]
         generation = marker["generation"]
         if not isinstance(launcher, str) or not isinstance(generation, str):
             return None

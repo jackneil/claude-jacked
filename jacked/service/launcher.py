@@ -13,13 +13,21 @@ from pathlib import Path
 POSIX_LAUNCHER_SOURCE = b"""#!/bin/sh
 set -eu
 runtime=$1
-shift
+expected=$2
+shift 2
 case "$runtime" in
+    /*) ;;
+    *) exit 64 ;;
+esac
+case "$expected" in
     /*) ;;
     *) exit 64 ;;
 esac
 [ -f "$runtime" ] || exit 66
 [ -x "$runtime" ] || exit 77
+[ -f "$expected" ] || exit 66
+[ -x "$expected" ] || exit 77
+[ "$runtime" -ef "$expected" ] || exit 78
 exec "$runtime" "$@"
 """
 
