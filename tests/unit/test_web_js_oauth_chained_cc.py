@@ -205,3 +205,78 @@ def test_cancel_while_chained_says_the_account_is_stored(tmp_path):
     assert "authorize the Claude Code token from the account menu" in result["banner"]
     assert result["guard"] is False
     assert result["hooks"] == 0
+
+
+def test_chaining_re_arms_the_poll_interval(tmp_path):
+    """refreshAndRender goes through renderRoute, which clears
+    window.jackedState.flowPolling, so chaining without re-arming would leave the
+    chained flow polled only when the tab regains focus (and its timeout dead)."""
+    result = _run(tmp_path, r"""
+(async () => {
+    const cleared = [];
+    let nextId = 0;
+    global.setInterval = () => ++nextId;
+    global.clearInterval = (id) => { cleared.push(id); };
+    const answers = [
+        { status: 'completed', cc_flow_id: 'cc1' },
+        { status: 'completed' },
+    ];
+    global.api.get = async () => { calls.get++; return answers.shift() || { status: 'completed' }; };
+    releaseRefresh();
+
+    startReauthFlow(7, 'a@b.com');
+    await tick();
+    const startsBeforeChain = nextId;
+    fireDoc('visibilitychange');
+    await tick(); await tick();
+    out2 = { startsBeforeChain, startsAfterChain: nextId,
+             pollingAfterChain: window.jackedState.flowPolling,
+             hooksAfterChain: (listeners.doc['visibilitychange'] || []).length };
+    fireDoc('visibilitychange');
+    await tick(); await tick();
+    out2.clearedLast = cleared[cleared.length - 1];
+    out2.pollingAtEnd = window.jackedState.flowPolling;
+    out2.hooksAtEnd = (listeners.doc['visibilitychange'] || []).length;
+    out(out2);
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+    assert result["startsBeforeChain"] == 1
+    assert result["startsAfterChain"] == 2, "the chained flow gets its own interval"
+    assert result["pollingAfterChain"] == 2, "the new interval is the one renderRoute would clean up"
+    assert result["hooksAfterChain"] == 1, "the visibility hooks are registered once, not twice"
+    assert result["clearedLast"] == 2, "the flow's terminal exit clears the interval it is actually using"
+    assert result["pollingAtEnd"] is None
+    assert result["hooksAtEnd"] == 0
+
+
+def test_a_failed_refresh_still_renders_a_verdict_and_frees_the_guard(tmp_path):
+    result = _run(tmp_path, r"""
+(async () => {
+    const answers = [
+        { status: 'completed', cc_flow_id: 'cc1' },
+        { status: 'not_found' },
+    ];
+    global.api.get = async () => { calls.get++; return answers.shift() || { status: 'not_found' }; };
+    let refreshes = 0;
+    global.refreshAndRender = async () => {
+        refreshes++;
+        if (refreshes > 1) throw new Error('network down');
+    };
+
+    startReauthFlow(7, 'a@b.com');
+    await tick();
+    fireDoc('visibilitychange');
+    await tick(); await tick();
+    fireDoc('visibilitychange');
+    await tick(); await tick();
+    out({ refreshes, banner: textAll(statusEl), guard: window.jackedState._accountActionInFlight,
+          hooks: (listeners.doc['visibilitychange'] || []).length });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+    assert result["refreshes"] == 2, "the chained exit still tries to refresh"
+    assert "the token authorization flow was not found" in result["banner"], "the verdict survives"
+    assert "reload the page to see the stored state" in result["banner"]
+    assert result["guard"] is False, "a failed refresh must not leave every account action refused"
+    assert result["hooks"] == 0

@@ -219,6 +219,9 @@ async function runOAuthFlow(opts) {
 
     const msgs = opts.messages;
     let pollTimer = null;
+    // The two "user came back to the tab" hooks are registered once for the
+    // life of the flow, even though the interval is re-armed after chaining.
+    let hooked = false;
     // The poller and a code submission race to finish the flow. First one to
     // reach a terminal state wins; the loser must not re-render or double-refresh.
     let terminal = false;
@@ -254,7 +257,6 @@ async function runOAuthFlow(opts) {
         chainedFlowId = ccFlowId;
         primaryResult = primary;
         flowId = ccFlowId;
-        elapsed = 0;
         const slot = document.getElementById('oauth-flow-status') || statusEl;
         const chainedTextDiv = buildOAuthBanner(slot, OAUTH_ACCENT_ORANGE,
             primary.text + ' Authorizing the Claude Code token in the browser...');
@@ -262,6 +264,10 @@ async function runOAuthFlow(opts) {
         // banner's Cancel button with it, so the chained wait needs its own.
         addCancelButton(chainedTextDiv,
             primary.text + ' The Claude Code token step was cancelled' + OAUTH_CHAINED_RETRY_HINT);
+        // The refresh went through renderRoute, which clears
+        // window.jackedState.flowPolling and with it our interval, so the
+        // chained flow would be polled only when the tab regains focus.
+        startPolling();
     }
 
     // Copy for the chained step, built from the flow's own success line so an
@@ -288,6 +294,29 @@ async function runOAuthFlow(opts) {
         return chainedFailPrefix() + chainedReason + OAUTH_CHAINED_RETRY_HINT;
     }
 
+    // The 1s poll plus the hooks that re-poll when the tab comes back. Safe to
+    // call twice: it takes over from any interval still running and registers
+    // the listeners only the first time.
+    function startPolling() {
+        elapsed = 0;
+        if (pollTimer !== null) clearInterval(pollTimer);
+        pollTimer = setInterval(() => {
+            elapsed++;
+            if (elapsed > maxWait) {
+                endWith(OAUTH_WARN_CLASS,
+                    terminalCopy(msgs.timedOut(waitLabel), 'it was not finished within ' + waitLabel));
+                return;
+            }
+            pollOnce();
+        }, 1000);
+        window.jackedState.flowPolling = pollTimer;
+        if (!hooked) {
+            document.addEventListener('visibilitychange', pollOnVisible);
+            window.addEventListener('focus', pollOnVisible);
+            hooked = true;
+        }
+    }
+
     function stopPolling() {
         if (pollTimer !== null) clearInterval(pollTimer);
         // Only release the shared slot if it's still ours — a newer flow may
@@ -296,6 +325,7 @@ async function runOAuthFlow(opts) {
         pollTimer = null;
         document.removeEventListener('visibilitychange', pollOnVisible);
         window.removeEventListener('focus', pollOnVisible);
+        hooked = false;
     }
 
     // End the flow on a local verdict: timeout, expiry, cancel, or a dead poll loop.
@@ -303,13 +333,22 @@ async function runOAuthFlow(opts) {
         if (terminal) return;
         terminal = true;
         stopPolling();
-        // While chained, the sign-in is stored whatever became of the token,
-        // so the card has to show what the server holds. Refresh FIRST:
-        // refreshAndRender re-renders the route wholesale and would wipe a
-        // banner drawn before it.
-        if (chainedFlowId) await refreshAndRender();
-        renderBanner(className, text);
-        window.jackedState._accountActionInFlight = false;
+        let bannerText = text;
+        try {
+            // While chained, the sign-in is stored whatever became of the
+            // token, so the card has to show what the server holds. Refresh
+            // FIRST: refreshAndRender re-renders the route wholesale and would
+            // wipe a banner drawn before it.
+            if (chainedFlowId) await refreshAndRender();
+        } catch (e) {
+            // A refresh that fails must not cost the user the verdict or leave
+            // the guard up, which would refuse every other account action.
+            console.warn('Could not refresh the accounts view: ' + ((e && e.message) || e));
+            bannerText = text + ' The accounts view could not be refreshed, so reload the page to see the stored state.';
+        } finally {
+            renderBanner(className, bannerText);
+            window.jackedState._accountActionInFlight = false;
+        }
     }
 
     // A way out that is not "reload the page". While a flow is pending, the
@@ -482,19 +521,7 @@ async function runOAuthFlow(opts) {
         pollOnce();
     }
 
-    pollTimer = setInterval(() => {
-        elapsed++;
-        if (elapsed > maxWait) {
-            endWith(OAUTH_WARN_CLASS,
-                terminalCopy(msgs.timedOut(waitLabel), 'it was not finished within ' + waitLabel));
-            return;
-        }
-        pollOnce();
-    }, 1000);
-
-    window.jackedState.flowPolling = pollTimer;
-    document.addEventListener('visibilitychange', pollOnVisible);
-    window.addEventListener('focus', pollOnVisible);
+    startPolling();
 }
 
 // ---------------------------------------------------------------------------
