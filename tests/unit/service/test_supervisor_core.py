@@ -75,6 +75,29 @@ def test_renderers_embed_exact_generation_and_clean_launch(kind, renderer, needl
         assert root.find("./t:Actions", namespace).attrib["Context"] == "CurrentUser"
 
 
+def test_systemd_unit_retries_failed_starts_with_bounded_limits():
+    spec = _spec(SupervisorKind.SYSTEMD_USER)
+    rendered = render_systemd_user(spec, environment={"HOME": "/tmp/user"})
+    text = rendered.content.decode("utf-8")
+    unit_section, service_section = text.split("[Service]", 1)
+
+    assert "StartLimitIntervalSec=300" in unit_section
+    assert "StartLimitBurst=5" in unit_section
+    assert "Restart=on-failure" in service_section
+    assert "RestartSec=5" in service_section
+
+
+def test_launchd_plist_keeps_keepalive_on_failure_only():
+    import plistlib
+
+    spec = _spec(SupervisorKind.LAUNCHD)
+    rendered = render_launchd(spec, environment={"HOME": "/tmp/user"})
+    payload = plistlib.loads(rendered.content)
+
+    assert payload["KeepAlive"] == {"SuccessfulExit": False}
+    assert payload["RunAtLoad"] is True
+
+
 def test_reconcile_is_idempotent_and_refuses_foreign_artifact(tmp_path):
     spec = _spec(SupervisorKind.SYSTEMD_USER)
     artifact = render_systemd_user(
