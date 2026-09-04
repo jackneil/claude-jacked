@@ -30,7 +30,7 @@ and records one decision per tick.
 
 At a high level:
 
-1. Resolve the observed active account. If exact-build store consensus is not
+1. Resolve the observed active account. If certified store consensus is not
    available, there is no safe active identity for a credential switch.
 2. Refresh active usage within the polling and rate-limit bounds.
 3. Refresh stale candidate usage within per-candidate timeouts.
@@ -125,10 +125,11 @@ and build travel as evidence. The shipped production records certify the
 topology on macOS (Keychain plus file mirror), Linux and Windows (file
 authority) for Claude builds from `2.1.0`, inspected through `2.1.260`.
 
-That record is `global_uncooperative`: macOS Keychain is authority,
+The macOS record is `global_uncooperative`: macOS Keychain is authority,
 `~/.claude/.credentials.json` is a required mirror, and all possible competing
-writers cannot be fenced. `CredentialTransactionEngine` refuses a background
-request for this mode with `restart_required` before writing.
+writers cannot be fenced. All three shipped records are uncooperative.
+`CredentialTransactionEngine` refuses a background request for this mode with
+`restart_required` before writing.
 
 Auto-swap requests use `InteractionMode.BACKGROUND`. Even if the shipped
 global-uncooperative engine were incorrectly attached to the database, it
@@ -232,7 +233,7 @@ certified transaction engine exists.
 
 ## 12. Invariants
 
-1. Selection is advisory until a cooperative exact-build capability and
+1. Selection is advisory until a cooperative certified capability and
    complete writer fence are installed.
 2. A recommendation never changes credential stores or active/desired
    pointers.
@@ -261,7 +262,7 @@ certified transaction engine exists.
 | `jacked/web/auto_swap/tiers.py` | Urgency tiers, target usage, deficit calculations |
 | `jacked/web/auto_swap/burn.py` | Burn projection and reset suppression helpers |
 | `jacked/web/auto_swap/diagnostics.py` | Decision evidence and advisory calculations |
-| `jacked/credentials/runtime.py` | Shipped exact-build capabilities |
+| `jacked/credentials/runtime.py` | Shipped topology capabilities (platform, config mode, build floor) |
 | `jacked/credentials/transaction.py` | Certified switch outcomes and state machine |
 | `jacked/credentials/writer_fence.py` | Complete-writer protocol and capability fence |
 | `jacked/web/credential_repository.py` | Pending/final journal and pointer publication |

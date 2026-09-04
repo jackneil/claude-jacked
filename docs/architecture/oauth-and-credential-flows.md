@@ -112,8 +112,9 @@ evidence on every resolution.
 
 A build newer than "inspected through" still resolves and carries the
 `build-newer-than-inspected` evidence marker; on such a build jacked refuses
-to create a missing authority (a moved store looks identical to a missing
-one) and logs any `claudeAiOauth` keys it would drop. Scoped config mode
+to create a missing authority, because a moved store looks identical to a
+missing one. Every unfenced activation, on any build, logs the `claudeAiOauth`
+keys the authority carries that jacked would drop. Scoped config mode
 (`CLAUDE_CONFIG_DIR`) has no shipped record. On Linux and Windows a scoped
 launch does not touch the global file. `~/.claude` must be a real directory
 (a symlinked dotfiles setup is refused with a clear reason); on Windows the
@@ -144,12 +145,12 @@ the username returned by the operating-system identity API, not the `USER` or
 All Keychain reads and writes go through `/usr/bin/security`, the same
 Apple-signed tool Claude Code uses, so its access-list entry is shared and no
 password prompt ever names a Python binary. Writes run `security -i` with the
-command on stdin, so tokens never appear in process arguments. A write is sent
-as hex when that command line fits the tool's 4095-byte stdin limit, then as
-escaped JSON with `-w` when that form fits; otherwise the write fails closed
-unless `JACKED_KEYCHAIN_ARGV_FALLBACK=1` is set, which passes the hex payload
-as a process argument and warns once per process. Reads decode the tool's hex
-output. Background calls are guarded by a prompt-free lock-status probe, a 2 s
+command on stdin, so tokens are not process arguments on the default path. A
+write is sent as hex when that command line fits the tool's 4095-byte stdin
+limit, then as escaped JSON with `-w` when that form fits; otherwise the write
+fails closed unless `JACKED_KEYCHAIN_ARGV_FALLBACK=1` is set, which passes the
+hex payload as a process argument and warns once per process. Reads decode the
+tool's hex output. Background calls are guarded by a prompt-free lock-status probe, a 2 s
 subprocess timeout (the child is killed on expiry), and a 10 minute cooling
 latch that also blocks background writes; a successful foreground call clears
 the latch.
@@ -187,7 +188,7 @@ required mirror. Resolution is intentionally strict:
 | `unusable` | An adapter is absent, a store cannot be read, a payload is invalid, or the agreed payload lacks an account stamp |
 | `conflict` | Store digests or identities disagree |
 | `stale` | Reserved observation state; the current fresh snapshot reader returns no snapshot after expiry rather than constructing this state |
-| `unsupported` | The exact executable capability or platform adapter is unavailable |
+| `unsupported` | No certified topology for this platform and config mode, or the build is below the certified floor |
 
 `GET /api/auth/active-credential` returns this state and its evidence. Even a
 resolved stamp is checked against a live, non-deleted Claude account row and
@@ -279,7 +280,7 @@ readback cannot prove what an already-running Claude process cached.
 | `indeterminate` | The authority cannot be classified safely as before or target |
 | `restart_required` | The requested background operation cannot safely activate an uncooperative topology |
 | `unusable` | The request or store state cannot form a safe transaction |
-| `unsupported` | Exact-build capability, complete writer evidence, or platform support is absent |
+| `unsupported` | A certified capability, complete writer evidence, or platform support is absent |
 | `diverged` | Pre-write stores conflict in a mode that cannot repair safely, including a missing authority with a readable required mirror |
 
 The model also reserves `busy` and `concurrent_write`. API clients
