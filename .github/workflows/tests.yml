@@ -41,11 +41,4 @@ jobs:
           python -m pip install --only-binary=:all: uv
 
       - name: Run tests
-        if: runner.os != 'Windows'
         run: uv run --frozen python -m pytest
-
-      - name: Isolate Windows security failure
-        if: runner.os == 'Windows'
-        run: >-
-          uv run --frozen python -m pytest -vv
-          tests/unit/service/test_windows_security.py
