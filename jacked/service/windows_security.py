@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from jacked.service.windows_security_models import WindowsApi, WindowsPathSecurity
 
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -21,36 +22,9 @@ _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 _SE_DACL_PROTECTED = 0x1000
 _ACL_SIZE_INFORMATION_CLASS = 2
 _ACCESS_ALLOWED_ACE_TYPE = 0
+_OBJECT_INHERIT_ACE = 0x01
+_CONTAINER_INHERIT_ACE = 0x02
 _FILE_ALL_ACCESS = 0x001F01FF
-
-
-@dataclass(frozen=True)
-class WindowsPathSecurity:
-    is_directory: bool
-    is_reparse_point: bool
-    link_count: int
-    owner_matches: bool
-    dacl_private: bool
-
-    def private_for(self, *, directory: bool) -> bool:
-        return (
-            self.is_directory is directory
-            and not self.is_reparse_point
-            and (directory or self.link_count == 1)
-            and self.owner_matches
-            and self.dacl_private
-        )
-
-
-@dataclass(frozen=True)
-class WindowsApi:
-    """Configured Win32 libraries and dynamically declared structures."""
-
-    kernel32: Any
-    advapi32: Any
-    by_handle_type: type[Any]
-    acl_size_type: type[Any]
-    access_ace_type: type[Any]
 
 
 def _windows_types():
@@ -337,7 +311,13 @@ def _open_path_handle(path: Path, api: WindowsApi) -> Any:
     return handle
 
 
-def _single_private_ace(dacl: Any, current_sid: Any, api: WindowsApi) -> bool:
+def _single_private_ace(
+    dacl: Any,
+    current_sid: Any,
+    api: WindowsApi,
+    *,
+    directory: bool,
+) -> bool:
     import ctypes
 
     info = api.acl_size_type()
@@ -353,16 +333,50 @@ def _single_private_ace(dacl: Any, current_sid: Any, api: WindowsApi) -> bool:
         return False
     ace = ctypes.cast(ace_pointer, ctypes.POINTER(api.access_ace_type)).contents
     sid_pointer = ace_pointer.value + api.access_ace_type.SidStart.offset
+    expected_flags = (
+        _OBJECT_INHERIT_ACE | _CONTAINER_INHERIT_ACE if directory else 0
+    )
     return bool(
         ace.Header.AceType == _ACCESS_ALLOWED_ACE_TYPE
+        and ace.Header.AceFlags == expected_flags
         and ace.Mask == _FILE_ALL_ACCESS
         and api.advapi32.EqualSid(sid_pointer, current_sid)
     )
 
 
-def _descriptor_security(handle: Any, api: WindowsApi) -> tuple[bool, bool]:
+def _protected_private_dacl(
+    descriptor: Any,
+    dacl: Any,
+    current_sid: Any,
+    api: WindowsApi,
+    *,
+    directory: bool,
+) -> bool:
     import ctypes
     from ctypes import wintypes
+
+    control = wintypes.WORD()
+    revision = wintypes.DWORD()
+    protected = bool(
+        api.advapi32.GetSecurityDescriptorControl(
+            descriptor, ctypes.byref(control), ctypes.byref(revision)
+        )
+        and control.value & _SE_DACL_PROTECTED
+    )
+    return bool(
+        dacl
+        and protected
+        and _single_private_ace(dacl, current_sid, api, directory=directory)
+    )
+
+
+def _descriptor_security(
+    handle: Any,
+    api: WindowsApi,
+    *,
+    directory: bool,
+) -> tuple[bool, bool]:
+    import ctypes
 
     descriptor = ctypes.c_void_p()
     current_sid = ctypes.c_void_p()
@@ -385,18 +399,8 @@ def _descriptor_security(handle: Any, api: WindowsApi) -> tuple[bool, bool]:
             current_user_sid(), ctypes.byref(current_sid)
         ):
             raise ctypes.WinError(ctypes.get_last_error())
-        control = wintypes.WORD()
-        revision = wintypes.DWORD()
-        protected = bool(
-            api.advapi32.GetSecurityDescriptorControl(
-                descriptor, ctypes.byref(control), ctypes.byref(revision)
-            )
-            and control.value & _SE_DACL_PROTECTED
-        )
-        private_ace = bool(
-            dacl
-            and protected
-            and _single_private_ace(dacl, current_sid, api)
+        private_ace = _protected_private_dacl(
+            descriptor, dacl, current_sid, api, directory=directory
         )
         return (
             bool(owner and api.advapi32.EqualSid(owner, current_sid)),
@@ -422,10 +426,13 @@ def inspect_windows_path(path: Path) -> WindowsPathSecurity:
             handle, ctypes.byref(info)
         ):
             raise ctypes.WinError(ctypes.get_last_error())
-        owner_matches, dacl_private = _descriptor_security(handle, api)
         attributes = info.dwFileAttributes
+        is_directory = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
+        owner_matches, dacl_private = _descriptor_security(
+            handle, api, directory=is_directory
+        )
         return WindowsPathSecurity(
-            is_directory=bool(attributes & _FILE_ATTRIBUTE_DIRECTORY),
+            is_directory=is_directory,
             is_reparse_point=bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT),
             link_count=info.nNumberOfLinks,
             owner_matches=owner_matches,
@@ -456,9 +463,15 @@ def secure_windows_path(path: Path) -> None:
     descriptor = ctypes.c_void_p()
     owner = ctypes.c_void_p()
     sid = current_user_sid()
-    owner_matches = inspect_windows_path(path).owner_matches
+    initial = inspect_windows_path(path)
+    expected_directory = initial.is_directory
+    owner_matches = initial.owner_matches
+    ace_flags = "OICI" if expected_directory else ""
     if not api.advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        f"D:P(A;;FA;;;{sid})", 1, ctypes.byref(descriptor), None
+        f"D:P(A;{ace_flags};FA;;;{sid})",
+        1,
+        ctypes.byref(descriptor),
+        None,
     ):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
@@ -481,7 +494,6 @@ def secure_windows_path(path: Path) -> None:
         if owner:
             api.kernel32.LocalFree(owner)
         api.kernel32.LocalFree(descriptor)
-    expected_directory = path.is_dir()
     observed = inspect_windows_path(path)
     if not observed.private_for(directory=expected_directory):
         raise OSError(f"service-state DACL verification failed: {observed!r}")

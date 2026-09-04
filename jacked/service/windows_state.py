@@ -7,6 +7,18 @@ from pathlib import Path
 from jacked.service.windows_security import inspect_windows_path, secure_windows_path
 
 
+def _repair_private_windows_directory(path: Path) -> None:
+    inspected = inspect_windows_path(path)
+    if (
+        not inspected.is_directory
+        or inspected.is_reparse_point
+        or not inspected.owner_matches
+    ):
+        raise ValueError("private directory has unsafe Windows ownership or type")
+    if not inspected.dacl_private:
+        secure_windows_path(path)
+
+
 def reject_windows_reparse_ancestors(path: Path) -> None:
     """Reject any existing reparse point in a Windows path chain."""
     current = path
@@ -42,17 +54,24 @@ def ensure_private_windows_directory(path: Path) -> None:
     """Create or validate a non-reparse, current-user-owned private directory."""
 
     reject_windows_reparse_ancestors(path.parent)
-    existed = path.exists() or path.is_symlink()
-    if not existed:
-        path.mkdir(parents=True, exist_ok=True)
-        secure_windows_path(path)
-        return
-    inspected = inspect_windows_path(path)
-    if (
-        not inspected.is_directory
-        or inspected.is_reparse_point
-        or not inspected.owner_matches
-    ):
-        raise ValueError("private directory has unsafe Windows ownership or type")
-    if not inspected.dacl_private:
-        secure_windows_path(path)
+    missing = []
+    current = path
+    while not (current.exists() or current.is_symlink()):
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            _repair_private_windows_directory(directory)
+        else:
+            secure_windows_path(directory)
+
+    reject_windows_reparse_ancestors(path)
+    for directory in reversed(missing):
+        _repair_private_windows_directory(directory)
+    if not missing:
+        _repair_private_windows_directory(path)

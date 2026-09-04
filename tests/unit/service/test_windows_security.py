@@ -56,6 +56,72 @@ def test_private_dacl_rejects_an_additional_everyone_ace(tmp_path):
     assert not inspect_windows_path(path).private_for(directory=False)
 
 
+def test_private_directory_acl_allows_hardening_new_children(tmp_path):
+    from jacked.service.windows_security import (
+        inspect_windows_path,
+        secure_windows_path,
+    )
+
+    directory = tmp_path / "private-directory"
+    directory.mkdir()
+    secure_windows_path(directory)
+
+    child = directory / "child.json"
+    child.write_text("{}", encoding="utf-8")
+    secure_windows_path(child)
+
+    assert child.read_text(encoding="utf-8") == "{}"
+    assert inspect_windows_path(child).private_for(directory=False)
+
+
+def test_private_directory_creation_hardens_missing_parent_chain(tmp_path):
+    from jacked.service.windows_security import inspect_windows_path
+    from jacked.service.windows_state import ensure_private_windows_directory
+
+    parent = tmp_path / "service-state"
+    directory = parent / "launchers"
+
+    ensure_private_windows_directory(directory)
+
+    assert inspect_windows_path(parent).private_for(directory=True)
+    assert inspect_windows_path(directory).private_for(directory=True)
+
+
+def test_private_directory_creation_rejects_intermediate_junction_swap(tmp_path):
+    from jacked.service import windows_state
+    from jacked.service.windows_security import secure_windows_path
+
+    target = tmp_path / "redirect-target"
+    target.mkdir()
+    parent = tmp_path / "service-state"
+    directory = parent / "launchers"
+
+    def secure_then_swap(path):
+        secure_windows_path(path)
+        if path != parent:
+            return
+        path.rmdir()
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(path), str(target)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if created.returncode != 0:
+            pytest.skip(created.stderr or created.stdout)
+
+    try:
+        with patch.object(
+            windows_state, "secure_windows_path", side_effect=secure_then_swap
+        ):
+            with pytest.raises(ValueError, match="reparse ancestor"):
+                windows_state.ensure_private_windows_directory(directory)
+    finally:
+        if parent.exists():
+            parent.rmdir()
+
+
 def test_launcher_reuse_requires_private_current_user_file(tmp_path):
     from jacked.service.launcher import verify_launcher
     from jacked.service.windows_security import secure_windows_path

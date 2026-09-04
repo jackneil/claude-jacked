@@ -8,6 +8,7 @@ from jacked.service.supervisors import (
     install_owned_supervisor,
 )
 from tests.unit.service.supervisor_test_support import (
+    _secure_test_path,
     installed_artifact as _installed_artifact,
 )
 
@@ -52,6 +53,7 @@ def test_install_task_retires_known_legacy_vbs_and_runs_task(tmp_path, monkeypat
         ' --port 8321", 0, False\n'
     )
     legacy.write_text(legacy_content, encoding="utf-8")
+    _secure_test_path(legacy)
     monkeypatch.setenv("APPDATA", str(appdata))
     runner = Mock(
         side_effect=[
@@ -171,6 +173,7 @@ def test_ambiguous_task_create_is_deleted_before_legacy_vbs_returns(
         ' --port 8321", 0, False\n',
         encoding="utf-8",
     )
+    _secure_test_path(legacy)
     monkeypatch.setenv("APPDATA", str(appdata))
     calls = []
 
