@@ -1,8 +1,10 @@
 """Launch Claude Code with evidence-qualified account selection.
 
 CLAUDE_CONFIG_DIR still separates configuration and local credential inputs.
-The currently certified macOS Claude build uses a global credential authority,
-so launch activation explicitly updates and verifies that authority first.
+Where the certified topology puts the authority outside that directory (the
+macOS Keychain), launch activation explicitly updates and verifies the global
+authority first; where the credential file itself is the authority, the launch
+directory is what Claude reads and the global file is left alone.
 
 Directory structure:
     ~/.claude/accounts/<account_id>/.credentials.json
@@ -28,6 +30,7 @@ from jacked.api.credential_helpers import (
     _safe_replace,
     build_oauth_data,
 )
+from jacked.credentials.runtime import scoped_launch_needs_global_activation
 from jacked.web.auth import should_refresh, should_refresh_cc
 from jacked.web.database import Database
 
@@ -524,62 +527,88 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             pass
         raise
 
-    # The exact certified Claude build reads the global macOS Keychain before
-    # CLAUDE_CONFIG_DIR. A scoped file alone therefore cannot establish the
-    # runtime identity. Use the same durable, read-back transaction as /use and
-    # OAuth. Unknown builds fail closed instead of launching with stale global
-    # credentials.
-    from jacked.credentials.models import SwitchOutcome
+    from jacked.credentials.models import CredentialIdentity, SwitchOutcome
 
-    activation = _activate_launch_credentials(account, db)
-    truthful_outcomes = {
-        SwitchOutcome.COMMITTED,
-        SwitchOutcome.COMMITTED_DEGRADED,
-        SwitchOutcome.OBSERVED_TARGET_UNFENCED,
-    }
-    if (
-        activation.outcome not in truthful_outcomes
-        or activation.observed_identity.account_id != account_id
-    ):
-        reason = activation.message or activation.outcome.value.replace("_", " ")
-        raise click.ClickException(
-            f"Could not establish Claude credentials for account {account_id}: {reason}"
-        )
-
-    click.echo(
-        "Note: this certified Claude build uses the global credential authority. "
-        "Launching this account also changes the default for future Claude "
-        "sessions; existing sessions keep their current credentials.",
-        err=True,
+    identity = CredentialIdentity(
+        account_id=account_id,
+        email=account.get("email"),
+        organization_id=account.get("organization_uuid") or None,
     )
+    if scoped_launch_needs_global_activation():
+        # On macOS the Keychain outranks CLAUDE_CONFIG_DIR, so the global
+        # authority must switch too. Unknown builds fail closed here.
+        activation = _activate_launch_credentials(account, db)
+        truthful_outcomes = {
+            SwitchOutcome.COMMITTED,
+            SwitchOutcome.COMMITTED_DEGRADED,
+            SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+        }
+        if (
+            activation.outcome not in truthful_outcomes
+            or activation.observed_identity.account_id != account_id
+        ):
+            reason = activation.message or activation.outcome.value.replace("_", " ")
+            raise click.ClickException(
+                f"Could not establish Claude credentials for account {account_id}: {reason}"
+            )
+        click.echo(
+            "Note: this certified Claude build uses the global credential authority. "
+            "Launching this account also changes the default for future Claude "
+            "sessions; existing sessions keep their current credentials.",
+            err=True,
+        )
+        observed = activation.observed_identity
+        evidence = (
+            "launch:scoped-file-readback",
+            f"launch:global-authority:{activation.outcome.value}",
+        )
+        revision = f"switch:{activation.operation_id}"
+    else:
+        click.echo(
+            "Note: this platform reads credentials from the launch directory; "
+            "the default account for other Claude sessions is unchanged.",
+            err=True,
+        )
+        # "observed" must mean read back. The scoped file was just written;
+        # read it through the strict store and compare the OAuth object to
+        # what build_oauth_data produced before claiming anything.
+        from jacked.credentials.file_store import FileCredentialStore
 
-    # Publish the transaction's token-free observation beside the launch
-    # directory for session hooks. This is deliberately labelled global: the
-    # scoped file is a launch input, not the certified credential authority.
+        readback = FileCredentialStore(
+            config_dir / ".credentials.json", trusted_root=config_dir
+        ).read()
+        written = readback.payload.to_mapping() if readback.payload is not None else None
+        if written is None or written.get("claudeAiOauth") != build_oauth_data(account):
+            raise click.ClickException(
+                f"Credentials for account {account_id} did not read back from the "
+                f"launch directory: {readback.reason or 'content mismatch'}"
+            )
+        observed = CredentialIdentity(
+            account_id=account_id,
+            email=account.get("email"),
+            organization_id=readback.payload.identity.organization_id,
+        )
+        evidence = ("launch:scoped-file-readback", "launch:global-authority:skipped")
+        revision = f"launch:{uuid.uuid4()}"
+
+    # Publish the token-free observation beside the launch directory for
+    # session hooks. Labelled global on purpose: the scoped file is a launch
+    # input, not the certified credential authority.
     try:
-        from jacked.credentials.models import CredentialIdentity
         from jacked.credentials.resolver import (
             FileResolverSnapshotSink,
             ResolverState,
             SnapshotUpdate,
         )
 
-        identity = CredentialIdentity(
-            account_id=account_id,
-            email=account.get("email"),
-            organization_id=account.get("organization_uuid") or None,
-        )
         FileResolverSnapshotSink(config_dir / "jacked-resolver-snapshot.json").publish(
             SnapshotUpdate(
                 scope="global",
                 state=ResolverState.RESOLVED,
-                evidence=(
-                    "launch:scoped-file-readback",
-                    f"launch:global-authority:{activation.outcome.value}",
-                ),
-                credential_revision=f"switch:{activation.operation_id}",
+                evidence=evidence,
+                credential_revision=revision,
                 desired=identity,
-                observed=activation.observed_identity,
+                observed=observed,
             )
         )
     except OSError as exc:

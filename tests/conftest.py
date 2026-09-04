@@ -42,8 +42,23 @@ def _block_keychain_writes():
     ), patch(
         "jacked.launch._activate_launch_credentials",
         side_effect=launch_result,
+    ), patch(
+        # prepare_account_dir asks the real Claude install which authority it
+        # uses; keep every launch test on the deterministic global-activation
+        # path instead of the developer's own machine.
+        "jacked.launch.scoped_launch_needs_global_activation",
+        return_value=True,
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_claude_identity_cache():
+    from jacked.credentials.runtime import clear_identity_cache
+
+    clear_identity_cache()
+    yield
+    clear_identity_cache()
 
 
 @pytest.fixture(autouse=True)

@@ -9,6 +9,16 @@ from .models import InteractionMode, StoreReadResult, StoreStatus, StoreWriteRes
 
 
 class CredentialStore(Protocol):
+    """One credential backend, addressed by the locator its capability declares.
+
+    ``write`` returning ``StoreStatus.CONCURRENT_WRITE`` means exactly one
+    thing: the adapter refused before any mutation because the store changed
+    since this adapter last read it. Callers may therefore treat the store's
+    current contents as intact and re-read to see what the other writer left.
+    Any other failure to land a write reports ``UNUSABLE``, ``DENIED``,
+    ``INTERACTIVE_REQUIRED`` or ``ERROR``, which carry no such guarantee.
+    """
+
     @property
     def locator(self) -> str: ...
 

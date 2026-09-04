@@ -12,6 +12,7 @@ from jacked.credentials.models import (
     StoreDeclaration,
     StoreRole,
     StoreStatus,
+    StoreWriteResult,
     SwitchContext,
     SwitchOutcome,
 )
@@ -386,3 +387,133 @@ def test_payload_repr_is_secret_free() -> None:
     assert "access-canary" not in repr(payload)
     assert "refresh-access-canary" not in repr(payload)
     assert payload.identity == CredentialIdentity(account_id=2)
+
+
+def test_uninspected_build_may_not_create_a_missing_authority():
+    repository = InMemoryCredentialSwitchRepository()
+    store = MemoryCredentialStore("auth", None)
+    deps = TransactionDependencies(
+        capability=_capability(CapabilityMode.GLOBAL_UNCOOPERATIVE),
+        repository=repository,
+        authority=store,
+        mirrors={},
+        writer_fence=WriterFence(StaticWriterInspector(())),
+        install_key=StaticInstallKeyProvider(None),
+        machine_install_id="unfenced-local",
+        snapshot_sink=MemoryResolverSnapshotSink(),
+        allow_missing_authority=False,
+    )
+    engine = CredentialTransactionEngine(deps)
+
+    result = engine.activate(_request(_payload(2, "token")))
+
+    assert result.outcome is SwitchOutcome.UNUSABLE
+    assert "authority is missing" in result.message
+    assert store.read().status is StoreStatus.MISSING
+
+
+def test_inspected_build_keeps_authority_creation_enabled(tmp_path):
+    from jacked.credentials.runtime import SHIPPED_REGISTRY, _engine_for
+    from tests.unit.test_credential_runtime import _identity
+
+    inspected = _engine_for(
+        object(),
+        SHIPPED_REGISTRY.resolve(_identity(platform_system="linux")),
+        tmp_path,
+    )
+    newer = _engine_for(
+        object(),
+        SHIPPED_REGISTRY.resolve(_identity(platform_system="linux", build_version="2.1.261")),
+        tmp_path,
+    )
+    assert inspected._deps.allow_missing_authority is True
+    assert newer._deps.allow_missing_authority is False
+
+
+def test_concurrent_write_on_authority_reports_the_refreshed_contents_as_preserved():
+    refreshed = _payload(7, "refreshed-by-claude")
+
+    class RefreshedUnderneath(MemoryCredentialStore):
+        def write(self, payload, interaction):
+            self._payload = refreshed  # what the other writer left behind
+            return StoreWriteResult(StoreStatus.CONCURRENT_WRITE, "changed since read")
+
+    before = _payload(1, "old")
+    repository = InMemoryCredentialSwitchRepository()
+    store = RefreshedUnderneath("auth", before)
+    deps = TransactionDependencies(
+        capability=_capability(CapabilityMode.GLOBAL_UNCOOPERATIVE),
+        repository=repository,
+        authority=store,
+        mirrors={},
+        writer_fence=WriterFence(StaticWriterInspector(())),
+        install_key=StaticInstallKeyProvider(None),
+        machine_install_id="unfenced-local",
+        snapshot_sink=MemoryResolverSnapshotSink(),
+    )
+
+    result = CredentialTransactionEngine(deps).activate(_request(_payload(2, "new")))
+
+    assert result.outcome is SwitchOutcome.FAILED_PRESERVED
+    assert result.observed_identity.account_id == 7
+    assert "changed since read" in result.message
+
+
+def test_required_mirror_concurrent_write_is_retried_once_after_reread():
+    class RefreshedMirror(MemoryCredentialStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.refusals_left = 1
+            self.reads = 0
+
+        def read(self):
+            self.reads += 1
+            return super().read()
+
+        def write(self, payload, interaction):
+            if self.refusals_left:
+                self.refusals_left -= 1
+                return StoreWriteResult(StoreStatus.CONCURRENT_WRITE, "changed since read")
+            return super().write(payload, interaction)
+
+    before = _payload(1, "old")
+    authority = MemoryCredentialStore("auth", before)
+    mirror = RefreshedMirror("mirror", before)
+    capability = CredentialCapability(
+        **{
+            **_capability(CapabilityMode.GLOBAL_UNCOOPERATIVE).__dict__,
+            "required_mirrors": (StoreDeclaration("mirror", "mirror", StoreRole.REQUIRED_MIRROR),),
+        }
+    )
+    deps = TransactionDependencies(
+        capability=capability,
+        repository=InMemoryCredentialSwitchRepository(),
+        authority=authority,
+        mirrors={"mirror": mirror},
+        writer_fence=WriterFence(StaticWriterInspector(())),
+        install_key=StaticInstallKeyProvider(None),
+        machine_install_id="unfenced-local",
+        snapshot_sink=MemoryResolverSnapshotSink(),
+    )
+
+    result = CredentialTransactionEngine(deps).activate(_request(_payload(2, "new")))
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert mirror.read().payload.digest == _payload(2, "new").digest
+    assert mirror.reads >= 2  # re-armed before the retry
+
+
+def test_schema_drift_is_logged_by_key_name(caplog):
+    before = CredentialPayload.from_mapping(
+        {
+            "_jackedAccountId": 1,
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "newField": 1},
+        }
+    )
+    engine, _repository, _store = _engine(CapabilityMode.GLOBAL_UNCOOPERATIVE, before)
+
+    with caplog.at_level("WARNING"):
+        engine.activate(_request(_payload(2, "token")))
+
+    assert "newField" in caplog.text
+    assert "refresh-" not in caplog.text  # key names only, never values

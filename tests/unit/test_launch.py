@@ -559,6 +559,50 @@ class TestPrepareAccountDir:
             file_mode = stat.S_IMODE(cred_file.stat().st_mode)
             assert file_mode == 0o600
 
+    def test_scoped_launch_skips_global_activation_on_file_authority_platforms(self, tmp_path):
+        """Where the credential file is the authority, the launch dir is what Claude
+        reads; the global file must stay untouched and the snapshot must say so."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+
+        with (
+            mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
+            mock.patch("jacked.launch.should_refresh", return_value=False),
+            mock.patch("jacked.launch.scoped_launch_needs_global_activation", return_value=False),
+            mock.patch("jacked.launch._activate_launch_credentials") as activate,
+        ):
+            from jacked.launch import prepare_account_dir
+
+            result = prepare_account_dir(account, db)
+
+        activate.assert_not_called()
+        snapshot = json.loads((result / "jacked-resolver-snapshot.json").read_text())
+        assert snapshot["state"] == "resolved"
+        assert "launch:global-authority:skipped" in snapshot["evidence"]
+        assert "launch:scoped-file-readback" in snapshot["evidence"]
+        assert snapshot["observed"]["account_id"] == 1
+        assert snapshot["observed"]["organization_id"] == snapshot["desired"]["organization_id"]
+        assert snapshot["credential_revision"].startswith("launch:")
+        assert "alice_cc_access" not in json.dumps(snapshot)
+
+    def test_scoped_launch_fails_when_the_written_file_does_not_read_back(self, tmp_path):
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+
+        def corrupt_replace(src, dst, **kwargs):
+            Path(dst).write_text("{not json", encoding="utf-8")
+
+        with (
+            mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
+            mock.patch("jacked.launch.should_refresh", return_value=False),
+            mock.patch("jacked.launch.scoped_launch_needs_global_activation", return_value=False),
+            mock.patch("jacked.launch._safe_replace", corrupt_replace),
+            pytest.raises(click.ClickException, match="read back"),
+        ):
+            from jacked.launch import prepare_account_dir
+
+            prepare_account_dir(account, db)
+
     def test_refreshes_if_near_expiry(self, tmp_path):
         """Pre-launch token refresh fires when should_refresh returns True."""
         db = _make_db(tmp_path)

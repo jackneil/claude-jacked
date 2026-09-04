@@ -195,3 +195,66 @@ def test_pyobjc_noninteractive_query_uses_ui_fail_without_auth_context() -> None
 
     assert query["ui-key"] == "ui-fail"
     assert "context-key" not in query
+
+
+def test_file_store_refuses_to_overwrite_a_file_changed_since_read(tmp_path: Path) -> None:
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+
+    path.write_bytes(_payload(2).to_bytes())  # Claude Code refreshed a token
+    os.utime(path, ns=(10**12, 10**12))
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.CONCURRENT_WRITE
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 2
+
+
+def test_file_store_refuses_when_a_file_appears_after_a_missing_read(tmp_path: Path) -> None:
+    path = tmp_path / ".credentials.json"
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.MISSING
+
+    path.write_bytes(_payload(9).to_bytes())  # Claude Code logged in meanwhile
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.CONCURRENT_WRITE
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 9
+
+
+def test_file_store_checks_again_right_before_replace(tmp_path: Path, monkeypatch) -> None:
+    from jacked.credentials import file_store as file_store_module
+
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+
+    def rewrite_during_staging(fd):
+        path.write_bytes(_payload(2).to_bytes())
+        os.utime(path, ns=(10**12, 10**12))
+
+    monkeypatch.setattr(file_store_module.os, "fsync", rewrite_during_staging)
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.CONCURRENT_WRITE
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 2
+
+
+def test_file_store_detects_same_size_rewrite_inside_one_mtime_tick(tmp_path: Path) -> None:
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+    original = path.stat()
+
+    path.write_bytes(_payload(2).to_bytes())  # same length as _payload(1)
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.CONCURRENT_WRITE

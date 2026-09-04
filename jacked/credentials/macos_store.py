@@ -261,7 +261,7 @@ class MacOSCredentialStore:
             return StoreWriteResult(StoreStatus.UNUSABLE, str(exc))
         if payload.digest != target.digest:
             return StoreWriteResult(
-                StoreStatus.CONCURRENT_WRITE,
+                StoreStatus.ERROR,
                 "Keychain readback differs from the requested credential revision",
             )
         return StoreWriteResult(StoreStatus.OK)

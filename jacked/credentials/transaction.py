@@ -70,6 +70,7 @@ class TransactionDependencies:
     machine_install_id: str
     snapshot_sink: ResolverSnapshotSink
     switch_lease: SwitchLease = field(default_factory=ProcessSwitchLease)
+    allow_missing_authority: bool = True
 
 
 def _transcript(record: PendingSwitchRecord, *, state_role: str, digest: str) -> bytes:
@@ -167,6 +168,28 @@ def build_unverified_pending_record(
     )
 
 
+def _warn_on_schema_drift(before: StoreReadResult, request: SwitchRequest) -> None:
+    """Name any claudeAiOauth keys Claude wrote that jacked's payload does not carry.
+
+    jacked replaces the whole object; a key it does not know is dropped. That
+    is logged loudly so a Claude Code schema change is diagnosable from the
+    tray log instead of surfacing as a mysterious re-login.
+    """
+    if before.payload is None:
+        return
+    current = before.payload.to_mapping().get("claudeAiOauth")
+    target = request.payload.to_mapping().get("claudeAiOauth")
+    if not isinstance(current, dict) or not isinstance(target, dict):
+        return
+    dropped = sorted(set(current) - set(target))
+    if dropped:
+        logger.warning(
+            "Credential schema drift: authority carries claudeAiOauth keys jacked "
+            "does not write and will drop: %s",
+            ", ".join(dropped),
+        )
+
+
 def _result(
     request: SwitchRequest,
     outcome: SwitchOutcome,
@@ -249,7 +272,7 @@ class CredentialTransactionEngine:
     def _activate_unfenced(self, request: SwitchRequest) -> SwitchResult:
         before, prepared, failure = self._prepare_preserving_target(
             request,
-            allow_missing_authority=True,
+            allow_missing_authority=self._deps.allow_missing_authority,
             allow_divergent_mirrors=True,
         )
         if failure is not None:
@@ -257,6 +280,7 @@ class CredentialTransactionEngine:
             return self._record(request, outcome, message=reason)
         assert prepared is not None
         request = prepared
+        _warn_on_schema_drift(before, request)
         # Even though this mode has no recovery key and can never commit an
         # active pointer, persist the operation before the native write. A
         # crash after Keychain mutation must remain observable and recover as
@@ -368,7 +392,12 @@ class CredentialTransactionEngine:
                 return (
                     before,
                     None,
-                    (SwitchOutcome.UNUSABLE, "credential authority is missing"),
+                    (
+                        SwitchOutcome.UNUSABLE,
+                        "credential authority is missing; jacked will not create it "
+                        "for a Claude build newer than the inspected one; run "
+                        "`claude` and log in once",
+                    ),
                 )
             baseline = {}
         elif before.status is StoreStatus.OK and before.payload is not None:
@@ -488,6 +517,16 @@ class CredentialTransactionEngine:
             return self._record(
                 request, SwitchOutcome.INTERACTIVE_REQUIRED, message=reason
             )
+        if status is StoreStatus.CONCURRENT_WRITE:
+            # The adapter refused before writing because the authority changed
+            # since it was read (Claude Code refreshed or re-logged in). Nothing
+            # of ours landed, so report what is there now as preserved.
+            observed = self._deps.authority.read()
+            if observed.payload is not None:
+                return self._record(
+                    request, SwitchOutcome.FAILED_PRESERVED, observed.payload.identity, reason
+                )
+            return self._record(request, SwitchOutcome.INDETERMINATE, message=reason)
         observed = self._deps.authority.read()
         if observed.payload is not None and observed.payload.digest == before.digest:
             return self._record(
@@ -563,6 +602,10 @@ class CredentialTransactionEngine:
                 failures.append((locator, locator in required, "adapter missing"))
                 continue
             write = mirror.write(request.payload, request.interaction)
+            if write.status is StoreStatus.CONCURRENT_WRITE:
+                # The mirror changed since it was read; re-arm and try once more.
+                mirror.read()
+                write = mirror.write(request.payload, request.interaction)
             if write.status is StoreStatus.OK:
                 continue
             failures.append((locator, locator in required, write.reason))

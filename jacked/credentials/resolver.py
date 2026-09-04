@@ -142,8 +142,12 @@ class CanonicalCredentialResolver:
             )
         identity = observations[0].identity
         if identity.account_id is None:
+            # Claude Code wrote this credential itself, or a jacked write was
+            # replaced. Name it instead of hiding it inside a bare UNUSABLE.
             return ResolverObservation(
-                ResolverState.UNUSABLE, CredentialIdentity(), tuple(evidence)
+                ResolverState.UNUSABLE,
+                CredentialIdentity(),
+                (*evidence, "identity:stamp-absent"),
             )
         return ResolverObservation(ResolverState.RESOLVED, identity, tuple(evidence))
 

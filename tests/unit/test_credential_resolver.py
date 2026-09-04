@@ -116,3 +116,19 @@ def test_snapshot_rejects_hard_link_target(tmp_path: Path) -> None:
 
     with pytest.raises(OSError, match="hard-linked"):
         publish_snapshot(link, snapshot)
+
+
+def test_unstamped_payload_is_unusable_with_named_evidence() -> None:
+    payload = CredentialPayload.from_mapping({"claudeAiOauth": {"accessToken": "a"}})
+    resolver = CanonicalCredentialResolver(
+        _capability(),
+        {
+            "keychain": MemoryCredentialStore("keychain", payload),
+            "file": MemoryCredentialStore("file", payload),
+        },
+    )
+
+    observation = resolver.resolve()
+
+    assert observation.state is ResolverState.UNUSABLE
+    assert "identity:stamp-absent" in observation.evidence

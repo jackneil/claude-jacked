@@ -5,22 +5,35 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from jacked.credentials.models import ExecutableIdentity, SwitchContext, SwitchOutcome
+import pytest
+
+from jacked.credentials.file_store import FileCredentialStore
+from jacked.credentials.models import (
+    CredentialCapability,
+    ExecutableIdentity,
+    StoreDeclaration,
+    StoreRole,
+    SwitchContext,
+    SwitchOutcome,
+)
 from jacked.credentials.runtime import (
+    GLOBAL_FILE_LOCATOR,
+    INSPECTED_CLAUDE_BUILD,
+    KEYCHAIN_LOCATOR,
     SHIPPED_REGISTRY,
     activate_account,
+    build_stores,
     detect_claude_identity,
+    resolve_active_identity,
+    scoped_launch_needs_global_activation,
 )
-
-
-SHIPPED_DIGEST = "884baa38fe1a624be25c4a91568bf5a08b5cf4e7d7acf29b7760e3525d964898"
 
 
 def _identity(**changes) -> ExecutableIdentity:
     values = {
         "resolved_path": "/different/install/location/claude",
-        "sha256": SHIPPED_DIGEST,
-        "build_version": "2.1.259",
+        "sha256": "0" * 64,
+        "build_version": INSPECTED_CLAUDE_BUILD,
         "config_mode": "global",
         "platform_system": "darwin",
         "platform_machine": "arm64",
@@ -39,21 +52,183 @@ def _account() -> dict:
     }
 
 
-def test_shipped_registry_matches_exact_artifact_at_any_resolved_path() -> None:
-    resolution = SHIPPED_REGISTRY.resolve(_identity())
+def test_shipped_registry_resolves_any_build_hash_on_each_platform() -> None:
+    darwin = SHIPPED_REGISTRY.resolve(_identity(sha256="f" * 64))
+    assert darwin.can_mutate is True
+    assert darwin.capability.authority.locator == KEYCHAIN_LOCATOR
+    assert [m.locator for m in darwin.capability.required_mirrors] == [GLOBAL_FILE_LOCATOR]
 
-    assert resolution.can_mutate is True
-    assert resolution.capability.executable.resolved_path.endswith("/claude")
+    for system in ("linux", "windows"):
+        resolution = SHIPPED_REGISTRY.resolve(
+            _identity(platform_system=system, platform_machine="x86_64")
+        )
+        assert resolution.can_mutate is True
+        assert resolution.capability.authority.locator == GLOBAL_FILE_LOCATOR
+        assert resolution.capability.required_mirrors == ()
 
 
-def test_shipped_registry_rejects_unknown_digest_or_build() -> None:
-    assert SHIPPED_REGISTRY.resolve(_identity(sha256="0" * 64)).can_mutate is False
-    assert SHIPPED_REGISTRY.resolve(_identity(build_version="2.1.260")).can_mutate is False
+def test_shipped_registry_flags_uninspected_newer_builds_and_rejects_old_ones() -> None:
+    newer = SHIPPED_REGISTRY.resolve(_identity(build_version="2.1.999"))
+    assert newer.can_mutate is True
+    assert "build-newer-than-inspected" in newer.evidence
+
+    assert SHIPPED_REGISTRY.resolve(_identity(build_version="2.0.9")).can_mutate is False
+    assert SHIPPED_REGISTRY.resolve(_identity(config_mode="scoped")).can_mutate is False
+
+    floor = SHIPPED_REGISTRY.resolve(_identity(build_version="2.1.0"))
+    assert floor.can_mutate is True
+    assert "build-newer-than-inspected" not in floor.evidence
+
+    inspected = SHIPPED_REGISTRY.resolve(_identity(build_version=INSPECTED_CLAUDE_BUILD))
+    assert inspected.can_mutate is True
+    assert "build-newer-than-inspected" not in inspected.evidence
 
 
-def test_shipped_registry_rejects_wrong_platform_or_architecture() -> None:
-    assert SHIPPED_REGISTRY.resolve(_identity(platform_system="linux")).can_mutate is False
-    assert SHIPPED_REGISTRY.resolve(_identity(platform_machine="x86_64")).can_mutate is False
+def test_build_stores_keys_adapters_by_declaration_locator(tmp_path: Path) -> None:
+    linux = SHIPPED_REGISTRY.resolve(_identity(platform_system="linux")).capability
+    stores = build_stores(linux, tmp_path)
+    assert set(stores) == {GLOBAL_FILE_LOCATOR}
+    assert isinstance(stores[GLOBAL_FILE_LOCATOR], FileCredentialStore)
+    assert stores[GLOBAL_FILE_LOCATOR].path == tmp_path / ".claude" / ".credentials.json"
+
+    darwin = SHIPPED_REGISTRY.resolve(_identity()).capability
+    with mock.patch("jacked.credentials.runtime.MacOSCredentialStore") as keychain:
+        stores = build_stores(darwin, tmp_path)
+    assert set(stores) == {KEYCHAIN_LOCATOR, GLOBAL_FILE_LOCATOR}
+    assert stores[KEYCHAIN_LOCATOR] is keychain.return_value
+
+
+def test_build_stores_rejects_unknown_locator(tmp_path: Path) -> None:
+    capability = SHIPPED_REGISTRY.resolve(_identity(platform_system="linux")).capability
+    unknown = CredentialCapability(
+        **{
+            **capability.__dict__,
+            "authority": StoreDeclaration("x", "nowhere", StoreRole.AUTHORITY),
+        }
+    )
+    with pytest.raises(ValueError):
+        build_stores(unknown, tmp_path)
+
+
+def test_linux_activation_writes_file_authority_end_to_end(tmp_path: Path) -> None:
+    from jacked.credentials.repository import InMemoryCredentialSwitchRepository
+
+    home = tmp_path
+    (home / ".claude").mkdir()
+    with (
+        mock.patch(
+            "jacked.credentials.runtime.detect_claude_identity",
+            return_value=_identity(platform_system="linux", platform_machine="x86_64"),
+        ),
+        mock.patch("jacked.credentials.runtime.Path.home", return_value=home),
+        mock.patch(
+            "jacked.credentials.runtime.DatabaseCredentialSwitchRepository",
+            lambda _db: InMemoryCredentialSwitchRepository(),
+        ),
+    ):
+        result = activate_account(object(), _account(), SwitchContext.MANUAL, "op-linux")
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    written = home / ".claude" / ".credentials.json"
+    assert written.exists()
+    assert (written.stat().st_mode & 0o777) == 0o600
+    assert '"_jackedAccountId":7' in written.read_text(encoding="utf-8").replace(" ", "")
+
+
+def test_resolve_active_identity_on_linux_reads_credential_file(tmp_path: Path) -> None:
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / ".credentials.json").write_text(
+        '{"_jackedAccountId": 4, "claudeAiOauth": {"accessToken": "a"}}', encoding="utf-8"
+    )
+    with (
+        mock.patch(
+            "jacked.credentials.runtime.detect_claude_identity",
+            return_value=_identity(platform_system="linux", platform_machine="x86_64"),
+        ),
+        mock.patch("jacked.credentials.runtime.Path.home", return_value=home),
+    ):
+        observation = resolve_active_identity()
+
+    assert observation.state.value == "resolved"
+    assert observation.identity.account_id == 4
+    assert f"build:{INSPECTED_CLAUDE_BUILD}" in observation.evidence
+
+
+def test_unstamped_credential_file_is_unusable_with_named_evidence(tmp_path: Path) -> None:
+    """A first-run Linux install has a Claude-written file with no jacked stamp."""
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}}', encoding="utf-8"
+    )
+    with (
+        mock.patch(
+            "jacked.credentials.runtime.detect_claude_identity",
+            return_value=_identity(platform_system="linux", platform_machine="x86_64"),
+        ),
+        mock.patch("jacked.credentials.runtime.Path.home", return_value=home),
+    ):
+        observation = resolve_active_identity()
+
+    assert observation.state.value == "unusable"
+    assert "identity:stamp-absent" in observation.evidence
+
+
+def test_scoped_launch_needs_global_activation_only_for_keychain_authority() -> None:
+    with mock.patch(
+        "jacked.credentials.runtime.detect_claude_identity",
+        return_value=_identity(platform_system="linux", platform_machine="x86_64"),
+    ):
+        assert scoped_launch_needs_global_activation() is False
+    with mock.patch(
+        "jacked.credentials.runtime.detect_claude_identity", return_value=_identity()
+    ):
+        assert scoped_launch_needs_global_activation() is True
+    with mock.patch(
+        "jacked.credentials.runtime.detect_claude_identity",
+        side_effect=OSError("no claude"),
+    ):
+        assert scoped_launch_needs_global_activation() is True  # fail closed
+
+
+def test_detection_caches_identity_until_the_binary_changes(tmp_path: Path) -> None:
+    executable = tmp_path / "claude"
+    executable.write_bytes(b"build-one")
+    executable.chmod(0o755)
+    completed = SimpleNamespace(returncode=0, stdout="2.1.260 (Claude Code)\n")
+    run = mock.MagicMock(return_value=completed)
+
+    with (
+        mock.patch("jacked.credentials.runtime.find_bin", return_value=str(executable)),
+        mock.patch("jacked.credentials.runtime.subprocess.run", run),
+    ):
+        first = detect_claude_identity(tmp_path)
+        second = detect_claude_identity(tmp_path)
+        executable.write_bytes(b"build-two")  # same size, new mtime
+        os.utime(executable, ns=(1, 1))
+        third = detect_claude_identity(tmp_path)
+
+    assert first == second
+    assert third.sha256 != first.sha256
+    assert run.call_count == 2
+
+
+def test_detection_turns_version_probe_timeout_into_oserror(tmp_path: Path) -> None:
+    import subprocess
+
+    executable = tmp_path / "claude"
+    executable.write_bytes(b"x")
+    executable.chmod(0o755)
+    with (
+        mock.patch("jacked.credentials.runtime.find_bin", return_value=str(executable)),
+        mock.patch(
+            "jacked.credentials.runtime.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["claude"], 5),
+        ),
+        pytest.raises(OSError),
+    ):
+        detect_claude_identity(tmp_path)
 
 
 def test_detection_uses_known_install_locations_when_path_is_sanitized(
@@ -78,7 +253,7 @@ def test_detection_uses_known_install_locations_when_path_is_sanitized(
 def test_activation_maps_unknown_build_to_unsupported_without_mutation() -> None:
     with mock.patch(
         "jacked.credentials.runtime.detect_claude_identity",
-        return_value=_identity(sha256="0" * 64),
+        return_value=_identity(build_version="2.0.0"),
     ):
         result = activate_account(
             object(), _account(), SwitchContext.MANUAL, "operation-unknown"
@@ -87,22 +262,6 @@ def test_activation_maps_unknown_build_to_unsupported_without_mutation() -> None
     assert result.outcome is SwitchOutcome.UNSUPPORTED
     assert result.committed_authority.account_id is None
     assert result.storage.state == "unchanged"
-
-
-def test_activation_fails_closed_when_platform_adapter_is_unavailable() -> None:
-    with (
-        mock.patch(
-            "jacked.credentials.runtime.detect_claude_identity",
-            return_value=_identity(),
-        ),
-        mock.patch("jacked.credentials.runtime.sys.platform", "linux"),
-    ):
-        result = activate_account(
-            object(), _account(), SwitchContext.MANUAL, "operation-linux"
-        )
-
-    assert result.outcome is SwitchOutcome.UNSUPPORTED
-    assert "platform adapter" in result.message
 
 
 def test_active_identity_callers_do_not_reintroduce_file_precedence() -> None:
