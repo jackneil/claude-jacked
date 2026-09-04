@@ -40,7 +40,7 @@ from rich.console import Console
 from starlette.testclient import TestClient
 
 import jacked.cli as cli
-from jacked import guardrails, statusline, statusline_setup
+from jacked import guardrails, statusline, statusline_account, statusline_setup
 from jacked.api.routes import features
 from jacked.api.routes.features import router
 from jacked.cli import main
@@ -148,12 +148,15 @@ def _write_account(home_dir, **account):
                 "fresh_until": NOW + 3600,
                 "scope": account.get("scope", "global"),
                 "state": account.get("state", "resolved"),
-                "evidence": [account.get("evidence", "store_consensus")],
+                "evidence": account.get("evidence", ["store_consensus"]),
                 "credential_revision": account.get("credentialRevision", "rev-1"),
                 "desired": identity,
-                "observed": identity
-                if account.get("state", "resolved") == "resolved"
-                else None,
+                "observed": account.get(
+                    "observed",
+                    identity
+                    if account.get("state", "resolved") == "resolved"
+                    else None,
+                ),
             }
         ),
         encoding="utf-8",
@@ -449,6 +452,40 @@ def test_unresolved_snapshot_renders_desired_and_runtime_unknown(home, state, re
     )
 
 
+def test_desired_default_conflict_renders_observed_and_desired(home):
+    observed = {"account_id": 4, "email": "runtime@co.com", "organization_id": "org-4"}
+    _write_account(
+        home,
+        emailAddress="target@co.com",
+        state="conflict",
+        observed=observed,
+        evidence=["authority:macos-keychain:ok", "desired-default:conflict"],
+    )
+
+    assert _render({}, home) == f"runtime@co.com {MIDDOT} desired target@co.com"
+
+    facts = statusline_account.account_facts(str(home), NOW)
+    assert facts["email"] == "runtime@co.com"
+    assert facts["org_uuid"] == "org-4"
+    assert facts["state"] == "credential conflict"
+
+
+def test_organization_conflict_keeps_runtime_unknown_rendering(home):
+    observed = {"account_id": 4, "email": "target@co.com", "organization_id": "org-db"}
+    _write_account(
+        home,
+        emailAddress="target@co.com",
+        state="conflict",
+        observed=observed,
+        evidence=["account-metadata:organization-conflict"],
+    )
+
+    assert _render({}, home) == (
+        f"desired target@co.com {MIDDOT} runtime unknown (credential conflict)"
+    )
+    assert statusline_account.account_facts(str(home), NOW)["org_uuid"] == ""
+
+
 def test_expired_snapshot_renders_desired_and_stale(home):
     path = _write_account(home, emailAddress="target@co.com")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -523,7 +560,7 @@ def test_scoped_snapshot_requires_exact_certified_launch_binding(
         emailAddress="scoped@co.com",
         scope="scoped",
         credentialRevision="revision-1",
-        evidence="launch_binding:nonce-1",
+        evidence=["launch_binding:nonce-1"],
     )
     path.replace(scoped / path.name)
 
@@ -533,9 +570,9 @@ def test_scoped_snapshot_requires_exact_certified_launch_binding(
 @pytest.mark.parametrize(
     "env_revision,nonce,evidence",
     [
-        ("wrong-revision", "nonce-1", "launch_binding:nonce-1"),
-        ("revision-1", "wrong-nonce", "launch_binding:nonce-1"),
-        ("revision-1", "nonce-1", "launch_binding"),
+        ("wrong-revision", "nonce-1", ["launch_binding:nonce-1"]),
+        ("revision-1", "wrong-nonce", ["launch_binding:nonce-1"]),
+        ("revision-1", "nonce-1", ["launch_binding"]),
     ],
 )
 def test_scoped_snapshot_rejects_mismatched_revision_or_nonce(

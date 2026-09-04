@@ -41,6 +41,32 @@ def _scoped_launch_certified(snapshot: dict) -> bool:
     return isinstance(evidence, list) and f"launch_binding:{launch_nonce}" in evidence
 
 
+def _desired_default_conflict(snapshot: dict, observed: dict | None) -> bool:
+    """True when the stores agree on an identity that is not the desired default.
+
+    An organization conflict also reports ``conflict`` but its observed
+    identity is known to be wrong, so it must keep the unknown rendering.
+    """
+    evidence = snapshot.get("evidence")
+    evidence = evidence if isinstance(evidence, list) else []
+    return (
+        snapshot.get("state") == "conflict"
+        and observed is not None
+        and "desired-default:conflict" in evidence
+        and "account-metadata:organization-conflict" not in evidence
+    )
+
+
+def _observed_with_desired(observed: dict, desired_label: str) -> dict:
+    """Facts naming what the runtime will actually use; the conflict is not hidden."""
+    return {
+        "segment": f"{observed['email']} {MIDDOT} desired {desired_label}",
+        "email": observed["email"],
+        "org_uuid": observed["organization_id"],
+        "state": "credential conflict",
+    }
+
+
 def account_facts(home: str, now: float, *, json_load=json.load) -> dict:
     snapshot = read_resolver_snapshot(snapshot_path(home), json_load=json_load)
     if snapshot is None:
@@ -76,6 +102,8 @@ def account_facts(home: str, now: float, *, json_load=json.load) -> dict:
         )
         return facts
     desired_label = desired["email"] if desired is not None else "account"
+    if valid_clock and not scoped_unverified and _desired_default_conflict(snapshot, observed):
+        return {**facts, **_observed_with_desired(observed, desired_label)}
     if scoped_unverified:
         reason = "scoped unverified"
     elif not valid_clock or state == "stale":
