@@ -144,6 +144,7 @@ class CapabilityResolution:
     capability: CredentialCapability
     can_mutate: bool
     reason: str
+    evidence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
