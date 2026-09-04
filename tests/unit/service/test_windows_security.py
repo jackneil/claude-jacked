@@ -159,7 +159,7 @@ def test_private_directory_rejects_junction(tmp_path):
     )
     if created.returncode != 0:
         pytest.skip(created.stderr or created.stdout)
-    with pytest.raises(ValueError, match="unsafe Windows ownership or type"):
+    with pytest.raises(ValueError, match="reparse ancestor"):
         ensure_private_windows_directory(junction)
 
 
