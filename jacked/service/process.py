@@ -216,47 +216,64 @@ def remove_pid(pid_file: Path, *, expected_pid: int | None = None) -> bool:
     return True
 
 
-def is_process_alive(pid: int) -> bool:
-    """Cross-platform check if a PID is running.
+def _windows_process_liveness(pid: int) -> bool | None:
+    """Probe a Windows PID without generating a console control event."""
+    import ctypes
+    from ctypes import wintypes
 
-    POSIX: `os.kill(pid, 0)` probes process existence.
-    Windows: `os.kill(pid, 0)` is not a valid probe — use the Win32 API
-    via ctypes. WaitForSingleObject with 0 timeout avoids the
-    STILL_ACTIVE==259 false-positive that bites GetExitCodeProcess.
-    """
+    SYNCHRONIZE = 0x00100000
+    ERROR_INVALID_PARAMETER = 87
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+
+    kernel32 = ctypes.windll.kernel32
+    # Explicit argtypes/restype — default int marshalling truncates
+    # 64-bit HANDLE values and yields false results.
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetLastError.argtypes = []
+    kernel32.GetLastError.restype = wintypes.DWORD
+
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if not handle:
+        error = kernel32.GetLastError()
+        return False if error == ERROR_INVALID_PARAMETER else None
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == WAIT_TIMEOUT:
+            return True
+        if result == WAIT_OBJECT_0:
+            return False
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def process_liveness(pid: int) -> bool | None:
+    """Return True for alive, False for dead, and None when indeterminate."""
     if pid <= 0:
         return False
-
     if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        SYNCHRONIZE = 0x00100000
-        WAIT_TIMEOUT = 0x00000102
-
-        kernel32 = ctypes.windll.kernel32
-        # Explicit argtypes/restype — default int marshalling truncates
-        # 64-bit HANDLE values and yields false results.
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        kernel32.WaitForSingleObject.restype = wintypes.DWORD
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-        if not handle:
-            return False
-        try:
-            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
-        finally:
-            kernel32.CloseHandle(handle)
+        return _windows_process_liveness(pid)
 
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, ProcessLookupError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def is_process_alive(pid: int) -> bool:
+    """Return whether a PID is confirmed alive; unknown remains non-authority."""
+    return process_liveness(pid) is True
 
 
 def is_port_available(host: str, port: int) -> bool:

@@ -89,6 +89,10 @@ _ICON_COLORS = {
     "stopped": (130, 130, 130, 255),
 }
 
+# If Win32 refuses to unregister a console callback, Windows still owns its
+# raw address. Root it for the rest of the process so GC can never free it.
+_FAILED_WIN_CTRL_HANDLERS: list[object] = []
+
 
 def check_tray_deps() -> None:
     """Raise with install instructions if tray deps missing."""
@@ -278,6 +282,7 @@ class ServiceRunner:
         self._server_ready = False
         self._service_state = "starting"
         self._lifecycle_failure: str | None = None
+        self._win_ctrl_handler = None
 
     @staticmethod
     def _resolve_active_legacy_service_pid() -> int | None:
@@ -773,6 +778,8 @@ class ServiceRunner:
         """
         if sys.platform != "win32":
             return
+        if self._win_ctrl_handler is not None:
+            return
         try:
             import ctypes
             from ctypes import wintypes
@@ -792,14 +799,39 @@ class ServiceRunner:
                     pass
                 return True  # we handled it — don't chain to default handler
 
-            # Keep a strong reference so the callback isn't GC'd.
-            self._win_ctrl_handler = HandlerRoutine(_handler)
+            callback = HandlerRoutine(_handler)
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleCtrlHandler.argtypes = [HandlerRoutine, wintypes.BOOL]
             kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
-            kernel32.SetConsoleCtrlHandler(self._win_ctrl_handler, True)
+            if not kernel32.SetConsoleCtrlHandler(callback, True):
+                logger.error("Could not install Windows console Ctrl handler")
+                return
+            # Keep a strong reference for exactly as long as Windows retains it.
+            self._win_ctrl_handler = callback
         except Exception:
             logger.exception("Could not install Windows console Ctrl handler")
+
+    def _uninstall_windows_console_handler(self) -> None:
+        """Unregister the Win32 callback before releasing its ctypes object."""
+        handler = self._win_ctrl_handler
+        if sys.platform != "win32" or handler is None:
+            return
+        try:
+            import ctypes
+
+            if not ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, False):
+                if not any(root is handler for root in _FAILED_WIN_CTRL_HANDLERS):
+                    _FAILED_WIN_CTRL_HANDLERS.append(handler)
+                logger.error("Could not uninstall Windows console Ctrl handler")
+                return
+            _FAILED_WIN_CTRL_HANDLERS[:] = [
+                root for root in _FAILED_WIN_CTRL_HANDLERS if root is not handler
+            ]
+            self._win_ctrl_handler = None
+        except Exception:
+            if not any(root is handler for root in _FAILED_WIN_CTRL_HANDLERS):
+                _FAILED_WIN_CTRL_HANDLERS.append(handler)
+            logger.exception("Could not uninstall Windows console Ctrl handler")
 
     def _on_stop(self):
         """Full stop — called from menu or atexit, not from signal handler."""
@@ -1345,6 +1377,7 @@ class ServiceRunner:
             finally:
                 set_restart_handler(None)
         finally:
+            self._uninstall_windows_console_handler()
             if self._control_server is not None:
                 self._control_server.close()
                 self._control_server = None

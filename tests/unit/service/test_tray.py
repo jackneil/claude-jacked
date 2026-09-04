@@ -1118,10 +1118,53 @@ class TestWindowsConsoleHandler:
             pytest.skip("ctypes.windll unavailable on this platform")
 
         runner = ServiceRunner()
-        with patch.object(_sys, "platform", "win32"):
-            runner._install_windows_console_handler()
-        # Callback must be retained (otherwise GC would invalidate the handler).
-        assert getattr(runner, "_win_ctrl_handler", None) is not None
+        try:
+            with patch.object(_sys, "platform", "win32"):
+                runner._install_windows_console_handler()
+            # Callback must be retained while Windows has it registered.
+            assert runner._win_ctrl_handler is not None
+        finally:
+            runner._uninstall_windows_console_handler()
+        assert runner._win_ctrl_handler is None
+
+    @pytest.mark.parametrize("failure", [False, OSError("denied")])
+    def test_failed_uninstall_roots_callback_for_process_lifetime(
+        self, monkeypatch, failure
+    ):
+        _skip_if_no_tray()
+        import ctypes
+        import gc
+        import sys as _sys
+        import weakref
+        from types import SimpleNamespace
+        from jacked.service import tray as tray_mod
+
+        def callback():
+            return None
+
+        callback_ref = weakref.ref(callback)
+        runner = tray_mod.ServiceRunner()
+        runner._win_ctrl_handler = callback
+        kernel32 = MagicMock()
+        if isinstance(failure, Exception):
+            kernel32.SetConsoleCtrlHandler.side_effect = failure
+        else:
+            kernel32.SetConsoleCtrlHandler.return_value = failure
+        monkeypatch.setattr(
+            ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False
+        )
+        tray_mod._FAILED_WIN_CTRL_HANDLERS.clear()
+        try:
+            with patch.object(_sys, "platform", "win32"):
+                runner._uninstall_windows_console_handler()
+
+            kernel32.SetConsoleCtrlHandler.assert_called_once_with(callback, False)
+            del callback
+            del runner
+            gc.collect()
+            assert callback_ref() is tray_mod._FAILED_WIN_CTRL_HANDLERS[0]
+        finally:
+            tray_mod._FAILED_WIN_CTRL_HANDLERS.clear()
 
 
 class TestVersionCheckThread:
@@ -1294,6 +1337,12 @@ class TestRestartHandlerRegistration:
 
         restart_mod.set_restart_handler(None)
         runner = ServiceRunner(host="127.0.0.1", port=8321)
+        uninstall_console_handler = MagicMock()
+        monkeypatch.setattr(
+            runner,
+            "_uninstall_windows_console_handler",
+            uninstall_console_handler,
+        )
 
         captured = {}
 
@@ -1342,6 +1391,7 @@ class TestRestartHandlerRegistration:
         assert captured.get("during") != runner._on_restart
         # Unregistered on exit (run()'s finally).
         assert restart_mod.get_restart_handler() is None
+        uninstall_console_handler.assert_called_once_with()
         ownership.close.assert_called_once()
 
 

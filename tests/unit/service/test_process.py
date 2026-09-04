@@ -5,7 +5,8 @@ import signal
 import subprocess
 import sys
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -181,6 +182,31 @@ class TestIsProcessAlive:
         finally:
             p.terminate()
             p.wait(timeout=5)
+
+    def test_indeterminate_probe_is_not_reported_alive(self):
+        from jacked.service import process
+
+        with patch.object(process, "process_liveness", return_value=None):
+            assert process.is_process_alive(12345) is False
+
+    def test_windows_access_denied_probe_is_indeterminate(self, monkeypatch):
+        import ctypes
+        from jacked.service.process import _windows_process_liveness
+
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 0
+        kernel32.GetLastError.return_value = 5
+        monkeypatch.setattr(
+            ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False
+        )
+
+        assert _windows_process_liveness(12345) is None
+
+    def test_posix_permission_error_means_process_exists(self):
+        from jacked.service.process import process_liveness
+
+        with patch("os.kill", side_effect=PermissionError):
+            assert process_liveness(12345) is True
 
 
 class TestCheckPort:

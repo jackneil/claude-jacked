@@ -8,6 +8,7 @@ per-account CODEX_HOME slot/home + launch env.
 
 import base64
 import json
+import os
 
 import pytest
 
@@ -81,6 +82,40 @@ def test_seed_codex_slot_no_root_returns_false(tmp_path):
     base = tmp_path / ".codex"
     base.mkdir()
     assert sw.seed_codex_slot(7, base) is False
+
+
+def test_swap_lock_uses_non_signalling_process_probe(tmp_path, monkeypatch):
+    base = tmp_path / ".codex"
+    lock_dir = base / ".jacked-codex-swap.lock"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "pid").write_text(str(os.getpid()))
+    observed = []
+    monkeypatch.setattr(sw, "process_liveness", lambda pid: observed.append(pid) or True)
+    monkeypatch.setattr(sw.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        sw.os,
+        "kill",
+        lambda *_args: pytest.fail("lock liveness checks must never signal a process"),
+    )
+
+    with sw._codex_swap_lock(base, retries=1) as acquired:
+        assert acquired is False
+
+    assert observed == [os.getpid()]
+
+
+def test_swap_lock_preserves_owner_when_liveness_is_unknown(tmp_path, monkeypatch):
+    base = tmp_path / ".codex"
+    lock_dir = base / ".jacked-codex-swap.lock"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "pid").write_text("4242")
+    monkeypatch.setattr(sw, "process_liveness", lambda _pid: None)
+    monkeypatch.setattr(sw.time, "sleep", lambda _delay: None)
+
+    with sw._codex_swap_lock(base, retries=1) as acquired:
+        assert acquired is False
+
+    assert lock_dir.exists()
 
 
 # --------------------------------------------------------------------------
