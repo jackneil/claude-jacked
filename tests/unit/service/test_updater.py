@@ -1,9 +1,23 @@
 """Tests for the auto-updater."""
 
+import itertools
 import os
 import subprocess
 import sys
 from unittest.mock import patch, MagicMock
+
+
+def _ok(stdout: str = "") -> MagicMock:
+    """Successful subprocess result with real text streams.
+
+    The preflight step concatenates `.stdout` and `.stderr`, so a bare
+    MagicMock would put a repr into the update log.
+    """
+    return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+
+def _fail(returncode: int = 1, stdout: str = "", stderr: str = "") -> MagicMock:
+    return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 class TestWaitForExit:
@@ -23,7 +37,7 @@ class TestRunUpdate:
            return_value=(False, "unavailable", "test: manual spawn"))
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
-    @patch("jacked.service.updater.is_port_available", return_value=True)
+    @patch("jacked.service.updater.is_port_available")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
@@ -31,7 +45,8 @@ class TestRunUpdate:
         self, mock_popen, mock_run, mock_find, mock_port_avail,
         mock_method, mock_gate, mock_ensure,
     ):
-        """Verify: wait_for_exit -> uv install -> jacked install -> jacked service start.
+        """Verify: wait_for_exit -> uv install -> preflight -> jacked install
+        -> jacked service start.
 
         Forces ensure_native_lifecycle to 'unavailable' so the updater falls
         through to the manual Popen(jacked service start) path exercised here."""
@@ -41,20 +56,28 @@ class TestRunUpdate:
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
+        # Port-wait: free. Verification: False = the port is bound, so the new
+        # service came up and no rollback is owed.
+        mock_port_avail.side_effect = [True, True] + [False] * 100
 
         with patch.object(updater, "wait_for_exit", return_value=True) as mock_wait:
             updater.run_update(parent_pid=12345, extras="tray")
 
         assert mock_wait.called
-        assert mock_run.call_count == 2
+        # uv install -> service preflight -> jacked install --force.
+        assert mock_run.call_count == 3
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
         assert "tool" in uv_args and "install" in uv_args
         assert "claude-jacked[tray]" in uv_args
         assert "--force" in uv_args
 
-        jacked_install_args = mock_run.call_args_list[1][0][0]
+        assert mock_run.call_args_list[1][0][0] == [
+            "/fake/jacked", "service", "preflight"
+        ]
+
+        jacked_install_args = mock_run.call_args_list[2][0][0]
         assert "/fake/jacked" in jacked_install_args
         assert "install" in jacked_install_args
         assert "--force" in jacked_install_args
@@ -121,8 +144,8 @@ class TestRunUpdate:
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
-        # First subprocess.run (uv tool install) succeeds; second (jacked install) fails.
-        mock_run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=1)]
+        # uv tool install succeeds, preflight passes, `jacked install` fails.
+        mock_run.side_effect = [_ok(), _ok("[OK] Service contract OK"), _fail(1)]
 
         # Track whether native_restart was called from the finally-guard.
         with patch("jacked.service.platform.native_restart", return_value=(True, "test-kickstart")) as mock_restart, \
@@ -196,14 +219,12 @@ class TestPortWaitBeforeServiceStart:
         from jacked.service import updater
 
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
 
-        # Return False 2 times (port busy), then always True.
-        call_counter = {"n": 0}
-        def port_result(*_args, **_kw):
-            call_counter["n"] += 1
-            return call_counter["n"] > 2
-        mock_port_avail.side_effect = port_result
+        # Port-wait: busy twice, then free (loop check + post-loop confirm).
+        # Verification: False = the port is bound, so the new service came up
+        # and no rollback is owed.
+        mock_port_avail.side_effect = [False, False, True, True] + [False] * 100
 
         with patch.object(updater, "wait_for_exit", return_value=True):
             updater.run_update(parent_pid=12345, extras="tray")
@@ -306,12 +327,16 @@ class TestNewServiceVerification:
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.time.sleep", lambda _s: None)
+    # Fake clock: sleep is a no-op, so the real 20s verify deadline would
+    # busy-spin for 20 real seconds on each of the two start attempts.
+    @patch("jacked.service.updater.time.monotonic",
+           side_effect=itertools.count(0.0, 5.0))
     @patch("jacked.service.updater.is_port_available")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
     def test_recovery_file_written_when_new_service_never_binds(
-        self, mock_popen, mock_run, mock_find, mock_port_avail,
+        self, mock_popen, mock_run, mock_find, mock_port_avail, mock_clock,
         mock_gate, mock_method, mock_ensure,
         tmp_path, monkeypatch,
     ):
@@ -319,16 +344,193 @@ class TestNewServiceVerification:
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
         # Port-wait: True (free). Then verification phase: always True (never bound).
         mock_port_avail.return_value = True
 
         with patch.object(updater, "wait_for_exit", return_value=True):
             updater.run_update(parent_pid=12345, extras="tray")
 
-        mock_popen.assert_called_once()
+        # A new build that never binds is rolled back, and the restored build
+        # is started through the same start-and-verify tail: two spawns.
+        assert mock_popen.call_count == 2
         assert (tmp_path / "recovery.txt").exists()
-        assert "never came up" in (tmp_path / "recovery.txt").read_text()
+        body = (tmp_path / "recovery.txt").read_text()
+        assert "never became ready" in body
+        assert "rolled back" in body
+
+
+class TestUpdaterRollback:
+    """The tray update is a transaction: a build that cannot run is undone.
+
+    Every test patches subprocess.run, subprocess.Popen and
+    ensure_native_lifecycle, so no real install, service or supervisor is
+    touched.
+    """
+
+    RB_ARGV_TAIL = ["tool", "install", "claude-jacked[tray]==0.95.0",
+                    "--force", "--refresh"]
+
+    @staticmethod
+    def _run_update(monkeypatch, tmp_path, run_results, port_results):
+        """Drive run_update with scripted subprocess and port outcomes."""
+        from jacked.service import updater, update_status as us_mod
+
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+
+        with (
+            patch("jacked.service.platform.ensure_native_lifecycle",
+                  return_value=(False, "unavailable", "test: manual spawn")),
+            patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.service.updater.time.sleep", lambda _s: None),
+            # A fake clock: sleep is a no-op, so a real 20s verify deadline
+            # would busy-spin for 20 real seconds per attempt.
+            patch("jacked.service.updater.time.monotonic",
+                  side_effect=itertools.count(0.0, 5.0)),
+            patch("jacked.service.updater.is_port_available") as port,
+            patch("jacked.service.updater.find_bin") as find,
+            patch("subprocess.run") as run,
+            patch("subprocess.Popen") as popen,
+            patch("jacked.__version__", "0.95.0"),
+            patch.object(updater, "wait_for_exit", return_value=True),
+        ):
+            find.side_effect = lambda name: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked",
+            }.get(name)
+            run.side_effect = list(run_results)
+            if isinstance(port_results, bool):
+                # The verify loop spins with sleep patched out, so a finite
+                # side_effect list would run dry mid-poll.
+                port.return_value = port_results
+            else:
+                port.side_effect = list(port_results)
+            updater.run_update(
+                parent_pid=12345, extras="tray", target_version="0.100.0"
+            )
+        status = us_mod.read_status(tmp_path / "status.json")
+        return run, popen, status, (tmp_path / "recovery.txt")
+
+    def test_refused_preflight_rolls_back_and_restarts_the_old_build(
+        self, tmp_path, monkeypatch
+    ):
+        run, popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),                                        # uv install
+                _fail(1, stderr="[FAIL] ValueError: runtime_path untrusted"),
+                _ok(),                                        # rollback install
+                _ok(),                                        # jacked install --force
+            ],
+            # Port free for the wait, then bound so the restored build verifies.
+            port_results=[True, True] + [False] * 100,
+        )
+
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert argvs[1] == ["/fake/jacked", "service", "preflight"]
+        assert argvs[2][1:] == self.RB_ARGV_TAIL
+        assert argvs[3] == ["/fake/jacked", "install", "--force"]
+        # The NEW build's settings migration never ran: the gate closed first.
+        assert argvs.count(["/fake/jacked", "install", "--force"]) == 1
+        # The restored build is started through the normal start+verify tail.
+        popen.assert_called_once()
+
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["preflight"] == "failed"
+        assert phases["rolling_back"] == "ok"
+        assert status["overall"] == "failed"
+        body = recovery.read_text(encoding="utf-8")
+        assert "0.100.0" in body and "0.95.0" in body
+
+    def test_a_service_that_never_binds_rolls_back(self, tmp_path, monkeypatch):
+        run, popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),                             # uv install
+                _ok("[OK] Service contract OK"),   # preflight
+                _ok(),                             # jacked install --force
+                _ok(),                             # rollback install
+                _ok(),                             # jacked install --force
+            ],
+            # Always available == the service never bound, both times round.
+            port_results=True,
+        )
+
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert argvs[3][1:] == self.RB_ARGV_TAIL
+        # Start attempted for the new build, then again for the restored one.
+        assert popen.call_count == 2
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["rolling_back"] == "ok"
+        body = recovery.read_text(encoding="utf-8")
+        assert "never became ready" in body
+        assert "rolled back to v0.95.0" in body
+
+    def test_rollback_runs_at_most_once_per_update(self, tmp_path, monkeypatch):
+        """The restored build's own verify must not trigger a second rollback.
+
+        Both attempts fail to bind here. Without the once-per-run guard the
+        updater would reinstall 0.95.0 twice and loop.
+        """
+        run, popen, status, _recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),                             # uv install
+                _ok("[OK] Service contract OK"),   # preflight
+                _ok(),                             # jacked install --force
+                _ok(),                             # rollback install
+                _ok(),                             # jacked install --force
+            ],
+            port_results=True,
+        )
+
+        rollback_calls = [
+            call[0][0] for call in run.call_args_list
+            if call[0][0][1:] == self.RB_ARGV_TAIL
+        ]
+        assert len(rollback_calls) == 1
+        assert popen.call_count == 2
+
+    def test_a_failed_rollback_command_is_reported_not_hidden(
+        self, tmp_path, monkeypatch
+    ):
+        run, _popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),                                  # uv install
+                _fail(1, stderr="[FAIL] ValueError: nope"),
+                _fail(2),                               # rollback install fails
+            ],
+            port_results=[True, True] + [False] * 100,
+        )
+
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["rolling_back"] == "failed"
+        assert status["overall"] == "failed"
+        body = recovery.read_text(encoding="utf-8")
+        assert "rollback did not complete" in body
+        # The manual recovery line names the exact version to reinstall.
+        assert "claude-jacked[tray]==0.95.0" in body
+
+    def test_a_healthy_update_never_records_a_rollback(self, tmp_path, monkeypatch):
+        run, popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),
+                _ok("[OK] Service contract OK"),
+                _ok(),
+            ],
+            port_results=[True, True] + [False] * 100,
+        )
+
+        assert status["overall"] == "succeeded"
+        assert "rolling_back" not in {p["name"] for p in status["phases"]}
+        assert not recovery.exists()
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert not [a for a in argvs if a[1:] == self.RB_ARGV_TAIL]
+        popen.assert_called_once()
 
 
 class TestSpawnDetached:
@@ -392,10 +594,11 @@ class TestJackedInstallFailure:
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
-        # uv install succeeds, jacked install fails
+        # uv install succeeds, preflight passes, jacked install fails
         mock_run.side_effect = [
-            MagicMock(returncode=0),
-            MagicMock(returncode=1),
+            _ok(),
+            _ok("[OK] Service contract OK"),
+            _fail(1),
         ]
 
         with patch.object(updater, "wait_for_exit", return_value=True):
@@ -554,6 +757,9 @@ class TestMainEntrypoint:
 
 
 class TestUpdaterWritesStatus:
+    # Hermetic pin: without this the start phase drives a REAL launchctl.
+    @patch("jacked.service.platform.ensure_native_lifecycle",
+           return_value=(False, "unavailable", "test: manual spawn"))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.is_port_available")
@@ -562,14 +768,14 @@ class TestUpdaterWritesStatus:
     @patch("subprocess.Popen")
     def test_writes_succeeded_status_with_all_phases(
         self, mock_popen, mock_run, mock_find, mock_port_avail, mock_gate, mock_method,
-        tmp_path, monkeypatch,
+        mock_ensure, tmp_path, monkeypatch,
     ):
         from jacked.service import updater, update_status as us_mod
         from jacked.service.update_phases import PHASE_NAMES
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
 
         # Port-wait phase: True (port is free, break loop) — may be called
         # twice (loop check + post-loop confirmation). Verify phase: False
@@ -584,7 +790,12 @@ class TestUpdaterWritesStatus:
         assert data["overall"] == "succeeded"
         assert data["to_version"] == "0.41.19"
         phase_names = [p["name"] for p in data["phases"]]
+        # `rolling_back` is an exceptional phase: a healthy update must never
+        # record it. Every other phase must be present and ok.
+        assert "rolling_back" not in phase_names
         for expected in PHASE_NAMES:
+            if expected == "rolling_back":
+                continue
             assert expected in phase_names, f"missing phase {expected}"
         for p in data["phases"]:
             assert p["status"] == "ok", f"phase {p['name']} ended with {p['status']}"
@@ -720,6 +931,8 @@ class TestWindowsBatchPhases:
                 "waiting_for_parent ok",
                 "installing_package in_progress",
                 "installing_package ok",
+                "preflight in_progress",
+                "preflight ok",
                 "migrating_settings in_progress",
                 "migrating_settings ok",
                 "waiting_port_free in_progress",
@@ -826,6 +1039,10 @@ class TestWindowsBatchPhases:
 
 
 class TestRunUpdateReusesTrayPreInit:
+    # Hermetic pin: without this the start phase drives a REAL launchctl on
+    # macOS, which the conftest tripwire refuses.
+    @patch("jacked.service.platform.ensure_native_lifecycle",
+           return_value=(False, "unavailable", "test: manual spawn"))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.is_port_available")
@@ -834,13 +1051,13 @@ class TestRunUpdateReusesTrayPreInit:
     @patch("subprocess.Popen")
     def test_reuses_tray_pre_init_and_completes(
         self, mock_popen, mock_run, mock_find, mock_port_avail,
-        mock_gate, mock_method, tmp_path, monkeypatch,
+        mock_gate, mock_method, mock_ensure, tmp_path, monkeypatch,
     ):
         from jacked.service import updater, update_status as us_mod
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
         mock_port_avail.side_effect = [True, True] + [False] * 100
 
         us_mod.init_status(
@@ -925,6 +1142,9 @@ class TestRunUpdateTerminalStatus:
         assert "jacked" in (data.get("error") or "").lower()
 
 
+    # Hermetic pin: without this the start phase drives a REAL launchctl.
+    @patch("jacked.service.platform.ensure_native_lifecycle",
+           return_value=(False, "unavailable", "test: manual spawn"))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.updater.is_port_available")
@@ -933,13 +1153,13 @@ class TestRunUpdateTerminalStatus:
     @patch("subprocess.Popen")
     def test_mark_succeeded_exception_degrades_to_failed(
         self, mock_popen, mock_run, mock_find, mock_port_avail,
-        mock_gate, mock_method, tmp_path, monkeypatch,
+        mock_gate, mock_method, mock_ensure, tmp_path, monkeypatch,
     ):
         from jacked.service import updater, update_status as us_mod
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
         monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
         mock_port_avail.side_effect = [True, True] + [False] * 100
 
         def boom(*_args, **_kw):

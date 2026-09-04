@@ -8,7 +8,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from jacked.api.credential_helpers import build_oauth_data
+from jacked.api.credential_helpers import build_oauth_data, update_claude_config_email
 from jacked.findbin import find_bin
 from jacked.web.credential_repository import DatabaseCredentialSwitchRepository
 
@@ -236,6 +236,7 @@ def _engine_for(
             repository=DatabaseCredentialSwitchRepository(db),
             authority=authority,
             mirrors=stores,
+            identity_publisher=claude_config_identity_publisher(home),
             writer_fence=WriterFence(StaticWriterInspector((), is_complete=False)),
             install_key=key_provider,
             machine_install_id=install_id,
@@ -249,6 +250,27 @@ def _engine_for(
             allow_missing_authority=NEWER_THAN_INSPECTED not in resolution.evidence,
         )
     )
+
+
+def claude_config_identity_publisher(home: Path):
+    """Return the publisher that mirrors a switch into ``<home>/.claude.json``.
+
+    Claude Code keeps its OAuth token in memory and re-reads the credential
+    store only when the ``oauthAccount`` identity in its config changes. Every
+    switch must therefore republish that identity, or running sessions keep
+    the previous account until they restart (regression fixed 2026-09-04).
+    """
+
+    def publish(request: SwitchRequest) -> None:
+        update_claude_config_email(
+            request.email,
+            request.display_name,
+            request.organization_id,
+            request.organization_name,
+            home=home,
+        )
+
+    return publish
 
 
 def activate_account(db, account: dict, context: SwitchContext, operation_id: str) -> SwitchResult:
@@ -275,6 +297,8 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
         payload=payload,
         context=context,
         interaction=InteractionMode.FOREGROUND,
+        display_name=account.get("display_name") or None,
+        organization_name=account.get("organization_name") or None,
     )
     return engine.activate(request)
 

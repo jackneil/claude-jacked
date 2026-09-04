@@ -79,6 +79,7 @@ def test_launcher_rejects_source_hash_mismatch(tmp_path):
         )
 
 
+@pytest.mark.real_process
 @pytest.mark.skipif(os.name != "posix", reason="POSIX launcher boundary")
 def test_launcher_refuses_retargeted_runtime_without_running_replacement(tmp_path):
     venv = tmp_path / "venv"

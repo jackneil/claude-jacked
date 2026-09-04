@@ -7,7 +7,7 @@ import hmac
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 from .canonical import CredentialPayload
 from .lease import ProcessSwitchLease, SwitchLease
@@ -57,6 +57,14 @@ class SwitchRequest:
     payload: CredentialPayload
     context: SwitchContext
     interaction: InteractionMode
+    # Non-secret identity mirrored into Claude's config after a successful
+    # authority write. Running Claude Code sessions reload credentials when
+    # this identity changes; a Keychain write alone is invisible to them.
+    display_name: str | None = None
+    organization_name: str | None = None
+
+
+IdentityPublisher = Callable[[SwitchRequest], None]
 
 
 @dataclass(frozen=True)
@@ -71,6 +79,10 @@ class TransactionDependencies:
     snapshot_sink: ResolverSnapshotSink
     switch_lease: SwitchLease = field(default_factory=ProcessSwitchLease)
     allow_missing_authority: bool = True
+    # Publishes the switched identity where running Claude Code sessions
+    # look for it (``oauthAccount`` in the config file). Optional so store-only
+    # engines (tests, recovery) stay independent of Claude's config layout.
+    identity_publisher: IdentityPublisher | None = None
 
 
 def _transcript(record: PendingSwitchRecord, *, state_role: str, digest: str) -> bytes:
@@ -197,14 +209,25 @@ def _result(
     observed: CredentialIdentity = CredentialIdentity(),
     is_committed: bool = False,
     message: str = "",
+    sessions_follow: bool | None = None,
 ) -> SwitchResult:
     observed = _enrich_identity(request, observed)
     storage_state = "committed" if is_committed else outcome.value
     session_state = SessionActivationState.UNCHANGED
     if is_committed:
-        session_state = SessionActivationState.PENDING_NEXT_ACTIVITY
+        session_state = (
+            SessionActivationState.RESTART_REQUIRED
+            if sessions_follow is False
+            else SessionActivationState.PENDING_NEXT_ACTIVITY
+        )
     elif outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED:
-        session_state = SessionActivationState.RESTART_REQUIRED
+        # The target is in every store. Running sessions follow it only when
+        # the identity mirror landed; otherwise they keep their cached token.
+        session_state = (
+            SessionActivationState.PENDING_NEXT_ACTIVITY
+            if sessions_follow
+            else SessionActivationState.RESTART_REQUIRED
+        )
     return SwitchResult(
         operation_id=request.operation_id,
         outcome=outcome,
@@ -312,18 +335,22 @@ class CredentialTransactionEngine:
             return self._record(
                 request, SwitchOutcome.INDETERMINATE, observed.identity
             )
+        identity_published, identity_message = self._publish_identity(request)
         result = self._record(
             request,
             SwitchOutcome.OBSERVED_TARGET_UNFENCED,
             observed.identity,
             "target observed; concurrent writers cannot be excluded"
-            + (f"; {mirror_message}" if mirror_message else ""),
+            + (f"; {mirror_message}" if mirror_message else "")
+            + (f"; {identity_message}" if identity_message else ""),
+            sessions_follow=identity_published,
         )
         self._publish_snapshot(
             request,
             observed.identity,
             ResolverState.RESOLVED,
-            ("authority:observed-target-unfenced",),
+            ("authority:observed-target-unfenced",)
+            + (("claude-config:identity:failed",) if identity_message else ()),
         )
         return result
 
@@ -577,6 +604,10 @@ class CredentialTransactionEngine:
         outcome, message = self._publish_mirrors(request)
         if outcome is SwitchOutcome.INDETERMINATE:
             return self._record(request, outcome, observed.payload.identity, message)
+        identity_published, identity_message = self._publish_identity(request)
+        if identity_message:
+            outcome = SwitchOutcome.COMMITTED_DEGRADED
+            message = f"{message}; {identity_message}" if message else identity_message
         final = FinalizeSwitchRecord(
             request.operation_id,
             request.account_id,
@@ -589,7 +620,8 @@ class CredentialTransactionEngine:
             request,
             observed.payload.identity,
             ResolverState.RESOLVED,
-            (f"authority:{self._deps.capability.authority.name}:readback",),
+            (f"authority:{self._deps.capability.authority.name}:readback",)
+            + (("claude-config:identity:failed",) if identity_message else ()),
         )
         return _result(
             request,
@@ -597,7 +629,30 @@ class CredentialTransactionEngine:
             observed=observed.payload.identity,
             is_committed=True,
             message=message,
+            sessions_follow=identity_published,
         )
+
+    def _publish_identity(self, request: SwitchRequest) -> tuple[bool, str]:
+        """Mirror the switched identity into Claude's config.
+
+        Returns ``(published, reason)``. ``published`` is True only when the
+        identity landed, which is what lets running sessions follow the
+        switch. The authority write has already landed, so a failure here
+        never changes which credentials are stored; it only means running
+        sessions keep their cached token until they restart or it expires.
+        """
+        publisher = self._deps.identity_publisher
+        if publisher is None:
+            return False, ""
+        try:
+            publisher(request)
+        except Exception as exc:  # noqa: BLE001 - config I/O must never undo a switch
+            logger.warning(
+                "Could not publish the switched identity to Claude's config: %s",
+                exc,
+            )
+            return False, f"claude config identity not updated ({type(exc).__name__})"
+        return True, ""
 
     def _publish_mirrors(self, request: SwitchRequest) -> tuple[SwitchOutcome, str]:
         required = {item.locator for item in self._deps.capability.required_mirrors}
@@ -668,6 +723,7 @@ class CredentialTransactionEngine:
         outcome: SwitchOutcome,
         observed: CredentialIdentity = CredentialIdentity(),
         message: str = "",
+        sessions_follow: bool | None = None,
     ) -> SwitchResult:
         self._deps.repository.record_outcome(
             OutcomeSwitchRecord(
@@ -680,4 +736,10 @@ class CredentialTransactionEngine:
                 self._deps.capability.mode,
             )
         )
-        return _result(request, outcome, observed=observed, message=message)
+        return _result(
+            request,
+            outcome,
+            observed=observed,
+            message=message,
+            sessions_follow=sessions_follow,
+        )

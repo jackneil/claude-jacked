@@ -540,10 +540,64 @@ class ServiceRunner:
         except OSError:
             logger.exception("Could not clear start-failure memory")
 
-    def _abort_unready_start(self) -> None:
-        """Stop before any tray UI exists when startup never became ready."""
+    def _record_start_failure(self, reason: str) -> int:
+        """Remember one failed start with its reason; never raise on IO.
+
+        The reason is what `jacked service status` reads back, so a refusal
+        that happens before any tray UI exists still names itself.
+        """
         import time
 
+        from jacked.service.start_failures import record_start_failure
+
+        try:
+            return record_start_failure(
+                self._start_failure_path(), time.time(), reason=reason
+            )
+        except OSError:
+            logger.exception("Could not record start failure")
+            return 1
+
+    def _give_up_if_limit_reached(self, failures: int) -> None:
+        """Exit cleanly once repeated starts fail, so no supervisor relaunches.
+
+        A clean exit stops every supervisor from relaunching. The log line is
+        the operator's signal; `jacked service restart` re-arms the breaker.
+        """
+        if failures < START_FAILURE_LIMIT:
+            return
+        logger.error(
+            "Service failed to start %d times in a row; giving up until "
+            "`jacked service restart` is run",
+            failures,
+        )
+        raise SystemExit(0)
+
+    def _abort_refused_contract(self, exc: BaseException) -> None:
+        """Stop when the runtime contract is refused before any UI exists.
+
+        `provision_service_contract` refuses an untrusted runtime path or an
+        unreadable service root. That refusal used to reach only the tray log,
+        so the breaker records the reason and `jacked service status` names it.
+        """
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.error("Service contract refused: %s", reason)
+        logger.debug("Service contract refusal detail", exc_info=exc)
+        self._service_state = "degraded"
+        self._lifecycle_failure = f"service contract refused: {reason}"
+        failures = self._record_start_failure(reason)
+        # An exact or supervised spawn carries the generation marker. Only that
+        # start is relaunched by a supervisor, so only it needs the give-up
+        # exit; a manual start must always report the reason to the operator.
+        if os.environ.get("JACKED_SERVICE_GENERATION"):
+            self._give_up_if_limit_reached(failures)
+        raise SystemExit(
+            f"Jacked service contract refused: {reason}. "
+            "Run `jacked service status` for details."
+        ) from exc
+
+    def _abort_unready_start(self) -> None:
+        """Stop before any tray UI exists when startup never became ready."""
         logger.error("Service did not become ready; aborting before UI startup")
         self._service_state = "degraded"
         self._lifecycle_failure = "initial service start did not become ready"
@@ -551,7 +605,6 @@ class ServiceRunner:
         if self._uvicorn_thread is not None:
             self._uvicorn_thread.join(timeout=5)
         from jacked.service.spec import SupervisorKind
-        from jacked.service.start_failures import record_start_failure
 
         if (
             self._service_spec is None
@@ -560,20 +613,8 @@ class ServiceRunner:
             raise SystemExit(
                 "Jacked did not become ready. Check ~/.claude/jacked-tray.log."
             )
-        try:
-            failures = record_start_failure(self._start_failure_path(), time.time())
-        except OSError:
-            logger.exception("Could not record start failure")
-            failures = 1
-        if failures >= START_FAILURE_LIMIT:
-            # A clean exit stops every supervisor from relaunching. The log
-            # line is the operator's signal; `jacked service restart` resets.
-            logger.error(
-                "Service failed to start %d times in a row; giving up until "
-                "`jacked service restart` is run",
-                failures,
-            )
-            raise SystemExit(0)
+        failures = self._record_start_failure("start did not become ready")
+        self._give_up_if_limit_reached(failures)
         # A non-zero exit is what makes launchd, systemd and Task Scheduler
         # retry; a clean exit would be treated as final.
         raise SystemExit(EX_TEMPFAIL)
@@ -1391,17 +1432,20 @@ class ServiceRunner:
             provision_service_contract,
         )
 
-        candidate, environment = provision_service_contract()
-        if os.environ.get("JACKED_SERVICE_GENERATION") == candidate.generation:
-            self._service_spec, self._service_environment = candidate, environment
-        else:
-            # A direct CLI/manual start has no exact supervisor generation
-            # marker and must never claim native-manager provenance.
-            from jacked.service.spec import SupervisorKind
+        try:
+            candidate, environment = provision_service_contract()
+            if os.environ.get("JACKED_SERVICE_GENERATION") == candidate.generation:
+                self._service_spec, self._service_environment = candidate, environment
+            else:
+                # A direct CLI/manual start has no exact supervisor generation
+                # marker and must never claim native-manager provenance.
+                from jacked.service.spec import SupervisorKind
 
-            self._service_spec, self._service_environment = provision_service_contract(
-                supervisor=SupervisorKind.MANUAL
-            )
+                self._service_spec, self._service_environment = (
+                    provision_service_contract(supervisor=SupervisorKind.MANUAL)
+                )
+        except (OSError, ValueError) as exc:
+            self._abort_refused_contract(exc)
         from jacked.service.instance import ServiceLeaseBusy, ServiceOwnershipInvalid
 
         try:

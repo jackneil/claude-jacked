@@ -8,6 +8,8 @@ import pytest
 
 from jacked.install_method import (
     detect_install_method,
+    rollback_command,
+    rollback_command_label,
     upgrade_command,
     upgrade_command_label,
 )
@@ -105,3 +107,94 @@ class TestUpgradeCommandLabel:
         with patch("jacked.install_method.detect_install_method", return_value="pip"):
             with pytest.raises(ValueError, match="pip auto-upgrade is not supported"):
                 upgrade_command_label(extras="tray")
+
+
+class TestRollbackCommand:
+    """A failed upgrade must be able to pin the exact build that was running."""
+
+    def test_uv_pins_the_exact_version(self):
+        with patch("jacked.install_method.detect_install_method", return_value="uv"):
+            cmd = rollback_command(extras="tray", version="0.95.0")
+        assert cmd[0] == "uv"
+        assert cmd[1:3] == ["tool", "install"]
+        assert "claude-jacked[tray]==0.95.0" in cmd
+        assert "--force" in cmd
+        # Same reason upgrade_command needs it: a cached index entry must not
+        # decide which artifact we pin back to.
+        assert "--refresh" in cmd
+
+    def test_pipx_pins_the_exact_version(self):
+        with patch("jacked.install_method.detect_install_method", return_value="pipx"):
+            cmd = rollback_command(extras="tray", version="0.95.0")
+        assert cmd[0] == "pipx"
+        assert "install" in cmd
+        assert "claude-jacked[tray]==0.95.0" in cmd
+        assert "--force" in cmd
+
+    def test_pip_method_raises_valueerror(self):
+        with patch("jacked.install_method.detect_install_method", return_value="pip"):
+            with pytest.raises(ValueError, match="pip rollback is not supported"):
+                rollback_command(extras="tray", version="0.95.0")
+
+    def test_editable_method_raises_valueerror(self):
+        with patch("jacked.install_method.detect_install_method", return_value="editable"):
+            with pytest.raises(ValueError, match="pip rollback is not supported"):
+                rollback_command(extras="tray", version="0.95.0")
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "",
+            "0.95.0 && rm -rf /",
+            '0.95.0"',
+            "0.95.0; whoami",
+            "$(id)",
+            "%PATH%",
+            "../0.95.0",
+            "0.95.0\n1.0.0",
+        ],
+    )
+    def test_refuses_a_version_that_is_not_a_version(self, version):
+        """The version reaches us from a running build and lands in a batch
+        line, so anything but a PEP 440 release is refused outright."""
+        with patch("jacked.install_method.detect_install_method", return_value="uv"):
+            with pytest.raises(ValueError, match="refusing to build a rollback"):
+                rollback_command(extras="tray", version=version)
+
+    def test_refuses_a_bad_version_before_detecting_the_method(self):
+        """Validation runs first, so even a pip install reports the real fault."""
+        with patch("jacked.install_method.detect_install_method", return_value="pip"):
+            with pytest.raises(ValueError, match="refusing to build a rollback"):
+                rollback_command(extras="tray", version="not a version")
+
+    @pytest.mark.parametrize(
+        "version", ["1.2.3", "0.100.0", "1.0.0rc1", "1.0.0.post1", "1!2.0.0", "1.0.0+local"]
+    )
+    def test_accepts_real_pep440_versions(self, version):
+        with patch("jacked.install_method.detect_install_method", return_value="uv"):
+            cmd = rollback_command(extras="tray", version=version)
+        assert f"claude-jacked[tray]=={version}" in cmd
+
+
+class TestRollbackCommandLabel:
+    def test_uv_label_is_readable(self):
+        with patch("jacked.install_method.detect_install_method", return_value="uv"):
+            label = rollback_command_label(extras="tray", version="0.95.0")
+        assert (
+            label == 'uv tool install "claude-jacked[tray]==0.95.0" --force --refresh'
+        )
+
+    def test_pipx_label_is_readable(self):
+        with patch("jacked.install_method.detect_install_method", return_value="pipx"):
+            label = rollback_command_label(extras="tray", version="0.95.0")
+        assert label == 'pipx install "claude-jacked[tray]==0.95.0" --force'
+
+    def test_pip_label_raises_valueerror(self):
+        with patch("jacked.install_method.detect_install_method", return_value="pip"):
+            with pytest.raises(ValueError, match="pip rollback is not supported"):
+                rollback_command_label(extras="tray", version="0.95.0")
+
+    def test_label_refuses_a_bad_version(self):
+        with patch("jacked.install_method.detect_install_method", return_value="uv"):
+            with pytest.raises(ValueError, match="refusing to build a rollback"):
+                rollback_command_label(extras="tray", version="0.95.0 && id")

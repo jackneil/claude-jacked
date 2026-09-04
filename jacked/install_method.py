@@ -20,6 +20,7 @@ in a different place.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -171,6 +172,73 @@ def upgrade_command(extras: str = "tray") -> list[str]:
         ]
     raise ValueError(
         f"pip auto-upgrade is not supported (detected method: {method}). "
+        "Caller must refuse via can_auto_upgrade() with migration guidance."
+    )
+
+
+_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+!_-]{0,63}$")
+
+
+def _validated_version(version: str) -> str:
+    """Return `version` if it looks like a PEP 440 release, else raise.
+
+    Rollback commands are built from a version string that reaches us from a
+    running build (``jacked.__version__``) or a caller. It is interpolated into
+    a requirement specifier and, on Windows, into a batch line — so anything
+    with whitespace, quotes or shell metacharacters is refused outright rather
+    than quoted and hoped for.
+    """
+    if not isinstance(version, str) or not _VERSION_RE.match(version):
+        raise ValueError(
+            f"refusing to build a rollback command for version {version!r}: "
+            "expected a PEP 440 version (digits, letters, '.', '-', '+', '_', '!')"
+        )
+    return version
+
+
+def rollback_command(extras: str = "tray", version: str = "") -> list[str]:
+    """Return the argv list that reinstalls an EXACT previous version.
+
+    Mirrors :func:`upgrade_command` — same install-method detection, same
+    refusal contract. pip and editable installs are refused here too: an
+    upgrade never starts on those (``can_auto_upgrade`` gates it), so a
+    rollback can never be owed to one.
+    """
+    _validated_version(version)
+    method = detect_install_method()
+    if method == "uv":
+        # `--refresh` for the same reason the upgrade path needs it: a cached
+        # index entry must not decide which artifact we pin back to.
+        return [
+            "uv", "tool", "install", f"claude-jacked[{extras}]=={version}",
+            "--force", "--refresh",
+        ]
+    if method == "pipx":
+        return [
+            "pipx", "install", f"claude-jacked[{extras}]=={version}",
+            "--force",
+        ]
+    raise ValueError(
+        f"pip rollback is not supported (detected method: {method}). "
+        "Caller must refuse via can_auto_upgrade() with migration guidance."
+    )
+
+
+def rollback_command_label(extras: str = "tray", version: str = "") -> str:
+    """Human-readable rollback command for logs, error messages, and docs.
+
+    Raises ValueError for non-uv/pipx methods — same contract as rollback_command.
+    """
+    _validated_version(version)
+    method = detect_install_method()
+    if method == "uv":
+        return (
+            f'uv tool install "claude-jacked[{extras}]=={version}" --force --refresh'
+        )
+    if method == "pipx":
+        return f'pipx install "claude-jacked[{extras}]=={version}" --force'
+    raise ValueError(
+        f"pip rollback is not supported (detected method: {method}). "
         "Caller must refuse via can_auto_upgrade() with migration guidance."
     )
 

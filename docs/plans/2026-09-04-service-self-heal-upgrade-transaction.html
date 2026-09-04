@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>Service self-heal: upgrade transaction + runtime trust model</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="{{in-progress|complete|draft}}">
+<meta name="jacked:branch" content="{{git branch if relevant}}">
+<meta name="jacked:date" content="2026-09-04">
+<meta name="jacked:project" content="{{project-name}}">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Service self-heal: upgrade transaction + runtime trust model</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">in progress</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-09-04</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">jack_20260904_service_self_heal</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#files">File Structure</a></li>
+    <li><a href="#tasks">Tasks</a></li>
+    <li><a href="#open-questions">Open Questions</a></li>
+  </ol>
+</nav>
+
+
+<h2 id="goal">Goal</h2>
+<p>After any upgrade (CLI <code>jacked upgrade</code>, tray Update button, Windows helper), the tray must come back on every machine, or the upgrade must roll itself back to the version that was running. A supervised service must never die silently at boot.</p>
+<aside class="callout warn"><strong>Incident (2026-09-04, this Mac).</strong> 0.95.0 to 0.100.0. The new <code>ServiceSpec</code> directory-chain check rejected <code>/opt/homebrew/Caskroom</code> (mode 0775, group <code>admin</code>) because this machine's uv tool venv is built on the miniconda-cask Python. <code>jacked service start</code> raised <code>ValueError: runtime_path has an untrusted writable directory</code> before any UI existed. The legacy launchd job had already been taken down, so: no tray icon, no account in the statusline, <code>jacked service status</code> = "stopped / legacy requires recovery". The Mac Studio passed only because its venv sits on a different interpreter.</aside>
+
+<h2 id="architecture">Root causes (the class, not the instance)</h2>
+<ol>
+<li><strong>Trust model too narrow.</strong> Group-writable was rejected unconditionally. On macOS <code>%admin ALL=(ALL) ALL</code> is the default sudoers rule, so a directory writable by <code>admin</code> is not a privilege boundary: every member can already become root. Homebrew makes its prefix admin group-writable by design, so <em>every Homebrew-installed Python</em> trips the check. Same for Linux <code>sudo</code>/<code>wheel</code> groups and user-private groups.</li>
+<li><strong>Upgrade is not a transaction.</strong> All three upgrade flows install the new package, tear down (or wait for) the old service, then start the new one. Nothing proves the new build can provision its service contract before the old one is gone, and nothing rolls back when the new one never becomes ready.</li>
+<li><strong>Boot refusal is invisible.</strong> A provisioning failure escapes as a traceback into the launchd log. The start-failure breaker never records it, so <code>jacked service status</code> cannot name the reason, and the statusline just says "stale".</li>
+</ol>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+  U[jacked upgrade / tray Update] --> I[install new package]
+  I --> P{jacked service preflight<br/>new build provisions contract?}
+  P -- no --> R[rollback: reinstall previous version] --> S[service restart old build] --> N[loud notice + recovery file]
+  P -- yes --> M[jacked install --force] --> T[service restart new build]
+  T --> V{ready within timeout?}
+  V -- no --> R
+  V -- yes --> OK[done]
+</pre><pre class="mermaid-source">(see diagram)</pre></div>
+
+<h2 id="files">File Structure</h2>
+<ul>
+<li><code>jacked/service/spec.py</code>: root-equivalent group trust (<code>admin</code> on macOS, <code>sudo</code>/<code>wheel</code>, gid 0, user-private group) for group-writable directories and files; owner trust extends to members of those groups.</li>
+<li><code>jacked/cli.py</code>: new <code>jacked service preflight</code>; <code>upgrade</code> becomes a transaction with rollback; <code>service start</code> records provisioning refusals into the breaker with a reason; <code>service status</code> prints that reason.</li>
+<li><code>jacked/service/updater.py</code>: tray Update flow gets the same preflight + rollback.</li>
+<li><code>jacked/install_method.py</code>: <code>rollback_command(extras, version)</code> for uv / pipx / pip.</li>
+<li><code>jacked/service/start_failures.py</code>: failures carry an optional reason.</li>
+<li><code>jacked/statusline_account.py</code>: when the snapshot is stale and no service endpoint is discoverable, say "jacked service down" instead of "stale".</li>
+<li>Windows helper batch (<code>_spawn_windows_upgrade_helper</code>): preflight + rollback steps mirrored.</li>
+<li>README troubleshooting + <code>jacked-reference.md</code>.</li>
+</ul>
+
+<h2 id="tasks">Tasks</h2>
+<ul class="tasks">
+<li><input type="checkbox" disabled> Trust model fix + tests (main loop)</li>
+<li><input type="checkbox" disabled> Agent A (Opus): preflight command, upgrade transaction + rollback in CLI, updater, Windows helper, install_method, tests</li>
+<li><input type="checkbox" disabled> Agent B (Opus): boot-refusal reason into breaker, status output, statusline degraded segment, tests</li>
+<li><input type="checkbox" disabled> Live repair on this Mac: install fixed build, <code>jacked service recover</code>, verify icon + statusline + status</li>
+<li><input type="checkbox" disabled> Full local CI gate, /dcr, PR, release</li>
+</ul>
+
+
+<h2 id="incident-2">Incident 2 (same day): account switch no longer reached running sessions</h2>
+<aside class="callout warn"><strong>Symptom.</strong> Clicking Use account in the dashboard changed the Keychain and the mirror file, the badge said active, but every open Claude Code session kept the previous account. Reverting the tool to 0.94.1 made the click work again.</aside>
+<p><strong>Root cause.</strong> Commit b6391c7 (2026-09-03) replaced <code>sync_credential_to_all_stores</code> with the credential transaction engine. The engine writes the authority (Keychain) and the mirror file, but nothing in that path called <code>update_claude_config_email</code>, so <code>oauthAccount</code> in <code>~/.claude.json</code> stayed on the old account. Claude Code holds its token in memory and re-reads the store only when that identity changes.</p>
+<p><strong>Proof.</strong> A pty-driven interactive <code>claude</code> session: after the 0.94.1 endpoint, <code>/status</code> flipped to the target; after master's <code>activate_account</code>, it stayed on the old account; after master plus the identity write, it flipped. The probe script lives at the scratchpad path <code>cc-probe/tui_probe2.py</code> and is the acceptance test for any future switch-path change.</p>
+<p><strong>Fix.</strong> <code>TransactionDependencies.identity_publisher</code>, called by the engine after a successful authority write on both the unfenced and the cooperative path; <code>runtime._engine_for</code> wires <code>claude_config_identity_publisher(home)</code>, so manual, OAuth, launch and auto-swap contexts all republish the identity. <code>SwitchRequest</code> carries <code>display_name</code> and <code>organization_name</code>. A publish failure keeps the switch, degrades the outcome, and reports <code>existing_sessions = restart_required</code> instead of pretending sessions will follow.</p>
+<p><strong>Open policy question for Jack.</strong> The same rewrite made auto-swap recommendation-only (<code>_execute_swap</code> refuses background mutation without a certified cooperative engine, which no production build has). Auto-swap has been disabled in this machine's settings since 2026-07-01, so it is not the reported bug, but the feature is silently dead on every install. Restoring it means allowing background Keychain writes again, the behaviour 0.94.1 had.</p>
+
+<h2 id="open-questions">Policy note</h2>
+<p>Trusting root-equivalent groups is a deliberate relaxation of the 0.100.0 rule "group-writable is always rejected". Rationale: a principal who can already <code>sudo</code> gains nothing from a writable directory. Flagged for Jack to bless in the PR.</p>
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+  } catch (err) {
+    // Network unreachable or import failed — show source instead of broken diagrams.
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>

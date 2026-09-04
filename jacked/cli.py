@@ -429,39 +429,30 @@ def _clear_start_failure_breaker(paths) -> None:
 
 
 def _print_start_failure_breaker(paths) -> None:
-    """Name the give-up state that today only shows up in the tray log.
+    """Name the last start failure, and the give-up state, from the breaker.
 
-    Task 1's breaker exits the supervised service cleanly once
+    A boot refusal reaches only the tray log, which nobody reads. The breaker
+    keeps the reason, so status can print it.
+
+    The breaker also exits the supervised service cleanly once
     START_FAILURE_LIMIT starts fail inside START_FAILURE_WINDOW_SECONDS, so
     the supervisor stops relaunching and `jacked service status` would
     otherwise just say "stopped" with no reason.
     """
-    import json
     import time as _t
 
-    from jacked.service import (
-        START_FAILURE_FILENAME,
-        START_FAILURE_LIMIT,
-        START_FAILURE_WINDOW_SECONDS,
-    )
+    from jacked.service import START_FAILURE_FILENAME, START_FAILURE_LIMIT
+    from jacked.service.start_failures import read_start_failures
 
-    try:
-        loaded = json.loads(
-            (paths.root / START_FAILURE_FILENAME).read_text(encoding="utf-8")
-        )
-    except OSError:
-        return  # no breaker file, or it is unreadable: nothing to report
-    except ValueError:
-        return  # corrupt breaker file; record_start_failure rewrites it
-    if not isinstance(loaded, list):
-        return
     now = _t.time()
-    recent = [
-        item
-        for item in loaded
-        if isinstance(item, (int, float))
-        and 0 <= now - item <= START_FAILURE_WINDOW_SECONDS
-    ]
+    # A missing or corrupt breaker file reads as no failures.
+    recent = read_start_failures(paths.root / START_FAILURE_FILENAME, now)
+    if not recent:
+        return
+    last = recent[-1]
+    reason = last.reason or "did not become ready"
+    when = _t.strftime("%H:%M:%S", _t.localtime(last.at))
+    console.print(f"  [yellow]Last start failure: {reason} ({when})[/yellow]")
     if len(recent) < START_FAILURE_LIMIT:
         return
     console.print(
@@ -764,7 +755,12 @@ def check_version():
     is_flag=True,
     help="Don't touch the running service — just upgrade the package + migrate settings.",
 )
-def upgrade(extras: str, skip_service: bool):
+@click.option(
+    "--no-rollback",
+    is_flag=True,
+    help="Keep the new version installed even when its service preflight or restart fails.",
+)
+def upgrade(extras: str, skip_service: bool, no_rollback: bool):
     """Upgrade claude-jacked end-to-end.
 
     Runs all three steps the tray 'Update' button would do:
@@ -819,18 +815,159 @@ def upgrade(extras: str, skip_service: bool):
     # Windows can't overwrite a running .exe. Spawn a detached cmd.exe that
     # waits for this process to die, then does the install + migrate + restart.
     if sys.platform == "win32":
-        _spawn_windows_upgrade_helper(cmd, label, extras, skip_service)
+        _spawn_windows_upgrade_helper(
+            cmd, label, extras, skip_service,
+            previous_version=__version__, no_rollback=no_rollback,
+        )
         return
 
-    # POSIX path: run inline.
-    _run_upgrade_inline(cmd, label, extras, skip_service, PID_FILE, DEFAULT_HOST, DEFAULT_PORT)
+    # POSIX path: run inline. `__version__` is read BEFORE anything is
+    # installed, so it names the build a rollback must restore.
+    _run_upgrade_inline(
+        cmd, label, extras, skip_service, PID_FILE, DEFAULT_HOST, DEFAULT_PORT,
+        previous_version=__version__, no_rollback=no_rollback,
+    )
+
+
+def _installed_package_version() -> str:
+    """Return the claude-jacked version that is on disk right now.
+
+    `jacked.__version__` is the version this interpreter IMPORTED, so after an
+    in-place install it still names the old build. The distribution metadata is
+    read from disk on each call, so it names the build that was just written.
+    Returns an empty string when the metadata cannot be read.
+    """
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("claude-jacked")
+    except Exception:
+        return ""
+
+
+def _version_label(version: str) -> str:
+    """Return 'v1.2.3', or 'the new build' when the version is unknown."""
+    return f"v{version}" if version else "the new build"
+
+
+def _write_upgrade_recovery(reason: str, commands: list[str]) -> None:
+    """Record why an upgrade failed, and the exact commands that repair it.
+
+    Writes the same file the tray updater uses, so one place answers "what
+    broke my install" no matter which flow ran.
+    """
+    from jacked.service.updater import RECOVERY_FILE
+
+    body = f"Jacked upgrade failed: {reason}\n\nRecovery:\n"
+    body += "".join(f"  {line}\n" for line in commands)
+    try:
+        RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RECOVERY_FILE.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[dim]Could not write {RECOVERY_FILE}: {exc}[/dim]")
+
+
+def _upgrade_rollback_and_exit(
+    *,
+    jacked: str,
+    extras: str,
+    previous_version: str,
+    new_version: str,
+    reason: str,
+    detail: str,
+    no_rollback: bool,
+    restart_service: bool,
+) -> None:
+    """Undo a failed upgrade: reinstall the previous version, then exit 1.
+
+    An upgrade is a transaction. When the new build cannot provision its
+    service contract, or its service never restarts, the machine must go back
+    to the build that was running.
+    """
+    import subprocess
+    from jacked.findbin import find_bin
+    from jacked.install_method import rollback_command, rollback_command_label
+    from jacked.service.updater import RECOVERY_FILE
+
+    new_label = _version_label(new_version)
+    console.print(f"\n[red]Upgrade to {new_label} failed:[/red] {reason}")
+    if detail:
+        console.print(f"[red]{detail}[/red]")
+
+    if no_rollback:
+        console.print(
+            f"[yellow]Keeping {new_label} installed (--no-rollback). "
+            "The service may be down.[/yellow]"
+        )
+        _write_upgrade_recovery(
+            f"{new_label} {reason}; rollback was disabled with --no-rollback",
+            [
+                f"jacked service preflight    # {detail or 'shows the refusal'}",
+                "jacked service status",
+            ],
+        )
+        console.print(f"[dim]Wrote {RECOVERY_FILE}[/dim]")
+        sys.exit(1)
+
+    try:
+        rb_cmd = rollback_command(extras, previous_version)
+        rb_label = rollback_command_label(extras, previous_version)
+    except ValueError as exc:
+        console.print(f"[red]Cannot roll back automatically:[/red] {exc}")
+        _write_upgrade_recovery(
+            f"{new_label} {reason}; automatic rollback is not available ({exc})",
+            ["jacked service status"],
+        )
+        console.print(f"[dim]Wrote {RECOVERY_FILE}[/dim]")
+        sys.exit(1)
+
+    if rb_cmd[0] == "uv":
+        resolved_uv = find_bin("uv")
+        if resolved_uv:
+            rb_cmd[0] = resolved_uv
+
+    console.print(f"\n[yellow]Rolling back to v{previous_version}[/yellow]")
+    console.print(f"[dim]$ {rb_label}[/dim]")
+    rb_result = subprocess.run(rb_cmd)
+    if rb_result.returncode != 0:
+        console.print(
+            f"[red]Rollback command failed (exit {rb_result.returncode}).[/red]"
+        )
+        _write_upgrade_recovery(
+            f"{new_label} {reason}; the rollback to v{previous_version} also failed",
+            [rb_label, "jacked install --force", "jacked service restart"],
+        )
+        console.print(f"[dim]Wrote {RECOVERY_FILE}[/dim]")
+        sys.exit(1)
+
+    restored = find_bin("jacked") or jacked
+    console.print(f"[dim]$ {restored} install --force[/dim]")
+    subprocess.run([restored, "install", "--force"])
+    if restart_service:
+        console.print(f"[dim]$ {restored} service restart[/dim]")
+        subprocess.run([restored, "service", "restart"])
+
+    _write_upgrade_recovery(
+        f"{new_label} {reason}; rolled back to v{previous_version}",
+        [rb_label, "jacked install --force", "jacked service restart"],
+    )
+    console.print(
+        f"[yellow]Restored v{previous_version}. Details in {RECOVERY_FILE}[/yellow]"
+    )
+    sys.exit(1)
 
 
 def _run_upgrade_inline(
     cmd: list[str], label: str, extras: str, skip_service: bool,
     pid_file, host: str, port: int,
+    previous_version: str = "", no_rollback: bool = False,
 ):
-    """Inline upgrade for POSIX. Running binary gets replaced safely via inode."""
+    """Inline upgrade for POSIX. Running binary gets replaced safely via inode.
+
+    The upgrade is a transaction. Between the package install and the service
+    restart, `jacked service preflight` proves the NEW build can provision its
+    service contract. A refusal rolls the machine back to `previous_version`.
+    """
     import subprocess
     from jacked.findbin import find_bin
     from jacked.service.lifecycle import default_service_paths
@@ -853,7 +990,31 @@ def _run_upgrade_inline(
         )
         sys.exit(1)
 
-    # Step 2: migrate settings.json.
+    new_version = _installed_package_version()
+
+    # Step 2: preflight. This is the transaction gate. It proves the new build
+    # can provision its service contract BEFORE the old service is replaced.
+    # It runs even with --skip-service: it is cheap, and it is the whole point.
+    console.print(f"\n[dim]$ {jacked} service preflight[/dim]")
+    preflight = subprocess.run(
+        [jacked, "service", "preflight"], capture_output=True, text=True
+    )
+    preflight_output = ((preflight.stdout or "") + (preflight.stderr or "")).strip()
+    if preflight_output:
+        console.print(f"[dim]{preflight_output}[/dim]")
+    if preflight.returncode != 0:
+        _upgrade_rollback_and_exit(
+            jacked=jacked,
+            extras=extras,
+            previous_version=previous_version,
+            new_version=new_version,
+            reason="the new build cannot provision its service contract",
+            detail=preflight_output,
+            no_rollback=no_rollback,
+            restart_service=not skip_service,
+        )
+
+    # Step 3: migrate settings.json.
     console.print(f"\n[dim]$ {jacked} install --force[/dim]")
     result = subprocess.run([jacked, "install", "--force"])
     if result.returncode != 0:
@@ -862,7 +1023,7 @@ def _run_upgrade_inline(
             "Your settings.json may be in a partial state — check ~/.claude/settings.json.bak-*"
         )
 
-    # Step 3: delegate restart to the newly installed CLI. Only its v2
+    # Step 4: delegate restart to the newly installed CLI. Only its v2
     # manifest + authenticated control channel may authorize a handoff.
     if skip_service:
         console.print("\n[dim]Skipping service restart (--skip-service)[/dim]")
@@ -884,18 +1045,26 @@ def _run_upgrade_inline(
             console.print(f"\n[dim]$ {jacked} service restart[/dim]")
             result = subprocess.run([jacked, "service", "restart"])
             if result.returncode != 0:
-                console.print(
-                    "[yellow]Package upgraded, but the owned service restart "
-                    f"failed (exit {result.returncode}).[/yellow]"
+                _upgrade_rollback_and_exit(
+                    jacked=jacked,
+                    extras=extras,
+                    previous_version=previous_version,
+                    new_version=new_version,
+                    reason=(
+                        "the new service did not restart "
+                        f"(exit {result.returncode})"
+                    ),
+                    detail=f"Run manually: {jacked} service restart",
+                    no_rollback=no_rollback,
+                    restart_service=True,
                 )
-                console.print(f"[dim]Run manually: {jacked} service restart[/dim]")
-                sys.exit(result.returncode or 1)
 
     console.print("\n[green][OK][/green] Upgrade complete.")
 
 
 def _spawn_windows_upgrade_helper(
     cmd: list[str], label: str, extras: str, skip_service: bool,
+    previous_version: str = "", no_rollback: bool = False,
 ):
     """Windows: spawn a detached cmd.exe helper and exit this process.
 
@@ -907,13 +1076,17 @@ def _spawn_windows_upgrade_helper(
     Helper steps:
       1. Wait for our PID to exit (avoids racing against the .exe lock).
       2. Run the detected upgrade command (uv / pipx / pip).
-      3. `jacked install --force` (migrate settings.json).
-      4. `jacked service restart` (unless --skip-service).
-      5. Append progress to ~/.claude/jacked-update.log.
+      3. `jacked service preflight` (prove the new build can provision its
+         service contract). A refusal rolls back to `previous_version`.
+      4. `jacked install --force` (migrate settings.json).
+      5. `jacked service restart` (unless --skip-service).
+      6. Append progress to ~/.claude/jacked-update.log.
     """
     import os
     import subprocess
     import tempfile
+    from jacked.findbin import find_bin
+    from jacked.install_method import rollback_command, rollback_command_label
     from jacked.service import CLAUDE_DIR
     from jacked.service.updater import UPDATE_LOG, wait_for_parent_block
 
@@ -925,6 +1098,24 @@ def _spawn_windows_upgrade_helper(
     # (uv from AppData, user site-packages python.exe, etc.); every argv
     # element must be individually quoted to survive cmd's tokenization.
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
+
+    # Rollback command for the version that is running right now. Built here,
+    # in Python, so the batch never has to compose a requirement specifier.
+    rollback_line = ""
+    rollback_label = ""
+    if previous_version and not no_rollback:
+        try:
+            rb_cmd = rollback_command(extras, previous_version)
+            rollback_label = rollback_command_label(extras, previous_version)
+        except ValueError:
+            rb_cmd = []
+            rollback_label = ""
+        if rb_cmd:
+            if rb_cmd[0] == "uv":
+                _resolved_uv = find_bin("uv")
+                if _resolved_uv:
+                    rb_cmd[0] = _resolved_uv
+            rollback_line = " ".join(f'"{arg}"' for arg in rb_cmd)
 
     # Everything below writes to plain stdout, which the Popen at the bottom
     # binds to the update log. Do NOT reintroduce `>> "%LOGFILE%"` on any step:
@@ -941,6 +1132,38 @@ def _spawn_windows_upgrade_helper(
         '    jacked service restart 2>&1\r\n'
         ')\r\n'
     )
+    # Rollback path. Reached only by `goto`, so the success path never touches
+    # it. Flat lines and one single-level `if` block: nested parentheses inside
+    # a parenthesised block is the classic cmd.exe parsing trap.
+    _failed_file = '"%USERPROFILE%\\.claude\\jacked-update-failed.txt"'
+    preflight_failed_block = (
+        ':preflight_failed\r\n'
+        'echo [%date% %time%] ERROR: jacked service preflight failed for the new build\r\n'
+    )
+    if rollback_line:
+        preflight_failed_block += (
+            'echo [%date% %time%] rolling back to v' + previous_version + '\r\n'
+            + rollback_line + ' 2>&1\r\n'
+            'if errorlevel 1 echo [%date% %time%] ERROR: rollback command failed\r\n'
+            'echo [%date% %time%] running jacked install --force\r\n'
+            'jacked install --force 2>&1\r\n'
+            + restart_line +
+            'echo Jacked upgrade failed its service preflight; rolled back to v'
+            + previous_version + '. See %LOGFILE%. > ' + _failed_file + '\r\n'
+            'echo Recovery: ' + rollback_label
+            + ' ^&^& jacked install --force ^&^& jacked service restart >> '
+            + _failed_file + '\r\n'
+        )
+    else:
+        preflight_failed_block += (
+            'echo [%date% %time%] rollback disabled; keeping the new version\r\n'
+            'echo Jacked upgrade failed its service preflight and was NOT rolled back. '
+            'See %LOGFILE%. > ' + _failed_file + '\r\n'
+            'echo Recovery: jacked service preflight ^&^& jacked service status >> '
+            + _failed_file + '\r\n'
+        )
+    preflight_failed_block += 'exit /b 1\r\n'
+
     batch_body = (
         '@echo off\r\n'
         'set LOGFILE=' + str(log_path) + '\r\n'
@@ -956,11 +1179,17 @@ def _spawn_windows_upgrade_helper(
         '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         '    exit /b 1\r\n'
         ')\r\n'
+        # Transaction gate: the new build must prove it can provision its
+        # service contract before the old service is replaced.
+        'echo [%date% %time%] running jacked service preflight\r\n'
+        'jacked service preflight 2>&1\r\n'
+        'if errorlevel 1 goto preflight_failed\r\n'
         'echo [%date% %time%] running jacked install --force\r\n'
         'jacked install --force 2>&1\r\n'
         + restart_line +
         'echo [%date% %time%] upgrade complete\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
+        + preflight_failed_block
     )
 
     # Write the batch file to %TEMP% — it deletes itself at the end.
@@ -3566,6 +3795,69 @@ def _tray_extra_installed() -> bool:
         return False
 
 
+def _live_manifest(paths):
+    """Return the instance manifest only when it is valid and names a live PID.
+
+    Returns ``None`` for a missing, unreadable, invalid, or proven-stale
+    manifest, so callers can fall through to quarantine and reprovisioning.
+    """
+    from jacked.service.instance import read_manifest
+
+    try:
+        manifest = read_manifest(paths.manifest)
+    except (OSError, ValueError):
+        return None
+    if _manifest_is_proven_stale(paths.manifest):
+        return None
+    return manifest
+
+
+def _already_owned_and_running(manifest, paths) -> bool:
+    """True when a live supervised instance is exactly what recovery installs.
+
+    Two independent pieces of evidence must agree: the manifest generation
+    equals the generation this build provisions, and the native login item is
+    owned and enabled. A drifted generation or a disabled or foreign login
+    item still falls through to a real recovery.
+    """
+    from jacked.service.autostart import AutostartState, inspect_autostart
+    from jacked.service.lifecycle import provision_service_contract
+
+    try:
+        spec, _environment = provision_service_contract(paths=paths)
+    except (OSError, ValueError):
+        return False
+    if manifest.generation != spec.generation:
+        return False
+    return inspect_autostart().state is AutostartState.OWNED_ENABLED
+
+
+def _release_manual_owner(paths, *, timeout: float = 10.0) -> tuple[bool, str]:
+    """Hand ownership back from a manually started instance.
+
+    Sends an authenticated SHUTDOWN over the control channel, then waits for
+    the instance to remove its manifest. Returns ``(released, detail)`` where
+    ``detail`` is a short user-facing sentence describing the outcome. Shared
+    by `service install` and `service recover` so both hand off identically.
+    """
+    import time
+
+    from jacked.service.ipc import ControlAction, send_native_control
+
+    try:
+        response = send_native_control(paths.manifest, ControlAction.SHUTDOWN)
+    except (OSError, ValueError) as exc:
+        return False, f"manual service refused handoff ({type(exc).__name__})"
+    if not response.get("ok"):
+        return False, "manual service refused handoff"
+    deadline = time.monotonic() + timeout
+    while paths.manifest.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if paths.manifest.exists():
+        return False, "manual service did not release ownership"
+    return True, "manual service released ownership"
+
+
 def _ensure_autostart_and_running(
     port: int, *, one_shot_host: str | None = None, label: str = "Service"
 ) -> None:
@@ -3593,9 +3885,11 @@ def _ensure_autostart_and_running(
         spawn_exact_service,
     )
     from jacked.service.instance import read_manifest
-    from jacked.service.ipc import ControlAction, send_native_control
     from jacked.service.spec import SupervisorKind
-    from jacked.service.supervisors import ArtifactDisposition
+    from jacked.service.supervisors import (
+        ArtifactDisposition,
+        is_known_legacy_artifact,
+    )
 
     paths = default_service_paths()
     try:
@@ -3604,30 +3898,29 @@ def _ensure_autostart_and_running(
         if endpoint.source == "manifest":
             existing = read_manifest(paths.manifest)
             if existing.supervisor == SupervisorKind.MANUAL.value:
+                artifact_path = native_artifact_path(spec, paths=paths)
                 inspected = inspect_native_artifact(
                     spec,
-                    native_artifact_path(spec, paths=paths),
+                    artifact_path,
                     environment=environment,
                 )
-                if inspected.artifact.disposition is ArtifactDisposition.FOREIGN:
+                # A pre-v2 definition jacked itself wrote is NOT foreign: the
+                # supervisor install backs it up and replaces it. Only refuse
+                # an artifact nobody here recognises.
+                if (
+                    inspected.artifact.disposition is ArtifactDisposition.FOREIGN
+                    and not is_known_legacy_artifact(
+                        artifact_path, spec.service_id, spec.supervisor
+                    )
+                ):
                     console.print(
                         "[red]Error:[/red] supervisor artifact is foreign; "
                         "run `jacked service recover`"
                     )
                     return
-                response = send_native_control(paths.manifest, ControlAction.SHUTDOWN)
-                if not response.get("ok"):
-                    console.print("[red]Error:[/red] manual service refused handoff")
-                    return
-                import time
-
-                deadline = time.monotonic() + 10
-                while paths.manifest.exists() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if paths.manifest.exists():
-                    console.print(
-                        "[red]Error:[/red] manual service did not release ownership"
-                    )
+                released, detail = _release_manual_owner(paths)
+                if not released:
+                    console.print(f"[red]Error:[/red] {detail}")
                     return
         result = (
             spawn_exact_service(spec, environment=environment)
@@ -5587,6 +5880,73 @@ def service_start(host: str | None, port: int | None):
     runner.run()
 
 
+@service.command(name="preflight")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print one JSON object with the result, for automation.",
+)
+def service_preflight(as_json: bool):
+    """Prove this build can provision its service contract.
+
+    The command provisions the contract only. It starts no process and it
+    changes no supervisor. Provisioning writes the immutable
+    content-addressed launcher file, which is safe to repeat.
+
+    Exit code 0 means this build can boot its service. Exit code 1 means it
+    cannot, and an upgrade to this build must not be trusted.
+    """
+    import json as _json
+    from jacked.service.lifecycle import (
+        default_service_paths,
+        provision_service_contract,
+    )
+
+    try:
+        spec, _environment = provision_service_contract(paths=default_service_paths())
+    except (OSError, ValueError) as exc:
+        if as_json:
+            click.echo(
+                _json.dumps(
+                    {
+                        "ok": False,
+                        "runtime_path": None,
+                        "runtime_target_path": None,
+                        "supervisor": None,
+                        "generation": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            )
+        else:
+            console.print(f"[red][FAIL][/red] {type(exc).__name__}: {exc}")
+            console.print("[dim]Run 'jacked service status' for details.[/dim]")
+        sys.exit(1)
+
+    supervisor = getattr(spec.supervisor, "value", str(spec.supervisor))
+    if as_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "ok": True,
+                    "runtime_path": spec.runtime_path,
+                    "runtime_target_path": spec.runtime_target_path,
+                    "supervisor": supervisor,
+                    "generation": spec.generation,
+                    "error": None,
+                }
+            )
+        )
+        return
+
+    console.print("[green][OK][/green] Service contract OK")
+    console.print(f"[dim]runtime:[/dim] {spec.runtime_path}")
+    console.print(f"[dim]target:[/dim] {spec.runtime_target_path}")
+    console.print(f"[dim]supervisor:[/dim] {supervisor}")
+    console.print(f"[dim]generation:[/dim] {spec.generation[:12]}")
+
+
 @service.command(name="stop")
 def service_stop():
     """Stop only an instance proven by its private v2 control channel."""
@@ -5718,6 +6078,7 @@ def service_status():
     paths = default_service_paths()
     endpoint = discover_service(paths)
     autostart = inspect_autostart()
+    stopped = False
     if autostart.state is AutostartState.OWNED_ENABLED:
         autostart_label = "[green]enabled[/green]"
     elif autostart.state in {AutostartState.ABSENT, AutostartState.OWNED_DISABLED}:
@@ -5778,7 +6139,12 @@ def service_status():
         console.print(f"  Evidence:  {endpoint.source} ({endpoint.reason})")
     else:
         console.print("[bold yellow]Jacked Service: stopped[/bold yellow]")
+        stopped = True
     console.print(f"  Autostart: {autostart_label}")
+    # A legacy autostart entry cannot start the owned service, so a stopped
+    # service stays stopped until the operator re-installs ownership.
+    if stopped and autostart.state is AutostartState.LEGACY:
+        console.print("  Recovery:  run `jacked service recover`")
     _print_start_failure_breaker(paths)
 
 
@@ -5814,13 +6180,43 @@ def service_recover():
         quarantine_invalid_ownership,
     )
     from jacked.service.instance import ServiceLeaseBusy
+    from jacked.service.spec import SupervisorKind
 
     paths = default_service_paths()
+    # A live instance holds the singleton lease, so quarantine would fail with
+    # ServiceLeaseBusy before recovery could do anything. Resolve the live
+    # owner first: hand off a manual one, or report a healthy supervised one.
+    live = _live_manifest(paths)
+    if live is not None and live.supervisor == SupervisorKind.MANUAL.value:
+        console.print(
+            "[yellow]A manually started service holds ownership.[/yellow] "
+            "Recovery will hand it off to the native supervisor."
+        )
+        released, detail = _release_manual_owner(paths)
+        if not released:
+            console.print(f"[red]Recovery could not hand off ownership:[/red] {detail}")
+            raise SystemExit(1)
+        console.print(f"[green][OK][/green] {detail.capitalize()}")
+    elif live is not None:
+        if _already_owned_and_running(live, paths):
+            console.print(
+                "[green][OK][/green] Service already owned and running "
+                f"(generation {live.generation[:12]})"
+            )
+            return
     try:
         quarantined = quarantine_invalid_ownership(paths)
         spec, environment = provision_service_contract(paths=paths)
         artifact_path = native_artifact_path(spec, paths=paths)
-    except (OSError, ValueError, ServiceLeaseBusy) as exc:
+    except ServiceLeaseBusy as exc:
+        console.print(
+            "[red]Recovery could not take ownership:[/red] a running jacked "
+            "service holds the service lease. Run `jacked service stop`, then "
+            "run `jacked service recover` again. No process or supervisor was "
+            "changed."
+        )
+        raise SystemExit(1) from exc
+    except (OSError, ValueError) as exc:
         console.print(
             f"[red]Recovery could not establish ownership:[/red] {type(exc).__name__}. "
             "No process or supervisor was changed."

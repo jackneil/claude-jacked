@@ -1524,6 +1524,69 @@ class TestReadinessBudget:
         assert exc_info.value.code == 0
         assert "giving up" in caplog.text
 
+    def test_refused_contract_records_the_reason_and_exits_non_zero(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The boot refusal that only reached the tray log now names itself."""
+        from jacked.service.start_failures import read_start_failures
+        from jacked.service.tray import ServiceRunner
+
+        path = tmp_path / "f.json"
+        monkeypatch.delenv("JACKED_SERVICE_GENERATION", raising=False)
+        runner = ServiceRunner()
+        monkeypatch.setattr(runner, "_install_tray_file_logger", lambda: None)
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.provision_service_contract",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ValueError("runtime_path has an untrusted writable directory")
+            ),
+        )
+        with (
+            patch.object(runner, "_start_failure_path", return_value=path),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner.run()
+
+        message = str(exc_info.value.code)
+        assert "contract refused" in message
+        assert "untrusted writable directory" in message
+        assert "jacked service status" in message
+        assert exc_info.value.code != 0
+        assert runner._service_state == "degraded"
+        recorded = read_start_failures(path, time.time())
+        assert len(recorded) == 1
+        assert recorded[0].reason == (
+            "ValueError: runtime_path has an untrusted writable directory"
+        )
+        assert "Service contract refused" in caplog.text
+
+    def test_refused_contract_gives_up_cleanly_for_a_spawned_service(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A supervisor relaunches a non-zero exit; the limit stops the loop."""
+        from jacked.service import START_FAILURE_LIMIT
+        from jacked.service.start_failures import record_start_failure
+        from jacked.service.tray import ServiceRunner
+
+        path = tmp_path / "f.json"
+        for _ in range(START_FAILURE_LIMIT - 1):
+            record_start_failure(path, time.time(), reason="OSError: nope")
+        monkeypatch.setenv("JACKED_SERVICE_GENERATION", "spawned-generation")
+        runner = ServiceRunner()
+        monkeypatch.setattr(runner, "_install_tray_file_logger", lambda: None)
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.provision_service_contract",
+            lambda **_kwargs: (_ for _ in ()).throw(OSError("service root is unreadable")),
+        )
+        with (
+            patch.object(runner, "_start_failure_path", return_value=path),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            runner.run()
+
+        assert exc_info.value.code == 0
+        assert "giving up" in caplog.text
+
     def test_unready_start_under_manual_supervisor_keeps_message(self):
         from jacked.service.spec import SupervisorKind
         from jacked.service.tray import ServiceRunner

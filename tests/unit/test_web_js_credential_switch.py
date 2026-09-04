@@ -83,3 +83,29 @@ def test_auto_swap_recommendation_is_visible_and_uses_safe_activation_path() -> 
     assert "setTimeout(function() { if (banner.parentNode)" not in actions.split(
         "function showAutoSwapRecommendation(data)", 1
     )[1].split("function bindAccountEvents", 1)[0]
+
+
+def test_use_account_ui_tells_the_user_whether_open_sessions_follow() -> None:
+    """The headline is the switch; the second sentence is what open sessions do.
+
+    Regression 2026-09-04: the engine wrote the Keychain but not the identity
+    Claude Code watches, so every open session kept the old account while the
+    toast said the switch was observed. The UI must key the session sentence
+    on the API's ``existing_sessions`` field, never on the raw engine message.
+    """
+    source = (WEB_JS / "components" / "account-actions.js").read_text()
+
+    assert "function sessionsFollowCopy(" in source
+    assert "result.existing_sessions === 'pending_next_activity'" in source
+    assert "pick it up on their next message" in source
+    assert "Restart them to use this account" in source
+    # The engine's diagnostic text is not the user's headline.
+    assert "concurrent writers cannot be excluded" not in source
+    body = source.split("function showCredentialActivationResult")[1].split(
+        "async function pollCredentialOperation"
+    )[0]
+    for outcome in ("committed", "committed_degraded", "observed_target_unfenced"):
+        branch = body.split(f"result.status === '{outcome}'")[1].split("} else")[0]
+        assert "sessionsFollowCopy(" in branch
+        assert "result.message ||" not in branch
+

@@ -148,6 +148,8 @@ def run_update(
     from jacked.install_method import (
         can_auto_upgrade as _can_upgrade,
         detect_install_method as _detect,
+        rollback_command,
+        rollback_command_label,
         upgrade_command,
         upgrade_command_label,
     )
@@ -327,6 +329,207 @@ def run_update(
             )
             return
 
+        # The restart + verify tail. It runs for the successful path AND for
+        # the rolled-back path, so the machine always ends with a service.
+        def _start_and_verify() -> str:
+            """Start the service and wait for it. Returns the outcome name.
+
+            'ok'        - the service is listening.
+            'port_busy' - the port stayed occupied by an unverified listener.
+            'not_ready' - the service never bound the port in time.
+            """
+            # Phase: waiting_port_free
+            _begin("waiting_port_free")
+            log("Waiting for port to become available")
+            port_deadline = time.monotonic() + 10.0
+            while time.monotonic() < port_deadline:
+                if is_port_available("127.0.0.1", port):
+                    break
+                time.sleep(0.5)
+            if not is_port_available("127.0.0.1", port):
+                _end(
+                    "waiting_port_free",
+                    "failed",
+                    error=f"port {port} remains occupied by an unverified listener",
+                    recovery="run `jacked service status`; v2 services use discoverable quarantine",
+                )
+                log(f"ABORT: port {port} is ambiguous; no process was signalled")
+                return "port_busy"
+            _end("waiting_port_free", "ok")
+
+            # Phase: starting_service
+            _begin("starting_service")
+            # On macOS the tray may be managed by launchd with KeepAlive - a
+            # plain detached `jacked service start` races launchd's respawn to
+            # bind :port and usually loses. Delegate to the platform's native
+            # lifecycle manager when present (launchctl kickstart on macOS;
+            # systemctl --user on Linux if user-installed). Fall back to
+            # detached Popen when no manager is present (Windows or unmanaged
+            # Linux).
+            from jacked.service.platform import ensure_native_lifecycle, native_restart
+
+            ens_ok, ens_state, ens_reason = ensure_native_lifecycle()
+            if ens_ok:
+                if ens_state == "just_installed":
+                    log(
+                        f"Native lifecycle freshly installed (RunAtLoad booted service): {ens_reason}"
+                    )
+                    _restart_attempted[0] = True
+                else:
+                    # already_installed -> atomic kickstart
+                    native_ok, native_reason = native_restart()
+                    _restart_attempted[0] = True
+                    if native_ok:
+                        log(f"Native lifecycle restart: {native_reason}")
+                    else:
+                        log(
+                            f"Native kickstart failed ({native_reason}); fallback to manual spawn"
+                        )
+                        _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
+            else:
+                log(f"Native lifecycle unavailable ({ens_reason}); manual spawn")
+                _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
+                _restart_attempted[0] = True
+            _end("starting_service", "ok")
+
+            # Phase: verifying_service
+            _begin("verifying_service")
+            log("Verifying service came up")
+            verify_deadline = time.monotonic() + 20.0
+            came_up = False
+            while time.monotonic() < verify_deadline:
+                if not is_port_available("127.0.0.1", port):
+                    came_up = True
+                    break
+                time.sleep(0.5)
+
+            if came_up:
+                _end("verifying_service", "ok")
+                return "ok"
+            _end(
+                "verifying_service",
+                "failed",
+                error=f"service did not bind :{port} within 20s",
+                recovery="jacked service start",
+            )
+            log(f"WARNING: service did not bind :{port} within 20s")
+            return "not_ready"
+
+        _rolled_back = [False]
+
+        def _rollback(reason: str) -> bool:
+            """Reinstall the version that was running. At most once per run.
+
+            Returns True when the previous version is back on disk.
+            """
+            if _rolled_back[0]:
+                log("Rollback already attempted once; refusing a second pass")
+                return False
+            _rolled_back[0] = True
+            try:
+                rb_cmd = rollback_command(extras, _current_version)
+                rb_label = rollback_command_label(extras, _current_version)
+            except ValueError as exc:
+                log(f"ERROR: cannot build a rollback command: {exc}")
+                return False
+            if method == "uv":
+                rb_uv = find_bin("uv")
+                if rb_uv:
+                    rb_cmd[0] = rb_uv
+            _begin("rolling_back")
+            log(f"Rolling back to v{_current_version} ({reason}): {rb_label}")
+            rb = subprocess.run(
+                rb_cmd,
+                stdout=log_fh,
+                stderr=log_fh,
+                check=False,
+                creationflags=NO_WINDOW,
+            )
+            if rb.returncode != 0:
+                _end(
+                    "rolling_back",
+                    "failed",
+                    error=f"rollback command exit {rb.returncode}",
+                    recovery=rb_label,
+                )
+                log(f"ERROR: rollback command returned {rb.returncode}")
+                return False
+            restored = find_bin("jacked") or jacked
+            subprocess.run(
+                [restored, "install", "--force"],
+                stdout=log_fh,
+                stderr=log_fh,
+                check=False,
+                creationflags=NO_WINDOW,
+            )
+            _end("rolling_back", "ok")
+            log(f"Rollback to v{_current_version} complete")
+            return True
+
+        def _fail_and_recover(what: str, rolled: bool) -> None:
+            """Record a failed update and tell the user what state they are in."""
+            if rolled:
+                error = f"{what}; rolled back to v{_current_version}"
+                recovery = (
+                    f"v{_current_version} is restored. Run `jacked service status`, "
+                    "then report the preflight output."
+                )
+            else:
+                error = f"{what}; rollback did not complete"
+                recovery = (
+                    f'uv tool install "claude-jacked[{extras}]=={_current_version}" '
+                    "--force --refresh && jacked install --force && jacked service start"
+                )
+            try:
+                _us.mark_failed(
+                    _us.UPDATE_STATUS_FILE, error=error, recovery=recovery
+                )
+            except Exception:
+                logger.exception("mark_failed after %s", what)
+            _write_recovery(
+                f"Jacked auto-update failed: {error}\n\n"
+                f"See {UPDATE_LOG} for details.\n\n"
+                "Recovery:\n"
+                f"  {recovery}\n"
+            )
+            log(f"UPDATE FAILED: {error}")
+
+        # Phase: preflight - the transaction gate. The new build must prove it
+        # can provision its service contract before the old service is gone.
+        _begin("preflight")
+        log(f"Running: {jacked} service preflight")
+        preflight = subprocess.run(
+            [jacked, "service", "preflight"],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=NO_WINDOW,
+        )
+        preflight_output = (
+            (preflight.stdout or "") + (preflight.stderr or "")
+        ).strip()
+        if preflight_output:
+            log(f"preflight output: {preflight_output}")
+        log(f"preflight returncode: {preflight.returncode}")
+        if preflight.returncode != 0:
+            first_line = (
+                preflight_output.splitlines()[0]
+                if preflight_output
+                else f"exit {preflight.returncode}"
+            )
+            _end(
+                "preflight",
+                "failed",
+                error=f"new build refused to provision its service contract: {first_line}",
+                recovery=f'uv tool install "claude-jacked[{extras}]=={_current_version}" --force --refresh',
+            )
+            rolled = _rollback("preflight refused")
+            # Bring the restored version back up through the native lifecycle.
+            _start_and_verify()
+            _fail_and_recover(f"v{_target} refused to start: {first_line}", rolled)
+            return
+        _end("preflight", "ok")
+
         # Phase: migrating_settings
         _begin("migrating_settings")
         log(f"Running: {jacked} install --force")
@@ -360,78 +563,9 @@ def run_update(
             return
         _end("migrating_settings", "ok")
 
-        # Phase: waiting_port_free
-        _begin("waiting_port_free")
-        log("Waiting for port to become available")
-        port_deadline = time.monotonic() + 10.0
-        while time.monotonic() < port_deadline:
-            if is_port_available("127.0.0.1", port):
-                break
-            time.sleep(0.5)
-        if not is_port_available("127.0.0.1", port):
-            _end(
-                "waiting_port_free",
-                "failed",
-                error=f"port {port} remains occupied by an unverified listener",
-                recovery="run `jacked service status`; v2 services use discoverable quarantine",
-            )
-            _write_recovery(
-                f"Jacked auto-update stopped safely because port {port} is occupied by an "
-                "unverified listener. No port owner was killed. Run `jacked service status` "
-                "for ownership and quarantine guidance.\n"
-            )
-            log(f"ABORT: port {port} is ambiguous; no process was signalled")
-            return
-        _end("waiting_port_free", "ok")
-
-        # Phase: starting_service
-        _begin("starting_service")
-        # On macOS the tray may be managed by launchd with KeepAlive — a plain
-        # detached `jacked service start` races launchd's respawn to bind :port
-        # and usually loses. Delegate to the platform's native lifecycle
-        # manager when present (launchctl kickstart on macOS; systemctl
-        # --user on Linux if user-installed). Fall back to detached Popen
-        # when no manager is present (Windows or unmanaged Linux).
-        from jacked.service.platform import ensure_native_lifecycle, native_restart
-
-        ens_ok, ens_state, ens_reason = ensure_native_lifecycle()
-        if ens_ok:
-            if ens_state == "just_installed":
-                log(
-                    f"Native lifecycle freshly installed (RunAtLoad booted service): {ens_reason}"
-                )
-                _restart_attempted[0] = True
-            else:
-                # already_installed → atomic kickstart
-                native_ok, native_reason = native_restart()
-                _restart_attempted[0] = True
-                if native_ok:
-                    log(f"Native lifecycle restart: {native_reason}")
-                else:
-                    log(
-                        f"Native kickstart failed ({native_reason}); fallback to manual spawn"
-                    )
-                    _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
-        else:
-            log(f"Native lifecycle unavailable ({ens_reason}); manual spawn")
-            _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
-            _restart_attempted[0] = True
-        _end("starting_service", "ok")
-
-        # Phase: verifying_service
-        _begin("verifying_service")
-        log("Verifying new service came up")
-        verify_deadline = time.monotonic() + 20.0
-        came_up = False
-        while time.monotonic() < verify_deadline:
-            if not is_port_available("127.0.0.1", port):
-                came_up = True
-                break
-            time.sleep(0.5)
-
-        if came_up:
-            _end("verifying_service", "ok")
-            log(f"Updater done — new service is listening on :{port}")
+        outcome = _start_and_verify()
+        if outcome == "ok":
+            log(f"Updater done - new service is listening on :{port}")
             if RECOVERY_FILE.exists():
                 try:
                     RECOVERY_FILE.unlink()
@@ -440,35 +574,32 @@ def run_update(
             try:
                 _us.mark_succeeded(_us.UPDATE_STATUS_FILE)
             except Exception:
-                logger.exception("mark_succeeded failed — writing mark_failed fallback")
-                log("WARNING: mark_succeeded raised — attempting mark_failed fallback")
+                logger.exception("mark_succeeded failed - writing mark_failed fallback")
+                log("WARNING: mark_succeeded raised - attempting mark_failed fallback")
                 try:
                     _us.mark_failed(
                         _us.UPDATE_STATUS_FILE,
-                        error="mark_succeeded raised — service came up but final status write failed",
+                        error="mark_succeeded raised - service came up but final status write failed",
                         recovery="Reload the dashboard: http://127.0.0.1:8321/",
                     )
                 except Exception:
                     logger.exception("mark_failed fallback also raised")
-                    log("ERROR: mark_failed fallback also raised — disk likely full")
-        else:
-            _end(
-                "verifying_service",
-                "failed",
-                error=f"new service did not bind :{port} within 20s",
-                recovery="jacked service start",
-            )
-            log(f"WARNING: new service did not bind :{port} within 20s")
+                    log("ERROR: mark_failed fallback also raised - disk likely full")
+        elif outcome == "port_busy":
             _write_recovery(
-                "Jacked auto-update: package install + migrate succeeded, but "
-                "the new tray never came up.\n\n"
-                f"See {UPDATE_LOG} for details. Most likely uv installed into\n"
-                "an unexpected PATH location.\n\n"
-                "Recovery:\n"
-                "  jacked service start\n"
-                "If that fails:\n"
-                "  uv tool install 'claude-jacked[tray]' --force\n"
-                "  jacked service start\n"
+                f"Jacked auto-update stopped safely because port {port} is occupied by an "
+                "unverified listener. No port owner was killed. Run `jacked service status` "
+                "for ownership and quarantine guidance.\n"
+            )
+        else:
+            # The new service never came up. Put the previous version back and
+            # restart it, so the user keeps a working tray.
+            rolled = _rollback("new service never became ready")
+            if rolled:
+                _start_and_verify()
+            _fail_and_recover(
+                f"v{_target} never became ready on :{port}",
+                rolled,
             )
     finally:
         # Best-effort recovery: ensure the service comes back up even when an
@@ -580,6 +711,8 @@ def _spawn_windows_tray_updater(
     from jacked.install_method import (
         can_auto_upgrade,
         detect_install_method,
+        rollback_command,
+        rollback_command_label,
         upgrade_command,
         upgrade_command_label,
     )
@@ -612,6 +745,24 @@ def _spawn_windows_tray_updater(
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
     to_version = target_version or "next"
     current_version = __import__("jacked").__version__
+
+    # Rollback argv for the version running right now. Built in Python so the
+    # batch never composes a requirement specifier itself.
+    rollback_line = ""
+    rollback_label = ""
+    try:
+        rb_cmd = rollback_command(extras, current_version)
+        rollback_label = rollback_command_label(extras, current_version)
+    except ValueError as exc:
+        logger.warning("No rollback command available: %s", exc)
+        rb_cmd = []
+    if rb_cmd:
+        if method == "uv":
+            rb_uv = find_bin("uv")
+            if rb_uv:
+                rb_cmd[0] = rb_uv
+        rollback_line = " ".join(f'"{arg}"' for arg in rb_cmd)
+    rollback_label_for_batch = rollback_label.replace('"', "'")
 
     UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
     log_path = str(UPDATE_LOG)
@@ -647,6 +798,51 @@ def _spawn_windows_tray_updater(
         "    echo [%date% %time%] WARN: _update_status shim returned non-zero (continuing)\r\n"
         ")\r\n"
     )
+    # Rollback path. Reached only by `goto`, from a refused preflight or from a
+    # new service that never bound the port. Flat lines only: nesting
+    # parentheses inside a parenthesised block is a cmd.exe parsing trap.
+    _FAILED_FILE = '"%USERPROFILE%\\.claude\\jacked-update-failed.txt"'
+    rollback_block = (
+        ":rollback_now\r\n"
+        "echo [%date% %time%] the new version cannot run; rolling back to v"
+        + current_version + "\r\n"
+        "jacked _update_status rolling_back in_progress\r\n"
+        + DRIFT_GUARD
+    )
+    if rollback_line:
+        rollback_block += (
+            rollback_line + " 2>&1\r\n"
+            "if errorlevel 1 goto rollback_failed\r\n"
+            "jacked install --force 2>&1\r\n"
+            "jacked _update_status rolling_back ok\r\n"
+            + DRIFT_GUARD
+            + 'start "" /B jacked service start\r\n'
+            + _verify_service_block(port)
+            + "echo Jacked tray update: v" + to_version
+            + " could not start; rolled back to v" + current_version
+            + ". See %LOGFILE%. > " + _FAILED_FILE + "\r\n"
+            "echo Recovery: " + rollback_label_for_batch
+            + " ^&^& jacked install --force ^&^& jacked service start >> "
+            + _FAILED_FILE + "\r\n"
+            "exit /b 1\r\n"
+            ":rollback_failed\r\n"
+            'jacked _update_status rolling_back failed --error "rollback command failed" --recovery "'
+            + rollback_label_for_batch + '"\r\n'
+            + DRIFT_GUARD
+            + "echo Jacked tray update failed AND the rollback failed. See %LOGFILE%. > "
+            + _FAILED_FILE + "\r\n"
+            "exit /b 1\r\n"
+        )
+    else:
+        rollback_block += (
+            'jacked _update_status rolling_back failed --error "no rollback command available" '
+            '--recovery "jacked install --force"\r\n'
+            + DRIFT_GUARD
+            + "echo Jacked tray update failed and no rollback command is available. "
+            "See %LOGFILE%. > " + _FAILED_FILE + "\r\n"
+            "exit /b 1\r\n"
+        )
+
     batch_body = (
         "@echo off\r\n"
         "set LOGFILE=" + log_path + "\r\n"
@@ -693,6 +889,15 @@ def _spawn_windows_tray_updater(
         "    exit /b 1\r\n"
         ")\r\n"
         "jacked _update_status installing_package ok\r\n"
+        + DRIFT_GUARD
+        +
+        # Phase: preflight - the transaction gate. The new build must prove it
+        # can provision its service contract before the old service is gone.
+        "jacked _update_status preflight in_progress\r\n"
+        + DRIFT_GUARD
+        + "jacked service preflight 2>&1\r\n"
+        "if errorlevel 1 goto rollback_now\r\n"
+        "jacked _update_status preflight ok\r\n"
         + DRIFT_GUARD
         +
         # Phase: migrating_settings
@@ -743,13 +948,14 @@ def _spawn_windows_tray_updater(
         + str(port)
         + ' in 20s" --recovery "jacked service start"\r\n'
         '    echo Jacked tray update: service did not come up. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        "    exit /b 1\r\n"
+        "    goto rollback_now\r\n"
         ")\r\n"
         "jacked _update_status verifying_service ok\r\n"
         + DRIFT_GUARD
         + "jacked _update_status_succeed\r\n"
         "echo [%date% %time%] tray update complete\r\n"
         '(goto) 2>nul & del "%~f0"\r\n'
+        + rollback_block
     )
 
     fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-tray-update-")

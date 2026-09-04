@@ -4,6 +4,19 @@ from unittest.mock import patch, MagicMock
 from click.testing import CliRunner
 
 
+def _ok(stdout: str = "") -> MagicMock:
+    """A successful subprocess result with real (not MagicMock) text streams.
+
+    The preflight step reads `.stdout`/`.stderr` and concatenates them, so a
+    bare MagicMock leaks a repr into the console output.
+    """
+    return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+
+def _fail(returncode: int = 1, stdout: str = "", stderr: str = "") -> MagicMock:
+    return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
 class TestUpgradeRefusal:
     @patch(
         "jacked.install_method.can_auto_upgrade",
@@ -52,24 +65,57 @@ class TestUpgradeCommand:
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
 
         runner = CliRunner()
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # Three blocking calls: package install, settings migration, v2 restart.
-        assert mock_run.call_count == 3
+        # Four blocking calls: package install, preflight (the transaction
+        # gate), settings migration, v2 restart.
+        assert mock_run.call_count == 4
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
         assert "claude-jacked[tray]" in uv_args
-        install_args = mock_run.call_args_list[1][0][0]
+        preflight_args = mock_run.call_args_list[1][0][0]
+        assert preflight_args == ["/fake/jacked", "service", "preflight"]
+        install_args = mock_run.call_args_list[2][0][0]
         assert "/fake/jacked" in install_args
         assert "install" in install_args
 
-        restart_args = mock_run.call_args_list[2][0][0]
+        restart_args = mock_run.call_args_list[3][0][0]
         assert restart_args == ["/fake/jacked", "service", "restart"]
         mock_popen.assert_not_called()
+
+    @patch("sys.platform", "darwin")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.findbin.find_bin")
+    @patch("jacked.service.process.read_pid", return_value=None)
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    def test_preflight_runs_before_the_settings_migration(
+        self, mock_run, mock_popen, mock_read_pid, mock_find, mock_method,
+    ):
+        """The gate must close before anything replaces the old install.
+
+        `jacked install --force` rewrites settings.json and the native service
+        definition. If preflight ran after it, a refused build would already
+        have taken the old service down.
+        """
+        from jacked.cli import main
+
+        mock_find.side_effect = lambda name: {
+            "uv": "/fake/uv",
+            "jacked": "/fake/jacked",
+        }.get(name)
+        mock_run.return_value = _ok()
+
+        CliRunner().invoke(main, ["upgrade"])
+
+        verbs = [call[0][0][1:3] for call in mock_run.call_args_list[1:]]
+        assert verbs.index(["service", "preflight"]) < verbs.index(
+            ["install", "--force"]
+        )
 
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
@@ -134,7 +180,7 @@ class TestUpgradeCommand:
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
 
         with (
             patch(
@@ -147,7 +193,7 @@ class TestUpgradeCommand:
             result = CliRunner().invoke(main, ["upgrade"])
 
         assert result.exit_code == 0, result.output
-        assert mock_run.call_args_list[2][0][0] == [
+        assert mock_run.call_args_list[3][0][0] == [
             "/fake/jacked", "service", "restart"
         ]
         stop.assert_not_called()
@@ -170,7 +216,7 @@ class TestUpgradeCommand:
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
 
         with (
             patch(
@@ -190,7 +236,12 @@ class TestUpgradeCommand:
         assert "upgrade complete" in result.output.lower()
         assert "quit the old tray" in result.output.lower()
         assert "service start" in result.output.lower()
-        assert mock_run.call_count == 2
+        # Package install, preflight, settings migration. No restart: the
+        # legacy tray cannot be authenticated, so nothing is signalled.
+        assert mock_run.call_count == 3
+        assert mock_run.call_args_list[1][0][0] == [
+            "/fake/jacked", "service", "preflight"
+        ]
         resolve_legacy.assert_called_once()
         stop.assert_not_called()
         remove.assert_not_called()
@@ -211,14 +262,19 @@ class TestUpgradeCommand:
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _ok()
 
         runner = CliRunner()
         result = runner.invoke(main, ["upgrade", "--skip-service"])
 
         assert result.exit_code == 0
-        # Only 2 blocking runs — service untouched. No detached Popen either.
-        assert mock_run.call_count == 2
+        # Package install, preflight, settings migration. The service is
+        # untouched, and no detached Popen is spawned either. Preflight still
+        # runs: it changes no process, and it is the whole point of the gate.
+        assert mock_run.call_count == 3
+        assert mock_run.call_args_list[1][0][0] == [
+            "/fake/jacked", "service", "preflight"
+        ]
         mock_popen.assert_not_called()
 
     @patch("sys.platform", "darwin")
@@ -237,11 +293,12 @@ class TestUpgradeCommand:
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
-        # uv install succeeds, jacked install fails
+        # uv install succeeds, preflight passes, jacked install fails.
         mock_run.side_effect = [
-            MagicMock(returncode=0),
-            MagicMock(returncode=1),
-            MagicMock(returncode=0),
+            _ok(),
+            _ok("[OK] Service contract OK"),
+            _fail(1),
+            _ok(),
         ]
 
         runner = CliRunner()
@@ -249,11 +306,177 @@ class TestUpgradeCommand:
 
         assert result.exit_code == 0
         # Migration remains non-fatal; the new CLI still owns the v2 restart.
-        assert mock_run.call_count == 3
-        assert mock_run.call_args_list[2][0][0] == [
+        # A failed migration is NOT a rollback trigger: the new build already
+        # proved it can provision its service contract.
+        assert mock_run.call_count == 4
+        assert mock_run.call_args_list[3][0][0] == [
             "/fake/jacked", "service", "restart"
         ]
         mock_popen.assert_not_called()
+
+
+class TestUpgradeIsATransaction:
+    """`jacked upgrade` must never leave the machine without a service.
+
+    Every test here patches subprocess.run and subprocess.Popen, so no real
+    package install, preflight or service restart can escape the test process.
+    """
+
+    RB_ARGV = [
+        "/fake/uv", "tool", "install",
+        "claude-jacked[tray]==0.95.0", "--force", "--refresh",
+    ]
+
+    @staticmethod
+    def _patches():
+        """Common patch stack: uv install method, resolvable binaries."""
+        return (
+            patch("sys.platform", "darwin"),
+            patch(
+                "jacked.install_method.detect_install_method", return_value="uv"
+            ),
+            patch(
+                "jacked.findbin.find_bin",
+                side_effect=lambda name: {
+                    "uv": "/fake/uv",
+                    "jacked": "/fake/jacked",
+                }.get(name),
+            ),
+            patch("jacked.service.process.read_pid", return_value=None),
+        )
+
+    def _invoke(self, run_results, args=(), version="0.95.0", tmp_path=None):
+        """Run `jacked upgrade` with a scripted subprocess.run sequence."""
+        from jacked.cli import main
+
+        recovery = (tmp_path / "jacked-update-failed.txt") if tmp_path else None
+        stack = self._patches()
+        with (
+            stack[0], stack[1], stack[2], stack[3],
+            patch("subprocess.Popen") as popen,
+            patch("subprocess.run") as run,
+            patch("jacked.__version__", version),
+            patch("jacked.cli._installed_package_version", return_value="0.100.0"),
+        ):
+            run.side_effect = list(run_results)
+            if recovery is not None:
+                with patch("jacked.service.updater.RECOVERY_FILE", recovery):
+                    result = CliRunner().invoke(main, ["upgrade", *args])
+            else:
+                result = CliRunner().invoke(main, ["upgrade", *args])
+        return result, run, popen
+
+    def test_refused_preflight_rolls_back_to_the_previous_version(self, tmp_path):
+        """The whole point: a build that cannot boot never keeps the machine."""
+        result, run, popen = self._invoke(
+            [
+                _ok(),                                   # uv install
+                _fail(1, stderr="[FAIL] ValueError: runtime_path untrusted"),
+                _ok(),                                   # rollback: uv install ==0.95.0
+                _ok(),                                   # jacked install --force
+                _ok(),                                   # jacked service restart
+            ],
+            tmp_path=tmp_path,
+        )
+
+        assert result.exit_code == 1, result.output
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert argvs[1] == ["/fake/jacked", "service", "preflight"]
+        assert argvs[2] == self.RB_ARGV
+        assert argvs[3] == ["/fake/jacked", "install", "--force"]
+        assert argvs[4] == ["/fake/jacked", "service", "restart"]
+        # The migration for the NEW build never ran: the gate closed first.
+        assert argvs.count(["/fake/jacked", "install", "--force"]) == 1
+        assert "rolling back" in result.output.lower()
+        assert "0.95.0" in result.output
+        popen.assert_not_called()
+
+    def test_refused_preflight_writes_the_recovery_file(self, tmp_path):
+        recovery = tmp_path / "jacked-update-failed.txt"
+        result, _run, _popen = self._invoke(
+            [_ok(), _fail(1, stderr="[FAIL] ValueError: nope"), _ok(), _ok(), _ok()],
+            tmp_path=tmp_path,
+        )
+        assert result.exit_code == 1
+        body = recovery.read_text(encoding="utf-8")
+        assert "0.100.0" in body       # the build that refused
+        assert "0.95.0" in body        # the build that was restored
+        assert "jacked install --force" in body
+
+    def test_failed_restart_also_rolls_back(self, tmp_path):
+        """A build can provision its contract and still fail to come up."""
+        result, run, _popen = self._invoke(
+            [
+                _ok(),          # uv install
+                _ok("[OK] Service contract OK"),
+                _ok(),          # jacked install --force
+                _fail(3),       # jacked service restart
+                _ok(),          # rollback: uv install ==0.95.0
+                _ok(),          # jacked install --force
+                _ok(),          # jacked service restart
+            ],
+            tmp_path=tmp_path,
+        )
+
+        assert result.exit_code == 1, result.output
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert argvs[4] == self.RB_ARGV
+        assert argvs[6] == ["/fake/jacked", "service", "restart"]
+        assert "did not restart" in result.output.lower()
+
+    def test_no_rollback_flag_keeps_the_new_version(self, tmp_path):
+        recovery = tmp_path / "jacked-update-failed.txt"
+        result, run, _popen = self._invoke(
+            [_ok(), _fail(1, stderr="[FAIL] ValueError: nope")],
+            args=("--no-rollback",),
+            tmp_path=tmp_path,
+        )
+
+        assert result.exit_code == 1, result.output
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert self.RB_ARGV not in argvs
+        assert len(argvs) == 2  # install + preflight, then it stops
+        assert "--no-rollback" in result.output
+        assert "no-rollback" in recovery.read_text(encoding="utf-8")
+
+    def test_skip_service_still_rolls_back_but_never_restarts(self, tmp_path):
+        """--skip-service suppresses the restart, not the transaction."""
+        result, run, _popen = self._invoke(
+            [
+                _ok(),                                   # uv install
+                _fail(1, stderr="[FAIL] ValueError: nope"),
+                _ok(),                                   # rollback install
+                _ok(),                                   # jacked install --force
+            ],
+            args=("--skip-service",),
+            tmp_path=tmp_path,
+        )
+
+        assert result.exit_code == 1, result.output
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert argvs[2] == self.RB_ARGV
+        assert ["/fake/jacked", "service", "restart"] not in argvs
+
+    def test_a_failed_rollback_command_still_reports_and_exits_nonzero(
+        self, tmp_path
+    ):
+        recovery = tmp_path / "jacked-update-failed.txt"
+        result, run, _popen = self._invoke(
+            [
+                _ok(),
+                _fail(1, stderr="[FAIL] ValueError: nope"),
+                _fail(2),   # the rollback install itself fails
+            ],
+            tmp_path=tmp_path,
+        )
+
+        assert result.exit_code == 1, result.output
+        argvs = [call[0][0] for call in run.call_args_list]
+        # It stops after the failed rollback rather than reinstalling blindly.
+        assert argvs[-1] == self.RB_ARGV
+        body = recovery.read_text(encoding="utf-8")
+        assert "rollback" in body.lower()
+        assert "claude-jacked[tray]==0.95.0" in body
 
 
 class TestUpgradeWindows:

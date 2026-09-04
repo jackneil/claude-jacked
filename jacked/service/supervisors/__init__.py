@@ -338,6 +338,33 @@ def _install_owned_locked(
     return SupervisorAction(False, "refused", "manual supervisor")
 
 
+def is_known_legacy_artifact(
+    path: Path, service_id: str, kind: SupervisorKind
+) -> bool:
+    """Report whether ``path`` holds a pre-v2 definition jacked itself wrote.
+
+    A known legacy definition is not foreign: ``install_owned_supervisor``
+    recognises it, backs it up, and replaces it with the owned artifact.
+    Callers use this to tell "jacked's own old layout" apart from a genuinely
+    foreign artifact, which is never touched.
+
+    LAUNCHD inspects the plist at ``path``. TASK_SCHEDULER inspects the legacy
+    Startup VBS script at ``path``; the registered task itself has no pre-v2
+    form. SYSTEMD_USER and MANUAL have no recognised legacy layout, so they
+    always report False.
+    """
+
+    if kind is SupervisorKind.LAUNCHD:
+        from jacked.service.supervisors.launchd import _legacy_arguments
+
+        return _legacy_arguments(path, service_id) is not None
+    if kind is SupervisorKind.TASK_SCHEDULER:
+        from jacked.service.supervisors.task_scheduler import _known_legacy_vbs
+
+        return _known_legacy_vbs(path) is not None
+    return False
+
+
 def _require_kind(spec: ServiceSpec, expected: SupervisorKind) -> None:
     if spec.supervisor is not expected:
         raise ValueError(f"ServiceSpec supervisor must be {expected.value}")
@@ -365,6 +392,7 @@ __all__ = [
     "SupervisorArtifact",
     "inspect_artifact",
     "install_owned_supervisor",
+    "is_known_legacy_artifact",
     "reconcile_artifact",
     "render_for_spec",
     "render_launchd",

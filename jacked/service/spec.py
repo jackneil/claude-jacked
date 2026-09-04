@@ -129,15 +129,106 @@ def _validate_darwin_link_acl(path: Path) -> None:
         raise ValueError("runtime_path symlink has a mutating extended ACL")
 
 
+# Groups whose members can already act as root on the host. macOS ships
+# ``%admin ALL=(ALL) ALL`` in /etc/sudoers and Homebrew makes its prefix
+# admin group-writable by design, so every Homebrew-installed Python lives
+# under such a directory. Linux distributions use ``sudo`` or ``wheel``.
+_ROOT_EQUIVALENT_GROUP_NAMES = ("root", "wheel", "admin", "sudo")
+
+
+def _user_private_group_id() -> int | None:
+    """Return the caller's primary gid when no other account can use it.
+
+    Linux creates one group per user (same name, no other members, no other
+    account with it as primary group). Writes granted to that group reach
+    only the user, so it is as trusted as the user. macOS ``staff`` fails
+    every one of these tests, which keeps staff-writable paths untrusted.
+    """
+    import grp
+    import pwd
+
+    uid = os.getuid()
+    try:
+        user = pwd.getpwuid(uid)
+        group = grp.getgrgid(user.pw_gid)
+    except KeyError:
+        return None
+    if group.gr_name != user.pw_name:
+        return None
+    if any(member != user.pw_name for member in group.gr_mem):
+        return None
+    for other in pwd.getpwall():
+        if other.pw_gid == group.gr_gid and other.pw_uid != uid:
+            return None
+    return group.gr_gid
+
+
+@lru_cache(maxsize=1)
+def _trusted_group_ids() -> frozenset[int]:
+    """Groups a writable bit may grant without opening a privilege boundary.
+
+    A directory writable only by principals who can already become root is
+    not an escalation path: any of them could replace it with ``sudo``.
+    """
+    import grp
+
+    trusted = {0}
+    for name in _ROOT_EQUIVALENT_GROUP_NAMES:
+        try:
+            trusted.add(grp.getgrnam(name).gr_gid)
+        except KeyError:
+            continue
+    private = _user_private_group_id()
+    if private is not None:
+        trusted.add(private)
+    return frozenset(trusted)
+
+
+@lru_cache(maxsize=1)
+def _trusted_owner_ids() -> frozenset[int]:
+    """Root, the caller, and every member of a root-equivalent group."""
+    import grp
+    import pwd
+
+    trusted = {0, os.getuid()}
+    root_equivalent_gids = set()
+    for name in _ROOT_EQUIVALENT_GROUP_NAMES:
+        try:
+            group = grp.getgrnam(name)
+        except KeyError:
+            continue
+        root_equivalent_gids.add(group.gr_gid)
+        for member in group.gr_mem:
+            try:
+                trusted.add(pwd.getpwnam(member).pw_uid)
+            except KeyError:
+                continue
+    for user in pwd.getpwall():
+        if user.pw_gid in root_equivalent_gids:
+            trusted.add(user.pw_uid)
+    return frozenset(trusted)
+
+
 def _trusted_posix_owner(owner: int) -> bool:
-    return owner in {0, os.getuid()}
+    return owner in _trusted_owner_ids()
 
 
 def _writable_by_untrusted_principal(
     status: os.stat_result, *, directory: bool
 ) -> bool:
+    """True when a principal outside the trust set could mutate the path.
+
+    World-writable is always untrusted unless the sticky bit protects a
+    directory. Group-writable is untrusted unless the group is
+    root-equivalent or the caller's private group (see
+    ``_trusted_group_ids``).
+    """
     sticky = directory and bool(status.st_mode & stat.S_ISVTX)
-    return bool(status.st_mode & 0o022) and not sticky
+    if status.st_mode & 0o002 and not sticky:
+        return True
+    if status.st_mode & 0o020 and not sticky:
+        return status.st_gid not in _trusted_group_ids()
+    return False
 
 
 def _validate_posix_directory_chain(path: Path) -> None:

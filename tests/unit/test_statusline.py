@@ -515,12 +515,78 @@ def test_organization_conflict_outranks_a_desired_default_conflict(home):
     assert facts["state"] == "credential conflict"
 
 
-def test_expired_snapshot_renders_desired_and_stale(home):
+def _service_up(monkeypatch, discoverable=True):
+    """Pin the service-discovery probe the stale branch consults."""
+    monkeypatch.setattr(
+        statusline_account, "_service_is_discoverable", lambda home: discoverable
+    )
+
+
+def test_expired_snapshot_renders_desired_and_stale(home, monkeypatch):
+    _service_up(monkeypatch)
     path = _write_account(home, emailAddress="target@co.com")
     data = json.loads(path.read_text(encoding="utf-8"))
     data["fresh_until"] = NOW - 1
     path.write_text(json.dumps(data), encoding="utf-8")
     path.chmod(0o600)
+    assert _render({}, home) == (
+        f"desired target@co.com {MIDDOT} runtime unknown (stale)"
+    )
+
+
+def test_stale_snapshot_names_the_down_service(home, monkeypatch):
+    """A stale snapshot plus an undiscoverable service is a down service."""
+    _service_up(monkeypatch, discoverable=False)
+    path = _write_account(home, emailAddress="target@co.com")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["fresh_until"] = NOW - 1
+    path.write_text(json.dumps(data), encoding="utf-8")
+    path.chmod(0o600)
+
+    assert _render({}, home) == f"desired target@co.com {MIDDOT} jacked service down"
+    facts = statusline_account.account_facts(str(home), NOW)
+    assert facts["state"] == "service down"
+
+
+def test_stale_state_names_the_down_service(home, monkeypatch):
+    """The `state == "stale"` arm reaches the same branch as an invalid clock."""
+    _service_up(monkeypatch, discoverable=False)
+    _write_account(home, emailAddress="target@co.com", state="stale")
+
+    assert _render({}, home) == f"desired target@co.com {MIDDOT} jacked service down"
+
+
+def test_service_probe_is_injectable_and_only_gates_the_stale_branch(home):
+    """A caller may stub the probe; a non-stale reason never consults it."""
+    _write_account(home, emailAddress="target@co.com", state="missing")
+    calls = []
+
+    def probe():
+        calls.append(1)
+        return False
+
+    facts = statusline_account.account_facts(
+        str(home), NOW, service_discoverable=probe
+    )
+
+    assert facts["state"] == "missing"
+    assert calls == []
+
+
+def test_service_probe_failure_never_claims_the_service_is_down(home, monkeypatch):
+    """A broken probe must not turn a stale snapshot into a false alarm."""
+    import jacked.service.lifecycle as lifecycle
+
+    def explode(paths=None):
+        raise RuntimeError("discovery is broken")
+
+    monkeypatch.setattr(lifecycle, "discover_service", explode)
+    path = _write_account(home, emailAddress="target@co.com")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["fresh_until"] = NOW - 1
+    path.write_text(json.dumps(data), encoding="utf-8")
+    path.chmod(0o600)
+
     assert _render({}, home) == (
         f"desired target@co.com {MIDDOT} runtime unknown (stale)"
     )
@@ -542,7 +608,8 @@ def test_invalid_or_secret_bearing_snapshot_is_ignored(home, mutate):
     assert _render({}, home) == ""
 
 
-def test_future_dated_snapshot_is_not_treated_as_observed(home):
+def test_future_dated_snapshot_is_not_treated_as_observed(home, monkeypatch):
+    _service_up(monkeypatch)
     path = _write_account(home, emailAddress="target@co.com")
     data = json.loads(path.read_text(encoding="utf-8"))
     data["published_at"] = NOW + 301

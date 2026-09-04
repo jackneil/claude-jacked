@@ -208,9 +208,11 @@ def _apply_claude_account(config: dict, metadata: _ClaudeConfigAccount) -> None:
             account[tier_field] = metadata.rate_limit_tier
 
 
-def _update_claude_config_account(metadata: _ClaudeConfigAccount) -> None:
+def _update_claude_config_account(
+    metadata: _ClaudeConfigAccount, *, home: Path | None = None
+) -> None:
     """Atomically mirror one account's non-secret metadata to ~/.claude.json."""
-    claude_config = Path.home() / ".claude.json"
+    claude_config = (home or Path.home()) / ".claude.json"
 
     if claude_config.is_symlink():
         logger.warning("Refusing to write ~/.claude.json — path is a symlink")
@@ -230,8 +232,12 @@ def update_claude_config_email(
     display_name: str = None,
     organization_uuid: str = None,
     organization_name: str = None,
+    *,
+    home: Path | None = None,
 ):
     """Update Claude identity while preserving legacy tier metadata.
+
+    ``home`` selects the config directory; it defaults to the user's home.
 
     >>> update_claude_config_email("test@example.com")  # noqa: no side-effects in test env
     """
@@ -241,7 +247,8 @@ def update_claude_config_email(
             display_name=display_name,
             organization_uuid=organization_uuid,
             organization_name=organization_name,
-        )
+        ),
+        home=home,
     )
 
 

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 
-from jacked.service.start_failures import clear_start_failures, record_start_failure
+from jacked.service.start_failures import (
+    clear_start_failures,
+    read_start_failures,
+    record_start_failure,
+)
 
 
 def test_record_counts_failures_inside_window_and_prunes_old_ones(tmp_path):
@@ -15,7 +19,10 @@ def test_record_counts_failures_inside_window_and_prunes_old_ones(tmp_path):
     assert (
         record_start_failure(path, 1700.0, window=600.0) == 2
     )  # 1000.0 pruned, 1100.0 on the edge kept
-    assert json.loads(path.read_text()) == [1100.0, 1700.0]
+    assert [item.at for item in read_start_failures(path, 1700.0, window=600.0)] == [
+        1100.0,
+        1700.0,
+    ]
 
 
 def test_record_drops_future_stamps(tmp_path):
@@ -30,6 +37,59 @@ def test_record_tolerates_corrupt_file(tmp_path):
     path.write_text("not json")
 
     assert record_start_failure(path, 5.0, window=600.0) == 1
+
+
+def test_read_tolerates_corrupt_and_missing_files(tmp_path):
+    missing = tmp_path / "absent.json"
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("not json")
+    wrong_shape = tmp_path / "wrong.json"
+    wrong_shape.write_text(json.dumps({"at": 1.0}))
+
+    assert read_start_failures(missing, 10.0) == []
+    assert read_start_failures(corrupt, 10.0) == []
+    assert read_start_failures(wrong_shape, 10.0) == []
+
+
+def test_reasons_round_trip(tmp_path):
+    path = tmp_path / "start-failures.json"
+
+    record_start_failure(path, 1000.0, window=600.0, reason="ValueError: bad runtime")
+    record_start_failure(path, 1001.0, window=600.0)
+
+    failures = read_start_failures(path, 1002.0, window=600.0)
+    assert [(item.at, item.reason) for item in failures] == [
+        (1000.0, "ValueError: bad runtime"),
+        (1001.0, None),
+    ]
+
+
+def test_legacy_float_entries_are_still_read(tmp_path):
+    """Files written before the object form must keep counting."""
+    path = tmp_path / "start-failures.json"
+    path.write_text(json.dumps([1000.0, 1100.0]), encoding="utf-8")
+
+    failures = read_start_failures(path, 1200.0, window=600.0)
+    assert [(item.at, item.reason) for item in failures] == [
+        (1000.0, None),
+        (1100.0, None),
+    ]
+    # A record on top of legacy data keeps them and rewrites the object form.
+    assert record_start_failure(path, 1200.0, window=600.0, reason="OSError: nope") == 3
+    assert json.loads(path.read_text(encoding="utf-8"))[-1] == {
+        "at": 1200.0,
+        "reason": "OSError: nope",
+    }
+
+
+def test_read_applies_the_window_filter(tmp_path):
+    path = tmp_path / "start-failures.json"
+    record_start_failure(path, 1000.0, window=600.0)
+    record_start_failure(path, 1500.0, window=600.0)
+
+    assert len(read_start_failures(path, 1550.0, window=600.0)) == 2
+    assert len(read_start_failures(path, 1900.0, window=600.0)) == 1
+    assert read_start_failures(path, 3000.0, window=600.0) == []
 
 
 def test_clear_removes_file_and_is_idempotent(tmp_path):

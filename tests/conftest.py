@@ -15,6 +15,51 @@ from jacked.credentials.models import (
 
 
 @pytest.fixture(autouse=True)
+def _no_real_service_processes(request, monkeypatch):
+    """Tripwire: a test must never start the real jacked service or drive a
+    real supervisor.
+
+    On 2026-09-04 a `service restart` test spawned a detached tray from the
+    repo venv against the developer's real ~/.claude and another wrote a
+    launchd transition lock into the real ~/Library/LaunchAgents. Tests that
+    deliberately exec a sandboxed stub opt out with ``@pytest.mark.real_process``.
+    """
+    import subprocess
+
+    if request.node.get_closest_marker("real_process"):
+        return
+    real_popen = subprocess.Popen
+    real_run = subprocess.run
+    supervisors = ("launchctl", "systemctl", "schtasks", "schtasks.exe")
+
+    def _text(args):
+        if isinstance(args, (list, tuple)):
+            return " ".join(str(part) for part in args)
+        return str(args)
+
+    class _GuardedPopen(real_popen):
+        def __init__(self, args, *popen_args, **popen_kwargs):
+            text = _text(args)
+            if "jacked" in text and " service " in f" {text} " and (
+                " start" in text or " restart" in text
+            ):
+                raise RuntimeError(
+                    "test tried to spawn a real jacked service: " + text
+                )
+            super().__init__(args, *popen_args, **popen_kwargs)
+
+    def _guarded_run(args, *run_args, **run_kwargs):
+        text = _text(args)
+        first = text.split(" ", 1)[0].rsplit("/", 1)[-1]
+        if first in supervisors:
+            raise RuntimeError("test tried to drive a real supervisor: " + text)
+        return real_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _GuardedPopen)
+    monkeypatch.setattr(subprocess, "run", _guarded_run)
+
+
+@pytest.fixture(autouse=True)
 def _block_keychain_writes():
     """Prevent tests from mutating the real credential authority."""
     def launch_result(account, _db):

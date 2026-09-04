@@ -11,6 +11,7 @@ from tests._platform import posix_file_modes_enforced
 
 from jacked.credentials.file_store import FileCredentialStore
 from jacked.credentials.models import (
+    SessionActivationState,
     CredentialCapability,
     ExecutableIdentity,
     StoreDeclaration,
@@ -48,6 +49,9 @@ def _account() -> dict:
     return {
         "id": 7,
         "email": "seven@example.com",
+        "display_name": "Seven Example",
+        "organization_uuid": "org-seven",
+        "organization_name": "Seven Org",
         "cc_access_token": "secret",
         "cc_refresh_token": "refresh",
         "cc_expires_at": 2_000_000_000,
@@ -138,6 +142,16 @@ def test_linux_activation_writes_file_authority_end_to_end(tmp_path: Path) -> No
         # is the profile directory's ACL, which this assertion cannot see.
         assert (written.stat().st_mode & 0o777) == 0o600
     assert '"_jackedAccountId":7' in written.read_text(encoding="utf-8").replace(" ", "")
+    # Running Claude Code sessions follow a switch only through this identity
+    # (regression 2026-09-04: the engine skipped it and no session switched).
+    import json
+
+    config = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+    assert config["oauthAccount"]["emailAddress"] == "seven@example.com"
+    assert config["oauthAccount"]["displayName"] == "Seven Example"
+    assert config["oauthAccount"]["organizationUuid"] == "org-seven"
+    assert config["oauthAccount"]["organizationName"] == "Seven Org"
+    assert result.existing_session_activation is SessionActivationState.PENDING_NEXT_ACTIVITY
 
 
 def test_resolve_active_identity_on_linux_reads_credential_file(tmp_path: Path) -> None:

@@ -41,6 +41,13 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
 
     fake = tmp_path / ".claude"
     fake.mkdir(parents=True, exist_ok=True)
+    # Supervisor artifact paths derive from Path.home() (LaunchAgents, systemd
+    # user units), not from CLAUDE_DIR. Point home at the tmp dir too so no
+    # test can read or write the developer's real service definition.
+    import pathlib
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: cls(tmp_path)))
     if os.name == "nt":
         secure_windows_path(fake)
 

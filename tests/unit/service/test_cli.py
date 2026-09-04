@@ -474,7 +474,12 @@ class TestServiceRecover:
             result = CliRunner().invoke(main, ["service", "recover"])
 
         assert result.exit_code != 0
-        assert "could not establish ownership" in result.output.lower()
+        # The message names what holds the lease and the next command, never a
+        # bare exception class name.
+        lowered = result.output.lower()
+        assert "holds the service" in lowered
+        assert "jacked service stop" in lowered
+        assert "servicelease" not in lowered
     def test_foreign_artifact_is_left_untouched_with_actionable_guidance(self):
         from jacked.cli import main
         with (
@@ -1315,6 +1320,7 @@ class TestServiceRestartRemoteAccessParity:
                 "jacked.service.platform.native_restart",
                 return_value=(True, "launchctl kickstart"),
             ),
+            patch("jacked.cli._spawn_service_detached") as mock_spawn,
         ):
             result = CliRunner().invoke(
                 cli.main, ["service", "restart", "--host", "127.0.0.1"]
@@ -1322,6 +1328,9 @@ class TestServiceRestartRemoteAccessParity:
         assert result.exit_code == 0, result.output
         assert db.get_setting("remote_access_enabled") == "false"
         assert "Remote access setting updated" in result.output
+        # No manifest exists, so the restart falls through to the detached
+        # spawn; it must be the patched one, never a real process.
+        mock_spawn.assert_called_once_with(None, 8321)
 
     def test_mapped_host_spawn_argv_is_hostfree(self, monkeypatch):
         """On the manual fallback path a MAPPED host must not leak into the
@@ -1463,6 +1472,71 @@ def test_service_status_reports_the_start_failure_give_up():
     assert "jacked service restart" in result.output
 
 
+def test_service_status_points_a_stopped_legacy_autostart_at_recovery():
+    """A legacy autostart entry cannot start the owned service on its own."""
+    from jacked.cli import main
+    from jacked.service.autostart import AutostartInspection, AutostartState
+    from jacked.service.instance_models import Discovery
+
+    with (
+        patch(
+            "jacked.service.lifecycle.discover_service",
+            return_value=Discovery("127.0.0.1", 8321, "default"),
+        ),
+        patch(
+            "jacked.service.platform.inspect_autostart",
+            return_value=AutostartInspection(AutostartState.LEGACY, "legacy plist"),
+        ),
+    ):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "stopped" in result.output
+    assert "jacked service recover" in result.output
+
+
+def test_service_status_names_the_last_start_failure_reason():
+    """A boot refusal must be readable without opening the tray log."""
+    import time
+
+    from jacked.cli import main
+    from jacked.service import START_FAILURE_FILENAME
+    from jacked.service.lifecycle import default_service_paths
+    from jacked.service.start_failures import record_start_failure
+
+    paths = default_service_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    breaker = paths.root / START_FAILURE_FILENAME
+    breaker.unlink(missing_ok=True)
+    record_start_failure(
+        breaker,
+        time.time(),
+        reason="ValueError: runtime_path has an untrusted writable directory",
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    # Rich soft-wraps the line, so compare on collapsed whitespace.
+    flat = " ".join(result.output.split())
+    assert "Last start failure" in flat
+    assert "untrusted writable directory" in flat
+    # One failure is below the limit, so the give-up line stays silent.
+    assert "will not retry" not in result.output
+
+
+def test_service_status_falls_back_when_a_failure_has_no_reason():
+    """Legacy float entries carry no reason and must still read plainly."""
+    from jacked.cli import main
+
+    _write_breaker(1)
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Last start failure: did not become ready" in result.output
+
+
 def test_service_status_is_silent_when_the_breaker_has_not_tripped():
     from jacked.cli import main
     from jacked.service import START_FAILURE_LIMIT, START_FAILURE_WINDOW_SECONDS
@@ -1504,3 +1578,354 @@ def test_start_clears_the_start_failure_breaker_before_spawning(tmp_path):
     assert result.exit_code == 0, result.output
     spawn.assert_called_once()
     assert not breaker.exists()
+
+
+class TestServiceRecoverLiveOwnership:
+    """Recovery resolves the live owner instead of dying on ServiceLeaseBusy."""
+
+    def _manifest(self, supervisor, generation="a" * 64):
+        return MagicMock(supervisor=supervisor, generation=generation)
+
+    def test_live_manual_instance_is_handed_off_then_the_supervisor_installs(self):
+        from jacked.cli import main
+
+        spec = MagicMock(generation="b" * 64)
+        with (
+            patch(
+                "jacked.service.instance.read_manifest",
+                return_value=self._manifest("manual"),
+            ),
+            patch(
+                "jacked.service.instance.manifest_is_proven_stale", return_value=False
+            ),
+            patch(
+                "jacked.service.ipc.send_native_control", return_value={"ok": True}
+            ) as shutdown,
+            patch(
+                "jacked.service.lifecycle.quarantine_invalid_ownership",
+                return_value=None,
+            ),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.native_artifact_path",
+                return_value="/owned/path/jacked.plist",
+            ),
+            patch(
+                "jacked.service.lifecycle.install_native_owned",
+                return_value=MagicMock(ok=True, reason="installed"),
+            ) as install,
+            patch("jacked.cli._wait_owned_service_ready", return_value=_ready_status()),
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code == 0, result.output
+        assert "manually started service holds ownership" in result.output
+        shutdown.assert_called_once()
+        install.assert_called_once()
+        assert "Recovered exact service generation" in result.output
+
+    def test_manual_handoff_refusal_stops_recovery(self):
+        from jacked.cli import main
+
+        with (
+            patch(
+                "jacked.service.instance.read_manifest",
+                return_value=self._manifest("manual"),
+            ),
+            patch(
+                "jacked.service.instance.manifest_is_proven_stale", return_value=False
+            ),
+            patch(
+                "jacked.service.ipc.send_native_control", return_value={"ok": False}
+            ),
+            patch(
+                "jacked.service.lifecycle.install_native_owned",
+                return_value=MagicMock(ok=True, reason="installed"),
+            ) as install,
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code != 0
+        assert "could not hand off ownership" in result.output
+        install.assert_not_called()
+
+    def test_healthy_supervised_instance_reports_success(self):
+        from jacked.cli import main
+        from jacked.service.autostart import AutostartInspection, AutostartState
+
+        spec = MagicMock(generation="c" * 64)
+        with (
+            patch(
+                "jacked.service.instance.read_manifest",
+                return_value=self._manifest("launchd", generation="c" * 64),
+            ),
+            patch(
+                "jacked.service.instance.manifest_is_proven_stale", return_value=False
+            ),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, {}),
+            ),
+            patch(
+                "jacked.service.autostart.inspect_autostart",
+                return_value=AutostartInspection(AutostartState.OWNED_ENABLED),
+            ),
+            patch(
+                "jacked.service.lifecycle.quarantine_invalid_ownership"
+            ) as quarantine,
+            patch("jacked.service.lifecycle.install_native_owned") as install,
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code == 0, result.output
+        assert "already owned and running" in result.output
+        assert "cccccccccccc" in result.output
+        quarantine.assert_not_called()
+        install.assert_not_called()
+
+    def test_drifted_generation_still_reinstalls(self):
+        """A live supervised instance from an older build is NOT already-owned."""
+        from jacked.cli import main
+        from jacked.service.autostart import AutostartInspection, AutostartState
+
+        spec = MagicMock(generation="d" * 64)
+        with (
+            patch(
+                "jacked.service.instance.read_manifest",
+                return_value=self._manifest("launchd", generation="0" * 64),
+            ),
+            patch(
+                "jacked.service.instance.manifest_is_proven_stale", return_value=False
+            ),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, {}),
+            ),
+            patch(
+                "jacked.service.autostart.inspect_autostart",
+                return_value=AutostartInspection(AutostartState.OWNED_ENABLED),
+            ),
+            patch(
+                "jacked.service.lifecycle.quarantine_invalid_ownership",
+                return_value=None,
+            ),
+            patch(
+                "jacked.service.lifecycle.native_artifact_path",
+                return_value="/owned/path/jacked.plist",
+            ),
+            patch(
+                "jacked.service.lifecycle.install_native_owned",
+                return_value=MagicMock(ok=True, reason="installed"),
+            ) as install,
+            patch("jacked.cli._wait_owned_service_ready", return_value=_ready_status()),
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code == 0, result.output
+        assert "already owned and running" not in result.output
+        install.assert_called_once()
+
+    def test_disabled_login_item_still_reinstalls(self):
+        from jacked.cli import main
+        from jacked.service.autostart import AutostartInspection, AutostartState
+
+        spec = MagicMock(generation="e" * 64)
+        with (
+            patch(
+                "jacked.service.instance.read_manifest",
+                return_value=self._manifest("launchd", generation="e" * 64),
+            ),
+            patch(
+                "jacked.service.instance.manifest_is_proven_stale", return_value=False
+            ),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, {}),
+            ),
+            patch(
+                "jacked.service.autostart.inspect_autostart",
+                return_value=AutostartInspection(AutostartState.OWNED_DISABLED),
+            ),
+            patch(
+                "jacked.service.lifecycle.quarantine_invalid_ownership",
+                return_value=None,
+            ),
+            patch(
+                "jacked.service.lifecycle.native_artifact_path",
+                return_value="/owned/path/jacked.plist",
+            ),
+            patch(
+                "jacked.service.lifecycle.install_native_owned",
+                return_value=MagicMock(ok=True, reason="installed"),
+            ) as install,
+            patch("jacked.cli._wait_owned_service_ready", return_value=_ready_status()),
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code == 0, result.output
+        assert "already owned and running" not in result.output
+        install.assert_called_once()
+
+    def test_proven_stale_manifest_is_quarantined_not_treated_as_live(self):
+        from jacked.cli import main
+
+        spec = MagicMock(generation="f" * 64)
+        with (
+            patch(
+                "jacked.service.instance.read_manifest",
+                return_value=self._manifest("manual"),
+            ),
+            patch(
+                "jacked.service.instance.manifest_is_proven_stale", return_value=True
+            ),
+            patch(
+                "jacked.service.ipc.send_native_control", return_value={"ok": True}
+            ) as shutdown,
+            patch(
+                "jacked.service.lifecycle.quarantine_invalid_ownership",
+                return_value="/tmp/api-v2.instance.json.invalid-1",
+            ),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(spec, {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.native_artifact_path",
+                return_value="/owned/path/jacked.plist",
+            ),
+            patch(
+                "jacked.service.lifecycle.install_native_owned",
+                return_value=MagicMock(ok=True, reason="installed"),
+            ) as install,
+            patch("jacked.cli._wait_owned_service_ready", return_value=_ready_status()),
+        ):
+            result = CliRunner().invoke(main, ["service", "recover"])
+
+        assert result.exit_code == 0, result.output
+        assert "Quarantined invalid ownership evidence" in result.output
+        shutdown.assert_not_called()
+        install.assert_called_once()
+
+
+class TestServicePreflight:
+    """`jacked service preflight` is the upgrade transaction gate.
+
+    It must answer one question - can THIS build provision its service
+    contract - and it must answer it without starting a process or touching a
+    supervisor.
+    """
+
+    def _spec(self):
+        return MagicMock(
+            runtime_path="/opt/jacked/bin/python",
+            runtime_target_path="/opt/jacked/bin/python3.11",
+            supervisor=MagicMock(value="launchd"),
+            generation="abcdef0123456789",
+        )
+
+    def test_reports_ok_with_the_provisioned_contract(self):
+        from jacked.cli import main
+
+        with patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(self._spec(), {}),
+        ) as provision:
+            result = CliRunner().invoke(main, ["service", "preflight"])
+
+        assert result.exit_code == 0, result.output
+        assert "Service contract OK" in result.output
+        assert "/opt/jacked/bin/python" in result.output
+        assert "launchd" in result.output
+        assert "abcdef012345" in result.output
+        provision.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ValueError("runtime_path has an untrusted writable directory"),
+            OSError("permission denied writing the launcher"),
+        ],
+    )
+    def test_a_refused_contract_exits_1_and_names_the_reason(self, exc):
+        """The message must carry the exception TYPE and text: the upgrade
+        transaction pastes this straight into its recovery file."""
+        from jacked.cli import main
+
+        with patch(
+            "jacked.service.lifecycle.provision_service_contract", side_effect=exc
+        ):
+            result = CliRunner().invoke(main, ["service", "preflight"])
+
+        assert result.exit_code == 1
+        assert "[FAIL]" in result.output
+        assert type(exc).__name__ in result.output
+        assert str(exc) in result.output
+        assert "jacked service status" in result.output
+
+    def test_json_ok_shape(self):
+        import json
+
+        from jacked.cli import main
+
+        with patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(self._spec(), {}),
+        ):
+            result = CliRunner().invoke(main, ["service", "preflight", "--json"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data == {
+            "ok": True,
+            "runtime_path": "/opt/jacked/bin/python",
+            "runtime_target_path": "/opt/jacked/bin/python3.11",
+            "supervisor": "launchd",
+            "generation": "abcdef0123456789",
+            "error": None,
+        }
+
+    def test_json_failure_shape(self):
+        import json
+
+        from jacked.cli import main
+
+        with patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            side_effect=ValueError("runtime_path has an untrusted writable directory"),
+        ):
+            result = CliRunner().invoke(main, ["service", "preflight", "--json"])
+
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["ok"] is False
+        assert data["runtime_path"] is None
+        assert data["supervisor"] is None
+        assert data["error"].startswith("ValueError: ")
+
+    def test_starts_no_process_and_drives_no_supervisor(self):
+        """The gate runs while the OLD service is still live. Starting or
+        stopping anything here would defeat the whole transaction."""
+        import subprocess
+
+        from jacked.cli import main
+
+        with (
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(self._spec(), {}),
+            ),
+            patch.object(subprocess, "run") as run,
+            patch.object(subprocess, "Popen") as popen,
+            patch("jacked.service.platform.ensure_native_lifecycle") as ensure,
+            patch("jacked.service.platform.native_restart") as restart,
+        ):
+            result = CliRunner().invoke(main, ["service", "preflight"])
+
+        assert result.exit_code == 0, result.output
+        run.assert_not_called()
+        popen.assert_not_called()
+        ensure.assert_not_called()
+        restart.assert_not_called()

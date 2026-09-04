@@ -3,16 +3,29 @@
 from jacked.service.update_phases import PHASES, PHASE_NAMES
 
 
-def test_six_phases_in_expected_order():
-    """Order matters — the UI renders phases in this order."""
+def test_phases_in_expected_order():
+    """Order matters — the UI renders phases in this order.
+
+    `preflight` sits directly after the package install: it is the transaction
+    gate, and it must close before `migrating_settings` replaces the old
+    install. `rolling_back` is last because it only runs when something ahead
+    of it failed.
+    """
     assert PHASE_NAMES == [
         "waiting_for_parent",
         "installing_package",
+        "preflight",
         "migrating_settings",
         "waiting_port_free",
         "starting_service",
         "verifying_service",
+        "rolling_back",
     ]
+
+
+def test_preflight_precedes_the_settings_migration():
+    """Pinned separately: this ordering is the whole safety property."""
+    assert PHASE_NAMES.index("preflight") < PHASE_NAMES.index("migrating_settings")
 
 
 def test_phases_have_name_and_label():
