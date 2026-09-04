@@ -63,11 +63,16 @@ def _reset_claude_identity_cache():
 
 @pytest.fixture(autouse=True)
 def _reset_keychain_latches():
-    from jacked.credentials.macos_store import clear_keychain_latches
+    from jacked.credentials.macos_store import (
+        clear_keychain_latches,
+        reset_argv_fallback_warning,
+    )
 
     clear_keychain_latches()
+    reset_argv_fallback_warning()
     yield
     clear_keychain_latches()
+    reset_argv_fallback_warning()
 
 
 @pytest.fixture(autouse=True)

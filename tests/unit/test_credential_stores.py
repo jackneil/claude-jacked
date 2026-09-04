@@ -373,6 +373,9 @@ def test_security_cli_read_decodes_hex_output_for_non_ascii_payloads() -> None:
     backend = SecurityCliBackend(run=lambda *a, **k: _completed(0, b"7b22c3a9223a317d\n"))
     assert backend.read(service="s", account="a", is_interactive=False).data == '{"é":1}'.encode()
 
+    backend = SecurityCliBackend(run=lambda *a, **k: _completed(0, b"7B22C3A9223A317D\n"))
+    assert backend.read(service="s", account="a", is_interactive=False).data == '{"é":1}'.encode()
+
     backend = SecurityCliBackend(run=lambda *a, **k: _completed(0, b'{"x":1}\n'))
     assert backend.read(service="s", account="a", is_interactive=False).data == b'{"x":1}'
 
@@ -424,6 +427,31 @@ def test_timed_out_latch_is_shared_across_store_instances_and_expires() -> None:
     backend.read_result = NativeReadResult(StoreStatus.OK, _payload().to_bytes())
     assert make().read().status is StoreStatus.OK  # expired, backend consulted again
     assert backend.calls == 2
+
+
+def test_tool_timeout_latches_although_the_bounded_read_returns_in_time() -> None:
+    """The tool's own timeout lands inside the store's wait, so no queue.Empty."""
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    def make():
+        return MacOSCredentialStore(
+            "alice", backend=SecurityCliBackend(run=run), lock_probe=lambda: False
+        )
+
+    assert make().read().status is StoreStatus.ERROR
+    assert len(calls) == 1
+
+    second = make()
+    assert second.read().status is StoreStatus.ERROR  # latched, tool not respawned
+    assert (
+        second.write(_payload(), InteractionMode.BACKGROUND).status
+        is StoreStatus.INTERACTIVE_REQUIRED
+    )
+    assert len(calls) == 1
 
 
 def test_successful_interactive_call_clears_the_latch() -> None:

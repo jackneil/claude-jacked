@@ -72,7 +72,11 @@ _STDERR_HINTS = (
 
 
 SECURITY_STDIN_MAX_LINE = 4095  # security -i splits longer lines
-_HEX_ALPHABET = frozenset(b"0123456789abcdef")
+_HEX_ALPHABET = frozenset(b"0123456789abcdefABCDEF")
+
+# The tool's own timeout expires inside the store's thread budget, so the
+# bounded read returns normally; the store matches on this reason to latch.
+_TOOL_TIMEOUT_REASON = "security tool timed out"
 
 
 def _classify_failure(
@@ -129,6 +133,12 @@ def _warn_argv_fallback_once() -> None:
         )
 
 
+def reset_argv_fallback_warning() -> None:
+    """Test hook: the warning is once per process, so tests must reset it."""
+    global _argv_fallback_warned
+    _argv_fallback_warned = False
+
+
 try:  # PyObjC's own exception class is not an OSError
     import objc as _objc
 
@@ -166,12 +176,12 @@ def keychain_is_locked(*, security_module=None) -> bool:
         if status != 0 or keychain is None:
             return False
         status, flags = module.SecKeychainGetStatus(keychain, None)
+        if status != 0:
+            return False
+        return not bool(flags & module.kSecUnlockStateStatus)
     except _PROBE_ERRORS:
         logger.debug("keychain status probe failed", exc_info=True)
         return False
-    if status != 0:
-        return False
-    return not bool(flags & module.kSecUnlockStateStatus)
 
 
 class SecurityCliBackend:
@@ -219,7 +229,7 @@ class SecurityCliBackend:
                 is_interactive=is_interactive,
             )
         except subprocess.TimeoutExpired:
-            return NativeReadResult(StoreStatus.ERROR, reason="security tool timed out")
+            return NativeReadResult(StoreStatus.ERROR, reason=_TOOL_TIMEOUT_REASON)
         except OSError as exc:
             return NativeReadResult(StoreStatus.ERROR, reason=f"security tool unavailable: {exc}")
         if completed.returncode != 0:
@@ -270,7 +280,7 @@ class SecurityCliBackend:
             completed = self._invoke(args, is_interactive=is_interactive, stdin=stdin)
         except subprocess.TimeoutExpired:
             # Never stringify the exception: its .cmd carries the full argv.
-            return StoreStatus.ERROR, "security tool timed out"
+            return StoreStatus.ERROR, _TOOL_TIMEOUT_REASON
         except OSError as exc:
             return StoreStatus.ERROR, f"security tool unavailable: {exc}"
         if completed.returncode != 0:
@@ -384,13 +394,18 @@ class MacOSCredentialStore:
         )
         worker.start()
         try:
-            return results.get(timeout=self._noninteractive_timeout)
+            result = results.get(timeout=self._noninteractive_timeout)
         except queue.Empty:
             self._latch()
             return NativeReadResult(
                 StoreStatus.ERROR,
                 reason="Keychain read timed out; noninteractive access disabled",
             )
+        # The tool's own timeout is shorter than this wait, so a blocked call
+        # returns here rather than through queue.Empty. Latch either way.
+        if result.status is StoreStatus.ERROR and result.reason == _TOOL_TIMEOUT_REASON:
+            self._latch()
+        return result
 
     def write(
         self, payload: CredentialPayload, interaction: InteractionMode
