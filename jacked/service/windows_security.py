@@ -435,20 +435,37 @@ def inspect_windows_path(path: Path) -> WindowsPathSecurity:
         api.kernel32.CloseHandle(handle)
 
 
+def _set_named_security(path: Path, api: WindowsApi, dacl: Any, owner: Any) -> None:
+    information = _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION
+    if owner:
+        information |= _OWNER_SECURITY_INFORMATION
+    result = api.advapi32.SetNamedSecurityInfoW(
+        str(path), _SE_FILE_OBJECT, information, owner, None, dacl, None
+    )
+    if result:
+        raise OSError(result, "could not apply service-state security")
+
+
 def secure_windows_path(path: Path) -> None:
-    """Apply and verify a protected current-user-only full-control DACL."""
+    """Apply and verify current-user ownership and a protected private DACL."""
 
     import ctypes
     from ctypes import wintypes
 
     api = windows_libraries()
     descriptor = ctypes.c_void_p()
+    owner = ctypes.c_void_p()
     sid = current_user_sid()
+    owner_matches = inspect_windows_path(path).owner_matches
     if not api.advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
         f"D:P(A;;FA;;;{sid})", 1, ctypes.byref(descriptor), None
     ):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
+        if not owner_matches and not api.advapi32.ConvertStringSidToSidW(
+            sid, ctypes.byref(owner)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
         present = wintypes.BOOL()
         defaulted = wintypes.BOOL()
         dacl = ctypes.c_void_p()
@@ -459,18 +476,10 @@ def secure_windows_path(path: Path) -> None:
             ctypes.byref(defaulted),
         ) or not present:
             raise OSError("could not read the service-state DACL")
-        result = api.advapi32.SetNamedSecurityInfoW(
-            str(path),
-            1,
-            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            dacl,
-            None,
-        )
-        if result:
-            raise OSError(result, "could not apply the service-state DACL")
+        _set_named_security(path, api, dacl, owner)
     finally:
+        if owner:
+            api.kernel32.LocalFree(owner)
         api.kernel32.LocalFree(descriptor)
     expected_directory = path.is_dir()
     observed = inspect_windows_path(path)

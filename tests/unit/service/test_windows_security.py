@@ -120,9 +120,10 @@ def test_incomplete_fixed_name_locks_recover_to_private_dacls(tmp_path):
     from jacked.service.instance import ServiceLease
     from jacked.service.supervisors._transition import SupervisorTransitionLease
     from jacked.service.windows_security import inspect_windows_path
+    from jacked.service.windows_state import ensure_private_windows_directory
 
     root = tmp_path / "service"
-    root.mkdir()
+    ensure_private_windows_directory(root)
     lease_path = root / "instance.lock"
     lease_path.write_bytes(b"")
     lease = ServiceLease(lease_path)
