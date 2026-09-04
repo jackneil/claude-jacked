@@ -596,9 +596,11 @@ class TestPrepareAccountDir:
 
         accounts_dir = tmp_path / "accounts"
         accounts_dir.mkdir(parents=True)
-        # Create symlink at accounts/1 -> /tmp
+        # Use a guaranteed-missing target so this covers dangling links too.
         symlink_dir = accounts_dir / "1"
-        symlink_dir.symlink_to("/tmp")
+        symlink_dir.symlink_to(
+            tmp_path / "missing-account-target", target_is_directory=True
+        )
 
         with mock.patch("jacked.launch.ACCOUNTS_DIR", accounts_dir):
             with mock.patch("jacked.launch.should_refresh", return_value=False):
