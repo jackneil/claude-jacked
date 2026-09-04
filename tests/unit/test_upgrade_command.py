@@ -180,6 +180,7 @@ class TestUpgradeCommand:
                 "jacked.service.lifecycle.default_service_paths",
                 return_value=paths,
             ),
+            patch("jacked.service.legacy.probe_legacy_health", return_value=True),
             patch("jacked.service.process.stop_process_graceful") as stop,
             patch("jacked.service.process.remove_pid") as remove,
         ):
