@@ -294,7 +294,10 @@ class CredentialTransactionEngine:
         )
         write = self._deps.authority.write(request.payload, request.interaction)
         if write.status is not StoreStatus.OK:
-            if before.payload is not None:
+            # A refused write mutated nothing, so it is classified by re-reading
+            # the authority even when the authority was missing at prepare time
+            # (the file appeared between the read and the write).
+            if before.payload is not None or write.status is StoreStatus.CONCURRENT_WRITE:
                 return self._classify_after_failure(
                     request, before.payload, write.status, write.reason
                 )
@@ -509,7 +512,7 @@ class CredentialTransactionEngine:
     def _classify_after_failure(
         self,
         request: SwitchRequest,
-        before: CredentialPayload,
+        before: CredentialPayload | None,
         status: StoreStatus,
         reason: str,
     ) -> SwitchResult:
@@ -528,7 +531,11 @@ class CredentialTransactionEngine:
                 )
             return self._record(request, SwitchOutcome.INDETERMINATE, message=reason)
         observed = self._deps.authority.read()
-        if observed.payload is not None and observed.payload.digest == before.digest:
+        if (
+            observed.payload is not None
+            and before is not None
+            and observed.payload.digest == before.digest
+        ):
             return self._record(
                 request,
                 SwitchOutcome.FAILED_PRESERVED,

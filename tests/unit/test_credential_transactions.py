@@ -517,3 +517,31 @@ def test_schema_drift_is_logged_by_key_name(caplog):
 
     assert "newField" in caplog.text
     assert "refresh-" not in caplog.text  # key names only, never values
+
+
+def test_concurrent_write_on_a_missing_authority_reports_the_new_contents_as_preserved():
+    """Claude Code logged in between this adapter's read and its write."""
+    appeared = _payload(9, "written-by-claude")
+
+    class AppearedUnderneath(MemoryCredentialStore):
+        def write(self, payload, interaction):
+            self._payload = appeared  # what the other writer left behind
+            return StoreWriteResult(StoreStatus.CONCURRENT_WRITE, "changed since read")
+
+    store = AppearedUnderneath("auth", None)
+    deps = TransactionDependencies(
+        capability=_capability(CapabilityMode.GLOBAL_UNCOOPERATIVE),
+        repository=InMemoryCredentialSwitchRepository(),
+        authority=store,
+        mirrors={},
+        writer_fence=WriterFence(StaticWriterInspector(())),
+        install_key=StaticInstallKeyProvider(None),
+        machine_install_id="unfenced-local",
+        snapshot_sink=MemoryResolverSnapshotSink(),
+    )
+
+    result = CredentialTransactionEngine(deps).activate(_request(_payload(2, "new")))
+
+    assert result.outcome is SwitchOutcome.FAILED_PRESERVED
+    assert result.observed_identity.account_id == 9
+    assert "changed since read" in result.message

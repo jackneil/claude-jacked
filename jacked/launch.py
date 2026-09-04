@@ -363,6 +363,122 @@ def _ensure_shared_symlinks(config_dir: Path) -> None:
                 logger.warning("Failed to symlink %s (non-fatal)", name)
 
 
+def _activate_global_authority(account: dict, db: Database, account_id: int):
+    """Switch the global credential authority and report what was observed.
+
+    On macOS the Keychain outranks CLAUDE_CONFIG_DIR, so a scoped launch must
+    also switch the global authority. Unknown builds fail closed here.
+    """
+    from jacked.credentials.models import SwitchOutcome
+
+    activation = _activate_launch_credentials(account, db)
+    truthful_outcomes = {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.COMMITTED_DEGRADED,
+        SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+    }
+    if (
+        activation.outcome not in truthful_outcomes
+        or activation.observed_identity.account_id != account_id
+    ):
+        reason = activation.message or activation.outcome.value.replace("_", " ")
+        raise click.ClickException(
+            f"Could not establish Claude credentials for account {account_id}: {reason}"
+        )
+    click.echo(
+        "Note: this certified Claude build uses the global credential authority. "
+        "Launching this account also changes the default for future Claude "
+        "sessions; existing sessions keep their current credentials.",
+        err=True,
+    )
+    evidence = (
+        "launch:scoped-file-readback",
+        f"launch:global-authority:{activation.outcome.value}",
+    )
+    return activation.observed_identity, evidence, f"switch:{activation.operation_id}"
+
+
+def _read_back_scoped_credentials(account: dict, config_dir: Path, account_id: int):
+    """Prove the launch directory holds this account's credentials.
+
+    "Observed" must mean read back. The scoped file was just written; read it
+    through the strict store and compare the OAuth object to what
+    build_oauth_data produced before claiming anything. The scoped file is
+    unstamped by design, so only the organization comes from the readback.
+    """
+    from jacked.credentials.file_store import FileCredentialStore
+    from jacked.credentials.models import CredentialIdentity
+
+    click.echo(
+        "Note: this platform reads credentials from the launch directory; "
+        "the default account for other Claude sessions is unchanged.",
+        err=True,
+    )
+    readback = FileCredentialStore(
+        config_dir / ".credentials.json", trusted_root=config_dir
+    ).read()
+    written = readback.payload.to_mapping() if readback.payload is not None else None
+    if written is None or written.get("claudeAiOauth") != build_oauth_data(account):
+        raise click.ClickException(
+            f"Credentials for account {account_id} did not read back from the "
+            f"launch directory: {readback.reason or 'content mismatch'}"
+        )
+    observed = CredentialIdentity(
+        account_id=account_id,
+        email=account.get("email"),
+        organization_id=readback.payload.identity.organization_id,
+    )
+    evidence = ("launch:scoped-file-readback", "launch:global-authority:skipped")
+    return observed, evidence, f"launch:{uuid.uuid4()}"
+
+
+def _publish_launch_credentials(
+    account: dict, db: Database, config_dir: Path, account_id: int
+) -> None:
+    """Establish the credentials Claude will read, then publish the evidence.
+
+    The token-free observation is written beside the launch directory for
+    session hooks. It is labelled global on purpose: the scoped file is a
+    launch input, not the certified credential authority.
+    """
+    from jacked.credentials.models import CredentialIdentity
+    from jacked.credentials.resolver import (
+        FileResolverSnapshotSink,
+        ResolverState,
+        SnapshotUpdate,
+    )
+
+    if scoped_launch_needs_global_activation():
+        observed, evidence, revision = _activate_global_authority(
+            account, db, account_id
+        )
+    else:
+        observed, evidence, revision = _read_back_scoped_credentials(
+            account, config_dir, account_id
+        )
+    try:
+        FileResolverSnapshotSink(config_dir / "jacked-resolver-snapshot.json").publish(
+            SnapshotUpdate(
+                scope="global",
+                state=ResolverState.RESOLVED,
+                evidence=evidence,
+                credential_revision=revision,
+                desired=CredentialIdentity(
+                    account_id=account_id,
+                    email=account.get("email"),
+                    organization_id=account.get("organization_uuid") or None,
+                ),
+                observed=observed,
+            )
+        )
+    except OSError as exc:
+        logger.warning(
+            "Failed to publish launch credential evidence for account %d: %s",
+            account_id,
+            exc,
+        )
+
+
 def prepare_account_dir(account: dict, db: Database) -> Path:
     """Create account config and verify its certified credential authority.
 
@@ -527,96 +643,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             pass
         raise
 
-    from jacked.credentials.models import CredentialIdentity, SwitchOutcome
-
-    identity = CredentialIdentity(
-        account_id=account_id,
-        email=account.get("email"),
-        organization_id=account.get("organization_uuid") or None,
-    )
-    if scoped_launch_needs_global_activation():
-        # On macOS the Keychain outranks CLAUDE_CONFIG_DIR, so the global
-        # authority must switch too. Unknown builds fail closed here.
-        activation = _activate_launch_credentials(account, db)
-        truthful_outcomes = {
-            SwitchOutcome.COMMITTED,
-            SwitchOutcome.COMMITTED_DEGRADED,
-            SwitchOutcome.OBSERVED_TARGET_UNFENCED,
-        }
-        if (
-            activation.outcome not in truthful_outcomes
-            or activation.observed_identity.account_id != account_id
-        ):
-            reason = activation.message or activation.outcome.value.replace("_", " ")
-            raise click.ClickException(
-                f"Could not establish Claude credentials for account {account_id}: {reason}"
-            )
-        click.echo(
-            "Note: this certified Claude build uses the global credential authority. "
-            "Launching this account also changes the default for future Claude "
-            "sessions; existing sessions keep their current credentials.",
-            err=True,
-        )
-        observed = activation.observed_identity
-        evidence = (
-            "launch:scoped-file-readback",
-            f"launch:global-authority:{activation.outcome.value}",
-        )
-        revision = f"switch:{activation.operation_id}"
-    else:
-        click.echo(
-            "Note: this platform reads credentials from the launch directory; "
-            "the default account for other Claude sessions is unchanged.",
-            err=True,
-        )
-        # "observed" must mean read back. The scoped file was just written;
-        # read it through the strict store and compare the OAuth object to
-        # what build_oauth_data produced before claiming anything.
-        from jacked.credentials.file_store import FileCredentialStore
-
-        readback = FileCredentialStore(
-            config_dir / ".credentials.json", trusted_root=config_dir
-        ).read()
-        written = readback.payload.to_mapping() if readback.payload is not None else None
-        if written is None or written.get("claudeAiOauth") != build_oauth_data(account):
-            raise click.ClickException(
-                f"Credentials for account {account_id} did not read back from the "
-                f"launch directory: {readback.reason or 'content mismatch'}"
-            )
-        observed = CredentialIdentity(
-            account_id=account_id,
-            email=account.get("email"),
-            organization_id=readback.payload.identity.organization_id,
-        )
-        evidence = ("launch:scoped-file-readback", "launch:global-authority:skipped")
-        revision = f"launch:{uuid.uuid4()}"
-
-    # Publish the token-free observation beside the launch directory for
-    # session hooks. Labelled global on purpose: the scoped file is a launch
-    # input, not the certified credential authority.
-    try:
-        from jacked.credentials.resolver import (
-            FileResolverSnapshotSink,
-            ResolverState,
-            SnapshotUpdate,
-        )
-
-        FileResolverSnapshotSink(config_dir / "jacked-resolver-snapshot.json").publish(
-            SnapshotUpdate(
-                scope="global",
-                state=ResolverState.RESOLVED,
-                evidence=evidence,
-                credential_revision=revision,
-                desired=identity,
-                observed=observed,
-            )
-        )
-    except OSError as exc:
-        logger.warning(
-            "Failed to publish launch credential evidence for account %d: %s",
-            account_id,
-            exc,
-        )
+    _publish_launch_credentials(account, db, config_dir, account_id)
 
     return config_dir
 
