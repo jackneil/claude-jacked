@@ -41,4 +41,17 @@ jobs:
           python -m pip install --only-binary=:all: uv
 
       - name: Run tests
+        if: runner.os != 'Windows'
         run: uv run --frozen python -m pytest
+
+      - name: Bisect Windows test-state pollution
+        if: runner.os == 'Windows'
+        run: >-
+          uv run --frozen python -m pytest -vv
+          -k "account_label or account_truth_database or active_account_cc_skip
+          or active_sessions or analytics_anomalies or analytics_api or analytics_db
+          or analytics_paths or analytics_scanner or auto_swap or browser_launch
+          or chain_of_command_hook or chrome_devtools_mcp or claude_skill_preservation
+          or cli_dcr or cli_first_run_and_tray or codex_add or codex_credentials
+          or codex_installer or codex_switching
+          or test_read_rate_limits_real_subprocess_roundtrip"
