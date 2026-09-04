@@ -157,13 +157,10 @@ class TestUpgradeCommand:
     @patch("sys.platform", "darwin")
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.findbin.find_bin")
-    @patch("jacked.service.process.is_process_alive", return_value=True)
-    @patch("jacked.service.process.read_pid", return_value={"pid": 99999, "port": 8321})
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_upgrade_live_legacy_pid_reports_manual_handoff_without_signal(
-        self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find,
-        mock_method, tmp_path,
+        self, mock_run, mock_popen, mock_find, mock_method, tmp_path,
     ):
         """Legacy evidence never authorizes a signal or a competing tray."""
         from jacked.cli import main
@@ -180,7 +177,10 @@ class TestUpgradeCommand:
                 "jacked.service.lifecycle.default_service_paths",
                 return_value=paths,
             ),
-            patch("jacked.service.legacy.probe_legacy_health", return_value=True),
+            patch(
+                "jacked.service.legacy.resolve_active_legacy_service",
+                return_value=MagicMock(pid=99999, port=8321),
+            ) as resolve_legacy,
             patch("jacked.service.process.stop_process_graceful") as stop,
             patch("jacked.service.process.remove_pid") as remove,
         ):
@@ -191,6 +191,7 @@ class TestUpgradeCommand:
         assert "quit the old tray" in result.output.lower()
         assert "service start" in result.output.lower()
         assert mock_run.call_count == 2
+        resolve_legacy.assert_called_once()
         stop.assert_not_called()
         remove.assert_not_called()
         mock_popen.assert_not_called()

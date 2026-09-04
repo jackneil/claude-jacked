@@ -41,4 +41,9 @@ jobs:
           python -m pip install --only-binary=:all: uv
 
       - name: Run tests
+        if: runner.os != 'Windows'
         run: uv run --frozen python -m pytest
+
+      - name: Isolate Windows tray failure
+        if: runner.os == 'Windows'
+        run: uv run --frozen python -m pytest -x -vv tests/unit/service/test_tray.py
