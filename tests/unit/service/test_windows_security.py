@@ -26,7 +26,8 @@ def test_current_process_sid_and_identity_are_pointer_safe():
     identity = process_identity(os.getpid())
     assert identity.pid == os.getpid()
     assert identity.creation_id.startswith("windows-filetime:")
-    assert os.path.samefile(identity.executable, sys.executable)
+    expected_executable = getattr(sys, "_base_executable", sys.executable)
+    assert os.path.samefile(identity.executable, expected_executable)
 
 
 def test_private_dacl_rejects_an_additional_everyone_ace(tmp_path):

@@ -47,5 +47,5 @@ jobs:
       - name: Isolate Windows security failure
         if: runner.os == 'Windows'
         run: >-
-          uv run --frozen python -m pytest -x -vv
+          uv run --frozen python -m pytest -vv
           tests/unit/service/test_windows_security.py
