@@ -473,5 +473,6 @@ def secure_windows_path(path: Path) -> None:
     finally:
         api.kernel32.LocalFree(descriptor)
     expected_directory = path.is_dir()
-    if not inspect_windows_path(path).private_for(directory=expected_directory):
-        raise OSError("service-state DACL verification failed")
+    observed = inspect_windows_path(path)
+    if not observed.private_for(directory=expected_directory):
+        raise OSError(f"service-state DACL verification failed: {observed!r}")
