@@ -184,6 +184,13 @@ class FileCredentialStore:
             if self._changed_since_read():
                 return _refuse_concurrent_write()
             _durable_replace(stage_path, self.path)
+            # The bytes are published now, so re-arm the compare-and-swap
+            # stamp BEFORE anything that can still raise. A chmod or directory
+            # fsync failure below returns UNUSABLE, and a stale stamp would
+            # then make the next write refuse as CONCURRENT_WRITE against our
+            # own bytes. chmod changes ctime, not mtime, so the stamp stays
+            # valid across it.
+            self._remember(raw)
             os.chmod(self.path, 0o600)
             _sync_directory(self.path.parent)
         except OSError as exc:
@@ -194,7 +201,6 @@ class FileCredentialStore:
                     stage_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-        self._remember(raw)
         return StoreWriteResult(StoreStatus.OK)
 
     def cleanup_stages(self) -> None:

@@ -25,3 +25,6 @@ EX_TEMPFAIL = 75
 # so a permanently broken environment does not relaunch forever.
 START_FAILURE_LIMIT = 5
 START_FAILURE_WINDOW_SECONDS = 600.0
+# The breaker only resets if every writer and reader names the same file, so
+# the name lives here rather than as a literal at each site.
+START_FAILURE_FILENAME = "start-failures.json"

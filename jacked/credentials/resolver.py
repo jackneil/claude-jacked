@@ -102,7 +102,14 @@ class MemoryResolverSnapshotSink:
 
 
 class CanonicalCredentialResolver:
-    """Resolve authority and required-store consensus without guessing."""
+    """Resolve the active identity without guessing, in one of two modes.
+
+    ``require_mirror_consensus=True`` (the default, used by write
+    verification) resolves only when the authority and every required mirror
+    describe the same payload. ``False`` (used by observation) lets the
+    authority decide and reports required-mirror drift as evidence, because
+    Claude Code refreshes the authority alone between jacked writes.
+    """
 
     def __init__(
         self,

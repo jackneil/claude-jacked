@@ -419,12 +419,55 @@ def _clear_start_failure_breaker(paths) -> None:
     A supervised service exits cleanly once repeated starts fail inside the
     window, and only an operator gesture is allowed to re-arm it.
     """
+    from jacked.service import START_FAILURE_FILENAME
     from jacked.service.start_failures import clear_start_failures
 
     try:
-        clear_start_failures(paths.root / "start-failures.json")
+        clear_start_failures(paths.root / START_FAILURE_FILENAME)
     except OSError:
         logger.warning("Could not clear the start-failure breaker", exc_info=True)
+
+
+def _print_start_failure_breaker(paths) -> None:
+    """Name the give-up state that today only shows up in the tray log.
+
+    Task 1's breaker exits the supervised service cleanly once
+    START_FAILURE_LIMIT starts fail inside START_FAILURE_WINDOW_SECONDS, so
+    the supervisor stops relaunching and `jacked service status` would
+    otherwise just say "stopped" with no reason.
+    """
+    import json
+    import time as _t
+
+    from jacked.service import (
+        START_FAILURE_FILENAME,
+        START_FAILURE_LIMIT,
+        START_FAILURE_WINDOW_SECONDS,
+    )
+
+    try:
+        loaded = json.loads(
+            (paths.root / START_FAILURE_FILENAME).read_text(encoding="utf-8")
+        )
+    except OSError:
+        return  # no breaker file, or it is unreadable: nothing to report
+    except ValueError:
+        return  # corrupt breaker file; record_start_failure rewrites it
+    if not isinstance(loaded, list):
+        return
+    now = _t.time()
+    recent = [
+        item
+        for item in loaded
+        if isinstance(item, (int, float))
+        and 0 <= now - item <= START_FAILURE_WINDOW_SECONDS
+    ]
+    if len(recent) < START_FAILURE_LIMIT:
+        return
+    console.print(
+        f"  [yellow]Retries:   stopped after {len(recent)} failed starts; "
+        "the service will not retry until you run `jacked service restart`[/yellow]"
+    )
 
 
 def _manifest_is_proven_stale(path: Path) -> bool:
@@ -5695,6 +5738,7 @@ def service_status():
                 f"  Evidence:  manifest + failed control ({type(exc).__name__})"
             )
             console.print(f"  Autostart: {autostart_label}")
+            _print_start_failure_breaker(paths)
             return
         if response.get("ok"):
             state = response["result"]
@@ -5719,6 +5763,7 @@ def service_status():
                 )
             if reported == "running":
                 console.print(f"  Dashboard: http://127.0.0.1:{state.get('port')}")
+            _print_start_failure_breaker(paths)
             return
     if endpoint.source == "legacy":
         console.print("[bold yellow]Jacked Service: legacy service running[/bold yellow]")
@@ -5734,6 +5779,7 @@ def service_status():
     else:
         console.print("[bold yellow]Jacked Service: stopped[/bold yellow]")
     console.print(f"  Autostart: {autostart_label}")
+    _print_start_failure_breaker(paths)
 
 
 @service.command(name="install")

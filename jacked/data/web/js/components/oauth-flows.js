@@ -367,7 +367,10 @@ async function runOAuthFlow(opts) {
         cancelBtn.textContent = 'Cancel';
         cancelBtn.setAttribute('data-oauth-cancel', 'true');
         cancelBtn.addEventListener('click', () => {
-            endWith(OAUTH_WARN_CLASS, cancelledText);
+            // endWith is async, and a throw from renderBanner inside its
+            // finally would surface as an unhandled rejection from a DOM
+            // event handler. The verdict is already settled either way.
+            endWith(OAUTH_WARN_CLASS, cancelledText).catch(() => {});
             if (typeof loadAllData === 'function' && typeof rerenderAccountsView === 'function') {
                 loadAllData().then(() => rerenderAccountsView()).catch(() => {});
             }

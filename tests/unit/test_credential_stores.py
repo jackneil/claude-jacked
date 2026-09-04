@@ -530,6 +530,51 @@ def test_file_store_checks_again_right_before_replace(tmp_path: Path, monkeypatc
     assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 2
 
 
+def test_file_store_rearms_the_stamp_when_post_replace_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failure after the replace commits must not poison the next write.
+
+    ``_durable_replace`` publishes the bytes; a later ``os.chmod`` /
+    ``_sync_directory`` OSError makes ``write()`` report UNUSABLE while the new
+    bytes are already on disk. If the compare-and-swap stamp still held the
+    pre-write file, the next write would refuse with CONCURRENT_WRITE and the
+    engine would report FAILED_PRESERVED naming the account we just wrote.
+    """
+    from jacked.credentials import file_store as file_store_module
+
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+
+    real_chmod = file_store_module.os.chmod
+    failing = {"armed": False}
+
+    def chmod_failing_on_the_committed_file(target, mode, *args, **kwargs):
+        if failing["armed"] and Path(target) == path:
+            raise OSError("chmod refused after the replace committed")
+        return real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setattr(
+        file_store_module.os, "chmod", chmod_failing_on_the_committed_file
+    )
+    failing["armed"] = True
+
+    first = store.write(_payload(2), InteractionMode.FOREGROUND)
+
+    assert first.status is StoreStatus.UNUSABLE
+    assert "chmod refused" in first.reason
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 2
+
+    failing["armed"] = False
+    second = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert second.status is not StoreStatus.CONCURRENT_WRITE
+    assert second.status is StoreStatus.OK
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 3
+
+
 def test_file_store_detects_same_size_rewrite_inside_one_mtime_tick(tmp_path: Path) -> None:
     path = tmp_path / ".credentials.json"
     path.write_bytes(_payload(1).to_bytes())

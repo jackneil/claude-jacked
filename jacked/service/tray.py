@@ -525,9 +525,10 @@ class ServiceRunner:
         return False
 
     def _start_failure_path(self):
+        from jacked.service import START_FAILURE_FILENAME
         from jacked.service.lifecycle import default_service_paths
 
-        return default_service_paths().root / "start-failures.json"
+        return default_service_paths().root / START_FAILURE_FILENAME
 
     def _note_ready(self, elapsed: float) -> None:
         """Record a successful start: reset the retry breaker, remember timing."""

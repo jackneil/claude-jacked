@@ -486,6 +486,35 @@ def test_organization_conflict_keeps_runtime_unknown_rendering(home):
     assert statusline_account.account_facts(str(home), NOW)["org_uuid"] == ""
 
 
+def test_organization_conflict_outranks_a_desired_default_conflict(home):
+    """Both tokens present: the exclusion clause, not the short-circuit, decides.
+
+    The single-token case above stops at the missing ``desired-default:conflict``
+    token, so it never reaches the ``account-metadata:organization-conflict``
+    exclusion in ``_desired_default_conflict``. Carrying BOTH tokens is what
+    exercises that clause, which is the thing standing between a
+    known-wrong observed identity and being printed as the runtime account.
+    """
+    observed = {"account_id": 4, "email": "target@co.com", "organization_id": "org-db"}
+    _write_account(
+        home,
+        emailAddress="target@co.com",
+        state="conflict",
+        observed=observed,
+        evidence=[
+            "desired-default:conflict",
+            "account-metadata:organization-conflict",
+        ],
+    )
+
+    assert _render({}, home) == (
+        f"desired target@co.com {MIDDOT} runtime unknown (credential conflict)"
+    )
+    facts = statusline_account.account_facts(str(home), NOW)
+    assert facts["org_uuid"] == ""
+    assert facts["state"] == "credential conflict"
+
+
 def test_expired_snapshot_renders_desired_and_stale(home):
     path = _write_account(home, emailAddress="target@co.com")
     data = json.loads(path.read_text(encoding="utf-8"))

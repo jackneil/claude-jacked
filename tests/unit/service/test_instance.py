@@ -278,6 +278,15 @@ def test_process_is_stale_rules(monkeypatch):
     monkeypatch.setattr(instance_storage, "process_identity", slow)
     assert process_is_stale(process) is False  # not proven; fail closed
 
+    def truncated_stat(pid):
+        # A dying process can hand back a short /proc/<pid>/stat, so the
+        # fields[19] index in _linux_process_identity raises IndexError. That
+        # is evidence of death, not a crash for `jacked service restart`.
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(instance_storage, "process_identity", truncated_stat)
+    assert process_is_stale(process) is True
+
 
 def test_manifest_is_proven_stale_reads_then_applies_rule(tmp_path, monkeypatch):
     from types import SimpleNamespace

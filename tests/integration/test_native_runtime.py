@@ -86,4 +86,4 @@ def test_native_contract_preserves_an_isolated_importable_tool_runtime(
         check=False,
     )
     assert imported.returncode == 0, imported.stderr
-    assert imported.stdout.strip() == "0.99.3"
+    assert imported.stdout.strip() == "0.100.0"

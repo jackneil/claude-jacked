@@ -330,6 +330,11 @@ def process_is_stale(process: ProcessIdentity | None) -> bool:
 
     A probe that times out (macOS shells out to ``ps``) proves nothing and
     returns False so callers never treat a busy machine as a dead owner.
+
+    A truncated ``/proc/<pid>/stat`` read raises IndexError out of
+    ``_linux_process_identity``; that only happens while the process is dying,
+    so it counts as proof rather than escaping as a traceback from the
+    once-a-second probe in ``jacked service restart``.
     """
     if process is None:
         return False
@@ -337,7 +342,7 @@ def process_is_stale(process: ProcessIdentity | None) -> bool:
         observed = process_identity(process.pid)
     except subprocess.SubprocessError:
         return False
-    except (OSError, ProcessLookupError, ValueError):
+    except (OSError, ProcessLookupError, ValueError, IndexError):
         return True
     return observed != process
 

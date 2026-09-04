@@ -285,21 +285,24 @@ def read_fresh_active_token(account_id: int) -> str | None:
     Returns the access token string, or None if the stores don't belong
     to this account or are unreadable.
     """
-    # Identity must reach resolver consensus before any raw store can supply an
-    # "active" token. This prevents a matching file from winning while the
-    # Keychain authority belongs to another account.
+    # The authority store decides the identity; a required mirror that drifts
+    # is reported as evidence, not as a conflict. Gate on that observation
+    # first so a stale file can never make another account's token "active".
     if read_active_account_id() != account_id:
         return None
 
-    # Consensus guarantees required stores describe the same payload. Read raw
-    # bytes only now, because this caller genuinely needs the access token.
+    # The observation does NOT promise the file mirror holds the same account
+    # as the authority, so every raw read below re-checks _jackedAccountId.
     kc_data = read_platform_credentials()
     if kc_data and kc_data.get("_jackedAccountId") == account_id:
         token = kc_data.get("claudeAiOauth", {}).get("accessToken")
         if token:
             return token
 
-    # Fall back to global .credentials.json
+    # Fall back to global .credentials.json. The _jackedAccountId equality
+    # check below is what keeps this fallback same-account: on macOS the file
+    # mirror can legitimately name a different account while the authority
+    # observation above resolved. Do not remove it as redundant.
     cred_path = Path.home() / ".claude" / ".credentials.json"
     if cred_path.exists() and not cred_path.is_symlink():
         try:
@@ -320,9 +323,10 @@ def read_active_account_id() -> int | None:
     Consulted by all paths that must NOT rotate the active account's CC
     refresh token (architecture doc §7.1, §7.2, §7.3 + invariant I2).
 
-    Returns an ID only when the exact-build canonical resolver reports store
-    consensus. Never raises; unsupported, missing, and conflicting states all
-    resolve to None.
+    Returns an ID only when the canonical resolver RESOLVES an identity from
+    the authority store; required-mirror drift is carried as evidence rather
+    than suppressing the identity. Never raises; unsupported, missing, and
+    conflicting states all resolve to None.
     """
     try:
         from jacked.credentials.resolver import ResolverState
@@ -472,8 +476,13 @@ reconcile_outgoing_credentials = reconcile_credentials_from_live_store
 def write_platform_credentials(data: dict) -> bool:
     """Write credentials to the platform's native credential store.
 
-    macOS: Security.framework Keychain entry with the full service/account
-    locator. Credential bytes never appear in a subprocess argument.
+    macOS: a Keychain generic-password entry written through the signed
+    /usr/bin/security tool, addressed by the full service/account locator.
+    Bytes are handed to the tool on stdin. A payload too large for the tool's
+    stdin line limit is refused unless the explicit
+    JACKED_KEYCHAIN_ARGV_FALLBACK=1 opt-in is set, and under that opt-in the
+    bytes do appear in a subprocess argument, briefly readable by other local
+    processes.
 
     Linux/Windows: no-op (they use .credentials.json)
 
