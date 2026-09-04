@@ -62,6 +62,15 @@ def _reset_claude_identity_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_keychain_latches():
+    from jacked.credentials.macos_store import clear_keychain_latches
+
+    clear_keychain_latches()
+    yield
+    clear_keychain_latches()
+
+
+@pytest.fixture(autouse=True)
 def _block_browser_open():
     """Prevent any test from opening a real browser window.
 
