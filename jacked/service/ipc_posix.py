@@ -6,6 +6,7 @@ import os
 import socket
 import stat
 import struct
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -22,6 +23,30 @@ from jacked.service.ipc_protocol import (
 )
 
 
+_HOST_IS_DARWIN = sys.platform == "darwin"
+
+
+def _darwin_peer_identity(connection: socket.socket) -> str:
+    """Read peer credentials with Darwin's native getpeereid(2)."""
+
+    import ctypes
+
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    getpeereid = libc.getpeereid
+    getpeereid.argtypes = [
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    getpeereid.restype = ctypes.c_int
+    uid = ctypes.c_uint()
+    gid = ctypes.c_uint()
+    if getpeereid(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return f"uid:{uid.value}"
+
+
 def posix_peer_identity(connection: socket.socket) -> str:
     """Return the kernel-authenticated UID of a UDS peer."""
 
@@ -34,6 +59,8 @@ def posix_peer_identity(connection: socket.socket) -> str:
         )
         _pid, uid, _gid = struct.unpack("3i", credentials)
         return f"uid:{uid}"
+    if _HOST_IS_DARWIN:
+        return _darwin_peer_identity(connection)
     raise OSError("peer credentials are unavailable on this POSIX platform")
 
 

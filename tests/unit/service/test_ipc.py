@@ -1,3 +1,6 @@
+import os
+import socket
+import sys
 import time
 
 import pytest
@@ -15,6 +18,7 @@ from jacked.service.ipc import (
     send_native_control,
     windows_named_pipe_policy,
 )
+from jacked.service.ipc_posix import posix_peer_identity
 
 
 def _request(**changes):
@@ -127,6 +131,29 @@ def test_native_control_address_and_server_select_windows_pipe(tmp_path):
         platform="win32",
     )
     assert isinstance(server, WindowsControlServer)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX peer credentials")
+def test_real_socket_peer_identity_matches_current_user():
+    left, right = socket.socketpair()
+    try:
+        assert posix_peer_identity(left) == f"uid:{os.getuid()}"
+        assert posix_peer_identity(right) == f"uid:{os.getuid()}"
+    finally:
+        left.close()
+        right.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin getpeereid fallback")
+def test_darwin_peer_identity_uses_native_getpeereid():
+    left, right = socket.socketpair()
+    try:
+        from jacked.service.ipc_posix import _darwin_peer_identity
+
+        assert _darwin_peer_identity(left) == f"uid:{os.getuid()}"
+    finally:
+        left.close()
+        right.close()
 
 
 def test_send_native_control_dispatches_without_platform_fallback(
