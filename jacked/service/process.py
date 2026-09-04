@@ -253,13 +253,8 @@ def _windows_process_liveness(pid: int) -> bool | None:
         kernel32.CloseHandle(handle)
 
 
-def process_liveness(pid: int) -> bool | None:
-    """Return True for alive, False for dead, and None when indeterminate."""
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        return _windows_process_liveness(pid)
-
+def _posix_process_liveness(pid: int) -> bool | None:
+    """Probe a POSIX PID without conflating access denial with absence."""
     try:
         os.kill(pid, 0)
         return True
@@ -269,6 +264,15 @@ def process_liveness(pid: int) -> bool | None:
         return True
     except OSError:
         return None
+
+
+def process_liveness(pid: int) -> bool | None:
+    """Return True for alive, False for dead, and None when indeterminate."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return _windows_process_liveness(pid)
+    return _posix_process_liveness(pid)
 
 
 def is_process_alive(pid: int) -> bool:

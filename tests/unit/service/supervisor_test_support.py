@@ -17,6 +17,8 @@ def _secure_test_path(path: Path) -> None:
     if os.name == "nt":
         from jacked.service.windows_security import secure_windows_path
 
+        if path.parent.exists():
+            secure_windows_path(path.parent)
         secure_windows_path(path)
 
 

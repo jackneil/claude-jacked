@@ -448,9 +448,12 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     config_dir = ACCOUNTS_DIR / str(account_id)
 
     # Refuse symlinks on the directory itself (defense-in-depth)
-    if config_dir.exists() and config_dir.is_symlink():
+    # is_symlink() uses lstat and also catches a broken link. Checking
+    # exists() first misses broken Windows links and lets mkdir fail outside
+    # the intended, user-facing refusal path.
+    if config_dir.is_symlink():
         raise click.ClickException(
-            f"Account dir is a symlink — refusing to use: {config_dir}"
+            f"Account dir is a symlink; refusing to use: {config_dir}"
         )
 
     # Create dir with user-only permissions

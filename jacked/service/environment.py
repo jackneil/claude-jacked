@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 
@@ -102,7 +102,11 @@ def posix_preinterpreter_command(
 ) -> tuple[str, ...]:
     """Return argv that clears the environment before Python is executed."""
 
-    if not PurePosixPath(runtime).is_absolute() or not argv or argv[0] != "-I":
+    # ServiceSpec already validates the runtime using the host platform's path
+    # rules. Keep this boundary independently defensive without interpreting
+    # a Windows drive path as POSIX when cross-platform serializer tests render
+    # every supervisor on every CI host.
+    if not os.path.isabs(runtime) or not argv or argv[0] != "-I":
         raise ValueError("an absolute runtime and isolated Python argv are required")
     assignments = tuple(
         f"{key}={_validate_plain(value, key)}"

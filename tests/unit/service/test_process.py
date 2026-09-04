@@ -203,10 +203,10 @@ class TestIsProcessAlive:
         assert _windows_process_liveness(12345) is None
 
     def test_posix_permission_error_means_process_exists(self):
-        from jacked.service.process import process_liveness
+        from jacked.service.process import _posix_process_liveness
 
         with patch("os.kill", side_effect=PermissionError):
-            assert process_liveness(12345) is True
+            assert _posix_process_liveness(12345) is True
 
 
 class TestCheckPort:
