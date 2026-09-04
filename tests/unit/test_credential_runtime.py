@@ -7,6 +7,8 @@ from unittest import mock
 
 import pytest
 
+from tests._platform import posix_file_modes_enforced
+
 from jacked.credentials.file_store import FileCredentialStore
 from jacked.credentials.models import (
     CredentialCapability,
@@ -131,7 +133,10 @@ def test_linux_activation_writes_file_authority_end_to_end(tmp_path: Path) -> No
     assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
     written = home / ".claude" / ".credentials.json"
     assert written.exists()
-    assert (written.stat().st_mode & 0o777) == 0o600
+    if posix_file_modes_enforced():
+        # Windows reports 0o666 regardless of chmod; there the file's privacy
+        # is the profile directory's ACL, which this assertion cannot see.
+        assert (written.stat().st_mode & 0o777) == 0o600
     assert '"_jackedAccountId":7' in written.read_text(encoding="utf-8").replace(" ", "")
 
 
