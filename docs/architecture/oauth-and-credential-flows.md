@@ -77,17 +77,20 @@ secret-free resolver snapshot.
 
 Before the new activation path can mutate credentials, it resolves the actual
 Claude executable, runs `claude --version`, follows the executable to its real
-path, and hashes its bytes. `CapabilityRegistry` matches this identity on:
+path, and hashes its bytes. `CapabilityRegistry` then looks up a certified
+credential-store topology for that identity on:
 
-- executable SHA-256;
-- reported build version;
-- config mode (`global` or `scoped`);
 - operating system;
-- machine architecture.
+- config mode (`global` or `scoped`).
 
-The installed path is evidence but is not part of the registry key. Relocating
-identical certified bytes therefore does not invalidate an otherwise exact
-match.
+The reported build must also be at or above the record's certified floor. A
+build past the record's "inspected through" version still matches and adds the
+`build-newer-than-inspected` marker to the resolution evidence.
+
+The installed path, the executable SHA-256, the machine architecture, and the
+reported build are carried on the resolved identity and recorded as evidence;
+none of them is part of the registry key. A new Claude release or a relocated
+binary therefore does not by itself invalidate a match.
 
 An unknown platform or config mode, or a build below the certified floor,
 resolves to `unsupported` with `can_mutate=False`; digest and architecture are
@@ -392,7 +395,7 @@ credential file.
 | File | Responsibility |
 | --- | --- |
 | `jacked/credentials/canonical.py` | Strict JSON parsing, canonical bytes, identity, digest |
-| `jacked/credentials/capabilities.py` | Exact-build and platform capability registry |
+| `jacked/credentials/capabilities.py` | Topology-keyed capability registry (platform, config mode, build floor) |
 | `jacked/credentials/runtime.py` | Production capability assembly and activation entry points |
 | `jacked/credentials/macos_store.py` | Keychain authority adapter driven by the signed security tool |
 | `jacked/credentials/file_store.py` | Cross-platform durable JSON file adapter |
