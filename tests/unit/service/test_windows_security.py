@@ -134,7 +134,7 @@ def test_incomplete_fixed_name_locks_recover_to_private_dacls(tmp_path):
         lease.release()
 
     artifact = root / "supervisors" / "jacked.xml"
-    artifact.parent.mkdir()
+    ensure_private_windows_directory(artifact.parent)
     lock_path = artifact.parent / ".ai.hank.jacked.transition.lock"
     lock_path.write_bytes(b"")
     with SupervisorTransitionLease(artifact, "ai.hank.jacked"):

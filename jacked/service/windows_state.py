@@ -27,10 +27,13 @@ def ensure_private_windows_file(path: Path) -> None:
         inspected.is_directory
         or inspected.is_reparse_point
         or inspected.link_count != 1
-        or not inspected.owner_matches
     ):
         raise ValueError("private file has unsafe Windows ownership or type")
-    if not inspected.dacl_private:
+    if not inspected.owner_matches and not inspect_windows_path(
+        path.parent
+    ).private_for(directory=True):
+        raise ValueError("private file has unsafe Windows ownership or type")
+    if not inspected.owner_matches or not inspected.dacl_private:
         secure_windows_path(path)
 
 
