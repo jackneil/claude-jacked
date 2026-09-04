@@ -187,7 +187,7 @@ class TestUpgradeCommand:
             result = CliRunner().invoke(main, ["upgrade"])
 
         assert result.exit_code == 0, result.output
-        assert "package upgraded" in result.output.lower()
+        assert "upgrade complete" in result.output.lower()
         assert "quit the old tray" in result.output.lower()
         assert "service start" in result.output.lower()
         assert mock_run.call_count == 2
