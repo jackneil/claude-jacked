@@ -7,7 +7,8 @@ from pathlib import Path
 from jacked.service.windows_security import inspect_windows_path, secure_windows_path
 
 
-def _reject_reparse_ancestors(path: Path) -> None:
+def reject_windows_reparse_ancestors(path: Path) -> None:
+    """Reject any existing reparse point in a Windows path chain."""
     current = path
     while True:
         if current.exists() or current.is_symlink():
@@ -21,7 +22,7 @@ def _reject_reparse_ancestors(path: Path) -> None:
 def ensure_private_windows_file(path: Path) -> None:
     """Validate ownership/type and repair a current-user file's private DACL."""
 
-    _reject_reparse_ancestors(path.parent)
+    reject_windows_reparse_ancestors(path.parent)
     inspected = inspect_windows_path(path)
     if (
         inspected.is_directory
@@ -40,7 +41,7 @@ def ensure_private_windows_file(path: Path) -> None:
 def ensure_private_windows_directory(path: Path) -> None:
     """Create or validate a non-reparse, current-user-owned private directory."""
 
-    _reject_reparse_ancestors(path.parent)
+    reject_windows_reparse_ancestors(path.parent)
     existed = path.exists() or path.is_symlink()
     if not existed:
         path.mkdir(parents=True, exist_ok=True)
