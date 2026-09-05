@@ -8,7 +8,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from jacked.api.credential_helpers import build_oauth_data
+from jacked.api.credential_helpers import build_oauth_data, update_claude_config_email
 from jacked.findbin import find_bin
 from jacked.web.credential_repository import DatabaseCredentialSwitchRepository
 
@@ -21,7 +21,7 @@ from .capabilities import (
 )
 from .file_store import FileCredentialStore
 from .key import FileInstallKeyProvider, machine_install_id
-from .lease import ProcessSwitchLease
+from .lease import CompositeSwitchLease, FileSwitchLease, ProcessSwitchLease
 from .macos_store import MacOSCredentialStore
 from .models import (
     CapabilityMode,
@@ -115,6 +115,21 @@ _SHIPPED_RECORDS = (
 
 SHIPPED_REGISTRY = CapabilityRegistry(_SHIPPED_RECORDS)
 _PROCESS_SWITCH_LEASE = ProcessSwitchLease()
+SWITCH_LEASE_RELATIVE_PATH = ("jacked-service-v2", "credential-switch.lock")
+
+
+def switch_lease_for(home: Path) -> CompositeSwitchLease:
+    """Serialize switches against every thread AND every other process.
+
+    ``jacked launch`` activates an account from its own process while the
+    dashboard service can activate one from the API process. Both leases are
+    required: the thread lock separates threads that share a file lock, the
+    file lock separates the processes.
+    """
+    return CompositeSwitchLease(
+        _PROCESS_SWITCH_LEASE,
+        FileSwitchLease(home / ".claude" / Path(*SWITCH_LEASE_RELATIVE_PATH)),
+    )
 
 _identity_cache_lock = threading.Lock()
 _identity_cache: dict[tuple[str, str], tuple[tuple[int, int], ExecutableIdentity]] = {}
@@ -236,19 +251,45 @@ def _engine_for(
             repository=DatabaseCredentialSwitchRepository(db),
             authority=authority,
             mirrors=stores,
+            identity_publisher=claude_config_identity_publisher(home),
             writer_fence=WriterFence(StaticWriterInspector((), is_complete=False)),
             install_key=key_provider,
             machine_install_id=install_id,
             snapshot_sink=FileResolverSnapshotSink(
                 home / ".claude" / "jacked-resolver-snapshot.json"
             ),
-            switch_lease=_PROCESS_SWITCH_LEASE,
+            switch_lease=switch_lease_for(home),
             # An uninspected newer build may have moved its store; a missing
             # authority then looks identical to "never logged in". Refuse to
             # create it so jacked never writes where Claude no longer reads.
             allow_missing_authority=NEWER_THAN_INSPECTED not in resolution.evidence,
         )
     )
+
+
+def claude_config_identity_publisher(home: Path):
+    """Return the publisher that mirrors a switch into ``<home>/.claude.json``.
+
+    Claude Code keeps its OAuth token in memory and re-reads the credential
+    store only when the ``oauthAccount`` identity in its config changes. Every
+    switch must therefore republish that identity, or running sessions keep
+    the previous account until they restart (regression fixed 2026-09-04).
+    """
+
+    def publish(request: SwitchRequest) -> None:
+        # strict=True: a symlinked or unwritable config must raise, not log.
+        # The engine reports "sessions follow" from this call returning, so a
+        # silent failure would promise an activation that never happened.
+        update_claude_config_email(
+            request.email,
+            request.display_name,
+            request.organization_id,
+            request.organization_name,
+            home=home,
+            strict=True,
+        )
+
+    return publish
 
 
 def activate_account(db, account: dict, context: SwitchContext, operation_id: str) -> SwitchResult:
@@ -275,6 +316,8 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
         payload=payload,
         context=context,
         interaction=InteractionMode.FOREGROUND,
+        display_name=account.get("display_name") or None,
+        organization_name=account.get("organization_name") or None,
     )
     return engine.activate(request)
 

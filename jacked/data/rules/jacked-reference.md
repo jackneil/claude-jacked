@@ -209,6 +209,9 @@ Language-specific coding standards enforced through templates and git hooks.
 | Hook not running your code changes | Check `~/.claude/settings.json` hook path -- may point to stale uv/pip install instead of current env |
 | "jacked: command not found" | Run `uv tool update-shell` and restart terminal |
 | Dangerous permission wildcards | Run `jacked permissions audit --fix` to find and prune them |
+| Service will not start | Run `jacked service status`. It prints the last start failure with its reason. The statusline shows `jacked service down` while the service is not running. Correct the cause, then run `jacked service restart` |
+| Upgrade left the service down | Read `~/.claude/jacked-update-failed.txt`. `jacked upgrade` is a transaction: it runs `jacked service preflight` before it replaces the old install, and it reinstalls the previous version if the new one cannot start. The file names both versions and the manual recovery commands |
+| Is this build able to start? | Run `jacked service preflight`. Exit code 0 means the build can provision its service contract. Exit code 1 prints `[FAIL] <error type>: <reason>`. The command starts no process and changes no supervisor. Add `--json` for one machine-readable object |
 
 ## Environment Variables
 

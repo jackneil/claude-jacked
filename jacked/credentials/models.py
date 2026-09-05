@@ -43,6 +43,9 @@ class SwitchContext(str, Enum):
     OAUTH = "oauth"
     LAUNCH = "launch"
     AUTO_SWAP = "auto_swap"
+    # A foreign process (a Claude Code token refresh) replaced the authority.
+    # jacked republishes the desired account over that write.
+    REASSERT = "reassert"
 
 
 class SwitchOutcome(str, Enum):
@@ -208,6 +211,12 @@ class PendingSwitchRecord:
     canonicalizer_version: int
     before_hmac: str
     target_hmac: str
+    # Non-secret identity, carried so crash recovery can republish it to
+    # Claude's config. They are optional: a row written by an older jacked
+    # has none, and recovery then finalizes without republishing the identity.
+    email: str | None = None
+    display_name: str | None = None
+    organization_name: str | None = None
 
 
 @dataclass(frozen=True)

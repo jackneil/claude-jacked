@@ -33,10 +33,53 @@ UPDATE_STATUS_FILE: Path = CLAUDE_DIR / "jacked-update-status.json"
 
 STALE_SUCCEEDED_SECONDS: int = 600  # 10 minutes
 STALE_IN_PROGRESS_SECONDS: int = 300  # 5 minutes
+# Passed as `updater_pid` by an updater that cannot be probed (a Windows batch
+# whose Python shim exits at once): the record then carries no pid and the
+# abandoned-update check uses the mtime rule alone.
+NO_UPDATER_PID: int = 0
 
 
 class LockBusy(Exception):
     """Another updater is actively in-flight — refuse to clobber its state."""
+
+
+def acquire_update_lock(path: Path):
+    """Take the exclusive update lock, or return None when one is held.
+
+    `init_or_adopt_status` inspects the status file and then writes it. Two
+    upgrades that start inside the same second both read "no in-flight
+    updater" and both proceed, so the mtime rule alone cannot serialize a
+    package install against a service restart. This is a real OS lock on a
+    sidecar file (`<status>.lock`), taken before that read-check-write and
+    held for the whole update.
+
+    Returns a handle whose ``close()`` releases the lock (it is also a
+    context manager), or None when another process already holds it.
+    
+
+    Scope: the lock serializes updaters that run as Python processes (the
+    POSIX CLI upgrade and the tray updater). A Windows batch cannot hold an
+    OS lock across its steps, so the Windows helpers rely on the status
+    record's in-flight check (``jacked _update_status_init``, exit 2).
+    """
+    from contextlib import ExitStack
+
+    from jacked.credentials.lease import FileSwitchLease
+
+    stack = ExitStack()
+    try:
+        if not stack.enter_context(FileSwitchLease(_lock_path(path)).acquire()):
+            stack.close()
+            return None
+    except Exception:
+        stack.close()
+        raise
+    return stack
+
+
+def _lock_path(path: Path) -> Path:
+    """Return the advisory lock file that guards one status file."""
+    return path.with_name(path.name + ".lock")
 
 
 def _now_iso() -> str:
@@ -95,6 +138,72 @@ def read_status(path: Path) -> Optional[dict]:
     return data
 
 
+def abandoned_status(path: Path) -> Optional[dict]:
+    """Return the raw record of an update that was interrupted, else None.
+
+    `read_status` hides an `in_progress` file older than
+    STALE_IN_PROGRESS_SECONDS so the dashboard shows no zombie banner. Hiding
+    it is not the same as telling the user: the machine may be running a build
+    whose settings never migrated. The tray reads this at boot and turns it
+    into a recovery file.
+
+    The mtime rule alone is not enough. One phase can legitimately run longer
+    than STALE_IN_PROGRESS_SECONDS (a slow package install on a slow link),
+    and a supervisor that relaunches the tray mid-update would then read a
+    LIVE update as abandoned, mark it failed and write a false recovery file.
+    So a record that names its updater's pid is abandoned only when that
+    process is gone. A record with no pid keeps the mtime rule.
+
+    >>> import json, os, tempfile, time
+    >>> from pathlib import Path
+    >>> with tempfile.TemporaryDirectory() as d:
+    ...     p = Path(d) / "status.json"
+    ...     _ = p.write_text(json.dumps({"overall": "in_progress",
+    ...                                  "current_phase": "migrating_settings"}))
+    ...     old = time.time() - STALE_IN_PROGRESS_SECONDS - 60
+    ...     os.utime(p, (old, old))
+    ...     abandoned_status(p)["current_phase"]
+    'migrating_settings'
+    """
+    data = _read_raw(path)
+    if data is None or data.get("overall") != "in_progress":
+        return None
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+    if age <= STALE_IN_PROGRESS_SECONDS:
+        return None
+    # A proven-live updater is never abandoned. Proven-dead or indeterminate
+    # (no pid, probe failed) falls back to the mtime rule above.
+    if _updater_liveness(data) is True:
+        return None
+    return data
+
+
+def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
+    """None means "this process"; NO_UPDATER_PID means "record no pid"."""
+    if updater_pid is None:
+        return os.getpid()
+    if updater_pid == NO_UPDATER_PID:
+        return None
+    return updater_pid
+
+
+def _updater_liveness(data: dict) -> Optional[bool]:
+    """True when the recording process runs, False when it is gone, None when
+    the record names no usable pid or the probe is indeterminate."""
+    pid = data.get("updater_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    from jacked.service.process import process_liveness
+
+    try:
+        return process_liveness(pid)
+    except Exception:  # noqa: BLE001 - a probe failure is indeterminate, not proof
+        return None
+
+
 def read_status_with_mtime(path: Path) -> tuple[Optional[dict], Optional[str]]:
     """Returns (data, mtime_iso). Used by /api/update/status."""
     data = read_status(path)
@@ -114,15 +223,27 @@ def init_status(
     to_version: str,
     method: str,
     log_path: Optional[str] = None,
+    updater_pid: Optional[int] = None,
+    preinit: bool = False,
 ) -> None:
     """Create a fresh status file. Raises LockBusy if another updater is active.
+
+    ``preinit`` marks the record the TRAY writes moments before it spawns the
+    updater, so the dashboard has something to show at once. Only a record
+    carrying this marker may be adopted by the updater that follows; a fresh
+    record from another updater is a busy updater, phases or not.
+
+    `updater_pid` names the process that drives this update, so a reader can
+    tell a slow phase from an abandoned one. It defaults to this process.
 
     Clobbers:
       - no prior file
       - prior succeeded/failed file
       - prior in_progress file older than STALE_IN_PROGRESS_SECONDS
+      - prior in_progress file whose recorded updater pid is proven dead
     Refuses:
-      - prior in_progress file fresher than that
+      - prior in_progress file fresher than that whose updater is alive or
+        cannot be probed
     """
     prior = _read_raw(path)
     if prior is not None and prior.get("overall") == "in_progress":
@@ -130,7 +251,13 @@ def init_status(
             age = time.time() - path.stat().st_mtime
         except OSError:
             age = 0
-        if age <= STALE_IN_PROGRESS_SECONDS:
+        # The write side agrees with the read side: a record whose updater is
+        # proven dead is clobbered at once, not after the mtime window. The
+        # tray's pre-init is exempt: the tray that wrote it is expected to be
+        # gone by the time the updater arrives, and adoption consumes it.
+        if age <= STALE_IN_PROGRESS_SECONDS and (
+            prior.get("preinit") is True or _updater_liveness(prior) is not False
+        ):
             raise LockBusy(
                 "Another updater is in-flight (started "
                 f"{prior.get('started_at', '?')}, last updated "
@@ -148,7 +275,10 @@ def init_status(
         "error": None,
         "recovery": None,
         "log_path": log_path,
+        "updater_pid": _resolve_updater_pid(updater_pid),
     }
+    if preinit:
+        data["preinit"] = True
     _atomic_write(path, data)
 
 
@@ -158,6 +288,7 @@ def init_or_adopt_status(
     to_version: str,
     method: str,
     log_path: Optional[str] = None,
+    updater_pid: Optional[int] = None,
 ) -> str:
     """Init a fresh status file, or adopt the tray's pre-init one.
 
@@ -165,10 +296,11 @@ def init_or_adopt_status(
     the user clicks update so the dashboard has something from t=0. The
     detached updater — POSIX Python or the Windows cmd.exe shim — then races
     to init again moments later and hits LockBusy on the tray's own
-    seconds-old file. That's not a real collision: a file with no phases and
-    no current_phase is the tray's pre-init, so adopt it without rewriting
-    (its metadata is already correct). A file with an open phase IS a real
-    concurrent updater — re-raise LockBusy so callers refuse.
+    seconds-old file. That's not a real collision: a file the tray wrote with
+    ``preinit=True`` and no phases is the tray's pre-init, so adopt it without
+    rewriting (its metadata is already correct) and consume the marker. Any
+    other in-flight file, phases or not, IS a real concurrent updater: re-raise
+    LockBusy so callers refuse.
 
     Returns ``"initialized"`` (wrote a fresh file) or ``"adopted"`` (reused
     the tray's pre-init metadata).
@@ -177,17 +309,54 @@ def init_or_adopt_status(
     >>> from pathlib import Path
     >>> with tempfile.TemporaryDirectory() as d:
     ...     p = Path(d) / "status.json"
+    ...     init_status(p, "1.0.0", "1.1.0", "uv", preinit=True)
     ...     init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
-    ...     init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
-    'initialized'
+    ...     try:
+    ...         init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
+    ...     except LockBusy:
+    ...         print("busy")
     'adopted'
+    busy
     """
     try:
-        init_status(path, from_version, to_version, method, log_path=log_path)
+        init_status(
+            path,
+            from_version,
+            to_version,
+            method,
+            log_path=log_path,
+            updater_pid=updater_pid,
+        )
         return "initialized"
     except LockBusy:
         prior = _read_raw(path) or {}
-        if not (prior.get("phases") or []) and prior.get("current_phase") is None:
+        if (
+            prior.get("preinit") is True
+            and not (prior.get("phases") or [])
+            and prior.get("current_phase") is None
+        ):
+            # Claim the record for THIS process. The tray that pre-created it
+            # is about to exit, and a record naming a dead pid would read as
+            # abandoned the moment this update runs longer than the mtime rule.
+            # The marker is consumed here: a second updater arriving later sees
+            # a claimed record and is refused like any other busy updater.
+            prior.pop("preinit", None)
+            claimed = _resolve_updater_pid(updater_pid)
+            if claimed is None:
+                # An updater that cannot be probed (a Windows batch) must
+                # not leave the dead tray's pid on the record.
+                prior.pop("updater_pid", None)
+            else:
+                prior["updater_pid"] = claimed
+            # A claim that cannot be written leaves the tray's dead pid on
+            # the record; the update would then read as abandoned mid-run.
+            # Surface it as the LockBusy the caller already handles.
+            try:
+                _atomic_write(path, prior)
+            except OSError as exc:
+                raise LockBusy(
+                    f"could not claim the update status record: {exc}"
+                ) from exc
             return "adopted"
         raise
 

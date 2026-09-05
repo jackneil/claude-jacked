@@ -46,7 +46,13 @@ def render_launchd(
         "ProgramArguments": list(command),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
-        "ProcessType": "Background",
+        # The tray is a user-facing agent with a bounded readiness budget.
+        # launchd throttles the CPU and I/O of Background jobs "to prevent
+        # them from disrupting the user experience" (launchd.plist(5)); on a
+        # loaded machine that left the service still importing Python two
+        # minutes into its 90s window (2026-09-05). Interactive is the class
+        # Apple prescribes for agents the user sees and waits on.
+        "ProcessType": "Interactive",
         "JackedOwner": marker["owner"],
         "JackedServiceID": marker["service_id"],
         "JackedSchemaVersion": marker["schema_version"],
@@ -209,10 +215,13 @@ def restart_owned_supervisor(
     artifact_path: Path,
     *,
     environment: dict[str, str],
-    run: Any = subprocess.run,
+    run: Any | None = None,
     uid: int | None = None,
 ) -> SupervisorAction:
     """Restart only after disk and native-manager identities both match."""
+    # Resolved at call time so a test-time patch of subprocess.run is honored;
+    # a def-time default would bind the real function before any patch.
+    run = subprocess.run if run is None else run
 
     expected = render_for_spec(spec, environment=environment)
     try:
@@ -299,10 +308,13 @@ def install_owned_supervisor(
     artifact_path: Path,
     *,
     environment: dict[str, str],
-    run: Any = subprocess.run,
+    run: Any | None = None,
     uid: int | None = None,
 ) -> SupervisorAction:
     """Reconcile and activate under one service-scoped transition lease."""
+    # Resolved at call time so a test-time patch of subprocess.run is honored;
+    # a def-time default would bind the real function before any patch.
+    run = subprocess.run if run is None else run
 
     expected = render_for_spec(spec, environment=environment)
     try:
@@ -338,6 +350,33 @@ def _install_owned_locked(
     return SupervisorAction(False, "refused", "manual supervisor")
 
 
+def is_known_legacy_artifact(
+    path: Path, service_id: str, kind: SupervisorKind
+) -> bool:
+    """Report whether ``path`` holds a pre-v2 definition jacked itself wrote.
+
+    A known legacy definition is not foreign: ``install_owned_supervisor``
+    recognises it, backs it up, and replaces it with the owned artifact.
+    Callers use this to tell "jacked's own old layout" apart from a genuinely
+    foreign artifact, which is never touched.
+
+    LAUNCHD inspects the plist at ``path``. TASK_SCHEDULER inspects the legacy
+    Startup VBS script at ``path``; the registered task itself has no pre-v2
+    form. SYSTEMD_USER and MANUAL have no recognised legacy layout, so they
+    always report False.
+    """
+
+    if kind is SupervisorKind.LAUNCHD:
+        from jacked.service.supervisors.launchd import _legacy_arguments
+
+        return _legacy_arguments(path, service_id) is not None
+    if kind is SupervisorKind.TASK_SCHEDULER:
+        from jacked.service.supervisors.task_scheduler import _known_legacy_vbs
+
+        return _known_legacy_vbs(path) is not None
+    return False
+
+
 def _require_kind(spec: ServiceSpec, expected: SupervisorKind) -> None:
     if spec.supervisor is not expected:
         raise ValueError(f"ServiceSpec supervisor must be {expected.value}")
@@ -348,10 +387,13 @@ def uninstall_owned_supervisor(
     artifact_path: Path,
     *,
     environment: dict[str, str],
-    run: Any = subprocess.run,
+    run: Any | None = None,
     uid: int | None = None,
 ) -> SupervisorAction:
     """Load the evidence-qualified uninstall implementation on demand."""
+    # Resolved at call time so a test-time patch of subprocess.run is honored;
+    # a def-time default would bind the real function before any patch.
+    run = subprocess.run if run is None else run
     from jacked.service.supervisors.uninstall import uninstall_owned_supervisor
 
     return uninstall_owned_supervisor(
@@ -365,6 +407,7 @@ __all__ = [
     "SupervisorArtifact",
     "inspect_artifact",
     "install_owned_supervisor",
+    "is_known_legacy_artifact",
     "reconcile_artifact",
     "render_for_spec",
     "render_launchd",

@@ -99,6 +99,9 @@ packages = ["jacked"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "real_process: the test deliberately executes a sandboxed stub process (opts out of the real-service tripwire in tests/conftest.py)",
+]
 
 # Supply-chain hardening: uv resolves only versions uploaded before this date.
 # Defends against smash-and-grab attacks (axios 1.14.1, Shai-Hulud, etc.) — gives

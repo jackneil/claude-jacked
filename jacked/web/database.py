@@ -349,6 +349,9 @@ CREATE TABLE IF NOT EXISTS credential_switches (
     canonicalizer_version INTEGER NOT NULL,
     before_hmac TEXT,
     target_hmac TEXT NOT NULL,
+    email TEXT,
+    display_name TEXT,
+    organization_name TEXT,
     phase TEXT NOT NULL,
     outcome TEXT,
     observed_account_id INTEGER,
@@ -731,6 +734,23 @@ class Database:
                     try:
                         conn.execute(
                             f"ALTER TABLE swap_log ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+            # Migration: carry the non-secret switch identity on the journal row.
+            # Crash recovery republishes it to Claude's config; without it a
+            # recovered switch can only tell the user to restart the session.
+            cursor = conn.execute("PRAGMA table_info(credential_switches)")
+            switch_cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_def in [
+                ("email", "TEXT"),
+                ("display_name", "TEXT"),
+                ("organization_name", "TEXT"),
+            ]:
+                if col_name not in switch_cols:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE credential_switches ADD COLUMN {col_name} {col_def}"
                         )
                     except sqlite3.OperationalError:
                         pass
@@ -2234,10 +2254,11 @@ class Database:
                 """INSERT INTO credential_switches
                    (operation_id, account_id, previous_account_id, organization_id,
                     machine_install_id, context, capability_mode, capability_epoch, backend_locator,
-                    canonicalizer_version, before_hmac, target_hmac, phase,
+                    canonicalizer_version, before_hmac, target_hmac,
+                    email, display_name, organization_name, phase,
                     outcome, observed_account_id, observed_at, detail_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     values["operation_id"],
                     values["account_id"],
@@ -2251,6 +2272,9 @@ class Database:
                     values.get("canonicalizer_version", 1),
                     values.get("before_hmac"),
                     values["target_hmac"],
+                    values.get("email"),
+                    values.get("display_name"),
+                    values.get("organization_name"),
                     values.get("phase", "pending"),
                     values.get("outcome"),
                     values.get("observed_account_id"),

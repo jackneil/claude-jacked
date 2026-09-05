@@ -187,3 +187,58 @@ def test_pending_audit_prefers_validated_desired_previous_identity(tmp_path):
 
     row = db.get_credential_switch("op-desired-audit")
     assert row["previous_account_id"] == desired["id"]
+
+
+def _pending_with_identity(**changes) -> PendingSwitchRecord:
+    values = {
+        "operation_id": "op-identity",
+        "account_id": 5,
+        "organization_id": "org-5",
+        "context": SwitchContext.MANUAL,
+        "capability_mode": CapabilityMode.GLOBAL_COOPERATIVE,
+        "machine_install_id": "machine-1",
+        "backend_locator": "file:test",
+        "capability_epoch": 3,
+        "canonicalizer_version": 1,
+        "before_hmac": "before-verifier",
+        "target_hmac": "target-verifier",
+        "email": "five@example.com",
+        "display_name": "Five Example",
+        "organization_name": "Example Org",
+    }
+    values.update(changes)
+    return PendingSwitchRecord(**values)
+
+
+def test_pending_row_carries_the_identity_recovery_must_republish(tmp_path):
+    db = Database(str(tmp_path / "jacked.db"))
+    repository = DatabaseCredentialSwitchRepository(db)
+    repository.create_pending(_pending_with_identity())
+
+    restored = repository.get_pending("op-identity")
+
+    assert restored.email == "five@example.com"
+    assert restored.display_name == "Five Example"
+    assert restored.organization_name == "Example Org"
+    # Secrets never reach the journal, only this non-secret identity.
+    row = db.get_credential_switch("op-identity")
+    assert "token" not in str(dict(row)).lower()
+
+
+def test_a_row_written_before_the_identity_columns_still_recovers(tmp_path):
+    """The columns are added by migration; older rows have none."""
+    path = tmp_path / "jacked.db"
+    db = Database(str(path))
+    with db._writer() as conn:
+        for column in ("email", "display_name", "organization_name"):
+            conn.execute(f"UPDATE credential_switches SET {column} = NULL")
+    repository = DatabaseCredentialSwitchRepository(db)
+    repository.create_pending(
+        _pending_with_identity(email=None, display_name=None, organization_name=None)
+    )
+
+    restored = repository.get_pending("op-identity")
+
+    assert restored.email is None
+    assert restored.display_name is None
+    assert restored.organization_name is None

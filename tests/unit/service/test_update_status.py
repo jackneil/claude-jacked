@@ -1,7 +1,10 @@
 """Tests for the update-status JSON reader/writer."""
 
 import os
+
+import pytest
 import time
+from pathlib import Path
 
 
 def test_init_creates_file_with_metadata(tmp_path):
@@ -174,10 +177,14 @@ def test_init_or_adopt_fresh_file_initializes(tmp_path):
 
 
 def test_init_or_adopt_over_tray_pre_init_adopts_and_preserves_metadata(tmp_path):
-    from jacked.service.update_status import init_or_adopt_status, read_status
+    from jacked.service.update_status import (
+        init_or_adopt_status,
+        init_status,
+        read_status,
+    )
     p = tmp_path / "status.json"
-    # Tray pre-init writes the real from/to metadata.
-    init_or_adopt_status(p, from_version="0.41.19", to_version="0.41.20", method="uv")
+    # Tray pre-init writes the real from/to metadata, marked as pre-init.
+    init_status(p, from_version="0.41.19", to_version="0.41.20", method="uv", preinit=True)
     # Detached updater races in moments later with a placeholder target.
     outcome = init_or_adopt_status(p, from_version="0.41.19", to_version="next", method="uv")
     assert outcome == "adopted"
@@ -305,7 +312,7 @@ def test_cli_update_status_init_exits_0_on_tray_pre_init(tmp_path, monkeypatch):
     from jacked.cli import main
     from jacked.service import update_status as us_mod
     p = tmp_path / "status.json"
-    us_mod.init_status(p, from_version="a", to_version="b", method="uv")  # tray pre-init
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv", preinit=True)  # tray pre-init
     monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
     result = CliRunner().invoke(main, ["_update_status_init", "a", "b", "uv"])
     assert result.exit_code == 0
@@ -428,3 +435,369 @@ def test_cli_update_status_exits_1_on_unknown_phase(tmp_path, monkeypatch):
     monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
     result = CliRunner().invoke(main, ["_update_status", "nonexistent_phase", "ok"])
     assert result.exit_code == 1
+
+
+class TestAbandonedStatus:
+    """A crash mid-update must be reported, not just hidden."""
+
+    @staticmethod
+    def _write(path, overall, phase, age_seconds):
+        import json
+        import os
+        import time
+
+        path.write_text(
+            json.dumps(
+                {
+                    "overall": overall,
+                    "current_phase": phase,
+                    "from_version": "0.95.0",
+                    "to_version": "0.100.0",
+                    "phases": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_a_stale_in_progress_file_is_reported_as_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "in_progress", "migrating_settings",
+                    us.STALE_IN_PROGRESS_SECONDS + 60)
+
+        # read_status hides it so the dashboard shows no zombie banner...
+        assert us.read_status(path) is None
+        # ...but the raw record is still available to warn the user.
+        record = us.abandoned_status(path)
+        assert record is not None
+        assert record["current_phase"] == "migrating_settings"
+
+    def test_a_fresh_in_progress_file_is_not_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "in_progress", "installing_package", 5)
+        assert us.abandoned_status(path) is None
+
+    def test_a_finished_update_is_never_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "failed", None, us.STALE_IN_PROGRESS_SECONDS + 60)
+        assert us.abandoned_status(path) is None
+
+    def test_a_missing_file_is_never_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        assert us.abandoned_status(tmp_path / "nope.json") is None
+
+
+class TestUpdaterPidLiveness:
+    """A live updater is never abandoned, however long its phase runs.
+
+    STALE_IN_PROGRESS_SECONDS is a heartbeat rule, not a duration limit. One
+    phase (a package install on a slow link) can legitimately run longer, and
+    a supervisor that relaunches the tray mid-update then read the LIVE update
+    as abandoned, marked it failed and wrote a false recovery file.
+    """
+
+    @staticmethod
+    def _write(path, pid, age_seconds):
+        import json
+        import os
+        import time
+
+        record = {
+            "overall": "in_progress",
+            "current_phase": "installing_package",
+            "phases": [],
+        }
+        if pid is not None:
+            record["updater_pid"] = pid
+        path.write_text(json.dumps(record), encoding="utf-8")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_init_status_records_the_updater_pid(self, tmp_path):
+        import json
+
+        from jacked.service.update_status import init_status
+
+        path = tmp_path / "status.json"
+        init_status(path, "1.0.0", "1.1.0", "uv")
+        assert json.loads(path.read_text())["updater_pid"] == os.getpid()
+
+    def test_init_status_accepts_an_explicit_updater_pid(self, tmp_path):
+        import json
+
+        from jacked.service.update_status import init_status
+
+        path = tmp_path / "status.json"
+        init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=4242)
+        assert json.loads(path.read_text())["updater_pid"] == 4242
+
+    def test_a_stale_record_whose_updater_still_runs_is_not_abandoned(
+        self, tmp_path
+    ):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, os.getpid(), us.STALE_IN_PROGRESS_SECONDS + 600)
+        assert us.abandoned_status(path) is None
+
+    def test_a_stale_record_whose_updater_is_gone_is_abandoned(self, tmp_path):
+        import subprocess
+        import sys
+
+        from jacked.service import update_status as us
+
+        # A real, definitely-dead pid: run a child to completion and reuse it.
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        path = tmp_path / "status.json"
+        self._write(path, dead.pid, us.STALE_IN_PROGRESS_SECONDS + 60)
+        record = us.abandoned_status(path)
+        assert record is not None
+        assert record["current_phase"] == "installing_package"
+
+    def test_a_record_without_a_pid_keeps_the_mtime_rule(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, None, us.STALE_IN_PROGRESS_SECONDS + 60)
+        assert us.abandoned_status(path) is not None
+
+    def test_a_garbage_pid_keeps_the_mtime_rule(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "not-a-pid", us.STALE_IN_PROGRESS_SECONDS + 60)
+        assert us.abandoned_status(path) is not None
+
+    def test_adopting_the_tray_pre_init_claims_the_pid(self, tmp_path):
+        import json
+
+        from jacked.service.update_status import init_or_adopt_status
+
+        path = tmp_path / "status.json"
+        # The tray pre-creates the file, then exits; the detached updater
+        # adopts it. A record still naming the dead tray would read as
+        # abandoned the moment the update outran the mtime rule.
+        from jacked.service.update_status import init_status
+
+        init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=999999, preinit=True)
+        assert init_or_adopt_status(path, "1.0.0", "1.1.0", "uv") == "adopted"
+        data = json.loads(path.read_text())
+        assert data["updater_pid"] == os.getpid()
+        assert data["from_version"] == "1.0.0"
+
+
+class TestExclusiveUpdateLock:
+    """Two upgrades that start in the same second must not both proceed.
+
+    `init_or_adopt_status` is a read-check-write on mtime, so it cannot
+    serialize them by itself. `acquire_update_lock` is a real OS lock.
+    """
+
+    def test_the_lock_is_granted_when_nothing_holds_it(self, tmp_path):
+        from jacked.service.update_status import acquire_update_lock
+
+        handle = acquire_update_lock(tmp_path / "status.json")
+        assert handle is not None
+        handle.close()
+
+    def test_the_lock_is_reusable_after_release(self, tmp_path):
+        from jacked.service.update_status import acquire_update_lock
+
+        path = tmp_path / "status.json"
+        first = acquire_update_lock(path)
+        assert first is not None
+        first.close()
+        second = acquire_update_lock(path)
+        assert second is not None
+        second.close()
+
+    def test_the_lock_does_not_require_an_existing_status_file(self, tmp_path):
+        from jacked.service.update_status import acquire_update_lock
+
+        path = tmp_path / "nested" / "status.json"
+        handle = acquire_update_lock(path)
+        assert handle is not None
+        handle.close()
+        assert not path.exists()
+
+    def test_another_process_holding_the_lock_refuses_this_one(self, tmp_path):
+        """The real thing: a separate process, a real cross-process lock."""
+        import subprocess
+        import sys
+
+        from jacked.service.update_status import acquire_update_lock
+
+        path = tmp_path / "status.json"
+        holder_script = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from pathlib import Path\n"
+            "from jacked.service.update_status import acquire_update_lock\n"
+            "handle = acquire_update_lock(Path(%r))\n"
+            "print('HELD' if handle is not None else 'REFUSED', flush=True)\n"
+            "sys.stdin.readline()\n"
+        ) % (str(Path(__file__).resolve().parents[3]), str(path))
+
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "HELD"
+            assert acquire_update_lock(path) is None, (
+                "a second updater took a lock another process holds"
+            )
+        finally:
+            holder.stdin.write("\n")
+            holder.stdin.flush()
+            holder.wait(timeout=10)
+        # Released with the holder: the next updater may proceed.
+        handle = acquire_update_lock(path)
+        assert handle is not None
+        handle.close()
+
+
+@pytest.mark.parametrize("pid", [2**31, 2**40, 2**70, True])
+def test_an_oversized_or_bogus_updater_pid_never_raises(tmp_path, pid):
+    """os.kill raises OverflowError (not OSError) above pid_t; a probe must not."""
+    import json
+    import os
+    import time
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps({"overall": "in_progress", "current_phase": "preflight", "updater_pid": pid}))
+    old = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+    os.utime(path, (old, old))
+    record = us.abandoned_status(path)
+    assert record is not None and record["current_phase"] == "preflight"
+
+
+def test_process_liveness_is_false_for_out_of_range_pids():
+    from jacked.service.process import is_process_alive, process_liveness
+
+    for pid in (2**31, 2**40, -5, 0):
+        assert process_liveness(pid) is False
+        assert is_process_alive(pid) is False
+
+
+def test_no_updater_pid_sentinel_records_no_pid_and_uses_the_mtime_rule(tmp_path):
+    import json
+    import os
+    import time
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=us.NO_UPDATER_PID)
+    assert "updater_pid" not in json.loads(path.read_text()) or json.loads(path.read_text())["updater_pid"] is None
+    us.begin_phase(path, "installing_package")
+    old = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+    os.utime(path, (old, old))
+    assert us.abandoned_status(path) is not None
+
+
+def test_adoption_replaces_the_dead_tray_pid_with_no_pid_for_a_batch(tmp_path):
+    import json
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999, preinit=True)  # tray pre-init
+    assert us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv", updater_pid=us.NO_UPDATER_PID) == "adopted"
+    assert json.loads(path.read_text()).get("updater_pid") is None
+
+
+def test_adoption_that_cannot_write_its_claim_is_refused(tmp_path, monkeypatch):
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999, preinit=True)
+
+    def _boom(p, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(us, "_atomic_write", _boom)
+    with pytest.raises(us.LockBusy, match="could not claim"):
+        us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv")
+
+
+def test_indeterminate_liveness_falls_back_to_the_mtime_rule(tmp_path, monkeypatch):
+    import json
+    import os
+    import time
+
+    from jacked.service import update_status as us
+
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: None)
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps({"overall": "in_progress", "current_phase": "preflight", "updater_pid": 4242}))
+    old = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+    os.utime(path, (old, old))
+    assert us.abandoned_status(path) is not None
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: True)
+    assert us.abandoned_status(path) is None
+
+
+def test_only_a_tray_preinit_record_can_be_adopted(tmp_path):
+    """Two fresh updaters must not share one record: adoption needs the marker."""
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    # A record written by ANOTHER updater (no phases yet, no preinit marker).
+    us.init_status(path, "1.0.0", "1.1.0", "uv")
+    with pytest.raises(us.LockBusy):
+        us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv")
+
+
+def test_the_preinit_marker_is_consumed_on_adoption(tmp_path):
+    import json
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999, preinit=True)
+    assert us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv") == "adopted"
+    assert "preinit" not in json.loads(path.read_text())
+    # A third arrival sees a claimed record and is refused.
+    with pytest.raises(us.LockBusy):
+        us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv")
+
+
+def test_update_status_doctests_pass():
+    """The module's doctests document adoption; keep them executable."""
+    import doctest
+
+    from jacked.service import update_status
+
+    results = doctest.testmod(update_status)
+    assert results.failed == 0, results
+
+
+def test_init_status_clobbers_a_record_whose_updater_is_proven_dead(tmp_path, monkeypatch):
+    """The write side agrees with the read side on liveness."""
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=4242)
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: False)
+    us.init_status(path, "1.0.0", "1.2.0", "uv")  # no LockBusy
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: True)
+    with pytest.raises(us.LockBusy):
+        us.init_status(path, "1.0.0", "1.3.0", "uv")
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: None)
+    with pytest.raises(us.LockBusy):  # indeterminate keeps the mtime rule
+        us.init_status(path, "1.0.0", "1.4.0", "uv")
+

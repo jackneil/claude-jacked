@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_TIER_UNSET = object()
 
 
+class ClaudeConfigUnwritable(RuntimeError):
+    """The Claude config identity could not be written.
+
+    Raised only by the strict callers. Claude Code re-reads its credential
+    store when the ``oauthAccount`` identity in the config changes, so a
+    caller that reports "running sessions will follow" must know whether the
+    identity actually landed. Non-strict callers keep logging and continuing.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class _ClaudeConfigAccount:
     """Account metadata mirrored into Claude's non-secret config."""
@@ -184,8 +198,12 @@ def _apply_claude_account(config: dict, metadata: _ClaudeConfigAccount) -> None:
     """Replace active identity metadata in an already parsed config."""
     account = config.setdefault("oauthAccount", {})
     account["emailAddress"] = metadata.email
-    if metadata.display_name and "displayName" not in account:
+    # Every identity field is replaced, never merged: a leftover displayName
+    # from the previous account would label the new email with the old name.
+    if metadata.display_name:
         account["displayName"] = metadata.display_name
+    else:
+        account.pop("displayName", None)
 
     if metadata.organization_uuid:
         account["organizationUuid"] = metadata.organization_uuid
@@ -208,12 +226,26 @@ def _apply_claude_account(config: dict, metadata: _ClaudeConfigAccount) -> None:
             account[tier_field] = metadata.rate_limit_tier
 
 
-def _update_claude_config_account(metadata: _ClaudeConfigAccount) -> None:
-    """Atomically mirror one account's non-secret metadata to ~/.claude.json."""
-    claude_config = Path.home() / ".claude.json"
+def _update_claude_config_account(
+    metadata: _ClaudeConfigAccount,
+    *,
+    home: Path | None = None,
+    strict: bool = False,
+) -> None:
+    """Atomically mirror one account's non-secret metadata to ~/.claude.json.
+
+    ``strict`` makes the outcome explicit. A strict caller gets
+    ``ClaudeConfigUnwritable`` when the identity did not land, which is the
+    only way it can honestly say whether running Claude Code sessions follow
+    the switch. Non-strict callers keep the log-and-continue behaviour.
+    """
+    claude_config = (home or Path.home()) / ".claude.json"
 
     if claude_config.is_symlink():
-        logger.warning("Refusing to write ~/.claude.json — path is a symlink")
+        reason = "the Claude config path is a symlink"
+        if strict:
+            raise ClaudeConfigUnwritable(reason)
+        logger.warning("Refusing to write ~/.claude.json - %s", reason)
         return
 
     config = _read_claude_config(claude_config)
@@ -222,6 +254,10 @@ def _update_claude_config_account(metadata: _ClaudeConfigAccount) -> None:
     try:
         _write_credential_file(claude_config, config)
     except Exception as exc:
+        if strict:
+            raise ClaudeConfigUnwritable(
+                f"could not write the Claude config: {exc}"
+            ) from exc
         logger.warning("Failed to write ~/.claude.json: %s", exc)
 
 
@@ -230,8 +266,15 @@ def update_claude_config_email(
     display_name: str = None,
     organization_uuid: str = None,
     organization_name: str = None,
+    *,
+    home: Path | None = None,
+    strict: bool = False,
 ):
     """Update Claude identity while preserving legacy tier metadata.
+
+    ``home`` selects the config directory; it defaults to the user's home.
+    ``strict`` raises ``ClaudeConfigUnwritable`` instead of logging when the
+    identity cannot be written.
 
     >>> update_claude_config_email("test@example.com")  # noqa: no side-effects in test env
     """
@@ -241,7 +284,9 @@ def update_claude_config_email(
             display_name=display_name,
             organization_uuid=organization_uuid,
             organization_name=organization_name,
-        )
+        ),
+        home=home,
+        strict=strict,
     )
 
 

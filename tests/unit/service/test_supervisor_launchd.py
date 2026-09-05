@@ -324,3 +324,117 @@ def test_install_launchd_refuses_drift_when_loaded_identity_is_not_the_old_artif
     assert result.ok is False
     assert path.read_bytes() == previous
     assert runner.call_count == 1
+
+
+def test_is_known_legacy_artifact_recognises_the_pre_v2_launchd_plist(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    path = tmp_path / "ai.hank.jacked.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "ai.hank.jacked",
+                "ProgramArguments": [
+                    "/Users/test/.local/bin/jacked",
+                    "service",
+                    "start",
+                    "--port",
+                    "8321",
+                ],
+                "RunAtLoad": True,
+            }
+        )
+    )
+    path.chmod(0o600)
+
+    assert is_known_legacy_artifact(path, "ai.hank.jacked", SupervisorKind.LAUNCHD)
+
+
+def test_is_known_legacy_artifact_rejects_a_foreign_launchd_plist(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    path = tmp_path / "ai.hank.jacked.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "ai.hank.jacked",
+                "ProgramArguments": ["/usr/bin/curl", "https://example.invalid"],
+            }
+        )
+    )
+    path.chmod(0o600)
+
+    assert not is_known_legacy_artifact(path, "ai.hank.jacked", SupervisorKind.LAUNCHD)
+
+
+def test_is_known_legacy_artifact_rejects_a_different_label(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    path = tmp_path / "other.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.other.thing",
+                "ProgramArguments": ["/usr/local/bin/jacked", "service", "start"],
+            }
+        )
+    )
+    path.chmod(0o600)
+
+    assert not is_known_legacy_artifact(path, "ai.hank.jacked", SupervisorKind.LAUNCHD)
+
+
+def test_is_known_legacy_artifact_rejects_the_owned_v2_artifact(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    spec, _environment, _rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+
+    assert not is_known_legacy_artifact(path, spec.service_id, SupervisorKind.LAUNCHD)
+
+
+def test_is_known_legacy_artifact_is_false_for_systemd_and_manual(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    spec, _environment, _rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.SYSTEMD_USER
+    )
+
+    assert not is_known_legacy_artifact(
+        path, spec.service_id, SupervisorKind.SYSTEMD_USER
+    )
+    assert not is_known_legacy_artifact(path, spec.service_id, SupervisorKind.MANUAL)
+
+
+def test_is_known_legacy_artifact_is_false_for_a_missing_path(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    assert not is_known_legacy_artifact(
+        tmp_path / "absent.plist", "ai.hank.jacked", SupervisorKind.LAUNCHD
+    )
+
+
+def test_launchd_artifact_runs_the_tray_as_an_interactive_job(tmp_path):
+    """Background jobs are CPU/IO throttled by launchd; the tray must bind a
+    port inside its readiness window even on a loaded machine (2026-09-05)."""
+    import hashlib
+    import plistlib
+
+    from jacked.service.spec import SupervisorKind
+    from jacked.service.supervisors import render_for_spec
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    launcher = tmp_path / "launcher"
+    launcher.write_bytes(b"launcher")
+    launcher.chmod(0o700)
+    spec = make_spec(
+        SupervisorKind.LAUNCHD,
+        launcher_path=launcher,
+        launcher_hash=hashlib.sha256(b"launcher").hexdigest(),
+    )
+    artifact = render_for_spec(
+        spec, environment={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    )
+    payload = plistlib.loads(artifact.content)
+    assert payload["ProcessType"] == "Interactive"

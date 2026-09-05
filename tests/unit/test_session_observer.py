@@ -134,3 +134,120 @@ def test_failed_refresh_restores_drained_requests(tmp_path):
     assert rows[0]["idempotency_key"] == "one"
     assert rows[0]["credential_revision"] == "revision-1"
     assert rows[0]["launch_nonce"] == "launch-1"
+
+
+def test_the_authority_heal_runs_before_the_observation(tmp_path):
+    """A foreign write is repaired first, so the published snapshot
+    describes the healed authority and names the repair as evidence."""
+    from jacked.api.authority_guard import HealResult
+
+    db = Database(str(tmp_path / "jacked.db"))
+    _account(db, 11, "kim@example.com", "org-11")
+    db.set_setting("desired_account_id", 11)
+    order: list[str] = []
+
+    class _OrderedResolver(_Resolver):
+        def resolve(self) -> ResolverObservation:
+            order.append("resolve")
+            return super().resolve()
+
+    def heal(database):
+        assert database is db
+        order.append("heal")
+        return HealResult("reasserted", foreign_account_id=3, desired_account_id=11)
+
+    resolver = _OrderedResolver(
+        ResolverObservation(
+            ResolverState.RESOLVED,
+            CredentialIdentity(11, organization_id="org-11"),
+            ("authority:test:ok",),
+        )
+    )
+    sink = MemoryResolverSnapshotSink()
+
+    update = refresh_resolver_snapshot(
+        db,
+        resolver=resolver,
+        sink=sink,
+        config_root=Path(tmp_path),
+        scope="global",
+        heal=heal,
+    )
+
+    assert order == ["heal", "resolve"]
+    assert "authority:foreign-write:reasserted" in update.evidence
+
+
+def test_a_healed_authority_without_a_repair_adds_no_evidence(tmp_path):
+    from jacked.api.authority_guard import HealResult
+
+    db = Database(str(tmp_path / "jacked.db"))
+    _account(db, 11, "kim@example.com", "org-11")
+    resolver = _Resolver(
+        ResolverObservation(
+            ResolverState.RESOLVED,
+            CredentialIdentity(11, organization_id="org-11"),
+            ("authority:test:ok",),
+        )
+    )
+
+    update = refresh_resolver_snapshot(
+        db,
+        resolver=resolver,
+        sink=MemoryResolverSnapshotSink(),
+        config_root=Path(tmp_path),
+        scope="global",
+        heal=lambda _database: HealResult("none"),
+    )
+
+    assert not any(item.startswith("authority:foreign-write") for item in update.evidence)
+
+
+def test_a_failing_heal_never_blocks_the_snapshot(tmp_path):
+    db = Database(str(tmp_path / "jacked.db"))
+    _account(db, 11, "kim@example.com", "org-11")
+
+    def heal(_database):
+        raise RuntimeError("guard exploded")
+
+    update = refresh_resolver_snapshot(
+        db,
+        resolver=_Resolver(
+            ResolverObservation(
+                ResolverState.RESOLVED,
+                CredentialIdentity(11, organization_id="org-11"),
+                ("authority:test:ok",),
+            )
+        ),
+        sink=MemoryResolverSnapshotSink(),
+        config_root=Path(tmp_path),
+        scope="global",
+        heal=heal,
+    )
+
+    assert update.state is ResolverState.RESOLVED
+
+
+def test_an_injected_resolver_never_touches_the_runtime_authority(tmp_path, monkeypatch):
+    """Only the production path (no injected resolver) runs the default
+    guard, which reads the real credential authority."""
+    from jacked.api import session_observer
+
+    calls = []
+    monkeypatch.setattr(
+        session_observer, "_default_heal", lambda database: calls.append(database)
+    )
+    db = Database(str(tmp_path / "jacked.db"))
+    _account(db, 11, "kim@example.com", "org-11")
+
+    refresh_resolver_snapshot(
+        db,
+        resolver=_Resolver(
+            ResolverObservation(ResolverState.RESOLVED, CredentialIdentity(11), ())
+        ),
+        sink=MemoryResolverSnapshotSink(),
+        config_root=Path(tmp_path),
+        scope="global",
+    )
+
+    assert calls == []

@@ -26,10 +26,11 @@ def uninstall_owned_supervisor(
     artifact_path: Path,
     *,
     environment: dict[str, str],
-    run: Any = subprocess.run,
+    run: Any | None = None,
     uid: int | None = None,
 ) -> SupervisorAction:
     """Unregister under the same service-scoped lease used by install/restart."""
+    run = subprocess.run if run is None else run
 
     expected = render_for_spec(spec, environment=environment)
     try:

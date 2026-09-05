@@ -730,6 +730,8 @@ def _auto_swap_request(target: dict):
         payload=payload,
         context=SwitchContext.AUTO_SWAP,
         interaction=InteractionMode.BACKGROUND,
+        display_name=target.get("display_name") or None,
+        organization_name=target.get("organization_name") or None,
     )
 
 

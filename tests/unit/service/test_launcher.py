@@ -79,6 +79,7 @@ def test_launcher_rejects_source_hash_mismatch(tmp_path):
         )
 
 
+@pytest.mark.real_process
 @pytest.mark.skipif(os.name != "posix", reason="POSIX launcher boundary")
 def test_launcher_refuses_retargeted_runtime_without_running_replacement(tmp_path):
     venv = tmp_path / "venv"
@@ -130,3 +131,31 @@ def test_launcher_refuses_retargeted_runtime_without_running_replacement(tmp_pat
     )
     assert result.returncode == 78
     assert not sentinel.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX launcher boundary")
+def test_install_sweeps_orphaned_temp_files_from_a_hard_exit(tmp_path):
+    import hashlib
+
+    from jacked.service.launcher import LauncherInstall, install_versioned_launcher
+
+    content = b"#!/bin/sh\nexit 0\n"
+    request = LauncherInstall(
+        version="v2-sweep",
+        name="launcher",
+        content=content,
+        expected_sha256=hashlib.sha256(content).hexdigest(),
+        executable=True,
+    )
+    slot = tmp_path / "launchers" / "v2-sweep"
+    slot.mkdir(parents=True)
+    orphan = slot / ".launcher.abc123"
+    orphan.write_bytes(b"partial")
+    unrelated = slot / "notes.txt"
+    unrelated.write_text("keep", encoding="utf-8")
+
+    target = install_versioned_launcher(tmp_path / "launchers", request)
+
+    assert target.exists() and not orphan.exists()
+    assert unrelated.exists()
+

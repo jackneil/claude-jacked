@@ -59,11 +59,16 @@
     const PHASES = [
         ["waiting_for_parent", "Waiting for old tray to exit"],
         ["installing_package", "Installing package"],
+        ["preflight",          "Checking the new version can start"],
         ["migrating_settings", "Migrating settings"],
         ["waiting_port_free",  "Waiting for port to free"],
         ["starting_service",   "Starting new service"],
         ["verifying_service",  "Verifying new service"],
+        ["rolling_back",       "Rolling back to the previous version"],
     ];
+
+    // Phases that only run when an update goes wrong.
+    const OPTIONAL_PHASES = new Set(["rolling_back"]);
 
     const state = {
         startedAt: null,
@@ -94,6 +99,9 @@
         const ol = document.getElementById("phases");
         clearChildren(ol);
         for (const [name, label] of PHASES) {
+            // Exceptional phases appear only once they actually happen. A
+            // healthy update must not advertise a rollback step.
+            if (OPTIONAL_PHASES.has(name) && !state.phases[name]) continue;
             const entry = state.phases[name] || { status: "pending" };
             const li = makeEl("li", "phase " + entry.status);
             li.appendChild(makeEl("span", "dot " + entry.status));

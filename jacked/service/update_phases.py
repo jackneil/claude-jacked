@@ -14,10 +14,12 @@ test will fail until you update update.html to match.
 PHASES: list[dict] = [
     {"name": "waiting_for_parent", "label": "Waiting for old tray to exit"},
     {"name": "installing_package", "label": "Installing package"},
+    {"name": "preflight", "label": "Checking the new version can start"},
     {"name": "migrating_settings", "label": "Migrating settings"},
     {"name": "waiting_port_free", "label": "Waiting for port to free"},
     {"name": "starting_service", "label": "Starting new service"},
     {"name": "verifying_service", "label": "Verifying new service"},
+    {"name": "rolling_back", "label": "Rolling back to the previous version"},
 ]
 
 PHASE_NAMES: list[str] = [p["name"] for p in PHASES]

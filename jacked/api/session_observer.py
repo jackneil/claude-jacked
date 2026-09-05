@@ -115,6 +115,13 @@ def _build_resolver(config_root: Path, scope: str) -> CanonicalCredentialResolve
     return CanonicalCredentialResolver(capability, stores)
 
 
+def _default_heal(db: SessionObservationDatabase | None):
+    """Repair a foreign write to the runtime authority before observing it."""
+    from jacked.api.authority_guard import heal_foreign_authority
+
+    return heal_foreign_authority(db)
+
+
 def _account_identity(
     db: SessionObservationDatabase | None, account_id: int | None
 ) -> CredentialIdentity | None:
@@ -179,12 +186,29 @@ def refresh_resolver_snapshot(
     sink: ResolverSnapshotSink | None = None,
     config_root: Path | None = None,
     scope: str | None = None,
+    heal: Callable[[SessionObservationDatabase | None], object] | None = None,
 ) -> SnapshotUpdate:
     """Re-observe one authority and atomically publish a secret-free snapshot."""
     if config_root is None or scope is None:
         default_root, default_scope = _config_root()
         config_root = config_root or default_root
         scope = scope or default_scope
+    # Heal first: the published snapshot must describe the healed authority,
+    # not the foreign write that this pass is about to repair. An injected
+    # resolver means the caller supplied its own authority, so the default
+    # guard (which reads the real runtime authority) stays out of the way.
+    heal_evidence: tuple[str, ...] = ()
+    if heal is None and resolver is None and db is not None:
+        heal = _default_heal
+    if heal is not None:
+        try:
+            heal_result = heal(db)
+        except Exception:
+            logger.warning("Authority heal pass failed", exc_info=True)
+        else:
+            action = getattr(heal_result, "action", None)
+            if action and action != "none":
+                heal_evidence = (f"authority:foreign-write:{action}",)
     try:
         resolver = resolver or _build_resolver(config_root, scope)
         observation = resolver.resolve()
@@ -201,7 +225,7 @@ def refresh_resolver_snapshot(
     update = SnapshotUpdate(
         scope=scope,
         state=state,
-        evidence=evidence,
+        evidence=evidence + heal_evidence,
         # A revision is an ordering claim. A passive read has no transaction
         # witness, so it intentionally leaves this unknown.
         credential_revision=None,

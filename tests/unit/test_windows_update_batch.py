@@ -178,7 +178,11 @@ class TestVerifyRetry:
 
     def test_tray_batch_retries_service_start_once(self):
         body = _tray_batch()["body"]
-        assert body.count("start \"\" /B jacked service start") == 2
+        # Two on the success path (first start + one retry), plus one on the
+        # rollback path that brings the restored build back up.
+        success_path, rollback_path = body.split(":rollback_now", 1)
+        assert success_path.count("start \"\" /B jacked service start") == 2
+        assert rollback_path.count("start \"\" /B jacked service start") == 1
         assert "if not errorlevel 1 goto verifyok" in body
         assert ":verifyok" in body
 
@@ -191,6 +195,172 @@ class TestVerifyRetry:
                 assert not line.startswith(" "), (
                     "verify line is indented, i.e. inside a parenthesised block"
                 )
+
+
+class TestPreflightGateAndRollback:
+    """Both batches must run the transaction gate and undo a bad build.
+
+    A refused preflight on Windows has to be handled inside the batch: the
+    Python process that started the upgrade is already gone by then.
+    """
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_preflight_runs_before_the_settings_migration(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        assert "jacked service preflight --timeout 120 2>&1" in body
+        # Only the FIRST occurrence matters: the rollback tail can mention
+        # neither before the gate.
+        gate = body.index("jacked service preflight --timeout 120 2>&1")
+        migrate = body.index("jacked install --force 2>&1")
+        assert gate < migrate
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_refused_preflight_jumps_to_the_rollback_label(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        gate = body.index("jacked service preflight --timeout 120 2>&1")
+        tail = body[gate:]
+        first_check = tail.split("\r\n")[1]
+        assert first_check.startswith("if errorlevel 1 goto ")
+        label = first_check.rsplit(" ", 1)[1]
+        assert ":" + label in body, f"batch has no :{label} label"
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_rollback_pins_the_exact_previous_version(self, which):
+        import jacked
+
+        body = BATCH_BUILDERS[which]()["body"]
+        # Both helpers pin the build that is running right now: that is the
+        # one a failed upgrade has to restore.
+        previous = jacked.__version__
+        pin = f'"claude-jacked[tray]=={previous}"'
+        assert pin in body, f"rollback does not pin {previous}"
+        # Every argv element is individually quoted so cmd.exe cannot split a
+        # path containing spaces.
+        rollback_line = [
+            line for line in body.splitlines()
+            if pin in line and line.strip().startswith('"')
+        ]
+        assert rollback_line, "rollback line is not fully quoted"
+        for token in rollback_line[0].replace(" 2>&1", "").split('" "'):
+            assert token.strip('"'), "empty argv element in the rollback line"
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_rollback_reinstalls_and_exits_nonzero(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        _success, rollback = body.split(
+            ":rollback_now" if which == "tray" else ":preflight_failed", 1
+        )
+        assert "jacked install --force" in rollback
+        assert rollback.rstrip().endswith("exit /b 1")
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_rollback_writes_the_failed_file_with_a_reason(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        marker = ":rollback_now" if which == "tray" else ":preflight_failed"
+        rollback = body.split(marker, 1)[1]
+        assert "jacked-update-failed.txt" in rollback
+        assert "Recovery:" in rollback
+
+    def test_cli_batch_skips_the_rollback_restart_with_skip_service(self):
+        """--skip-service must not restart the service on the rollback path."""
+        body = _cli_batch(("--skip-service",))["body"]
+        rollback = body.split(":preflight_failed", 1)[1]
+        assert "set SKIP_SERVICE=1" in body
+        # No restart COMMAND on the rollback path, guarded or bare. (The
+        # recovery text may still mention it as a manual step.)
+        assert not [
+            ln for ln in rollback.split("\r\n")
+            if ln.strip().startswith("jacked service restart")
+        ]
+        assert "goto rollback_done" in rollback
+
+    def test_cli_batch_restarts_on_the_rollback_path_by_default(self):
+        body = _cli_batch()["body"]
+        rollback = body.split(":preflight_failed", 1)[1]
+        assert "jacked service restart 2>&1" in rollback
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_success_path_never_falls_into_the_rollback_block(self, which):
+        """The rollback tail sits after the self-delete, reachable only by goto."""
+        body = BATCH_BUILDERS[which]()["body"]
+        marker = ":rollback_now" if which == "tray" else ":preflight_failed"
+        self_delete = body.index('(goto) 2>nul & del "%~f0"')
+        assert self_delete < body.index(marker)
+
+
+class TestEveryRollbackStepIsChecked:
+    """A rollback that stopped halfway must never write "rolled back".
+
+    Both batches used to run `jacked install --force` and the guarded
+    `jacked service restart` with no `if errorlevel 1` check at all, then write
+    the "rolled back" recovery file regardless. The tray batch went further and
+    marked the `rolling_back` phase ok BEFORE it restarted anything.
+    """
+
+    @staticmethod
+    def _rollback_tail(which: str) -> str:
+        body = BATCH_BUILDERS[which]()["body"]
+        marker = ":rollback_now" if which == "tray" else ":preflight_failed"
+        return body.split(marker, 1)[1]
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_each_rollback_step_is_followed_by_an_errorlevel_check(self, which):
+        tail = self._rollback_tail(which)
+        lines = [ln for ln in tail.split("\r\n") if ln]
+        steps = [
+            i for i, ln in enumerate(lines)
+            if ln.startswith(('"', "jacked install --force", "jacked service restart"))
+        ]
+        assert steps, "no rollback work steps found"
+        for i in steps:
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            assert nxt.startswith("if errorlevel 1 goto "), (
+                f"{which} rollback step {lines[i]!r} is unchecked; "
+                f"next line is {nxt!r}"
+            )
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_each_failure_label_exists_and_exits_nonzero(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        tail = self._rollback_tail(which)
+        targets = {
+            ln.rsplit(" ", 1)[1]
+            for ln in tail.split("\r\n")
+            if ln.startswith("if errorlevel 1 goto ")
+        }
+        assert targets
+        for label in targets:
+            assert ":" + label + "\r\n" in body, f"missing :{label} label"
+            after = body.split(":" + label + "\r\n", 1)[1].split("\r\n")
+            block_lines = []
+            for line in after:
+                block_lines.append(line)
+                if line.strip() == "exit /b 1":
+                    break
+            block = "\r\n".join(block_lines)
+            assert "jacked-update-failed.txt" in block
+            assert "exit /b 1" in block
+            # It names the step that failed rather than claiming a rollback.
+            assert "step" in block
+            assert "rolled back" not in block
+
+    def test_the_tray_marks_rolling_back_ok_only_after_the_verify(self):
+        tail = self._rollback_tail("tray")
+        ok = tail.index("jacked _update_status rolling_back ok")
+        verify = tail.index("Invoke-WebRequest")
+        assert verify < ok, (
+            "the rollback phase is marked ok before the restored service is "
+            "verified, so a dead service reads as a restoration"
+        )
+
+    def test_a_version_that_cannot_be_validated_never_reaches_a_batch_line(self):
+        """The version is validated once, at the top, and used everywhere."""
+        with patch("jacked.__version__", 'evil" & del C:\\ &'):
+            body = _tray_batch()["body"]
+        assert "del C:" not in body
+        assert "previous" in body
+        # With no usable version there is no rollback command either.
+        assert "claude-jacked[tray]==" not in body
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe redirection semantics")
@@ -234,3 +404,134 @@ class TestCmdRedirectionSemantics:
         assert "ERRORLEVEL_IS_0" in text
         # ...while bare output reaches the log just fine. Hence: no redirection.
         assert "BARE-OUTPUT" in text
+
+
+def test_cli_batch_never_carries_an_invalid_previous_version():
+    """A bad previous version must not reach cmd.exe through the CLI batch."""
+    with patch("jacked.__version__", 'evil" & del C:\\ &'):
+        body = _cli_batch()["body"]
+    assert "del C:" not in body
+    assert "claude-jacked[tray]==" not in body
+
+
+def test_upgrade_refuses_shell_text_in_extras():
+    from click.testing import CliRunner
+
+    from jacked.cli import main
+
+    result = CliRunner().invoke(main, ["upgrade", "--extras", 'x" & echo pwned'])
+    assert result.exit_code == 2
+    assert "Invalid --extras" in result.output
+
+
+
+class TestEveryUpgradeStepIsChecked:
+    """A failed step after the preflight must roll back, not report success.
+
+    Both batches ran `jacked install --force` (and, in the CLI helper, the
+    service restart) with NO `if errorlevel 1` guard at all, then printed
+    "upgrade complete" and deleted themselves. The user was left on a build
+    whose settings never migrated, with no breadcrumb and nothing rolled back.
+    """
+
+    @staticmethod
+    def _success_path(which: str) -> str:
+        body = BATCH_BUILDERS[which]()["body"]
+        marker = ":rollback_now" if which == "tray" else ":preflight_failed"
+        return body.split(marker, 1)[0]
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_settings_migration_is_checked(self, which):
+        lines = [ln for ln in self._success_path(which).split("\r\n") if ln]
+        migrate = [
+            i for i, ln in enumerate(lines) if ln == "jacked install --force 2>&1"
+        ]
+        assert migrate, "the settings migration step is missing"
+        nxt = lines[migrate[0] + 1]
+        assert nxt.startswith("if errorlevel 1 goto "), (
+            f"{which}: a failed settings migration is unchecked; next line is "
+            f"{nxt!r}"
+        )
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_settings_migration_failure_label_rolls_back(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        lines = [ln for ln in self._success_path(which).split("\r\n") if ln]
+        migrate = lines.index("jacked install --force 2>&1")
+        label = lines[migrate + 1].rsplit(" ", 1)[1]
+        assert ":" + label + "\r\n" in body, f"missing :{label} label"
+        block = body.split(":" + label + "\r\n", 1)[1]
+        # It reaches the rollback rather than exiting with the new build in
+        # place and the old service gone. Either by an explicit goto or by
+        # falling straight into the shared block on the next line.
+        rollback_entry = "rollback_now" if which == "tray" else "do_rollback"
+        assert ":" + rollback_entry + "\r\n" in body
+        before = block.split(":" + rollback_entry + "\r\n", 1)[0]
+        lines = [ln for ln in before.split("\r\n") if ln]
+        assert "exit /b 1" not in lines, (
+            f"{which}: a failed settings migration exits without rolling back"
+        )
+
+    def test_the_cli_service_restart_is_checked(self):
+        lines = [ln for ln in self._success_path("cli").split("\r\n") if ln]
+        restart = [
+            i for i, ln in enumerate(lines) if ln == "jacked service restart 2>&1"
+        ]
+        assert restart, "the restart step is missing from the success path"
+        nxt = lines[restart[0] + 1]
+        assert nxt.startswith("if errorlevel 1 goto "), (
+            f"a failed service restart is unchecked; next line is {nxt!r}"
+        )
+
+    def test_the_cli_restart_failure_label_rolls_back(self):
+        body = _cli_batch()["body"]
+        assert ":restart_failed\r\n" in body
+        block = body.split(":restart_failed\r\n", 1)[1]
+        assert "goto do_rollback" in block.split(":do_rollback")[0]
+
+    def test_the_cli_skip_service_batch_has_no_dangling_restart_goto(self):
+        """With --skip-service nothing restarts, so nothing may jump there."""
+        body = _cli_batch(("--skip-service",))["body"]
+        assert "goto restart_failed" not in body
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_rollback_breadcrumb_names_the_step_that_failed(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        marker = ":rollback_now" if which == "tray" else ":preflight_failed"
+        # Each entry label sets its own reason, and the shared breadcrumb
+        # prints it, so a failed migration is never reported as a refused
+        # preflight.
+        reasons = [
+            ln for ln in body.split("\r\n") if ln.startswith("set FAILREASON=")
+        ]
+        assert len(reasons) >= 3, reasons
+        assert any("settings migration" in ln for ln in reasons), reasons
+        tail = body.split(marker, 1)[1]
+        assert "%FAILREASON%" in tail
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_success_path_clears_a_stale_failed_file(self, which):
+        """A repaired failure must not warn the user on the next boot."""
+        success = self._success_path(which)
+        deletes = [
+            ln
+            for ln in success.split("\r\n")
+            if ln.startswith("if exist ") and "jacked-update-failed.txt" in ln
+            and " del " in ln
+        ]
+        assert deletes, (
+            f"{which}: a successful update leaves the old "
+            "jacked-update-failed.txt in place, so the tray warns about a "
+            "failure the user already repaired"
+        )
+
+
+def test_cli_batch_claims_the_status_record_before_installing():
+    """Windows cannot hold an OS lock across batch steps; the status-record
+    claim (`_update_status_init`, exit 2 when busy) is the in-flight guard."""
+    body = _cli_batch()["body"]
+    claim = body.index("jacked _update_status_init")
+    guard = body.index("if errorlevel 2", claim)
+    assert body.index("uv.exe", guard) > guard or body.index("tool install", guard) > guard
+    assert "exit /b 2" in body[guard:guard + 400]
+

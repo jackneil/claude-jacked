@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from jacked.resolver_snapshot import (
@@ -67,7 +68,45 @@ def _observed_with_desired(observed: dict, desired_label: str) -> dict:
     }
 
 
-def account_facts(home: str, now: float, *, json_load=json.load) -> dict:
+def _service_is_discoverable(home: str) -> bool:
+    """True when the owned service leaves discoverable evidence under ``home``.
+
+    The statusline must never invent a failure, so an unreadable or unexpected
+    discovery result reads as discoverable. Paths are derived from the given
+    home, which keeps this read hermetic and matches where the service writes.
+    """
+    try:
+        from jacked.service.instance_models import ServicePaths
+        from jacked.service.lifecycle import discover_service
+
+        claude_dir = Path(home) / ".claude"
+        paths = ServicePaths.in_directory(claude_dir / "jacked-service-v2")
+        paths = ServicePaths(
+            root=paths.root,
+            lease=paths.lease,
+            manifest=paths.manifest,
+            control=paths.control,
+            legacy_pid=claude_dir / "jacked-service.pid",
+        )
+        source = discover_service(paths).source
+        if source == "manifest":
+            from jacked.service.instance import manifest_is_proven_stale
+
+            # A crashed service leaves a valid manifest behind; only a live,
+            # identity-matched PID counts as the service being up.
+            return not manifest_is_proven_stale(paths.manifest)
+        return source == "legacy"
+    except Exception:  # noqa: BLE001 - a broken probe must never claim a failure
+        return True
+
+
+def account_facts(
+    home: str,
+    now: float,
+    *,
+    json_load=json.load,
+    service_discoverable: Callable[[], bool] | None = None,
+) -> dict:
     snapshot = read_resolver_snapshot(snapshot_path(home), json_load=json_load)
     if snapshot is None:
         return dict(EMPTY_ACCOUNT_FACTS)
@@ -107,6 +146,15 @@ def account_facts(home: str, now: float, *, json_load=json.load) -> dict:
     if scoped_unverified:
         reason = "scoped unverified"
     elif not valid_clock or state == "stale":
+        # A stale snapshot has one common cause: the service that refreshes it
+        # is not running. Name that cause instead of the symptom.
+        probe = service_discoverable or (lambda: _service_is_discoverable(home))
+        if not probe():
+            facts["segment"] = (
+                f"desired {desired_label} {MIDDOT} jacked service down"
+            )
+            facts["state"] = "service down"
+            return facts
         reason = "stale"
     elif state == "conflict":
         reason = "credential conflict"

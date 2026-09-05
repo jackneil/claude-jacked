@@ -121,12 +121,36 @@ def _publish_launcher(
         temporary.unlink(missing_ok=True)
 
 
+def _sweep_orphaned_temps(slot: Path, prefix: str) -> None:
+    """Remove temp files a hard exit left in the slot.
+
+    A publish that dies between ``mkstemp`` and ``os.link`` (a preflight
+    timeout exits without unwinding) leaves a same-user 0600 temp file. It is
+    never resolved as a launcher, so this is hygiene: remove regular files
+    with the temp prefix that are not hard-linked to the target.
+    """
+    try:
+        entries = list(slot.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.startswith(prefix):
+            continue
+        try:
+            status = entry.lstat()
+            if stat.S_ISREG(status.st_mode) and status.st_nlink == 1:
+                entry.unlink()
+        except OSError:
+            continue
+
+
 def install_versioned_launcher(root: Path, request: LauncherInstall) -> Path:
     """Install once into a stable version slot; never rewrite altered files."""
 
     _validate_install(request)
     slot = _prepare_slot(root, request.version)
     target = slot / request.name
+    _sweep_orphaned_temps(slot, f".{request.name}.")
     if target.exists() or target.is_symlink():
         from jacked.service.instance_storage import _recover_interrupted_hardlink
 

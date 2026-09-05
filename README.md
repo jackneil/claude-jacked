@@ -256,8 +256,9 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 - **Safe port collisions** - the owned service uses port 8321 when available. If that port belongs to an ambiguous or foreign process, jacked starts on a dynamic quarantine port for the configured bind and `jacked service status` reports the actual dashboard URL.
 - **Secret-negative startup** - native service definitions start isolated Python with a small reviewed environment. Tokens and unrelated shell environment variables are not inherited into the long-lived service.
 - **Crash recovery, not nag-ware** - each native supervisor restarts failed runs but respects a clean user stop. On launchd this is `KeepAlive` scoped to `SuccessfulExit=false`; systemd and Task Scheduler carry matching failure-only restart policies.
-- **Non-destructive recovery** - `jacked service recover` reconciles drift only when the native definition is provably jacked-owned. It refuses legacy or foreign same-name artifacts, prints the exact path that needs operator review, and never adopts, deletes, or signals them automatically.
-- **CLI equivalent** - `jacked upgrade` does the same three-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
+- **Non-destructive recovery** - `jacked service recover` reconciles drift when the native definition is provably jacked-owned. If a manually started service holds ownership, `jacked install` and `jacked service recover` ask that service to release ownership, then install the native definition. Both commands also back up and replace a known legacy definition that jacked wrote in an earlier version. Recovery refuses a foreign same-name artifact, prints the exact path that needs operator review, and never adopts, deletes, or signals it automatically.
+- **CLI equivalent** - `jacked upgrade` does the same four-step upgrade from the terminal. No more remembering to run `uv tool install`, then `jacked install`, then restart the service separately.
+- **Upgrades roll back** - an upgrade proves the new version can start its service before it replaces the old one, and proves the service came back after. If either check fails, jacked reinstalls the version that was running and restarts it. Run `jacked service preflight` to make the same check by hand.
 - **Recovery file** - if the auto-update fails, `~/.claude/jacked-update-failed.txt` explains what happened and how to recover manually. The tray warns you on the next startup so you don't miss it.
 
 ### Commands
@@ -270,6 +271,7 @@ jacked service restart     # stop + detached start (returns immediately)
 jacked service restart --foreground   # same but runs in foreground like service start
 jacked service status      # show evidence-qualified state, build, protocol, port, autostart
 jacked service recover     # safely reconcile a provably owned native definition
+jacked service preflight   # prove this build can provision its service contract
 ```
 
 ### Troubleshooting
@@ -282,15 +284,17 @@ jacked service restart     # uses the authenticated control channel when ownersh
 jacked service recover     # reconcile owned drift without PID- or port-based control
 ```
 
-If status says **quarantined**, use the dashboard URL it prints. Another process owns 8321, and jacked deliberately leaves that process alone. If status says **ownership indeterminate**, run `jacked service recover`. Recovery refuses a legacy or foreign supervisor artifact and prints its exact path; stop that service from its own tray menu, inspect and move the artifact to a backup path, then retry recovery. Do not kill a PID copied from the legacy diagnostic file at `~/.claude/jacked-service.pid`.
+If status says **quarantined**, use the dashboard URL it prints. Another process owns 8321, and jacked deliberately leaves that process alone. If status says **ownership indeterminate**, run `jacked service recover`. Recovery hands off a manually started service before it installs the native definition. It also backs up and replaces a known legacy definition that jacked wrote in an earlier version. Recovery refuses a foreign supervisor artifact and prints its exact path. For a foreign artifact, stop that service from its own tray menu, inspect and move the artifact to a backup path, then run recovery again. Do not kill a PID copied from the legacy diagnostic file at `~/.claude/jacked-service.pid`.
 
 Common issues:
 
 - **Tray icon never appears after install** - the tray ships by default now, so the usual causes are: (a) you passed `jacked install --no-tray`, (b) you're on a **headless** box (no `DISPLAY`/Wayland) where the icon is skipped on purpose, or (c) the service is not running. Run `jacked service status`; use the reported dashboard URL if the service is quarantined, or run `jacked service start` if it is stopped.
 - **Tray shows a wrong version after an upgrade** - run `jacked service status` to compare the owned service build with the installed version. If ownership is proven, `jacked service restart` performs an authenticated handoff. If ownership is indeterminate, use `jacked service recover`; do not signal a PID manually.
 - **"Port 8321 in use"** - run `jacked service status`. A v2 service quarantines itself onto a discoverable dynamic port instead of killing the listener, so use the dashboard URL status prints.
-- **Auto-update ran but the tray never came back** - run `jacked service status`, then `jacked service recover` to reconcile a provably owned native definition. Recovery stops with exact-path guidance if it finds a legacy or foreign artifact.
+- **The service refuses to start** - run `jacked service status`. Status prints the last start failure with its reason, for example a refused runtime path. The reason no longer stays in `~/.claude/jacked-tray.log`. The Claude Code statusline shows `jacked service down` while the service is not running. Correct the reported cause, then run `jacked service restart`.
+- **Auto-update ran but the tray never came back** - the upgrade rolls itself back when the new version cannot start, so first read `~/.claude/jacked-update-failed.txt`. It names the version that failed, the version that was restored, and the commands to finish by hand. Run `jacked service preflight` to see the refusal in full. If the file is absent, run `jacked service status`, then `jacked service recover` to reconcile a provably owned native definition. Recovery replaces a known legacy definition that jacked wrote in an earlier version. Recovery stops with exact-path guidance if it finds a foreign artifact.
 - **Claude Code keeps asking me to log in** - jacked was rotating the active account's CC refresh token out from under Claude Code. Fixed in 0.41.2+. Update and the issue goes away. Architecture doc at `docs/architecture/oauth-and-credential-flows.md` §7.1-7.3 explains the full mechanism.
+- **Sessions drift back to another account** - a Claude Code session that still holds an older account refreshes its OAuth token and writes the new payload into the shared credential store, which replaces the account you chose. jacked repairs this on its own: it adopts the rotated tokens into the account they belong to, then republishes your chosen account over the foreign write. An account jacked does not recognize is never overwritten. If your chosen account can no longer refresh (its card shows a token error), jacked keeps the account that holds the store and marks it, so every session shows the true account; re-auth the chosen account from its card to make it the default again. See `docs/architecture/oauth-and-credential-flows.md` section 11.
 - **Auto-update failed** - read `~/.claude/jacked-update-failed.txt` and the log at `~/.claude/jacked-update.log`. The recovery file lists the exact commands to finish the upgrade manually.
 
 Verify what's actually running:
@@ -332,7 +336,7 @@ jacked install
 
 Notes:
 - uv's installer adds `~/.local/bin` to your shell rc automatically. If `jacked --version` says "command not found" after step 5, run `uv tool update-shell && source ~/.zshrc` or open a fresh terminal.
-- The owned launchd definition lives at `~/Library/LaunchAgents/ai.hank.jacked.plist`. If it conflicts with a legacy or foreign definition, `jacked service recover` refuses to replace it and prints that exact path for review.
+- The owned launchd definition lives at `~/Library/LaunchAgents/ai.hank.jacked.plist`. If a known legacy definition holds that path, `jacked install` and `jacked service recover` back it up and replace it. If a foreign definition holds that path, both commands refuse to replace it and print that exact path for review.
 
 ---
 
@@ -404,26 +408,43 @@ Requirements: Python 3.10+ (uv will fetch one for you if your system doesn't hav
 jacked upgrade
 ```
 
-That's it. One command. Works on macOS, Linux, and Windows. Does all three things `uv tool install --force` alone doesn't do:
+That's it. One command. Works on macOS, Linux, and Windows. Does all four things `uv tool install --force` alone doesn't do:
 
 1. `uv tool install claude-jacked --force` - new package on disk
-2. `jacked install --force` - migrate `settings.json` hooks to the shim form (`jacked _hook <name>`) so they survive Python version bumps
-3. `jacked service restart` - reload the running service with the new code (only if a service is running)
+2. `jacked service preflight` - prove the new version can start its service
+3. `jacked install --force` - migrate `settings.json` hooks to the shim form (`jacked _hook <name>`) so they survive Python version bumps
+4. `jacked service restart` - reload the running service with the new code (only if a service is running)
 
-**Why you need all three:** `uv tool install --force` just drops the new package on disk. The service you already have running is still executing the old version in memory, and your `settings.json` may still have hook paths that point at the old site-packages location (broken if `uv` upgraded Python under you).
+**Why you need all four:** `uv tool install --force` just drops the new package on disk. The service you already have running is still executing the old version in memory, and your `settings.json` may still have hook paths that point at the old site-packages location (broken if `uv` upgraded Python under you).
+
+### The upgrade is a transaction
+
+An upgrade never leaves you without a service. Step 2 runs before anything replaces the old install: it asks the NEW version to build its service definition and refuses the upgrade if that version cannot. Step 4 then proves the new service comes back up.
+
+If either step fails, jacked reinstalls the exact version that was running, runs `jacked install --force`, restarts that service, and exits with a non-zero code. It writes the reason and the manual recovery commands to `~/.claude/jacked-update-failed.txt`. The tray Update button and the Windows helper follow the same sequence.
+
+### Check a build before you upgrade
+
+```bash
+jacked service preflight          # exit 0: this build can start its service
+jacked service preflight --json   # one JSON object, for scripts
+```
+
+The command provisions the service contract and prints the runtime path, the runtime target, the supervisor, and the generation. It starts no process and it changes no supervisor, so it is safe to run while the service is live. On a refusal it prints `[FAIL] <error type>: <reason>` and exits 1.
 
 ### Options
 
-- `jacked upgrade --skip-service` - just swap the package and migrate settings, don't restart the running service
+- `jacked upgrade --skip-service` - just swap the package and migrate settings, don't restart the running service. The preflight gate still runs, and a refusal still rolls back.
+- `jacked upgrade --no-rollback` - keep the new version installed even when its preflight or its restart fails. Use this only to debug a bad build.
 
 ### Cross-platform notes
 
 - **macOS/Linux:** runs inline. Your terminal shows live output from each step.
-- **Windows:** spawns a detached `cmd.exe` helper and exits immediately. Windows can't overwrite a running `.exe`, so this process has to step out of the way before `uv tool install` replaces `jacked.exe`. The helper waits for this process to exit, then runs the three steps with output appended to `~/.claude/jacked-update.log`. You can `type %USERPROFILE%\.claude\jacked-update.log` to follow along.
+- **Windows:** spawns a detached `cmd.exe` helper and exits immediately. Windows can't overwrite a running `.exe`, so this process has to step out of the way before `uv tool install` replaces `jacked.exe`. The helper waits for this process to exit, then runs the four steps with output appended to `~/.claude/jacked-update.log`. The helper also carries the rollback: it pins the previous version itself, so a refused preflight is undone without the original process. You can `type %USERPROFILE%\.claude\jacked-update.log` to follow along.
 
 ### Tray upgrades
 
-If you're running the background service, you can also click **Update to vX.Y.Z ->** in the tray menu when a newer version is available on PyPI. Same three-step sequence, fully detached - survives its own binary being replaced mid-update.
+If you're running the background service, you can also click **Update to vX.Y.Z ->** in the tray menu when a newer version is available on PyPI. Same four-step sequence, fully detached - survives its own binary being replaced mid-update. The progress page shows a **Checking the new version can start** step, and adds a **Rolling back to the previous version** step only if the update has to undo itself.
 
 ### What changed in this update
 
@@ -702,6 +723,7 @@ Your local database (`~/.claude/jacked.db`) stays intact - reinstall anytime wit
 
 | Version | Changes |
 |---------|---------|
+| **0.101.0** | **The tray survives an upgrade on every machine, and an account switch reaches every open Claude Code session again.** 0.100.0 refused to boot on any Mac whose tool environment sits on a Homebrew or cask Python: the runtime trust check rejected every group-writable directory, and Homebrew makes its prefix admin group-writable by design. Root-equivalent groups (macOS admin, Linux sudo and wheel where the distribution grants them) are now trusted, and the check never enumerates the user database, so a directory-bound machine cannot block a boot. Every upgrade is now a transaction: `jacked upgrade`, the tray Update button, and both Windows helpers run `jacked service preflight` to prove the new build can provision its service before the old service is replaced, and roll back to the previous version when preflight, the settings migration, or the restart fails. A rollback claims success only when the package, the settings, and the restored service all came back. Upgrades hold an exclusive lock, a hung preflight is bounded, and an update interrupted after the old tray exited is reported at the next boot instead of vanishing. A boot refusal now records its reason; `jacked service status` prints it, and the status line says `jacked service down` when the service is not running. `jacked service install` accepts a known legacy launchd definition and `jacked service recover` hands off a manually started instance, so the two commands no longer point at each other. The tray runs as an Interactive launchd job; the Background class is CPU-throttled and on a loaded machine left the service importing Python well past its readiness window. On the switching side, the 0.99 transaction engine wrote the Keychain and the mirror file but never the `oauthAccount` identity in `~/.claude.json`, and Claude Code reloads its credentials only when that identity changes, so a switch changed the store while every open session kept its old account. The engine now republishes that identity after every successful write, on the manual, launch, OAuth, and recovery paths; a publish that fails degrades the outcome and tells you to restart the sessions instead of claiming they will follow. Claude Code also refreshes an expiring token from the account it holds in memory and writes it back unstamped, which silently reverted the chosen account at every expiry; jacked now adopts those rotated tokens into the right account, so no refresh lineage is lost, and reasserts the account you chose. An account jacked cannot identify is never overwritten. The switch lease is cross-process, the dashboard toast says truthfully whether open sessions follow, and the test suite carries a tripwire so no test can ever spawn the real service or drive launchd again. |
 | **0.100.0** | **Cold boots, restarts, and credential reads stop failing on the paths that only show up on a real machine.** A cold start on a slow disk needs well over ten seconds to import the app and run lifespan startup, and the old ten-second readiness budget declared that a healthy service had failed; the wait now returns the moment the port answers and only gives up after a budget a cold boot can actually meet. Repeated failed supervised starts inside one window now trip a breaker that exits cleanly instead of relaunching forever, and `jacked service status` says so in plain words rather than leaving the reason in `~/.claude/jacked-tray.log`. On macOS the restart handoff waits for the previous owner to exit and for its replacement to report ready, so `jacked service restart` no longer hands you a dead tray. Credential topology is now certified per platform for Linux and Windows as well as macOS, replacing the exact-hash build registry that failed closed on every Claude Code update and made account switching refuse to work until jacked shipped a new hash. macOS Keychain access moved off in-process Security.framework calls and onto the signed `/usr/bin/security` tool, which ends the password prompts that asked you to authorize python itself; an oversize payload is refused unless you opt in with `JACKED_KEYCHAIN_ARGV_FALLBACK=1`, which trades a briefly visible process argument for the write. The dashboard keeps polling the chained Claude Code token flow after a re-auth, so the account card updates when that token lands instead of on your next click. |
 | **0.99.3** | **Authenticated service control now works on macOS Python builds that do not expose peer credentials through the socket module.** The Unix-domain control server falls back to Darwin's native `getpeereid(2)` API through the trusted system library, preserving kernel-verified same-user authentication for status, graceful shutdown, restart handoff, and upgrade recovery. A real socket-pair test runs on macOS CI so this platform boundary can no longer be hidden by mocks. |
 | **0.99.2** | **Native services now preserve the installed virtualenv Python entrypoint.** uv-tool and pipx-style installs start with the environment that contains `jacked`, including under Python isolated mode, instead of resolving the entrypoint to a base interpreter that cannot import the package. The service contract still rejects arbitrary runtime symlinks. It accepts only a normalized, absolute virtualenv Python link backed by `pyvenv.cfg`, trusted ownership, and directory and target chains that another local user cannot modify. The resolved interpreter is bound into the service generation and checked again by the launcher immediately before execution. |

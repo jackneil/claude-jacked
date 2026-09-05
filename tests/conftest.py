@@ -1,5 +1,7 @@
 """Shared fixtures for jacked tests."""
 
+import re
+
 import pytest
 from unittest.mock import patch
 
@@ -12,6 +14,67 @@ from jacked.credentials.models import (
     SwitchResult,
 )
 
+
+
+@pytest.fixture(autouse=True)
+def _no_real_service_processes(request, monkeypatch):
+    """Tripwire: a test must never start the real jacked service or drive a
+    real supervisor.
+
+    On 2026-09-04 a `service restart` test spawned a detached tray from the
+    repo venv against the developer's real ~/.claude and another wrote a
+    launchd transition lock into the real ~/Library/LaunchAgents. Tests that
+    deliberately exec a sandboxed stub opt out with ``@pytest.mark.real_process``.
+    """
+    import subprocess
+
+    if request.node.get_closest_marker("real_process"):
+        return
+    real_popen = subprocess.Popen
+    real_run = subprocess.run
+    supervisors = ("launchctl", "systemctl", "schtasks", "schtasks.exe")
+
+    def _text(args):
+        if isinstance(args, (list, tuple)):
+            return " ".join(str(part) for part in args)
+        return str(args)
+
+    def _refuse(args) -> None:
+        """One predicate for every subprocess entry point.
+
+        A supervisor binary anywhere in argv[0], or a jacked service
+        lifecycle command (start/restart/preflight/recover/install) reached
+        through any launcher, is refused. subprocess.call/check_call/
+        check_output route through Popen, so guarding run and Popen covers
+        them too.
+        """
+        text = _text(args)
+        head = str(args[0]) if isinstance(args, (list, tuple)) and args else text.split(" ", 1)[0]
+        first = head.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if first in supervisors:
+            raise RuntimeError("test tried to drive a real supervisor: " + text)
+        padded = f" {text} "
+        after_service = " " + padded.split(" service ", 1)[1] if " service " in padded else ""
+        if "jacked" in text and any(
+            f" {verb} " in after_service
+            for verb in ("start", "restart", "preflight", "recover", "install")
+        ):
+            raise RuntimeError("test tried to spawn a real jacked service: " + text)
+        # `jacked install` rewrites the real ~/.claude/settings.json.
+        if "jacked" in text and re.search(r"jacked(?:\.exe)?\"? install(?: |$)", padded):
+            raise RuntimeError("test tried to run a real jacked install: " + text)
+
+    class _GuardedPopen(real_popen):
+        def __init__(self, args, *popen_args, **popen_kwargs):
+            _refuse(args)
+            super().__init__(args, *popen_args, **popen_kwargs)
+
+    def _guarded_run(args, *run_args, **run_kwargs):
+        _refuse(args)
+        return real_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _GuardedPopen)
+    monkeypatch.setattr(subprocess, "run", _guarded_run)
 
 
 @pytest.fixture(autouse=True)

@@ -1624,11 +1624,7 @@ async def use_account(account_id: int, request: Request):
     if truthful_target:
         db.mark_global_sessions_pending()
 
-    committed = result.outcome in {
-        SwitchOutcome.COMMITTED,
-        SwitchOutcome.COMMITTED_DEGRADED,
-    }
-    if not committed:
+    if not truthful_target:
         return JSONResponse(
             status_code=http_status,
             content=content,
@@ -1640,6 +1636,20 @@ async def use_account(account_id: int, request: Request):
     # note_external_swap() arms the monitor's cooldown + min-residency
     # clocks and clears the emergence streak; the pause setting holds the
     # sweep loop off entirely for at least 15 minutes.
+    #
+    # Every truthful target runs this, not only a committed one. On macOS the
+    # engine reports observed_target_unfenced for every switch, because no
+    # shipped Claude build can be fenced. That outcome still names the account
+    # the authority now holds, so the DB pointer and the pause must follow it.
+    try:
+        db.set_setting("active_account_id", str(account_id))
+    except Exception:
+        logger.exception(
+            "Failed to record the active account pointer after a manual switch "
+            "(account=%d)",
+            account_id,
+        )
+
     try:
         from jacked.api import usage_monitor  # local import: avoids cycle
 

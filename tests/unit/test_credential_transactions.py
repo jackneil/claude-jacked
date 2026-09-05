@@ -9,6 +9,7 @@ from jacked.credentials.models import (
     CredentialIdentity,
     ExecutableIdentity,
     InteractionMode,
+    SessionActivationState,
     StoreDeclaration,
     StoreRole,
     StoreStatus,
@@ -54,7 +55,9 @@ def _capability(mode: CapabilityMode) -> CredentialCapability:
     )
 
 
-def _engine(mode: CapabilityMode, before: CredentialPayload):
+def _engine(
+    mode: CapabilityMode, before: CredentialPayload, *, identity_publisher=None
+):
     repository = InMemoryCredentialSwitchRepository()
     store = MemoryCredentialStore("auth", before)
     fence = WriterFence(StaticWriterInspector(()))
@@ -67,6 +70,7 @@ def _engine(mode: CapabilityMode, before: CredentialPayload):
         install_key=StaticInstallKeyProvider(b"k" * 32),
         machine_install_id="machine-1",
         snapshot_sink=MemoryResolverSnapshotSink(),
+        identity_publisher=identity_publisher,
     )
     return CredentialTransactionEngine(deps), repository, store
 
@@ -545,3 +549,115 @@ def test_concurrent_write_on_a_missing_authority_reports_the_new_contents_as_pre
     assert result.outcome is SwitchOutcome.FAILED_PRESERVED
     assert result.observed_identity.account_id == 9
     assert "changed since read" in result.message
+
+
+# --- Identity mirror: running Claude Code sessions follow a switch only when
+# the oauthAccount identity in Claude's config changes (regression 2026-09-04:
+# the transaction engine wrote the Keychain and mirror but never the config,
+# so every running session kept its previous account).
+
+
+class _Publisher:
+    def __init__(self, fail: Exception | None = None) -> None:
+        self.requests: list[SwitchRequest] = []
+        self.fail = fail
+
+    def __call__(self, request: SwitchRequest) -> None:
+        self.requests.append(request)
+        if self.fail is not None:
+            raise self.fail
+
+
+def _identity_request(payload: CredentialPayload) -> SwitchRequest:
+    return replace(
+        _request(payload),
+        display_name="Two Example",
+        organization_name="Example Org",
+    )
+
+
+def test_unfenced_switch_publishes_identity_and_sessions_follow() -> None:
+    publisher = _Publisher()
+    engine, _, _ = _engine(
+        CapabilityMode.GLOBAL_UNCOOPERATIVE,
+        _payload(1, "before"),
+        identity_publisher=publisher,
+    )
+
+    result = engine.activate(_identity_request(_payload(2, "target")))
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert [r.account_id for r in publisher.requests] == [2]
+    assert publisher.requests[0].email == "two@example.com"
+    assert publisher.requests[0].display_name == "Two Example"
+    assert publisher.requests[0].organization_name == "Example Org"
+    assert result.existing_session_activation is SessionActivationState.PENDING_NEXT_ACTIVITY
+
+
+def test_cooperative_switch_publishes_identity_after_authority_readback() -> None:
+    publisher = _Publisher()
+    engine, repository, _ = _engine(
+        CapabilityMode.GLOBAL_COOPERATIVE,
+        _payload(1, "before"),
+        identity_publisher=publisher,
+    )
+
+    result = engine.activate(_identity_request(_payload(2, "target")))
+
+    assert result.outcome is SwitchOutcome.COMMITTED
+    assert [r.account_id for r in publisher.requests] == [2]
+    assert result.existing_session_activation is SessionActivationState.PENDING_NEXT_ACTIVITY
+    assert repository.finalized
+
+
+def test_identity_is_not_published_when_the_authority_write_fails() -> None:
+    publisher = _Publisher()
+    engine, _, store = _engine(
+        CapabilityMode.GLOBAL_UNCOOPERATIVE,
+        _payload(1, "before"),
+        identity_publisher=publisher,
+    )
+    store.fail_writes = True
+
+    result = engine.activate(_identity_request(_payload(2, "target")))
+
+    assert result.outcome is not SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert publisher.requests == []
+
+
+def test_identity_publish_failure_keeps_the_switch_but_says_sessions_wont_follow() -> None:
+    publisher = _Publisher(fail=OSError("read-only config"))
+    engine, repository, store = _engine(
+        CapabilityMode.GLOBAL_UNCOOPERATIVE,
+        _payload(1, "before"),
+        identity_publisher=publisher,
+    )
+
+    result = engine.activate(_identity_request(_payload(2, "target")))
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert store.read().payload.identity.account_id == 2
+    assert "claude config identity not updated (OSError)" in result.message
+    assert result.existing_session_activation is SessionActivationState.RESTART_REQUIRED
+
+
+def test_cooperative_identity_publish_failure_degrades_the_commit() -> None:
+    publisher = _Publisher(fail=OSError("read-only config"))
+    engine, _, _ = _engine(
+        CapabilityMode.GLOBAL_COOPERATIVE,
+        _payload(1, "before"),
+        identity_publisher=publisher,
+    )
+
+    result = engine.activate(_identity_request(_payload(2, "target")))
+
+    assert result.outcome is SwitchOutcome.COMMITTED_DEGRADED
+    assert "claude config identity not updated (OSError)" in result.message
+    assert result.existing_session_activation is SessionActivationState.RESTART_REQUIRED
+
+
+def test_engine_without_a_publisher_is_unchanged() -> None:
+    engine, _, _ = _engine(CapabilityMode.GLOBAL_UNCOOPERATIVE, _payload(1, "before"))
+    result = engine.activate(_request(_payload(2, "target")))
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert result.existing_session_activation is SessionActivationState.RESTART_REQUIRED

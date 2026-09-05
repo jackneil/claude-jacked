@@ -176,6 +176,36 @@ It is not consulted by the canonical active-credential resolver.
 a per-account `.credentials.json` and selected shared resources. The directory
 is launch input, not a certified authority for the currently shipped build.
 
+### 5.5 Claude config identity mirror
+
+Claude Code holds its OAuth token in memory. It reads the credential store
+again only when the `oauthAccount` identity in `~/.claude.json` changes. A
+credential write that does not change that identity is invisible to a running
+session. The session keeps the previous account until it stops.
+
+Every switch therefore republishes the identity. The transaction engine
+publishes it after a committed switch and after an observed unfenced switch.
+Crash recovery publishes it when it finds the target credentials in the
+authority. The engine replaces all identity fields together. It removes a
+`displayName` that the new account does not supply, because the previous
+account's name must not stay beside the new email address.
+
+A failed publication does not undo the switch. The credentials are already in
+the store. The result degrades instead:
+
+| Fact | Value after a failed publication |
+| --- | --- |
+| Outcome | `committed_degraded`, or `observed_target_unfenced` |
+| Existing-session activation | `restart_required` |
+| Message | contains "claude config identity not updated" |
+
+The switch lease is cross-process. `jacked launch` activates an account from
+one process while the dashboard service can activate one from another process.
+A lock file at `~/.claude/jacked-service-v2/credential-switch.lock` separates
+the processes. A thread lock separates the threads inside one process. A switch
+holds both leases. Neither lease waits: a switch that cannot get a lease
+reports `interactive_operation_in_progress` and changes nothing.
+
 ## 6. Canonical resolution
 
 `CanonicalCredentialResolver.resolve()` reads the declared authority and every
@@ -373,7 +403,60 @@ with evidence for the scoped-file input and global-authority observation. The
 system must not claim that the child actually consumed only the scoped
 credential file.
 
-## 11. Safety invariants
+## 11. Foreign authority writes
+
+Claude Code holds its OAuth token in memory. When that token expires, the
+session refreshes it and writes the new payload into the same authority store
+jacked writes. The payload has no `_jackedAccountId` stamp, and it carries a
+`refreshTokenExpiresAt` field that jacked logs as schema drift. A session that
+still holds an older account therefore replaces the account the user chose.
+
+Three effects follow a foreign write:
+
+1. The authority names a different account, so every session that reloads its
+   credentials uses that account.
+2. The unstamped payload makes the observed identity unusable, so the status
+   line degrades.
+3. Claude Code rotated the refresh token. If jacked overwrites the authority
+   before it imports that token, the account loses its refresh lineage and the
+   next refresh fails with `invalid_grant`.
+
+`jacked/api/authority_guard.py` repairs this on each session observer pass,
+before the pass observes the authority:
+
+- A payload with a valid stamp is a jacked write. The guard does nothing.
+- A payload without a stamp is a foreign write. The guard identifies it once
+  per payload through the OAuth profile endpoint, and matches the email and the
+  organization uuid to an account row.
+- The guard adopts the rotated tokens into the identified row. It never imports
+  a refresh token while the `invalid_grant` breaker is set for that row.
+- The guard then reasserts the desired account through the transaction engine,
+  with the `reassert` switch context. It reasserts at most once each 60
+  seconds, and never while another operation holds the switch lease.
+- When the identified account is the desired account, the guard still
+  reasserts. That write restores the stamp, and no session changes account.
+- An account the profile endpoint does not match is never overwritten. The
+  guard logs a warning and stops, because jacked does not hold that account's
+  refresh lineage.
+- When the desired account cannot be reasserted (its row is missing, disabled,
+  invalid, or has no Claude Code refresh token), the guard re-stamps the
+  authority for the account that holds it, with the same tokens Claude Code
+  wrote. Sessions do not change account, the observed identity becomes usable,
+  and the status line shows the true account. The guard cannot restore a
+  refresh lineage that is already lost; the user re-authenticates the desired
+  account to make it the default again.
+
+The guard never raises. Each failure is logged and reported as a skipped heal.
+The observer publishes the repair as snapshot evidence, for example
+`authority:foreign-write:reasserted`.
+
+Manual switches keep the same rule. Every truthful outcome, `committed`,
+`committed_degraded` and `observed_target_unfenced`, records the active
+account pointer and arms the auto-swap pause. On the shipped macOS topology
+every switch reports `observed_target_unfenced`, so a rule that acted only on
+`committed` left the pointer stale after each switch.
+
+## 12. Safety invariants
 
 1. Unknown executable or platform capability never permits mutation.
 2. On the certified macOS topology, Keychain is authority and the global file
@@ -391,7 +474,7 @@ credential file.
 10. Per-account launch directories remain inputs until exact scoped
     consumption is separately certified.
 
-## 12. Primary implementation map
+## 13. Primary implementation map
 
 | File | Responsibility |
 | --- | --- |
@@ -408,4 +491,5 @@ credential file.
 | `jacked/web/oauth.py` | OAuth storage and conditional local activation |
 | `jacked/launch.py` | Per-account launch preparation and current scoped limitation |
 | `jacked/api/session_observer.py` | Off-hook authority observation and snapshot refresh |
+| `jacked/api/authority_guard.py` | Foreign-write adoption and desired-account reassertion |
 | `jacked/data/hooks/session_account_tracker.py` | Snapshot-only session spans without relabelling |

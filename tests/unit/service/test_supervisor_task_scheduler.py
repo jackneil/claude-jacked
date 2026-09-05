@@ -196,3 +196,43 @@ def test_ambiguous_task_create_is_deleted_before_legacy_vbs_returns(
     assert "previous Task Scheduler state restored" in result.reason
     assert legacy.exists()
     assert [call[1] for call in calls] == ["/Query", "/Create", "/Query", "/Delete"]
+
+
+def test_is_known_legacy_artifact_recognises_the_pre_v2_startup_vbs(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    legacy = tmp_path / "jacked.vbs"
+    legacy.write_text(
+        'Set WshShell = CreateObject("WScript.Shell")\n'
+        'WshShell.Run """C:\\bin\\jacked.exe"" service start --port 8321", 0, False\n',
+        encoding="utf-8",
+    )
+    _secure_test_path(legacy)
+
+    assert is_known_legacy_artifact(
+        legacy, "ai.hank.jacked", SupervisorKind.TASK_SCHEDULER
+    )
+
+
+def test_is_known_legacy_artifact_rejects_a_foreign_startup_vbs(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    legacy = tmp_path / "jacked.vbs"
+    legacy.write_text('WshShell.Run "format c:", 0, False\n', encoding="utf-8")
+    _secure_test_path(legacy)
+
+    assert not is_known_legacy_artifact(
+        legacy, "ai.hank.jacked", SupervisorKind.TASK_SCHEDULER
+    )
+
+
+def test_is_known_legacy_artifact_rejects_the_owned_task_xml(tmp_path):
+    from jacked.service.supervisors import is_known_legacy_artifact
+
+    spec, _environment, _rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+
+    assert not is_known_legacy_artifact(
+        path, spec.service_id, SupervisorKind.TASK_SCHEDULER
+    )

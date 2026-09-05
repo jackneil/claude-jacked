@@ -129,15 +129,146 @@ def _validate_darwin_link_acl(path: Path) -> None:
         raise ValueError("runtime_path symlink has a mutating extended ACL")
 
 
+def _root_equivalent_group_names() -> tuple[str, ...]:
+    """Groups whose members can already act as root on THIS host.
+
+    Root-equivalence is a sudoers property, not a group-name property, so the
+    list is scoped per platform to what the platform itself guarantees:
+
+    - macOS ships ``%admin ALL=(ALL) ALL`` and Homebrew makes its prefix admin
+      group-writable by design, so every Homebrew-installed Python lives under
+      such a directory. ``wheel`` is root's group there.
+    - Debian-family Linux ships ``%sudo``; RHEL, Fedora, SUSE and Amazon Linux
+      ship ``%wheel``. Arch, Alpine, Void and Gentoo ship ``wheel`` with the
+      sudoers grant commented out, so ``wheel`` is trusted only on the families
+      that enable it. A Linux ``admin`` group is an ordinary group and is never
+      trusted by name.
+    """
+    if _HOST_IS_DARWIN:
+        return ("wheel", "admin")
+    if sys.platform.startswith("linux"):
+        families = _linux_family_ids()
+        names = ["sudo"]
+        if families & {"rhel", "fedora", "centos", "rocky", "almalinux", "amzn", "suse", "opensuse", "sles"}:
+            names.append("wheel")
+        return tuple(names)
+    return ()
+
+
+def _linux_family_ids() -> frozenset[str]:
+    """``ID`` and ``ID_LIKE`` tokens from /etc/os-release, lowercase."""
+    release = Path("/etc/os-release")
+    try:
+        status = release.stat()
+        # A mis-permissioned container could let a local user rewrite the
+        # family; fail closed (no wheel grant) unless root owns it read-only.
+        if status.st_uid != 0 or status.st_mode & 0o022:
+            return frozenset()
+        text = release.read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    tokens: set[str] = set()
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() in {"ID", "ID_LIKE"}:
+            tokens.update(value.strip().strip('"').lower().split())
+    return frozenset(tokens)
+
+
+def _user_private_group_id() -> int | None:
+    """Return the caller's primary gid when it is a Linux user-private group.
+
+    Linux creates one group per user: same name as the user, no other members.
+    Writes granted to that group reach only the user, so it is as trusted as
+    the user. The check is bounded on purpose: it never enumerates the user
+    database, which can block for a directory-service timeout on hosts bound
+    to LDAP or Active Directory. macOS never has such groups (``staff``).
+    """
+    if _HOST_IS_DARWIN:
+        return None
+    import grp
+    import pwd
+
+    uid = os.getuid()
+    try:
+        user = pwd.getpwuid(uid)
+        group = grp.getgrgid(user.pw_gid)
+    except KeyError:
+        return None
+    if group.gr_name != user.pw_name or group.gr_gid < 1000:
+        return None
+    if any(member != user.pw_name for member in group.gr_mem):
+        return None
+    return group.gr_gid
+
+
+def _trusted_group_ids() -> frozenset[int]:
+    """Groups a writable bit may grant without opening a privilege boundary.
+
+    A directory writable only by principals who can already become root is
+    not an escalation path: any of them could replace it with ``sudo``.
+    Computed on every validation (three call sites per boot); a cache would
+    only let a demoted administrator's files stay trusted for the tray's life.
+    """
+    import grp
+
+    trusted = {0}
+    for name in _root_equivalent_group_names():
+        try:
+            trusted.add(grp.getgrnam(name).gr_gid)
+        except KeyError:
+            continue
+    private = _user_private_group_id()
+    if private is not None:
+        trusted.add(private)
+    return frozenset(trusted)
+
+
+def _trusted_owner_ids() -> frozenset[int]:
+    """Root, the caller, and the listed members of root-equivalent groups.
+
+    Only ``gr_mem`` is consulted. Users whose PRIMARY group is root-equivalent
+    are not enumerated: that needs ``pwd.getpwall()``, which walks every
+    directory-service record and can block a boot gate. Such a user is trusted
+    through the group-writable rule instead when the path is group-writable.
+    """
+    import grp
+    import pwd
+
+    trusted = {0, os.getuid()}
+    for name in _root_equivalent_group_names():
+        try:
+            group = grp.getgrnam(name)
+        except KeyError:
+            continue
+        for member in group.gr_mem:
+            try:
+                trusted.add(pwd.getpwnam(member).pw_uid)
+            except KeyError:
+                continue
+    return frozenset(trusted)
+
+
 def _trusted_posix_owner(owner: int) -> bool:
-    return owner in {0, os.getuid()}
+    return owner in _trusted_owner_ids()
 
 
 def _writable_by_untrusted_principal(
     status: os.stat_result, *, directory: bool
 ) -> bool:
+    """True when a principal outside the trust set could mutate the path.
+
+    World-writable is always untrusted unless the sticky bit protects a
+    directory. Group-writable is untrusted unless the group is
+    root-equivalent or the caller's private group (see
+    ``_trusted_group_ids``).
+    """
     sticky = directory and bool(status.st_mode & stat.S_ISVTX)
-    return bool(status.st_mode & 0o022) and not sticky
+    if status.st_mode & 0o002 and not sticky:
+        return True
+    if status.st_mode & 0o020 and not sticky:
+        return status.st_gid not in _trusted_group_ids()
+    return False
 
 
 def _validate_posix_directory_chain(path: Path) -> None:

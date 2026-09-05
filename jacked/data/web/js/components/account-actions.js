@@ -362,6 +362,24 @@ function initAccountMenuHandlers() {
     });
 }
 
+// One sentence about the credentials, one about open sessions. The API's
+// `existing_sessions` field is the only truthful source for the second part;
+// the raw engine message is diagnostic text and never shown as the headline.
+function sessionsFollowCopy(result, email, lead) {
+    const sessions = result.existing_sessions;
+    let tail;
+    if (sessions === 'pending_next_activity') {
+        tail = 'Open Claude Code sessions pick it up on their next message.';
+    } else if (sessions === 'restart_required') {
+        tail = 'Open Claude Code sessions could not be told. Restart them to use this account.';
+    } else if (sessions === 'scoped_target') {
+        tail = 'Only sessions launched for this account use it.';
+    } else {
+        tail = 'Open Claude Code sessions are unverified. Check /status inside a session.';
+    }
+    return `${lead} ${tail}`;
+}
+
 function showCredentialActivationResult(result, email) {
     if (result && result.restart_required) {
         showToast(
@@ -370,11 +388,18 @@ function showCredentialActivationResult(result, email) {
             7000,
         );
     } else if (result.status === 'committed') {
-        showToast(result.message || `Default credentials verified for ${email}. Existing sessions update on next activity.`, 'success', 6000);
+        showToast(sessionsFollowCopy(result, email, `Switched to ${email}.`), 'success', 6000);
     } else if (result.status === 'committed_degraded') {
-        showToast(result.message || `Default credentials verified for ${email}, but optional metadata is degraded.`, 'warning', 7000);
+        showToast(sessionsFollowCopy(result, email, `Switched to ${email}, but optional metadata is degraded.`), 'warning', 7000);
     } else if (result.status === 'observed_target_unfenced') {
-        showToast(result.message || `Credentials observed for ${email}, but concurrent writers cannot be excluded. Restart Claude Code; existing sessions are unverified.`, 'warning', 8000);
+        // The credentials are in every store. Whether open sessions follow
+        // depends on the identity mirror, which the API reports explicitly.
+        const follows = result.existing_sessions === 'pending_next_activity';
+        showToast(
+            sessionsFollowCopy(result, email, `Switched to ${email}.`),
+            follows ? 'success' : 'warning',
+            follows ? 6000 : 8000,
+        );
     } else {
         showToast(result.message || `Credential activation returned ${result.status}.`, 'warning', 7000);
     }
@@ -461,7 +486,7 @@ async function activateAccountFromDashboard(id, email, sourceButton) {
         } else if (outcome.status === 'unsupported') {
             showToast(outcome.message || 'This Claude build is not certified for credential switching.', 'error', 8000);
         } else if (outcome.status === 'observed_target_unfenced') {
-            showToast(outcome.message || `Credentials observed for ${email}, but existing sessions are unverified.`, 'warning', 8000);
+            showCredentialActivationResult(outcome, email);
         } else {
             showToast(outcome.message || e.message, 'error');
         }

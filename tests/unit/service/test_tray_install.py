@@ -245,3 +245,123 @@ class TestEnsureAutostartAndRunning:
         monkeypatch.setattr("jacked.service.lifecycle.spawn_exact_service", boom)
         # Must not propagate — install should never die over the tray.
         cli._ensure_autostart_and_running(8321)
+
+
+# ---------------------------------------------------------------------------
+# _ensure_autostart_and_running: legacy vs foreign artifacts
+# ---------------------------------------------------------------------------
+
+
+def _legacy_launchd_plist(path):
+    """Write the exact pre-v2 launchd definition jacked used to install."""
+    import plistlib
+
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "ai.hank.jacked",
+                "ProgramArguments": [
+                    "/Users/test/.local/bin/jacked",
+                    "service",
+                    "start",
+                    "--port",
+                    "8321",
+                ],
+                "RunAtLoad": True,
+            }
+        )
+    )
+    path.chmod(0o600)
+    return path
+
+
+def _patch_manual_owner(monkeypatch, tmp_path, artifact_path):
+    """Wire a live manual instance whose artifact inspects as FOREIGN."""
+    import jacked.cli as cli
+    from jacked.service.spec import SupervisorKind
+    from jacked.service.supervisors import ArtifactDisposition, ArtifactInspection
+
+    manifest = tmp_path / "manifest"
+    manifest.write_text("owned")
+    paths = mock.MagicMock(manifest=manifest)
+    spec = mock.MagicMock(
+        supervisor=SupervisorKind.LAUNCHD, service_id="ai.hank.jacked"
+    )
+    order = []
+    monkeypatch.setattr("jacked.service.lifecycle.default_service_paths", lambda: paths)
+    monkeypatch.setattr(
+        "jacked.service.lifecycle.provision_service_contract", lambda **k: (spec, {})
+    )
+    monkeypatch.setattr(
+        "jacked.service.lifecycle.discover_service",
+        lambda _p: mock.MagicMock(source="manifest"),
+    )
+    monkeypatch.setattr(
+        "jacked.service.instance.read_manifest",
+        lambda _p: mock.MagicMock(supervisor="manual"),
+    )
+    monkeypatch.setattr(
+        "jacked.service.lifecycle.inspect_native_artifact",
+        lambda *a, **k: mock.MagicMock(
+            artifact=ArtifactInspection(ArtifactDisposition.FOREIGN, "unowned")
+        ),
+    )
+    monkeypatch.setattr(
+        "jacked.service.lifecycle.native_artifact_path", lambda *a, **k: artifact_path
+    )
+
+    def shutdown(*_a, **_k):
+        order.append("shutdown")
+        manifest.unlink()
+        return {"ok": True}
+
+    monkeypatch.setattr("jacked.service.ipc.send_native_control", shutdown)
+    monkeypatch.setattr(
+        "jacked.service.lifecycle.install_native_owned",
+        lambda *a, **k: (
+            order.append("activate") or mock.MagicMock(ok=True, reason="ok")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_wait_owned_service_ready",
+        lambda *_a, **_k: {"state": "running", "port": 8321},
+    )
+    return cli, order
+
+
+class TestEnsureAutostartLegacyHandoff:
+    def test_known_legacy_launchd_artifact_is_replaced_not_refused(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        artifact = _legacy_launchd_plist(tmp_path / "ai.hank.jacked.plist")
+        cli, order = _patch_manual_owner(monkeypatch, tmp_path, artifact)
+
+        cli._ensure_autostart_and_running(8321)
+
+        assert order == ["shutdown", "activate"]
+        assert "foreign" not in capsys.readouterr().out.lower()
+
+    def test_truly_foreign_artifact_still_refuses(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        import plistlib
+
+        artifact = tmp_path / "ai.hank.jacked.plist"
+        artifact.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "ai.hank.jacked",
+                    "ProgramArguments": ["/usr/bin/curl", "https://example.invalid"],
+                }
+            )
+        )
+        artifact.chmod(0o600)
+        cli, order = _patch_manual_owner(monkeypatch, tmp_path, artifact)
+
+        cli._ensure_autostart_and_running(8321)
+
+        assert order == []  # nothing shut down, nothing activated
+        output = capsys.readouterr().out.lower()
+        assert "foreign" in output
+        assert "service recover" in output
