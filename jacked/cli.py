@@ -1805,6 +1805,12 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
     except us_mod.LockBusy as exc:
         click.echo(f"[update-status] lock busy: {exc}", err=True)
         sys.exit(2)
+    except Exception as exc:  # noqa: BLE001 - the batch only aborts on exit 2
+        click.echo(
+            f"[update-status] cannot claim the status record: {type(exc).__name__}",
+            err=True,
+        )
+        sys.exit(2)
     if outcome == "adopted":
         click.echo("[update-status] adopted tray pre-init")
 
@@ -6378,24 +6384,45 @@ def _provision_with_timeout(provision, paths, timeout_seconds):
     """Run provisioning, bounded when the caller asked for a timeout.
 
     A batch file cannot bound a command itself, so the Windows upgrade helpers
-    ask this command to bound its own work. The worker thread is a daemon:
-    a hung provisioning call must not keep the process alive after the
-    refusal is printed.
+    ask this command to bound its own work. The worker is an explicit daemon
+    thread: ``ThreadPoolExecutor`` workers are joined at interpreter exit, so
+    a hung provisioning call would keep the process alive after the refusal.
     """
     if timeout_seconds is None:
         return provision(paths=paths)
-    import concurrent.futures
+    import queue
+    import threading
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(provision, paths=paths)
+    outcome: "queue.Queue" = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            outcome.put(("ok", provision(paths=paths)))
+        except BaseException as exc:  # noqa: BLE001 - handed back to the caller
+            outcome.put(("error", exc))
+
+    threading.Thread(target=_worker, name="jacked-preflight", daemon=True).start()
     try:
-        return future.result(timeout=timeout_seconds)
-    except concurrent.futures.TimeoutError as exc:
+        kind, value = outcome.get(timeout=timeout_seconds)
+    except queue.Empty as exc:
         raise TimeoutError(
             f"provisioning did not finish within {timeout_seconds:g}s"
         ) from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    if kind == "error":
+        raise value
+    return value
+
+
+def _exit_hard(code: int) -> None:
+    """Exit even if a daemon thread is wedged inside a C call."""
+    import os
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # noqa: BLE001 - exiting anyway
+            pass
+    os._exit(code)
 
 
 @service.command(name="preflight")
@@ -6433,6 +6460,7 @@ def service_preflight(as_json: bool, timeout_seconds: float | None):
             provision_service_contract, default_service_paths(), timeout_seconds
         )
     except (OSError, ValueError, TimeoutError) as exc:
+        timed_out = isinstance(exc, TimeoutError)
         if as_json:
             click.echo(
                 _json.dumps(
@@ -6449,6 +6477,10 @@ def service_preflight(as_json: bool, timeout_seconds: float | None):
         else:
             console.print(f"[red][FAIL][/red] {type(exc).__name__}: {exc}")
             console.print("[dim]Run 'jacked service status' for details.[/dim]")
+        if timed_out:
+            # The provisioning thread is still wedged; a normal exit would
+            # wait for it. The batches depend on this command returning.
+            _exit_hard(1)
         sys.exit(1)
 
     supervisor = getattr(spec.supervisor, "value", str(spec.supervisor))

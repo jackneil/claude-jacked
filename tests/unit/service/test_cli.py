@@ -1948,7 +1948,12 @@ class TestServicePreflightTimeout:
 
         started = time.monotonic()
         try:
-            with patch("jacked.service.lifecycle.provision_service_contract", _hang):
+            with (
+                patch("jacked.service.lifecycle.provision_service_contract", _hang),
+                # In-process: the real hard exit would kill pytest. The
+                # subprocess test below proves the real exit.
+                patch("jacked.cli._exit_hard", side_effect=SystemExit(1)),
+            ):
                 result = CliRunner().invoke(
                     main, ["service", "preflight", "--timeout", "0.5", "--json"]
                 )
@@ -1956,6 +1961,31 @@ class TestServicePreflightTimeout:
             release.set()
         assert result.exit_code == 1, result.output
         assert "TimeoutError" in result.output
+        assert time.monotonic() - started < 10
+
+    def test_a_hung_provisioning_call_does_not_keep_the_process_alive(self, tmp_path):
+        """ThreadPoolExecutor workers are joined at exit; a daemon thread is not.
+
+        Runs a real interpreter: CliRunner swallows SystemExit in-process and
+        never observes interpreter exit, which is what the batches depend on.
+        """
+        import subprocess
+        import sys
+        import time
+
+        script = (
+            "import threading\n"
+            "import jacked.service.lifecycle as lc\n"
+            "lc.provision_service_contract = lambda paths=None: threading.Event().wait(30)\n"
+            "from jacked.cli import main\n"
+            "main(['service', 'preflight', '--timeout', '0.5', '--json'])\n"
+        )
+        started = time.monotonic()
+        completed = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=15
+        )
+        assert completed.returncode == 1, completed.stdout + completed.stderr
+        assert "TimeoutError" in completed.stdout
         assert time.monotonic() - started < 10
 
     def test_batches_bound_the_preflight(self):
@@ -1967,4 +1997,21 @@ class TestServicePreflightTimeout:
         assert "jacked service preflight 2>&1" not in upd_src
         assert "jacked service preflight --timeout 120 2>&1" in cli_src
         assert "jacked service preflight --timeout 120 2>&1" in upd_src
+
+
+
+
+def test_status_init_shim_fails_closed_on_any_error(monkeypatch):
+    """The batches abort only on exit 2, so every failure must map to it."""
+    from click.testing import CliRunner
+
+    from jacked.cli import main
+    from jacked.service import update_status as us
+
+    def _boom(*a, **k):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(us, "init_or_adopt_status", _boom)
+    result = CliRunner().invoke(main, ["_update_status_init", "1.0", "next", "uv"])
+    assert result.exit_code == 2
 
