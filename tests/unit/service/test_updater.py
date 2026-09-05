@@ -1230,6 +1230,7 @@ class TestRunUpdateReusesTrayPreInit:
             from_version="0.41.19",
             to_version="0.41.20",
             method="uv",
+            preinit=True,
         )
 
         with patch.object(updater, "wait_for_exit", return_value=True):

@@ -177,10 +177,14 @@ def test_init_or_adopt_fresh_file_initializes(tmp_path):
 
 
 def test_init_or_adopt_over_tray_pre_init_adopts_and_preserves_metadata(tmp_path):
-    from jacked.service.update_status import init_or_adopt_status, read_status
+    from jacked.service.update_status import (
+        init_or_adopt_status,
+        init_status,
+        read_status,
+    )
     p = tmp_path / "status.json"
-    # Tray pre-init writes the real from/to metadata.
-    init_or_adopt_status(p, from_version="0.41.19", to_version="0.41.20", method="uv")
+    # Tray pre-init writes the real from/to metadata, marked as pre-init.
+    init_status(p, from_version="0.41.19", to_version="0.41.20", method="uv", preinit=True)
     # Detached updater races in moments later with a placeholder target.
     outcome = init_or_adopt_status(p, from_version="0.41.19", to_version="next", method="uv")
     assert outcome == "adopted"
@@ -308,7 +312,7 @@ def test_cli_update_status_init_exits_0_on_tray_pre_init(tmp_path, monkeypatch):
     from jacked.cli import main
     from jacked.service import update_status as us_mod
     p = tmp_path / "status.json"
-    us_mod.init_status(p, from_version="a", to_version="b", method="uv")  # tray pre-init
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv", preinit=True)  # tray pre-init
     monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
     result = CliRunner().invoke(main, ["_update_status_init", "a", "b", "uv"])
     assert result.exit_code == 0
@@ -582,7 +586,9 @@ class TestUpdaterPidLiveness:
         # The tray pre-creates the file, then exits; the detached updater
         # adopts it. A record still naming the dead tray would read as
         # abandoned the moment the update outran the mtime rule.
-        init_or_adopt_status(path, "1.0.0", "1.1.0", "uv", updater_pid=999999)
+        from jacked.service.update_status import init_status
+
+        init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=999999, preinit=True)
         assert init_or_adopt_status(path, "1.0.0", "1.1.0", "uv") == "adopted"
         data = json.loads(path.read_text())
         assert data["updater_pid"] == os.getpid()
@@ -709,7 +715,7 @@ def test_adoption_replaces_the_dead_tray_pid_with_no_pid_for_a_batch(tmp_path):
     from jacked.service import update_status as us
 
     path = tmp_path / "status.json"
-    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999)  # tray pre-init
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999, preinit=True)  # tray pre-init
     assert us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv", updater_pid=us.NO_UPDATER_PID) == "adopted"
     assert json.loads(path.read_text()).get("updater_pid") is None
 
@@ -718,7 +724,7 @@ def test_adoption_that_cannot_write_its_claim_is_refused(tmp_path, monkeypatch):
     from jacked.service import update_status as us
 
     path = tmp_path / "status.json"
-    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999)
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999, preinit=True)
 
     def _boom(p, data):
         raise OSError("disk full")
@@ -743,4 +749,29 @@ def test_indeterminate_liveness_falls_back_to_the_mtime_rule(tmp_path, monkeypat
     assert us.abandoned_status(path) is not None
     monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: True)
     assert us.abandoned_status(path) is None
+
+
+def test_only_a_tray_preinit_record_can_be_adopted(tmp_path):
+    """Two fresh updaters must not share one record: adoption needs the marker."""
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    # A record written by ANOTHER updater (no phases yet, no preinit marker).
+    us.init_status(path, "1.0.0", "1.1.0", "uv")
+    with pytest.raises(us.LockBusy):
+        us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv")
+
+
+def test_the_preinit_marker_is_consumed_on_adoption(tmp_path):
+    import json
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999, preinit=True)
+    assert us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv") == "adopted"
+    assert "preinit" not in json.loads(path.read_text())
+    # A third arrival sees a claimed record and is refused.
+    with pytest.raises(us.LockBusy):
+        us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv")
 

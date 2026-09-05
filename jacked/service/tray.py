@@ -1262,6 +1262,7 @@ class ServiceRunner:
                     to_version=latest if latest and latest != "?" else "next",
                     method=_det(),
                     log_path=str(_upd_log),
+                    preinit=True,
                 )
             except Exception as _e:
                 # LockBusy or other — just log and continue. The updater

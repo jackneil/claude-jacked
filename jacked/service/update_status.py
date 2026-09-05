@@ -224,8 +224,14 @@ def init_status(
     method: str,
     log_path: Optional[str] = None,
     updater_pid: Optional[int] = None,
+    preinit: bool = False,
 ) -> None:
     """Create a fresh status file. Raises LockBusy if another updater is active.
+
+    ``preinit`` marks the record the TRAY writes moments before it spawns the
+    updater, so the dashboard has something to show at once. Only a record
+    carrying this marker may be adopted by the updater that follows; a fresh
+    record from another updater is a busy updater, phases or not.
 
     `updater_pid` names the process that drives this update, so a reader can
     tell a slow phase from an abandoned one. It defaults to this process.
@@ -263,6 +269,8 @@ def init_status(
         "log_path": log_path,
         "updater_pid": _resolve_updater_pid(updater_pid),
     }
+    if preinit:
+        data["preinit"] = True
     _atomic_write(path, data)
 
 
@@ -309,12 +317,19 @@ def init_or_adopt_status(
         return "initialized"
     except LockBusy:
         prior = _read_raw(path) or {}
-        if not (prior.get("phases") or []) and prior.get("current_phase") is None:
+        if (
+            prior.get("preinit") is True
+            and not (prior.get("phases") or [])
+            and prior.get("current_phase") is None
+        ):
             # Claim the record for THIS process. The tray that pre-created it
             # is about to exit, and a record naming a dead pid would read as
             # abandoned the moment this update runs longer than the mtime rule.
+            # The marker is consumed here: a second updater arriving later sees
+            # a claimed record and is refused like any other busy updater.
+            prior.pop("preinit", None)
             claimed = _resolve_updater_pid(updater_pid)
-            if prior.get("updater_pid") != claimed:
+            if True:
                 if claimed is None:
                     # An updater that cannot be probed (a Windows batch) must
                     # not leave the dead tray's pid on the record.

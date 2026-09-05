@@ -6449,7 +6449,6 @@ def service_preflight(as_json: bool, timeout_seconds: float | None):
     Exit code 0 means this build can boot its service. Exit code 1 means it
     cannot, and an upgrade to this build must not be trusted.
     """
-    import json as _json
     from jacked.service.lifecycle import (
         default_service_paths,
         provision_service_contract,
@@ -6460,28 +6459,38 @@ def service_preflight(as_json: bool, timeout_seconds: float | None):
             provision_service_contract, default_service_paths(), timeout_seconds
         )
     except (OSError, ValueError, TimeoutError) as exc:
-        timed_out = isinstance(exc, TimeoutError)
-        if as_json:
-            click.echo(
-                _json.dumps(
-                    {
-                        "ok": False,
-                        "runtime_path": None,
-                        "runtime_target_path": None,
-                        "supervisor": None,
-                        "generation": None,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-            )
-        else:
-            console.print(f"[red][FAIL][/red] {type(exc).__name__}: {exc}")
-            console.print("[dim]Run 'jacked service status' for details.[/dim]")
-        if timed_out:
+        _print_preflight_failure(exc, as_json)
+        if isinstance(exc, TimeoutError):
             # The provisioning thread is still wedged; a normal exit would
             # wait for it. The batches depend on this command returning.
             _exit_hard(1)
         sys.exit(1)
+    _print_preflight_ok(spec, as_json)
+
+
+def _print_preflight_failure(exc: BaseException, as_json: bool) -> None:
+    import json as _json
+
+    if as_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "ok": False,
+                    "runtime_path": None,
+                    "runtime_target_path": None,
+                    "supervisor": None,
+                    "generation": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        )
+        return
+    console.print(f"[red][FAIL][/red] {type(exc).__name__}: {exc}")
+    console.print("[dim]Run 'jacked service status' for details.[/dim]")
+
+
+def _print_preflight_ok(spec, as_json: bool) -> None:
+    import json as _json
 
     supervisor = getattr(spec.supervisor, "value", str(spec.supervisor))
     if as_json:
@@ -6498,7 +6507,6 @@ def service_preflight(as_json: bool, timeout_seconds: float | None):
             )
         )
         return
-
     console.print("[green][OK][/green] Service contract OK")
     console.print(f"[dim]runtime:[/dim] {spec.runtime_path}")
     console.print(f"[dim]target:[/dim] {spec.runtime_target_path}")
