@@ -46,6 +46,12 @@ class LaunchdTransition:
 # left an upgraded machine with no loaded job and a manually spawned tray.
 BOOTOUT_DRAIN_TIMEOUT_SECONDS = 30.0
 BOOTOUT_DRAIN_POLL_SECONDS = 0.25
+# `kickstart -k` and `bootout` block while launchd waits for the running
+# process to exit; a tray mid-drain takes 12s or more under load, and the flat
+# 15s call timeout turned a healthy handoff into a refusal and a rollback
+# (2026-09-05). Lifecycle calls get a budget sized to the handoff itself.
+LIFECYCLE_CALL_TIMEOUT_SECONDS = 60.0
+_LIFECYCLE_VERBS = ("kickstart", "bootout")
 _LAUNCHCTL_NOT_FOUND = 113
 _LAUNCHCTL_EIO = 5
 
@@ -251,8 +257,11 @@ def _resolve_ambiguous_bootstrap(
 
 
 def _invoke(context: LaunchdTransition, command: list[str]) -> SupervisorAction:
+    options = dict(context.common)
+    if len(command) > 1 and command[1] in _LIFECYCLE_VERBS:
+        options["timeout"] = LIFECYCLE_CALL_TIMEOUT_SECONDS
     try:
-        result = context.run(command, **context.common)
+        result = context.run(command, **options)
     except (OSError, subprocess.SubprocessError) as exc:
         return SupervisorAction(False, "install", type(exc).__name__)
     if result.returncode != 0:

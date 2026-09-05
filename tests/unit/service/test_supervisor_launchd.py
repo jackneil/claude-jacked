@@ -574,3 +574,29 @@ def test_drain_timeout_rolls_back_to_the_previous_generation(tmp_path, monkeypat
     assert "did not unload" in result.reason
     assert path.read_bytes() == previous
 
+
+@pytest.mark.usefixtures("_no_drain")
+def test_lifecycle_launchctl_calls_get_the_handoff_sized_timeout(tmp_path):
+    """kickstart -k and bootout block on the old process's drain; they must
+    not share the 15s budget of print/enable/bootstrap (2026-09-05)."""
+    from jacked.service.supervisors import launchd as launchd_module
+
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    seen = {}
+
+    def runner(argv, **kwargs):
+        seen[argv[1]] = kwargs.get("timeout")
+        if argv[1] == "print":
+            return SimpleNamespace(returncode=0, stdout=f"{spec.generation} {spec.launcher_path}")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok, result.reason
+    assert seen["kickstart"] == launchd_module.LIFECYCLE_CALL_TIMEOUT_SECONDS
+    assert seen["print"] == 15 and seen["enable"] == 15
+
