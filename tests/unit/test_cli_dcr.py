@@ -22,7 +22,7 @@ from tests._platform import requires_posix_dir_permissions, requires_posix_file_
 
 RESOLVE_KEYS = {
     "engine", "model", "effort", "keep_on_claude", "usable", "reason",
-    "codex_installed", "codex_logged_in", "codex_path", "schema_path",
+    "codex_installed", "codex_logged_in", "codex_path", "codex_version", "schema_path",
 }
 
 # chmod-based refusals are meaningless as root.
@@ -84,7 +84,7 @@ def test_engine_human_output_for_codex_ready(isolated_home):
         result = _invoke(["dcr", "engine"])
     assert result.exit_code == 0
     assert "DCR review engine: Codex (OpenAI)" in result.output
-    assert "gpt-5.6-luna" in result.output
+    assert "gpt-6-astra" in result.output
     assert "xhigh" in result.output
     assert "Security, Frontend Design" in result.output
     assert "ready" in result.output
@@ -104,7 +104,7 @@ def test_set_and_clear_round_trip(isolated_home):
     with patch("jacked.dcr_settings.codex_preflight", return_value=READY):
         set_result = _invoke([
             "dcr", "engine", "set", "codex",
-            "--model", "gpt-5.6-luna", "--effort", "high",
+            "--model", "gpt-6-astra", "--effort", "high",
             "--keep-on-claude", "Security, Frontend Design , Data Integrity",
         ])
     assert set_result.exit_code == 0, set_result.output
@@ -112,7 +112,8 @@ def test_set_and_clear_round_trip(isolated_home):
     assert on_disk == {
         "version": 1,
         "engine": "codex",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
+        "model_pinned": True,
         "effort": "high",
         "keep_on_claude": ["Security", "Frontend Design", "Data Integrity"],
     }
@@ -131,7 +132,7 @@ def test_set_and_clear_round_trip(isolated_home):
 def test_set_keeps_existing_values_when_flags_are_omitted(isolated_home):
     dcr_settings.write_config(isolated_home, {
         "engine": "codex",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
         "effort": "low",
         "keep_on_claude": ["Security"],
         "future_key": "kept",
@@ -353,3 +354,18 @@ def test_set_surfaces_a_post_write_verification_failure_without_a_traceback(
     assert result.exit_code == 1
     assert "Traceback" not in result.output
     assert "Nothing was written" in result.output
+
+
+def test_engine_human_output_shows_the_reason_when_usable_but_adjusted(isolated_home):
+    """A too-old CLI swaps the model for the fallback while staying usable; the
+    human block must say so or the printed Model line looks chosen."""
+    dcr_settings.write_config(isolated_home, {**dcr_settings.DEFAULTS, "engine": "codex"})
+    with patch("jacked.dcr_settings.codex_preflight", return_value={
+        **READY, "codex_version": "0.151.0",
+    }):
+        result = CliRunner().invoke(main, ["dcr", "engine"])
+    assert result.exit_code == 0, result.output
+    assert "Model:  gpt-5.6-sol" in result.output
+    assert "codex CLI 0.151.0 installed" in result.output
+    assert "needs Codex CLI 0.153.0 or newer" in result.output
+    assert "codex update" in result.output

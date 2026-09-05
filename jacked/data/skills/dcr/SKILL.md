@@ -164,7 +164,7 @@ You (the parent) can see cross-cutting concerns — e.g., reviewer A flags a sec
 /dcr can run its reviewers on two engines. The parent dispatcher (you) ALWAYS stays in this session and keeps lens selection, finding validation, the fix phase, and the verdict — the engine only changes WHO executes the read-only reviewer briefs.
 
 - **claude** (default): reviewers spawn as parallel Task subagents, exactly as described in SPAWNING INSTRUCTIONS and the tiered-dispatch rules.
-- **codex**: reviewer briefs execute as parallel OpenAI Codex CLI jobs (the user configures the model, e.g. `gpt-5.6-luna`). Review findings come back as schema-validated JSON files. This keeps Anthropic usage in the parent loop only; the user pays for reviews with their OpenAI subscription instead.
+- **codex**: reviewer briefs execute as parallel OpenAI Codex CLI jobs (the user configures the model, e.g. `gpt-6-astra`; `jacked dcr engine --json` reports the model the installed Codex CLI can actually serve). Review findings come back as schema-validated JSON files. This keeps Anthropic usage in the parent loop only; the user pays for reviews with their OpenAI subscription instead.
 
 ### ENGINE CHECK (once per /dcr run, before Wave 1)
 

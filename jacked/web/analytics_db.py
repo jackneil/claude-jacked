@@ -111,8 +111,11 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-6": _TIER_OPUS,
     "claude-opus-4-7": _TIER_OPUS,
     "claude-opus-4-8": _TIER_OPUS,
+    "claude-opus-5": _TIER_OPUS,
     "claude-fable-5": _TIER_FABLE,
+    "claude-fable-5-1": _TIER_FABLE,
     "claude-mythos-5": _TIER_FABLE,
+    "claude-mythos-5-1": _TIER_FABLE,
     # Short aliases (fallback for legacy rows without model column)
     "haiku": _TIER_HAIKU,
     "sonnet": _TIER_SONNET,

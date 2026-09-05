@@ -103,8 +103,11 @@ lenses (default Security + Frontend Design) always spawn as Claude reviewers.
 Every failure shape falls back to Claude - codex missing/unauthed, a corrupt
 config file, a failed or hung Codex job (that one reviewer re-runs as a Claude
 Task) - so a review never blocks on the engine and no lens is ever dropped.
-Defaults when enabling: model `gpt-5.6-luna`, effort `xhigh`. Any Codex model
-name is accepted; effort is one of none/minimal/low/medium/high/xhigh/max.
+Defaults when enabling: model `gpt-6-astra`, effort `xhigh`. Any Codex model
+name is accepted; effort is one of none/minimal/low/medium/high/xhigh/max/ultra.
+`gpt-6-astra` needs Codex CLI 0.153.0 or newer; on an older CLI the engine
+reports the reason and reviews on `gpt-5.6-sol` until you run `codex update`.
+A stored `gpt-5.6-luna` (the default through 0.103.0) migrates to `gpt-6-astra`.
 
 Chain-of-command auto-load (0.76.0+): `jacked install` registers a synchronous
 SessionStart hook (`jacked _hook chain_of_command_context`) that injects the
