@@ -337,11 +337,34 @@ def test_an_unusable_desired_account_imports_without_reasserting(
         read_authority=lambda: _foreign_payload(),
     )
 
-    assert result.action == "skipped"
+    # The desired account cannot be reasserted, so the guard re-stamps the
+    # authority for the account that holds it: tokens unchanged, identity
+    # usable, and the user sees the truth instead of "runtime unknown".
+    assert result.action == "adopted"
     assert expected_reason in result.reason
     assert result.foreign_account_id == 3
+    assert result.desired_account_id == 11
     assert db.accounts[3]["cc_access_token"] == "live_at_3"
-    assert activate.calls == []
+    assert [call[0]["id"] for call in activate.calls] == [3]
+    assert activate.calls[0][1] is SwitchContext.REASSERT
+
+
+def test_an_unusable_desired_account_restamp_failure_is_a_skip():
+    db = _db()
+    db.accounts[11].update({"cc_refresh_token": None})
+    activate = _Activator(SwitchOutcome.INTERACTIVE_OPERATION_IN_PROGRESS)
+
+    result = heal_foreign_authority(
+        db,
+        now=100.0,
+        profile_lookup=_profile("carol@test.com", "org-3"),
+        activate=activate,
+        read_authority=lambda: _foreign_payload(),
+    )
+
+    assert result.action == "skipped"
+    assert "no Claude Code tokens" in result.reason
+    assert db.accounts[3]["cc_access_token"] == "live_at_3"
 
 
 def test_a_missing_desired_row_imports_without_reasserting():
@@ -357,10 +380,11 @@ def test_a_missing_desired_row_imports_without_reasserting():
         read_authority=lambda: _foreign_payload(),
     )
 
-    assert result.action == "skipped"
+    # No desired row to reassert: the holder is re-stamped instead.
+    assert result.action == "adopted"
     assert "missing" in result.reason
     assert db.accounts[3]["cc_access_token"] == "live_at_3"
-    assert activate.calls == []
+    assert [call[0]["id"] for call in activate.calls] == [3]
 
 
 def test_a_held_switch_lease_skips_the_reassert():

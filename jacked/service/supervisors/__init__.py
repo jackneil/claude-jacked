@@ -46,7 +46,13 @@ def render_launchd(
         "ProgramArguments": list(command),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
-        "ProcessType": "Background",
+        # The tray is a user-facing agent with a bounded readiness budget.
+        # launchd throttles the CPU and I/O of Background jobs "to prevent
+        # them from disrupting the user experience" (launchd.plist(5)); on a
+        # loaded machine that left the service still importing Python two
+        # minutes into its 90s window (2026-09-05). Interactive is the class
+        # Apple prescribes for agents the user sees and waits on.
+        "ProcessType": "Interactive",
         "JackedOwner": marker["owner"],
         "JackedServiceID": marker["service_id"],
         "JackedSchemaVersion": marker["schema_version"],

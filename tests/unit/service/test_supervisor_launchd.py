@@ -413,3 +413,28 @@ def test_is_known_legacy_artifact_is_false_for_a_missing_path(tmp_path):
     assert not is_known_legacy_artifact(
         tmp_path / "absent.plist", "ai.hank.jacked", SupervisorKind.LAUNCHD
     )
+
+
+def test_launchd_artifact_runs_the_tray_as_an_interactive_job(tmp_path):
+    """Background jobs are CPU/IO throttled by launchd; the tray must bind a
+    port inside its readiness window even on a loaded machine (2026-09-05)."""
+    import hashlib
+    import plistlib
+
+    from jacked.service.spec import SupervisorKind
+    from jacked.service.supervisors import render_for_spec
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    launcher = tmp_path / "launcher"
+    launcher.write_bytes(b"launcher")
+    launcher.chmod(0o700)
+    spec = make_spec(
+        SupervisorKind.LAUNCHD,
+        launcher_path=launcher,
+        launcher_hash=hashlib.sha256(b"launcher").hexdigest(),
+    )
+    artifact = render_for_spec(
+        spec, environment={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    )
+    payload = plistlib.loads(artifact.content)
+    assert payload["ProcessType"] == "Interactive"

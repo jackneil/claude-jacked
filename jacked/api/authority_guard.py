@@ -245,6 +245,34 @@ def _desired_account_id(db) -> int | None:
     return None
 
 
+def _restamp_foreign_holder(db, row: dict, activate: Callable[..., Any] | None) -> bool:
+    """Republish the foreign holder's own credentials through the engine.
+
+    The tokens are identical to what Claude Code just wrote, so running
+    sessions are unaffected; the write only adds the stamp and the config
+    identity. Returns True when the engine observed or committed the target.
+    """
+    from jacked.credentials.models import SwitchContext, SwitchOutcome
+    from jacked.credentials.runtime import activate_account
+
+    fresh = db.get_account(int(row["id"])) or row
+    if not fresh.get("cc_access_token"):
+        return False
+    activator = activate or activate_account
+    try:
+        result = activator(
+            db, fresh, SwitchContext.REASSERT, f"restamp-{uuid.uuid4().hex}"
+        )
+    except Exception:  # noqa: BLE001 - never break the observer pass
+        logger.debug("Re-stamp of the foreign holder failed", exc_info=True)
+        return False
+    return getattr(result, "outcome", None) in {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.COMMITTED_DEGRADED,
+        SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+    }
+
+
 def _desired_row_refusal(row: dict | None) -> str:
     """Say why a desired account cannot be reasserted, or an empty string."""
     if row is None:
@@ -376,9 +404,22 @@ def _heal(
     desired_row = db.get_account(desired_id)
     refusal = _desired_row_refusal(desired_row)
     if refusal:
+        # The chosen account cannot be reasserted (typically its refresh
+        # lineage is already dead and it needs a re-auth). Do not leave the
+        # authority unstamped: re-stamp it for the account that actually
+        # holds it so jacked's observed identity is usable and the user sees
+        # the truth instead of "runtime unknown".
         _mark_handled(digest, foreign_account_id, settled=True)
+        logger.warning(
+            "Desired account %d cannot be reasserted (%s); keeping account %d, "
+            "which now holds the authority",
+            desired_id,
+            refusal,
+            foreign_account_id,
+        )
+        restamp = _restamp_foreign_holder(db, row, activate)
         return HealResult(
-            ACTION_SKIPPED,
+            ACTION_ADOPTED if restamp else ACTION_SKIPPED,
             foreign_account_id=foreign_account_id,
             desired_account_id=desired_id,
             reason=refusal,

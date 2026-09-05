@@ -438,6 +438,13 @@ before the pass observes the authority:
 - An account the profile endpoint does not match is never overwritten. The
   guard logs a warning and stops, because jacked does not hold that account's
   refresh lineage.
+- When the desired account cannot be reasserted (its row is missing, disabled,
+  invalid, or has no Claude Code refresh token), the guard re-stamps the
+  authority for the account that holds it, with the same tokens Claude Code
+  wrote. Sessions do not change account, the observed identity becomes usable,
+  and the status line shows the true account. The guard cannot restore a
+  refresh lineage that is already lost; the user re-authenticates the desired
+  account to make it the default again.
 
 The guard never raises. Each failure is logged and reported as a skipped heal.
 The observer publishes the repair as snapshot evidence, for example
