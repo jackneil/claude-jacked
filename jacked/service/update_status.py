@@ -240,8 +240,10 @@ def init_status(
       - no prior file
       - prior succeeded/failed file
       - prior in_progress file older than STALE_IN_PROGRESS_SECONDS
+      - prior in_progress file whose recorded updater pid is proven dead
     Refuses:
-      - prior in_progress file fresher than that
+      - prior in_progress file fresher than that whose updater is alive or
+        cannot be probed
     """
     prior = _read_raw(path)
     if prior is not None and prior.get("overall") == "in_progress":
@@ -249,7 +251,13 @@ def init_status(
             age = time.time() - path.stat().st_mtime
         except OSError:
             age = 0
-        if age <= STALE_IN_PROGRESS_SECONDS:
+        # The write side agrees with the read side: a record whose updater is
+        # proven dead is clobbered at once, not after the mtime window. The
+        # tray's pre-init is exempt: the tray that wrote it is expected to be
+        # gone by the time the updater arrives, and adoption consumes it.
+        if age <= STALE_IN_PROGRESS_SECONDS and (
+            prior.get("preinit") is True or _updater_liveness(prior) is not False
+        ):
             raise LockBusy(
                 "Another updater is in-flight (started "
                 f"{prior.get('started_at', '?')}, last updated "
@@ -288,10 +296,11 @@ def init_or_adopt_status(
     the user clicks update so the dashboard has something from t=0. The
     detached updater — POSIX Python or the Windows cmd.exe shim — then races
     to init again moments later and hits LockBusy on the tray's own
-    seconds-old file. That's not a real collision: a file with no phases and
-    no current_phase is the tray's pre-init, so adopt it without rewriting
-    (its metadata is already correct). A file with an open phase IS a real
-    concurrent updater — re-raise LockBusy so callers refuse.
+    seconds-old file. That's not a real collision: a file the tray wrote with
+    ``preinit=True`` and no phases is the tray's pre-init, so adopt it without
+    rewriting (its metadata is already correct) and consume the marker. Any
+    other in-flight file, phases or not, IS a real concurrent updater: re-raise
+    LockBusy so callers refuse.
 
     Returns ``"initialized"`` (wrote a fresh file) or ``"adopted"`` (reused
     the tray's pre-init metadata).
@@ -300,10 +309,14 @@ def init_or_adopt_status(
     >>> from pathlib import Path
     >>> with tempfile.TemporaryDirectory() as d:
     ...     p = Path(d) / "status.json"
+    ...     init_status(p, "1.0.0", "1.1.0", "uv", preinit=True)
     ...     init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
-    ...     init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
-    'initialized'
+    ...     try:
+    ...         init_or_adopt_status(p, "1.0.0", "1.1.0", "uv")
+    ...     except LockBusy:
+    ...         print("busy")
     'adopted'
+    busy
     """
     try:
         init_status(
@@ -329,22 +342,21 @@ def init_or_adopt_status(
             # a claimed record and is refused like any other busy updater.
             prior.pop("preinit", None)
             claimed = _resolve_updater_pid(updater_pid)
-            if True:
-                if claimed is None:
-                    # An updater that cannot be probed (a Windows batch) must
-                    # not leave the dead tray's pid on the record.
-                    prior.pop("updater_pid", None)
-                else:
-                    prior["updater_pid"] = claimed
-                # A claim that cannot be written leaves the tray's dead pid on
-                # the record; the update would then read as abandoned mid-run.
-                # Surface it as the LockBusy the caller already handles.
-                try:
-                    _atomic_write(path, prior)
-                except OSError as exc:
-                    raise LockBusy(
-                        f"could not claim the update status record: {exc}"
-                    ) from exc
+            if claimed is None:
+                # An updater that cannot be probed (a Windows batch) must
+                # not leave the dead tray's pid on the record.
+                prior.pop("updater_pid", None)
+            else:
+                prior["updater_pid"] = claimed
+            # A claim that cannot be written leaves the tray's dead pid on
+            # the record; the update would then read as abandoned mid-run.
+            # Surface it as the LockBusy the caller already handles.
+            try:
+                _atomic_write(path, prior)
+            except OSError as exc:
+                raise LockBusy(
+                    f"could not claim the update status record: {exc}"
+                ) from exc
             return "adopted"
         raise
 

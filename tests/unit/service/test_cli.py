@@ -1980,9 +1980,19 @@ class TestServicePreflightTimeout:
             "from jacked.cli import main\n"
             "main(['service', 'preflight', '--timeout', '0.5', '--json'])\n"
         )
+        # The child is a fresh interpreter, so the conftest isolation does not
+        # apply. Point HOME at tmp so nothing can reach the real ~/.claude.
+        import os
+
+        env = {**os.environ, "HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
         started = time.monotonic()
         completed = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True, timeout=15
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+            cwd=str(tmp_path),
         )
         assert completed.returncode == 1, completed.stdout + completed.stderr
         assert "TimeoutError" in completed.stdout

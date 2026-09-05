@@ -775,3 +775,29 @@ def test_the_preinit_marker_is_consumed_on_adoption(tmp_path):
     with pytest.raises(us.LockBusy):
         us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv")
 
+
+def test_update_status_doctests_pass():
+    """The module's doctests document adoption; keep them executable."""
+    import doctest
+
+    from jacked.service import update_status
+
+    results = doctest.testmod(update_status)
+    assert results.failed == 0, results
+
+
+def test_init_status_clobbers_a_record_whose_updater_is_proven_dead(tmp_path, monkeypatch):
+    """The write side agrees with the read side on liveness."""
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=4242)
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: False)
+    us.init_status(path, "1.0.0", "1.2.0", "uv")  # no LockBusy
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: True)
+    with pytest.raises(us.LockBusy):
+        us.init_status(path, "1.0.0", "1.3.0", "uv")
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: None)
+    with pytest.raises(us.LockBusy):  # indeterminate keeps the mtime rule
+        us.init_status(path, "1.0.0", "1.4.0", "uv")
+

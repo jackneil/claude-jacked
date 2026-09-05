@@ -43,6 +43,9 @@ class SwitchContext(str, Enum):
     OAUTH = "oauth"
     LAUNCH = "launch"
     AUTO_SWAP = "auto_swap"
+    # A foreign process (a Claude Code token refresh) replaced the authority.
+    # jacked republishes the desired account over that write.
+    REASSERT = "reassert"
 
 
 class SwitchOutcome(str, Enum):

@@ -854,3 +854,40 @@ def test_session_states_preserves_earliest_started_identity(client, db):
 
     assert session["started_as"]["account_id"] == 1
     assert session["observed_configuration"]["account_id"] == 2
+
+
+def test_use_account_unfenced_switch_gets_residency(client, app, db):
+    """On macOS every switch reports observed_target_unfenced. That outcome
+    still names the account the authority holds, so the DB pointer, the swap
+    notice and the auto-swap pause must all follow it."""
+    app.state.credential_switcher.return_value = _switch_result(
+        SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    )
+    before = datetime.now(timezone.utc)
+    with (
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap") as mock_note,
+    ):
+        response = client.post("/api/auth/accounts/1/use")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "observed_target_unfenced"
+    assert db.get_setting("active_account_id") == "1"
+    mock_note.assert_called_once_with()
+    paused = datetime.fromisoformat(db.get_setting("auto_swap_paused_until"))
+    assert paused - before >= timedelta(minutes=14, seconds=50)
+
+
+def test_use_account_committed_switch_records_the_active_pointer(client, db):
+    with (
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        response = client.post("/api/auth/accounts/1/use")
+
+    assert response.status_code == 200
+    assert db.get_setting("active_account_id") == "1"
