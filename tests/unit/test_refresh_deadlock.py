@@ -194,7 +194,7 @@ class TestBoundedLockAcquire:
                 lock.release()
 
         with patch("jacked.web.auth._exchange_refresh_token", exchange):
-            result = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+            result = asyncio.run(asyncio.wait_for(scenario(), timeout=60))
 
         assert result.success is False
         assert result.error == "lock_timeout"
@@ -259,7 +259,7 @@ class TestProfileFetchOutsideLock:
         with patch("jacked.web.auth._exchange_refresh_token", exchange), \
              patch("jacked.web.auth.fetch_profile", new_callable=AsyncMock):
             result, still_locked = asyncio.run(
-                asyncio.wait_for(scenario(), timeout=5))
+                asyncio.wait_for(scenario(), timeout=60))
 
         assert result.success is True
         assert still_locked is False
@@ -319,8 +319,12 @@ class TestShieldedRefreshSurvivesCancellation:
                     len(auth._inflight_refresh_tasks),
                 )
 
+        # The behaviour under test is the 0.1s caller timeout inside the
+        # scenario. The outer budget only guards against a hung shielded
+        # task, so it must be generous: on a loaded machine a 5s wall budget
+        # expired first and surfaced as CancelledError inside pytest.raises.
         row, still_locked, inflight = asyncio.run(
-            asyncio.wait_for(scenario(), timeout=5))
+            asyncio.wait_for(scenario(), timeout=60))
 
         assert row["refresh_token"] == "new-rt", (
             "rotated refresh token must be persisted despite caller timeout"
@@ -364,7 +368,7 @@ class TestShieldedRefreshSurvivesCancellation:
                     auth._get_refresh_lock(acct["id"]).locked(),
                 )
 
-        row, still_locked = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+        row, still_locked = asyncio.run(asyncio.wait_for(scenario(), timeout=60))
 
         assert row["refresh_token"] == "new-rt"
         assert row["access_token"] == "new-at"
