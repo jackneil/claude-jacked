@@ -186,7 +186,7 @@ Carve-outs stay as Claude Task dispatches regardless of engine: every lens liste
 
 For each Codex-engine reviewer in a wave:
 
-1. **Write the complete reviewer brief to a scratchpad file** (e.g. `<scratchpad>/dcr-wave1-reviewer-A.md`). Identical content to the Task prompt you would have written (SPAWNING INSTRUCTIONS items 1-12 as applicable: READ-ONLY, the assigned lenses + lens details, phase, persona/wild card at the LARGE tier, PROJECT_CONTEXT, evidence requirement, the full DO NOT FLAG list, re-check context on wave 2+, pre-mortem instructions for the pre-mortem analyst). Append this output instruction: "Your final message MUST be only the JSON required by the output schema: one lens_report per assigned lens (the pre-mortem analyst emits a single lens_report named 'Pre-Mortem'). Put each finding's concrete trigger — the specific input, state, or call path — in `trigger`, and the exact location in `file`/`line_start`/`line_end`."
+1. **Write the complete reviewer brief to a scratchpad file** (e.g. `<scratchpad>/dcr-wave1-reviewer-A.md`). Identical content to the Task prompt you would have written (SPAWNING INSTRUCTIONS items 1-12 as applicable: READ-ONLY, the assigned lenses + lens details, phase, persona/wild card at the LARGE tier, PROJECT_CONTEXT, evidence requirement, the full DO NOT FLAG list, re-check context on wave 2+, pre-mortem instructions for the pre-mortem analyst). Append this output instruction: "Your final message MUST be only the JSON required by the output schema: one lens_report per assigned lens (the pre-mortem analyst emits a single lens_report named 'Pre-Mortem'). Put each finding's concrete trigger — the specific input, state, or call path — in `trigger`, the exact location in `file`/`line_start`/`line_end`, and `introduced_by_branch` (true when the defect lives in lines or behavior this diff changed)."
 2. **Launch the job** with Bash `run_in_background: true` (these are CLI processes, not subagents):
    ```
    codex exec --sandbox read-only --ephemeral --cd "<repo root>" \
@@ -232,6 +232,7 @@ When spawning each reviewer in a wave, include ALL of the following in the Task 
     You are READ-ONLY. Report findings but do NOT edit files. Include file paths and line numbers."
 11. **Evidence requirement** (always): "Every CRITICAL or MEDIUM finding you report MUST include (a) the exact `file:line`, (b) the concrete trigger — the specific input, state, or call path that produces the failure — and (c) one sentence on why it is wrong. If you cannot point to the specific code path that exhibits the problem, do NOT report it as CRITICAL/MEDIUM — downgrade it to LOW or drop it. No evidence, no report."
 12. **Exclusions (always)**: Include the full `## DO NOT FLAG` list (below) verbatim in every reviewer prompt. Those items are out of scope at every severity — reporting them erodes trust and triggers wasted fix waves.
+13. **Scope and provenance (always)**: "This branch's stated scope is: [SCOPE]. Tag EVERY finding with `introduced_by_branch: true|false` — true when the defect lives in lines this diff added or changed, or in behavior this diff changed; false when the defect was already present before the branch. Say which in one clause (e.g. `introduced_by_branch: false — this branch only reads the helper, the bug predates it`). Pre-existing defects are still worth reporting with full evidence; the tag decides whether this PR fixes them or files them." This one field is what makes the fix/file decision mechanical instead of a judgment the parent has to make per finding.
 
 ## DO NOT FLAG
 
@@ -256,7 +257,7 @@ Beyond this list, report with confidence discipline: raise a CRITICAL/MEDIUM onl
    - **Fix phase**: the parent dispatcher (you) edits the plan file to incorporate findings — this is the one file editable in plan mode. Do not edit any other files.
 
 1. **Detect phase** using the signals above. If ambiguous, ask the user. Then **classify the RISK TIER** (see RISK TIER section) from the resolved diff: changed-line count, file count, and sensitive areas (grep the diff paths/hunks for auth/credential/RBAC/tenant/billing/migration/lock signals plus any repo-configured Sensitive Areas).
-2. **Announce**: "Starting parallel DCR. Phase: [PHASE]. Tier: [TIER] — [one-line justification]. Selecting relevant lenses and spawning reviewers."
+2. **State the scope, then announce**: derive the branch's stated scope in ONE sentence from the strongest source available (the PR title/body, the plan doc, the commit messages, the user's request; last resort, the diff itself) and set `scope = "<sentence>"`. Then: "Starting parallel DCR. Phase: [PHASE]. Tier: [TIER] — [one-line justification]. Scope: [SCOPE]. Selecting relevant lenses and spawning reviewers." The scope line travels into every reviewer prompt (SPAWNING INSTRUCTIONS item 13) and decides which findings this PR must fix (FIX PHASE step 10).
 3. **Initialize**:
    - `covered = Set()` — lenses that passed clean
    - `needs_recheck = Set()` — lenses that found issues, fix applied, must verify
@@ -496,9 +497,11 @@ Why: Fable-tier models run behind safety classifiers that can block security-fla
    - **Clean** (no *validated* CRITICAL/MEDIUM — a lens whose only findings were dropped as unconfirmed counts as clean) → move lens to `covered`
    - **Validated CRITICAL/MEDIUM** → add findings to list
    - **LOW issues** → report them but do NOT block progress
-10. **If findings exist**:
-    - Apply all fixes holistically (you see the full picture across all reports)
-    - Run tests if code was changed
+10. **If findings exist**, sort the validated CRITICAL/MEDIUM findings into two buckets by `introduced_by_branch` (verify the tag during validation; a reviewer that got it wrong is corrected, not trusted):
+    - **Introduced by this branch** → fixed in this PR, always.
+    - **Pre-existing, discovered adjacent to the branch** → fixed in this PR only when it is security-, data-integrity-, or billing-critical, or when the fix is a one-line change. Otherwise FILE it: open an issue (`gh issue create`) whose body is the reviewer's evidence verbatim (file:line, trigger, why, recommendation), link the issue in the PR body and in the final report, and move on. Filing with evidence is not punting; growing a PR past its stated scope is its own review risk (one prompt audit became a 65-file rewrite this way, 2026-09-04). A project or global CLAUDE.md that says otherwise wins over this default.
+    - Apply the in-PR fixes holistically (you see the full picture across all reports)
+    - Run the targeted tests for what changed (the FULL suite runs once, on a frozen tree, as the final gate before the push; the full-suite gate is per PUSH, not per fix batch)
     - Move each fixed lens to `needs_recheck`
     - Add to `resolved_issues` with description of what was found and how it was fixed
 11. `wave++`
@@ -508,7 +511,7 @@ Why: Fable-tier models run behind safety classifiers that can block security-fla
 Re-check waves VERIFY FIXES; they do not re-review from scratch. Wave 1 already covered the code — re-reviewing unchanged code every round is the single biggest token waste in a recursive loop, and a fresh full review by fresh eyes almost always dredges up some new marginal item, so it also stops the loop from converging.
 
 12. **Check stop**: If `needs_recheck` is empty → **ALL COVERED** → go to step 16.
-13. **Check cap**: Default wave cap is **3** (Wave 1 + up to 2 re-check waves), and the chain-of-command dispatch shape sets the everyday cap at 2 (Wave 1 + one fix-verification wave); a third wave is for a LARGE tier with confirmed CRITICALs still open. A project or global CLAUDE.md may override the cap in either direction (including "no cap"). If `wave >= cap`, go to step 17. Re-check waves review the fix DELTA only (item 7); a fresh whole-branch pass happens at most once, as the final wave of a LARGE review, never every round.
+13. **Check convergence, then the cap**: a review loop CONVERGES; it does not run until nothing new appears (a fresh pass always finds something new by construction, which is how one branch ran 12 rounds, ~200 agents and ~42M tokens for 6 real bugs, 2026-09-04). The loop has converged when the last wave yielded no validated branch-introduced CRITICAL/MEDIUM and no critical pre-existing one; everything else it found is filed per step 10, and the run reports clean (step 16) even if `needs_recheck` is not empty for filed items. Default wave cap is **2** (Wave 1 + one fix-verification wave). A third wave is allowed only at the LARGE tier with a confirmed CRITICAL still open; if that third wave STILL finds branch-introduced defects, the fixes are too broad and the answer is to split the PR, not to review again — go to step 17 with that next step. A project or global CLAUDE.md may override the cap in either direction (including "no cap"). If `wave >= cap`, go to step 17. Re-check waves review the fix DELTA only (item 7); a fresh whole-branch completeness pass happens at most once, as the final wave of a LARGE review, never every round.
 14. **Build re-check wave**:
     - Group ALL `needs_recheck` lenses into ONE verification reviewer (two if more than 5 lenses need re-check). Fix verification is narrow — it does not need the Wave-1 fan-out.
     - No personas, no wild cards, any tier.
@@ -546,6 +549,7 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
     **Diagnostics:** ✓ lint/type/tests green ([N] tests) / ⊘ no toolchain detected — skipped / n/a (not POST-IMPLEMENTATION)
     **Issues found and fixed:** [count] ([which lenses/pre-mortem])
     **Unconfirmed findings (not actioned):** [list with reason, or "none"]
+    **Pre-existing findings filed, not fixed here:** [issue links with file:line, or "none"]
     **Context sources:** [list of discovered files]
     **Verdict:** Ready to Merge — all selected lenses clean, no confirmed CRITICAL/MEDIUM. (If advisory LOW/unconfirmed items remain, report **Needs Attention** instead and list them.)
     **Next step:** [one sentence — e.g. "Commit and open the PR." or "N LOW items remain; merge if cheap-or-irrelevant, else address first."]
@@ -555,7 +559,7 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
 
     **Memory vault (guarded, judgment-based):** on a clean final pass ONLY, if the memory vault is enabled (`jacked memory status --quiet` exits 0; skip silently otherwise), record any notable ARCHITECTURAL decision the review surfaced as a decision note: `jacked memory add --type decision --title "<decision>" --body "<the decision + the reasoning that settled it>"`. This is a rare, high-signal capture: most clean passes surface no such decision and record nothing. Never store a routine fix or a finding. If the vault is off, do nothing.
 
-17. **Report cap reached** (wave cap hit — default 3, or the user-configured cap):
+17. **Report cap reached** (wave cap hit — default 2, LARGE-tier third wave, or the user-configured cap):
     ```
     ## DCR Cap Reached ([N] waves)
 
@@ -564,15 +568,17 @@ Every report ends with one crisp **Verdict** a human or an autonomous agent (/bh
     **Covered:** [list of covered lenses]
     **Still failing:** [list of lenses still in needs_recheck with latest issues]
     **Summary:** [what was fixed vs what remains]
+    **Pre-existing findings filed, not fixed here:** [issue links, or "none"]
     **Verdict:** Needs Work — wave cap reached with confirmed CRITICAL/MEDIUM still open.
-    **Next step:** Re-run /dcr to continue, or fix the listed issues manually before merging.
+    **Next step:** [If a third wave still found branch-introduced defects: "Split the PR — the fixes outgrew the stated scope." Otherwise: "Fix the listed issues, then re-run /dcr."]
     ```
 
 ## HARD RULES
 
 - Depth follows the RISK TIER: never spawn the LARGE fan-out for a SMALL change, and never skip the Security carve-out (or the LARGE tier) when a sensitive area is touched. Cheap by default, thorough where a miss is expensive.
-- Do NOT stop the wave loop early. Do NOT skip re-verification of failed lenses.
-- Do NOT ask "should I continue?" — the answer is always yes until all covered or the wave cap (default 3; CLAUDE.md may override).
+- Do NOT stop the wave loop before it converges, and do NOT skip re-verification of a fixed lens. Do NOT run it past convergence either: a wave that yields no branch-introduced CRITICAL/MEDIUM and no critical pre-existing one ends the loop, whatever else it turned up (file those).
+- Do NOT ask "should I continue?" between waves — the convergence rule and the wave cap (default 2; a LARGE-tier third wave only for an open CRITICAL; CLAUDE.md may override) decide, not the user. A third wave that still finds branch-introduced defects means split the PR, never a fourth wave.
+- Every finding carries `introduced_by_branch`; branch-introduced defects are fixed in-PR, pre-existing ones are fixed in-PR only when critical or one-line and otherwise filed with the evidence attached.
 - Re-check waves verify fixes and adjacent code ONLY — never a fresh full review of already-covered code.
 - LOW issues: Report them but do NOT block progress. Only CRITICAL/MEDIUM trigger re-checks.
 - Reviewers are READ-ONLY. Only you (the parent dispatcher) edit files.

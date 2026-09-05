@@ -83,3 +83,28 @@ def test_behaviors_rule_makes_review_triggers_proportional():
     assert "Review depth is proportional" in text
     assert "Exactly one party runs the browser gate per review round" in text
 
+
+def test_backstop_lets_a_review_loop_converge():
+    text = _read("rules/jacked_behaviors.md")
+    assert "A review loop is the one exception" in text
+    assert "converges by the /dcr rule" in text
+    assert "split it rather than review again" in text
+
+
+def test_chain_of_command_scopes_reviews_and_converges():
+    text = _read("skills/chain-of-command/SKILL.md")
+    assert "13. **Scope and provenance on every review dispatch.**" in text
+    assert "`introduced_by_branch: true|false`" in text
+    assert "A review loop converges" in text
+    assert "split the PR instead of reviewing again" in text
+    assert "Exhaustive on the FIRST pass of any task; convergent after that." in text
+    assert "The full-suite gate is per PUSH, not per fix batch" in text
+    assert "LOW findings go to the main loop unverified" in text
+
+
+
+def test_dc_planning_loop_converges_instead_of_always_continuing():
+    text = _read("commands/dc.md")
+    assert "the answer is always yes" not in text
+    assert "do NOT run it past convergence either" in text
+    assert "reviews the DELTA since the previous cycle" in text
