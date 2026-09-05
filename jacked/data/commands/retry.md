@@ -16,7 +16,7 @@ Then check where you actually fell off and act on whichever is true:
 
 2. **Inline work** (an edit, command, or tool call) got interrupted. → Verify what actually landed. Trust on-disk / tool-result reality over your last sentence: mid-multi-step work can look finished but be partial, so reconcile what you *claimed* against what committed before declaring resume complete. Resume from the precise point it fell off — do NOT repeat steps that already succeeded.
 
-3. **Spawned subagents or a workflow died.** → Re-launch or resume only those: resume a workflow with resumeFromRunId (not a fresh restart); re-dispatch only the agents that actually failed.
+3. **Spawned subagents or a workflow died.** → Re-launch or resume only those: resume a workflow with resumeFromRunId FIRST (completed agents are cached in the run's journal; only the dead ones re-run) and read `<transcriptDir>/journal.jsonl` before assuming anything was lost; re-dispatch only the agents that actually failed. A review wave in which any agent returned null is INCOMPLETE, never clean: re-run that wave, do not let `filter(Boolean)` convert dead agents into a pass. Near a usage limit, prefer fewer, larger lenses so a single death loses less.
 
 **Before re-running any step with an external side effect** (git commit/push, opening or commenting on a PR, sending a message, writing to an API or DB, a destructive command), confirm it did NOT already land — duplicated side effects are the real damage, not lost compute. For pure reads/edits, just redo if unsure.
 

@@ -300,7 +300,7 @@ Verify — run each and show the output; ALL must pass before you stop:
 - Each milestone works when run for real — paste the proof: <a concrete command + its expected output, or the user flow you walked>
 - [UI work only] Browser-QA via available browser tools (or `/qa` / `/ux`): the target flows work and the console is error-free
 - [security-sensitive only — auth, RBAC, tenancy, billing, credentials] `/cso` runs and reports no high/critical findings
-- [if `/dcr` is available] `/dcr` runs and reports a clean pass
+- [if `/dcr` is available] `/dcr` runs and reports a clean pass (review via `/dcr` tiers; never write "ultracode" or "use dynamic workflows" into the `/goal` pointer, which flips unbounded fan-out on for the whole run)
 
 DONE when: every milestone is built, the test command and the per-milestone real-run proofs all pass in the transcript, every applicable review gate reports clean, and the work is committed on a feature branch and opened as a PR for review (not merged to main). Do NOT stop while any milestone is unmet or unproven — diagnose, fix, re-run. Never report success without the supporting output.
 ```
