@@ -334,7 +334,13 @@ def test_bulk_refresh_fetches_accounts_concurrently(monkeypatch):
     assert resp.refreshed == 5
     assert resp.failed == 0
     assert in_flight["peak"] >= 2, "fetches never overlapped — pass is serialized"
-    assert elapsed < 1.2, f"5x0.3s pass took {elapsed:.2f}s — looks serialized"
+    # A serialized pass cannot finish under 5 x 0.3s no matter the load; a
+    # tighter wall-clock bound only measures the machine (1.23s on a loaded
+    # box, 2026-09-05). Overlap itself is proven by the peak assertion above.
+    serialized = 5 * 0.3
+    assert elapsed < serialized, (
+        f"5x0.3s pass took {elapsed:.2f}s — no faster than serialized"
+    )
 
 
 def test_bulk_refresh_progress_counts_completions(monkeypatch):
