@@ -399,7 +399,20 @@ def test_linux_family_ids_parses_id_and_id_like(tmp_path, monkeypatch):
 
     release = tmp_path / "os-release"
     release.write_text('NAME="Rocky Linux"\nID="rocky"\nID_LIKE="rhel centos fedora"\n', encoding="utf-8")
-    monkeypatch.setattr(spec_module, "Path", lambda _p: release)
+    release.chmod(0o644)
+
+    class _RootOwned:
+        def __init__(self, real):
+            self._real = real
+
+        def stat(self):
+            real = self._real.stat()
+            return os.stat_result((real.st_mode, real.st_ino, real.st_dev, real.st_nlink, 0, 0, real.st_size, real.st_atime, real.st_mtime, real.st_ctime))
+
+        def read_text(self, encoding="utf-8"):
+            return self._real.read_text(encoding=encoding)
+
+    monkeypatch.setattr(spec_module, "Path", lambda _p: _RootOwned(release))
     assert spec_module._linux_family_ids() == frozenset({"rocky", "rhel", "centos", "fedora"})
 
 
@@ -409,3 +422,19 @@ def test_artifact_marker_requires_exact_owner_and_generation():
     assert spec.matches_artifact_marker(marker)
     assert not spec.matches_artifact_marker({**marker, "generation": "0" * 64})
     assert not spec.matches_artifact_marker({**marker, "owner": "foreign"})
+
+
+def test_linux_family_ids_fail_closed_on_a_writable_or_unowned_os_release(tmp_path, monkeypatch):
+    from jacked.service import spec as spec_module
+
+    release = tmp_path / "os-release"
+    release.write_text('ID="rhel"\n', encoding="utf-8")
+    monkeypatch.setattr(spec_module, "Path", lambda _p: release)
+    release.chmod(0o666)
+    assert spec_module._linux_family_ids() == frozenset()
+    release.chmod(0o644)
+    if os.getuid() != 0:
+        # Not root-owned in this test, so still refused; root-owned is the
+        # positive case pinned by test_linux_family_ids_parses_id_and_id_like.
+        assert spec_module._linux_family_ids() == frozenset()
+

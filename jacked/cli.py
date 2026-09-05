@@ -8,6 +8,7 @@ retrieving Claude Code sessions.
 import os
 import shutil
 import subprocess
+import re
 import sys
 import logging
 from dataclasses import dataclass, replace
@@ -43,6 +44,9 @@ if sys.platform == "win32":
             pass
 
 console = Console()
+
+# Extras names are package extras: a bare identifier list, never shell text.
+_EXTRAS_NAME_RE = re.compile(r"[A-Za-z0-9_.,-]{0,64}")
 logger = logging.getLogger(__name__)
 
 
@@ -788,6 +792,14 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
 
     # Pre-flight: refuse editable / pip installs before touching the service.
+    # The extras name reaches a shell (uv) and, on Windows, a generated batch
+    # file. Refuse anything but a plain extras identifier before building either.
+    if not _EXTRAS_NAME_RE.fullmatch(extras or ""):
+        console.print(
+            "[red]Invalid --extras value.[/red] Use letters, digits, '_', '-', ',' or '.'"
+        )
+        sys.exit(2)
+
     _ok, _reason = can_auto_upgrade()
     if not _ok:
         console.print(f"[red]Cannot auto-upgrade:[/red] {_reason}")
@@ -906,7 +918,6 @@ def _run_rollback_steps(
     but never migrated settings or restarted the service has not restored the
     machine, and must never be reported as if it had.
     """
-    import subprocess
     from jacked.findbin import find_bin
 
     cmd = list(rollback_cmd)
@@ -917,35 +928,45 @@ def _run_rollback_steps(
 
     console.print(f"\n[yellow]Rolling back to v{plan.previous_version}[/yellow]")
     console.print(f"[dim]$ {rollback_label}[/dim]")
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        console.print(
-            f"[red]Rollback command failed (exit {result.returncode}).[/red]"
-        )
+    if _rollback_step_failed(cmd, "Rollback command"):
         return _ROLLBACK_STEP_PACKAGE
 
     restored = find_bin("jacked") or plan.jacked
     console.print(f"[dim]$ {restored} install --force[/dim]")
-    result = subprocess.run([restored, "install", "--force"])
-    if result.returncode != 0:
-        console.print(
-            f"[red]`jacked install --force` failed (exit {result.returncode}) "
-            "for the restored build.[/red]"
-        )
+    if _rollback_step_failed(
+        [restored, "install", "--force"], "`jacked install --force`"
+    ):
         return _ROLLBACK_STEP_INSTALL
 
     if plan.skip_service:
         return None
 
     console.print(f"[dim]$ {restored} service restart[/dim]")
-    result = subprocess.run([restored, "service", "restart"])
-    if result.returncode != 0:
-        console.print(
-            f"[red]`jacked service restart` failed (exit {result.returncode}) "
-            "for the restored build.[/red]"
-        )
+    if _rollback_step_failed(
+        [restored, "service", "restart"], "`jacked service restart`"
+    ):
         return _ROLLBACK_STEP_RESTART
     return None
+
+
+def _rollback_step_failed(argv: list[str], what: str) -> bool:
+    """Run one rollback step. True when it failed to run or exited non-zero.
+
+    A step whose binary is missing or not executable raises OSError. Letting
+    that escape abandoned the rollback before the failed step was recorded, so
+    the user got no recovery file naming what to repair.
+    """
+    import subprocess
+
+    try:
+        code = subprocess.run(argv).returncode
+    except OSError as exc:
+        console.print(f"[red]{what} could not run:[/red] {exc}")
+        return True
+    if code != 0:
+        console.print(f"[red]{what} failed (exit {code}).[/red]")
+        return True
+    return False
 
 
 def _upgrade_rollback_and_exit(
@@ -1066,16 +1087,37 @@ def _finish_failed_upgrade(*, error: str, commands: list[str]) -> None:
     sys.exit(1)
 
 
-def _acquire_upgrade_lock(previous_version: str, extras: str) -> None:
-    """Claim the shared update-status file, or refuse when one is in flight.
+def _acquire_upgrade_lock(previous_version: str, extras: str):
+    """Claim the shared update lock, or refuse when one is in flight.
 
     The tray updater and this command drive the same machine. Two of them at
-    once would race a package install against a service restart, so the status
-    file is the lock: `init_or_adopt_status` raises LockBusy while another
-    updater is active.
+    once would race a package install against a service restart. The exclusive
+    OS lock is taken FIRST, because `init_or_adopt_status` is a read-check-
+    write on mtime and two upgrades starting inside the same second both read
+    "no updater in flight". The status file then records the phases.
+
+    Returns the lock handle. The caller must close it when the upgrade ends.
     """
     from jacked.install_method import detect_install_method
     from jacked.service import update_status as _us
+
+    try:
+        handle = _us.acquire_update_lock(_us.UPDATE_STATUS_FILE)
+    except Exception as exc:
+        # A machine that cannot take the lock must not start a package
+        # install: nothing would stop a second upgrade from racing it.
+        console.print(
+            "[red]Cannot take the update lock:[/red] "
+            f"{exc}\nFix the permissions on ~/.claude, then run "
+            "`jacked upgrade` again."
+        )
+        sys.exit(1)
+    if handle is None:
+        console.print(
+            "[red]Another jacked update is already running.[/red] "
+            "Wait for it to finish, then run `jacked upgrade` again."
+        )
+        sys.exit(1)
 
     try:
         method = detect_install_method()
@@ -1089,15 +1131,36 @@ def _acquire_upgrade_lock(previous_version: str, extras: str) -> None:
             method=method,
         )
     except _us.LockBusy as exc:
+        _release_upgrade_lock(handle)
         console.print(
             "[red]Another jacked update is already running.[/red] "
             f"{exc}\nWait for it to finish, then run `jacked upgrade` again."
         )
         sys.exit(1)
-    except Exception:
-        # Status tracking is observability, never the upgrade itself.
-        logger.debug("Could not initialize the update status file", exc_info=True)
+    except Exception as exc:
+        # The status file is where every later phase, the failure reason and
+        # the recovery text are recorded. A machine that cannot write it (bad
+        # permissions, a full disk) must not begin a package install: the
+        # upgrade would proceed with no way to report what it broke.
+        _release_upgrade_lock(handle)
+        console.print(
+            "[red]Cannot record the update status:[/red] "
+            f"{exc}\nFix the permissions on ~/.claude, then run "
+            "`jacked upgrade` again."
+        )
+        sys.exit(1)
     del extras  # kept for signature symmetry with the tray updater
+    return handle
+
+
+def _release_upgrade_lock(handle) -> None:
+    """Release the exclusive update lock. Never raises."""
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except Exception:
+        logger.debug("Could not release the update lock", exc_info=True)
 
 
 def _upgrade_phase(phase: str, status: str, **kwargs) -> None:
@@ -1149,18 +1212,40 @@ def _upgrade_install_package(cmd: list[str], label: str) -> str:
 
 
 def _upgrade_run_preflight(jacked: str) -> "tuple[int, str]":
-    """Run `jacked service preflight`. Returns (returncode, output)."""
+    """Run `jacked service preflight`. Returns (returncode, output).
+
+    A preflight that hangs or cannot be launched is a REFUSAL, not a crash.
+    Without the bound the command would wait forever with the transaction
+    half-applied; without the OSError guard a missing or non-executable
+    `jacked` would raise straight past the rollback path.
+    """
     import subprocess
+
+    from jacked.service.updater import PREFLIGHT_TIMEOUT_SECONDS
 
     _upgrade_phase("preflight", "begin")
     console.print(f"\n[dim]$ {jacked} service preflight[/dim]")
-    preflight = subprocess.run(
-        [jacked, "service", "preflight"], capture_output=True, text=True
-    )
-    output = ((preflight.stdout or "") + (preflight.stderr or "")).strip()
+    try:
+        preflight = subprocess.run(
+            [jacked, "service", "preflight"],
+            capture_output=True,
+            text=True,
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+        code = preflight.returncode
+        output = ((preflight.stdout or "") + (preflight.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        code = -1
+        output = (
+            "preflight did not answer within "
+            f"{PREFLIGHT_TIMEOUT_SECONDS}s"
+        )
+    except OSError as exc:
+        code = -1
+        output = f"preflight could not run: {exc}"
     if output:
         console.print(f"[dim]{output}[/dim]")
-    return preflight.returncode, output
+    return code, output
 
 
 def _upgrade_restart_service(jacked: str, pid_file) -> int:
@@ -1268,9 +1353,25 @@ def _run_upgrade_inline(
     service contract. Any failure after that gate rolls the machine back to
     `previous_version`.
     """
-    from jacked.service import update_status as _us
+    lock = _acquire_upgrade_lock(previous_version, extras)
+    try:
+        _run_upgrade_inline_locked(
+            cmd, label, extras, skip_service, pid_file, host, port,
+            previous_version, no_rollback,
+        )
+    finally:
+        # Held for the whole transaction, released on success, on a rollback
+        # (which exits through SystemExit) and on any unexpected raise.
+        _release_upgrade_lock(lock)
 
-    _acquire_upgrade_lock(previous_version, extras)
+
+def _run_upgrade_inline_locked(
+    cmd: list[str], label: str, extras: str, skip_service: bool,
+    pid_file, host: str, port: int,
+    previous_version: str = "", no_rollback: bool = False,
+):
+    """The upgrade transaction itself. Runs while the update lock is held."""
+    from jacked.service import update_status as _us
 
     # Step 1: package upgrade (uv / pipx, auto-detected).
     jacked = _upgrade_install_package(cmd, label)
@@ -1425,11 +1526,17 @@ def _spawn_windows_upgrade_helper(
     # install (no upgrade, no settings migration, no service, no tray icon).
     # %LOGFILE% stays defined only for the recovery-file message text, and the
     # recovery file is a different path nothing else holds open.
+    # Flat labels, not a parenthesised block: a failed restart has to `goto`
+    # the rollback, and `goto` out of a paren block is exactly the cmd.exe
+    # parsing trap this batch avoids everywhere else.
     restart_line = (
-        'if "%SKIP_SERVICE%"=="" (\r\n'
-        '    echo [%date% %time%] service restart\r\n'
-        '    jacked service restart 2>&1\r\n'
-        ')\r\n'
+        ''
+        if skip_service
+        else (
+            'echo [%date% %time%] service restart\r\n'
+            'jacked service restart 2>&1\r\n'
+            'if errorlevel 1 goto restart_failed\r\n'
+        )
     )
     # Rollback path. Reached only by `goto`, so the success path never touches
     # it. Flat lines and one single-level `if` block: nested parentheses inside
@@ -1440,9 +1547,27 @@ def _spawn_windows_upgrade_helper(
     # machine, so it must never write "rolled back". Each failure jumps to a
     # flat label that names its own step: `goto` out of a parenthesised block is
     # exactly the cmd.exe parsing trap this batch avoids everywhere else.
+    # Three entry labels, one shared rollback body. Every failure after the
+    # package install has to undo the upgrade, and each one names its own step
+    # in the failed file rather than borrowing the preflight's wording.
     preflight_failed_block = (
         ':preflight_failed\r\n'
         'echo [%date% %time%] ERROR: jacked service preflight failed for the new build\r\n'
+        'set FAILREASON=its service preflight failed\r\n'
+        'goto do_rollback\r\n'
+    )
+    if not skip_service:
+        preflight_failed_block += (
+            ':restart_failed\r\n'
+            'echo [%date% %time%] ERROR: the new service did not restart\r\n'
+            'set FAILREASON=the new service did not restart\r\n'
+            'goto do_rollback\r\n'
+        )
+    preflight_failed_block += (
+        ':migrate_failed\r\n'
+        'echo [%date% %time%] ERROR: the settings migration failed for the new build\r\n'
+        'set FAILREASON=the settings migration failed\r\n'
+        ':do_rollback\r\n'
     )
     if rollback_line:
         _rb_restart = (
@@ -1463,7 +1588,7 @@ def _spawn_windows_upgrade_helper(
             'if errorlevel 1 goto rollback_install_failed\r\n'
             + _rb_restart +
             ':rollback_done\r\n'
-            'echo Jacked upgrade failed its service preflight; rolled back to v'
+            'echo Jacked upgrade failed (%FAILREASON%); rolled back to v'
             + safe_previous + '. See %LOGFILE%. > ' + _failed_file + '\r\n'
             'echo Recovery: ' + rollback_label
             + ' ^&^& jacked install --force ^&^& jacked service restart >> '
@@ -1485,7 +1610,7 @@ def _spawn_windows_upgrade_helper(
     else:
         preflight_failed_block += (
             'echo [%date% %time%] rollback disabled; keeping the new version\r\n'
-            'echo Jacked upgrade failed its service preflight and was NOT rolled back. '
+            'echo Jacked upgrade failed (%FAILREASON%) and was NOT rolled back. '
             'See %LOGFILE%. > ' + _failed_file + '\r\n'
             'echo Recovery: jacked service preflight ^&^& jacked service status >> '
             + _failed_file + '\r\n'
@@ -1496,8 +1621,15 @@ def _spawn_windows_upgrade_helper(
         '@echo off\r\n'
         'set LOGFILE=' + str(log_path) + '\r\n'
         'set SKIP_SERVICE=' + ("1" if skip_service else "") + '\r\n'
+        # Default reason for the breadcrumb; every rollback entry label
+        # overwrites it with the step that actually failed.
+        'set FAILREASON=the new build could not be brought up\r\n'
         'echo [%date% %time%] jacked upgrade helper starting (parent PID ' + str(my_pid) + ')\r\n'
         'echo [%date% %time%] upgrade command: ' + label + '\r\n'
+        # The restart step is decided in Python when the batch is written, so
+        # SKIP_SERVICE is a record of what this batch was generated for. Echo
+        # it: a support reader needs to know why no restart line ran.
+        'echo [%date% %time%] skip service: "%SKIP_SERVICE%"\r\n'
         + wait_for_parent_block(my_pid) +
         'echo [%date% %time%] parent exited, running upgrade command\r\n'
         + upgrade_line + ' 2>&1\r\n'
@@ -1514,7 +1646,11 @@ def _spawn_windows_upgrade_helper(
         'if errorlevel 1 goto preflight_failed\r\n'
         'echo [%date% %time%] running jacked install --force\r\n'
         'jacked install --force 2>&1\r\n'
+        'if errorlevel 1 goto migrate_failed\r\n'
         + restart_line +
+        # A clean upgrade retires the breadcrumb an earlier failure left
+        # behind, so nothing warns about a failure already repaired.
+        'if exist ' + _WIN_FAILED_FILE + ' del ' + _WIN_FAILED_FILE + '\r\n'
         'echo [%date% %time%] upgrade complete\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
         + preflight_failed_block

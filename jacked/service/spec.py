@@ -157,8 +157,14 @@ def _root_equivalent_group_names() -> tuple[str, ...]:
 
 def _linux_family_ids() -> frozenset[str]:
     """``ID`` and ``ID_LIKE`` tokens from /etc/os-release, lowercase."""
+    release = Path("/etc/os-release")
     try:
-        text = Path("/etc/os-release").read_text(encoding="utf-8")
+        status = release.stat()
+        # A mis-permissioned container could let a local user rewrite the
+        # family; fail closed (no wheel grant) unless root owns it read-only.
+        if status.st_uid != 0 or status.st_mode & 0o022:
+            return frozenset()
+        text = release.read_text(encoding="utf-8")
     except OSError:
         return frozenset()
     tokens: set[str] = set()

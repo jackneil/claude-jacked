@@ -1414,3 +1414,168 @@ def test_windows_batch_checks_errorlevel_after_status_writes(
             _os.unlink(body_path)
         except OSError:
             pass
+
+
+class TestUpdaterRollbackStepsThatCannotSpawn:
+    """A rollback step whose binary is gone must be recorded, not raised.
+
+    `subprocess.run` raises OSError when `uv` or `jacked` is missing or not
+    executable. That escaped `_rollback` and killed the detached helper before
+    the failed step reached the status file or the recovery file, so the user
+    was left with a dead service and no breadcrumb at all.
+    """
+
+    @staticmethod
+    def _run_update(monkeypatch, tmp_path, run_results):
+        return TestUpdaterRollback._run_update(
+            monkeypatch, tmp_path, run_results, port_results=True
+        )
+
+    def test_a_package_rollback_that_cannot_spawn_is_recorded(
+        self, tmp_path, monkeypatch
+    ):
+        from jacked.service import update_status as us_mod
+
+        _run, _popen, _status, recovery = self._run_update(
+            monkeypatch,
+            tmp_path,
+            [
+                _ok(),                                  # uv install
+                _fail(1, stderr="[FAIL] refused"),      # preflight
+                OSError("No such file or directory: '/fake/uv'"),
+            ],
+        )
+        raw = us_mod._read_raw(tmp_path / "status.json")
+        assert raw["overall"] == "failed"
+        assert "package rollback" in raw["error"]
+        assert recovery.exists()
+        assert "rolled back to v0.95.0" not in recovery.read_text()
+
+    def test_a_settings_rollback_that_cannot_spawn_is_recorded(
+        self, tmp_path, monkeypatch
+    ):
+        from jacked.service import update_status as us_mod
+
+        _run, _popen, _status, recovery = self._run_update(
+            monkeypatch,
+            tmp_path,
+            [
+                _ok(),                                  # uv install
+                _fail(1, stderr="[FAIL] refused"),      # preflight
+                _ok(),                                  # rollback package
+                PermissionError("jacked is not executable"),
+            ],
+        )
+        raw = us_mod._read_raw(tmp_path / "status.json")
+        assert raw["overall"] == "failed"
+        assert "settings migration" in raw["error"]
+        assert recovery.exists()
+        assert "rolled back to v0.95.0" not in recovery.read_text()
+
+
+class TestUpdaterHoldsTheExclusiveLock:
+    """`run_update` serializes against every other updater on the machine."""
+
+    def test_run_update_refuses_while_another_process_holds_the_lock(
+        self, tmp_path, monkeypatch
+    ):
+        from pathlib import Path
+
+        from jacked.service import updater, update_status as us_mod
+
+        status = tmp_path / "status.json"
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", status)
+
+        holder_script = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from pathlib import Path\n"
+            "from jacked.service.update_status import acquire_update_lock\n"
+            "handle = acquire_update_lock(Path(%r))\n"
+            "print('HELD' if handle is not None else 'REFUSED', flush=True)\n"
+            "sys.stdin.readline()\n"
+        ) % (str(Path(__file__).resolve().parents[3]), str(status))
+
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "HELD"
+            with (
+                patch("jacked.install_method.can_auto_upgrade",
+                      return_value=(True, "")),
+                patch("jacked.install_method.detect_install_method",
+                      return_value="uv"),
+                patch("subprocess.run") as run,
+                patch("subprocess.Popen") as popen,
+                patch.object(updater, "wait_for_exit", return_value=True),
+            ):
+                updater.run_update(
+                    parent_pid=12345, extras="tray", target_version="0.100.0"
+                )
+        finally:
+            holder.stdin.write("\n")
+            holder.stdin.flush()
+            holder.wait(timeout=10)
+
+        run.assert_not_called()
+        popen.assert_not_called()
+        assert not status.exists(), "a refused updater clobbered the status file"
+        assert "already running" in (tmp_path / "recovery.txt").read_text()
+
+    def test_a_finished_update_releases_the_lock(self, tmp_path, monkeypatch):
+        from jacked.service.update_status import acquire_update_lock
+
+        TestUpdaterRollback._run_update(
+            monkeypatch, tmp_path, [_ok(), _ok(), _ok()], port_results=False
+        )
+        handle = acquire_update_lock(tmp_path / "status.json")
+        assert handle is not None, "run_update never released the update lock"
+        handle.close()
+
+
+class TestUpdaterFunctionLength:
+    """Guardrail on the update transaction's own helpers: 50 lines each.
+
+    `_rollback` grew past that, and the length is what let its package step
+    and its settings step drift into one unreadable block. `_start_and_verify`
+    went the same way. Both are now composed of named steps.
+    """
+
+    STEP_FUNCTIONS = {
+        "_rollback",
+        "_rollback_package",
+        "_rollback_settings",
+        "_run_rollback_step",
+        "_fail_and_recover",
+        "_start_and_verify",
+        "_wait_port_free",
+        "_spawn_service",
+        "_verify_service",
+    }
+
+    def test_every_transaction_step_is_under_50_lines(self):
+        import ast
+        import inspect
+
+        from jacked.service import updater
+
+        tree = ast.parse(inspect.getsource(updater))
+        seen, too_long = set(), []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name not in self.STEP_FUNCTIONS:
+                continue
+            seen.add(node.name)
+            length = node.end_lineno - node.lineno + 1
+            if length > 50:
+                too_long.append((node.name, length))
+        assert too_long == [], f"functions over 50 lines: {too_long}"
+        missing = self.STEP_FUNCTIONS - seen
+        assert not missing, f"the guardrail names functions that are gone: {missing}"

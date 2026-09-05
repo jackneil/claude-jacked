@@ -1710,6 +1710,80 @@ class TestAbandonedUpdateRecovery:
         ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
         assert not updater.RECOVERY_FILE.exists()
 
+    def _write_status_with_pid(self, path, phase, age_seconds, pid):
+        import json
+        import os
+        import time
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "overall": "in_progress",
+                    "current_phase": phase,
+                    "updater_pid": pid,
+                }
+            ),
+            encoding="utf-8",
+        )
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_a_live_updater_is_never_reported_as_abandoned(self):
+        """A slow phase is not an abandoned update.
+
+        A supervisor that relaunches the tray while an update is still running
+        used to mark that LIVE update failed and write a recovery file the
+        user never needed, because one phase (a package install on a slow
+        link) outran STALE_IN_PROGRESS_SECONDS.
+        """
+        import json
+        import os as _os
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        self._write_status_with_pid(
+            us.UPDATE_STATUS_FILE,
+            "installing_package",
+            us.STALE_IN_PROGRESS_SECONDS + 600,
+            _os.getpid(),
+        )
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        assert not updater.RECOVERY_FILE.exists(), (
+            "the tray wrote a recovery file for an update that is still running"
+        )
+        record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
+        assert record["overall"] == "in_progress"
+
+    def test_an_updater_that_died_is_still_reported(self):
+        """The pid check must not hide a genuinely abandoned update."""
+        import json
+        import subprocess
+        import sys
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        self._write_status_with_pid(
+            us.UPDATE_STATUS_FILE,
+            "migrating_settings",
+            us.STALE_IN_PROGRESS_SECONDS + 60,
+            dead.pid,
+        )
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        assert "interrupted at phase migrating_settings" in (
+            updater.RECOVERY_FILE.read_text(encoding="utf-8")
+        )
+        record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
+        assert record["overall"] == "failed"
+
     def test_run_checks_for_an_abandoned_update_before_provisioning(self):
         from jacked.service.tray import ServiceRunner
 

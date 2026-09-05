@@ -149,6 +149,16 @@ def _spawn_detached(cmd: list, log_fh=None) -> "subprocess.Popen":
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _release_update_lock(handle) -> None:
+    """Release the exclusive update lock. Never raises."""
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except Exception:
+        logger.exception("Could not release the update lock")
+
+
 def _write_recovery(message: str) -> None:
     """Write a human-readable recovery file so the user sees what broke."""
     try:
@@ -194,6 +204,25 @@ def run_update(
     # --- Status file lifecycle
     _target = target_version or "next"
     _method = _detect()
+    # Exclusive lock FIRST. `init_or_adopt_status` is a read-check-write on
+    # mtime, so two updaters that start inside the same second both read "no
+    # updater in flight" and both proceed. The lock is held for the whole
+    # update and released in the finally below.
+    try:
+        _update_lock = _us.acquire_update_lock(_us.UPDATE_STATUS_FILE)
+    except Exception:
+        logger.exception("Could not take the update lock")
+        _update_lock = None
+        log("WARNING: could not take the update lock; continuing")
+    else:
+        if _update_lock is None:
+            log("REFUSED: another updater holds the update lock")
+            _write_recovery(
+                "Jacked auto-update refused: another jacked update is already "
+                "running. Wait for it to finish, then retry.\n"
+            )
+            log_fh.close()
+            return
     try:
         outcome = _us.init_or_adopt_status(
             _us.UPDATE_STATUS_FILE,
@@ -206,6 +235,7 @@ def run_update(
             log("REUSING tray pre-init status file")
     except _us.LockBusy as exc:
         log(f"REFUSED: another updater active: {exc}")
+        _release_update_lock(_update_lock)
         log_fh.close()
         return
     except Exception:
@@ -359,14 +389,8 @@ def run_update(
 
         # The restart + verify tail. It runs for the successful path AND for
         # the rolled-back path, so the machine always ends with a service.
-        def _start_and_verify() -> str:
-            """Start the service and wait for it. Returns the outcome name.
-
-            'ok'        - the service is listening.
-            'port_busy' - the port stayed occupied by an unverified listener.
-            'not_ready' - the service never bound the port in time.
-            """
-            # Phase: waiting_port_free
+        def _wait_port_free() -> bool:
+            """Wait for the old listener to release the port. True when free."""
             _begin("waiting_port_free")
             log("Waiting for port to become available")
             port_deadline = time.monotonic() + 10.0
@@ -382,10 +406,12 @@ def run_update(
                     recovery="run `jacked service status`; v2 services use discoverable quarantine",
                 )
                 log(f"ABORT: port {port} is ambiguous; no process was signalled")
-                return "port_busy"
+                return False
             _end("waiting_port_free", "ok")
+            return True
 
-            # Phase: starting_service
+        def _spawn_service() -> None:
+            """Start the service through the platform's own lifecycle manager."""
             _begin("starting_service")
             # On macOS the tray may be managed by launchd with KeepAlive - a
             # plain detached `jacked service start` races launchd's respawn to
@@ -420,7 +446,8 @@ def run_update(
                 _restart_attempted[0] = True
             _end("starting_service", "ok")
 
-            # Phase: verifying_service
+        def _verify_service() -> bool:
+            """Wait for the new service to bind the port. True when it did."""
             _begin("verifying_service")
             log("Verifying service came up")
             verify_deadline = time.monotonic() + 20.0
@@ -433,7 +460,7 @@ def run_update(
 
             if came_up:
                 _end("verifying_service", "ok")
-                return "ok"
+                return True
             _end(
                 "verifying_service",
                 "failed",
@@ -441,9 +468,88 @@ def run_update(
                 recovery="jacked service start",
             )
             log(f"WARNING: service did not bind :{port} within 20s")
-            return "not_ready"
+            return False
+
+        def _start_and_verify() -> str:
+            """Start the service and wait for it. Returns the outcome name.
+
+            'ok'        - the service is listening.
+            'port_busy' - the port stayed occupied by an unverified listener.
+            'not_ready' - the service never bound the port in time.
+            """
+            if not _wait_port_free():
+                return "port_busy"
+            _spawn_service()
+            return "ok" if _verify_service() else "not_ready"
 
         _rolled_back = [False]
+
+        def _run_rollback_step(argv: list) -> "tuple[int, str]":
+            """Run one rollback step. Returns (returncode, failure detail).
+
+            A step that cannot even SPAWN (uv or jacked deleted, or not
+            executable) raises OSError. Letting that escape aborted the
+            rollback before the failed step was ever recorded, so the user got
+            no recovery file at all. Treat it as that step's failure instead.
+            """
+            try:
+                completed = subprocess.run(
+                    argv,
+                    stdout=log_fh,
+                    stderr=log_fh,
+                    check=False,
+                    creationflags=NO_WINDOW,
+                )
+            except OSError as exc:
+                return -1, f"could not run {argv[0]}: {exc}"
+            return completed.returncode, f"exit {completed.returncode}"
+
+        def _rollback_package(reason: str) -> "str | None":
+            """Reinstall the previous build. Returns a failure detail or None."""
+            try:
+                rb_cmd = rollback_command(extras, _current_version)
+                rb_label = rollback_command_label(extras, _current_version)
+            except ValueError as exc:
+                log(f"ERROR: cannot build a rollback command: {exc}")
+                return str(exc)
+            if method == "uv":
+                rb_uv = find_bin("uv")
+                if rb_uv:
+                    rb_cmd[0] = rb_uv
+            _begin("rolling_back")
+            log(f"Rolling back to v{_current_version} ({reason}): {rb_label}")
+            code, detail = _run_rollback_step(rb_cmd)
+            if code == 0:
+                return None
+            _end(
+                "rolling_back",
+                "failed",
+                error=f"rollback command {detail}",
+                recovery=rb_label,
+            )
+            log(f"ERROR: rollback command failed: {detail}")
+            return detail
+
+        def _rollback_settings() -> "str | None":
+            """Migrate the restored build's settings. Detail on failure."""
+            restored = find_bin("jacked") or jacked
+            code, detail = _run_rollback_step([restored, "install", "--force"])
+            if code == 0:
+                return None
+            _end(
+                "rolling_back",
+                "failed",
+                error=(
+                    "the restored build could not migrate its settings "
+                    f"(jacked install --force {detail})"
+                ),
+                recovery="jacked install --force",
+            )
+            log(
+                "ERROR: jacked install --force failed for the restored build: "
+                f"{detail}"
+            )
+            return detail
 
         def _rollback(reason: str) -> "RollbackResult":
             """Reinstall the version that was running. At most once per run.
@@ -457,56 +563,9 @@ def run_update(
                 log("Rollback already attempted once; refusing a second pass")
                 return RollbackResult(False, False, ROLLBACK_STEP_PACKAGE)
             _rolled_back[0] = True
-            try:
-                rb_cmd = rollback_command(extras, _current_version)
-                rb_label = rollback_command_label(extras, _current_version)
-            except ValueError as exc:
-                log(f"ERROR: cannot build a rollback command: {exc}")
+            if _rollback_package(reason) is not None:
                 return RollbackResult(False, False, ROLLBACK_STEP_PACKAGE)
-            if method == "uv":
-                rb_uv = find_bin("uv")
-                if rb_uv:
-                    rb_cmd[0] = rb_uv
-            _begin("rolling_back")
-            log(f"Rolling back to v{_current_version} ({reason}): {rb_label}")
-            rb = subprocess.run(
-                rb_cmd,
-                stdout=log_fh,
-                stderr=log_fh,
-                check=False,
-                creationflags=NO_WINDOW,
-            )
-            if rb.returncode != 0:
-                _end(
-                    "rolling_back",
-                    "failed",
-                    error=f"rollback command exit {rb.returncode}",
-                    recovery=rb_label,
-                )
-                log(f"ERROR: rollback command returned {rb.returncode}")
-                return RollbackResult(False, False, ROLLBACK_STEP_PACKAGE)
-            restored = find_bin("jacked") or jacked
-            migrate = subprocess.run(
-                [restored, "install", "--force"],
-                stdout=log_fh,
-                stderr=log_fh,
-                check=False,
-                creationflags=NO_WINDOW,
-            )
-            if migrate.returncode != 0:
-                _end(
-                    "rolling_back",
-                    "failed",
-                    error=(
-                        "the restored build could not migrate its settings "
-                        f"(jacked install --force exit {migrate.returncode})"
-                    ),
-                    recovery="jacked install --force",
-                )
-                log(
-                    "ERROR: jacked install --force returned "
-                    f"{migrate.returncode} for the restored build"
-                )
+            if _rollback_settings() is not None:
                 return RollbackResult(True, False, ROLLBACK_STEP_INSTALL)
             _end("rolling_back", "ok")
             log(f"Rollback to v{_current_version} reinstalled the package")
@@ -704,6 +763,7 @@ def run_update(
                 )
             except Exception:
                 logger.exception("Final-guard native_restart raised")
+        _release_update_lock(_update_lock)
         log_fh.close()
 
 
@@ -920,8 +980,29 @@ def _spawn_windows_tray_updater(
     # new service that never bound the port. Flat lines only: nesting
     # parentheses inside a parenthesised block is a cmd.exe parsing trap.
     _FAILED_FILE = '"%USERPROFILE%\\.claude\\jacked-update-failed.txt"'
+    # A failed settings migration is a transaction failure like any other: the
+    # old tray is already gone, so returning here left the machine on a build
+    # whose settings never migrated, with no service and no breadcrumb. Route
+    # it into the shared rollback, naming its own step for the failed file.
+    migrate_failed_block = (
+        ":preflight_failed\r\n"
+        "echo [%date% %time%] ERROR: jacked service preflight failed for the "
+        "new build\r\n"
+        "set FAILREASON=the new build refused to provision its service "
+        "contract\r\n"
+        "goto rollback_now\r\n"
+        ":migrate_failed\r\n"
+        'jacked _update_status migrating_settings failed --error "jacked '
+        'install --force failed" --recovery "jacked install --force"\r\n'
+        + DRIFT_GUARD
+        + "echo [%date% %time%] ERROR: the settings migration failed for the "
+        "new build\r\n"
+        "set FAILREASON=the " + ROLLBACK_STEP_INSTALL + " failed\r\n"
+        "goto rollback_now\r\n"
+    )
     rollback_block = (
-        ":rollback_now\r\n"
+        migrate_failed_block
+        + ":rollback_now\r\n"
         "echo [%date% %time%] the new version cannot run; rolling back to v"
         + current_version + "\r\n"
         "jacked _update_status rolling_back in_progress\r\n"
@@ -941,8 +1022,8 @@ def _spawn_windows_tray_updater(
             + "if errorlevel 1 goto rollback_failed_verify\r\n"
             "jacked _update_status rolling_back ok\r\n"
             + DRIFT_GUARD
-            + "echo Jacked tray update: v" + to_version
-            + " could not start; rolled back to v" + current_version
+            + "echo Jacked tray update to v" + to_version
+            + " failed (%FAILREASON%); rolled back to v" + current_version
             + ". See %LOGFILE%. > " + _FAILED_FILE + "\r\n"
             "echo Recovery: " + rollback_label_for_batch
             + " ^&^& jacked install --force ^&^& jacked service start >> "
@@ -966,14 +1047,17 @@ def _spawn_windows_tray_updater(
             'jacked _update_status rolling_back failed --error "no rollback command available" '
             '--recovery "jacked install --force"\r\n'
             + DRIFT_GUARD
-            + "echo Jacked tray update failed and no rollback command is available. "
-            "See %LOGFILE%. > " + _FAILED_FILE + "\r\n"
+            + "echo Jacked tray update failed (%FAILREASON%) and no rollback "
+            "command is available. See %LOGFILE%. > " + _FAILED_FILE + "\r\n"
             "exit /b 1\r\n"
         )
 
     batch_body = (
         "@echo off\r\n"
         "set LOGFILE=" + log_path + "\r\n"
+        # Default reason for the rollback breadcrumb. Every entry point into
+        # :rollback_now that has a more specific one overwrites this first.
+        "set FAILREASON=the new version could not start\r\n"
         "echo [%date% %time%] tray update helper starting (parent PID "
         + str(parent_pid)
         + ", method "
@@ -1024,7 +1108,7 @@ def _spawn_windows_tray_updater(
         "jacked _update_status preflight in_progress\r\n"
         + DRIFT_GUARD
         + "jacked service preflight 2>&1\r\n"
-        "if errorlevel 1 goto rollback_now\r\n"
+        "if errorlevel 1 goto preflight_failed\r\n"
         "jacked _update_status preflight ok\r\n"
         + DRIFT_GUARD
         +
@@ -1032,10 +1116,7 @@ def _spawn_windows_tray_updater(
         "jacked _update_status migrating_settings in_progress\r\n"
         + DRIFT_GUARD
         + "jacked install --force 2>&1\r\n"
-        "if errorlevel 1 (\r\n"
-        '    jacked _update_status migrating_settings failed --error "jacked install --force failed" --recovery "jacked install --force"\r\n'
-        "    exit /b 1\r\n"
-        ")\r\n"
+        "if errorlevel 1 goto migrate_failed\r\n"
         "jacked _update_status migrating_settings ok\r\n"
         + DRIFT_GUARD
         +
@@ -1076,12 +1157,16 @@ def _spawn_windows_tray_updater(
         + str(port)
         + ' in 20s" --recovery "jacked service start"\r\n'
         '    echo Jacked tray update: service did not come up. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        "    set FAILREASON=the new service never bound the port\r\n"
         "    goto rollback_now\r\n"
         ")\r\n"
         "jacked _update_status verifying_service ok\r\n"
         + DRIFT_GUARD
         + "jacked _update_status_succeed\r\n"
-        "echo [%date% %time%] tray update complete\r\n"
+        # A clean update retires the breadcrumb an earlier failure left behind,
+        # so the next tray boot never warns about a repaired failure.
+        + "if exist " + _FAILED_FILE + " del " + _FAILED_FILE + "\r\n"
+        + "echo [%date% %time%] tray update complete\r\n"
         '(goto) 2>nul & del "%~f0"\r\n'
         + rollback_block
     )

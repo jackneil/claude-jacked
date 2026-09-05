@@ -130,3 +130,15 @@ def test_record_is_atomic_and_private(tmp_path, monkeypatch):
     assert leftovers == ["start-failures.json"]
     assert stat_module.S_ISREG(path.stat().st_mode)
 
+
+def test_record_works_without_fchmod(tmp_path, monkeypatch):
+    """Windows has no os.fchmod; the atomic write must not depend on it."""
+    import os
+
+    from jacked.service import start_failures
+
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    path = tmp_path / "start-failures.json"
+    assert start_failures.record_start_failure(path, 100.0, reason="boot") == 1
+    assert path.exists()
+

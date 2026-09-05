@@ -59,3 +59,16 @@ def test_supervisor_entry_points_do_not_capture_the_real_runner(tmp_path, monkey
     ):
         default = inspect.signature(function).parameters["run"].default
         assert default is None, function.__qualname__
+
+
+def test_run_refuses_a_real_jacked_install():
+    with pytest.raises(RuntimeError, match="real jacked install"):
+        subprocess.run(["/x/bin/jacked", "install", "--force"])
+    with pytest.raises(RuntimeError, match="real jacked install"):
+        subprocess.Popen([r"C:\\x\\jacked.exe", "install"])
+
+
+def test_run_refuses_windows_style_supervisor_paths():
+    with pytest.raises(RuntimeError, match="real supervisor"):
+        subprocess.run([r"C:\\Windows\\System32\\schtasks.exe", "/Query"])
+

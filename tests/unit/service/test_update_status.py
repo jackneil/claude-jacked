@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 
 
 def test_init_creates_file_with_metadata(tmp_path):
@@ -486,3 +487,174 @@ class TestAbandonedStatus:
         from jacked.service import update_status as us
 
         assert us.abandoned_status(tmp_path / "nope.json") is None
+
+
+class TestUpdaterPidLiveness:
+    """A live updater is never abandoned, however long its phase runs.
+
+    STALE_IN_PROGRESS_SECONDS is a heartbeat rule, not a duration limit. One
+    phase (a package install on a slow link) can legitimately run longer, and
+    a supervisor that relaunches the tray mid-update then read the LIVE update
+    as abandoned, marked it failed and wrote a false recovery file.
+    """
+
+    @staticmethod
+    def _write(path, pid, age_seconds):
+        import json
+        import os
+        import time
+
+        record = {
+            "overall": "in_progress",
+            "current_phase": "installing_package",
+            "phases": [],
+        }
+        if pid is not None:
+            record["updater_pid"] = pid
+        path.write_text(json.dumps(record), encoding="utf-8")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_init_status_records_the_updater_pid(self, tmp_path):
+        import json
+
+        from jacked.service.update_status import init_status
+
+        path = tmp_path / "status.json"
+        init_status(path, "1.0.0", "1.1.0", "uv")
+        assert json.loads(path.read_text())["updater_pid"] == os.getpid()
+
+    def test_init_status_accepts_an_explicit_updater_pid(self, tmp_path):
+        import json
+
+        from jacked.service.update_status import init_status
+
+        path = tmp_path / "status.json"
+        init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=4242)
+        assert json.loads(path.read_text())["updater_pid"] == 4242
+
+    def test_a_stale_record_whose_updater_still_runs_is_not_abandoned(
+        self, tmp_path
+    ):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, os.getpid(), us.STALE_IN_PROGRESS_SECONDS + 600)
+        assert us.abandoned_status(path) is None
+
+    def test_a_stale_record_whose_updater_is_gone_is_abandoned(self, tmp_path):
+        import subprocess
+        import sys
+
+        from jacked.service import update_status as us
+
+        # A real, definitely-dead pid: run a child to completion and reuse it.
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        path = tmp_path / "status.json"
+        self._write(path, dead.pid, us.STALE_IN_PROGRESS_SECONDS + 60)
+        record = us.abandoned_status(path)
+        assert record is not None
+        assert record["current_phase"] == "installing_package"
+
+    def test_a_record_without_a_pid_keeps_the_mtime_rule(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, None, us.STALE_IN_PROGRESS_SECONDS + 60)
+        assert us.abandoned_status(path) is not None
+
+    def test_a_garbage_pid_keeps_the_mtime_rule(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "not-a-pid", us.STALE_IN_PROGRESS_SECONDS + 60)
+        assert us.abandoned_status(path) is not None
+
+    def test_adopting_the_tray_pre_init_claims_the_pid(self, tmp_path):
+        import json
+
+        from jacked.service.update_status import init_or_adopt_status
+
+        path = tmp_path / "status.json"
+        # The tray pre-creates the file, then exits; the detached updater
+        # adopts it. A record still naming the dead tray would read as
+        # abandoned the moment the update outran the mtime rule.
+        init_or_adopt_status(path, "1.0.0", "1.1.0", "uv", updater_pid=999999)
+        assert init_or_adopt_status(path, "1.0.0", "1.1.0", "uv") == "adopted"
+        data = json.loads(path.read_text())
+        assert data["updater_pid"] == os.getpid()
+        assert data["from_version"] == "1.0.0"
+
+
+class TestExclusiveUpdateLock:
+    """Two upgrades that start in the same second must not both proceed.
+
+    `init_or_adopt_status` is a read-check-write on mtime, so it cannot
+    serialize them by itself. `acquire_update_lock` is a real OS lock.
+    """
+
+    def test_the_lock_is_granted_when_nothing_holds_it(self, tmp_path):
+        from jacked.service.update_status import acquire_update_lock
+
+        handle = acquire_update_lock(tmp_path / "status.json")
+        assert handle is not None
+        handle.close()
+
+    def test_the_lock_is_reusable_after_release(self, tmp_path):
+        from jacked.service.update_status import acquire_update_lock
+
+        path = tmp_path / "status.json"
+        first = acquire_update_lock(path)
+        assert first is not None
+        first.close()
+        second = acquire_update_lock(path)
+        assert second is not None
+        second.close()
+
+    def test_the_lock_does_not_require_an_existing_status_file(self, tmp_path):
+        from jacked.service.update_status import acquire_update_lock
+
+        path = tmp_path / "nested" / "status.json"
+        handle = acquire_update_lock(path)
+        assert handle is not None
+        handle.close()
+        assert not path.exists()
+
+    def test_another_process_holding_the_lock_refuses_this_one(self, tmp_path):
+        """The real thing: a separate process, a real cross-process lock."""
+        import subprocess
+        import sys
+
+        from jacked.service.update_status import acquire_update_lock
+
+        path = tmp_path / "status.json"
+        holder_script = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from pathlib import Path\n"
+            "from jacked.service.update_status import acquire_update_lock\n"
+            "handle = acquire_update_lock(Path(%r))\n"
+            "print('HELD' if handle is not None else 'REFUSED', flush=True)\n"
+            "sys.stdin.readline()\n"
+        ) % (str(Path(__file__).resolve().parents[3]), str(path))
+
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "HELD"
+            assert acquire_update_lock(path) is None, (
+                "a second updater took a lock another process holds"
+            )
+        finally:
+            holder.stdin.write("\n")
+            holder.stdin.flush()
+            holder.wait(timeout=10)
+        # Released with the holder: the next updater may proceed.
+        handle = acquire_update_lock(path)
+        assert handle is not None
+        handle.close()

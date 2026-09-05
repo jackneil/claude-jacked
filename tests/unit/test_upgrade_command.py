@@ -743,3 +743,320 @@ class TestUpgradeWindows:
         assert "goto wait" in batch  # the loop itself still exists
         # the old unbounded form is gone
         assert "if not errorlevel 1" not in batch
+
+
+class TestUpgradePreflightSubprocessGuards:
+    """The CLI preflight gate is bounded and never crashes the upgrade.
+
+    The updater's preflight already had these guards; the CLI's did not, so a
+    hung or unlaunchable preflight either waited forever with the transaction
+    half-applied or raised straight past the rollback path.
+    """
+
+    @staticmethod
+    def _invoke_with_preflight_raising(exc, tmp_path):
+        from jacked.cli import main
+
+        calls = []
+
+        def fake_run(args, *a, **kw):
+            calls.append((list(args), kw))
+            if list(args)[1:] == ["service", "preflight"]:
+                raise exc
+            return _ok()
+
+        with (
+            patch("sys.platform", "darwin"),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked"}.get(n)),
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.service.updater.RECOVERY_FILE",
+                  tmp_path / "jacked-update-failed.txt"),
+            patch("jacked.__version__", "0.95.0"),
+            patch("jacked.cli._installed_package_version", return_value="0.100.0"),
+            patch("subprocess.run", side_effect=fake_run),
+            patch("subprocess.Popen"),
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+        return result, calls
+
+    def test_the_preflight_carries_a_timeout(self, tmp_path):
+        from jacked.service.updater import PREFLIGHT_TIMEOUT_SECONDS
+
+        _result, calls = self._invoke_with_preflight_raising(
+            OSError("boom"), tmp_path
+        )
+        preflight = [
+            kw for argv, kw in calls if argv[1:] == ["service", "preflight"]
+        ]
+        assert preflight, "the preflight step never ran"
+        assert preflight[0].get("timeout") == PREFLIGHT_TIMEOUT_SECONDS, (
+            "an unbounded preflight can hang the upgrade forever with the "
+            "package already replaced"
+        )
+
+    def test_a_preflight_that_cannot_run_is_a_refusal(self, tmp_path):
+        recovery = tmp_path / "jacked-update-failed.txt"
+        result, calls = self._invoke_with_preflight_raising(
+            OSError("no such binary"), tmp_path
+        )
+        assert result.exit_code == 1, result.output
+        assert "no such binary" in result.output
+        # It rolled the package back rather than raising out of the command.
+        assert any(
+            argv[1:4] == ["tool", "install", "claude-jacked[tray]==0.95.0"]
+            for argv, _kw in calls
+        ), calls
+        assert recovery.exists()
+
+    def test_a_preflight_that_hangs_is_a_refusal(self, tmp_path):
+        import subprocess as _sp
+
+        result, calls = self._invoke_with_preflight_raising(
+            _sp.TimeoutExpired(cmd="preflight", timeout=120), tmp_path
+        )
+        assert result.exit_code == 1, result.output
+        assert "did not answer within" in result.output
+        assert any(
+            argv[1:4] == ["tool", "install", "claude-jacked[tray]==0.95.0"]
+            for argv, _kw in calls
+        ), calls
+
+
+class TestRollbackStepsThatCannotSpawn:
+    """A rollback step whose binary is gone must be RECORDED, not raised.
+
+    `uv` or `jacked` missing (or not executable) made subprocess.run raise
+    OSError out of the rollback, so the command died before the failed step
+    reached the recovery file and the user was told nothing at all.
+    """
+
+    @staticmethod
+    def _invoke(run_results, tmp_path):
+        from jacked.cli import main
+
+        recovery = tmp_path / "jacked-update-failed.txt"
+        with (
+            patch("sys.platform", "darwin"),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked"}.get(n)),
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("jacked.service.updater.RECOVERY_FILE", recovery),
+            patch("jacked.__version__", "0.95.0"),
+            patch("jacked.cli._installed_package_version", return_value="0.100.0"),
+            patch("subprocess.run") as run,
+            patch("subprocess.Popen"),
+        ):
+            run.side_effect = list(run_results)
+            result = CliRunner().invoke(main, ["upgrade"])
+        return result, recovery
+
+    def test_a_rollback_package_step_that_cannot_spawn_is_reported(self, tmp_path):
+        result, recovery = self._invoke(
+            [
+                _ok(),                                   # uv install
+                _fail(1, stderr="[FAIL] refused"),       # preflight
+                OSError("No such file or directory: '/fake/uv'"),
+            ],
+            tmp_path,
+        )
+        assert result.exit_code == 1, result.output
+        body = recovery.read_text(encoding="utf-8")
+        assert "package rollback" in body
+        assert "rolled back to v0.95.0" not in body
+
+    def test_a_rollback_install_step_that_cannot_spawn_is_reported(self, tmp_path):
+        result, recovery = self._invoke(
+            [
+                _ok(),                                   # uv install
+                _fail(1, stderr="[FAIL] refused"),       # preflight
+                _ok(),                                   # rollback package
+                PermissionError("jacked is not executable"),
+            ],
+            tmp_path,
+        )
+        assert result.exit_code == 1, result.output
+        body = recovery.read_text(encoding="utf-8")
+        assert "settings migration" in body
+        assert "rolled back to v0.95.0" not in body
+
+    def test_a_rollback_restart_step_that_cannot_spawn_is_reported(self, tmp_path):
+        result, recovery = self._invoke(
+            [
+                _ok(),                                   # uv install
+                _fail(1, stderr="[FAIL] refused"),       # preflight
+                _ok(),                                   # rollback package
+                _ok(),                                   # jacked install --force
+                OSError("exec format error"),
+            ],
+            tmp_path,
+        )
+        assert result.exit_code == 1, result.output
+        body = recovery.read_text(encoding="utf-8")
+        assert "service restart" in body
+        assert "rolled back to v0.95.0" not in body
+
+
+class TestUpgradeTakesAnExclusiveLock:
+    """Two upgrades starting in the same second must not both proceed.
+
+    The status file alone is a read-check-write on mtime, so both read "no
+    updater in flight". `jacked upgrade` now holds a real OS lock.
+    """
+
+    @staticmethod
+    def _patched(status, recovery):
+        return (
+            patch("sys.platform", "darwin"),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked"}.get(n)),
+            patch("jacked.service.update_status.UPDATE_STATUS_FILE", status),
+            patch("jacked.service.updater.RECOVERY_FILE", recovery),
+            patch("jacked.service.process.read_pid", return_value=None),
+        )
+
+    def test_an_upgrade_refuses_while_another_process_holds_the_lock(
+        self, tmp_path
+    ):
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        from jacked.cli import main
+
+        status = tmp_path / "status.json"
+        recovery = tmp_path / "jacked-update-failed.txt"
+        holder_script = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from pathlib import Path\n"
+            "from jacked.service.update_status import acquire_update_lock\n"
+            "handle = acquire_update_lock(Path(%r))\n"
+            "print('HELD' if handle is not None else 'REFUSED', flush=True)\n"
+            "sys.stdin.readline()\n"
+        ) % (str(Path(__file__).resolve().parents[2]), str(status))
+
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "HELD"
+            stack = self._patched(status, recovery)
+            with (
+                stack[0], stack[1], stack[2], stack[3], stack[4], stack[5],
+                patch("subprocess.run") as run,
+                patch("subprocess.Popen") as popen,
+            ):
+                result = CliRunner().invoke(main, ["upgrade"])
+        finally:
+            holder.stdin.write("\n")
+            holder.stdin.flush()
+            holder.wait(timeout=10)
+
+        assert result.exit_code == 1, result.output
+        assert "already running" in result.output.lower()
+        # No package install may start while another updater holds the lock.
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_the_lock_is_released_when_the_upgrade_finishes(self, tmp_path):
+        from jacked.cli import main
+        from jacked.service.update_status import acquire_update_lock
+
+        status = tmp_path / "status.json"
+        recovery = tmp_path / "jacked-update-failed.txt"
+        stack = self._patched(status, recovery)
+        with (
+            stack[0], stack[1], stack[2], stack[3], stack[4], stack[5],
+            patch("subprocess.run", return_value=_ok("[OK] Service contract OK")),
+            patch("subprocess.Popen"),
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        handle = acquire_update_lock(status)
+        assert handle is not None, "the upgrade never released the update lock"
+        handle.close()
+
+    def test_the_lock_is_released_when_the_upgrade_rolls_back(self, tmp_path):
+        from jacked.cli import main
+        from jacked.service.update_status import acquire_update_lock
+
+        status = tmp_path / "status.json"
+        recovery = tmp_path / "jacked-update-failed.txt"
+        stack = self._patched(status, recovery)
+        with (
+            stack[0], stack[1], stack[2], stack[3], stack[4], stack[5],
+            patch("jacked.__version__", "0.95.0"),
+            patch("jacked.cli._installed_package_version", return_value="0.100.0"),
+            patch("subprocess.run") as run,
+            patch("subprocess.Popen"),
+        ):
+            run.side_effect = [
+                _ok(),                              # uv install
+                _fail(1, stderr="[FAIL] refused"),  # preflight
+                _ok(), _ok(), _ok(),                # rollback
+            ]
+            result = CliRunner().invoke(main, ["upgrade"])
+
+        assert result.exit_code == 1, result.output
+        handle = acquire_update_lock(status)
+        assert handle is not None, "a rolled-back upgrade never released the lock"
+        handle.close()
+
+
+class TestUpgradeStatusInitFailsClosed:
+    """An unwritable status file must stop the upgrade, not be swallowed.
+
+    Every later phase, the failure reason and the recovery text live in that
+    file. An upgrade that cannot write it would install a new package with no
+    way to report what it broke, so it refuses instead.
+    """
+
+    def test_a_status_write_failure_refuses_the_upgrade(self, tmp_path):
+        from jacked.cli import main
+
+        with (
+            patch("sys.platform", "darwin"),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked"}.get(n)),
+            patch("jacked.service.update_status.UPDATE_STATUS_FILE",
+                  tmp_path / "status.json"),
+            patch("jacked.service.update_status.init_or_adopt_status",
+                  side_effect=PermissionError("read-only file system")),
+            patch("subprocess.run") as run,
+            patch("subprocess.Popen") as popen,
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+
+        assert result.exit_code == 1, result.output
+        assert "read-only file system" in result.output
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_a_lock_that_cannot_be_taken_refuses_the_upgrade(self, tmp_path):
+        from jacked.cli import main
+
+        with (
+            patch("sys.platform", "darwin"),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked"}.get(n)),
+            patch("jacked.service.update_status.acquire_update_lock",
+                  side_effect=OSError("no space left on device")),
+            patch("subprocess.run") as run,
+            patch("subprocess.Popen") as popen,
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+
+        assert result.exit_code == 1, result.output
+        assert "no space left on device" in result.output
+        run.assert_not_called()
+        popen.assert_not_called()

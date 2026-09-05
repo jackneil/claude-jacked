@@ -91,7 +91,8 @@ def _write_atomic(path: Path, text: str) -> None:
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
     try:
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "fchmod"):  # Windows has no fchmod; mkstemp is already 0600
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()

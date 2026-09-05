@@ -1,5 +1,7 @@
 """Shared fixtures for jacked tests."""
 
+import re
+
 import pytest
 from unittest.mock import patch
 
@@ -47,7 +49,7 @@ def _no_real_service_processes(request, monkeypatch):
         them too.
         """
         text = _text(args)
-        first = text.split(" ", 1)[0].rsplit("/", 1)[-1].lower()
+        first = text.split(" ", 1)[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
         if first in supervisors:
             raise RuntimeError("test tried to drive a real supervisor: " + text)
         padded = f" {text} "
@@ -57,6 +59,9 @@ def _no_real_service_processes(request, monkeypatch):
             for verb in ("start", "restart", "preflight", "recover", "install")
         ):
             raise RuntimeError("test tried to spawn a real jacked service: " + text)
+        # `jacked install` rewrites the real ~/.claude/settings.json.
+        if "jacked" in text and re.search(r"jacked(?:\.exe)?\"? install(?: |$)", padded):
+            raise RuntimeError("test tried to run a real jacked install: " + text)
 
     class _GuardedPopen(real_popen):
         def __init__(self, args, *popen_args, **popen_kwargs):
