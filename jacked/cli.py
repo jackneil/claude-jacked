@@ -5463,7 +5463,15 @@ def _dcr_print_status(resolved: dict) -> None:
         kept_text = ", ".join(_rich_escape(str(k)) for k in kept) if kept else "(none)"
         console.print(f"  Kept on Claude: {kept_text}")
         if resolved.get("usable"):
-            console.print("  Status: [green]ready[/green]  (codex CLI installed, signed in)")
+            version = resolved.get("codex_version")
+            cli_label = f"codex CLI {version}" if version else "codex CLI"
+            console.print(f"  Status: [green]ready[/green]  ({_rich_escape(cli_label)} installed, signed in)")
+            # Usable with a reason means something was adjusted on the way out
+            # (a retired default migrated, a model the CLI cannot serve swapped
+            # for the fallback). Hiding it would make the printed Model line
+            # look chosen when it was substituted.
+            if resolved.get("reason"):
+                console.print(f"[yellow][!][/yellow] {_rich_escape(str(resolved['reason']))}")
         else:
             reason = _rich_escape(str(resolved.get("reason") or "the Codex CLI is not usable"))
             console.print(f"  Status: [yellow]not usable - {reason}[/yellow]")
@@ -5478,7 +5486,7 @@ def _dcr_print_status(resolved: dict) -> None:
     if resolved.get("reason"):
         console.print(f"[yellow][!][/yellow] {_rich_escape(str(resolved['reason']))}")
     console.print(
-        "Switch with: jacked dcr engine set codex --model gpt-5.6-luna --effort xhigh"
+        "Switch with: jacked dcr engine set codex --model gpt-6-astra --effort xhigh"
     )
 
 
@@ -5506,7 +5514,7 @@ def dcr_engine_group(ctx, as_json: bool):
 @dcr_engine_group.command(name="set")
 @click.argument("engine", type=click.Choice(_DCR_ENGINE_CHOICES))
 @click.option("--model", default=None,
-              help="Model the codex reviewers run (for example gpt-5.6-luna).")
+              help="Model the codex reviewers run (for example gpt-6-astra, or gpt-5.6-sol on an older Codex CLI).")
 @click.option("--effort", type=click.Choice(_DCR_EFFORT_CHOICES), default=None,
               help="Reasoning effort the codex reviewers run at.")
 @click.option("--keep-on-claude", default=None,

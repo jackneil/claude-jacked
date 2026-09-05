@@ -41,7 +41,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Every effort level the card must offer, weakest to strongest.
-EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
 
 
 def _program(driver_source, api_stub="global.api = {};"):
@@ -106,7 +106,7 @@ def _capture(out, tag="OUT"):
 
 def _engine(
     engine="claude",
-    model="gpt-5.6-luna",
+    model="gpt-6-astra",
     effort="xhigh",
     keep_on_claude=("Security", "Frontend Design"),
     usable=True,
@@ -285,21 +285,21 @@ def test_claude_engine_hides_model_effort_and_status(tmp_path):
 def test_codex_engine_shows_model_field_with_placeholder_and_value(tmp_path):
     html = _render_section(tmp_path, _engine(engine="codex", model="gpt-5.6-terra"))
     assert 'id="dcr-engine-model"' in html
-    assert 'placeholder="gpt-5.6-luna"' in html
+    assert 'placeholder="gpt-6-astra"' in html
     assert 'value="gpt-5.6-terra"' in html
     assert (
-        "Any Codex model name works. gpt-5.6-luna is fast and cheap; "
-        "gpt-5.6-terra is stronger." in html
+        "Any Codex model name works. gpt-6-astra is the strongest (Codex CLI 0.153+); "
+        "gpt-5.6-sol is the strongest 5.6; gpt-5.6-luna is the cheapest." in html
     )
 
 
-def test_codex_engine_offers_all_seven_effort_levels(tmp_path):
-    """All seven levels, with the server's current one selected."""
+def test_codex_engine_offers_every_effort_level(tmp_path):
+    """Every level, with the server's current one selected."""
     html = _render_section(tmp_path, _engine(engine="codex", effort="xhigh"))
     for level in EFFORT_LEVELS:
         assert f'<option value="{level}"' in html, level
     assert '<option value="xhigh" selected>xhigh</option>' in html
-    assert "How hard the model thinks. xhigh is the sweet spot for reviews." in html
+    assert "How hard the model thinks. xhigh is the sweet spot for reviews; ultra adds task delegation" in html
 
 
 def test_codex_effort_falls_back_to_a_known_level_when_value_is_unknown(tmp_path):
@@ -841,7 +841,7 @@ global.api = {
     if (p === '/api/features') return { hooks: [], knowledge: [] };
     if (p === '/api/packs') return { npx_available: true, packs: [] };
     if (p === '/api/dcr-engine') {
-      return { engine: 'codex', model: 'gpt-5.6-luna', effort: 'xhigh',
+      return { engine: 'codex', model: 'gpt-6-astra', effort: 'xhigh',
                keep_on_claude: ['Security'], usable: true, codex_path: '/bin/codex' };
     }
     throw new Error('unexpected path ' + p);

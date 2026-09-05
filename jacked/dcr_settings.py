@@ -71,15 +71,34 @@ VALID_ENGINES = set(ENGINE_CHOICES)
 # Ordered for help text / UI menus (weakest to strongest); VALID_EFFORTS is the
 # membership check. All seven are accepted by the codex CLI's
 # ``model_reasoning_effort`` config key.
-EFFORT_CHOICES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+EFFORT_CHOICES = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 VALID_EFFORTS = set(EFFORT_CHOICES)
+
+# Models that a stored config may still carry because they were once the shipped
+# default. ``resolve`` migrates them to the current default and says so in
+# ``reason`` -- unless the config carries ``model_pinned: true``, which
+# ``update_config`` writes whenever a user names the model explicitly (CLI
+# ``--model`` or the dashboard field). A pre-pin config that still says the old
+# default is a config that followed the default, so it follows it forward.
+RETIRED_DEFAULT_MODELS: dict[str, str] = {
+    "gpt-5.6-luna": "gpt-6-astra",  # default 0.91.0 - 0.103.0
+}
+
+# Models that only newer Codex CLI builds can serve. ``resolve`` checks the
+# installed CLI against this table and reviews on ``OLD_CODEX_FALLBACK_MODEL``
+# with a reason naming the upgrade command, instead of letting every reviewer
+# job die on a 400 from the API.
+MODEL_MIN_CODEX_VERSION: dict[str, tuple[int, int, int]] = {
+    "gpt-6-astra": (0, 153, 0),
+}
+OLD_CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 
 # Model/effort defaults exist even while the engine is "claude" so that flipping
 # the engine to codex with no flags does something sensible.
 DEFAULTS = {
     "version": CONFIG_VERSION,
     "engine": "claude",
-    "model": "gpt-5.6-luna",
+    "model": "gpt-6-astra",
     "effort": "xhigh",
     "keep_on_claude": ["Security", "Frontend Design"],
 }
@@ -260,7 +279,15 @@ def _sanitize_fields(config: dict) -> tuple[dict, list[str]]:
         )
 
     model = config.get("model")
-    if _model_ok(model):
+    pinned = config.get("model_pinned") is True
+    if _model_ok(model) and model in RETIRED_DEFAULT_MODELS and not pinned:
+        values["model"] = RETIRED_DEFAULT_MODELS[model]
+        reasons.append(
+            f"stored model {model} was an earlier default; using "
+            f"{values['model']} (to keep {model}, run: jacked dcr engine set codex "
+            f"--model {model})"
+        )
+    elif _model_ok(model):
         values["model"] = model
     else:
         values["model"] = DEFAULTS["model"]
@@ -442,6 +469,8 @@ def update_config(
             config["engine"] = engine
         if model is not None:
             config["model"] = model.strip() if isinstance(model, str) else model
+            # An explicit model is a choice: it never migrates with the default.
+            config["model_pinned"] = True
         if effort is not None:
             config["effort"] = effort
         if keep_on_claude is not None:
@@ -520,19 +549,78 @@ def codex_preflight(timeout: float = 10.0) -> dict:
             "reason": f"Could not run the Codex CLI: {e}",
         }
 
+    version = _codex_version(codex, timeout)
     if proc.returncode == 0:
         return {
             "codex_installed": True,
             "codex_logged_in": True,
             "codex_path": codex,
+            "codex_version": version,
             "reason": None,
         }
     return {
         "codex_installed": True,
         "codex_logged_in": False,
         "codex_path": codex,
+        "codex_version": version,
         "reason": "Codex CLI is not signed in. Run: codex login",
     }
+
+
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_version(text) -> "tuple[int, int, int] | None":
+    """The first ``major.minor.patch`` triple in ``text``, or None.
+
+    >>> parse_version("codex-cli 0.153.4")
+    (0, 153, 4)
+    >>> parse_version("") is None
+    True
+    """
+    if not isinstance(text, str):
+        return None
+    m = _VERSION_RE.search(text)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _codex_version(codex: str, timeout: float) -> "str | None":
+    """``codex --version`` as a ``major.minor.patch`` string, or None. Never raises."""
+    try:
+        proc = subprocess.run(  # noqa: S603 -- fixed argv, resolved binary
+            [codex, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.debug("codex --version failed to run", exc_info=True)
+        return None
+    triple = parse_version(f"{proc.stdout}\n{proc.stderr}")
+    return ".".join(str(n) for n in triple) if triple else None
+
+
+def model_supported_by(model: str, codex_version) -> "str | None":
+    """None when ``codex_version`` can serve ``model``; else a human reason.
+
+    Only models listed in ``MODEL_MIN_CODEX_VERSION`` are gated, and only when
+    the installed version is KNOWN and too old. An unparseable version does not
+    gate: a wrong downgrade would silently review on a weaker model, while a
+    stale CLI fails loudly (a 400 per job, and each job re-runs on Claude).
+    """
+    minimum = MODEL_MIN_CODEX_VERSION.get(model)
+    if minimum is None:
+        return None
+    have = parse_version(codex_version)
+    if have is None or have >= minimum:
+        return None
+    need = ".".join(str(n) for n in minimum)
+    seen = codex_version or "unknown"
+    return (
+        f"{model} needs Codex CLI {need} or newer (installed: {seen}); "
+        f"reviewing on {OLD_CODEX_FALLBACK_MODEL} until you run: codex update"
+    )
 
 
 def resolve(home: Path | str, *, preflight: bool = True) -> dict:
@@ -540,7 +628,7 @@ def resolve(home: Path | str, *, preflight: bool = True) -> dict:
 
     Keys: ``engine``, ``model``, ``effort``, ``keep_on_claude``, ``usable``,
     ``reason``, ``codex_installed``, ``codex_logged_in``, ``codex_path``,
-    ``schema_path``.
+    ``codex_version``, ``schema_path``.
 
     Every field is re-validated on the way out (see ``_sanitize_fields``): a
     value this build cannot run with is replaced by its default and explained in
@@ -583,6 +671,7 @@ def resolve(home: Path | str, *, preflight: bool = True) -> dict:
         "codex_installed": None,
         "codex_logged_in": None,
         "codex_path": None,
+        "codex_version": None,
         "schema_path": str(schema_path()),
     }
 
@@ -591,9 +680,15 @@ def resolve(home: Path | str, *, preflight: bool = True) -> dict:
         resolved["codex_installed"] = check["codex_installed"]
         resolved["codex_logged_in"] = check["codex_logged_in"]
         resolved["codex_path"] = check.get("codex_path")
+        resolved["codex_version"] = check.get("codex_version")
         resolved["usable"] = bool(check["codex_installed"] and check["codex_logged_in"])
         if check["reason"]:
             reasons.append(check["reason"])
+        if resolved["usable"]:
+            too_old = model_supported_by(resolved["model"], resolved["codex_version"])
+            if too_old:
+                resolved["model"] = OLD_CODEX_FALLBACK_MODEL
+                reasons.append(too_old)
 
     resolved["reason"] = "; ".join(reasons) or None
     return resolved

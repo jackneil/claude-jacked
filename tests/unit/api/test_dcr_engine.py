@@ -24,7 +24,7 @@ from tests._platform import requires_posix_dir_permissions
 
 RESOLVE_KEYS = {
     "engine", "model", "effort", "keep_on_claude", "usable", "reason",
-    "codex_installed", "codex_logged_in", "codex_path", "schema_path",
+    "codex_installed", "codex_logged_in", "codex_path", "codex_version", "schema_path",
 }
 
 READY = {
@@ -75,7 +75,7 @@ def test_get_returns_the_contract_on_a_fresh_home(client, home):
     body = r.json()
     assert set(body) == RESOLVE_KEYS
     assert body["engine"] == "claude"
-    assert body["model"] == "gpt-5.6-luna"
+    assert body["model"] == "gpt-6-astra"
     assert body["effort"] == "xhigh"
     assert body["keep_on_claude"] == ["Security", "Frontend Design"]
     assert body["usable"] is True
@@ -111,7 +111,7 @@ def test_get_on_a_corrupt_config_degrades_to_claude(client, home):
     ({"keep_on_claude": 5}, "keep_on_claude", ["Security", "Frontend Design"]),
     ({"keep_on_claude": "Security, Frontend Design"}, "keep_on_claude",
      ["Security", "Frontend Design"]),
-    ({"model": 'gpt"; touch /tmp/x; "'}, "model", "gpt-5.6-luna"),
+    ({"model": 'gpt"; touch /tmp/x; "'}, "model", "gpt-6-astra"),
     ({"effort": "turbo"}, "effort", "xhigh"),
     ({"engine": "gemini"}, "engine", "claude"),
 ])
@@ -138,7 +138,7 @@ def test_get_sanitizes_a_hand_edited_config_instead_of_500ing(
 def test_put_writes_and_returns_fresh_state(client, home):
     with patch("jacked.dcr_settings.codex_preflight", return_value=READY):
         r = client.put("/api/dcr-engine", json={
-            "engine": "codex", "model": "gpt-5.6-luna", "effort": "high",
+            "engine": "codex", "model": "gpt-6-astra", "effort": "high",
         })
     assert r.status_code == 200, r.text
     body = r.json()

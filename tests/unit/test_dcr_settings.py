@@ -33,7 +33,7 @@ from tests._platform import requires_posix_dir_permissions, requires_posix_file_
 # The exact contract keys resolve() promises the /dcr command and the dashboard.
 RESOLVE_KEYS = {
     "engine", "model", "effort", "keep_on_claude", "usable", "reason",
-    "codex_installed", "codex_logged_in", "codex_path", "schema_path",
+    "codex_installed", "codex_logged_in", "codex_path", "codex_version", "schema_path",
 }
 
 # chmod-based refusals are meaningless as root, and fcntl is POSIX-only.
@@ -85,7 +85,7 @@ def test_engine_and_effort_choice_tuples_match_the_valid_sets():
     assert set(dcr_settings.ENGINE_CHOICES) == dcr_settings.VALID_ENGINES
     assert set(dcr_settings.EFFORT_CHOICES) == dcr_settings.VALID_EFFORTS
     assert dcr_settings.VALID_EFFORTS == {
-        "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
     }
 
 
@@ -133,7 +133,7 @@ def test_read_non_object_raises(tmp_path):
 def test_write_round_trip_stamps_version_and_leaves_no_tmp(tmp_path):
     dcr_settings.write_config(tmp_path, {
         "engine": "codex",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
         "effort": "xhigh",
         "keep_on_claude": ["Security"],
     })
@@ -141,7 +141,7 @@ def test_write_round_trip_stamps_version_and_leaves_no_tmp(tmp_path):
     assert on_disk == {
         "version": 1,
         "engine": "codex",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
         "effort": "xhigh",
         "keep_on_claude": ["Security"],
     }
@@ -462,11 +462,13 @@ def test_preflight_installed_and_logged_in():
             patch("jacked.dcr_settings.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 0, "Logged in", "")
         got = dcr_settings.codex_preflight()
-    assert run.call_args.args[0] == ["/usr/bin/codex", "login", "status"]
+    assert run.call_args_list[0].args[0] == ["/usr/bin/codex", "login", "status"]
+    assert run.call_args_list[1].args[0] == ["/usr/bin/codex", "--version"]
     assert got == {
         "codex_installed": True,
         "codex_logged_in": True,
         "codex_path": "/usr/bin/codex",
+        "codex_version": None,
         "reason": None,
     }
 
@@ -498,6 +500,7 @@ def test_preflight_installed_but_not_logged_in():
         "codex_installed": True,
         "codex_logged_in": False,
         "codex_path": "/usr/bin/codex",
+        "codex_version": None,
         "reason": "Codex CLI is not signed in. Run: codex login",
     }
 
@@ -580,7 +583,7 @@ def test_resolve_codex_usable(tmp_path):
         got = dcr_settings.resolve(tmp_path)
     assert set(got) == RESOLVE_KEYS
     assert got["engine"] == "codex"
-    assert got["model"] == "gpt-5.6-luna"
+    assert got["model"] == "gpt-6-astra"
     assert got["effort"] == "xhigh"
     assert got["keep_on_claude"] == ["Security", "Frontend Design"]
     assert got["usable"] is True
@@ -683,13 +686,13 @@ def test_resolve_on_an_unreadable_file_reports_the_access_error(tmp_path):
     ({"effort": None}, "effort", "xhigh"),
     ({"effort": ["high"]}, "effort", "xhigh"),
     # Model: blank, wrong type, and injection shapes.
-    ({"model": ""}, "model", "gpt-5.6-luna"),
-    ({"model": "   "}, "model", "gpt-5.6-luna"),
-    ({"model": None}, "model", "gpt-5.6-luna"),
-    ({"model": 5}, "model", "gpt-5.6-luna"),
-    ({"model": 'gpt"; touch /tmp/x; "'}, "model", "gpt-5.6-luna"),
-    ({"model": "gpt $(whoami)"}, "model", "gpt-5.6-luna"),
-    ({"model": "gpt`id`"}, "model", "gpt-5.6-luna"),
+    ({"model": ""}, "model", "gpt-6-astra"),
+    ({"model": "   "}, "model", "gpt-6-astra"),
+    ({"model": None}, "model", "gpt-6-astra"),
+    ({"model": 5}, "model", "gpt-6-astra"),
+    ({"model": 'gpt"; touch /tmp/x; "'}, "model", "gpt-6-astra"),
+    ({"model": "gpt $(whoami)"}, "model", "gpt-6-astra"),
+    ({"model": "gpt`id`"}, "model", "gpt-6-astra"),
     # keep_on_claude: a bare string must NOT expand per character, and a number
     # must not raise.
     ({"keep_on_claude": "Security, Frontend Design"}, "keep_on_claude",
@@ -825,3 +828,80 @@ def test_the_dashboard_js_effort_list_matches_the_python_one():
     assert match, f"DCR_EFFORT_LEVELS array literal not found in {settings_js}"
     js_levels = re.findall(r"'([^']*)'", match.group(1))
     assert js_levels == list(dcr_settings.EFFORT_CHOICES)
+
+
+# --------------------------------------------------------------------------- #
+# model gate and retired-default migration
+# --------------------------------------------------------------------------- #
+
+def test_preflight_reports_the_codex_version():
+    def fake_run(argv, **_):
+        if argv[1:] == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, "codex-cli 0.153.4\n", "")
+        return subprocess.CompletedProcess(argv, 0, "Logged in", "")
+    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+            patch("jacked.dcr_settings.subprocess.run", side_effect=fake_run):
+        got = dcr_settings.codex_preflight()
+    assert got["codex_version"] == "0.153.4"
+    assert got["codex_logged_in"] is True
+
+
+@pytest.mark.parametrize("version,expected_model,gated", [
+    ("0.153.4", "gpt-6-astra", False),
+    ("0.153.0", "gpt-6-astra", False),
+    ("0.151.0", "gpt-5.6-sol", True),
+    (None, "gpt-6-astra", False),  # unknown never downgrades silently
+])
+def test_resolve_falls_back_when_the_cli_is_too_old_for_the_model(tmp_path, version, expected_model, gated):
+    dcr_settings.write_config(tmp_path, {**dcr_settings.DEFAULTS, "engine": "codex"})
+    with patch("jacked.dcr_settings.codex_preflight", return_value={
+        "codex_installed": True, "codex_logged_in": True, "reason": None,
+        "codex_path": "/usr/bin/codex", "codex_version": version,
+    }):
+        got = dcr_settings.resolve(tmp_path)
+    assert got["model"] == expected_model
+    assert got["usable"] is True
+    assert got["codex_version"] == version
+    if gated:
+        assert "needs Codex CLI 0.153.0 or newer" in got["reason"]
+        assert "codex update" in got["reason"]
+    else:
+        assert got["reason"] is None
+
+
+def test_model_gate_ignores_models_without_a_minimum():
+    assert dcr_settings.model_supported_by("gpt-5.6-luna", "0.100.0") is None
+
+
+def test_resolve_migrates_the_retired_default_model(tmp_path):
+    dcr_settings.write_config(tmp_path, {**dcr_settings.DEFAULTS, "engine": "codex", "model": "gpt-5.6-luna"})
+    got = dcr_settings.resolve(tmp_path, preflight=False)
+    assert got["model"] == "gpt-6-astra"
+    assert "gpt-5.6-luna was an earlier default" in got["reason"]
+    assert "jacked dcr engine set codex --model gpt-5.6-luna" in got["reason"]
+    # the bytes on disk are untouched: resolve never writes
+    assert dcr_settings.read_config(tmp_path)["model"] == "gpt-5.6-luna"
+
+
+def test_resolve_keeps_an_explicit_non_default_model(tmp_path):
+    dcr_settings.write_config(tmp_path, {**dcr_settings.DEFAULTS, "engine": "codex", "model": "gpt-5.6-terra"})
+    got = dcr_settings.resolve(tmp_path, preflight=False)
+    assert got["model"] == "gpt-5.6-terra"
+    assert got["reason"] is None
+
+
+def test_explicit_model_is_pinned_and_never_migrates(tmp_path):
+    """The migration reason tells the user to set the old model explicitly to
+    keep it; that escape hatch must actually work."""
+    dcr_settings.update_config(tmp_path, engine="codex", model="gpt-5.6-luna")
+    assert dcr_settings.read_config(tmp_path)["model_pinned"] is True
+    got = dcr_settings.resolve(tmp_path, preflight=False)
+    assert got["model"] == "gpt-5.6-luna"
+    assert got["reason"] is None
+
+
+def test_setting_other_fields_does_not_pin_the_model(tmp_path):
+    dcr_settings.write_config(tmp_path, {**dcr_settings.DEFAULTS, "engine": "codex", "model": "gpt-5.6-luna"})
+    dcr_settings.update_config(tmp_path, effort="high")
+    assert "model_pinned" not in dcr_settings.read_config(tmp_path)
+    assert dcr_settings.resolve(tmp_path, preflight=False)["model"] == "gpt-6-astra"

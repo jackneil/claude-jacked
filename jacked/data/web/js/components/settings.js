@@ -353,7 +353,7 @@ async function refreshPacks() {
 // --- DCR review engine data loading ---
 
 // Effort levels the Codex CLI accepts, weakest to strongest.
-const DCR_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const DCR_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 
 // A PUT is running: the card renders its controls disabled and refuses a second
 // concurrent write. Module-level (not per-render) so a re-render landing mid-save
@@ -1030,15 +1030,15 @@ function _renderDcrEngineSection(data) {
                 <div class="flex items-center justify-between gap-3">
                     <div class="min-w-0 flex-1">
                         <div class="text-sm text-white">Model</div>
-                        <div class="text-xs text-slate-400">Any Codex model name works. gpt-5.6-luna is fast and cheap; gpt-5.6-terra is stronger.</div>
+                        <div class="text-xs text-slate-400">Any Codex model name works. gpt-6-astra is the strongest (Codex CLI 0.153+); gpt-5.6-sol is the strongest 5.6; gpt-5.6-luna is the cheapest.</div>
                     </div>
                     <input type="text" id="dcr-engine-model" class="w-44 flex-shrink-0 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
-                           placeholder="gpt-5.6-luna" value="${escapeHtml((data && data.model) || '')}" aria-label="Codex model"${disabledAttr}>
+                           placeholder="gpt-6-astra" value="${escapeHtml((data && data.model) || '')}" aria-label="Codex model"${disabledAttr}>
                 </div>
                 <div class="flex items-center justify-between gap-3">
                     <div class="min-w-0 flex-1">
                         <div class="text-sm text-white">Effort</div>
-                        <div class="text-xs text-slate-400">How hard the model thinks. xhigh is the sweet spot for reviews.</div>
+                        <div class="text-xs text-slate-400">How hard the model thinks. xhigh is the sweet spot for reviews; ultra adds task delegation, which a read-only reviewer does not need.</div>
                     </div>
                     <select id="dcr-engine-effort" class="flex-shrink-0 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500" aria-label="Codex effort"${disabledAttr}>
                         ${effortOptions}
