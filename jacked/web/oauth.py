@@ -1038,6 +1038,13 @@ class OAuthFlow:
             cc_refresh_token=tokens.get("refresh_token"),
             cc_expires_at=expires_at,
             validation_status="valid",
+            # A fresh interactive login is a new refresh lineage: clear the
+            # breaker a consumed token left behind, or the guard keeps
+            # refusing to import rotations and the heal sweep keeps churning.
+            refresh_failure_type=None,
+            refresh_last_failed_at=None,
+            last_error=None,
+            last_error_at=None,
             last_validated_at=int(time.time()),
         )
         if not updated:

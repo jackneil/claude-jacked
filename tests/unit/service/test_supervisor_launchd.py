@@ -1,6 +1,8 @@
 import plistlib
 import subprocess
 from types import SimpleNamespace
+
+import pytest
 from unittest.mock import Mock, patch
 
 
@@ -12,6 +14,17 @@ from jacked.service.supervisors import (
 from tests.unit.service.supervisor_test_support import (
     installed_artifact as _installed_artifact,
 )
+
+
+
+@pytest.fixture
+def _no_drain(monkeypatch):
+    """Skip the bootout drain wait for tests that script launchctl replies
+    positionally; the drain itself is covered by the simulator tests."""
+    from jacked.service.supervisors import launchd as launchd_module
+
+    monkeypatch.setattr(launchd_module, "_await_unloaded", lambda ctx, timeout=None: True)
+    monkeypatch.setattr(launchd_module.time, "sleep", lambda _s: None)
 
 
 def test_restart_refuses_loaded_systemd_definition_from_other_path(tmp_path):
@@ -81,6 +94,7 @@ def test_install_launchd_creates_missing_launchagents_directory(tmp_path):
     assert path.exists()
 
 
+@pytest.mark.usefixtures("_no_drain")
 def test_install_launchd_migrates_exact_known_legacy_definition(tmp_path):
     spec, environment, rendered, path = _installed_artifact(
         tmp_path, SupervisorKind.LAUNCHD
@@ -142,6 +156,7 @@ def test_install_launchd_resolves_bootstrap_timeout_from_loaded_identity(tmp_pat
     assert path.read_bytes() == rendered.content
 
 
+@pytest.mark.usefixtures("_no_drain")
 def test_install_launchd_boots_out_proven_old_generation_before_replacing_it(
     tmp_path,
 ):
@@ -185,6 +200,7 @@ def test_install_launchd_boots_out_proven_old_generation_before_replacing_it(
     ]
 
 
+@pytest.mark.usefixtures("_no_drain")
 def test_install_launchd_restores_old_generation_when_new_bootstrap_fails(tmp_path):
     spec, environment, rendered, path = _installed_artifact(
         tmp_path, SupervisorKind.LAUNCHD
@@ -204,6 +220,7 @@ def test_install_launchd_restores_old_generation_when_new_bootstrap_fails(tmp_pa
             SimpleNamespace(returncode=0, stdout=""),
             SimpleNamespace(returncode=0, stdout=""),
             SimpleNamespace(returncode=5, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),  # retried once after the drain
             SimpleNamespace(returncode=0, stdout=""),
         ]
     )
@@ -215,7 +232,7 @@ def test_install_launchd_restores_old_generation_when_new_bootstrap_fails(tmp_pa
     assert result.ok is False
     assert "previous supervisor restored" in result.reason
     assert path.read_bytes() == previous
-    assert runner.call_args_list[4].args[0] == [
+    assert runner.call_args_list[5].args[0] == [
         "launchctl",
         "bootstrap",
         "gui/501",
@@ -223,6 +240,7 @@ def test_install_launchd_restores_old_generation_when_new_bootstrap_fails(tmp_pa
     ]
 
 
+@pytest.mark.usefixtures("_no_drain")
 def test_install_launchd_removes_new_artifact_when_first_bootstrap_fails(tmp_path):
     spec, environment, _, path = _installed_artifact(tmp_path, SupervisorKind.LAUNCHD)
     path.unlink()
@@ -231,6 +249,7 @@ def test_install_launchd_removes_new_artifact_when_first_bootstrap_fails(tmp_pat
             SimpleNamespace(returncode=113, stdout=""),
             SimpleNamespace(returncode=0, stdout=""),
             SimpleNamespace(returncode=5, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),  # retried once after the drain
         ]
     )
 
@@ -243,6 +262,7 @@ def test_install_launchd_removes_new_artifact_when_first_bootstrap_fails(tmp_pat
     assert not path.exists()
 
 
+@pytest.mark.usefixtures("_no_drain")
 def test_install_launchd_restores_unloaded_owned_drift_on_failure(tmp_path):
     spec, environment, rendered, path = _installed_artifact(
         tmp_path, SupervisorKind.LAUNCHD
@@ -257,6 +277,7 @@ def test_install_launchd_restores_unloaded_owned_drift_on_failure(tmp_path):
             SimpleNamespace(returncode=113, stdout=""),
             SimpleNamespace(returncode=0, stdout=""),
             SimpleNamespace(returncode=5, stdout=""),
+            SimpleNamespace(returncode=5, stdout=""),  # retried once after the drain
         ]
     )
 
@@ -268,6 +289,7 @@ def test_install_launchd_restores_unloaded_owned_drift_on_failure(tmp_path):
     assert path.read_bytes() == previous
 
 
+@pytest.mark.usefixtures("_no_drain")
 def test_install_launchd_reloads_old_job_when_reconcile_raises(tmp_path):
     spec, environment, rendered, path = _installed_artifact(
         tmp_path, SupervisorKind.LAUNCHD
@@ -438,3 +460,117 @@ def test_launchd_artifact_runs_the_tray_as_an_interactive_job(tmp_path):
     )
     payload = plistlib.loads(artifact.content)
     assert payload["ProcessType"] == "Interactive"
+
+
+class _LaunchctlSim:
+    """A launchctl that models bootout's asynchronous drain.
+
+    After ``bootout`` the job name stays registered for ``drain_polls`` print
+    calls; a bootstrap inside that window fails with EIO (5), exactly as
+    launchd behaves (measured 2026-09-05: seconds of drain on a real tray).
+    """
+
+    def __init__(self, loaded_stdout: str, drain_polls: int = 2) -> None:
+        self.loaded_stdout = loaded_stdout
+        self.drain_polls = drain_polls
+        self.loaded = True
+        self.draining = 0
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        verb = argv[1]
+        if verb == "print":
+            if self.draining > 0:
+                self.draining -= 1
+                return SimpleNamespace(returncode=0, stdout=self.loaded_stdout)
+            return SimpleNamespace(
+                returncode=0 if self.loaded else 113,
+                stdout=self.loaded_stdout if self.loaded else "",
+            )
+        if verb == "enable":
+            return SimpleNamespace(returncode=0, stdout="")
+        if verb == "bootout":
+            self.loaded = False
+            self.draining = self.drain_polls
+            return SimpleNamespace(returncode=0, stdout="")
+        if verb == "bootstrap":
+            if self.draining > 0:
+                self.draining -= 1
+                return SimpleNamespace(returncode=5, stdout="")
+            self.loaded = True
+            return SimpleNamespace(returncode=0, stdout="")
+        raise AssertionError(f"unexpected launchctl verb {verb}")
+
+
+def _generation_change(tmp_path):
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    previous_generation = "0" * len(spec.generation)
+    previous = rendered.content.replace(
+        spec.generation.encode(), previous_generation.encode()
+    )
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    return spec, environment, rendered, path, previous_generation
+
+
+def test_generation_change_waits_for_the_old_job_to_drain_before_bootstrap(
+    tmp_path, monkeypatch
+):
+    from jacked.service.supervisors import launchd as launchd_module
+
+    monkeypatch.setattr(launchd_module.time, "sleep", lambda _s: None)
+    spec, environment, rendered, path, previous_generation = _generation_change(tmp_path)
+    sim = _LaunchctlSim(f"{previous_generation} {spec.launcher_path}", drain_polls=3)
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=sim, uid=501
+    )
+
+    assert result.ok, result.reason
+    assert path.read_bytes() == rendered.content
+    verbs = [call[1] for call in sim.calls]
+    bootout = verbs.index("bootout")
+    bootstrap = verbs.index("bootstrap")
+    # Every call between bootout and bootstrap is a drain probe.
+    assert set(verbs[bootout + 1 : bootstrap]) == {"print"}
+    assert verbs.count("bootstrap") == 1
+
+
+def test_bootstrap_eio_during_drain_is_retried_once_the_name_is_free(
+    tmp_path, monkeypatch
+):
+    from jacked.service.supervisors import launchd as launchd_module
+
+    monkeypatch.setattr(launchd_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(launchd_module, "_await_unloaded", lambda ctx, timeout=None: True)
+    spec, environment, rendered, path, previous_generation = _generation_change(tmp_path)
+    sim = _LaunchctlSim(f"{previous_generation} {spec.launcher_path}", drain_polls=1)
+    # The await is stubbed as "free", so the first bootstrap still hits EIO.
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=sim, uid=501
+    )
+
+    assert result.ok, result.reason
+    assert [c[1] for c in sim.calls].count("bootstrap") == 2
+
+
+def test_drain_timeout_rolls_back_to_the_previous_generation(tmp_path, monkeypatch):
+    from jacked.service.supervisors import launchd as launchd_module
+
+    monkeypatch.setattr(launchd_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(launchd_module, "BOOTOUT_DRAIN_TIMEOUT_SECONDS", 0.0)
+    spec, environment, rendered, path, previous_generation = _generation_change(tmp_path)
+    previous = path.read_bytes()
+    sim = _LaunchctlSim(f"{previous_generation} {spec.launcher_path}", drain_polls=50)
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=sim, uid=501
+    )
+
+    assert result.ok is False
+    assert "did not unload" in result.reason
+    assert path.read_bytes() == previous
+

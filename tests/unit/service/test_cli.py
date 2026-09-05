@@ -2025,3 +2025,59 @@ def test_status_init_shim_fails_closed_on_any_error(monkeypatch):
     result = CliRunner().invoke(main, ["_update_status_init", "1.0", "next", "uv"])
     assert result.exit_code == 2
 
+
+class TestRestartRearmsNativeOwner:
+    """After an upgrade the old job exits cleanly and takes its manifest with
+    it; `service restart` must re-arm the owned supervisor, not spawn a manual
+    tray that lives only until the next login (2026-09-05)."""
+
+    def _restart(self, monkeypatch, state, ensure_result):
+        from types import SimpleNamespace
+
+        from jacked.cli import main
+        from jacked.service.spec import SupervisorKind
+
+        calls = []
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.supervisor_for_platform",
+            lambda: SupervisorKind.LAUNCHD,
+        )
+        monkeypatch.setattr(
+            "jacked.service.platform.inspect_autostart",
+            lambda: SimpleNamespace(state=state),
+        )
+        monkeypatch.setattr(
+            "jacked.cli._ensure_autostart_and_running",
+            lambda port, label="Service", **kw: calls.append(port) or ensure_result,
+        )
+        with (
+            patch("jacked.cli._spawn_service_detached") as spawn,
+            patch("jacked.cli._wait_owned_service_ready", return_value={"port": 8321}),
+        ):
+            result = CliRunner().invoke(main, ["service", "restart"])
+        return result, calls, spawn
+
+    def test_owned_definition_is_rearmed_instead_of_a_manual_spawn(self, monkeypatch):
+        from jacked.service.autostart import AutostartState
+
+        result, calls, spawn = self._restart(monkeypatch, AutostartState.OWNED_ENABLED, True)
+        assert result.exit_code == 0, result.output
+        assert calls == [8321]
+        spawn.assert_not_called()
+
+    def test_refused_rearm_falls_back_to_the_detached_spawn(self, monkeypatch):
+        from jacked.service.autostart import AutostartState
+
+        result, calls, spawn = self._restart(monkeypatch, AutostartState.OWNED_ENABLED, False)
+        assert result.exit_code == 0, result.output
+        assert calls == [8321]
+        spawn.assert_called_once()
+
+    def test_no_definition_keeps_the_detached_spawn(self, monkeypatch):
+        from jacked.service.autostart import AutostartState
+
+        result, calls, spawn = self._restart(monkeypatch, AutostartState.ABSENT, True)
+        assert result.exit_code == 0, result.output
+        assert calls == []
+        spawn.assert_called_once()
+

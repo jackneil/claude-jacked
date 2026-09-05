@@ -86,4 +86,9 @@ def test_native_contract_preserves_an_isolated_importable_tool_runtime(
         check=False,
     )
     assert imported.returncode == 0, imported.stderr
-    assert imported.stdout.strip() == "0.100.0"
+    # Compare against the package the child actually imports, never a literal:
+    # a literal goes stale on every release bump (0.101.0 shipped with this
+    # test red because the bump landed after the gate ran).
+    import jacked
+
+    assert imported.stdout.strip() == jacked.__version__
