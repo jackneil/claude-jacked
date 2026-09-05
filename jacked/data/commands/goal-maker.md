@@ -53,7 +53,7 @@ Fold these into the brief's Approach/Verify sections. They are the **expected fl
 - **Tests** — TDD where it fits (failing test → implement → green); the repo's real test command green; NEW tests covering every milestone and its edge cases. If the repo has no runner, milestone 1 is *"stand up a test runner + first passing tests."* **Confirm the runner actually executed** — the test command must print a real pass/fail summary with a non-zero test count; an empty, errored, or "no tests collected / 0 tests" output counts as FAILED, never DONE (an unrun suite must never masquerade as satisfied).
 - **UI / front-end work** — browser-QA via `/qa`, `/ux`, or available browser tools (target flows work, console error-free) AND **front-end design + UX detail**: the *walked* experience, attention to detail, the **make-interfaces-feel-better** principles — concentric radii, optical alignment, tabular-nums on live numbers, press/hover feedback, real empty/loading/error states. Walk the actual user flows; don't assert.
 - **Security-sensitive** (auth, RBAC, tenancy, billing, credentials) — `/cso` reports no high/critical findings.
-- **Review** — `/dcr` reports a clean pass (if available).
+- **Review** — `/dcr` reports a clean pass (if available). Review depth follows the chain-of-command dispatch shape (tier first, agent budget per tier, two waves); the brief never authorizes unbounded fan-out.
 - **Build cleanly** — no stubs, no silent failures, no swallowed errors, no arbitrary data/scope caps; follow CLAUDE.md. Full scope: no MVP-for-later.
 
 ## Step 4: Forge the brief as a FILE (verbose by design; `/goal` gets a pointer)
@@ -93,7 +93,7 @@ Verify — run each and show the output; ALL must pass before you stop:
 - Each milestone works when run for real — paste the proof: <a command + its expected output, or the user flow you walked>
 - [UI work] Browser-QA via /qa or /ux: target flows work, console error-free; and the UI is polished — concentric radii, optical alignment, tabular-nums on live numbers, press/hover feedback, real empty/loading/error states
 - [security-sensitive] /cso reports no high/critical findings
-- [if available] /dcr reports a clean pass
+- [if available] /dcr reports a clean pass (review via /dcr tiers; the pointer never carries "ultracode" or "use dynamic workflows")
 
 DONE when: every milestone is built, the test command and per-milestone real-run proofs all pass in the transcript, every applicable gate is clean, and the work is committed on a feature branch and opened as a PR (feature branch → main) for review — NOT merged. Never report success without the supporting output. If the test command did not actually execute (empty output, runner/env error, 0 tests), that is a BLOCKED halt, not completion. Drive to completion across as many turns as it takes; only halt on a genuinely stuck item (3+ no-progress turns) or an unsafe step — never on a turn/time count.
 
