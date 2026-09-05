@@ -82,6 +82,10 @@ def _wait_for_handoff_exit(
     return SupervisorAction(False, "handoff", "old ownership did not exit")
 
 
+def _timed_out(reason: str) -> bool:
+    return "TimeoutExpired" in reason
+
+
 @dataclass(frozen=True)
 class _HandoffPrevious:
     instance_id: str
@@ -103,13 +107,18 @@ def _activate_handoff(
 
     artifact = native_artifact_path(spec, paths=paths)
     native = install_owned_supervisor(spec, artifact, environment=environment)
-    if native.ok:
-        return _await_ready_generation(
+    if native.ok or _timed_out(native.reason):
+        # A timed-out launchctl call is not evidence that nothing started:
+        # launchd may still be draining the old process and relaunching. Judge
+        # by the outcome, the exact generation becoming ready, before refusing.
+        ready = _await_ready_generation(
             paths,
             spec.generation,
             previous_instance=previous.instance_id,
             timeout=previous.timeout,
         )
+        if native.ok or ready.ok:
+            return ready
     if previous.supervisor != SupervisorKind.MANUAL.value:
         return SupervisorAction(
             False,

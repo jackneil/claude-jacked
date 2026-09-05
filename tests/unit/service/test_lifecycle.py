@@ -263,3 +263,80 @@ def test_handoff_budgets_come_from_service_constants():
     assert params["timeout"].default == HANDOFF_EXIT_TIMEOUT
     assert params["ready_timeout"].default == REPLACEMENT_READY_TIMEOUT
     assert REPLACEMENT_READY_TIMEOUT > 90
+
+
+def _handoff_fixture(monkeypatch, tmp_path, install_result, ready: bool):
+    old = SimpleNamespace(
+        instance_id="old",
+        generation="old-generation",
+        supervisor=SupervisorKind.LAUNCHD.value,
+    )
+    reads = iter((old, FileNotFoundError()))
+
+    def read(_path):
+        value = next(reads)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    spec = MagicMock(generation="a" * 64, supervisor=SupervisorKind.LAUNCHD)
+    paths = SimpleNamespace(manifest=tmp_path / "manifest", root=tmp_path)
+    status = {"state": "running", "generation": spec.generation, "instance_id": "new"}
+    responses = [{"ok": True, "result": {"accepted": True}}]
+    responses += [{"ok": True, "result": status}] if ready else [
+        {"ok": False, "error": "down"}
+    ] * 400
+    control = MagicMock(side_effect=responses)
+    spawn = MagicMock()
+    monkeypatch.setattr("jacked.service.instance.read_manifest", read)
+    monkeypatch.setattr("jacked.service.ipc.send_native_control", control)
+    monkeypatch.setattr(
+        "jacked.service.lifecycle.install_owned_supervisor",
+        lambda *_a, **_k: install_result,
+    )
+    monkeypatch.setattr("jacked.service.lifecycle.spawn_exact_service", spawn)
+    return spec, paths, spawn
+
+
+def test_timed_out_native_restart_succeeds_when_the_generation_comes_up(
+    monkeypatch, tmp_path
+):
+    """launchd waits for the old process to drain inside kickstart -k; a
+    timed-out call is not evidence that nothing started (2026-09-05)."""
+    spec, paths, spawn = _handoff_fixture(
+        monkeypatch, tmp_path, SupervisorAction(False, "install", "TimeoutExpired"), True
+    )
+
+    result = handoff_owned_service(spec, environment={}, paths=paths)
+
+    assert result.ok is True, result.reason
+    spawn.assert_not_called()
+
+
+def test_timed_out_native_restart_still_refuses_when_nothing_comes_up(
+    monkeypatch, tmp_path
+):
+    spec, paths, spawn = _handoff_fixture(
+        monkeypatch, tmp_path, SupervisorAction(False, "install", "TimeoutExpired"), False
+    )
+
+    result = handoff_owned_service(spec, environment={}, paths=paths, ready_timeout=0.3)
+
+    assert result.ok is False
+    assert "TimeoutExpired" in result.reason
+    spawn.assert_not_called()
+
+
+def test_non_timeout_native_refusal_does_not_wait_for_a_generation(
+    monkeypatch, tmp_path
+):
+    spec, paths, spawn = _handoff_fixture(
+        monkeypatch, tmp_path, SupervisorAction(False, "refused", "artifact is foreign"), True
+    )
+
+    result = handoff_owned_service(spec, environment={}, paths=paths)
+
+    assert result.ok is False
+    assert "artifact is foreign" in result.reason
+    spawn.assert_not_called()
+
