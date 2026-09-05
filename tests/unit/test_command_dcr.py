@@ -188,8 +188,32 @@ def test_recheck_waves_verify_fixes_not_fresh_review(dcr: str):
     assert "Do NOT limit your review to verifying prior fixes" not in dcr
 
 
-def test_default_wave_cap_is_three(dcr: str):
-    assert "Default wave cap is **3**" in dcr
+def test_default_wave_cap_is_two_and_the_loop_converges(dcr: str):
+    assert "Default wave cap is **2**" in dcr
+    assert "Default wave cap is **3**" not in dcr
+    assert "a review loop CONVERGES" in dcr
+    assert "no validated branch-introduced CRITICAL/MEDIUM and no critical pre-existing one" in dcr
+    assert "split the PR, not to review again" in dcr
+    assert "the answer is always yes" not in dcr
+    assert "never a fourth wave" in dcr
+
+
+def test_every_finding_carries_scope_provenance(dcr: str):
+    assert "Scope: [SCOPE]" in dcr
+    assert "13. **Scope and provenance (always)**" in dcr
+    assert "`introduced_by_branch: true|false`" in dcr
+    # the Codex output instruction asks for the same field
+    assert "and `introduced_by_branch` (true when the defect lives in lines or behavior this diff changed)" in dcr
+
+
+def test_fix_phase_buckets_findings_by_provenance(dcr: str):
+    assert "**Introduced by this branch** → fixed in this PR, always." in dcr
+    assert "**Pre-existing, discovered adjacent to the branch**" in dcr
+    assert "`gh issue create`" in dcr
+    assert "Filing with evidence is not punting" in dcr
+    assert "A project or global CLAUDE.md that says otherwise wins over this default." in dcr
+    assert "the full-suite gate is per PUSH, not per fix batch" in dcr
+    assert "**Pre-existing findings filed, not fixed here:**" in dcr
 
 
 def test_diagnostics_run_as_pre_gate_before_wave_one(dcr: str):
@@ -216,7 +240,7 @@ def test_repo_wrapper_carries_tier_contract():
         "## RISK TIER",
         "ONE consolidated reviewer carries every selected lens",
         "### SUBSEQUENT WAVES — Fix Verification",
-        "Default wave cap is **3**",
+        "Default wave cap is **2**",
     ):
         assert anchor in wrapper, f"repo dcr wrapper missing tier anchor: {anchor}"
 

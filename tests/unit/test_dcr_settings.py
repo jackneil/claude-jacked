@@ -548,7 +548,9 @@ def test_schema_path_exists_and_parses():
     assert set(finding["required"]) == {
         "severity", "title", "file", "line_start", "line_end",
         "trigger", "why", "confidence", "recommendation",
+        "introduced_by_branch",
     }
+    assert finding["properties"]["introduced_by_branch"]["type"] == "boolean"
     assert finding["properties"]["severity"]["enum"] == ["CRITICAL", "MEDIUM", "LOW"]
     assert finding["additionalProperties"] is False
 

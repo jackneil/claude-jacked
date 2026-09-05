@@ -52,7 +52,8 @@
         "trigger",
         "why",
         "confidence",
-        "recommendation"
+        "recommendation",
+        "introduced_by_branch"
       ],
       "properties": {
         "severity": {
@@ -99,6 +100,10 @@
         "recommendation": {
           "type": "string",
           "description": "The fix to apply."
+        },
+        "introduced_by_branch": {
+          "type": "boolean",
+          "description": "True when the defect is in lines or behavior that this change added or modified. False when the defect existed before this change."
         }
       }
     }
