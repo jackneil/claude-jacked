@@ -4360,8 +4360,10 @@ def _release_manual_owner(paths, *, timeout: float = 10.0) -> tuple[bool, str]:
 
 def _ensure_autostart_and_running(
     port: int, *, one_shot_host: str | None = None, label: str = "Service"
-) -> None:
+) -> bool:
     """Register login autostart and make sure the service is running now.
+
+    Returns True when the exact service generation is running afterwards.
 
     macOS: ``install_autostart`` bootstraps it via launchd (starts immediately)
     unless the service is already running. Windows/Linux: ``install_autostart``
@@ -4417,11 +4419,11 @@ def _ensure_autostart_and_running(
                         "[red]Error:[/red] supervisor artifact is foreign; "
                         "run `jacked service recover`"
                     )
-                    return
+                    return False
                 released, detail = _release_manual_owner(paths)
                 if not released:
                     console.print(f"[red]Error:[/red] {detail}")
-                    return
+                    return False
         result = (
             spawn_exact_service(spec, environment=environment)
             if spec.supervisor is SupervisorKind.MANUAL
@@ -4431,12 +4433,12 @@ def _ensure_autostart_and_running(
         console.print(
             f"[red]Error:[/red] safe service install failed ({type(exc).__name__})"
         )
-        return
+        return False
     if not result.ok:
         console.print(
             f"[red]Error:[/red] safe service install refused: {result.reason}"
         )
-        return
+        return False
     ready = _wait_owned_service_ready(
         paths,
         expected_generation=spec.generation,
@@ -4446,14 +4448,14 @@ def _ensure_autostart_and_running(
             "[red]Error:[/red] native manager accepted the definition, but the "
             "exact service generation did not become ready"
         )
-        return
+        return False
     port_label = ready.get("port") or port
     console.print("[green][OK][/green] Autostart registered from exact ServiceSpec")
     console.print(
         f"[green][OK][/green] {label} activation requested -> "
         f"http://127.0.0.1:{port_label}"
     )
-
+    return True
 
 def _setup_tray_autostart() -> None:
     """Register login autostart and start the tray now so `jacked install` makes
@@ -6619,6 +6621,15 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
         ServiceRunner(host=host, port=the_port).run()
         return
 
+    # No owned instance to hand off to. When this machine has an owned native
+    # supervisor definition, re-arm it so ownership stays with the supervisor:
+    # after an upgrade the old job exits cleanly and takes its manifest with
+    # it, and a manual spawn here would leave the tray unsupervised until the
+    # next login (2026-09-05). A machine with no definition keeps the plain
+    # detached spawn.
+    if host is None and _rearm_native_owner(the_port):
+        return
+
     # Detached - the tray must survive this command returning. Raw host stays
     # out of argv when None so the child re-resolves the bind from the DB.
     log_path = _spawn_service_detached(host, the_port)
@@ -6633,6 +6644,29 @@ def service_restart(host: str | None, port: int | None, foreground: bool):
     console.print(
         f"[green][OK][/green] Started authenticated service on :{running_port}"
     )
+
+
+def _rearm_native_owner(port: int) -> bool:
+    """Re-activate an owned native supervisor definition, if this machine has one.
+
+    Returns True when the exact service generation is running under the
+    native supervisor afterwards. Any refusal falls back to the caller.
+    """
+    from jacked.service.autostart import AutostartState
+    from jacked.service.lifecycle import supervisor_for_platform
+    from jacked.service.platform import inspect_autostart
+    from jacked.service.spec import SupervisorKind
+
+    if supervisor_for_platform() is SupervisorKind.MANUAL:
+        return False
+    try:
+        state = inspect_autostart().state
+    except Exception:  # noqa: BLE001 - inspection failure means "no definition"
+        return False
+    if state not in {AutostartState.OWNED_ENABLED, AutostartState.OWNED_DISABLED}:
+        return False
+    console.print("[dim]Re-arming the native supervisor definition[/dim]")
+    return _ensure_autostart_and_running(port, label="Service")
 
 
 @service.command(name="status")

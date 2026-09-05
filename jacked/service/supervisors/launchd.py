@@ -6,6 +6,7 @@ import os
 import plistlib
 import stat
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,36 @@ class LaunchdTransition:
     @property
     def common(self) -> dict[str, Any]:
         return {"capture_output": True, "text": True, "timeout": 15, "check": False}
+
+
+# launchd's bootout returns at once, but the job name stays registered while
+# the old process drains (seconds for a tray that shuts uvicorn down). A
+# bootstrap inside that window fails with EIO (exit 5), which on 2026-09-05
+# left an upgraded machine with no loaded job and a manually spawned tray.
+BOOTOUT_DRAIN_TIMEOUT_SECONDS = 30.0
+BOOTOUT_DRAIN_POLL_SECONDS = 0.25
+_LAUNCHCTL_NOT_FOUND = 113
+_LAUNCHCTL_EIO = 5
+
+
+def _await_unloaded(
+    context: "LaunchdTransition", timeout: float | None = None
+) -> bool:
+    """Return True once launchd no longer knows the job name."""
+    # Resolved at call time: a def-time default would freeze the module
+    # constant and defeat any test or operator override.
+    bound = BOOTOUT_DRAIN_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + bound
+    while True:
+        try:
+            probe = context.run(["launchctl", "print", context.domain], **context.common)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if probe.returncode == _LAUNCHCTL_NOT_FOUND:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(BOOTOUT_DRAIN_POLL_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -101,6 +132,8 @@ def _replace_legacy(
         )
         if not stopped.ok:
             return stopped
+        if not _await_unloaded(context):
+            return SupervisorAction(False, "install", "previous job did not unload")
         was_loaded = True
     elif loaded.returncode == 113:
         was_loaded = False
@@ -140,6 +173,8 @@ def _replace_loaded(
     stopped = _invoke(context, ["launchctl", "bootout", context.domain])
     if not stopped.ok:
         return stopped
+    if not _await_unloaded(context):
+        return _failed_with_rollback(context, state, "previous job did not unload")
     return _reconcile_bootstrap(context, state)
 
 
@@ -181,6 +216,9 @@ def _bootstrap(context: LaunchdTransition) -> SupervisorAction:
     command = ["launchctl", "bootstrap", f"gui/{context.uid}", str(context.path)]
     try:
         result = context.run(command, **context.common)
+        if result.returncode == _LAUNCHCTL_EIO and _await_unloaded(context):
+            # The previous job was still draining; the name is free now.
+            result = context.run(command, **context.common)
     except (OSError, subprocess.SubprocessError) as exc:
         return _resolve_ambiguous_bootstrap(context, type(exc).__name__)
     if result.returncode != 0:
@@ -258,10 +296,16 @@ def _rollback(context: LaunchdTransition, state: RollbackState) -> str:
             return "; rollback refused because the artifact changed"
         if not state.was_loaded:
             return "; previous unloaded state restored"
+        _await_unloaded(context)
         restored = context.run(
             ["launchctl", "bootstrap", f"gui/{context.uid}", str(context.path)],
             **context.common,
         )
+        if restored.returncode == _LAUNCHCTL_EIO and _await_unloaded(context):
+            restored = context.run(
+                ["launchctl", "bootstrap", f"gui/{context.uid}", str(context.path)],
+                **context.common,
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         return f"; rollback failed with {type(exc).__name__}"
     if restored.returncode != 0:

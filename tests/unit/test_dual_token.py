@@ -942,6 +942,35 @@ class TestCCIdentityValidation:
         result = flow._store_cc_tokens(tokens, profile)
         assert result["cc_access_token"] == "cc_at"
 
+    def test_fresh_cc_tokens_reset_the_refresh_breaker(self, tmp_path):
+        """A re-auth is a new refresh lineage: the invalid_grant breaker a
+        consumed token left behind must not survive it, or the authority
+        guard keeps refusing to import rotations and the heal sweep churns
+        (2026-09-05, account 11)."""
+        from jacked.web.oauth import OAuthFlow
+
+        db = _make_db(tmp_path)
+        db.update_account(
+            1,
+            refresh_failure_type="invalid_grant",
+            refresh_last_failed_at=int(time.time()),
+            last_error="Token invalid (HTTP 401), refresh failed",
+            last_error_at=int(time.time()),
+            validation_status="invalid",
+        )
+        flow = OAuthFlow(db, purpose="claude_code", target_account_id=1)
+        tokens = {"access_token": "cc_at", "refresh_token": "cc_rt", "expires_in": 3600}
+        profile = {"account": {"email_address": "alice@test.com"}}
+
+        result = flow._store_cc_tokens(tokens, profile)
+
+        assert result["cc_refresh_token"] == "cc_rt"
+        assert result["validation_status"] == "valid"
+        assert result["refresh_failure_type"] is None
+        assert result["refresh_last_failed_at"] is None
+        assert result["last_error"] is None
+        assert result["last_error_at"] is None
+
     def test_token_email_fallback_with_empty_profile(self, tmp_path):
         """CC auth succeeds when profile is empty but tokens contain email."""
         from jacked.web.oauth import OAuthFlow
