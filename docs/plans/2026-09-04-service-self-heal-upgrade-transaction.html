@@ -261,7 +261,7 @@
 <h1>Service self-heal: upgrade transaction + runtime trust model</h1>
 
 <div class="meta">
-  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">in progress</span></span></div>
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">shipped in PR, v0.101.0</span></span></div>
   <div class="kv"><span class="k">Date:</span><span class="v">2026-09-04</span></div>
   <div class="kv"><span class="k">Branch:</span><span class="v">jack_20260904_service_self_heal</span></div>
   <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
@@ -314,11 +314,11 @@ flowchart LR
 
 <h2 id="tasks">Tasks</h2>
 <ul class="tasks">
-<li><input type="checkbox" disabled> Trust model fix + tests (main loop)</li>
-<li><input type="checkbox" disabled> Agent A (Opus): preflight command, upgrade transaction + rollback in CLI, updater, Windows helper, install_method, tests</li>
-<li><input type="checkbox" disabled> Agent B (Opus): boot-refusal reason into breaker, status output, statusline degraded segment, tests</li>
-<li><input type="checkbox" disabled> Live repair on this Mac: install fixed build, <code>jacked service recover</code>, verify icon + statusline + status</li>
-<li><input type="checkbox" disabled> Full local CI gate, /dcr, PR, release</li>
+<li><input type="checkbox" checked disabled> Trust model fix + tests (main loop)</li>
+<li><input type="checkbox" checked disabled> Agent A (Opus): preflight command, upgrade transaction + rollback in CLI, updater, Windows helper, install_method, tests</li>
+<li><input type="checkbox" checked disabled> Agent B (Opus): boot-refusal reason into breaker, status output, statusline degraded segment, tests</li>
+<li><input type="checkbox" checked disabled> Live repair on this Mac: install fixed build, <code>jacked service recover</code>, verify icon + statusline + status</li>
+<li><input type="checkbox" checked disabled> Full local CI gate, /dcr, PR, release</li>
 </ul>
 
 
