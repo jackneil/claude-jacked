@@ -207,17 +207,17 @@ class TestPreflightGateAndRollback:
     @pytest.mark.parametrize("which", ["tray", "cli"])
     def test_preflight_runs_before_the_settings_migration(self, which):
         body = BATCH_BUILDERS[which]()["body"]
-        assert "jacked service preflight 2>&1" in body
+        assert "jacked service preflight --timeout 120 2>&1" in body
         # Only the FIRST occurrence matters: the rollback tail can mention
         # neither before the gate.
-        gate = body.index("jacked service preflight 2>&1")
+        gate = body.index("jacked service preflight --timeout 120 2>&1")
         migrate = body.index("jacked install --force 2>&1")
         assert gate < migrate
 
     @pytest.mark.parametrize("which", ["tray", "cli"])
     def test_a_refused_preflight_jumps_to_the_rollback_label(self, which):
         body = BATCH_BUILDERS[which]()["body"]
-        gate = body.index("jacked service preflight 2>&1")
+        gate = body.index("jacked service preflight --timeout 120 2>&1")
         tail = body[gate:]
         first_check = tail.split("\r\n")[1]
         assert first_check.startswith("if errorlevel 1 goto ")
@@ -524,3 +524,14 @@ class TestEveryUpgradeStepIsChecked:
             "jacked-update-failed.txt in place, so the tray warns about a "
             "failure the user already repaired"
         )
+
+
+def test_cli_batch_claims_the_status_record_before_installing():
+    """Windows cannot hold an OS lock across batch steps; the status-record
+    claim (`_update_status_init`, exit 2 when busy) is the in-flight guard."""
+    body = _cli_batch()["body"]
+    claim = body.index("jacked _update_status_init")
+    guard = body.index("if errorlevel 2", claim)
+    assert body.index("uv.exe", guard) > guard or body.index("tool install", guard) > guard
+    assert "exit /b 2" in body[guard:guard + 400]
+

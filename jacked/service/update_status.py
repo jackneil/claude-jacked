@@ -33,6 +33,10 @@ UPDATE_STATUS_FILE: Path = CLAUDE_DIR / "jacked-update-status.json"
 
 STALE_SUCCEEDED_SECONDS: int = 600  # 10 minutes
 STALE_IN_PROGRESS_SECONDS: int = 300  # 5 minutes
+# Passed as `updater_pid` by an updater that cannot be probed (a Windows batch
+# whose Python shim exits at once): the record then carries no pid and the
+# abandoned-update check uses the mtime rule alone.
+NO_UPDATER_PID: int = 0
 
 
 class LockBusy(Exception):
@@ -51,6 +55,12 @@ def acquire_update_lock(path: Path):
 
     Returns a handle whose ``close()`` releases the lock (it is also a
     context manager), or None when another process already holds it.
+    
+
+    Scope: the lock serializes updaters that run as Python processes (the
+    POSIX CLI upgrade and the tray updater). A Windows batch cannot hold an
+    OS lock across its steps, so the Windows helpers rely on the status
+    record's in-flight check (``jacked _update_status_init``, exit 2).
     """
     from contextlib import ExitStack
 
@@ -164,22 +174,34 @@ def abandoned_status(path: Path) -> Optional[dict]:
         return None
     if age <= STALE_IN_PROGRESS_SECONDS:
         return None
-    if _updater_is_alive(data):
+    # A proven-live updater is never abandoned. Proven-dead or indeterminate
+    # (no pid, probe failed) falls back to the mtime rule above.
+    if _updater_liveness(data) is True:
         return None
     return data
 
 
-def _updater_is_alive(data: dict) -> bool:
-    """Report whether the process that wrote this record still runs."""
+def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
+    """None means "this process"; NO_UPDATER_PID means "record no pid"."""
+    if updater_pid is None:
+        return os.getpid()
+    if updater_pid == NO_UPDATER_PID:
+        return None
+    return updater_pid
+
+
+def _updater_liveness(data: dict) -> Optional[bool]:
+    """True when the recording process runs, False when it is gone, None when
+    the record names no usable pid or the probe is indeterminate."""
     pid = data.get("updater_pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    from jacked.service.process import is_process_alive
+        return None
+    from jacked.service.process import process_liveness
 
     try:
-        return bool(is_process_alive(pid))
-    except OSError:
-        return False
+        return process_liveness(pid)
+    except Exception:  # noqa: BLE001 - a probe failure is indeterminate, not proof
+        return None
 
 
 def read_status_with_mtime(path: Path) -> tuple[Optional[dict], Optional[str]]:
@@ -239,7 +261,7 @@ def init_status(
         "error": None,
         "recovery": None,
         "log_path": log_path,
-        "updater_pid": os.getpid() if updater_pid is None else updater_pid,
+        "updater_pid": _resolve_updater_pid(updater_pid),
     }
     _atomic_write(path, data)
 
@@ -291,13 +313,23 @@ def init_or_adopt_status(
             # Claim the record for THIS process. The tray that pre-created it
             # is about to exit, and a record naming a dead pid would read as
             # abandoned the moment this update runs longer than the mtime rule.
-            claimed = os.getpid() if updater_pid is None else updater_pid
+            claimed = _resolve_updater_pid(updater_pid)
             if prior.get("updater_pid") != claimed:
-                prior["updater_pid"] = claimed
+                if claimed is None:
+                    # An updater that cannot be probed (a Windows batch) must
+                    # not leave the dead tray's pid on the record.
+                    prior.pop("updater_pid", None)
+                else:
+                    prior["updater_pid"] = claimed
+                # A claim that cannot be written leaves the tray's dead pid on
+                # the record; the update would then read as abandoned mid-run.
+                # Surface it as the LockBusy the caller already handles.
                 try:
                     _atomic_write(path, prior)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    raise LockBusy(
+                        f"could not claim the update status record: {exc}"
+                    ) from exc
             return "adopted"
         raise
 

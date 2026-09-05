@@ -210,10 +210,17 @@ def run_update(
     # update and released in the finally below.
     try:
         _update_lock = _us.acquire_update_lock(_us.UPDATE_STATUS_FILE)
-    except Exception:
+    except Exception as exc:
+        # Same posture as the CLI: a machine that cannot take the lock must
+        # not start a package install.
         logger.exception("Could not take the update lock")
-        _update_lock = None
-        log("WARNING: could not take the update lock; continuing")
+        log(f"REFUSED: could not take the update lock ({type(exc).__name__})")
+        _write_recovery(
+            "Jacked auto-update refused: the update lock could not be taken "
+            f"({type(exc).__name__}). Check ~/.claude is writable, then retry.\n"
+        )
+        log_fh.close()
+        return
     else:
         if _update_lock is None:
             log("REFUSED: another updater holds the update lock")
@@ -915,7 +922,7 @@ def _spawn_windows_tray_updater(
     # internal " (present in uv's label) would terminate the arg. Swap for '.
     label_for_batch = label.replace('"', "'")
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
-    to_version = target_version or "next"
+    to_version = safe_version_label(target_version or "next", fallback="next")
     # Validate the running version ONCE, before any batch line is built, and
     # use the validated label everywhere below - including the status-init line
     # and every echo. A version that fails the check must never reach cmd.exe.
@@ -1107,7 +1114,7 @@ def _spawn_windows_tray_updater(
         # can provision its service contract before the old service is gone.
         "jacked _update_status preflight in_progress\r\n"
         + DRIFT_GUARD
-        + "jacked service preflight 2>&1\r\n"
+        + "jacked service preflight --timeout 120 2>&1\r\n"
         "if errorlevel 1 goto preflight_failed\r\n"
         "jacked _update_status preflight ok\r\n"
         + DRIFT_GUARD

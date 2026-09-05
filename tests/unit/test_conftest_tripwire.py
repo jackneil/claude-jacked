@@ -72,3 +72,8 @@ def test_run_refuses_windows_style_supervisor_paths():
     with pytest.raises(RuntimeError, match="real supervisor"):
         subprocess.run([r"C:\\Windows\\System32\\schtasks.exe", "/Query"])
 
+
+def test_run_refuses_supervisor_paths_containing_spaces():
+    with pytest.raises(RuntimeError, match="real supervisor"):
+        subprocess.run([r"C:\\Program Files\\Windows\\System32\\schtasks.exe", "/Query"])
+

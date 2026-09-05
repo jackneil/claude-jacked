@@ -1353,78 +1353,91 @@ def _run_upgrade_inline(
     service contract. Any failure after that gate rolls the machine back to
     `previous_version`.
     """
+    request = _UpgradeRequest(
+        cmd=list(cmd),
+        label=label,
+        extras=extras,
+        skip_service=skip_service,
+        pid_file=pid_file,
+        previous_version=previous_version,
+        no_rollback=no_rollback,
+    )
     lock = _acquire_upgrade_lock(previous_version, extras)
     try:
-        _run_upgrade_inline_locked(
-            cmd, label, extras, skip_service, pid_file, host, port,
-            previous_version, no_rollback,
-        )
+        _run_upgrade_inline_locked(request)
     finally:
         # Held for the whole transaction, released on success, on a rollback
         # (which exits through SystemExit) and on any unexpected raise.
         _release_upgrade_lock(lock)
 
 
-def _run_upgrade_inline_locked(
-    cmd: list[str], label: str, extras: str, skip_service: bool,
-    pid_file, host: str, port: int,
-    previous_version: str = "", no_rollback: bool = False,
-):
+@dataclass(frozen=True)
+class _UpgradeRequest:
+    """Everything the inline upgrade transaction needs, decided up front."""
+
+    cmd: list[str]
+    label: str
+    extras: str
+    skip_service: bool
+    pid_file: object
+    previous_version: str = ""
+    no_rollback: bool = False
+
+
+def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
     """The upgrade transaction itself. Runs while the update lock is held."""
     from jacked.service import update_status as _us
 
     # Step 1: package upgrade (uv / pipx, auto-detected).
-    jacked = _upgrade_install_package(cmd, label)
+    jacked = _upgrade_install_package(request.cmd, request.label)
     new_version = _installed_package_version()
     plan = _RollbackPlan(
         jacked=jacked,
-        previous_version=previous_version,
-        extras=extras,
-        skip_service=skip_service,
+        previous_version=request.previous_version,
+        extras=request.extras,
+        skip_service=request.skip_service,
         reason="",
     )
-
-    # Step 2: preflight. This is the transaction gate. It proves the new build
-    # can provision its service contract BEFORE the old service is replaced.
-    # It runs even with --skip-service: it is cheap, and it is the whole point.
-    preflight_code, preflight_output = _upgrade_run_preflight(jacked)
-    if preflight_code != 0:
-        _upgrade_phase(
-            "preflight", "failed",
-            error="the new build cannot provision its service contract",
-            recovery="jacked service preflight",
-        )
-        _upgrade_rollback_and_exit(
-            plan=replace(
-                plan,
-                reason="the new build cannot provision its service contract",
-            ),
-            new_version=new_version,
-            detail=preflight_output,
-            no_rollback=no_rollback,
-        )
-    _upgrade_phase("preflight", "ok")
-
-    # Step 3: migrate settings.json. A failure here is a transaction failure:
-    # the new build is on disk with settings it could not migrate, so the
-    # machine goes back to the build that was running.
-    _upgrade_migrate_settings(plan, new_version, no_rollback)
-
-    # Step 4: delegate restart to the newly installed CLI. Only its v2
-    # manifest + authenticated control channel may authorize a handoff.
-    if skip_service:
+    # Step 2: the transaction gate. Runs even with --skip-service.
+    _upgrade_preflight_or_rollback(plan, new_version, request.no_rollback)
+    # Step 3: settings migration; a failure rolls back to the running build.
+    _upgrade_migrate_settings(plan, new_version, request.no_rollback)
+    # Step 4: restart through the newly installed CLI (authenticated handoff).
+    if request.skip_service:
         console.print("\n[dim]Skipping service restart (--skip-service)[/dim]")
     else:
-        _upgrade_restart_or_rollback(plan, new_version, no_rollback, pid_file)
-
-    # A clean upgrade retires the recovery file an earlier failure left behind,
-    # so the tray never warns about a failure the user has already repaired.
+        _upgrade_restart_or_rollback(
+            plan, new_version, request.no_rollback, request.pid_file
+        )
+    # A clean upgrade retires the recovery file an earlier failure left behind.
     _clear_upgrade_recovery_file()
     try:
         _us.mark_succeeded(_us.UPDATE_STATUS_FILE)
     except Exception:
         logger.debug("Could not mark the update status succeeded", exc_info=True)
     console.print("\n[green][OK][/green] Upgrade complete.")
+
+
+def _upgrade_preflight_or_rollback(plan, new_version: str, no_rollback: bool) -> None:
+    """Prove the NEW build can provision its service contract, or roll back.
+
+    This runs before the old service is replaced, and with --skip-service too:
+    it is cheap, and it is the whole point of the transaction.
+    """
+    preflight_code, preflight_output = _upgrade_run_preflight(plan.jacked)
+    if preflight_code == 0:
+        _upgrade_phase("preflight", "ok")
+        return
+    reason = "the new build cannot provision its service contract"
+    _upgrade_phase(
+        "preflight", "failed", error=reason, recovery="jacked service preflight"
+    )
+    _upgrade_rollback_and_exit(
+        plan=replace(plan, reason=reason),
+        new_version=new_version,
+        detail=preflight_output,
+        no_rollback=no_rollback,
+    )
 
 
 # The Windows helpers write their failure breadcrumb here. It is a DIFFERENT
@@ -1491,6 +1504,9 @@ def _spawn_windows_upgrade_helper(
     # line. A version that fails the check must never reach a shell line, not
     # even inside an echo.
     safe_previous = safe_version_label(previous_version)
+    from jacked.install_method import detect_install_method
+
+    method = detect_install_method()
     log_path = CLAUDE_DIR / "jacked-update.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1630,6 +1646,16 @@ def _spawn_windows_upgrade_helper(
         # SKIP_SERVICE is a record of what this batch was generated for. Echo
         # it: a support reader needs to know why no restart line ran.
         'echo [%date% %time%] skip service: "%SKIP_SERVICE%"\r\n'
+        # In-flight guard: the same status-record claim the tray batch makes.
+        # A batch cannot hold an OS lock across steps, so this is the Windows
+        # equivalent of the CLI's exclusive update lock.
+        'jacked _update_status_init "' + safe_previous + '" "next" ' + method
+        + ' --log-path "' + str(log_path) + '"\r\n'
+        'if errorlevel 2 (\r\n'
+        '    echo [%date% %time%] REFUSED: another jacked updater is in progress\r\n'
+        '    echo Another jacked updater is already in progress. Aborting. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
+        '    exit /b 2\r\n'
+        ')\r\n'
         + wait_for_parent_block(my_pid) +
         'echo [%date% %time%] parent exited, running upgrade command\r\n'
         + upgrade_line + ' 2>&1\r\n'
@@ -1642,7 +1668,7 @@ def _spawn_windows_upgrade_helper(
         # Transaction gate: the new build must prove it can provision its
         # service contract before the old service is replaced.
         'echo [%date% %time%] running jacked service preflight\r\n'
-        'jacked service preflight 2>&1\r\n'
+        'jacked service preflight --timeout 120 2>&1\r\n'
         'if errorlevel 1 goto preflight_failed\r\n'
         'echo [%date% %time%] running jacked install --force\r\n'
         'jacked install --force 2>&1\r\n'
@@ -1765,12 +1791,16 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
     """
     from jacked.service import update_status as us_mod
     try:
+        # This shim exits immediately while the batch that called it keeps
+        # running, so its own pid would read as "updater dead" within seconds.
+        # Record no pid: the batch's liveness then follows the mtime rule.
         outcome = us_mod.init_or_adopt_status(
             us_mod.UPDATE_STATUS_FILE,
             from_version=from_version,
             to_version=to_version,
             method=method,
             log_path=log_path,
+            updater_pid=us_mod.NO_UPDATER_PID,
         )
     except us_mod.LockBusy as exc:
         click.echo(f"[update-status] lock busy: {exc}", err=True)
@@ -6344,6 +6374,30 @@ def service_start(host: str | None, port: int | None):
     runner.run()
 
 
+def _provision_with_timeout(provision, paths, timeout_seconds):
+    """Run provisioning, bounded when the caller asked for a timeout.
+
+    A batch file cannot bound a command itself, so the Windows upgrade helpers
+    ask this command to bound its own work. The worker thread is a daemon:
+    a hung provisioning call must not keep the process alive after the
+    refusal is printed.
+    """
+    if timeout_seconds is None:
+        return provision(paths=paths)
+    import concurrent.futures
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(provision, paths=paths)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(
+            f"provisioning did not finish within {timeout_seconds:g}s"
+        ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 @service.command(name="preflight")
 @click.option(
     "--json",
@@ -6351,7 +6405,14 @@ def service_start(host: str | None, port: int | None):
     is_flag=True,
     help="Print one JSON object with the result, for automation.",
 )
-def service_preflight(as_json: bool):
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    default=None,
+    type=float,
+    help="Fail with exit code 1 if provisioning takes longer than this many seconds.",
+)
+def service_preflight(as_json: bool, timeout_seconds: float | None):
     """Prove this build can provision its service contract.
 
     The command provisions the contract only. It starts no process and it
@@ -6368,8 +6429,10 @@ def service_preflight(as_json: bool):
     )
 
     try:
-        spec, _environment = provision_service_contract(paths=default_service_paths())
-    except (OSError, ValueError) as exc:
+        spec, _environment = _provision_with_timeout(
+            provision_service_contract, default_service_paths(), timeout_seconds
+        )
+    except (OSError, ValueError, TimeoutError) as exc:
         if as_json:
             click.echo(
                 _json.dumps(

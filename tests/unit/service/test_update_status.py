@@ -1,6 +1,8 @@
 """Tests for the update-status JSON reader/writer."""
 
 import os
+
+import pytest
 import time
 from pathlib import Path
 
@@ -658,3 +660,87 @@ class TestExclusiveUpdateLock:
         handle = acquire_update_lock(path)
         assert handle is not None
         handle.close()
+
+
+@pytest.mark.parametrize("pid", [2**31, 2**40, 2**70, True])
+def test_an_oversized_or_bogus_updater_pid_never_raises(tmp_path, pid):
+    """os.kill raises OverflowError (not OSError) above pid_t; a probe must not."""
+    import json
+    import os
+    import time
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps({"overall": "in_progress", "current_phase": "preflight", "updater_pid": pid}))
+    old = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+    os.utime(path, (old, old))
+    record = us.abandoned_status(path)
+    assert record is not None and record["current_phase"] == "preflight"
+
+
+def test_process_liveness_is_false_for_out_of_range_pids():
+    from jacked.service.process import is_process_alive, process_liveness
+
+    for pid in (2**31, 2**40, -5, 0):
+        assert process_liveness(pid) is False
+        assert is_process_alive(pid) is False
+
+
+def test_no_updater_pid_sentinel_records_no_pid_and_uses_the_mtime_rule(tmp_path):
+    import json
+    import os
+    import time
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=us.NO_UPDATER_PID)
+    assert "updater_pid" not in json.loads(path.read_text()) or json.loads(path.read_text())["updater_pid"] is None
+    us.begin_phase(path, "installing_package")
+    old = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+    os.utime(path, (old, old))
+    assert us.abandoned_status(path) is not None
+
+
+def test_adoption_replaces_the_dead_tray_pid_with_no_pid_for_a_batch(tmp_path):
+    import json
+
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999)  # tray pre-init
+    assert us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv", updater_pid=us.NO_UPDATER_PID) == "adopted"
+    assert json.loads(path.read_text()).get("updater_pid") is None
+
+
+def test_adoption_that_cannot_write_its_claim_is_refused(tmp_path, monkeypatch):
+    from jacked.service import update_status as us
+
+    path = tmp_path / "status.json"
+    us.init_status(path, "1.0.0", "1.1.0", "uv", updater_pid=99999999)
+
+    def _boom(p, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(us, "_atomic_write", _boom)
+    with pytest.raises(us.LockBusy, match="could not claim"):
+        us.init_or_adopt_status(path, "1.0.0", "1.1.0", "uv")
+
+
+def test_indeterminate_liveness_falls_back_to_the_mtime_rule(tmp_path, monkeypatch):
+    import json
+    import os
+    import time
+
+    from jacked.service import update_status as us
+
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: None)
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps({"overall": "in_progress", "current_phase": "preflight", "updater_pid": 4242}))
+    old = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+    os.utime(path, (old, old))
+    assert us.abandoned_status(path) is not None
+    monkeypatch.setattr("jacked.service.process.process_liveness", lambda pid: True)
+    assert us.abandoned_status(path) is None
+

@@ -49,7 +49,8 @@ def _no_real_service_processes(request, monkeypatch):
         them too.
         """
         text = _text(args)
-        first = text.split(" ", 1)[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        head = str(args[0]) if isinstance(args, (list, tuple)) and args else text.split(" ", 1)[0]
+        first = head.replace("\\", "/").rsplit("/", 1)[-1].lower()
         if first in supervisors:
             raise RuntimeError("test tried to drive a real supervisor: " + text)
         padded = f" {text} "

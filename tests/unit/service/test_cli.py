@@ -1929,3 +1929,42 @@ class TestServicePreflight:
         popen.assert_not_called()
         ensure.assert_not_called()
         restart.assert_not_called()
+
+
+class TestServicePreflightTimeout:
+    def test_a_hung_provisioning_call_is_refused_within_the_timeout(self):
+        import threading
+        import time
+
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+
+        release = threading.Event()
+
+        def _hang(paths=None):
+            release.wait(30)
+            raise AssertionError("should not be reached")
+
+        started = time.monotonic()
+        try:
+            with patch("jacked.service.lifecycle.provision_service_contract", _hang):
+                result = CliRunner().invoke(
+                    main, ["service", "preflight", "--timeout", "0.5", "--json"]
+                )
+        finally:
+            release.set()
+        assert result.exit_code == 1, result.output
+        assert "TimeoutError" in result.output
+        assert time.monotonic() - started < 10
+
+    def test_batches_bound_the_preflight(self):
+        from pathlib import Path as _P
+
+        cli_src = _P("jacked/cli.py").read_text(encoding="utf-8")
+        upd_src = _P("jacked/service/updater.py").read_text(encoding="utf-8")
+        assert "jacked service preflight 2>&1" not in cli_src
+        assert "jacked service preflight 2>&1" not in upd_src
+        assert "jacked service preflight --timeout 120 2>&1" in cli_src
+        assert "jacked service preflight --timeout 120 2>&1" in upd_src
+

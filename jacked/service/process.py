@@ -266,13 +266,24 @@ def _posix_process_liveness(pid: int) -> bool | None:
         return None
 
 
+# pid_t on POSIX and DWORD on Windows are 32-bit; os.kill raises OverflowError
+# (not OSError) above this, and ctypes raises ArgumentError. A probe must never
+# raise: an out-of-range value is simply not a live process.
+_PID_MAX = 2**31 - 1
+
+
 def process_liveness(pid: int) -> bool | None:
     """Return True for alive, False for dead, and None when indeterminate."""
-    if pid <= 0:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or pid > _PID_MAX:
         return False
-    if sys.platform == "win32":
-        return _windows_process_liveness(pid)
-    return _posix_process_liveness(pid)
+    try:
+        if sys.platform == "win32":
+            return _windows_process_liveness(pid)
+        return _posix_process_liveness(pid)
+    except (OSError, OverflowError, ValueError):
+        return None
+    except Exception:  # noqa: BLE001 - ctypes.ArgumentError and friends
+        return None
 
 
 def is_process_alive(pid: int) -> bool:

@@ -1579,3 +1579,51 @@ class TestUpdaterFunctionLength:
         assert too_long == [], f"functions over 50 lines: {too_long}"
         missing = self.STEP_FUNCTIONS - seen
         assert not missing, f"the guardrail names functions that are gone: {missing}"
+
+
+class TestUpdaterLockFailsClosed:
+    def test_a_lock_error_refuses_the_update_before_any_install(self, monkeypatch):
+        from jacked.service import update_status as us
+        from jacked.service import updater
+
+        def _boom(path):
+            raise PermissionError("no lock for you")
+
+        monkeypatch.setattr(us, "acquire_update_lock", _boom)
+        monkeypatch.setattr(
+            "jacked.install_method.can_auto_upgrade", lambda: (True, "")
+        )
+        monkeypatch.setattr(
+            "jacked.install_method.detect_install_method", lambda: "uv"
+        )
+        ran = []
+        monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: ran.append(a))
+        updater.run_update(4242, "tray", target_version="9.9.9", port=8321)
+        assert ran == []
+        assert "update lock could not be taken" in updater.RECOVERY_FILE.read_text()
+
+    def test_tray_batch_never_carries_an_unvalidated_target_version(self):
+        from jacked.service import updater
+
+        captured = {}
+
+        class _Popen:
+            def __init__(self, args, **kwargs):
+                captured["args"] = args
+
+        with (
+            patch.object(updater.subprocess, "Popen", _Popen),
+            patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {"uv": r"C:\uv\uv.exe"}.get(n)),
+            patch("sys.platform", "win32"),
+        ):
+            updater._spawn_windows_tray_updater(
+                4242, "tray", target_version='9.9" & del C:\\ &', port=8321
+            )
+        from pathlib import Path as _P
+
+        body = _P(captured["args"][-1]).read_text(encoding="utf-8")
+        assert "del C:" not in body
+        assert '"next"' in body
+
